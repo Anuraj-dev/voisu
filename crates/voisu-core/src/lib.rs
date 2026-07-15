@@ -777,28 +777,63 @@ fn token_mixes_confusable_scripts(token: &str) -> bool {
     let mut greek = false;
     let mut cyrillic = false;
     for character in token.chars().filter(|character| character.is_alphabetic()) {
-        match character as u32 {
-            0x0041..=0x024f => latin = true,
-            0x0370..=0x03ff => greek = true,
-            0x0400..=0x052f => cyrillic = true,
-            _ => {}
+        match confusable_script(character) {
+            Some(ConfusableScript::Latin) => latin = true,
+            Some(ConfusableScript::Greek) => greek = true,
+            Some(ConfusableScript::Cyrillic) => cyrillic = true,
+            None => {}
         }
     }
     usize::from(latin) + usize::from(greek) + usize::from(cyrillic) >= 2
 }
 
+#[derive(Clone, Copy)]
+enum ConfusableScript {
+    Latin,
+    Greek,
+    Cyrillic,
+}
+
+/// Classifies a character into one of the visually confusable scripts by its
+/// Unicode Script property, with the range tables completed by hand across
+/// EVERY block each script occupies — a homoglyph drawn from an extended
+/// block (Greek Extended, Cyrillic Extended-B, ...) must classify the same as
+/// its base-block siblings.
+fn confusable_script(character: char) -> Option<ConfusableScript> {
+    match character as u32 {
+        0x0041..=0x024f // Basic Latin, Latin-1 Supplement, Extended-A/B
+        | 0x1e00..=0x1eff // Latin Extended Additional
+        | 0x2c60..=0x2c7f // Latin Extended-C
+        | 0xa720..=0xa7ff // Latin Extended-D
+        | 0xab30..=0xab6f // Latin Extended-E
+        | 0x1df00..=0x1dfff // Latin Extended-F/G
+        => Some(ConfusableScript::Latin),
+        0x0370..=0x03ff // Greek and Coptic
+        | 0x1f00..=0x1fff // Greek Extended
+        => Some(ConfusableScript::Greek),
+        0x0400..=0x052f // Cyrillic, Cyrillic Supplement
+        | 0x1c80..=0x1c8f // Cyrillic Extended-C
+        | 0x2de0..=0x2dff // Cyrillic Extended-A
+        | 0xa640..=0xa69f // Cyrillic Extended-B
+        | 0x1e030..=0x1e08f // Cyrillic Extended-D
+        => Some(ConfusableScript::Cyrillic),
+        _ => None,
+    }
+}
+
 fn script_count(text: &str) -> usize {
     let mut scripts = [false; 7];
     for character in text.chars().filter(|character| character.is_alphabetic()) {
-        let code = character as u32;
-        let index = match code {
-            0x0041..=0x024f => 0, // Latin and Latin extensions
-            0x0370..=0x03ff => 1, // Greek
-            0x0400..=0x052f => 2, // Cyrillic
-            0x0600..=0x06ff => 3, // Arabic
-            0x0900..=0x097f => 4, // Devanagari
-            0x3040..=0x30ff | 0x3400..=0x9fff => 5, // Japanese/CJK
-            _ => 6,
+        let index = match confusable_script(character) {
+            Some(ConfusableScript::Latin) => 0,
+            Some(ConfusableScript::Greek) => 1,
+            Some(ConfusableScript::Cyrillic) => 2,
+            None => match character as u32 {
+                0x0600..=0x06ff => 3, // Arabic
+                0x0900..=0x097f => 4, // Devanagari
+                0x3040..=0x30ff | 0x3400..=0x9fff => 5, // Japanese/CJK
+                _ => 6,
+            },
         };
         scripts[index] = true;
     }

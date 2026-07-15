@@ -583,3 +583,76 @@ async fn legitimate_bilingual_merge_result_passes_validation() {
     assert!(!decision.recovery_attempted);
     assert!(decision.fallback_reason.is_none());
 }
+
+#[tokio::test]
+async fn extended_block_homoglyph_merge_results_are_rejected_and_repaired() {
+    // Homoglyphs drawn from extended Unicode blocks must classify the same as
+    // their base-block siblings: "p\u{1f00}yment" hides a Greek Extended
+    // alpha, "a\u{a640}" hides a Cyrillic Extended-B letter — both inside
+    // Latin tokens.
+    let unsafe_candidates = [
+        "Schedule the p\u{1f00}yment review Wednesday morning.",
+        "Schedule the a\u{a640} review Wednesday morning.",
+    ];
+
+    for candidate in unsafe_candidates {
+        let mut pipeline = TranscriptDecisionPipeline::new(
+            CandidateThenRepairModel {
+                candidate: candidate.to_owned(),
+            },
+            Duration::from_millis(50),
+        );
+        let decision = pipeline
+            .decide(vec![
+                SourceTranscript {
+                    provider: Provider::Deepgram,
+                    text: "Book the room Tuesday afternoon.".to_owned(),
+                },
+                SourceTranscript {
+                    provider: Provider::Groq,
+                    text: "Schedule the review Wednesday morning.".to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            decision.selection,
+            TranscriptSelection::Repaired,
+            "candidate must be rejected: {candidate}"
+        );
+        assert_eq!(decision.validation_reason, "repaired mixed-script garbage");
+    }
+}
+
+#[tokio::test]
+async fn fully_greek_extended_token_passes_validation() {
+    // A word written entirely in Greek (including Greek Extended letters) as
+    // its own token is legitimate bilingual dictation, not a homoglyph.
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::clone(&kinds),
+            text: "Tell \u{1f00}\u{03b3}\u{03b1}\u{03b8}\u{03cc}\u{03c2} that the review is Wednesday morning.".to_owned(),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Book the room Tuesday afternoon.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Schedule the review Wednesday morning.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::Reconciled);
+    assert!(!decision.recovery_attempted);
+    assert!(decision.fallback_reason.is_none());
+}
