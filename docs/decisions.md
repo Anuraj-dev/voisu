@@ -93,3 +93,21 @@ process. Instead, each Groq stream owns a per-Recording cancel FLAG; abort only 
 loop that owns each `Child` observes the flag every ~10 ms poll tick and kills through its own `Child` handle —
 pid-reuse-safe because that loop is the only reaper. Already-cancelled operations fail fast without spawning,
 and per-Recording flag ownership guarantees stale results die with their aborted stream.
+
+## 2026-07-15 — Recovery is a first-class actor state with retryable rejection, not a deferral queue
+**Why:** `ActorState::Recovering(u64)` rejects Start/Toggle during recovery with a retryable error instead of
+queuing them, because queuing risked ordering violations across recovery boundaries. A `Recovered(id)` ack
+gates the return to `Idle`, and `abort_recording_work` runs capture abort and provider-coordinator abort
+concurrently via `tokio::join!` inside a 2s `RECOVERY_ABORT_DEADLINE`, itself inside the 22s
+`PROCESSING_RESPONSE_DEADLINE`.
+
+## 2026-07-15 — Cancel subprocesses via an AtomicBool flag, not raw-PID signals
+**Why:** Sol's Ticket 03 review (HIGH finding) identified a PID-reuse race in the original raw-PID `SIGKILL`
+cancellation. `CancelRegistry` now sets an `AtomicBool`; only the bounded-wait loop that already owns the
+`Child` handle acts on it, killing via that handle on a ~10ms poll tick, and already-cancelled operations
+fail fast without spawning.
+
+## 2026-07-15 — Review effort policy: first review high, re-reviews medium
+**Why:** Ticket 03 needed 5 Sol review rounds; running every round at high effort wastes Codex quota once the
+first pass has surfaced the architecture-level findings. First review of a ticket runs Sol high; subsequent
+re-reviews until merge run Sol medium. Recorded in `AGENTS.md`/`CLAUDE.md`.
