@@ -74,3 +74,19 @@ the last spoken frames; forced kill/reap remains the bounded abort path.
 **Why:** Thirty-second WAV chunks with 500 ms overlap start cloud work before stop without exposing credentials in
 argv or inherited environments. The final chunk includes frames collected during graceful capture finalization;
 word-overlap reconciliation produces one validated Groq Source Transcript and therefore one clipboard Delivery.
+
+## 2026-07-15 — Reject (do not defer) Start during post-failure recovery
+**Why:** After a failed start, the daemon enters a Recovering state until the bounded capture/provider aborts
+acknowledge completion. Start/Toggle received meanwhile get an immediate, distinct retryable rejection
+("Recording recovery in progress; retry shortly") instead of being queued for replay. A deferral queue was
+tried and rejected: a Stop can overtake a deferred Start (reordering Start→Stop into a live Recording), two
+deferred Toggles misbehave, and a deferred Start can begin a Recording after its client already timed out —
+a ghost Recording nobody observes. Rejection preserves command ordering by construction and never starts a
+Recording without a live client; callers retry, which the CLI acceptance helper encodes.
+
+## 2026-07-15 — Provider aborts must kill registered subprocesses, not just tasks
+**Why:** Aborting a tokio task that awaits `spawn_blocking` curl work detaches the blocking subprocess, which
+would keep an aborted Recording's provider request alive for up to its 14 s deadline and overlap the next
+Recording. Each Groq stream owns a per-Recording cancel registry of in-flight curl child pids; abort marks it
+cancelled and SIGKILLs the registered children (the owning bounded-wait loop reaps them), and per-Recording
+registry ownership guarantees stale results die with their aborted stream.

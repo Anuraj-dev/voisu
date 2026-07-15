@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -524,13 +525,78 @@ fn restricted_command(program: &str) -> Command {
     command
 }
 
+/// Cancellation registry shared between a provider stream and its in-flight
+/// subprocess requests: aborting the stream kills every registered child so a
+/// failed Recording's blocking work cannot continue into the next Recording.
+struct CancelRegistry {
+    cancelled: AtomicBool,
+    pids: Mutex<Vec<u32>>,
+}
+
+impl CancelRegistry {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancelled: AtomicBool::new(false),
+            pids: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Registers a live child. Returns false when the registry is already
+    /// cancelled; the caller must then kill and reap the child itself.
+    fn register(&self, pid: u32) -> bool {
+        let mut pids = self.pids.lock().unwrap();
+        if self.cancelled.load(Ordering::SeqCst) {
+            return false;
+        }
+        pids.push(pid);
+        true
+    }
+
+    fn deregister(&self, pid: u32) {
+        self.pids.lock().unwrap().retain(|registered| *registered != pid);
+    }
+
+    /// Marks the registry cancelled and kills every registered child. The
+    /// owning `run_restricted_with_deadline` call reaps the killed child under
+    /// its own bounded wait, preserving the kill+reap invariant.
+    fn cancel(&self) {
+        let pids = {
+            let mut pids = self.pids.lock().unwrap();
+            self.cancelled.store(true, Ordering::SeqCst);
+            std::mem::take(&mut *pids)
+        };
+        for pid in pids {
+            if let Ok(pid) = i32::try_from(pid) {
+                // SAFETY: kill only sends a signal to the recorded child pid.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
+/// Deregisters a child from its cancel registry on every exit path.
+struct CancelGuard<'a> {
+    cancel: Option<&'a CancelRegistry>,
+    pid: u32,
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel {
+            cancel.deregister(self.pid);
+        }
+    }
+}
+
 fn run_restricted(
     program: &str,
     arguments: &[&str],
     input: Option<&[u8]>,
     capture_stdout: bool,
 ) -> Result<ProcessOutcome, ProcessError> {
-    run_restricted_with_deadline(program, arguments, input, capture_stdout, PROCESS_DEADLINE)
+    run_restricted_with_deadline(program, arguments, input, capture_stdout, PROCESS_DEADLINE, None)
 }
 
 fn run_restricted_with_deadline(
@@ -539,6 +605,7 @@ fn run_restricted_with_deadline(
     input: Option<&[u8]>,
     capture_stdout: bool,
     deadline: Duration,
+    cancel: Option<&CancelRegistry>,
 ) -> Result<ProcessOutcome, ProcessError> {
     let started = Instant::now();
     let mut command = restricted_command(program);
@@ -548,6 +615,17 @@ fn run_restricted_with_deadline(
         .stdout(if capture_stdout { Stdio::piped() } else { Stdio::null() })
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|_| ProcessError::Unavailable)?;
+    if let Some(cancel) = cancel {
+        if !cancel.register(child.id()) {
+            let _ = child.kill();
+            reap_briefly(&mut child);
+            return Err(ProcessError::TimedOut);
+        }
+    }
+    let _cancel_guard = CancelGuard {
+        cancel,
+        pid: child.id(),
+    };
     // The whole-operation deadline starts before spawn and covers startup, the
     // stdin write, pipe drains, and wait. The write runs on its own thread so
     // the polling loop can kill an overdue child, which breaks the pipe and
@@ -968,6 +1046,7 @@ impl TranscriptProvider for GroqProvider {
             buffer: Vec::new(),
             streamed_bytes: 0,
             chunks: Vec::new(),
+            cancel: CancelRegistry::new(),
         }))
     }
 }
@@ -997,6 +1076,11 @@ struct GroqStream {
     buffer: Vec<u8>,
     streamed_bytes: usize,
     chunks: Vec<tokio::task::JoinHandle<Result<String, BoundaryError>>>,
+    /// Per-Recording registry of in-flight curl children. Because each
+    /// Recording gets its own stream and registry, cancelling one Recording
+    /// can never touch the next one's requests, and stale results die with
+    /// their aborted stream.
+    cancel: Arc<CancelRegistry>,
 }
 
 impl ProviderStream for GroqStream {
@@ -1015,9 +1099,10 @@ impl ProviderStream for GroqStream {
                     .to_vec();
                 let credential = self.credential.clone();
                 let endpoint = self.endpoint.clone();
+                let cancel = Arc::clone(&self.cancel);
                 self.chunks.push(tokio::spawn(async move {
                     ProviderHttpClient
-                        .transcribe_groq_chunk(credential, endpoint, pcm)
+                        .transcribe_groq_chunk(credential, endpoint, pcm, cancel)
                         .await
                 }));
             }
@@ -1027,6 +1112,10 @@ impl ProviderStream for GroqStream {
 
     fn abort(mut self: Box<Self>) -> BoundaryFuture<'static, ()> {
         Box::pin(async move {
+            // Kill the in-flight curl children first: aborting the tasks alone
+            // would detach already-running blocking requests, letting work from
+            // the failed Recording overlap the next one.
+            self.cancel.cancel();
             for chunk in self.chunks.drain(..) {
                 chunk.abort();
             }
@@ -1062,6 +1151,7 @@ impl ProviderStream for GroqStream {
                             self.credential,
                             self.endpoint,
                             std::mem::take(&mut self.buffer),
+                            Arc::clone(&self.cancel),
                         )
                         .await?,
                 );
@@ -1172,8 +1262,9 @@ impl ProviderHttpClient {
         credential: Credential,
         endpoint: String,
         pcm: Vec<u8>,
+        cancel: Arc<CancelRegistry>,
     ) -> Result<String, BoundaryError> {
-        tokio::task::spawn_blocking(move || request_groq_chunk(credential, endpoint, pcm))
+        tokio::task::spawn_blocking(move || request_groq_chunk(credential, endpoint, pcm, &cancel))
             .await
             .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "Groq request task failed"))?
     }
@@ -1183,6 +1274,7 @@ fn request_groq_chunk(
     credential: Credential,
     endpoint: String,
     pcm: Vec<u8>,
+    cancel: &CancelRegistry,
 ) -> Result<String, BoundaryError> {
     let mut file = tempfile::Builder::new()
         .prefix("voisu-recording-")
@@ -1220,6 +1312,7 @@ fn request_groq_chunk(
         Some(config.as_bytes()),
         true,
         PROVIDER_PROCESS_DEADLINE,
+        Some(cancel),
     )
     .map_err(|error| match error {
         ProcessError::TimedOut => {

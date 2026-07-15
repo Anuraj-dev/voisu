@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -233,13 +232,11 @@ enum ActorState {
     Recording(ActiveRecording),
     Processing(LifecycleEvidence),
     /// A failed start's aborts are still in flight. Publicly the daemon reads
-    /// idle and stays responsive, but a new Recording is deferred until the
-    /// cleanup acknowledges completion so adapters are never reused while a
-    /// previous abort is still running.
-    Recovering {
-        id: u64,
-        deferred: Vec<(Command, oneshot::Sender<Response>)>,
-    },
+    /// idle and stays responsive, but Start/Toggle are rejected with a
+    /// retryable message until the cleanup acknowledges completion: deferring
+    /// commands instead would reorder them and could begin a Recording whose
+    /// client already gave up (see docs/decisions.md).
+    Recovering(u64),
 }
 
 struct Completion {
@@ -281,15 +278,7 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
         Some(Box::new(ClipboardDelivery))
     };
 
-    let mut queued: VecDeque<ActorMessage> = VecDeque::new();
-    loop {
-        let message = match queued.pop_front() {
-            Some(message) => message,
-            None => match rx.recv().await {
-                Some(message) => message,
-                None => break,
-            },
-        };
+    while let Some(message) = rx.recv().await {
         match message {
             ActorMessage::Command(command, reply) => match command {
                 Command::Status => {
@@ -297,11 +286,15 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                     let _ = reply.send(response);
                 }
                 Command::Start | Command::Toggle
-                    if matches!(state, ActorState::Recovering { .. }) =>
+                    if matches!(state, ActorState::Recovering(_)) =>
                 {
-                    if let ActorState::Recovering { deferred, .. } = &mut state {
-                        deferred.push((command, reply));
-                    }
+                    // Immediate retryable rejection: replaying deferred
+                    // commands would reorder Start/Stop and could begin a
+                    // Recording after its client timed out.
+                    let _ = reply.send(Response::rejected(
+                        Some(DaemonState::Idle),
+                        "Recording recovery in progress; retry shortly",
+                    ));
                 }
                 Command::Start | Command::Toggle if matches!(state, ActorState::Idle) => {
                     let id = next_id;
@@ -432,13 +425,10 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                                 failure.error.public_message(),
                             ));
                             if failure.capture.is_some() || failure.provider_stream.is_some() {
-                                // The daemon reads idle immediately but defers
-                                // the next Recording until the bounded aborts
+                                // The daemon reads idle immediately but rejects
+                                // new Recordings until the bounded aborts
                                 // acknowledge completion (ActorMessage::Recovered).
-                                state = ActorState::Recovering {
-                                    id,
-                                    deferred: Vec::new(),
-                                };
+                                state = ActorState::Recovering(id);
                                 tokio::spawn(recover_failed_start(id, failure, tx.clone()));
                             } else {
                                 state = ActorState::Idle;
@@ -448,16 +438,8 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                 }
             }
             ActorMessage::Recovered(id) => {
-                if matches!(&state, ActorState::Recovering { id: recovering, .. } if *recovering == id)
-                {
-                    let ActorState::Recovering { deferred, .. } =
-                        std::mem::replace(&mut state, ActorState::Idle)
-                    else {
-                        unreachable!()
-                    };
-                    for (command, reply) in deferred {
-                        queued.push_back(ActorMessage::Command(command, reply));
-                    }
+                if matches!(&state, ActorState::Recovering(recovering) if *recovering == id) {
+                    state = ActorState::Idle;
                 }
             }
             ActorMessage::PumpTerminated(id) => {
@@ -516,7 +498,7 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
 
 fn state_label(state: &ActorState) -> DaemonState {
     match state {
-        ActorState::Idle | ActorState::Recovering { .. } => DaemonState::Idle,
+        ActorState::Idle | ActorState::Recovering(_) => DaemonState::Idle,
         ActorState::Starting(_) => DaemonState::Recording,
         ActorState::Recording(_) => DaemonState::Recording,
         ActorState::Processing(_) => DaemonState::Processing,
@@ -536,7 +518,7 @@ fn status_response(state: &ActorState) -> Response {
                 Some(evidence)
             }
             ActorState::Processing(evidence) => Some(evidence.clone()),
-            ActorState::Idle | ActorState::Starting(_) | ActorState::Recovering { .. } => None,
+            ActorState::Idle | ActorState::Starting(_) | ActorState::Recovering(_) => None,
         },
     )
 }

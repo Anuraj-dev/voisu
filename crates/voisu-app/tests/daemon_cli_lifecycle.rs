@@ -338,7 +338,8 @@ cat > "$dir/clipboard"
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 
-    assert!(voisu(runtime.path(), "start").status.success());
+    let restarted = start_recording_when_recovered(runtime.path());
+    assert!(restarted.status.success(), "{}", stderr(&restarted));
     thread::sleep(Duration::from_millis(50));
     let recovered = voisu(runtime.path(), "stop");
     assert!(recovered.status.success(), "{}", stderr(&recovered));
@@ -1047,6 +1048,25 @@ cat "$dir/clipboard"
 
     fn touch(&self, name: &str) {
         fs::write(self.bin.path().join(name), "").expect("fake command marker should be written");
+    }
+}
+
+/// Starts the next Recording after a failed one. A failed start's aborts run
+/// off the actor and Start is rejected with a retryable message until they
+/// acknowledge, so the next Recording retries through that window.
+fn start_recording_when_recovered(runtime_dir: &Path) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let started = voisu(runtime_dir, "start");
+        if started.status.success() || Instant::now() >= deadline {
+            return started;
+        }
+        assert!(
+            stderr(&started).contains("Recording recovery in progress"),
+            "only the retryable recovery rejection may be retried, got: {}",
+            stderr(&started)
+        );
+        thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -1834,7 +1854,8 @@ fn partial_provider_start_failure_aborts_the_capture_and_surfaces_abort_errors()
 
     // The one-shot provider failure is spent, so the next Recording proves the
     // aborted resources were left in a clean, reusable state.
-    assert!(voisu(runtime.path(), "start").status.success());
+    let restarted = start_recording_when_recovered(runtime.path());
+    assert!(restarted.status.success(), "{}", stderr(&restarted));
     let recovered = voisu(runtime.path(), "stop");
     assert!(recovered.status.success(), "{}", stderr(&recovered));
 
@@ -1847,6 +1868,118 @@ fn partial_provider_start_failure_aborts_the_capture_and_surfaces_abort_errors()
             && diagnostics.contains("controlled-provider-abort-detail"),
         "partial-start abort failures must be surfaced, got: {diagnostics}"
     );
+}
+
+#[test]
+fn start_during_recovery_is_rejected_retryably_then_succeeds() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_PROVIDER_START_FAILURE", "1"),
+            ("VOISU_TEST_CAPTURE_ABORT_STALL_MS", "30000"),
+        ],
+    );
+
+    // Groq's start fails; the stalled capture abort holds the daemon in
+    // recovery until the bounded abort timeout acknowledges completion.
+    let failed = voisu(runtime.path(), "start");
+    assert_eq!(failed.status.code(), Some(4));
+    assert_eq!(stderr(&failed), "Source Transcripts are unavailable\n");
+
+    // During recovery the daemon is publicly idle and Start is rejected with a
+    // distinct retryable message rather than deferred: no reordering against
+    // Stop, and never a Recording whose client already gave up.
+    let rejected = voisu(runtime.path(), "start");
+    assert_eq!(rejected.status.code(), Some(4));
+    assert_eq!(
+        stderr(&rejected),
+        "Recording recovery in progress; retry shortly\n"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+
+    // Once the bounded abort acknowledges, the next Recording succeeds.
+    let restarted = start_recording_when_recovered(runtime.path());
+    assert!(restarted.status.success(), "{}", stderr(&restarted));
+    let stopped = voisu(runtime.path(), "stop");
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+}
+
+#[test]
+fn failed_recording_kills_its_in_flight_groq_request_before_the_next_recording() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    // Enough PCM for one bounded Groq chunk request during the Recording, then
+    // keep recording until the configured Recording Deadline fails it.
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+head -c 1000000 /dev/zero | tr '\000' '\001'
+trap 'exit 0' INT TERM
+while :; do sleep 1; done
+"#,
+    );
+    // A curl stub simulating a slow endpoint: records its pid and start, then
+    // serves forever. Only a kill from the aborted Recording ends it early.
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$$" >> "$dir/curl.pids"
+: > "$dir/curl.start"
+while :; do sleep 0.1; done
+"#,
+    );
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "http://127.0.0.1:9/audio/transcriptions",
+            ),
+            ("VOISU_RECORDING_DEADLINE_MS", "2500"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "curl.start");
+
+    // The Recording Deadline fails the Recording while the request is in
+    // flight; the abort must kill the request's subprocess, not merely abort
+    // the tokio task that awaits it (a detached blocking curl would keep
+    // running for up to 14s, overlapping the next Recording).
+    let idle_deadline = Instant::now() + Duration::from_secs(8);
+    while stdout(&voisu(runtime.path(), "status")) != "idle\n" {
+        assert!(Instant::now() < idle_deadline, "failed Recording must recover to idle");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let curl_pid: u32 = fs::read_to_string(commands.path().join("curl.pids"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let kill_deadline = Instant::now() + Duration::from_secs(2);
+    while Path::new(&format!("/proc/{curl_pid}")).exists() {
+        assert!(
+            Instant::now() < kill_deadline,
+            "the failed Recording's in-flight Groq request must be terminated"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // Only after the stale request is provably dead does the next Recording begin.
+    assert!(voisu(runtime.path(), "start").status.success());
 }
 
 #[test]
