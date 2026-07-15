@@ -34,6 +34,7 @@ fn stop_response_budget_strictly_exceeds_all_daemon_processing_deadlines() {
 
 struct Daemon {
     child: Child,
+    _provider_stub: Option<TempDir>,
 }
 
 impl Daemon {
@@ -60,7 +61,10 @@ impl Daemon {
             if socket_path(runtime_dir).exists()
                 && voisu(runtime_dir, "status").status.success()
             {
-                return Self { child };
+                return Self {
+                    child,
+                    _provider_stub: None,
+                };
             }
             if let Some(status) = child.try_wait().expect("daemon status should be readable") {
                 panic!("daemon exited before binding its socket: {status}");
@@ -77,21 +81,54 @@ impl Daemon {
             .env("XDG_RUNTIME_DIR", runtime_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        if !environment
+            .stderr(Stdio::piped())
+            .env_remove("VOISU_DEEPGRAM_API_KEY");
+        let explicit_deepgram = environment
             .iter()
-            .any(|(name, _)| *name == "VOISU_DEEPGRAM_API_KEY")
-        {
-            command.env("VOISU_TEST_DEEPGRAM_UNAVAILABLE", "1");
-        }
+            .any(|(name, _)| *name == "VOISU_DEEPGRAM_API_KEY");
+        let live_smoke = std::env::var_os("VOISU_LIVE_SMOKE").as_deref()
+            == Some(std::ffi::OsStr::new("1"));
+        let original_path = environment
+            .iter()
+            .find_map(|(name, value)| (*name == "PATH").then_some((*value).to_owned()))
+            .unwrap_or_else(|| std::env::var("PATH").unwrap());
+        let provider_stub = (!explicit_deepgram && !live_smoke).then(|| {
+            let stub = TempDir::new().unwrap();
+            let delegate = std::env::split_paths(&original_path)
+                .map(|directory| directory.join("curl"))
+                .find(|candidate| candidate.is_file())
+                .expect("production acceptance PATH must provide curl");
+            write_fake_command(
+                stub.path(),
+                "curl",
+                &format!(
+                    "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\nconfig=$(/usr/bin/mktemp \"$dir/curl-config.XXXXXX\")\n/usr/bin/cat > \"$config\"\nif /usr/bin/grep -q unavailable.deepgram.test \"$config\"; then\n  /usr/bin/rm -f \"$config\"\n  exit 22\nfi\nexec \"{}\" \"$@\" < \"$config\"\n",
+                    delegate.display()
+                ),
+            );
+            command
+                .env("VOISU_DEEPGRAM_API_KEY", "path-stub-unavailable")
+                .env(
+                    "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
+                    "https://unavailable.deepgram.test/v1/listen",
+                )
+                .env("PATH", format!("{}:{original_path}", stub.path().display()));
+            stub
+        });
         for (name, value) in environment {
             command.env(name, value);
+        }
+        if let Some(stub) = provider_stub.as_ref() {
+            command.env("PATH", format!("{}:{original_path}", stub.path().display()));
         }
         let mut child = command.spawn().expect("daemon should start");
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             if socket_path(runtime_dir).exists() && voisu(runtime_dir, "status").status.success() {
-                return Self { child };
+                return Self {
+                    child,
+                    _provider_stub: provider_stub,
+                };
             }
             if let Some(status) = child.try_wait().expect("daemon status should be readable") {
                 panic!("daemon exited before binding its socket: {status}");
@@ -301,6 +338,109 @@ cat > "$dir/clipboard"
 }
 
 #[test]
+fn deepgram_queues_chunks_after_three_in_flight_requests() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+head -c 160000 /dev/zero | tr '\000' '\001'
+trap 'exit 0' INT TERM
+: > "$dir/pw-record.ready"
+while :; do /usr/bin/sleep 0.01; done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+config=$(mktemp "$dir/curl-config.XXXXXX")
+cat > "$config"
+if ! grep -q 'deepgram.test' "$config"; then
+  rm -f "$config"
+  printf '{"text":"Groq Source Transcript"}'
+  exit 0
+fi
+rm -f "$config"
+while ! mkdir "$dir/deepgram.lock" 2>/dev/null; do /usr/bin/sleep 0.01; done
+sequence=$(cat "$dir/deepgram.next" 2>/dev/null || printf '0')
+sequence=$((sequence + 1))
+printf '%s' "$sequence" > "$dir/deepgram.next"
+active=$(cat "$dir/deepgram.active" 2>/dev/null || printf '0')
+active=$((active + 1))
+printf '%s' "$active" > "$dir/deepgram.active"
+maximum=$(cat "$dir/deepgram.maximum" 2>/dev/null || printf '0')
+if [ "$active" -gt "$maximum" ]; then
+  printf '%s' "$active" > "$dir/deepgram.maximum"
+fi
+rmdir "$dir/deepgram.lock"
+: > "$dir/deepgram.started.$sequence"
+while [ ! -e "$dir/deepgram.release.$sequence" ]; do /usr/bin/sleep 0.01; done
+while ! mkdir "$dir/deepgram.lock" 2>/dev/null; do /usr/bin/sleep 0.01; done
+active=$(cat "$dir/deepgram.active")
+printf '%s' $((active - 1)) > "$dir/deepgram.active"
+rmdir "$dir/deepgram.lock"
+printf '{"results":{"channels":[{"alternatives":[{"transcript":"chunk"}]}]}}'
+"#,
+    );
+    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_TEST_MODE", "system-boundaries"),
+            ("VOISU_TEST_PROVIDER_DEADLINE_MS", "2000"),
+            ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
+            ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
+            (
+                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
+                "https://deepgram.test/v1/listen",
+            ),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "pw-record.ready");
+    for sequence in 1..=3 {
+        wait_for_marker(commands.path(), &format!("deepgram.started.{sequence}"));
+    }
+    for sequence in 1..=3 {
+        fs::write(
+            commands.path().join(format!("deepgram.release.{sequence}")),
+            "",
+        )
+        .unwrap();
+    }
+    wait_for_marker(commands.path(), "deepgram.started.4");
+    wait_for_marker(commands.path(), "deepgram.started.5");
+    assert_eq!(
+        fs::read_to_string(commands.path().join("deepgram.maximum")).unwrap(),
+        "3"
+    );
+    for sequence in 4..=5 {
+        fs::write(
+            commands.path().join(format!("deepgram.release.{sequence}")),
+            "",
+        )
+        .unwrap();
+    }
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+}
+
+#[test]
 fn deepgram_source_transcript_delivers_when_groq_fails() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
@@ -309,7 +449,7 @@ fn deepgram_source_transcript_delivers_when_groq_fails() {
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 64000 /dev/zero | tr '\000' '\001'
+head -c 32000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
 while :; do :; done
@@ -449,7 +589,7 @@ dir=$(dirname "$0")
 printf '%s\n' "$$" >> "$dir/pw-record.pids"
 head -c 6400 /dev/zero | tr '\000' '\001'
 trap 'printf "\002\003"; exit 0' INT TERM
-while :; do :; done
+while :; do sleep 0.01; done
 "#,
     );
     write_fake_command(
@@ -458,6 +598,7 @@ while :; do :; done
         r#"#!/bin/sh
 dir=$(dirname "$0")
 if [ ! -e "$dir/secret-tool.once" ]; then
+  while [ ! -e "$dir/pw-record.pids" ]; do sleep 0.01; done
   : > "$dir/secret-tool.once"
   exit 1
 fi
@@ -1833,6 +1974,82 @@ fn provider_deadline_releases_the_valid_source_without_waiting_for_the_slow_prov
         stopped["evidence"]["source_transcript_providers"],
         serde_json::json!(["deepgram"])
     );
+}
+
+#[test]
+fn provider_deadline_kills_and_reaps_late_deepgram_curl_before_idle() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+head -c 32000 /dev/zero | tr '\000' '\001'
+trap 'exit 0' INT TERM
+: > "$dir/pw-record.ready"
+while :; do sleep 0.01; done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+config=$(mktemp "$dir/curl-config.XXXXXX")
+cat > "$config"
+if grep -q 'deepgram.test' "$config"; then
+  printf '%s\n' "$$" > "$dir/deepgram.pid"
+  : > "$dir/deepgram.started"
+  rm -f "$config"
+  while [ ! -e "$dir/deepgram.release" ]; do sleep 0.01; done
+  printf '{"results":{"channels":[{"alternatives":[{"transcript":"late"}]}]}}'
+else
+  rm -f "$config"
+  printf '{"text":"Groq wins"}'
+fi
+"#,
+    );
+    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_TEST_MODE", "system-boundaries"),
+            ("VOISU_TEST_PROVIDER_DEADLINE_MS", "2000"),
+            ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
+            ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
+            (
+                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
+                "https://deepgram.test/v1/listen",
+            ),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "deepgram.started");
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(
+        stopped["evidence"]["source_transcript_providers"],
+        serde_json::json!(["groq"])
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    let pid = fs::read_to_string(commands.path().join("deepgram.pid")).unwrap();
+    assert!(
+        !Path::new(&format!("/proc/{}", pid.trim())).exists(),
+        "the late Deepgram curl must be reaped before Idle is observable"
+    );
+    assert!(!commands.path().join("deepgram.release").exists());
 }
 
 #[test]

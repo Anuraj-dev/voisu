@@ -41,6 +41,7 @@ const MAX_RECORDING_BYTES: usize = 16_000 * 2 * 60 * 5;
 const GROQ_CHUNK_BYTES: usize = 16_000 * 2 * 30;
 const GROQ_CHUNK_OVERLAP_BYTES: usize = 16_000;
 const DEEPGRAM_CHUNK_BYTES: usize = 16_000 * 2;
+const MAX_DEEPGRAM_IN_FLIGHT: usize = 3;
 
 pub struct FedoraReadiness;
 
@@ -1008,7 +1009,7 @@ impl TranscriptProvider for GroqProvider {
             endpoint,
             buffer: Vec::new(),
             streamed_bytes: 0,
-            chunks: Vec::new(),
+            chunks: VecDeque::new(),
             cancel: CancelRegistry::new(),
         }))
     }
@@ -1038,7 +1039,7 @@ struct GroqStream {
     endpoint: String,
     buffer: Vec<u8>,
     streamed_bytes: usize,
-    chunks: Vec<tokio::task::JoinHandle<Result<String, BoundaryError>>>,
+    chunks: VecDeque<tokio::task::JoinHandle<Result<String, BoundaryError>>>,
     /// Per-Recording cancellation flag observed by each in-flight curl
     /// request's owning bounded wait. Because each Recording gets its own
     /// stream and flag, cancelling one Recording can never touch the next
@@ -1072,7 +1073,7 @@ impl ProviderStream for GroqStream {
                 let credential = self.credential.clone();
                 let endpoint = self.endpoint.clone();
                 let cancel = Arc::clone(&self.cancel);
-                self.chunks.push(tokio::spawn(async move {
+                self.chunks.push_back(tokio::spawn(async move {
                     ProviderHttpClient
                         .transcribe_groq_chunk(credential, endpoint, pcm, cancel)
                         .await
@@ -1097,10 +1098,7 @@ impl ProviderStream for GroqStream {
         })
     }
 
-    fn complete(
-        mut self: Box<Self>,
-        audio: CapturedAudio,
-    ) -> BoundaryFuture<'static, SourceTranscript> {
+    fn complete(&mut self, audio: CapturedAudio) -> BoundaryFuture<'_, SourceTranscript> {
         Box::pin(async move {
             let pcm = audio.pcm_s16le_mono_16khz();
             if self.streamed_bytes > pcm.len() {
@@ -1111,10 +1109,12 @@ impl ProviderStream for GroqStream {
             }
             self.buffer.extend_from_slice(&pcm[self.streamed_bytes..]);
             let mut transcripts = Vec::new();
-            for chunk in self.chunks.drain(..) {
-                transcripts.push(chunk.await.map_err(|_| {
+            while let Some(chunk) = self.chunks.front_mut() {
+                let transcript = chunk.await.map_err(|_| {
                     BoundaryError::new(BoundaryKind::Provider, "Groq chunk task failed")
-                })??);
+                })??;
+                self.chunks.pop_front();
+                transcripts.push(transcript);
             }
             let needs_final_chunk = transcripts.is_empty()
                 || self.buffer.len() > GROQ_CHUNK_OVERLAP_BYTES;
@@ -1143,11 +1143,6 @@ pub struct DeepgramProvider;
 
 impl TranscriptProvider for DeepgramProvider {
     fn start(&mut self, _recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError> {
-        if std::env::var_os("VOISU_TEST_DEEPGRAM_UNAVAILABLE").as_deref()
-            == Some(std::ffi::OsStr::new("1"))
-        {
-            return Ok(Box::new(UnavailableDeepgramStream));
-        }
         let credential = SecretStore::load(&mut SecretToolStore, Provider::Deepgram)?;
         let endpoint = std::env::var("VOISU_DEEPGRAM_TRANSCRIPTION_URL").unwrap_or_else(|_| {
             "https://api.deepgram.com/v1/listen?model=nova-3&encoding=linear16&sample_rate=16000&channels=1"
@@ -1164,37 +1159,10 @@ impl TranscriptProvider for DeepgramProvider {
             endpoint,
             buffer: Vec::new(),
             streamed_bytes: 0,
-            chunks: Vec::new(),
+            chunks: VecDeque::new(),
+            permits: Arc::new(tokio::sync::Semaphore::new(MAX_DEEPGRAM_IN_FLIGHT)),
             cancel: CancelRegistry::new(),
         }))
-    }
-}
-
-struct UnavailableDeepgramStream;
-
-impl ProviderStream for UnavailableDeepgramStream {
-    fn provider(&self) -> Provider {
-        Provider::Deepgram
-    }
-
-    fn send_audio(&mut self, _chunk: AudioChunk) -> BoundaryFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn complete(
-        self: Box<Self>,
-        _audio: CapturedAudio,
-    ) -> BoundaryFuture<'static, SourceTranscript> {
-        Box::pin(async {
-            Err(BoundaryError::new(
-                BoundaryKind::Provider,
-                "controlled Deepgram adapter unavailable",
-            ))
-        })
     }
 }
 
@@ -1203,7 +1171,8 @@ struct DeepgramStream {
     endpoint: String,
     buffer: Vec<u8>,
     streamed_bytes: usize,
-    chunks: Vec<tokio::task::JoinHandle<Result<String, BoundaryError>>>,
+    chunks: VecDeque<tokio::task::JoinHandle<Result<String, BoundaryError>>>,
+    permits: Arc<tokio::sync::Semaphore>,
     cancel: Arc<CancelRegistry>,
 }
 
@@ -1230,7 +1199,11 @@ impl ProviderStream for DeepgramStream {
                 let credential = self.credential.clone();
                 let endpoint = self.endpoint.clone();
                 let cancel = Arc::clone(&self.cancel);
-                self.chunks.push(tokio::spawn(async move {
+                let permits = Arc::clone(&self.permits);
+                self.chunks.push_back(tokio::spawn(async move {
+                    let _permit = permits.acquire_owned().await.map_err(|_| {
+                        BoundaryError::new(BoundaryKind::Provider, "Deepgram request queue closed")
+                    })?;
                     ProviderHttpClient
                         .transcribe_deepgram_chunk(credential, endpoint, pcm, cancel)
                         .await
@@ -1250,10 +1223,7 @@ impl ProviderStream for DeepgramStream {
         })
     }
 
-    fn complete(
-        mut self: Box<Self>,
-        audio: CapturedAudio,
-    ) -> BoundaryFuture<'static, SourceTranscript> {
+    fn complete(&mut self, audio: CapturedAudio) -> BoundaryFuture<'_, SourceTranscript> {
         Box::pin(async move {
             let pcm = audio.pcm_s16le_mono_16khz();
             if self.streamed_bytes > pcm.len() {
@@ -1268,24 +1238,36 @@ impl ProviderStream for DeepgramStream {
                 let endpoint = self.endpoint.clone();
                 let tail = std::mem::take(&mut self.buffer);
                 let cancel = Arc::clone(&self.cancel);
-                self.chunks.push(tokio::spawn(async move {
+                let permits = Arc::clone(&self.permits);
+                self.chunks.push_back(tokio::spawn(async move {
+                    let _permit = permits.acquire_owned().await.map_err(|_| {
+                        BoundaryError::new(BoundaryKind::Provider, "Deepgram request queue closed")
+                    })?;
                     ProviderHttpClient
                         .transcribe_deepgram_chunk(credential, endpoint, tail, cancel)
                         .await
                 }));
             }
             let mut transcripts = Vec::new();
-            for chunk in self.chunks.drain(..) {
-                transcripts.push(chunk.await.map_err(|_| {
-                    BoundaryError::new(BoundaryKind::Provider, "Deepgram chunk task failed")
-                })??);
+            while let Some(chunk) = self.chunks.front_mut() {
+                let transcript = await_deepgram_chunk(chunk).await?;
+                self.chunks.pop_front();
+                transcripts.push(transcript);
             }
             Ok(SourceTranscript {
                 provider: Provider::Deepgram,
-                text: merge_chunk_transcripts(transcripts),
+                text: concatenate_chunk_transcripts(transcripts),
             })
         })
     }
+}
+
+async fn await_deepgram_chunk(
+    chunk: &mut tokio::task::JoinHandle<Result<String, BoundaryError>>,
+) -> Result<String, BoundaryError> {
+    chunk.await.map_err(|_| {
+        BoundaryError::new(BoundaryKind::Provider, "Deepgram chunk task failed")
+    })?
 }
 
 pub struct MergeResultValidator;
@@ -1524,6 +1506,19 @@ fn merge_chunk_transcripts(transcripts: Vec<String>) -> String {
     merged.join(" ")
 }
 
+fn concatenate_chunk_transcripts(transcripts: Vec<String>) -> String {
+    transcripts
+        .into_iter()
+        .flat_map(|transcript| {
+            transcript
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn wav_from_pcm(pcm: &[u8]) -> Result<Vec<u8>, BoundaryError> {
     let data_len = u32::try_from(pcm.len()).map_err(|_| {
         BoundaryError::new(BoundaryKind::Provider, "Recording is too large for WAV")
@@ -1596,6 +1591,14 @@ mod tests {
             started.elapsed() < Duration::from_millis(100),
             "an already-cancelled operation must not spawn, elapsed {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn non_overlapping_deepgram_chunks_keep_a_repeated_boundary_word() {
+        assert_eq!(
+            concatenate_chunk_transcripts(vec!["that was very".to_owned(), "very good".to_owned()]),
+            "that was very very good"
         );
     }
 }

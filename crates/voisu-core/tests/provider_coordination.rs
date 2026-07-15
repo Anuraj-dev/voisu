@@ -34,16 +34,15 @@ impl ProviderStream for ControlledStream {
         })
     }
 
-    fn complete(
-        self: Box<Self>,
-        _audio: CapturedAudio,
-    ) -> BoundaryFuture<'static, SourceTranscript> {
+    fn complete(&mut self, _audio: CapturedAudio) -> BoundaryFuture<'_, SourceTranscript> {
         self.completions.fetch_add(1, Ordering::SeqCst);
+        let provider = self.provider;
+        let delay = self.delay;
         Box::pin(async move {
-            tokio::time::sleep(self.delay).await;
+            tokio::time::sleep(delay).await;
             Ok(SourceTranscript {
-                provider: self.provider,
-                text: format!("{:?} Source Transcript", self.provider),
+                provider,
+                text: format!("{provider:?} Source Transcript"),
             })
         })
     }
@@ -83,6 +82,7 @@ async fn coordinator_abort_is_bounded_and_attempts_both_provider_streams() {
     };
     let coordinator = ProviderCoordinator::start(
         Duration::from_millis(50),
+        Duration::from_millis(50),
         ProviderStreams {
             deepgram: controlled(Provider::Deepgram, Arc::clone(&deepgram_aborts)),
             groq: controlled(Provider::Groq, Arc::clone(&groq_aborts)),
@@ -109,6 +109,7 @@ async fn coordinator_starts_both_completions_once_and_orders_attributed_sources(
     let deepgram_chunks = Arc::new(AtomicUsize::new(0));
     let groq_chunks = Arc::new(AtomicUsize::new(0));
     let mut coordinator = ProviderCoordinator::start(
+        Duration::from_secs(1),
         Duration::from_secs(1),
         ProviderStreams {
             deepgram: stream(
@@ -144,6 +145,7 @@ async fn provider_deadline_returns_the_valid_source_already_available() {
     let groq = Arc::new(AtomicUsize::new(0));
     let sources = ProviderCoordinator::start(
         Duration::from_millis(50),
+        Duration::from_secs(1),
         ProviderStreams {
             deepgram: stream(
                 Provider::Deepgram,
@@ -170,6 +172,50 @@ async fn provider_deadline_returns_the_valid_source_already_available() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn provider_deadline_awaits_the_losing_stream_abort_before_returning() {
+    let deepgram_aborts = Arc::new(AtomicUsize::new(0));
+    let groq_aborts = Arc::new(AtomicUsize::new(0));
+    let controlled = |provider, delay, abort_delay, aborts| {
+        Box::new(ControlledStream {
+            provider,
+            delay,
+            completions: Arc::new(AtomicUsize::new(0)),
+            chunks: Arc::new(AtomicUsize::new(0)),
+            aborts,
+            abort_delay,
+        }) as Box<dyn ProviderStream>
+    };
+    let started = tokio::time::Instant::now();
+    let sources = ProviderCoordinator::start(
+        Duration::from_millis(50),
+        Duration::from_secs(2),
+        ProviderStreams {
+            deepgram: controlled(
+                Provider::Deepgram,
+                Duration::from_millis(1),
+                Duration::ZERO,
+                Arc::clone(&deepgram_aborts),
+            ),
+            groq: controlled(
+                Provider::Groq,
+                Duration::from_secs(30),
+                Duration::from_millis(25),
+                Arc::clone(&groq_aborts),
+            ),
+        },
+    )
+    .complete(CapturedAudio::empty())
+    .await
+    .unwrap();
+
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].provider, Provider::Deepgram);
+    assert_eq!(deepgram_aborts.load(Ordering::SeqCst), 0);
+    assert_eq!(groq_aborts.load(Ordering::SeqCst), 1);
+    assert_eq!(started.elapsed(), Duration::from_millis(75));
+}
+
+#[tokio::test(start_paused = true)]
 async fn ready_sources_at_the_deadline_instant_are_not_discarded() {
     // Both providers complete at exactly the Provider Deadline instant. With
     // paused time the runtime advances to the shared timer, firing the provider
@@ -180,6 +226,7 @@ async fn ready_sources_at_the_deadline_instant_are_not_discarded() {
     let groq = Arc::new(AtomicUsize::new(0));
     let sources = ProviderCoordinator::start(
         deadline,
+        Duration::from_secs(1),
         ProviderStreams {
             deepgram: stream(
                 Provider::Deepgram,

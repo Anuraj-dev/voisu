@@ -253,7 +253,10 @@ struct Completion {
 async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<ActorMessage>) {
     let mut state = ActorState::Idle;
     let mut next_id = 1_u64;
-    let controlled = std::env::var_os("VOISU_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("controlled"));
+    let test_mode = std::env::var_os("VOISU_TEST_MODE");
+    let controlled = test_mode.as_deref() == Some(std::ffi::OsStr::new("controlled"));
+    let controlled_deadlines = controlled
+        || test_mode.as_deref() == Some(std::ffi::OsStr::new("system-boundaries"));
     let mut capture: Option<Box<dyn AudioCapture>> = Some(if controlled {
         Box::new(ControlledCapture::from_env())
     } else {
@@ -407,7 +410,7 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                             let chunk_counter = Arc::new(AtomicU32::new(0));
                             let first_chunk_ms = Arc::new(AtomicU64::new(u64::MAX));
                             let started_at = Instant::now();
-                            let provider_deadline = if controlled
+                            let provider_deadline = if controlled_deadlines
                                 && std::env::var_os("VOISU_TEST_PROVIDER_DEADLINE_MS").is_some()
                             {
                                 env_millis("VOISU_TEST_PROVIDER_DEADLINE_MS")
@@ -415,8 +418,11 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                             } else {
                                 PROVIDER_DEADLINE
                             };
-                            let coordinator =
-                                ProviderCoordinator::start(provider_deadline, streams);
+                            let coordinator = ProviderCoordinator::start(
+                                provider_deadline,
+                                RECOVERY_ABORT_DEADLINE,
+                                streams,
+                            );
                             let pump = tokio::spawn(capture_pump(
                                 id,
                                 active_capture,
@@ -1072,20 +1078,20 @@ impl ProviderStream for ControlledProviderStream {
         })
     }
 
-    fn complete(
-        self: Box<Self>,
-        _audio: CapturedAudio,
-    ) -> BoundaryFuture<'static, SourceTranscript> {
+    fn complete(&mut self, _audio: CapturedAudio) -> BoundaryFuture<'_, SourceTranscript> {
+        let provider = self.provider;
+        let delay = self.delay;
+        let fail_complete = self.fail_complete;
         Box::pin(async move {
-            tokio::time::sleep(self.delay).await;
-            if self.fail_complete {
+            tokio::time::sleep(delay).await;
+            if fail_complete {
                 return Err(BoundaryError::new(
                     BoundaryKind::Provider,
                     "controlled-provider-completion-detail",
                 ));
             }
             Ok(SourceTranscript {
-                provider: self.provider,
+                provider,
                 text: "controlled Source Transcript".to_owned(),
             })
         })

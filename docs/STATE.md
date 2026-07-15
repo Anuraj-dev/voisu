@@ -2,22 +2,9 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-15
 
 ## 🚧 In progress / next
-- Ticket 04 (issue #4, concurrent Deepgram + Provider Deadline) feature is committed as `3e4eecc` (71 tests). First
-  review (Sol HIGH) returned REQUEST-CHANGES: 2 HIGH (Provider Deadline cancellation not awaited before Idle; no
-  in-flight cap on Deepgram curls) + 2 MEDIUM (`VOISU_TEST_DEEPGRAM_UNAVAILABLE` production bypass; wrong
-  overlap-removal merge applied to non-overlapping Deepgram chunks).
-- Sol's medium fix round produced **UNCOMMITTED worktree changes** claiming all 4 findings fixed (75 tests), BUT the
-  new test `provider_deadline_kills_and_reaps_late_deepgram_curl_before_idle`
-  (`crates/voisu-app/tests/daemon_cli_lifecycle.rs:2047`) **fails deterministically** (0.14s) on the orchestrator's
-  machine: "the late Deepgram curl must be reaped before Idle is observable". 65 other acceptance tests pass. Do
-  **not** trust the "fully verified" claim in the prior session log for this round — it was wrong.
-  - A Sol medium feedback round is (or was, when this checkpoint was written) IN FLIGHT fixing that root cause via a
-    background codex run; it may have modified the worktree further since.
-- Next steps: verify the fix (full `cargo test --workspace` green + 3x flake-free `cargo test -p voisu-app`), then
-  commit as `fix(dictation): resolve Ticket 04 review findings (#4)`, dispatch a Sol **medium** re-review (re-reviews
-  are medium per policy), iterate to APPROVE, close issue #4, push, update `docs/model-benchmark.md` rows for the
-  ticket 04 fix rounds, and checkpoint. If Sol fails again, escalate to an Opus subagent (high effort) per the
-  fallback ladder.
+- Ticket 04 first-review fixes remain uncommitted. Two parallel-suite acceptance flakes now have load-tolerant fixtures;
+  the orchestrator must run `cargo test --workspace` and three consecutive parallel `cargo test -p voisu-app` runs,
+  then run the Sol re-review at medium effort before commit/close/push and the model-benchmark update.
 
 ## Status
 - The independent `voisu` and `voisu-daemon` binaries communicate over bounded, versioned Unix IPC.
@@ -29,13 +16,15 @@
   without allowing a long Recording to fan out into hundreds of curl processes.
 - Stop finalizes the audio tail and accepts valid Source Transcripts within the shared Provider Deadline; a deadline
   loser is cancelled, killed, reaped, and awaited inside the recovery budget before completion can publish `Idle`.
-- Provider completion is deterministic and exactly-once; structured IPC evidence reports first chunk, capture
-  finalization, per-provider completion, accepted providers, release-to-text timing, and Delivery count.
+- Provider completion is deterministic and exactly-once; completion futures retain spawned request handles until each
+  await finishes, so a deadline loser remains owned for cancellation, kill, reap, and awaited cleanup before `Idle`.
+  Structured IPC evidence reports first chunk, capture finalization, per-provider completion, accepted providers,
+  release-to-text timing, and Delivery count.
 - Capture/provider failure and capture EOF return the daemon to idle; Deepgram and Groq cancellation use the
   per-Recording `CancelRegistry`, owning-child kill/reap, and awaited request-task cleanup before reuse.
-- Last fully-verified, committed state (`3e4eecc`) is 71 tests green plus one ignored, opt-in live Fedora
-  microphone/Groq/clipboard smoke test. The uncommitted Ticket 04 fix-round worktree claims 75 tests but has one
-  known-failing test (see In progress) and must be reverified before it can be trusted or committed.
+- The uncommitted Ticket 04 fix worktree retains the awaited late-provider cleanup semantics. Its acceptance fixtures
+  now gate provider-start failure on the capture PID marker, avoid CPU spin loops, and use a two-second test-only
+  Provider Deadline for the late-curl reap assertion; the orchestrator's parallel flake gate is pending.
 
 ## Architecture map
 - Domain, audio contract, provider coordination/timings, typed errors, readiness/auth traits, IPC ->

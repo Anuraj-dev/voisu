@@ -381,8 +381,7 @@ pub trait ProviderStream: Send {
     fn provider(&self) -> Provider;
     fn send_audio(&mut self, chunk: AudioChunk) -> BoundaryFuture<'_, ()>;
     fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()>;
-    fn complete(self: Box<Self>, audio: CapturedAudio)
-    -> BoundaryFuture<'static, SourceTranscript>;
+    fn complete(&mut self, audio: CapturedAudio) -> BoundaryFuture<'_, SourceTranscript>;
 }
 
 pub struct ProviderStreams {
@@ -392,6 +391,7 @@ pub struct ProviderStreams {
 
 pub struct ProviderCoordinator {
     deadline: Duration,
+    abort_deadline: Duration,
     streams: ProviderStreams,
 }
 
@@ -401,8 +401,12 @@ pub struct ProviderCompletion {
 }
 
 impl ProviderCoordinator {
-    pub fn start(deadline: Duration, streams: ProviderStreams) -> Self {
-        Self { deadline, streams }
+    pub fn start(deadline: Duration, abort_deadline: Duration, streams: ProviderStreams) -> Self {
+        Self {
+            deadline,
+            abort_deadline,
+            streams,
+        }
     }
 
     pub async fn stream_audio(&mut self, chunk: AudioChunk) -> Result<(), BoundaryError> {
@@ -439,51 +443,92 @@ impl ProviderCoordinator {
         audio: CapturedAudio,
     ) -> Result<ProviderCompletion, BoundaryError> {
         let started = tokio::time::Instant::now();
-        let deepgram = self.streams.deepgram.complete(audio.clone());
-        let groq = self.streams.groq.complete(audio);
-        tokio::pin!(deepgram, groq);
-        let deadline = tokio::time::sleep(self.deadline);
-        tokio::pin!(deadline);
+        let ProviderStreams {
+            mut deepgram,
+            mut groq,
+        } = self.streams;
         let mut deepgram_done = false;
         let mut groq_done = false;
+        let mut deadline_elapsed = false;
         let mut transcripts = Vec::new();
         let mut timings_ms = Vec::new();
         let mut diagnostics = Vec::new();
 
-        while !deepgram_done || !groq_done {
-            tokio::select! {
-                // Bias toward provider results: if a valid Source Transcript is
-                // ready in the same poll as the Provider Deadline, honor the
-                // transcript instead of discarding it at the deadline instant.
-                biased;
-                result = &mut deepgram, if !deepgram_done => {
-                    deepgram_done = true;
-                    match result {
-                        Ok(source) => {
-                            timings_ms.push(ProviderTiming {
-                                provider: source.provider,
-                                completed_ms: duration_millis(started.elapsed()),
-                            });
-                            transcripts.push(source);
+        {
+            let deepgram_completion = deepgram.complete(audio.clone());
+            let groq_completion = groq.complete(audio);
+            tokio::pin!(deepgram_completion, groq_completion);
+            let deadline = tokio::time::sleep(self.deadline);
+            tokio::pin!(deadline);
+
+            while !deepgram_done || !groq_done {
+                tokio::select! {
+                    // Bias toward provider results: if a valid Source Transcript is
+                    // ready in the same poll as the Provider Deadline, honor the
+                    // transcript instead of discarding it at the deadline instant.
+                    biased;
+                    result = &mut deepgram_completion, if !deepgram_done => {
+                        deepgram_done = true;
+                        match result {
+                            Ok(source) => {
+                                timings_ms.push(ProviderTiming {
+                                    provider: source.provider,
+                                    completed_ms: duration_millis(started.elapsed()),
+                                });
+                                transcripts.push(source);
+                            }
+                            Err(error) => diagnostics.push(error.diagnostic().to_owned()),
                         }
-                        Err(error) => diagnostics.push(error.diagnostic().to_owned()),
                     }
-                }
-                result = &mut groq, if !groq_done => {
-                    groq_done = true;
-                    match result {
-                        Ok(source) => {
-                            timings_ms.push(ProviderTiming {
-                                provider: source.provider,
-                                completed_ms: duration_millis(started.elapsed()),
-                            });
-                            transcripts.push(source);
+                    result = &mut groq_completion, if !groq_done => {
+                        groq_done = true;
+                        match result {
+                            Ok(source) => {
+                                timings_ms.push(ProviderTiming {
+                                    provider: source.provider,
+                                    completed_ms: duration_millis(started.elapsed()),
+                                });
+                                transcripts.push(source);
+                            }
+                            Err(error) => diagnostics.push(error.diagnostic().to_owned()),
                         }
-                        Err(error) => diagnostics.push(error.diagnostic().to_owned()),
                     }
+                    _ = &mut deadline => {
+                        deadline_elapsed = true;
+                        break;
+                    },
                 }
-                _ = &mut deadline => break,
             }
+        }
+
+        if deadline_elapsed {
+            let abort_pending = async move {
+                let deepgram_abort = async move {
+                    if deepgram_done {
+                        Ok(())
+                    } else {
+                        deepgram.abort().await
+                    }
+                };
+                let groq_abort = async move {
+                    if groq_done {
+                        Ok(())
+                    } else {
+                        groq.abort().await
+                    }
+                };
+                let (deepgram_result, groq_result) = tokio::join!(deepgram_abort, groq_abort);
+                deepgram_result?;
+                groq_result
+            };
+            tokio::time::timeout(self.abort_deadline, abort_pending)
+                .await
+                .map_err(|_| {
+                    BoundaryError::new(
+                        BoundaryKind::Provider,
+                        "provider deadline cleanup timed out",
+                    )
+                })??;
         }
 
         transcripts.sort_by_key(|source| source.provider);
