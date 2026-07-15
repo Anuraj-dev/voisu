@@ -48,3 +48,29 @@ the explicit non-persistent `VOISU_GROQ_API_KEY` or `VOISU_DEEPGRAM_API_KEY` env
 **Why:** `secret-tool` and curl must receive only the desktop-session variables they need, never inherited provider
 keys, test credentials, or curl configuration. A shared async provider client centralizes the authenticated request
 policy for verification and the future Groq adapter, while a bounded process runner kills stalled child processes.
+
+## 2026-07-15 — Standardize subprocess-boundary hardening invariants across the codebase
+**Why:** Four Sol review rounds on Ticket 02 converged on a consistent set of subtle process-cleanup and
+resource-exhaustion defects (zombie children, descendant-pipe wedges, unbounded response buffering). Rather
+than re-litigate these per ticket, they are now standing invariants for every child-process or network
+boundary: `env_clear` + a minimal explicit allowlist on every spawn; `-q`-first curl; whole-operation
+`Instant` deadlines on spawn, stdin-write, join, and reap; bounded joins with kill/reap on every cleanup
+path (success, timeout, and error); a 16KiB cap on daemon-response bytes enforced before append; a 4KiB cap
+on retained stderr with the full stream still drained; and typed, redacted errors at every boundary. Ticket
+03's PipeWire/Groq/clipboard work must reuse `crates/voisu-app/src/system.rs` rather than re-implement
+subprocess handling.
+
+## 2026-07-15 — Track coder/reviewer model choice as a standing experiment
+**Why:** `docs/model-benchmark.md` logs one row per codex/Opus dispatch (Sol/Terra/Luna vs Opus, task type,
+review findings, fix rounds) to produce a routing recommendation after Ticket 13 instead of guessing from
+memory which model performs best on which task shape.
+
+## 2026-07-15 — Normalize PipeWire capture before provider boundaries
+**Why:** A documented 16 kHz mono s16 PCM contract keeps Groq chunking deterministic regardless of the physical
+microphone format. Stopping `pw-record` with SIGINT and draining its bounded stream before finalization preserves
+the last spoken frames; forced kill/reap remains the bounded abort path.
+
+## 2026-07-15 — Submit bounded Groq chunks during the Recording
+**Why:** Thirty-second WAV chunks with 500 ms overlap start cloud work before stop without exposing credentials in
+argv or inherited environments. The final chunk includes frames collected during graceful capture finalization;
+word-overlap reconciliation produces one validated Groq Source Transcript and therefore one clipboard Delivery.

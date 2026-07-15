@@ -11,6 +11,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use voisu_app::system::{
+    ClipboardDelivery, GroqProvider, MergeResultValidator, PipeWireCapture, UnavailableDeepgram,
+};
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
     CapturedAudio, Command, DaemonState, DeliveryAdapter, LifecycleEvidence, LifecycleStage,
@@ -22,7 +25,7 @@ use voisu_core::{
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
 const IO_DEADLINE: Duration = Duration::from_secs(2);
 const MAX_CONNECTIONS: usize = 32;
-const PROVIDER_DEADLINE: Duration = Duration::from_secs(2);
+const PROVIDER_DEADLINE: Duration = Duration::from_secs(15);
 
 #[tokio::main]
 async fn main() {
@@ -220,13 +223,32 @@ struct Completion {
 async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<ActorMessage>) {
     let mut state = ActorState::Idle;
     let mut next_id = 1_u64;
-    let mut capture: Box<dyn AudioCapture> = Box::new(ControlledCapture::from_env());
-    let mut deepgram: Box<dyn TranscriptProvider> =
-        Box::new(ControlledProvider::from_env(Provider::Deepgram));
-    let mut groq: Box<dyn TranscriptProvider> =
-        Box::new(ControlledProvider::from_env(Provider::Groq));
-    let mut validator: Option<Box<dyn TranscriptValidator>> = Some(Box::new(ControlledValidator));
-    let mut delivery: Option<Box<dyn DeliveryAdapter>> = Some(Box::new(ControlledDelivery));
+    let controlled = std::env::var_os("VOISU_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("controlled"));
+    let mut capture: Box<dyn AudioCapture> = if controlled {
+        Box::new(ControlledCapture::from_env())
+    } else {
+        Box::new(PipeWireCapture)
+    };
+    let mut deepgram: Box<dyn TranscriptProvider> = if controlled {
+        Box::new(ControlledProvider::from_env(Provider::Deepgram))
+    } else {
+        Box::new(UnavailableDeepgram)
+    };
+    let mut groq: Box<dyn TranscriptProvider> = if controlled {
+        Box::new(ControlledProvider::from_env(Provider::Groq))
+    } else {
+        Box::new(GroqProvider)
+    };
+    let mut validator: Option<Box<dyn TranscriptValidator>> = if controlled {
+        Some(Box::new(ControlledValidator))
+    } else {
+        Some(Box::new(MergeResultValidator))
+    };
+    let mut delivery: Option<Box<dyn DeliveryAdapter>> = if controlled {
+        Some(Box::new(ControlledDelivery))
+    } else {
+        Some(Box::new(ClipboardDelivery))
+    };
 
     while let Some(message) = rx.recv().await {
         match message {
@@ -609,6 +631,7 @@ async fn serve(stream: UnixStream, actor: mpsc::Sender<ActorMessage>) -> Result<
 
 struct ControlledCapture {
     fail_finish_once: bool,
+    recording_outcome_once: Option<String>,
     fail_abort: bool,
     abort_stall: Duration,
     chunks: u32,
@@ -632,6 +655,7 @@ impl ControlledCapture {
         let chunk_delay = env_millis("VOISU_TEST_CHUNK_DELAY_MS");
         Self {
             fail_finish_once: std::env::var_os("VOISU_TEST_CAPTURE_FINISH_FAILURE").is_some(),
+            recording_outcome_once: std::env::var("VOISU_TEST_RECORDING_OUTCOME").ok(),
             fail_abort: std::env::var_os("VOISU_TEST_CAPTURE_ABORT_FAILURE").is_some(),
             abort_stall: env_millis("VOISU_TEST_CAPTURE_ABORT_STALL_MS"),
             chunks,
@@ -643,8 +667,10 @@ impl ControlledCapture {
 impl AudioCapture for ControlledCapture {
     fn begin(&mut self, _recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError> {
         let fail_finish = std::mem::take(&mut self.fail_finish_once);
+        let recording_outcome = self.recording_outcome_once.take();
         Ok(Box::new(ControlledActiveCapture {
             fail_finish,
+            recording_outcome,
             fail_abort: self.fail_abort,
             abort_stall: self.abort_stall,
             remaining_chunks: self.chunks,
@@ -655,6 +681,7 @@ impl AudioCapture for ControlledCapture {
 
 struct ControlledActiveCapture {
     fail_finish: bool,
+    recording_outcome: Option<String>,
     fail_abort: bool,
     abort_stall: Duration,
     remaining_chunks: u32,
@@ -677,13 +704,23 @@ impl ActiveCapture for ControlledActiveCapture {
 
     fn finish(&mut self) -> BoundaryFuture<'_, CapturedAudio> {
         Box::pin(async move {
+            if let Some(outcome) = self.recording_outcome.take() {
+                let kind = match outcome.as_str() {
+                    "empty" => BoundaryKind::EmptyRecording,
+                    "too-short" => BoundaryKind::TooShortRecording,
+                    "silent" => BoundaryKind::SilentRecording,
+                    "over-deadline" => BoundaryKind::RecordingDeadline,
+                    _ => BoundaryKind::Capture,
+                };
+                return Err(BoundaryError::new(kind, format!("controlled {outcome} Recording")));
+            }
             if self.fail_finish {
                 Err(BoundaryError::new(
                     BoundaryKind::Capture,
                     "controlled-secret-capture-detail",
                 ))
             } else {
-                Ok(CapturedAudio)
+                Ok(CapturedAudio::new(vec![1_u8; 3_200]))
             }
         })
     }

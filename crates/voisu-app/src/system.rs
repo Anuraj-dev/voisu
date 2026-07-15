@@ -1,19 +1,31 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use voisu_core::{
-    socket_path, BoundaryError, BoundaryFuture, BoundaryKind, Command as DaemonCommand, Credential,
-    Provider, ProviderAuthenticator, ReadinessCapability, ReadinessFinding, ReadinessInspector,
-    ReadinessStatus, Request, Response, SecretStore, VersionEnvelope, PROTOCOL_VERSION,
+    socket_path, ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture,
+    BoundaryKind, CapturedAudio, Command as DaemonCommand, Credential, DeliveryAdapter, Provider,
+    ProviderAuthenticator, ProviderStream, ReadinessCapability, ReadinessFinding,
+    ReadinessInspector, ReadinessStatus, Request, Response, SecretStore, SourceTranscript,
+    Transcript, TranscriptProvider, TranscriptValidator, VersionEnvelope, PROTOCOL_VERSION,
 };
 
 const PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 const PROCESS_POLL: Duration = Duration::from_millis(10);
 const MAX_DAEMON_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_RETAINED_STDERR_BYTES: usize = 4 * 1024;
+const MAX_RETAINED_STDOUT_BYTES: usize = 64 * 1024;
+const PROVIDER_PROCESS_DEADLINE: Duration = Duration::from_secs(14);
+const PCM_CHUNK_BYTES: usize = 3_200;
+const MIN_RECORDING_BYTES: usize = PCM_CHUNK_BYTES;
+const MAX_RECORDING_BYTES: usize = 16_000 * 2 * 60 * 5;
+const GROQ_CHUNK_BYTES: usize = 16_000 * 2 * 30;
+const GROQ_CHUNK_OVERLAP_BYTES: usize = 16_000;
 
 pub struct FedoraReadiness;
 
@@ -486,7 +498,12 @@ fn restricted_command(program: &str) -> Command {
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
     }
-    for name in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+    for name in [
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "WAYLAND_DISPLAY",
+        "XDG_SESSION_TYPE",
+    ] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
@@ -499,6 +516,16 @@ fn run_restricted(
     arguments: &[&str],
     input: Option<&[u8]>,
     capture_stdout: bool,
+) -> Result<ProcessOutcome, ProcessError> {
+    run_restricted_with_deadline(program, arguments, input, capture_stdout, PROCESS_DEADLINE)
+}
+
+fn run_restricted_with_deadline(
+    program: &str,
+    arguments: &[&str],
+    input: Option<&[u8]>,
+    capture_stdout: bool,
+    deadline: Duration,
 ) -> Result<ProcessOutcome, ProcessError> {
     let mut command = restricted_command(program);
     command
@@ -526,10 +553,7 @@ fn run_restricted(
         None => None,
     };
     let stdout_reader = child.stdout.take().map(|mut stdout| {
-        thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).map(|_| bytes)
-        })
+        thread::spawn(move || read_capped(&mut stdout, MAX_RETAINED_STDOUT_BYTES))
     });
     let stderr_reader = child.stderr.take().map(|mut stderr| {
         thread::spawn(move || read_capped(&mut stderr, MAX_RETAINED_STDERR_BYTES))
@@ -541,10 +565,10 @@ fn run_restricted(
     // Collect every helper-thread result FIRST, then decide the outcome: an
     // early return between joins would silently detach a later thread while it
     // may still be blocked on a descendant-held pipe.
-    let status = wait_for_child(&mut child, started);
-    let writer = writer.map(|handle| bounded_join(handle, started, &mut child));
-    let stdout_joined = stdout_reader.map(|handle| bounded_join(handle, started, &mut child));
-    let stderr_joined = stderr_reader.map(|handle| bounded_join(handle, started, &mut child));
+    let status = wait_for_child(&mut child, started, deadline);
+    let writer = writer.map(|handle| bounded_join(handle, started, &mut child, deadline));
+    let stdout_joined = stdout_reader.map(|handle| bounded_join(handle, started, &mut child, deadline));
+    let stderr_joined = stderr_reader.map(|handle| bounded_join(handle, started, &mut child, deadline));
     let stdout = pipe_bytes(stdout_joined)?;
     let stderr = pipe_bytes(stderr_joined)?;
     let status = status?;
@@ -566,9 +590,10 @@ fn bounded_join<T: Send + 'static>(
     handle: thread::JoinHandle<T>,
     started: Instant,
     child: &mut Child,
+    deadline: Duration,
 ) -> Result<T, ProcessError> {
     while !handle.is_finished() {
-        if started.elapsed() >= PROCESS_DEADLINE {
+        if started.elapsed() >= deadline {
             let _ = child.kill();
             reap_briefly(child);
             drop(handle);
@@ -623,6 +648,7 @@ fn read_capped(source: &mut impl Read, cap: usize) -> std::io::Result<Vec<u8>> {
 fn wait_for_child(
     child: &mut Child,
     started: Instant,
+    deadline: Duration,
 ) -> Result<std::process::ExitStatus, ProcessError> {
     loop {
         match child.try_wait() {
@@ -636,11 +662,581 @@ fn wait_for_child(
                 return Err(ProcessError::Wait);
             }
         }
-        if started.elapsed() >= PROCESS_DEADLINE {
+        if started.elapsed() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             return Err(ProcessError::TimedOut);
         }
         thread::sleep(PROCESS_POLL);
     }
+}
+
+pub struct PipeWireCapture;
+
+struct CaptureReaderState {
+    chunks: VecDeque<AudioChunk>,
+    received_bytes: usize,
+    eof: bool,
+    error: Option<String>,
+}
+
+impl AudioCapture for PipeWireCapture {
+    fn begin(&mut self, _recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError> {
+        let mut command = restricted_command("pw-record");
+        command.args([
+            "--raw",
+            "--rate",
+            "16000",
+            "--channels",
+            "1",
+            "--format",
+            "s16",
+        ]);
+        if let Some(target) = std::env::var_os("VOISU_PIPEWIRE_TARGET") {
+            command.arg("--target").arg(target);
+        }
+        command
+            .arg("-")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().map_err(|_| {
+            BoundaryError::new(BoundaryKind::Capture, "pw-record unavailable")
+        })?;
+        let mut stdout = child.stdout.take().ok_or_else(|| {
+            BoundaryError::new(BoundaryKind::Capture, "pw-record stdout unavailable")
+        })?;
+        let mut stderr = child.stderr.take().ok_or_else(|| {
+            BoundaryError::new(BoundaryKind::Capture, "pw-record stderr unavailable")
+        })?;
+        let state = Arc::new(Mutex::new(CaptureReaderState {
+            chunks: VecDeque::new(),
+            received_bytes: 0,
+            eof: false,
+            error: None,
+        }));
+        let reader_state = Arc::clone(&state);
+        let reader = thread::spawn(move || {
+            let mut buffer = vec![0_u8; PCM_CHUNK_BYTES];
+            loop {
+                match stdout.read(&mut buffer) {
+                    Ok(0) => {
+                        reader_state.lock().unwrap().eof = true;
+                        return;
+                    }
+                    Ok(read) => {
+                        let mut state = reader_state.lock().unwrap();
+                        state.received_bytes = state.received_bytes.saturating_add(read);
+                        if state.received_bytes <= MAX_RECORDING_BYTES {
+                            state.chunks.push_back(AudioChunk(buffer[..read].to_vec()));
+                        } else if state.error.is_none() {
+                            state.error = Some("Recording exceeded the bounded audio buffer".to_owned());
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => {
+                        let mut state = reader_state.lock().unwrap();
+                        state.error = Some("pw-record audio read failed".to_owned());
+                        state.eof = true;
+                        return;
+                    }
+                }
+            }
+        });
+        let stderr_reader = thread::spawn(move || {
+            read_capped(&mut stderr, MAX_RETAINED_STDERR_BYTES).unwrap_or_default()
+        });
+        let deadline = std::env::var("VOISU_RECORDING_DEADLINE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .filter(|value| !value.is_zero())
+            .unwrap_or(Duration::from_secs(60));
+        Ok(Box::new(PipeWireActiveCapture {
+            child: Some(child),
+            state,
+            reader: Some(reader),
+            stderr_reader: Some(stderr_reader),
+            pcm: Vec::new(),
+            started: Instant::now(),
+            deadline,
+        }))
+    }
+}
+
+struct PipeWireActiveCapture {
+    child: Option<Child>,
+    state: Arc<Mutex<CaptureReaderState>>,
+    reader: Option<thread::JoinHandle<()>>,
+    stderr_reader: Option<thread::JoinHandle<Vec<u8>>>,
+    pcm: Vec<u8>,
+    started: Instant,
+    deadline: Duration,
+}
+
+impl PipeWireActiveCapture {
+    fn drain_chunks(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        while let Some(chunk) = state.chunks.pop_front() {
+            self.pcm.extend_from_slice(&chunk.0);
+        }
+    }
+
+    fn stop_child(&mut self, graceful: bool) -> Result<Vec<u8>, BoundaryError> {
+        let mut child = self.child.take().ok_or_else(|| {
+            BoundaryError::new(BoundaryKind::Capture, "pw-record already finalized")
+        })?;
+        if graceful {
+            if let Some(pid) = child.id().try_into().ok() {
+                unsafe {
+                    libc::kill(pid, libc::SIGINT);
+                }
+            }
+        } else {
+            let _ = child.kill();
+        }
+        let stopped = Instant::now();
+        let status = wait_for_child(&mut child, stopped, PROCESS_DEADLINE);
+        let reader = self
+            .reader
+            .take()
+            .map(|handle| bounded_join(handle, stopped, &mut child, PROCESS_DEADLINE));
+        let stderr = self
+            .stderr_reader
+            .take()
+            .map(|handle| bounded_join(handle, stopped, &mut child, PROCESS_DEADLINE));
+        if !matches!(reader, None | Some(Ok(()))) {
+            return Err(BoundaryError::new(
+                BoundaryKind::Capture,
+                "pw-record audio drain failed",
+            ));
+        }
+        let stderr = match stderr {
+            Some(Ok(bytes)) => bytes,
+            None => Vec::new(),
+            Some(Err(_)) => {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Capture,
+                    "pw-record diagnostic drain failed",
+                ));
+            }
+        };
+        let status = status.map_err(|error| capture_process_error(error, &stderr))?;
+        let expected_signal = if graceful { libc::SIGINT } else { libc::SIGKILL };
+        if !status.success() && status.signal() != Some(expected_signal) {
+            return Err(BoundaryError::new(
+                BoundaryKind::Capture,
+                process_diagnostic("pw-record failed", &stderr),
+            ));
+        }
+        Ok(stderr)
+    }
+
+    fn validate_audio(&self) -> Result<(), BoundaryError> {
+        if self.pcm.is_empty() {
+            return Err(BoundaryError::new(
+                BoundaryKind::EmptyRecording,
+                "pw-record returned no audio frames",
+            ));
+        }
+        if self.pcm.len() < MIN_RECORDING_BYTES {
+            return Err(BoundaryError::new(
+                BoundaryKind::TooShortRecording,
+                format!("Recording contained {} PCM bytes", self.pcm.len()),
+            ));
+        }
+        let audible = self.pcm.chunks_exact(2).any(|sample| {
+            i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs() > 32
+        });
+        if !audible {
+            return Err(BoundaryError::new(
+                BoundaryKind::SilentRecording,
+                "Recording peak amplitude did not exceed the silence floor",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ActiveCapture for PipeWireActiveCapture {
+    fn next_chunk(&mut self) -> BoundaryFuture<'_, Option<AudioChunk>> {
+        Box::pin(async move {
+            loop {
+                if self.started.elapsed() >= self.deadline {
+                    return Err(BoundaryError::new(
+                        BoundaryKind::RecordingDeadline,
+                        "configured Recording Deadline elapsed",
+                    ));
+                }
+                let next = {
+                    let mut state = self.state.lock().unwrap();
+                    if let Some(error) = state.error.clone() {
+                        return Err(BoundaryError::new(BoundaryKind::Capture, error));
+                    }
+                    (state.chunks.pop_front(), state.eof)
+                };
+                match next {
+                    (Some(chunk), _) => {
+                        self.pcm.extend_from_slice(&chunk.0);
+                        return Ok(Some(chunk));
+                    }
+                    (None, true) => return Ok(None),
+                    (None, false) => tokio::time::sleep(PROCESS_POLL).await,
+                }
+            }
+        })
+    }
+
+    fn finish(&mut self) -> BoundaryFuture<'_, CapturedAudio> {
+        Box::pin(async move {
+            self.stop_child(true)?;
+            self.drain_chunks();
+            if let Some(error) = self.state.lock().unwrap().error.clone() {
+                return Err(BoundaryError::new(BoundaryKind::Capture, error));
+            }
+            self.validate_audio()?;
+            Ok(CapturedAudio::new(std::mem::take(&mut self.pcm)))
+        })
+    }
+
+    fn abort(mut self: Box<Self>) -> BoundaryFuture<'static, ()> {
+        Box::pin(async move {
+            self.stop_child(false)?;
+            Ok(())
+        })
+    }
+}
+
+impl Drop for PipeWireActiveCapture {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn capture_process_error(error: ProcessError, stderr: &[u8]) -> BoundaryError {
+    let detail = match error {
+        ProcessError::Unavailable => "pw-record unavailable".to_owned(),
+        ProcessError::TimedOut => "pw-record cleanup deadline elapsed".to_owned(),
+        ProcessError::Input | ProcessError::Wait | ProcessError::Output => {
+            process_diagnostic("pw-record execution failed", stderr)
+        }
+    };
+    BoundaryError::new(BoundaryKind::Capture, detail)
+}
+
+fn process_diagnostic(prefix: &str, stderr: &[u8]) -> String {
+    let detail = String::from_utf8_lossy(stderr);
+    let detail = detail.trim();
+    if detail.is_empty() {
+        prefix.to_owned()
+    } else {
+        format!("{prefix}: {detail}")
+    }
+}
+
+pub struct GroqProvider;
+
+impl TranscriptProvider for GroqProvider {
+    fn start(&mut self, _recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError> {
+        let credential = SecretStore::load(&mut SecretToolStore, Provider::Groq)?;
+        let endpoint = std::env::var("VOISU_GROQ_TRANSCRIPTION_URL")
+            .unwrap_or_else(|_| "https://api.groq.com/openai/v1/audio/transcriptions".to_owned());
+        if !(endpoint.starts_with("https://") || endpoint.starts_with("http://"))
+            || endpoint.contains(['\n', '\r'])
+        {
+            return Err(BoundaryError::new(
+                BoundaryKind::Provider,
+                "invalid Groq transcription endpoint",
+            ));
+        }
+        Ok(Box::new(GroqStream {
+            credential,
+            endpoint,
+            buffer: Vec::new(),
+            streamed_bytes: 0,
+            chunks: Vec::new(),
+        }))
+    }
+}
+
+struct GroqStream {
+    credential: Credential,
+    endpoint: String,
+    buffer: Vec<u8>,
+    streamed_bytes: usize,
+    chunks: Vec<tokio::task::JoinHandle<Result<String, BoundaryError>>>,
+}
+
+impl ProviderStream for GroqStream {
+    fn provider(&self) -> Provider {
+        Provider::Groq
+    }
+
+    fn send_audio(&mut self, chunk: AudioChunk) -> BoundaryFuture<'_, ()> {
+        Box::pin(async move {
+            self.streamed_bytes = self.streamed_bytes.saturating_add(chunk.0.len());
+            self.buffer.extend_from_slice(&chunk.0);
+            while self.buffer.len() >= GROQ_CHUNK_BYTES {
+                let pcm = self.buffer[..GROQ_CHUNK_BYTES].to_vec();
+                self.buffer = self.buffer
+                    [GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES..]
+                    .to_vec();
+                let credential = self.credential.clone();
+                let endpoint = self.endpoint.clone();
+                self.chunks.push(tokio::spawn(async move {
+                    ProviderHttpClient
+                        .transcribe_groq_chunk(credential, endpoint, pcm)
+                        .await
+                }));
+            }
+            Ok(())
+        })
+    }
+
+    fn complete(
+        mut self: Box<Self>,
+        audio: CapturedAudio,
+    ) -> BoundaryFuture<'static, SourceTranscript> {
+        Box::pin(async move {
+            let pcm = audio.pcm_s16le_mono_16khz();
+            if self.streamed_bytes > pcm.len() {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Provider,
+                    "Groq stream exceeded the finalized Recording",
+                ));
+            }
+            self.buffer.extend_from_slice(&pcm[self.streamed_bytes..]);
+            let mut transcripts = Vec::new();
+            for chunk in self.chunks.drain(..) {
+                transcripts.push(chunk.await.map_err(|_| {
+                    BoundaryError::new(BoundaryKind::Provider, "Groq chunk task failed")
+                })??);
+            }
+            let needs_final_chunk = transcripts.is_empty()
+                || self.buffer.len() > GROQ_CHUNK_OVERLAP_BYTES;
+            if needs_final_chunk {
+                transcripts.push(
+                    ProviderHttpClient
+                        .transcribe_groq_chunk(
+                            self.credential,
+                            self.endpoint,
+                            std::mem::take(&mut self.buffer),
+                        )
+                        .await?,
+                );
+            }
+            let text = merge_chunk_transcripts(transcripts);
+            Ok(SourceTranscript {
+                provider: Provider::Groq,
+                text,
+            })
+        })
+    }
+}
+
+pub struct UnavailableDeepgram;
+
+impl TranscriptProvider for UnavailableDeepgram {
+    fn start(&mut self, _recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError> {
+        Ok(Box::new(UnavailableDeepgramStream))
+    }
+}
+
+struct UnavailableDeepgramStream;
+
+impl ProviderStream for UnavailableDeepgramStream {
+    fn provider(&self) -> Provider {
+        Provider::Deepgram
+    }
+
+    fn send_audio(&mut self, _chunk: AudioChunk) -> BoundaryFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn complete(
+        self: Box<Self>,
+        _audio: CapturedAudio,
+    ) -> BoundaryFuture<'static, SourceTranscript> {
+        Box::pin(async {
+            Err(BoundaryError::new(
+                BoundaryKind::Provider,
+                "Deepgram adapter is not enabled in Ticket 03",
+            ))
+        })
+    }
+}
+
+pub struct MergeResultValidator;
+
+impl TranscriptValidator for MergeResultValidator {
+    fn validate(
+        &mut self,
+        sources: Vec<SourceTranscript>,
+    ) -> Result<Transcript, BoundaryError> {
+        let source = sources
+            .into_iter()
+            .find(|source| source.provider == Provider::Groq)
+            .ok_or_else(|| {
+                BoundaryError::new(BoundaryKind::Validation, "Groq Source Transcript missing")
+            })?;
+        let text = source.text.trim();
+        if text.is_empty() || text.contains('\0') || text.len() > 100_000 {
+            return Err(BoundaryError::new(
+                BoundaryKind::Validation,
+                "Groq Source Transcript violated the Merge Result guardrails",
+            ));
+        }
+        Ok(Transcript(text.to_owned()))
+    }
+}
+
+pub struct ClipboardDelivery;
+
+impl DeliveryAdapter for ClipboardDelivery {
+    fn deliver(&mut self, transcript: Transcript) -> BoundaryFuture<'_, ()> {
+        Box::pin(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                run_restricted("wl-copy", &[], Some(transcript.0.as_bytes()), false)
+            })
+            .await
+            .map_err(|_| {
+                BoundaryError::new(BoundaryKind::Delivery, "wl-copy task failed")
+            })?;
+            match result {
+                Ok(outcome) if outcome.success => Ok(()),
+                Ok(_outcome) => Err(BoundaryError::new(
+                    BoundaryKind::Delivery,
+                    "wl-copy rejected the Transcript",
+                )),
+                Err(ProcessError::TimedOut) => Err(BoundaryError::new(
+                    BoundaryKind::Delivery,
+                    "wl-copy deadline elapsed",
+                )),
+                Err(_) => Err(BoundaryError::new(
+                    BoundaryKind::Delivery,
+                    "wl-copy unavailable or failed",
+                )),
+            }
+        })
+    }
+}
+
+impl ProviderHttpClient {
+    async fn transcribe_groq_chunk(
+        &self,
+        credential: Credential,
+        endpoint: String,
+        pcm: Vec<u8>,
+    ) -> Result<String, BoundaryError> {
+        tokio::task::spawn_blocking(move || request_groq_chunk(credential, endpoint, pcm))
+            .await
+            .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "Groq request task failed"))?
+    }
+}
+
+fn request_groq_chunk(
+    credential: Credential,
+    endpoint: String,
+    pcm: Vec<u8>,
+) -> Result<String, BoundaryError> {
+    let mut file = tempfile::Builder::new()
+        .prefix("voisu-recording-")
+        .suffix(".wav")
+        .tempfile()
+        .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "temporary audio file unavailable"))?;
+    let wav = wav_from_pcm(&pcm)?;
+    file.write_all(&wav)
+        .and_then(|()| file.flush())
+        .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "temporary audio write failed"))?;
+    let endpoint = curl_config_escape(&endpoint);
+    let credential = curl_config_escape(credential.expose_to_boundary());
+    let path = curl_config_escape(&file.path().to_string_lossy());
+    let model = std::env::var("VOISU_GROQ_MODEL")
+        .unwrap_or_else(|_| "whisper-large-v3-turbo".to_owned());
+    if model.is_empty() || model.contains(['\n', '\r']) {
+        return Err(BoundaryError::new(BoundaryKind::Provider, "invalid Groq model"));
+    }
+    let model = curl_config_escape(&model);
+    let config = format!(
+        "url = \"{endpoint}\"\nheader = \"Authorization: Bearer {credential}\"\nform = \"file=@{path};filename=recording.wav;type=audio/wav\"\nform = \"model={model}\"\nform = \"response_format=json\"\n"
+    );
+    let outcome = run_restricted_with_deadline(
+        "curl",
+        &[
+            "-q",
+            "--config",
+            "-",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "14",
+        ],
+        Some(config.as_bytes()),
+        true,
+        PROVIDER_PROCESS_DEADLINE,
+    )
+    .map_err(|error| match error {
+        ProcessError::TimedOut => {
+            BoundaryError::new(BoundaryKind::Provider, "Groq Provider Deadline elapsed")
+        }
+        _ => BoundaryError::new(BoundaryKind::Provider, "Groq request unavailable or failed"),
+    })?;
+    if !outcome.success {
+        return Err(BoundaryError::new(
+            BoundaryKind::Provider,
+            "Groq rejected the audio request",
+        ));
+    }
+    let response: serde_json::Value = serde_json::from_slice(&outcome.stdout).map_err(|_| {
+        BoundaryError::new(BoundaryKind::Provider, "Groq returned malformed JSON")
+    })?;
+    response
+        .get("text")
+        .and_then(|text| text.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| BoundaryError::new(BoundaryKind::Provider, "Groq response omitted text"))
+}
+
+fn merge_chunk_transcripts(transcripts: Vec<String>) -> String {
+    let mut merged: Vec<String> = Vec::new();
+    for transcript in transcripts {
+        let words: Vec<String> = transcript
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        let overlap = (1..=merged.len().min(words.len()).min(24))
+            .rev()
+            .find(|count| merged[merged.len() - count..] == words[..*count])
+            .unwrap_or(0);
+        merged.extend(words.into_iter().skip(overlap));
+    }
+    merged.join(" ")
+}
+
+fn wav_from_pcm(pcm: &[u8]) -> Result<Vec<u8>, BoundaryError> {
+    let data_len = u32::try_from(pcm.len()).map_err(|_| {
+        BoundaryError::new(BoundaryKind::Provider, "Recording is too large for WAV")
+    })?;
+    let riff_len = data_len.checked_add(36).ok_or_else(|| {
+        BoundaryError::new(BoundaryKind::Provider, "Recording WAV length overflow")
+    })?;
+    let mut wav = Vec::with_capacity(pcm.len() + 44);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_len.to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&16_000_u32.to_le_bytes());
+    wav.extend_from_slice(&32_000_u32.to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(pcm);
+    Ok(wav)
 }

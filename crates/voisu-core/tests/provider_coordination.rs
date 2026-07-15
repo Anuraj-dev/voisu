@@ -77,7 +77,7 @@ async fn coordinator_starts_both_completions_once_and_orders_attributed_sources(
         },
     );
     coordinator.stream_audio(AudioChunk(vec![1, 2, 3])).await.unwrap();
-    let sources = coordinator.complete(CapturedAudio).await.unwrap();
+    let sources = coordinator.complete(CapturedAudio::empty()).await.unwrap();
 
     assert_eq!(deepgram.load(Ordering::SeqCst), 1);
     assert_eq!(groq.load(Ordering::SeqCst), 1);
@@ -110,7 +110,7 @@ async fn provider_deadline_returns_the_valid_source_already_available() {
             ),
         },
     )
-        .complete(CapturedAudio)
+        .complete(CapturedAudio::empty())
         .await
         .unwrap();
 
@@ -146,7 +146,7 @@ async fn ready_sources_at_the_deadline_instant_are_not_discarded() {
             ),
         },
     )
-    .complete(CapturedAudio)
+    .complete(CapturedAudio::empty())
     .await
     .expect("ready sources at the deadline instant must not be discarded");
 

@@ -12,6 +12,7 @@ use voisu_app::system::{FedoraReadiness, ProviderHttpClient, SecretToolStore};
 
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024;
 const IO_DEADLINE: Duration = Duration::from_secs(2);
+const PROCESSING_RESPONSE_DEADLINE: Duration = Duration::from_secs(17);
 
 enum CliAction {
     Daemon(Command),
@@ -63,7 +64,12 @@ fn daemon_command(command: Command) -> ExitCode {
         return fail(1, "failed to send command to daemon");
     }
 
-    let response = match read_response_frame(&mut stream) {
+    let response_deadline = if matches!(command, Command::Stop | Command::Toggle) {
+        PROCESSING_RESPONSE_DEADLINE
+    } else {
+        IO_DEADLINE
+    };
+    let response = match read_response_frame(&mut stream, response_deadline) {
         Ok(response) => response,
         Err(message) => return fail(1, &message),
     };
@@ -154,12 +160,12 @@ fn block_on<T>(future: BoundaryFuture<'_, T>) -> Result<T, BoundaryError> {
         .block_on(future)
 }
 
-fn read_response_frame(stream: &mut UnixStream) -> Result<String, String> {
+fn read_response_frame(stream: &mut UnixStream, deadline: Duration) -> Result<String, String> {
     let started = Instant::now();
     let mut response = Vec::new();
     let mut buffer = [0_u8; 1024];
     loop {
-        let remaining = IO_DEADLINE
+        let remaining = deadline
             .checked_sub(started.elapsed())
             .filter(|remaining| !remaining.is_zero())
             .ok_or_else(|| "daemon response deadline elapsed".to_owned())?;

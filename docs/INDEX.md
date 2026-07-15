@@ -6,6 +6,7 @@
 | STATE.md | Current state — read this first on any fresh session |
 | decisions.md | Append-only log of load-bearing choices + why |
 | conventions.md | Stack, run/test commands, naming (ubiquitous language) |
+| model-benchmark.md | Standing experiment: per-dispatch log comparing codex models (Sol/Terra/Luna) vs Opus as coder/reviewer agents |
 | old_context.md | Honest pre-tracking backstory (planning phase summary) |
 | adr/ | Six architectural decision records (hard-to-reverse choices) |
 | research/linux-platform.md | Linux/Wayland platform research |

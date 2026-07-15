@@ -1,10 +1,12 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,6 +29,7 @@ impl Daemon {
         let mut command = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"));
         command
             .env("XDG_RUNTIME_DIR", runtime_dir)
+            .env("VOISU_TEST_MODE", "controlled")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -40,6 +43,31 @@ impl Daemon {
             if socket_path(runtime_dir).exists()
                 && voisu(runtime_dir, "status").status.success()
             {
+                return Self { child };
+            }
+            if let Some(status) = child.try_wait().expect("daemon status should be readable") {
+                panic!("daemon exited before binding its socket: {status}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("daemon did not bind its socket");
+    }
+
+    fn start_production_with_env(runtime_dir: &Path, environment: &[(&str, &str)]) -> Self {
+        fs::set_permissions(runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"));
+        command
+            .env("XDG_RUNTIME_DIR", runtime_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let mut child = command.spawn().expect("daemon should start");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if socket_path(runtime_dir).exists() && voisu(runtime_dir, "status").status.success() {
                 return Self { child };
             }
             if let Some(status) = child.try_wait().expect("daemon status should be readable") {
@@ -79,6 +107,381 @@ impl Daemon {
         let _ = self.child.wait();
         diagnostics
     }
+}
+
+#[test]
+fn pipewire_groq_merge_result_and_clipboard_delivery_form_one_real_boundary_slice() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$@" > "$dir/pw-record.args"
+env | sort > "$dir/pw-record.env"
+head -c 6400 /dev/zero | tr '\000' '\001'
+trap 'printf "\002\003"; exit 0' INT TERM
+while :; do :; done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+env | sort > "$dir/wl-copy.env"
+cat > "$dir/clipboard"
+"#,
+    );
+
+    let (endpoint, request_rx, server) = local_groq_server("hello from Groq");
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", &endpoint),
+            ("VOISU_RECORDING_DEADLINE_MS", "5000"),
+            ("VOISU_PIPEWIRE_TARGET", "test-microphone"),
+        ],
+    );
+
+    let started = voisu(runtime.path(), "start");
+    assert!(started.status.success(), "{}", stderr(&started));
+    thread::sleep(Duration::from_millis(50));
+    let status_started = Instant::now();
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    assert!(status_started.elapsed() < Duration::from_millis(100));
+    let stopped = voisu(runtime.path(), "stop");
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    assert_eq!(
+        fs::read_to_string(commands.path().join("clipboard")).unwrap(),
+        "hello from Groq"
+    );
+
+    let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    server.join().unwrap();
+    let riff = request
+        .windows(4)
+        .position(|window| window == b"RIFF")
+        .expect("Groq multipart request must contain WAV audio");
+    assert_eq!(&request[riff + 8..riff + 12], b"WAVE");
+    let pcm_len = u32::from_le_bytes(request[riff + 40..riff + 44].try_into().unwrap()) as usize;
+    assert!(pcm_len >= 6_402, "final audio frames must be retained");
+    assert_eq!(&request[riff + 44 + pcm_len - 2..riff + 44 + pcm_len], &[2, 3]);
+
+    let pipewire_args = fs::read_to_string(commands.path().join("pw-record.args")).unwrap();
+    assert!(pipewire_args.contains(
+        "--raw\n--rate\n16000\n--channels\n1\n--format\ns16\n--target\ntest-microphone\n-\n"
+    ));
+    let clipboard_environment =
+        fs::read_to_string(commands.path().join("wl-copy.env")).unwrap();
+    assert!(!clipboard_environment.contains("VOISU_GROQ_API_KEY="));
+    assert!(!clipboard_environment.contains("VOISU_TEST_"));
+}
+
+#[test]
+fn groq_receives_bounded_overlapping_chunks_and_the_merge_result_is_delivered_once() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+head -c 1000000 /dev/zero | tr '\000' '\001'
+trap 'printf "\002\003"; exit 0' INT TERM
+while :; do :; done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+cat > "$dir/clipboard"
+"#,
+    );
+    let (endpoint, requests_rx, live_requests, server) =
+        local_groq_chunk_server(vec!["alpha beta", "beta gamma"]);
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", &endpoint),
+            ("VOISU_RECORDING_DEADLINE_MS", "5000"),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    let live_deadline = Instant::now() + Duration::from_secs(2);
+    while live_requests.load(Ordering::SeqCst) == 0 && Instant::now() < live_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        live_requests.load(Ordering::SeqCst),
+        1,
+        "the first bounded Groq chunk must be submitted during the Recording"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    let stopped = voisu(runtime.path(), "stop");
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    let requests = requests_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    server.join().unwrap();
+    assert_eq!(requests.len(), 2, "one long Recording must be bounded into two Groq requests");
+    for request in requests {
+        assert!(request.windows(4).any(|window| window == b"RIFF"));
+    }
+    assert_eq!(
+        fs::read_to_string(commands.path().join("clipboard")).unwrap(),
+        "alpha beta gamma"
+    );
+}
+
+#[test]
+fn production_capture_is_reaped_after_provider_start_failure_and_the_next_recording_succeeds() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$$" >> "$dir/pw-record.pids"
+head -c 6400 /dev/zero | tr '\000' '\001'
+trap 'printf "\002\003"; exit 0' INT TERM
+while :; do :; done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "secret-tool",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+if [ ! -e "$dir/secret-tool.once" ]; then
+  : > "$dir/secret-tool.once"
+  exit 1
+fi
+printf 'controlled-secret'
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+cat > "$dir/clipboard"
+"#,
+    );
+    let (endpoint, request_rx, server) = local_groq_server("recovered Transcript");
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", &endpoint),
+            ("VOISU_RECORDING_DEADLINE_MS", "5000"),
+        ],
+    );
+
+    let failed = voisu(runtime.path(), "start");
+    assert_eq!(failed.status.code(), Some(4));
+    assert_eq!(
+        stderr(&failed),
+        "Secret storage is unavailable; set VOISU_GROQ_API_KEY or VOISU_DEEPGRAM_API_KEY for development or headless use\n"
+    );
+    let first_pid: u32 = fs::read_to_string(commands.path().join("pw-record.pids"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let reap_deadline = Instant::now() + Duration::from_secs(2);
+    while Path::new(&format!("/proc/{first_pid}")).exists() && Instant::now() < reap_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !Path::new(&format!("/proc/{first_pid}")).exists(),
+        "failed provider start must kill and reap pw-record"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    thread::sleep(Duration::from_millis(50));
+    let recovered = voisu(runtime.path(), "stop");
+    assert!(recovered.status.success(), "{}", stderr(&recovered));
+    request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        fs::read_to_string(commands.path().join("clipboard")).unwrap(),
+        "recovered Transcript"
+    );
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(!diagnostics.contains("controlled-secret"));
+}
+
+fn local_groq_server(
+    transcript: &'static str,
+) -> (String, mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_tx, request_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut content_length = 0_usize;
+        let mut authorized = false;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            let lower = line.to_ascii_lowercase();
+            if let Some(value) = lower.strip_prefix("content-length:") {
+                content_length = value.trim().parse().unwrap();
+            }
+            if line.trim_end() == "Authorization: Bearer controlled-secret" {
+                authorized = true;
+            }
+        }
+        assert!(authorized, "Groq credential must be sent in the HTTP header");
+        let mut body = vec![0_u8; content_length];
+        reader.read_exact(&mut body).unwrap();
+        request_tx.send(body).unwrap();
+        let response = serde_json::json!({ "text": transcript }).to_string();
+        write!(
+            reader.get_mut(),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .unwrap();
+    });
+    (format!("http://{address}/audio/transcriptions"), request_rx, server)
+}
+
+fn local_groq_chunk_server(
+    transcripts: Vec<&'static str>,
+) -> (
+    String,
+    mpsc::Receiver<Vec<Vec<u8>>>,
+    Arc<AtomicUsize>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_tx, request_rx) = mpsc::channel();
+    let live_requests = Arc::new(AtomicUsize::new(0));
+    let server_live_requests = Arc::clone(&live_requests);
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for transcript in transcripts {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut content_length = 0_usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0_u8; content_length];
+            reader.read_exact(&mut body).unwrap();
+            requests.push(body);
+            server_live_requests.fetch_add(1, Ordering::SeqCst);
+            let response = serde_json::json!({ "text": transcript }).to_string();
+            write!(
+                reader.get_mut(),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+        }
+        request_tx.send(requests).unwrap();
+    });
+    (
+        format!("http://{address}/audio/transcriptions"),
+        request_rx,
+        live_requests,
+        server,
+    )
+}
+
+#[test]
+#[ignore = "requires Fedora PipeWire, a microphone, Groq credentials, wl-copy, and VOISU_LIVE_SMOKE=1"]
+fn live_fedora_microphone_groq_and_clipboard_smoke() {
+    assert_eq!(std::env::var("VOISU_LIVE_SMOKE").as_deref(), Ok("1"));
+    let runtime = PathBuf::from(
+        std::env::var_os("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR is required"),
+    );
+    let _daemon = Daemon::start_production_with_env(&runtime, &[]);
+    assert!(voisu(&runtime, "start").status.success());
+    eprintln!("Speak now; the live smoke Recording lasts three seconds");
+    thread::sleep(Duration::from_secs(3));
+    let stopped = voisu(&runtime, "stop");
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    let clipboard = Command::new("wl-paste").output().unwrap();
+    assert!(clipboard.status.success());
+    assert!(!clipboard.stdout.is_empty(), "Transcript must remain on the clipboard");
+}
+
+fn recording_outcome(outcome: &str, expected: &str) {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_RECORDING_OUTCOME", outcome)],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = voisu(runtime.path(), "stop");
+    assert_eq!(stopped.status.code(), Some(4));
+    assert_eq!(stderr(&stopped), format!("{expected}\n"));
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+
+    // Every rejected Recording must leave the daemon ready for the next one.
+    assert!(voisu(runtime.path(), "start").status.success());
+}
+
+#[test]
+fn empty_recording_is_distinct_and_recoverable_through_the_public_cli() {
+    recording_outcome("empty", "No audio was captured");
+}
+
+#[test]
+fn too_short_recording_is_distinct_and_recoverable_through_the_public_cli() {
+    recording_outcome("too-short", "Recording is too short");
+}
+
+#[test]
+fn silent_recording_is_distinct_and_recoverable_through_the_public_cli() {
+    recording_outcome("silent", "Recording contains no speech");
+}
+
+#[test]
+fn over_deadline_recording_is_distinct_and_recoverable_through_the_public_cli() {
+    recording_outcome("over-deadline", "Recording Deadline elapsed");
 }
 
 #[test]

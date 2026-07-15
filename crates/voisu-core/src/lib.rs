@@ -5,6 +5,7 @@ use std::future::Future;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -141,6 +142,10 @@ impl Response {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BoundaryKind {
     Capture,
+    EmptyRecording,
+    TooShortRecording,
+    SilentRecording,
+    RecordingDeadline,
     Provider,
     Validation,
     Delivery,
@@ -169,6 +174,10 @@ impl BoundaryError {
     pub fn public_message(&self) -> &'static str {
         match self.kind {
             BoundaryKind::Capture => "Recording capture failed",
+            BoundaryKind::EmptyRecording => "No audio was captured",
+            BoundaryKind::TooShortRecording => "Recording is too short",
+            BoundaryKind::SilentRecording => "Recording contains no speech",
+            BoundaryKind::RecordingDeadline => "Recording Deadline elapsed",
             BoundaryKind::Provider => "Source Transcripts are unavailable",
             BoundaryKind::Validation => "Transcript failed quality validation",
             BoundaryKind::Delivery => "Transcript Delivery failed",
@@ -191,7 +200,25 @@ pub type BoundaryFuture<'a, T> =
 pub struct AudioChunk(pub Vec<u8>);
 
 #[derive(Clone, Debug)]
-pub struct CapturedAudio;
+pub struct CapturedAudio {
+    pcm_s16le_mono_16khz: Vec<u8>,
+}
+
+impl CapturedAudio {
+    pub fn new(pcm_s16le_mono_16khz: Vec<u8>) -> Self {
+        Self {
+            pcm_s16le_mono_16khz,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::new(Vec::new())
+    }
+
+    pub fn pcm_s16le_mono_16khz(&self) -> &[u8] {
+        &self.pcm_s16le_mono_16khz
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -225,7 +252,8 @@ impl Provider {
 
 /// An API credential deliberately has no `Debug` implementation, preventing
 /// accidental exposure through ordinary diagnostics.
-pub struct Credential(String);
+#[derive(Clone)]
+pub struct Credential(Arc<str>);
 
 impl Credential {
     pub fn new(value: String) -> Result<Self, BoundaryError> {
@@ -235,7 +263,7 @@ impl Credential {
                 "credential is empty or contains a line break",
             ));
         }
-        Ok(Self(value))
+        Ok(Self(value.into()))
     }
 
     pub fn expose_to_boundary(&self) -> &str {
