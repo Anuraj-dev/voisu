@@ -118,3 +118,9 @@ WebSocket library. One-second linear16 HTTP chunks begin cloud work live, preser
 `env_clear`, response-cap, cancellation, and owning-child kill/reap guarantees, and avoid adding a second networking
 stack. Voisu's 14-second whole-operation `Instant` budget intentionally expires before curl's 15-second internal limit,
 so Voisu consistently owns Provider Deadline classification and cleanup instead of racing curl's exit status.
+
+## 2026-07-15 — Queue Deepgram chunks behind a three-request in-flight cap
+**Why:** A slow endpoint must not turn a five-minute Recording into hundreds of simultaneous curl processes and
+pipe-drain threads. Deepgram queues request tasks behind a three-permit semaphore, so audio ingestion stays live while at
+most three tasks can own curl processes. Completion awaits the queued handles in creation order, preserving every
+non-overlapping audio chunk and transcript order. Coalescing was rejected because it would change request boundaries.

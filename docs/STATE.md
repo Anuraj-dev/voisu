@@ -2,8 +2,22 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-15
 
 ## 🚧 In progress / next
-- Ticket 04 is implemented and fully verified but uncommitted. Run the required first Sol review at high effort, resolve
-  any findings, then commit `feat(dictation): stream Deepgram within the Provider Deadline (#4)` and close issue #4.
+- Ticket 04 (issue #4, concurrent Deepgram + Provider Deadline) feature is committed as `3e4eecc` (71 tests). First
+  review (Sol HIGH) returned REQUEST-CHANGES: 2 HIGH (Provider Deadline cancellation not awaited before Idle; no
+  in-flight cap on Deepgram curls) + 2 MEDIUM (`VOISU_TEST_DEEPGRAM_UNAVAILABLE` production bypass; wrong
+  overlap-removal merge applied to non-overlapping Deepgram chunks).
+- Sol's medium fix round produced **UNCOMMITTED worktree changes** claiming all 4 findings fixed (75 tests), BUT the
+  new test `provider_deadline_kills_and_reaps_late_deepgram_curl_before_idle`
+  (`crates/voisu-app/tests/daemon_cli_lifecycle.rs:2047`) **fails deterministically** (0.14s) on the orchestrator's
+  machine: "the late Deepgram curl must be reaped before Idle is observable". 65 other acceptance tests pass. Do
+  **not** trust the "fully verified" claim in the prior session log for this round — it was wrong.
+  - A Sol medium feedback round is (or was, when this checkpoint was written) IN FLIGHT fixing that root cause via a
+    background codex run; it may have modified the worktree further since.
+- Next steps: verify the fix (full `cargo test --workspace` green + 3x flake-free `cargo test -p voisu-app`), then
+  commit as `fix(dictation): resolve Ticket 04 review findings (#4)`, dispatch a Sol **medium** re-review (re-reviews
+  are medium per policy), iterate to APPROVE, close issue #4, push, update `docs/model-benchmark.md` rows for the
+  ticket 04 fix rounds, and checkpoint. If Sol fails again, escalate to an Opus subagent (high effort) per the
+  fallback ladder.
 
 ## Status
 - The independent `voisu` and `voisu-daemon` binaries communicate over bounded, versioned Unix IPC.
@@ -11,14 +25,17 @@
   provider credentials with explicit environment fallback for development/headless use.
 - Normal daemon startup captures the configured/default PipeWire microphone as 16 kHz mono s16 PCM and concurrently
   sends one-second live PCM chunks to Deepgram plus bounded 30-second overlapping WAV chunks to Groq.
-- Stop finalizes the audio tail, accepts both valid Source Transcripts within the shared Provider Deadline, or proceeds
-  with the one valid Source Transcript available when the other provider fails or is late.
+- Deepgram queues request tasks behind a three-permit cap, preserving audio ingestion and ordered transcript assembly
+  without allowing a long Recording to fan out into hundreds of curl processes.
+- Stop finalizes the audio tail and accepts valid Source Transcripts within the shared Provider Deadline; a deadline
+  loser is cancelled, killed, reaped, and awaited inside the recovery budget before completion can publish `Idle`.
 - Provider completion is deterministic and exactly-once; structured IPC evidence reports first chunk, capture
   finalization, per-provider completion, accepted providers, release-to-text timing, and Delivery count.
 - Capture/provider failure and capture EOF return the daemon to idle; Deepgram and Groq cancellation use the
   per-Recording `CancelRegistry`, owning-child kill/reap, and awaited request-task cleanup before reuse.
-- `cargo build --workspace`, `cargo test --workspace`, and `git diff --check` pass: 71 tests green plus one ignored,
-  opt-in live Fedora microphone/Groq/clipboard smoke test. The `voisu-app` suite passed three consecutive full runs.
+- Last fully-verified, committed state (`3e4eecc`) is 71 tests green plus one ignored, opt-in live Fedora
+  microphone/Groq/clipboard smoke test. The uncommitted Ticket 04 fix-round worktree claims 75 tests but has one
+  known-failing test (see In progress) and must be reverified before it can be trusted or committed.
 
 ## Architecture map
 - Domain, audio contract, provider coordination/timings, typed errors, readiness/auth traits, IPC ->
@@ -40,15 +57,14 @@
 - One actor serializes lifecycle transitions while spawned work keeps status responsive during boundary work.
 - Credentials are stdin-only, Secret-Service-backed values; every subprocess clears its environment and has bounded,
   capped, owning-handle cleanup. Curl is always `-q` first and receives credentials only through stdin configuration.
-- Deepgram receives one-second linear16 HTTP chunks during the Recording through the shared hardened curl boundary;
-  Groq retains 30-second WAV chunks with 500 ms overlap and the final tail.
+- Deepgram receives one-second non-overlapping linear16 chunks through at most three concurrent curl owners; queued
+  results are concatenated in chunk order, while Groq retains overlap-removal for its overlapping audio chunks.
 - The 15-second Provider Deadline is shared across both completions; valid sources are attributed and sorted, and one
-  available Source Transcript proceeds without allowing late work to create another Delivery.
+  available Source Transcript proceeds only after any late provider's bounded awaited cleanup completes.
 - Recovery remains a first-class actor state; cancellation is an `AtomicBool` observed by the wait loop owning `Child`,
   never a raw-PID signal.
 
 ## Gotchas
 - Use CONTEXT.md's ubiquitous language exactly; it lists banned synonyms.
 - `rustfmt` and `clippy` are unavailable (`sudo dnf install rustfmt clippy` needed); both remain skipped.
-- The sandbox exposes `.git` read-only, so do not attempt staging or commits here.
-- The required first Ticket 04 review still needs a writable Codex state directory; never deliberately background it.
+- The sandbox exposes `.git` read-only; keep the review fixes uncommitted until a writable Git environment is available.
