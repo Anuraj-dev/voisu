@@ -1,8 +1,9 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -37,6 +38,20 @@ struct Daemon {
     _provider_stub: Option<TempDir>,
 }
 
+fn isolate_process_group(command: &mut Command) {
+    // SAFETY: setpgid is an async-signal-safe syscall and this hook runs in the
+    // child after fork, before exec, without touching shared process state.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
 impl Daemon {
     fn start(runtime_dir: &Path) -> Self {
         Self::start_with_env(runtime_dir, &[])
@@ -54,6 +69,7 @@ impl Daemon {
         for (name, value) in environment {
             command.env(name, value);
         }
+        isolate_process_group(&mut command);
         let mut child = command.spawn().expect("daemon should start");
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -67,7 +83,11 @@ impl Daemon {
                 };
             }
             if let Some(status) = child.try_wait().expect("daemon status should be readable") {
-                panic!("daemon exited before binding its socket: {status}");
+                let mut diagnostics = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    stderr.read_to_string(&mut diagnostics).ok();
+                }
+                panic!("daemon exited before binding its socket: {status}: {diagnostics}");
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -102,7 +122,7 @@ impl Daemon {
                 stub.path(),
                 "curl",
                 &format!(
-                    "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\nconfig=$(/usr/bin/mktemp \"$dir/curl-config.XXXXXX\")\n/usr/bin/cat > \"$config\"\nif /usr/bin/grep -q unavailable.deepgram.test \"$config\"; then\n  /usr/bin/rm -f \"$config\"\n  exit 22\nfi\nexec \"{}\" \"$@\" < \"$config\"\n",
+                    "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\nconfig=$(/usr/bin/mktemp \"$dir/curl-config.XXXXXX\")\n/usr/bin/cat > \"$config\"\nif /usr/bin/grep -q unavailable.deepgram.test \"$config\"; then\n  /usr/bin/rm -f \"$config\"\n  trap - EXIT\n  exit 22\nfi\nexec \"{}\" \"$@\" < \"$config\"\n",
                     delegate.display()
                 ),
             );
@@ -121,6 +141,7 @@ impl Daemon {
         if let Some(stub) = provider_stub.as_ref() {
             command.env("PATH", format!("{}:{original_path}", stub.path().display()));
         }
+        isolate_process_group(&mut command);
         let mut child = command.spawn().expect("daemon should start");
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
@@ -131,7 +152,11 @@ impl Daemon {
                 };
             }
             if let Some(status) = child.try_wait().expect("daemon status should be readable") {
-                panic!("daemon exited before binding its socket: {status}");
+                let mut diagnostics = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    stderr.read_to_string(&mut diagnostics).ok();
+                }
+                panic!("daemon exited before binding its socket: {status}: {diagnostics}");
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -182,7 +207,8 @@ printf '%s\n' "$@" > "$dir/pw-record.args"
 env | sort > "$dir/pw-record.env"
 head -c 6400 /dev/zero | tr '\000' '\001'
 trap 'printf "\002\003"; exit 0' INT TERM
-while :; do :; done
+i=0
+while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
 "#,
     );
     write_fake_command(
@@ -258,7 +284,8 @@ dir=$(dirname "$0")
 head -c 64000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
-while :; do :; done
+i=0
+while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
 "#,
     );
     write_fake_command(
@@ -349,7 +376,8 @@ dir=$(dirname "$0")
 head -c 160000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
-while :; do /usr/bin/sleep 0.01; done
+i=0
+while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
 "#,
     );
     write_fake_command(
@@ -365,7 +393,8 @@ if ! grep -q 'deepgram.test' "$config"; then
   exit 0
 fi
 rm -f "$config"
-while ! mkdir "$dir/deepgram.lock" 2>/dev/null; do /usr/bin/sleep 0.01; done
+i=0
+while ! mkdir "$dir/deepgram.lock" 2>/dev/null && [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
 sequence=$(cat "$dir/deepgram.next" 2>/dev/null || printf '0')
 sequence=$((sequence + 1))
 printf '%s' "$sequence" > "$dir/deepgram.next"
@@ -378,8 +407,10 @@ if [ "$active" -gt "$maximum" ]; then
 fi
 rmdir "$dir/deepgram.lock"
 : > "$dir/deepgram.started.$sequence"
-while [ ! -e "$dir/deepgram.release.$sequence" ]; do /usr/bin/sleep 0.01; done
-while ! mkdir "$dir/deepgram.lock" 2>/dev/null; do /usr/bin/sleep 0.01; done
+i=0
+while [ ! -e "$dir/deepgram.release.$sequence" ] && [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
+i=0
+while ! mkdir "$dir/deepgram.lock" 2>/dev/null && [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
 active=$(cat "$dir/deepgram.active")
 printf '%s' $((active - 1)) > "$dir/deepgram.active"
 rmdir "$dir/deepgram.lock"
@@ -452,7 +483,8 @@ dir=$(dirname "$0")
 head -c 32000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
-while :; do :; done
+i=0
+while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
 "#,
     );
     write_fake_command(
@@ -466,6 +498,7 @@ if grep -q 'deepgram.test' "$config"; then
   printf '{"results":{"channels":[{"alternatives":[{"transcript":"Deepgram fallback"}]}]}}'
 else
   rm -f "$config"
+  trap - EXIT
   exit 22
 fi
 "#,
@@ -525,7 +558,8 @@ fn groq_receives_bounded_overlapping_chunks_and_the_merge_result_is_delivered_on
         r#"#!/bin/sh
 head -c 1000000 /dev/zero | tr '\000' '\001'
 trap 'printf "\002\003"; exit 0' INT TERM
-while :; do :; done
+i=0
+while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
 "#,
     );
     write_fake_command(
@@ -589,7 +623,8 @@ dir=$(dirname "$0")
 printf '%s\n' "$$" >> "$dir/pw-record.pids"
 head -c 6400 /dev/zero | tr '\000' '\001'
 trap 'printf "\002\003"; exit 0' INT TERM
-while :; do sleep 0.01; done
+i=0
+while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
 "#,
     );
     write_fake_command(
@@ -598,8 +633,10 @@ while :; do sleep 0.01; done
         r#"#!/bin/sh
 dir=$(dirname "$0")
 if [ ! -e "$dir/secret-tool.once" ]; then
-  while [ ! -e "$dir/pw-record.pids" ]; do sleep 0.01; done
+  i=0
+  while [ ! -e "$dir/pw-record.pids" ] && [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
   : > "$dir/secret-tool.once"
+  trap - EXIT
   exit 1
 fi
 printf 'controlled-secret'
@@ -675,7 +712,8 @@ fn status_stays_responsive_while_secret_service_startup_is_slow() {
         "pw-record",
         r#"#!/bin/sh
 trap 'exit 0' INT TERM
-while :; do sleep 1; done
+i=0
+while [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
 "#,
     );
     // The Secret Service lookup blocks on an explicit release gate instead of a
@@ -687,7 +725,8 @@ while :; do sleep 1; done
         r#"#!/bin/sh
 dir=$(dirname "$0")
 : > "$dir/secret-tool.started"
-while [ ! -e "$dir/secret-tool.release" ]; do sleep 0.02; done
+i=0
+while [ ! -e "$dir/secret-tool.release" ] && [ "$i" -lt 3000 ]; do sleep 0.02; i=$((i + 1)); done
 printf 'controlled-secret'
 "#,
     );
@@ -726,7 +765,8 @@ fn non_loopback_plaintext_groq_endpoint_is_rejected_without_disclosing_secrets()
         "pw-record",
         r#"#!/bin/sh
 trap 'exit 0' INT TERM
-while :; do sleep 1; done
+i=0
+while [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
 "#,
     );
     let path = format!(
@@ -764,7 +804,7 @@ fn production_groq_quality_failure_is_classified_through_the_public_cli() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
     let (endpoint, request_rx, server) = local_groq_server("   ");
@@ -795,7 +835,7 @@ fn production_groq_5xx_is_recoverable_through_the_public_cli() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
     let (endpoint, request_rx, server) =
@@ -827,7 +867,7 @@ fn production_slow_groq_endpoint_is_bounded_and_recoverable() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
     let (endpoint, request_rx, server) = local_groq_response_server(
@@ -869,7 +909,7 @@ fn production_capture_death_mid_recording_self_recovers_without_stop() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\nprintf '\\100\\000'\nexit 7\n",
+        "#!/bin/sh\nprintf '\\100\\000'\ntrap - EXIT\nexit 7\n",
     );
     let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
     let daemon = Daemon::start_production_with_env(
@@ -897,7 +937,7 @@ fn production_missing_wl_copy_is_reported_and_recoverable() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\nwhile :; do /usr/bin/sleep 1; done\n",
+        "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do /usr/bin/sleep 1; i=$((i + 1)); done\n",
     );
     std::os::unix::fs::symlink("/usr/bin/curl", commands.path().join("curl")).unwrap();
     let (endpoint, request_rx, server) = local_groq_server("undeliverable Transcript");
@@ -1073,7 +1113,7 @@ fn production_recording_quality_failure(script_body: &str, expected: &str) {
 #[test]
 fn empty_recording_is_distinct_and_recoverable_through_the_public_cli() {
     production_recording_quality_failure(
-        "#!/bin/sh\ndir=$(dirname \"$0\")\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
         "No audio was captured",
     );
 }
@@ -1081,7 +1121,7 @@ fn empty_recording_is_distinct_and_recoverable_through_the_public_cli() {
 #[test]
 fn too_short_recording_is_distinct_and_recoverable_through_the_public_cli() {
     production_recording_quality_failure(
-        "#!/bin/sh\ndir=$(dirname \"$0\")\nprintf '\\001\\000'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\nprintf '\\001\\000'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
         "Recording is too short",
     );
 }
@@ -1089,7 +1129,7 @@ fn too_short_recording_is_distinct_and_recoverable_through_the_public_cli() {
 #[test]
 fn silent_recording_is_distinct_and_recoverable_through_the_public_cli() {
     production_recording_quality_failure(
-        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 3200 /dev/zero\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 3200 /dev/zero\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
         "Recording contains no speech",
     );
 }
@@ -1101,7 +1141,7 @@ fn over_deadline_recording_is_distinct_and_recoverable_through_the_public_cli() 
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\nprintf '\\100\\000'\ntrap 'exit 0' INT TERM\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\nprintf '\\100\\000'\ntrap 'exit 0' INT TERM\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
     );
     let path = format!(
         "{}:{}",
@@ -1189,7 +1229,10 @@ fn capture_finalization_failure_is_redacted_and_the_next_recording_succeeds() {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        let process_group = -(self.child.id() as i32);
+        // SAFETY: the daemon is created as process-group leader, so signaling
+        // the negative pgid targets only this test's daemon tree.
+        let _ = unsafe { libc::kill(process_group, libc::SIGKILL) };
         let _ = self.child.wait();
     }
 }
@@ -1282,6 +1325,7 @@ if [ "$1" = "lookup" ]; then
     if [ -e "$dir/secret-tool.dbuserror" ]; then
       echo "Cannot create secret service: not provided by any .service files" >&2
     fi
+    trap - EXIT
     exit 1
   fi
   printf 'stored-credential'
@@ -1400,6 +1444,10 @@ fn wait_for_marker(directory: &Path, name: &str) {
 
 fn write_fake_command(directory: &Path, name: &str, script: &str) {
     let path = directory.join(name);
+    let script = format!(
+        "#!/bin/sh\ntrap 'exit 0' EXIT INT TERM\n{}",
+        script.strip_prefix("#!/bin/sh\n").unwrap_or(script)
+    );
     fs::write(&path, script).expect("fake command should be written");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
         .expect("fake command should be executable");
@@ -1988,7 +2036,8 @@ dir=$(dirname "$0")
 head -c 32000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
-while :; do sleep 0.01; done
+i=0
+while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
 "#,
     );
     write_fake_command(
@@ -2002,7 +2051,8 @@ if grep -q 'deepgram.test' "$config"; then
   printf '%s\n' "$$" > "$dir/deepgram.pid"
   : > "$dir/deepgram.started"
   rm -f "$config"
-  while [ ! -e "$dir/deepgram.release" ]; do sleep 0.01; done
+  i=0
+  while [ ! -e "$dir/deepgram.release" ] && [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
   printf '{"results":{"channels":[{"alternatives":[{"transcript":"late"}]}]}}'
 else
   rm -f "$config"
@@ -2049,6 +2099,98 @@ fi
         !Path::new(&format!("/proc/{}", pid.trim())).exists(),
         "the late Deepgram curl must be reaped before Idle is observable"
     );
+    assert!(!commands.path().join("deepgram.release").exists());
+}
+
+#[test]
+fn deepgram_chunk_failure_reaps_later_curls_before_idle() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+head -c 32000 /dev/zero | tr '\000' '\001'
+head -c 32000 /dev/zero | tr '\000' '\002'
+head -c 32000 /dev/zero | tr '\000' '\003'
+: > "$dir/pw-record.ready"
+i=0
+while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+config=$(mktemp "$dir/curl-config.XXXXXX")
+cat > "$config"
+if grep -q 'deepgram.test' "$config"; then
+  audio=$(sed -n 's/^data-binary = "@\(.*\)"$/\1/p' "$config")
+  byte=$(od -An -tu1 -N1 "$audio" | tr -d ' ')
+  printf '%s\n' "$$" >> "$dir/deepgram.pids"
+  : > "$dir/deepgram.started.$byte"
+  rm -f "$config"
+  if [ "$byte" = "1" ]; then
+    trap - EXIT
+    exit 22
+  fi
+  i=0
+  while [ ! -e "$dir/deepgram.release" ] && [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
+  printf '{"results":{"channels":[{"alternatives":[{"transcript":"late"}]}]}}'
+else
+  rm -f "$config"
+  printf '{"text":"Groq wins"}'
+fi
+"#,
+    );
+    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_TEST_MODE", "system-boundaries"),
+            ("VOISU_TEST_PROVIDER_DEADLINE_MS", "2000"),
+            ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
+            ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
+            (
+                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
+                "https://deepgram.test/v1/listen",
+            ),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "deepgram.started.1");
+    wait_for_marker(commands.path(), "deepgram.started.2");
+    wait_for_marker(commands.path(), "deepgram.started.3");
+
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(
+        stopped["evidence"]["source_transcript_providers"],
+        serde_json::json!(["groq"])
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    for pid in fs::read_to_string(commands.path().join("deepgram.pids"))
+        .unwrap()
+        .lines()
+    {
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "a later Deepgram curl must be reaped before Idle is observable"
+        );
+    }
     assert!(!commands.path().join("deepgram.release").exists());
 }
 
@@ -2386,7 +2528,8 @@ fn failed_recording_kills_its_in_flight_groq_request_before_the_next_recording()
         r#"#!/bin/sh
 head -c 1000000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
-while :; do sleep 1; done
+i=0
+while [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
 "#,
     );
     // A curl stub simulating a slow endpoint: records its pid and start, then
@@ -2398,7 +2541,8 @@ while :; do sleep 1; done
 dir=$(dirname "$0")
 printf '%s\n' "$$" >> "$dir/curl.pids"
 : > "$dir/curl.start"
-while :; do sleep 0.1; done
+i=0
+while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
 "#,
     );
     let path = format!(
@@ -2461,7 +2605,8 @@ fn failed_recording_kills_its_in_flight_deepgram_requests_before_the_next_record
         r#"#!/bin/sh
 head -c 64000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
-while :; do :; done
+i=0
+while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
 "#,
     );
     write_fake_command(
@@ -2475,7 +2620,8 @@ if grep -q 'deepgram.test' "$config"; then
   printf '%s\n' "$$" >> "$dir/deepgram.pids"
   : > "$dir/deepgram.start"
   rm -f "$config"
-  while :; do :; done
+  i=0
+  while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
 fi
 rm -f "$config"
 printf '{"text":"unused Groq Source Transcript"}'

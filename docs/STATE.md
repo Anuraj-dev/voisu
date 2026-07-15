@@ -1,10 +1,9 @@
 # Voisu — State
-> Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-15
+> Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-16
 
 ## 🚧 In progress / next
-- Ticket 04 first-review fixes remain uncommitted. Two parallel-suite acceptance flakes now have load-tolerant fixtures;
-  the orchestrator must run `cargo test --workspace` and three consecutive parallel `cargo test -p voisu-app` runs,
-  then run the Sol re-review at medium effort before commit/close/push and the model-benchmark update.
+- Ticket 04 follow-up hardening remains uncommitted. The orchestrator must run `cargo test --workspace` and the
+  parallel acceptance gate outside the managed sandbox, then run the Sol re-review before commit/close/push.
 
 ## Status
 - The independent `voisu` and `voisu-daemon` binaries communicate over bounded, versioned Unix IPC.
@@ -18,13 +17,15 @@
   loser is cancelled, killed, reaped, and awaited inside the recovery budget before completion can publish `Idle`.
 - Provider completion is deterministic and exactly-once; completion futures retain spawned request handles until each
   await finishes, so a deadline loser remains owned for cancellation, kill, reap, and awaited cleanup before `Idle`.
+  Deepgram completion errors also cancel and await every later retained chunk handle before publishing `Idle`.
   Structured IPC evidence reports first chunk, capture finalization, per-provider completion, accepted providers,
   release-to-text timing, and Delivery count.
 - Capture/provider failure and capture EOF return the daemon to idle; Deepgram and Groq cancellation use the
   per-Recording `CancelRegistry`, owning-child kill/reap, and awaited request-task cleanup before reuse.
-- The uncommitted Ticket 04 fix worktree retains the awaited late-provider cleanup semantics. Its acceptance fixtures
-  now gate provider-start failure on the capture PID marker, avoid CPU spin loops, and use a two-second test-only
-  Provider Deadline for the late-curl reap assertion; the orchestrator's parallel flake gate is pending.
+- Linux capture children request `PR_SET_PDEATHSIG(SIGKILL)`. Acceptance daemons run in isolated process groups whose
+  Drop guard kills the whole tree, and all generated shell stubs have signal/exit traps plus bounded wait loops.
+- The new failed-Deepgram-chunk regression compiles, but this managed sandbox returns `EPERM` when the process-group
+  daemon binds its Unix socket; run that acceptance test and the full gate in the orchestrator environment.
 
 ## Architecture map
 - Domain, audio contract, provider coordination/timings, typed errors, readiness/auth traits, IPC ->
@@ -56,4 +57,6 @@
 ## Gotchas
 - Use CONTEXT.md's ubiquitous language exactly; it lists banned synonyms.
 - `rustfmt` and `clippy` are unavailable (`sudo dnf install rustfmt clippy` needed); both remain skipped.
+- Managed-sandbox acceptance runs cannot bind the daemon socket after the required test `setpgid`; library/core tests
+  and `cargo check --workspace --tests` remain runnable locally.
 - The sandbox exposes `.git` read-only; keep the review fixes uncommitted until a writable Git environment is available.

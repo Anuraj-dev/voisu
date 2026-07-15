@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -754,6 +754,18 @@ impl AudioCapture for PipeWireCapture {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(target_os = "linux")]
+        // SAFETY: this hook only invokes the async-signal-safe `prctl` syscall
+        // between fork and exec; it does not allocate or touch shared state.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
         let mut child = command.spawn().map_err(|_| {
             BoundaryError::new(BoundaryKind::Capture, "pw-record unavailable")
         })?;
@@ -1249,10 +1261,31 @@ impl ProviderStream for DeepgramStream {
                 }));
             }
             let mut transcripts = Vec::new();
+            // Await the in-flight chunk WITHOUT removing it from `self.chunks`.
+            // If this completion future is dropped mid-await (e.g. the Provider
+            // Deadline elapses and the coordinator moves to `abort()`), the
+            // chunk must still be in the deque so the gated `abort()` awaits and
+            // reaps its curl child before Idle is observable. Popping it here
+            // would detach that reap and race the Idle transition.
             while let Some(chunk) = self.chunks.front_mut() {
-                let transcript = await_deepgram_chunk(chunk).await?;
-                self.chunks.pop_front();
-                transcripts.push(transcript);
+                match await_deepgram_chunk(chunk).await {
+                    Ok(transcript) => {
+                        self.chunks.pop_front();
+                        transcripts.push(transcript);
+                    }
+                    Err(error) => {
+                        // Cancel the siblings so their curl children are killed,
+                        // then drop the already-awaited front handle (re-awaiting
+                        // a completed JoinHandle panics) and await the rest so
+                        // their reaps complete before this error surfaces.
+                        self.cancel.cancel();
+                        self.chunks.pop_front();
+                        for chunk in self.chunks.drain(..) {
+                            let _ = chunk.await;
+                        }
+                        return Err(error);
+                    }
+                }
             }
             Ok(SourceTranscript {
                 provider: Provider::Deepgram,
