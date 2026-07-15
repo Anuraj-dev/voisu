@@ -39,7 +39,8 @@ relative to your own context. Always pass `--effort high` on these calls.
 
 | Work | Model | Effort |
 |---|---|---|
-| Code review (every substantial ticket diff) | gpt-5.6-sol | high (Sol never goes above high) |
+| Code review — FIRST review of a ticket | gpt-5.6-sol | high (Sol never goes above high) |
+| Code review — re-reviews after the first, until merge | gpt-5.5 | medium |
 | Tough / architectural tickets (concurrency, IPC, provider streaming, reconciliation) | gpt-5.6-sol | medium |
 | Regular feature work | gpt-5.6-terra | high |
 | Light work (glue, config, packaging, small fixes) | gpt-5.6-luna | medium |
