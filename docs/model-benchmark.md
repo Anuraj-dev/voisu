@@ -15,9 +15,15 @@
 | 7 | 02 | Reviews | Sol (high) | 4 rounds total, each caught real issues; final APPROVE | — | — | False-WARN, trickle-hold, zombie-reap catches were genuinely subtle |
 | 8 | 02 | Fix round 2 | Opus (high) | delivered acfa7d3, 43 tests | 2/3 resolved, 1 edge remained | — | ~2.6 min, 86k tokens |
 | 9 | 02 | Fix round 3 | Opus (high) | delivered cfe336f, 44 tests → APPROVE | 0 findings | closed ticket | ~1.7 min, 93k tokens; 3 rounds to fully clear subtle process-cleanup edges |
+| 10 | 03 | Feature impl (end-to-end slice) | Sol (medium) | delivered 44879f9, 47 tests | round 1: pump-termination BLOCKER + blocking startup + budget bugs | 1 round used | Ambitious slice; missed capture-pump failure lifecycle |
+| 11 | 03 | Fix round 1 | Sol (medium) | delivered 66ad789 | plaintext endpoints, test-mode bypass, dropped coordinator remained | round exhausted | Partial; left security holes |
+| 12 | 03 | Escalated fixes | Opus (high) | 436fcb7 + df573ad, 58 tests | deferral-queue ordering + PID-reuse race found by review | 2 rounds | Recovering-state redesign (reject-not-defer) done cleanly |
+| 13 | 03 | Final fix (PID-reuse race) | Opus (high) | delivered f51dbbd, 65 tests 3x green → APPROVE | 0 findings | closed ticket | Flag-only CancelRegistry + owner-side kill; ~4.6 min, 240k tokens |
+| 14 | 03 | Reviews | Sol (high first, medium re-reviews) | 5 rounds; real defects every round until final APPROVE | — | — | Sol medium re-review still caught PID-reuse race + ordering violations; policy validated |
 
 ## Running observations
 - Sol as reviewer: consistently finds real, subtle defects (concurrency, deadline, probe semantics). High value.
 - Terra: good throughput on regular feature work; weaker on security edge cases and subtle async/subprocess hazards.
 - Opus: strong on scoped escalation fixes — precise, test-first, no new defects so far (pending verdict).
 - Luna: not yet used (tickets 11–13).
+- Sol medium as re-reviewer (new policy from ticket 03): still catches HIGH-severity concurrency races — the cost cut did not lose review quality so far.
