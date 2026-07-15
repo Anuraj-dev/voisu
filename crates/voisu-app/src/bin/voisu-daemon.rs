@@ -238,7 +238,7 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                 Command::Start | Command::Toggle if matches!(state, ActorState::Idle) => {
                     let id = next_id;
                     next_id += 1;
-                    match begin_recording(&mut capture, &mut deepgram, &mut groq, id).await {
+                    match begin_recording(&mut capture, &mut deepgram, &mut groq, id) {
                         Ok((active_capture, streams)) => {
                             let evidence = LifecycleEvidence {
                                 recording_id: id,
@@ -381,9 +381,10 @@ fn status_response(state: &ActorState) -> Response {
 }
 
 /// Starts a Recording, aborting anything already started if a later step of the
-/// start sequence fails so no capture or provider is left dangling. Capture-abort
-/// errors are surfaced into the returned typed diagnostic rather than discarded.
-async fn begin_recording(
+/// start sequence fails so no capture or provider is left dangling. The abort
+/// runs off the actor loop (see `spawn_capture_abort`) so a stalled abort can
+/// never block subsequent commands such as status.
+fn begin_recording(
     capture: &mut Box<dyn AudioCapture>,
     deepgram: &mut Box<dyn TranscriptProvider>,
     groq: &mut Box<dyn TranscriptProvider>,
@@ -392,7 +393,10 @@ async fn begin_recording(
     let active_capture = capture.begin(id)?;
     let deepgram_stream = match deepgram.start(id) {
         Ok(stream) => stream,
-        Err(error) => return Err(abort_capture(active_capture, error).await),
+        Err(error) => {
+            spawn_capture_abort(id, active_capture);
+            return Err(error);
+        }
     };
     let groq_stream = match groq.start(id) {
         Ok(stream) => stream,
@@ -400,7 +404,8 @@ async fn begin_recording(
             // Deepgram already started: drop it (no provider abort seam) and
             // abort the capture so nothing is left running.
             drop(deepgram_stream);
-            return Err(abort_capture(active_capture, error).await);
+            spawn_capture_abort(id, active_capture);
+            return Err(error);
         }
     };
     Ok((
@@ -412,15 +417,31 @@ async fn begin_recording(
     ))
 }
 
-/// Aborts an already-started capture after another start step failed, folding any
-/// abort failure into the originating diagnostic so it is never silently dropped.
-async fn abort_capture(
-    capture: Box<dyn ActiveCapture>,
-    cause: BoundaryError,
-) -> BoundaryError {
-    match capture.abort().await {
-        Ok(()) => cause,
-        Err(abort_error) => combine_capture_abort(cause, abort_error),
+/// Aborts an already-started capture without blocking the lifecycle actor: a
+/// stalled abort must never make the daemon unresponsive. Abort failures and
+/// timeouts are surfaced into local diagnostics rather than discarded.
+fn spawn_capture_abort(id: u64, capture: Box<dyn ActiveCapture>) {
+    tokio::spawn(async move {
+        match timeout(IO_DEADLINE, capture.abort()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("Recording {id}: capture abort failed: {}", error.diagnostic());
+            }
+            Err(_) => eprintln!("Recording {id}: capture abort timed out"),
+        }
+    });
+}
+
+/// Awaits a capture abort with a bounded deadline, folding any abort failure or
+/// timeout into the originating diagnostic so it is never silently dropped.
+async fn bounded_abort(capture: Box<dyn ActiveCapture>, cause: BoundaryError) -> BoundaryError {
+    match timeout(IO_DEADLINE, capture.abort()).await {
+        Ok(Ok(())) => cause,
+        Ok(Err(abort_error)) => combine_capture_abort(cause, abort_error),
+        Err(_) => BoundaryError::new(
+            cause.kind(),
+            format!("{}; capture abort timed out", cause.diagnostic()),
+        ),
     }
 }
 
@@ -457,11 +478,20 @@ async fn capture_pump(
             _ = &mut stop_rx => break,
             result = capture.next_chunk() => match result {
                 Ok(Some(chunk)) => {
-                    if let Err(error) = providers.stream_audio(chunk).await {
-                        stream_error = Some(error);
-                        break;
+                    // The provider send must also race the stop signal: a
+                    // stalled provider send must never prevent the pump from
+                    // observing stop and releasing the Recording.
+                    tokio::select! {
+                        biased;
+                        _ = &mut stop_rx => break,
+                        sent = providers.stream_audio(chunk) => match sent {
+                            Ok(()) => { counter.fetch_add(1, Ordering::SeqCst); }
+                            Err(error) => {
+                                stream_error = Some(error);
+                                break;
+                            }
+                        },
                     }
-                    counter.fetch_add(1, Ordering::SeqCst);
                 }
                 Ok(None) => draining = true,
                 Err(error) => {
@@ -502,22 +532,14 @@ async fn process_recording(
 
     let result = async {
         if let Some(error) = stream_error {
-            let abort = capture.abort().await;
             evidence.stages.push(LifecycleStage::CaptureAborted);
-            return Err(match abort {
-                Ok(()) => error,
-                Err(abort_error) => combine_capture_abort(error, abort_error),
-            });
+            return Err(bounded_abort(capture, error).await);
         }
         let audio = match capture.finish().await {
             Ok(audio) => audio,
             Err(error) => {
-                let abort = capture.abort().await;
                 evidence.stages.push(LifecycleStage::CaptureAborted);
-                return Err(match abort {
-                    Ok(()) => error,
-                    Err(abort_error) => combine_capture_abort(error, abort_error),
-                });
+                return Err(bounded_abort(capture, error).await);
             }
         };
         evidence.stages.push(LifecycleStage::CaptureFinalized);
@@ -588,8 +610,17 @@ async fn serve(stream: UnixStream, actor: mpsc::Sender<ActorMessage>) -> Result<
 struct ControlledCapture {
     fail_finish_once: bool,
     fail_abort: bool,
+    abort_stall: Duration,
     chunks: u32,
     chunk_delay: Duration,
+}
+
+fn env_millis(name: &str) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_default()
 }
 
 impl ControlledCapture {
@@ -598,14 +629,11 @@ impl ControlledCapture {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(1);
-        let chunk_delay = std::env::var("VOISU_TEST_CHUNK_DELAY_MS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .map(Duration::from_millis)
-            .unwrap_or_default();
+        let chunk_delay = env_millis("VOISU_TEST_CHUNK_DELAY_MS");
         Self {
             fail_finish_once: std::env::var_os("VOISU_TEST_CAPTURE_FINISH_FAILURE").is_some(),
             fail_abort: std::env::var_os("VOISU_TEST_CAPTURE_ABORT_FAILURE").is_some(),
+            abort_stall: env_millis("VOISU_TEST_CAPTURE_ABORT_STALL_MS"),
             chunks,
             chunk_delay,
         }
@@ -618,6 +646,7 @@ impl AudioCapture for ControlledCapture {
         Ok(Box::new(ControlledActiveCapture {
             fail_finish,
             fail_abort: self.fail_abort,
+            abort_stall: self.abort_stall,
             remaining_chunks: self.chunks,
             chunk_delay: self.chunk_delay,
         }))
@@ -627,6 +656,7 @@ impl AudioCapture for ControlledCapture {
 struct ControlledActiveCapture {
     fail_finish: bool,
     fail_abort: bool,
+    abort_stall: Duration,
     remaining_chunks: u32,
     chunk_delay: Duration,
 }
@@ -660,7 +690,11 @@ impl ActiveCapture for ControlledActiveCapture {
 
     fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()> {
         let fail_abort = self.fail_abort;
+        let abort_stall = self.abort_stall;
         Box::pin(async move {
+            if !abort_stall.is_zero() {
+                tokio::time::sleep(abort_stall).await;
+            }
             if fail_abort {
                 Err(BoundaryError::new(
                     BoundaryKind::Capture,
@@ -676,16 +710,14 @@ impl ActiveCapture for ControlledActiveCapture {
 struct ControlledProvider {
     provider: Provider,
     delay: Duration,
+    send_stall: Duration,
     fail_start_once: bool,
 }
 
 impl ControlledProvider {
     fn from_env(provider: Provider) -> Self {
-        let delay = std::env::var("VOISU_TEST_PROVIDER_DELAY_MS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .map(Duration::from_millis)
-            .unwrap_or_default();
+        let delay = env_millis("VOISU_TEST_PROVIDER_DELAY_MS");
+        let send_stall = env_millis("VOISU_TEST_PROVIDER_SEND_STALL_MS");
         // Only Groq fails its start, so capture and Deepgram are already started
         // when the partial-start-failure abort path is exercised.
         let fail_start_once = provider == Provider::Groq
@@ -693,6 +725,7 @@ impl ControlledProvider {
         Self {
             provider,
             delay,
+            send_stall,
             fail_start_once,
         }
     }
@@ -709,6 +742,7 @@ impl TranscriptProvider for ControlledProvider {
         Ok(Box::new(ControlledProviderStream {
             provider: self.provider,
             delay: self.delay,
+            send_stall: self.send_stall,
         }))
     }
 }
@@ -716,6 +750,7 @@ impl TranscriptProvider for ControlledProvider {
 struct ControlledProviderStream {
     provider: Provider,
     delay: Duration,
+    send_stall: Duration,
 }
 
 impl ProviderStream for ControlledProviderStream {
@@ -724,7 +759,13 @@ impl ProviderStream for ControlledProviderStream {
     }
 
     fn send_audio(&mut self, _chunk: AudioChunk) -> BoundaryFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
+        let send_stall = self.send_stall;
+        Box::pin(async move {
+            if !send_stall.is_zero() {
+                tokio::time::sleep(send_stall).await;
+            }
+            Ok(())
+        })
     }
 
     fn complete(

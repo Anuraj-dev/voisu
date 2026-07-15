@@ -584,6 +584,103 @@ fn cli_read_has_a_deadline_when_the_daemon_never_responds() {
 }
 
 #[test]
+fn cli_read_deadline_covers_the_whole_frame_even_under_trickled_traffic() {
+    let runtime = TempDir::new().unwrap();
+    let path = socket_path(runtime.path());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(&path).unwrap();
+
+    // A trickle server: one byte every 250ms, never a terminator. A per-read
+    // timeout alone would be reset by every byte and wait forever.
+    let server = thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = String::new();
+            let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut request);
+            for _ in 0..24 {
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let status = voisu(runtime.path(), "status");
+    let elapsed = started.elapsed();
+    assert!(!status.status.success());
+    assert!(
+        elapsed >= Duration::from_millis(1800) && elapsed < Duration::from_secs(4),
+        "CLI must honor a whole-frame deadline under trickled traffic, elapsed {elapsed:?}"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn a_stalled_provider_send_does_not_prevent_stop_from_completing() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_CAPTURE_CHUNKS", "1"),
+            ("VOISU_TEST_PROVIDER_SEND_STALL_MS", "30000"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    // Let the capture pump enter the stalled provider send.
+    thread::sleep(Duration::from_millis(100));
+
+    let started = Instant::now();
+    let stop = voisu(runtime.path(), "stop");
+    let elapsed = started.elapsed();
+    assert!(stop.status.success(), "{}", stderr(&stop));
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "stop must not wait on a stalled provider send, elapsed {elapsed:?}"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+}
+
+#[test]
+fn a_stalled_partial_start_abort_keeps_the_daemon_responsive() {
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_PROVIDER_START_FAILURE", "1"),
+            ("VOISU_TEST_CAPTURE_ABORT_STALL_MS", "30000"),
+        ],
+    );
+
+    // The partial-start failure triggers a capture abort that stalls; the start
+    // reply and every subsequent command must not wait on it.
+    let started = Instant::now();
+    let failed = voisu(runtime.path(), "start");
+    assert_eq!(failed.status.code(), Some(4));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "start rejection must not wait on the stalled abort"
+    );
+
+    let status_started = Instant::now();
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert!(
+        status_started.elapsed() < Duration::from_millis(500),
+        "status must stay responsive while the abort is stalled"
+    );
+
+    // The bounded abort must surface its timeout into local diagnostics.
+    thread::sleep(Duration::from_millis(2300));
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains("capture abort timed out"),
+        "abort timeout must be surfaced, got: {diagnostics}"
+    );
+}
+
+#[test]
 fn cli_reports_version_mismatch_from_the_envelope_even_for_incompatible_payloads() {
     let runtime = TempDir::new().unwrap();
     let path = socket_path(runtime.path());
