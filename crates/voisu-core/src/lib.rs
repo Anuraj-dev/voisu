@@ -99,6 +99,8 @@ pub struct LifecycleEvidence {
     pub recording_id: u64,
     pub stages: Vec<LifecycleStage>,
     pub delivery_count: u32,
+    #[serde(default)]
+    pub streamed_chunk_count: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -158,6 +160,10 @@ impl BoundaryError {
         }
     }
 
+    pub fn kind(&self) -> BoundaryKind {
+        self.kind
+    }
+
     pub fn public_message(&self) -> &'static str {
         match self.kind {
             BoundaryKind::Capture => "Recording capture failed",
@@ -201,6 +207,9 @@ pub trait AudioCapture: Send {
 }
 
 pub trait ActiveCapture: Send {
+    /// Yields the next live audio chunk for this Recording, or `None` once the
+    /// capture has no further chunks to stream before it is finished.
+    fn next_chunk(&mut self) -> BoundaryFuture<'_, Option<AudioChunk>>;
     fn finish(&mut self) -> BoundaryFuture<'_, CapturedAudio>;
     fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()>;
 }
@@ -255,6 +264,10 @@ impl ProviderCoordinator {
 
         while !deepgram_done || !groq_done {
             tokio::select! {
+                // Bias toward provider results: if a valid Source Transcript is
+                // ready in the same poll as the Provider Deadline, honor the
+                // transcript instead of discarding it at the deadline instant.
+                biased;
                 result = &mut deepgram, if !deepgram_done => {
                     deepgram_done = true;
                     match result {

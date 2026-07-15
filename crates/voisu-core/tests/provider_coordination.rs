@@ -120,6 +120,42 @@ async fn provider_deadline_returns_the_valid_source_already_available() {
     assert_eq!(sources[0].provider, Provider::Deepgram);
 }
 
+#[tokio::test(start_paused = true)]
+async fn ready_sources_at_the_deadline_instant_are_not_discarded() {
+    // Both providers complete at exactly the Provider Deadline instant. With
+    // paused time the runtime advances to the shared timer, firing the provider
+    // completions and the deadline in the same poll. A biased select must accept
+    // the ready valid Source Transcripts instead of breaking at the deadline.
+    let deadline = Duration::from_millis(50);
+    let deepgram = Arc::new(AtomicUsize::new(0));
+    let groq = Arc::new(AtomicUsize::new(0));
+    let sources = ProviderCoordinator::start(
+        deadline,
+        ProviderStreams {
+            deepgram: stream(
+                Provider::Deepgram,
+                deadline,
+                Arc::clone(&deepgram),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            groq: stream(
+                Provider::Groq,
+                deadline,
+                Arc::clone(&groq),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        },
+    )
+    .complete(CapturedAudio)
+    .await
+    .expect("ready sources at the deadline instant must not be discarded");
+
+    assert_eq!(
+        sources.iter().map(|source| source.provider).collect::<Vec<_>>(),
+        vec![Provider::Deepgram, Provider::Groq]
+    );
+}
+
 #[test]
 fn boundary_errors_separate_redacted_public_text_from_local_diagnostics() {
     let error = BoundaryError::new(

@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -62,6 +62,22 @@ impl Daemon {
     fn crash(mut self) {
         self.child.kill().expect("daemon should be killed");
         let _ = self.child.wait();
+    }
+
+    /// Sends SIGTERM, then drains the daemon's stderr to EOF so local
+    /// diagnostics emitted during the run can be asserted on.
+    fn terminate_and_stderr(mut self) -> String {
+        let status = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status()
+            .expect("SIGTERM should be sent");
+        assert!(status.success());
+        let mut diagnostics = String::new();
+        if let Some(mut stderr) = self.child.stderr.take() {
+            stderr.read_to_string(&mut diagnostics).ok();
+        }
+        let _ = self.child.wait();
+        diagnostics
     }
 }
 
@@ -433,6 +449,166 @@ fn runtime_paths_are_private_and_unsafe_runtime_roots_are_rejected() {
     assert_eq!(
         stderr(&rejected),
         "XDG_RUNTIME_DIR must be a real directory\n"
+    );
+}
+
+#[test]
+fn live_chunks_flow_to_providers_during_the_recording_not_only_after_stop() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_CAPTURE_CHUNKS", "8"),
+            ("VOISU_TEST_CHUNK_DELAY_MS", "40"),
+        ],
+    );
+
+    let start = voisu(runtime.path(), "start");
+    assert!(start.status.success(), "{}", stderr(&start));
+
+    // While the Recording is still active, streamed chunks must already be
+    // reaching the providers through the streaming seam.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut streamed_during = 0_u64;
+    while Instant::now() < deadline {
+        let status = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+        if status["state"] == "recording" {
+            let count = status["evidence"]["streamed_chunk_count"].as_u64().unwrap_or(0);
+            if count > 0 {
+                streamed_during = count;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        streamed_during >= 1,
+        "chunks must flow to providers during the Recording, not only after stop"
+    );
+
+    let stop = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stop["ok"], true, "{stop}");
+    assert!(
+        stop["evidence"]["streamed_chunk_count"].as_u64().unwrap() >= streamed_during,
+        "final evidence must retain the streamed chunk count"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+}
+
+#[test]
+fn partial_provider_start_failure_aborts_the_capture_and_surfaces_abort_errors() {
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_PROVIDER_START_FAILURE", "1"),
+            ("VOISU_TEST_CAPTURE_ABORT_FAILURE", "1"),
+        ],
+    );
+
+    // Groq's start fails after capture and Deepgram already started; the daemon
+    // must abort the capture and reject with a redacted public message.
+    let failed = voisu(runtime.path(), "start");
+    assert_eq!(failed.status.code(), Some(4));
+    assert_eq!(stderr(&failed), "Source Transcripts are unavailable\n");
+    assert!(!stderr(&failed).contains("controlled"));
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+
+    // The one-shot provider failure is spent, so the next Recording proves the
+    // aborted resources were left in a clean, reusable state.
+    assert!(voisu(runtime.path(), "start").status.success());
+    let recovered = voisu(runtime.path(), "stop");
+    assert!(recovered.status.success(), "{}", stderr(&recovered));
+
+    // The discarded capture-abort error must be surfaced into local diagnostics.
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains("capture abort failed")
+            && diagnostics.contains("controlled-abort-detail"),
+        "capture-abort failure must be surfaced, got: {diagnostics}"
+    );
+}
+
+#[test]
+fn capture_finalization_abort_failure_is_surfaced_into_diagnostics() {
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_CAPTURE_FINISH_FAILURE", "1"),
+            ("VOISU_TEST_CAPTURE_ABORT_FAILURE", "1"),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+
+    let failed = voisu(runtime.path(), "stop");
+    assert_eq!(failed.status.code(), Some(4));
+    assert_eq!(stderr(&failed), "Recording capture failed\n");
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains("capture abort failed")
+            && diagnostics.contains("controlled-abort-detail"),
+        "finalization-path abort failure must be surfaced, got: {diagnostics}"
+    );
+}
+
+#[test]
+fn cli_read_has_a_deadline_when_the_daemon_never_responds() {
+    let runtime = TempDir::new().unwrap();
+    let path = socket_path(runtime.path());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(&path).unwrap();
+
+    // A silent server that reads the request but never replies.
+    let server = thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            let mut request = String::new();
+            let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut request);
+            thread::sleep(Duration::from_secs(4));
+            drop(stream);
+        }
+    });
+
+    let started = Instant::now();
+    let status = voisu(runtime.path(), "status");
+    let elapsed = started.elapsed();
+    assert!(!status.status.success());
+    assert!(
+        elapsed >= Duration::from_millis(1800) && elapsed < Duration::from_secs(4),
+        "CLI must honor a bounded read deadline, elapsed {elapsed:?}"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn cli_reports_version_mismatch_from_the_envelope_even_for_incompatible_payloads() {
+    let runtime = TempDir::new().unwrap();
+    let path = socket_path(runtime.path());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(&path).unwrap();
+
+    // Version-mismatched AND schema-incompatible for this CLI's Response.
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        stream
+            .write_all(b"{\"version\":999,\"ok\":\"not-a-bool\",\"payload\":{\"future\":true}}\n")
+            .unwrap();
+    });
+
+    let status = voisu(runtime.path(), "status");
+    server.join().unwrap();
+    assert!(!status.status.success());
+    assert_eq!(
+        stderr(&status),
+        "IPC protocol mismatch: daemon uses 999, CLI uses 1\n"
     );
 }
 

@@ -2,11 +2,14 @@ use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
@@ -35,7 +38,10 @@ async fn run() -> Result<(), String> {
         .parent()
         .ok_or_else(|| "daemon socket has no parent directory".to_owned())?;
     create_private_runtime_dirs(parent)?;
-    let lock = SingleInstance::acquire(&parent.join("daemon.lock"))?;
+    // Declared before the socket guard so it drops LAST on shutdown: the single-
+    // instance lock must outlive socket cleanup, otherwise a replacement daemon
+    // could acquire the lock and be spuriously rejected by the still-present socket.
+    let _lock = SingleInstance::acquire(&parent.join("daemon.lock"))?;
     prepare_socket_path(&path)?;
     let listener = UnixListener::bind(&path)
         .map_err(|error| format!("cannot bind daemon socket {}: {error}", path.display()))?;
@@ -48,7 +54,6 @@ async fn run() -> Result<(), String> {
         device: metadata.dev(),
         inode: metadata.ino(),
     };
-    let _lock = lock;
 
     let (actor_tx, actor_rx) = mpsc::channel(64);
     tokio::spawn(actor_loop(actor_rx, actor_tx.clone()));
@@ -182,9 +187,19 @@ enum ActorMessage {
 
 struct ActiveRecording {
     id: u64,
+    stop_tx: oneshot::Sender<()>,
+    pump: JoinHandle<PumpOutput>,
+    chunk_counter: Arc<AtomicU32>,
+    evidence: LifecycleEvidence,
+}
+
+/// Ownership handed back by the capture pump once a Recording stops: the still-
+/// live capture and provider coordinator, plus any error hit while streaming
+/// live chunks to the providers.
+struct PumpOutput {
     capture: Box<dyn ActiveCapture>,
     providers: ProviderCoordinator,
-    evidence: LifecycleEvidence,
+    stream_error: Option<BoundaryError>,
 }
 
 enum ActorState {
@@ -223,12 +238,7 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                 Command::Start | Command::Toggle if matches!(state, ActorState::Idle) => {
                     let id = next_id;
                     next_id += 1;
-                    let started = capture.begin(id).and_then(|active_capture| {
-                        let deepgram = deepgram.start(id)?;
-                        let groq = groq.start(id)?;
-                        Ok((active_capture, ProviderStreams { deepgram, groq }))
-                    });
-                    match started {
+                    match begin_recording(&mut capture, &mut deepgram, &mut groq, id).await {
                         Ok((active_capture, streams)) => {
                             let evidence = LifecycleEvidence {
                                 recording_id: id,
@@ -237,11 +247,23 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                                     LifecycleStage::ProvidersStarted,
                                 ],
                                 delivery_count: 0,
+                                streamed_chunk_count: 0,
                             };
+                            let (stop_tx, stop_rx) = oneshot::channel();
+                            let chunk_counter = Arc::new(AtomicU32::new(0));
+                            let coordinator =
+                                ProviderCoordinator::start(PROVIDER_DEADLINE, streams);
+                            let pump = tokio::spawn(capture_pump(
+                                active_capture,
+                                coordinator,
+                                stop_rx,
+                                Arc::clone(&chunk_counter),
+                            ));
                             state = ActorState::Recording(ActiveRecording {
                                 id,
-                                capture: active_capture,
-                                providers: ProviderCoordinator::start(PROVIDER_DEADLINE, streams),
+                                stop_tx,
+                                pump,
+                                chunk_counter,
                                 evidence,
                             });
                             let _ = reply.send(Response::success(
@@ -270,7 +292,10 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                     else {
                         unreachable!()
                     };
-                    state = ActorState::Processing(recording.evidence.clone());
+                    let mut processing_evidence = recording.evidence.clone();
+                    processing_evidence.streamed_chunk_count =
+                        recording.chunk_counter.load(Ordering::SeqCst);
+                    state = ActorState::Processing(processing_evidence);
                     let actor = tx.clone();
                     let current_validator = validator.take().expect("validator is available");
                     let current_delivery = delivery.take().expect("Delivery adapter is available");
@@ -344,45 +369,173 @@ fn status_response(state: &ActorState) -> Response {
         Some(daemon_state),
         daemon_state.cli_label(),
         match state {
-            ActorState::Recording(recording) => Some(recording.evidence.clone()),
+            ActorState::Recording(recording) => {
+                let mut evidence = recording.evidence.clone();
+                evidence.streamed_chunk_count = recording.chunk_counter.load(Ordering::SeqCst);
+                Some(evidence)
+            }
             ActorState::Processing(evidence) => Some(evidence.clone()),
             ActorState::Idle => None,
         },
     )
 }
 
+/// Starts a Recording, aborting anything already started if a later step of the
+/// start sequence fails so no capture or provider is left dangling. Capture-abort
+/// errors are surfaced into the returned typed diagnostic rather than discarded.
+async fn begin_recording(
+    capture: &mut Box<dyn AudioCapture>,
+    deepgram: &mut Box<dyn TranscriptProvider>,
+    groq: &mut Box<dyn TranscriptProvider>,
+    id: u64,
+) -> Result<(Box<dyn ActiveCapture>, ProviderStreams), BoundaryError> {
+    let active_capture = capture.begin(id)?;
+    let deepgram_stream = match deepgram.start(id) {
+        Ok(stream) => stream,
+        Err(error) => return Err(abort_capture(active_capture, error).await),
+    };
+    let groq_stream = match groq.start(id) {
+        Ok(stream) => stream,
+        Err(error) => {
+            // Deepgram already started: drop it (no provider abort seam) and
+            // abort the capture so nothing is left running.
+            drop(deepgram_stream);
+            return Err(abort_capture(active_capture, error).await);
+        }
+    };
+    Ok((
+        active_capture,
+        ProviderStreams {
+            deepgram: deepgram_stream,
+            groq: groq_stream,
+        },
+    ))
+}
+
+/// Aborts an already-started capture after another start step failed, folding any
+/// abort failure into the originating diagnostic so it is never silently dropped.
+async fn abort_capture(
+    capture: Box<dyn ActiveCapture>,
+    cause: BoundaryError,
+) -> BoundaryError {
+    match capture.abort().await {
+        Ok(()) => cause,
+        Err(abort_error) => combine_capture_abort(cause, abort_error),
+    }
+}
+
+fn combine_capture_abort(cause: BoundaryError, abort_error: BoundaryError) -> BoundaryError {
+    BoundaryError::new(
+        cause.kind(),
+        format!(
+            "{}; capture abort failed: {}",
+            cause.diagnostic(),
+            abort_error.diagnostic()
+        ),
+    )
+}
+
+/// Owns the live capture and provider coordinator during a Recording, feeding
+/// every captured chunk to BOTH providers as it arrives, until the Recording is
+/// stopped. Hands ownership back so the stop path can finalize and complete.
+async fn capture_pump(
+    mut capture: Box<dyn ActiveCapture>,
+    mut providers: ProviderCoordinator,
+    mut stop_rx: oneshot::Receiver<()>,
+    counter: Arc<AtomicU32>,
+) -> PumpOutput {
+    let mut stream_error = None;
+    let mut draining = false;
+    loop {
+        if draining {
+            // No further chunks to stream; hold the Recording open until stop.
+            let _ = (&mut stop_rx).await;
+            break;
+        }
+        tokio::select! {
+            biased;
+            _ = &mut stop_rx => break,
+            result = capture.next_chunk() => match result {
+                Ok(Some(chunk)) => {
+                    if let Err(error) = providers.stream_audio(chunk).await {
+                        stream_error = Some(error);
+                        break;
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(None) => draining = true,
+                Err(error) => {
+                    stream_error = Some(error);
+                    break;
+                }
+            },
+        }
+    }
+    PumpOutput {
+        capture,
+        providers,
+        stream_error,
+    }
+}
+
 async fn process_recording(
-    mut recording: ActiveRecording,
+    recording: ActiveRecording,
     mut validator: Box<dyn TranscriptValidator>,
     mut delivery: Box<dyn DeliveryAdapter>,
     actor: mpsc::Sender<ActorMessage>,
     reply: oneshot::Sender<Response>,
 ) {
+    let ActiveRecording {
+        id,
+        stop_tx,
+        pump,
+        chunk_counter,
+        mut evidence,
+    } = recording;
+    let _ = stop_tx.send(());
+    let PumpOutput {
+        mut capture,
+        providers,
+        stream_error,
+    } = pump.await.expect("capture pump should not panic");
+    evidence.streamed_chunk_count = chunk_counter.load(Ordering::SeqCst);
+
     let result = async {
-        let audio = match recording.capture.finish().await {
+        if let Some(error) = stream_error {
+            let abort = capture.abort().await;
+            evidence.stages.push(LifecycleStage::CaptureAborted);
+            return Err(match abort {
+                Ok(()) => error,
+                Err(abort_error) => combine_capture_abort(error, abort_error),
+            });
+        }
+        let audio = match capture.finish().await {
             Ok(audio) => audio,
             Err(error) => {
-                let _ = recording.capture.abort().await;
-                recording.evidence.stages.push(LifecycleStage::CaptureAborted);
-                return Err(error);
+                let abort = capture.abort().await;
+                evidence.stages.push(LifecycleStage::CaptureAborted);
+                return Err(match abort {
+                    Ok(()) => error,
+                    Err(abort_error) => combine_capture_abort(error, abort_error),
+                });
             }
         };
-        recording.evidence.stages.push(LifecycleStage::CaptureFinalized);
-        let sources = recording.providers.complete(audio).await?;
-        recording.evidence.stages.push(LifecycleStage::ProvidersCompleted);
+        evidence.stages.push(LifecycleStage::CaptureFinalized);
+        let sources = providers.complete(audio).await?;
+        evidence.stages.push(LifecycleStage::ProvidersCompleted);
         let transcript = validator.validate(sources)?;
-        recording.evidence.stages.push(LifecycleStage::ValidationCompleted);
+        evidence.stages.push(LifecycleStage::ValidationCompleted);
         delivery.deliver(transcript).await?;
-        recording.evidence.delivery_count += 1;
-        recording.evidence.stages.push(LifecycleStage::DeliveryCompleted);
+        evidence.delivery_count += 1;
+        evidence.stages.push(LifecycleStage::DeliveryCompleted);
         Ok(())
     }
     .await;
     let _ = actor
         .send(ActorMessage::Completed(Completion {
-            id: recording.id,
+            id,
             result,
-            evidence: recording.evidence,
+            evidence,
             validator,
             delivery,
             reply,
@@ -434,12 +587,27 @@ async fn serve(stream: UnixStream, actor: mpsc::Sender<ActorMessage>) -> Result<
 
 struct ControlledCapture {
     fail_finish_once: bool,
+    fail_abort: bool,
+    chunks: u32,
+    chunk_delay: Duration,
 }
 
 impl ControlledCapture {
     fn from_env() -> Self {
+        let chunks = std::env::var("VOISU_TEST_CAPTURE_CHUNKS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1);
+        let chunk_delay = std::env::var("VOISU_TEST_CHUNK_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or_default();
         Self {
             fail_finish_once: std::env::var_os("VOISU_TEST_CAPTURE_FINISH_FAILURE").is_some(),
+            fail_abort: std::env::var_os("VOISU_TEST_CAPTURE_ABORT_FAILURE").is_some(),
+            chunks,
+            chunk_delay,
         }
     }
 }
@@ -447,15 +615,36 @@ impl ControlledCapture {
 impl AudioCapture for ControlledCapture {
     fn begin(&mut self, _recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError> {
         let fail_finish = std::mem::take(&mut self.fail_finish_once);
-        Ok(Box::new(ControlledActiveCapture { fail_finish }))
+        Ok(Box::new(ControlledActiveCapture {
+            fail_finish,
+            fail_abort: self.fail_abort,
+            remaining_chunks: self.chunks,
+            chunk_delay: self.chunk_delay,
+        }))
     }
 }
 
 struct ControlledActiveCapture {
     fail_finish: bool,
+    fail_abort: bool,
+    remaining_chunks: u32,
+    chunk_delay: Duration,
 }
 
 impl ActiveCapture for ControlledActiveCapture {
+    fn next_chunk(&mut self) -> BoundaryFuture<'_, Option<AudioChunk>> {
+        Box::pin(async move {
+            if self.remaining_chunks == 0 {
+                return Ok(None);
+            }
+            self.remaining_chunks -= 1;
+            if !self.chunk_delay.is_zero() {
+                tokio::time::sleep(self.chunk_delay).await;
+            }
+            Ok(Some(AudioChunk(vec![0])))
+        })
+    }
+
     fn finish(&mut self) -> BoundaryFuture<'_, CapturedAudio> {
         Box::pin(async move {
             if self.fail_finish {
@@ -470,13 +659,24 @@ impl ActiveCapture for ControlledActiveCapture {
     }
 
     fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()> {
-        Box::pin(async { Ok(()) })
+        let fail_abort = self.fail_abort;
+        Box::pin(async move {
+            if fail_abort {
+                Err(BoundaryError::new(
+                    BoundaryKind::Capture,
+                    "controlled-abort-detail",
+                ))
+            } else {
+                Ok(())
+            }
+        })
     }
 }
 
 struct ControlledProvider {
     provider: Provider,
     delay: Duration,
+    fail_start_once: bool,
 }
 
 impl ControlledProvider {
@@ -486,12 +686,26 @@ impl ControlledProvider {
             .and_then(|value| value.parse().ok())
             .map(Duration::from_millis)
             .unwrap_or_default();
-        Self { provider, delay }
+        // Only Groq fails its start, so capture and Deepgram are already started
+        // when the partial-start-failure abort path is exercised.
+        let fail_start_once = provider == Provider::Groq
+            && std::env::var_os("VOISU_TEST_PROVIDER_START_FAILURE").is_some();
+        Self {
+            provider,
+            delay,
+            fail_start_once,
+        }
     }
 }
 
 impl TranscriptProvider for ControlledProvider {
     fn start(&mut self, _recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError> {
+        if std::mem::take(&mut self.fail_start_once) {
+            return Err(BoundaryError::new(
+                BoundaryKind::Provider,
+                "controlled-provider-start-detail",
+            ));
+        }
         Ok(Box::new(ControlledProviderStream {
             provider: self.provider,
             delay: self.delay,

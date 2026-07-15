@@ -1,8 +1,14 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
+use std::time::Duration;
 
-use voisu_core::{Command, PROTOCOL_VERSION, Request, Response, socket_path};
+use voisu_core::{
+    Command, PROTOCOL_VERSION, Request, Response, VersionEnvelope, socket_path,
+};
+
+const MAX_RESPONSE_BYTES: u64 = 16 * 1024;
+const IO_DEADLINE: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
     let command = match parse_command() {
@@ -21,6 +27,12 @@ fn main() -> ExitCode {
         }
     };
 
+    if stream.set_read_timeout(Some(IO_DEADLINE)).is_err()
+        || stream.set_write_timeout(Some(IO_DEADLINE)).is_err()
+    {
+        return fail(1, "failed to configure daemon connection deadline");
+    }
+
     let request = Request {
         version: PROTOCOL_VERSION,
         command,
@@ -29,23 +41,36 @@ fn main() -> ExitCode {
         return fail(1, "failed to send command to daemon");
     }
 
+    // Bounded, deadline-guarded read: never trust the daemon to send a
+    // terminated frame within a finite size.
     let mut response = String::new();
-    if BufReader::new(stream).read_line(&mut response).is_err() {
+    let mut limited = BufReader::new(stream).take(MAX_RESPONSE_BYTES + 1);
+    if limited.read_line(&mut response).is_err() {
         return fail(1, "failed to read daemon response");
+    }
+    if response.len() as u64 > MAX_RESPONSE_BYTES || !response.ends_with('\n') {
+        return fail(1, "daemon response frame is too large or incomplete");
+    }
+
+    // Envelope-first decode: reject a protocol mismatch before trusting the
+    // rest of the payload to match this CLI's schema.
+    let envelope: VersionEnvelope = match serde_json::from_str(&response) {
+        Ok(envelope) => envelope,
+        Err(_) => return fail(1, "daemon returned an invalid response"),
+    };
+    if envelope.version != PROTOCOL_VERSION {
+        return fail(
+            5,
+            &format!(
+                "IPC protocol mismatch: daemon uses {}, CLI uses {}",
+                envelope.version, PROTOCOL_VERSION
+            ),
+        );
     }
     let response: Response = match serde_json::from_str(&response) {
         Ok(response) => response,
         Err(_) => return fail(1, "daemon returned an invalid response"),
     };
-    if response.version != PROTOCOL_VERSION {
-        return fail(
-            5,
-            &format!(
-                "IPC protocol mismatch: daemon uses {}, CLI uses {}",
-                response.version, PROTOCOL_VERSION
-            ),
-        );
-    }
     if response.ok {
         println!("{}", response.message);
         ExitCode::SUCCESS
