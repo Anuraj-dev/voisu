@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test gate (workspace + 3x flake gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Workspace suite
+        run: cargo test --workspace
+      - name: Flake gate — 3 consecutive parallel voisu-app runs
+        run: |
+          for i in 1 2 3; do
+            echo "::group::flake run $i"
+            cargo test -p voisu-app
+            echo "::endgroup::"
+          done
