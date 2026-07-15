@@ -525,68 +525,31 @@ fn restricted_command(program: &str) -> Command {
     command
 }
 
-/// Cancellation registry shared between a provider stream and its in-flight
-/// subprocess requests: aborting the stream kills every registered child so a
-/// failed Recording's blocking work cannot continue into the next Recording.
+/// Cancellation flag shared between a provider stream and its in-flight
+/// subprocess requests. It deliberately stores NO pids: signaling a raw pid is
+/// unsafe once reaping happens elsewhere (a reaped pid can be recycled by the
+/// kernel and the signal would land on an unrelated process). `cancel()` only
+/// sets the flag; the bounded-wait loop that OWNS each `Child` observes it on
+/// its next poll tick and kills through its own `Child` handle — pid-reuse-safe
+/// because that same loop is the only reaper, so the handle cannot be recycled
+/// while unreaped. Kill latency is at most one poll tick.
 struct CancelRegistry {
     cancelled: AtomicBool,
-    pids: Mutex<Vec<u32>>,
 }
 
 impl CancelRegistry {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             cancelled: AtomicBool::new(false),
-            pids: Mutex::new(Vec::new()),
         })
     }
 
-    /// Registers a live child. Returns false when the registry is already
-    /// cancelled; the caller must then kill and reap the child itself.
-    fn register(&self, pid: u32) -> bool {
-        let mut pids = self.pids.lock().unwrap();
-        if self.cancelled.load(Ordering::SeqCst) {
-            return false;
-        }
-        pids.push(pid);
-        true
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
     }
 
-    fn deregister(&self, pid: u32) {
-        self.pids.lock().unwrap().retain(|registered| *registered != pid);
-    }
-
-    /// Marks the registry cancelled and kills every registered child. The
-    /// owning `run_restricted_with_deadline` call reaps the killed child under
-    /// its own bounded wait, preserving the kill+reap invariant.
     fn cancel(&self) {
-        let pids = {
-            let mut pids = self.pids.lock().unwrap();
-            self.cancelled.store(true, Ordering::SeqCst);
-            std::mem::take(&mut *pids)
-        };
-        for pid in pids {
-            if let Ok(pid) = i32::try_from(pid) {
-                // SAFETY: kill only sends a signal to the recorded child pid.
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-            }
-        }
-    }
-}
-
-/// Deregisters a child from its cancel registry on every exit path.
-struct CancelGuard<'a> {
-    cancel: Option<&'a CancelRegistry>,
-    pid: u32,
-}
-
-impl Drop for CancelGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(cancel) = self.cancel {
-            cancel.deregister(self.pid);
-        }
+        self.cancelled.store(true, Ordering::SeqCst);
     }
 }
 
@@ -607,6 +570,10 @@ fn run_restricted_with_deadline(
     deadline: Duration,
     cancel: Option<&CancelRegistry>,
 ) -> Result<ProcessOutcome, ProcessError> {
+    // Fail fast without spawning when the operation is already cancelled.
+    if cancel.is_some_and(CancelRegistry::is_cancelled) {
+        return Err(ProcessError::TimedOut);
+    }
     let started = Instant::now();
     let mut command = restricted_command(program);
     command
@@ -615,17 +582,6 @@ fn run_restricted_with_deadline(
         .stdout(if capture_stdout { Stdio::piped() } else { Stdio::null() })
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|_| ProcessError::Unavailable)?;
-    if let Some(cancel) = cancel {
-        if !cancel.register(child.id()) {
-            let _ = child.kill();
-            reap_briefly(&mut child);
-            return Err(ProcessError::TimedOut);
-        }
-    }
-    let _cancel_guard = CancelGuard {
-        cancel,
-        pid: child.id(),
-    };
     // The whole-operation deadline starts before spawn and covers startup, the
     // stdin write, pipe drains, and wait. The write runs on its own thread so
     // the polling loop can kill an overdue child, which breaks the pipe and
@@ -655,7 +611,7 @@ fn run_restricted_with_deadline(
     // Collect every helper-thread result FIRST, then decide the outcome: an
     // early return between joins would silently detach a later thread while it
     // may still be blocked on a descendant-held pipe.
-    let status = wait_for_child(&mut child, started, deadline);
+    let status = wait_for_child(&mut child, started, deadline, cancel);
     let writer = writer.map(|handle| bounded_join(handle, started, &mut child, deadline));
     let stdout_joined = stdout_reader.map(|handle| bounded_join(handle, started, &mut child, deadline));
     let stderr_joined = stderr_reader.map(|handle| bounded_join(handle, started, &mut child, deadline));
@@ -739,6 +695,7 @@ fn wait_for_child(
     child: &mut Child,
     started: Instant,
     deadline: Duration,
+    cancel: Option<&CancelRegistry>,
 ) -> Result<std::process::ExitStatus, ProcessError> {
     loop {
         match child.try_wait() {
@@ -752,7 +709,12 @@ fn wait_for_child(
                 return Err(ProcessError::Wait);
             }
         }
-        if started.elapsed() >= deadline {
+        // Cancellation is observed by the loop that owns the Child handle:
+        // killing through the handle is pid-reuse-safe because this loop is
+        // also the only reaper. Latency is at most one poll tick.
+        if cancel.is_some_and(CancelRegistry::is_cancelled)
+            || started.elapsed() >= deadline
+        {
             let _ = child.kill();
             reap_briefly(child);
             return Err(ProcessError::TimedOut);
@@ -886,7 +848,7 @@ impl PipeWireActiveCapture {
             let _ = child.kill();
         }
         let stopped = Instant::now();
-        let status = wait_for_child(&mut child, stopped, PROCESS_DEADLINE);
+        let status = wait_for_child(&mut child, stopped, PROCESS_DEADLINE, None);
         let reader = self
             .reader
             .take()
@@ -1076,10 +1038,10 @@ struct GroqStream {
     buffer: Vec<u8>,
     streamed_bytes: usize,
     chunks: Vec<tokio::task::JoinHandle<Result<String, BoundaryError>>>,
-    /// Per-Recording registry of in-flight curl children. Because each
-    /// Recording gets its own stream and registry, cancelling one Recording
-    /// can never touch the next one's requests, and stale results die with
-    /// their aborted stream.
+    /// Per-Recording cancellation flag observed by each in-flight curl
+    /// request's owning bounded wait. Because each Recording gets its own
+    /// stream and flag, cancelling one Recording can never touch the next
+    /// one's requests, and stale results die with their aborted stream.
     cancel: Arc<CancelRegistry>,
 }
 
@@ -1112,9 +1074,11 @@ impl ProviderStream for GroqStream {
 
     fn abort(mut self: Box<Self>) -> BoundaryFuture<'static, ()> {
         Box::pin(async move {
-            // Kill the in-flight curl children first: aborting the tasks alone
-            // would detach already-running blocking requests, letting work from
-            // the failed Recording overlap the next one.
+            // Cancel the in-flight curl children first: each owning bounded
+            // wait observes the flag within one poll tick and kills through
+            // its own Child handle. Aborting the tasks alone would detach
+            // already-running blocking requests, letting work from the failed
+            // Recording overlap the next one.
             self.cancel.cancel();
             for chunk in self.chunks.drain(..) {
                 chunk.abort();
@@ -1374,4 +1338,56 @@ fn wav_from_pcm(pcm: &[u8]) -> Result<Vec<u8>, BoundaryError> {
     wav.extend_from_slice(&data_len.to_le_bytes());
     wav.extend_from_slice(pcm);
     Ok(wav)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_set_mid_wait_kills_the_owned_child_within_the_poll_bound() {
+        let cancel = CancelRegistry::new();
+        let registry = Arc::clone(&cancel);
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            registry.cancel();
+        });
+        let started = Instant::now();
+        let result = run_restricted_with_deadline(
+            "sleep",
+            &["5"],
+            None,
+            false,
+            Duration::from_secs(4),
+            Some(&cancel),
+        );
+        canceller.join().unwrap();
+        assert!(matches!(result, Err(ProcessError::TimedOut)));
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "a mid-wait cancel must kill within the poll bound, elapsed {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn already_cancelled_operations_fail_fast_without_spawning() {
+        let cancel = CancelRegistry::new();
+        cancel.cancel();
+        let started = Instant::now();
+        let result = run_restricted_with_deadline(
+            "sleep",
+            &["5"],
+            None,
+            false,
+            Duration::from_secs(4),
+            Some(&cancel),
+        );
+        assert!(matches!(result, Err(ProcessError::TimedOut)));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "an already-cancelled operation must not spawn, elapsed {:?}",
+            started.elapsed()
+        );
+    }
 }

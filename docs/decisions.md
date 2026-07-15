@@ -84,9 +84,12 @@ deferred Toggles misbehave, and a deferred Start can begin a Recording after its
 a ghost Recording nobody observes. Rejection preserves command ordering by construction and never starts a
 Recording without a live client; callers retry, which the CLI acceptance helper encodes.
 
-## 2026-07-15 — Provider aborts must kill registered subprocesses, not just tasks
+## 2026-07-15 — Provider aborts must kill their subprocesses, not just tasks — via a cancel flag, never raw pids
 **Why:** Aborting a tokio task that awaits `spawn_blocking` curl work detaches the blocking subprocess, which
 would keep an aborted Recording's provider request alive for up to its 14 s deadline and overlap the next
-Recording. Each Groq stream owns a per-Recording cancel registry of in-flight curl child pids; abort marks it
-cancelled and SIGKILLs the registered children (the owning bounded-wait loop reaps them), and per-Recording
-registry ownership guarantees stale results die with their aborted stream.
+Recording. A first design that stored in-flight child pids and SIGKILLed them from abort was rejected: once a
+child is reaped elsewhere its pid can be recycled by the kernel, so raw-pid signaling can kill an unrelated
+process. Instead, each Groq stream owns a per-Recording cancel FLAG; abort only sets it, and the bounded-wait
+loop that owns each `Child` observes the flag every ~10 ms poll tick and kills through its own `Child` handle —
+pid-reuse-safe because that loop is the only reaper. Already-cancelled operations fail fast without spawning,
+and per-Recording flag ownership guarantees stale results die with their aborted stream.
