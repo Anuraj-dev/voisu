@@ -15,3 +15,16 @@ without test-only binary lookup hooks.
 ## 2026-07-15 — Version IPC in both the socket path and every payload
 **Why:** `$XDG_RUNTIME_DIR/voisu/v1/daemon.sock` prevents accidental cross-major socket discovery, while
 request and response version fields let both peers reject incompatible payloads explicitly.
+
+## 2026-07-15 — Serialize lifecycle transitions in an actor, not a shared mutex
+**Why:** The actor makes start/stop decisions atomic while long-running capture finalization, provider
+coordination, validation, and Delivery run asynchronously, leaving processing observable through status.
+
+## 2026-07-15 — Give each Recording one dual-provider coordinator
+**Why:** Starting attributed Deepgram and Groq streams with the Recording and consuming the coordinator at
+completion provides a seam for live chunks, deterministic ordering, a Provider Deadline, and exactly-once
+completion without adding real provider behavior to Ticket 01.
+
+## 2026-07-15 — Treat the runtime socket as a user-owned capability
+**Why:** A private validated XDG root, single-instance lock, stale-socket probe, mode-0600 socket, and
+device/inode-checked cleanup prevent one daemon instance from deleting or replacing another instance's path.

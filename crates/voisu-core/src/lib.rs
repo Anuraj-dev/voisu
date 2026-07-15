@@ -1,17 +1,44 @@
-//! Shared domain, lifecycle, and IPC types for Voisu.
+//! Shared domain, provider coordination, and IPC types for Voisu.
 
 use std::env;
+use std::future::Future;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+pub fn runtime_dir() -> Result<PathBuf, String> {
+    let path = PathBuf::from(
+        env::var_os("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "XDG_RUNTIME_DIR is not set".to_owned())?,
+    );
+    if !path.is_absolute() {
+        return Err("XDG_RUNTIME_DIR must be absolute".to_owned());
+    }
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|error| format!("cannot inspect XDG_RUNTIME_DIR: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("XDG_RUNTIME_DIR must be a real directory".to_owned());
+    }
+    // SAFETY: geteuid has no preconditions and does not mutate memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        return Err("XDG_RUNTIME_DIR must be owned by the current user".to_owned());
+    }
+    if metadata.mode() & 0o777 != 0o700 {
+        return Err("XDG_RUNTIME_DIR must have mode 0700".to_owned());
+    }
+    Ok(path)
+}
+
 pub fn socket_path() -> Result<PathBuf, String> {
-    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "XDG_RUNTIME_DIR is not set".to_owned())?;
-    Ok(PathBuf::from(runtime_dir)
+    Ok(runtime_dir()?
         .join("voisu")
         .join(format!("v{PROTOCOL_VERSION}"))
         .join("daemon.sock"))
@@ -31,6 +58,7 @@ pub enum Command {
 pub enum DaemonState {
     Idle,
     Recording,
+    Processing,
 }
 
 impl DaemonState {
@@ -38,8 +66,14 @@ impl DaemonState {
         match self {
             Self::Idle => "idle",
             Self::Recording => "Recording",
+            Self::Processing => "processing",
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VersionEnvelope {
+    pub version: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -48,136 +82,218 @@ pub struct Request {
     pub command: Command,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleStage {
+    CaptureStarted,
+    ProvidersStarted,
+    CaptureFinalized,
+    ProvidersCompleted,
+    ValidationCompleted,
+    DeliveryCompleted,
+    CaptureAborted,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LifecycleEvidence {
+    pub recording_id: u64,
+    pub stages: Vec<LifecycleStage>,
+    pub delivery_count: u32,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Response {
     pub version: u32,
     pub ok: bool,
     pub state: Option<DaemonState>,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<LifecycleEvidence>,
 }
 
 impl Response {
     pub fn success(state: DaemonState, message: impl Into<String>) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            ok: true,
-            state: Some(state),
-            message: message.into(),
-        }
+        Self::with_evidence(true, Some(state), message, None)
     }
 
     pub fn rejected(state: Option<DaemonState>, message: impl Into<String>) -> Self {
+        Self::with_evidence(false, state, message, None)
+    }
+
+    pub fn with_evidence(
+        ok: bool,
+        state: Option<DaemonState>,
+        message: impl Into<String>,
+        evidence: Option<LifecycleEvidence>,
+    ) -> Self {
         Self {
             version: PROTOCOL_VERSION,
-            ok: false,
+            ok,
             state,
             message: message.into(),
+            evidence,
         }
     }
 }
 
-#[derive(Debug)]
-pub struct CapturedAudio;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BoundaryKind {
+    Capture,
+    Provider,
+    Validation,
+    Delivery,
+}
 
 #[derive(Debug)]
-pub struct SourceTranscript(pub String);
+pub struct BoundaryError {
+    kind: BoundaryKind,
+    diagnostic: String,
+}
+
+impl BoundaryError {
+    pub fn new(kind: BoundaryKind, diagnostic: impl Into<String>) -> Self {
+        Self {
+            kind,
+            diagnostic: diagnostic.into(),
+        }
+    }
+
+    pub fn public_message(&self) -> &'static str {
+        match self.kind {
+            BoundaryKind::Capture => "Recording capture failed",
+            BoundaryKind::Provider => "Source Transcripts are unavailable",
+            BoundaryKind::Validation => "Transcript failed quality validation",
+            BoundaryKind::Delivery => "Transcript Delivery failed",
+        }
+    }
+
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+}
+
+pub type BoundaryFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, BoundaryError>> + Send + 'a>>;
+
+#[derive(Clone, Debug)]
+pub struct AudioChunk(pub Vec<u8>);
+
+#[derive(Clone, Debug)]
+pub struct CapturedAudio;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Provider {
+    Deepgram,
+    Groq,
+}
+
+#[derive(Clone, Debug)]
+pub struct SourceTranscript {
+    pub provider: Provider,
+    pub text: String,
+}
 
 #[derive(Debug)]
 pub struct Transcript(pub String);
 
 pub trait AudioCapture: Send {
-    fn begin(&mut self) -> Result<(), String>;
-    fn finish(&mut self) -> Result<CapturedAudio, String>;
+    fn begin(&mut self, recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError>;
+}
+
+pub trait ActiveCapture: Send {
+    fn finish(&mut self) -> BoundaryFuture<'_, CapturedAudio>;
+    fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()>;
 }
 
 pub trait TranscriptProvider: Send {
-    fn transcribe(&mut self, audio: CapturedAudio) -> Result<SourceTranscript, String>;
+    fn start(&mut self, recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError>;
+}
+
+pub trait ProviderStream: Send {
+    fn provider(&self) -> Provider;
+    fn send_audio(&mut self, chunk: AudioChunk) -> BoundaryFuture<'_, ()>;
+    fn complete(self: Box<Self>, audio: CapturedAudio)
+    -> BoundaryFuture<'static, SourceTranscript>;
+}
+
+pub struct ProviderStreams {
+    pub deepgram: Box<dyn ProviderStream>,
+    pub groq: Box<dyn ProviderStream>,
+}
+
+pub struct ProviderCoordinator {
+    deadline: Duration,
+    streams: ProviderStreams,
+}
+
+impl ProviderCoordinator {
+    pub fn start(deadline: Duration, streams: ProviderStreams) -> Self {
+        Self { deadline, streams }
+    }
+
+    pub async fn stream_audio(&mut self, chunk: AudioChunk) -> Result<(), BoundaryError> {
+        let deepgram = self.streams.deepgram.send_audio(chunk.clone());
+        let groq = self.streams.groq.send_audio(chunk);
+        let (deepgram, groq) = tokio::join!(deepgram, groq);
+        deepgram?;
+        groq
+    }
+
+    pub async fn complete(
+        self,
+        audio: CapturedAudio,
+    ) -> Result<Vec<SourceTranscript>, BoundaryError> {
+        let deepgram = self.streams.deepgram.complete(audio.clone());
+        let groq = self.streams.groq.complete(audio);
+        tokio::pin!(deepgram, groq);
+        let deadline = tokio::time::sleep(self.deadline);
+        tokio::pin!(deadline);
+        let mut deepgram_done = false;
+        let mut groq_done = false;
+        let mut transcripts = Vec::new();
+        let mut diagnostics = Vec::new();
+
+        while !deepgram_done || !groq_done {
+            tokio::select! {
+                result = &mut deepgram, if !deepgram_done => {
+                    deepgram_done = true;
+                    match result {
+                        Ok(source) => transcripts.push(source),
+                        Err(error) => diagnostics.push(error.diagnostic().to_owned()),
+                    }
+                }
+                result = &mut groq, if !groq_done => {
+                    groq_done = true;
+                    match result {
+                        Ok(source) => transcripts.push(source),
+                        Err(error) => diagnostics.push(error.diagnostic().to_owned()),
+                    }
+                }
+                _ = &mut deadline => break,
+            }
+        }
+
+        transcripts.sort_by_key(|source| source.provider);
+        if transcripts.is_empty() {
+            let detail = if diagnostics.is_empty() {
+                "Provider Deadline elapsed".to_owned()
+            } else {
+                diagnostics.join("; ")
+            };
+            Err(BoundaryError::new(BoundaryKind::Provider, detail))
+        } else {
+            Ok(transcripts)
+        }
+    }
 }
 
 pub trait TranscriptValidator: Send {
-    fn validate(&mut self, source: SourceTranscript) -> Result<Transcript, String>;
+    fn validate(
+        &mut self,
+        sources: Vec<SourceTranscript>,
+    ) -> Result<Transcript, BoundaryError>;
 }
 
 pub trait DeliveryAdapter: Send {
-    fn deliver(&mut self, transcript: Transcript) -> Result<(), String>;
-}
-
-pub trait Clock: Send {
-    fn now_millis(&mut self) -> u64;
-}
-
-pub struct RecordingLifecycle {
-    state: DaemonState,
-    started_at_millis: Option<u64>,
-    capture: Box<dyn AudioCapture>,
-    provider: Box<dyn TranscriptProvider>,
-    validator: Box<dyn TranscriptValidator>,
-    delivery: Box<dyn DeliveryAdapter>,
-    clock: Box<dyn Clock>,
-}
-
-impl RecordingLifecycle {
-    pub fn new(
-        capture: Box<dyn AudioCapture>,
-        provider: Box<dyn TranscriptProvider>,
-        validator: Box<dyn TranscriptValidator>,
-        delivery: Box<dyn DeliveryAdapter>,
-        clock: Box<dyn Clock>,
-    ) -> Self {
-        Self {
-            state: DaemonState::Idle,
-            started_at_millis: None,
-            capture,
-            provider,
-            validator,
-            delivery,
-            clock,
-        }
-    }
-
-    pub fn execute(&mut self, command: Command) -> Response {
-        match command {
-            Command::Start => self.start(),
-            Command::Stop => self.stop(),
-            Command::Toggle if self.state == DaemonState::Idle => self.start(),
-            Command::Toggle => self.stop(),
-            Command::Status => Response::success(self.state, self.state.cli_label()),
-        }
-    }
-
-    fn start(&mut self) -> Response {
-        if self.state == DaemonState::Recording {
-            return Response::rejected(Some(self.state), "Recording already active");
-        }
-        if let Err(message) = self.capture.begin() {
-            return Response::rejected(Some(self.state), message);
-        }
-        self.started_at_millis = Some(self.clock.now_millis());
-        self.state = DaemonState::Recording;
-        Response::success(self.state, "Recording started")
-    }
-
-    fn stop(&mut self) -> Response {
-        if self.state == DaemonState::Idle {
-            return Response::rejected(Some(self.state), "No Recording active");
-        }
-
-        let audio = match self.capture.finish() {
-            Ok(audio) => audio,
-            Err(message) => return Response::rejected(Some(self.state), message),
-        };
-        self.state = DaemonState::Idle;
-        self.started_at_millis = None;
-
-        let completed = self
-            .provider
-            .transcribe(audio)
-            .and_then(|source| self.validator.validate(source))
-            .and_then(|transcript| self.delivery.deliver(transcript));
-
-        match completed {
-            Ok(()) => Response::success(self.state, "Recording completed; Transcript delivered"),
-            Err(message) => Response::rejected(Some(self.state), message),
-        }
-    }
+    fn deliver(&mut self, transcript: Transcript) -> BoundaryFuture<'_, ()>;
 }
