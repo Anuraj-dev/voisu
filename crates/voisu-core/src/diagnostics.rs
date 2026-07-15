@@ -333,7 +333,7 @@ pub fn sanitize_url(value: &str) -> String {
         .rsplit_once('@')
         .map(|(_, host)| host)
         .unwrap_or(authority);
-    if host.is_empty() || host.contains([':', '@']) && !is_host_port(host) {
+    if !is_valid_authority_host(host) {
         return REDACTED.to_owned();
     }
     match path {
@@ -342,15 +342,44 @@ pub fn sanitize_url(value: &str) -> String {
     }
 }
 
-/// True for `host` or `host:port` with a purely numeric port — the only `:`
-/// use permitted in a sanitized authority.
-fn is_host_port(host: &str) -> bool {
-    match host.split_once(':') {
-        None => !host.is_empty(),
-        Some((name, port)) => {
-            !name.is_empty() && !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
-        }
+/// Strictly validates a sanitized authority: a DNS-safe host name or a
+/// bracketed IPv6 literal, optionally followed by `:port` where the port
+/// parses as a non-zero u16. Anything else — whitespace, backslashes, stray
+/// separators, out-of-range ports — is invalid, and the caller redacts.
+fn is_valid_authority_host(host: &str) -> bool {
+    if let Some(inner) = host.strip_prefix('[') {
+        // IPv6 literal: `[addr]` or `[addr]:port`.
+        let Some((address, after)) = inner.split_once(']') else {
+            return false;
+        };
+        let address_ok = !address.is_empty()
+            && address
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() || character == ':' || character == '.');
+        let port_ok = match after.strip_prefix(':') {
+            Some(port) => is_valid_port(port),
+            None => after.is_empty(),
+        };
+        return address_ok && port_ok;
     }
+    match host.split_once(':') {
+        None => is_dns_safe_name(host),
+        Some((name, port)) => is_dns_safe_name(name) && is_valid_port(port),
+    }
+}
+
+fn is_dns_safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '.')
+}
+
+fn is_valid_port(port: &str) -> bool {
+    // Digits only (parse::<u16> would tolerate a leading '+'), then 1-65535.
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|value| value != 0)
 }
 
 /// A redacted, self-contained diagnostic export for one Recording. It carries
@@ -589,21 +618,25 @@ impl DiagnosticStore {
     /// is removed. Run at daemon startup, so a capture orphaned by a crash
     /// before its record persisted can never linger.
     pub fn cleanup_expired(&self) -> io::Result<()> {
-        let kept = self.history()?;
-        let _guard = self.lock.lock().expect("diagnostics lock is not poisoned");
-        // Purge crash-leftover temp files so a recycled PID can never collide
-        // with a stale name from an earlier daemon run.
-        if let Ok(entries) = fs::read_dir(&self.dir) {
-            for entry in entries.flatten() {
-                if entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with("history.json.tmp."))
-                {
-                    let _ = fs::remove_file(entry.path());
+        // Purge crash-leftover temp files FIRST, before any history rewrite:
+        // enough stale leftovers could otherwise exhaust the bounded create
+        // retries and fail the rewrite that was supposed to clean them up.
+        {
+            let _guard = self.lock.lock().expect("diagnostics lock is not poisoned");
+            if let Ok(entries) = fs::read_dir(&self.dir) {
+                for entry in entries.flatten() {
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("history.json.tmp."))
+                    {
+                        let _ = fs::remove_file(entry.path());
+                    }
                 }
             }
         }
+        let kept = self.history()?;
+        let _guard = self.lock.lock().expect("diagnostics lock is not poisoned");
         let referenced: Vec<&str> = kept
             .iter()
             .filter_map(|record| record.debug_audio.as_ref())

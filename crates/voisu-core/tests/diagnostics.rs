@@ -420,3 +420,61 @@ fn a_preplanted_colliding_temp_file_does_not_lose_the_record() {
         .count();
     assert_eq!(leftovers, 0, "stale temp files are purged at startup");
 }
+
+#[test]
+fn sanitize_url_rejects_malformed_hosts_and_invalid_ports() {
+    // Adversarial: hosts containing whitespace or backslashes are not DNS-safe
+    // and must redact, not pass through.
+    assert_eq!(voisu_core::sanitize_url("http://ho st.test/v1"), REDACTED);
+    assert_eq!(voisu_core::sanitize_url("http://host\\evil.test/v1"), REDACTED);
+    assert_eq!(voisu_core::sanitize_url("https://host.test\t/v1"), REDACTED);
+    assert_eq!(voisu_core::sanitize_url("https://host_test/v1"), REDACTED);
+    // Ports must parse as a non-zero u16.
+    assert_eq!(voisu_core::sanitize_url("https://host.test:0/v1"), REDACTED);
+    assert_eq!(voisu_core::sanitize_url("https://host.test:99999/v1"), REDACTED);
+    assert_eq!(voisu_core::sanitize_url("https://host.test:+443/v1"), REDACTED);
+    assert_eq!(voisu_core::sanitize_url("https://host.test:/v1"), REDACTED);
+    // Valid shapes still sanitize rather than redact.
+    assert_eq!(
+        voisu_core::sanitize_url("https://host.test:65535/v1?k=leak"),
+        "https://host.test:65535/v1"
+    );
+    assert_eq!(
+        voisu_core::sanitize_url("https://[2001:db8::1]:8443/v1?k=leak"),
+        "https://[2001:db8::1]:8443/v1"
+    );
+    assert_eq!(
+        voisu_core::sanitize_url("https://user:pass@[2001:db8::1]/v1"),
+        "https://[2001:db8::1]/v1"
+    );
+    // Malformed IPv6 literals redact.
+    assert_eq!(voisu_core::sanitize_url("https://[2001:db8::1/v1"), REDACTED);
+    assert_eq!(voisu_core::sanitize_url("https://[bad host]/v1"), REDACTED);
+}
+
+#[test]
+fn startup_cleanup_survives_all_temp_name_candidates_being_preplanted() {
+    let dir = TempDir::new().unwrap();
+    let store_dir = dir.path().join("diag");
+    let store = DiagnosticStore::open(store_dir.clone(), RetentionPolicy::default()).unwrap();
+    // Adversarial: every one of the 32 bounded temp-name candidates is already
+    // occupied by crash leftovers. Cleanup must purge them BEFORE any history
+    // rewrite, or the rewrite exhausts its retries and cleanup fails.
+    for nonce in 0..32 {
+        std::fs::write(
+            store_dir.join(format!("history.json.tmp.{}.{nonce}", std::process::id())),
+            b"stale",
+        )
+        .unwrap();
+    }
+    store
+        .cleanup_expired()
+        .expect("cleanup must purge stale temp files before rewriting history");
+    store
+        .record(DiagnosticRecord::new("corr-after-purge".to_owned(), 1))
+        .unwrap();
+    assert!(
+        store.find("corr-after-purge").unwrap().is_some(),
+        "history still works after the purge"
+    );
+}
