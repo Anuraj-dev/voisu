@@ -16,6 +16,15 @@ use voisu_core::{
 };
 
 const PROCESS_DEADLINE: Duration = Duration::from_secs(2);
+pub const CAPTURE_FINALIZE_DEADLINE: Duration = PROCESS_DEADLINE;
+pub const PROVIDER_COMPLETION_DEADLINE: Duration = Duration::from_secs(15);
+pub const CLIPBOARD_DELIVERY_DEADLINE: Duration = PROCESS_DEADLINE;
+pub const PROCESSING_RESPONSE_DEADLINE: Duration = Duration::from_secs(
+    CAPTURE_FINALIZE_DEADLINE.as_secs()
+        + PROVIDER_COMPLETION_DEADLINE.as_secs()
+        + CLIPBOARD_DELIVERY_DEADLINE.as_secs()
+        + 1,
+);
 const PROCESS_POLL: Duration = Duration::from_millis(10);
 const MAX_DAEMON_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_RETAINED_STDERR_BYTES: usize = 4 * 1024;
@@ -527,6 +536,7 @@ fn run_restricted_with_deadline(
     capture_stdout: bool,
     deadline: Duration,
 ) -> Result<ProcessOutcome, ProcessError> {
+    let started = Instant::now();
     let mut command = restricted_command(program);
     command
         .args(arguments)
@@ -534,12 +544,10 @@ fn run_restricted_with_deadline(
         .stdout(if capture_stdout { Stdio::piped() } else { Stdio::null() })
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|_| ProcessError::Unavailable)?;
-    // The overall deadline starts here and covers the stdin write as well as the
-    // wait: a child that never drains stdin combined with a large input would
-    // otherwise block the parent forever once the pipe buffer fills. The write
-    // runs on its own thread so the polling loop can kill an overdue child,
-    // which breaks the pipe and unblocks the writer.
-    let started = Instant::now();
+    // The whole-operation deadline starts before spawn and covers startup, the
+    // stdin write, pipe drains, and wait. The write runs on its own thread so
+    // the polling loop can kill an overdue child, which breaks the pipe and
+    // unblocks the writer.
     let writer = match input {
         Some(input) => {
             let input = input.to_vec();
@@ -664,7 +672,7 @@ fn wait_for_child(
         }
         if started.elapsed() >= deadline {
             let _ = child.kill();
-            let _ = child.wait();
+            reap_briefly(child);
             return Err(ProcessError::TimedOut);
         }
         thread::sleep(PROCESS_POLL);
@@ -911,7 +919,7 @@ impl Drop for PipeWireActiveCapture {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
-            let _ = child.wait();
+            reap_briefly(&mut child);
         }
     }
 }
@@ -944,12 +952,10 @@ impl TranscriptProvider for GroqProvider {
         let credential = SecretStore::load(&mut SecretToolStore, Provider::Groq)?;
         let endpoint = std::env::var("VOISU_GROQ_TRANSCRIPTION_URL")
             .unwrap_or_else(|_| "https://api.groq.com/openai/v1/audio/transcriptions".to_owned());
-        if !(endpoint.starts_with("https://") || endpoint.starts_with("http://"))
-            || endpoint.contains(['\n', '\r'])
-        {
+        if !groq_endpoint_is_secure(&endpoint) {
             return Err(BoundaryError::new(
                 BoundaryKind::Provider,
-                "invalid Groq transcription endpoint",
+                "Groq transcription endpoint must use HTTPS except on loopback",
             ));
         }
         Ok(Box::new(GroqStream {
@@ -960,6 +966,25 @@ impl TranscriptProvider for GroqProvider {
             chunks: Vec::new(),
         }))
     }
+}
+
+fn groq_endpoint_is_secure(endpoint: &str) -> bool {
+    if endpoint.contains(['\n', '\r']) {
+        return false;
+    }
+    if endpoint.starts_with("https://") {
+        return true;
+    }
+    let Some(remainder) = endpoint.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = remainder.split('/').next().unwrap_or_default().to_ascii_lowercase();
+    authority == "localhost"
+        || authority.starts_with("localhost:")
+        || authority == "127.0.0.1"
+        || authority.starts_with("127.0.0.1:")
+        || authority == "[::1]"
+        || authority.starts_with("[::1]:")
 }
 
 struct GroqStream {
@@ -991,6 +1016,15 @@ impl ProviderStream for GroqStream {
                         .transcribe_groq_chunk(credential, endpoint, pcm)
                         .await
                 }));
+            }
+            Ok(())
+        })
+    }
+
+    fn abort(mut self: Box<Self>) -> BoundaryFuture<'static, ()> {
+        Box::pin(async move {
+            for chunk in self.chunks.drain(..) {
+                chunk.abort();
             }
             Ok(())
         })
@@ -1053,6 +1087,10 @@ impl ProviderStream for UnavailableDeepgramStream {
     }
 
     fn send_audio(&mut self, _chunk: AudioChunk) -> BoundaryFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()> {
         Box::pin(async { Ok(()) })
     }
 

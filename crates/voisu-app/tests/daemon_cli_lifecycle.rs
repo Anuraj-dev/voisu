@@ -12,8 +12,22 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tempfile::TempDir;
+use voisu_app::system::{
+    CAPTURE_FINALIZE_DEADLINE, CLIPBOARD_DELIVERY_DEADLINE,
+    PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE,
+};
 
 const PROTOCOL_VERSION: u32 = 1;
+
+#[test]
+fn stop_response_budget_strictly_exceeds_all_daemon_processing_deadlines() {
+    assert!(
+        PROCESSING_RESPONSE_DEADLINE
+            > CAPTURE_FINALIZE_DEADLINE
+                + PROVIDER_COMPLETION_DEADLINE
+                + CLIPBOARD_DELIVERY_DEADLINE
+    );
+}
 
 struct Daemon {
     child: Child,
@@ -335,8 +349,270 @@ cat > "$dir/clipboard"
     assert!(!diagnostics.contains("controlled-secret"));
 }
 
+#[test]
+fn status_stays_responsive_while_secret_service_startup_is_slow() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+trap 'exit 0' INT TERM
+while :; do sleep 1; done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "secret-tool",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+: > "$dir/secret-tool.started"
+sleep 1
+printf 'controlled-secret'
+"#,
+    );
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(runtime.path(), &[("PATH", &path)]);
+
+    let runtime_dir = runtime.path().to_owned();
+    let start = thread::spawn(move || voisu(&runtime_dir, "start"));
+    let marker = commands.path().join("secret-tool.started");
+    let marker_deadline = Instant::now() + Duration::from_secs(2);
+    while !marker.exists() && Instant::now() < marker_deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(marker.exists(), "the Secret Service lookup must have started");
+
+    let status_started = Instant::now();
+    let status = voisu(runtime.path(), "status");
+    assert!(status.status.success(), "{}", stderr(&status));
+    assert!(
+        status_started.elapsed() < Duration::from_millis(200),
+        "status must not wait for the Secret Service lookup"
+    );
+    let started = start.join().unwrap();
+    assert!(started.status.success(), "{}", stderr(&started));
+}
+
+#[test]
+fn non_loopback_plaintext_groq_endpoint_is_rejected_without_disclosing_secrets() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+trap 'exit 0' INT TERM
+while :; do sleep 1; done
+"#,
+    );
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "http://example.invalid/audio/transcriptions",
+            ),
+        ],
+    );
+
+    let rejected = voisu(runtime.path(), "start");
+    assert_eq!(rejected.status.code(), Some(4));
+    assert_eq!(stderr(&rejected), "Source Transcripts are unavailable\n");
+    assert!(!stderr(&rejected).contains("controlled-secret"));
+    assert!(!stderr(&rejected).contains("example.invalid"));
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(!diagnostics.contains("controlled-secret"));
+    assert!(!diagnostics.contains("example.invalid"));
+}
+
+#[test]
+fn production_groq_quality_failure_is_classified_through_the_public_cli() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        "#!/bin/sh\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\nwhile :; do sleep 1; done\n",
+    );
+    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
+    let (endpoint, request_rx, server) = local_groq_server("   ");
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", &endpoint),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    thread::sleep(Duration::from_millis(50));
+    let rejected = voisu(runtime.path(), "stop");
+    assert_eq!(rejected.status.code(), Some(4));
+    assert_eq!(stderr(&rejected), "Transcript failed quality validation\n");
+    request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    server.join().unwrap();
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert!(voisu(runtime.path(), "start").status.success());
+}
+
+#[test]
+fn production_groq_5xx_is_recoverable_through_the_public_cli() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        "#!/bin/sh\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\nwhile :; do sleep 1; done\n",
+    );
+    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
+    let (endpoint, request_rx, server) =
+        local_groq_response_server("503 Service Unavailable", "unavailable".to_owned(), Duration::ZERO);
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", &endpoint),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    thread::sleep(Duration::from_millis(50));
+    let rejected = voisu(runtime.path(), "stop");
+    assert_eq!(rejected.status.code(), Some(4));
+    assert_eq!(stderr(&rejected), "Source Transcripts are unavailable\n");
+    request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    server.join().unwrap();
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert!(voisu(runtime.path(), "start").status.success());
+}
+
+#[test]
+fn production_slow_groq_endpoint_is_bounded_and_recoverable() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        "#!/bin/sh\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\nwhile :; do sleep 1; done\n",
+    );
+    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
+    let (endpoint, request_rx, server) = local_groq_response_server(
+        "200 OK",
+        serde_json::json!({ "text": "late Transcript" }).to_string(),
+        Duration::from_secs(16),
+    );
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", &endpoint),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    thread::sleep(Duration::from_millis(50));
+    let started = Instant::now();
+    let rejected = voisu(runtime.path(), "stop");
+    assert_eq!(rejected.status.code(), Some(4));
+    assert_eq!(stderr(&rejected), "Source Transcripts are unavailable\n");
+    assert!(started.elapsed() < PROCESSING_RESPONSE_DEADLINE);
+    request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    server.join().unwrap();
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert!(voisu(runtime.path(), "start").status.success());
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains("Provider Deadline elapsed"),
+        "slow production endpoint must exercise the Provider Deadline: {diagnostics}"
+    );
+}
+
+#[test]
+fn production_capture_death_mid_recording_self_recovers_without_stop() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        "#!/bin/sh\nprintf '\\100\\000'\nexit 7\n",
+    );
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[("PATH", &path), ("VOISU_GROQ_API_KEY", "controlled-secret")],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if stdout(&voisu(runtime.path(), "status")) == "idle\n" {
+            assert!(voisu(runtime.path(), "start").status.success());
+            let diagnostics = daemon.terminate_and_stderr();
+            assert!(diagnostics.contains("pw-record failed"));
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the daemon did not recover after pw-record died");
+}
+
+#[test]
+fn production_missing_wl_copy_is_reported_and_recoverable() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        "#!/bin/sh\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\nwhile :; do /usr/bin/sleep 1; done\n",
+    );
+    std::os::unix::fs::symlink("/usr/bin/curl", commands.path().join("curl")).unwrap();
+    let (endpoint, request_rx, server) = local_groq_server("undeliverable Transcript");
+    let path = commands.path().display().to_string();
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", &endpoint),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    thread::sleep(Duration::from_millis(50));
+    let rejected = voisu(runtime.path(), "stop");
+    assert_eq!(rejected.status.code(), Some(4));
+    assert_eq!(stderr(&rejected), "Transcript Delivery failed\n");
+    request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    server.join().unwrap();
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert!(voisu(runtime.path(), "start").status.success());
+}
+
 fn local_groq_server(
     transcript: &'static str,
+) -> (String, mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
+    let body = serde_json::json!({ "text": transcript }).to_string();
+    local_groq_response_server("200 OK", body, Duration::ZERO)
+}
+
+fn local_groq_response_server(
+    status: &'static str,
+    response_body: String,
+    delay: Duration,
 ) -> (String, mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -362,17 +638,18 @@ fn local_groq_server(
             }
         }
         assert!(authorized, "Groq credential must be sent in the HTTP header");
-        let mut body = vec![0_u8; content_length];
-        reader.read_exact(&mut body).unwrap();
-        request_tx.send(body).unwrap();
-        let response = serde_json::json!({ "text": transcript }).to_string();
-        write!(
+        let mut request_body = vec![0_u8; content_length];
+        reader.read_exact(&mut request_body).unwrap();
+        request_tx.send(request_body).unwrap();
+        if !delay.is_zero() {
+            thread::sleep(delay);
+        }
+        let _ = write!(
             reader.get_mut(),
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            response.len(),
-            response
-        )
-        .unwrap();
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
     });
     (format!("http://{address}/audio/transcriptions"), request_rx, server)
 }
@@ -448,11 +725,18 @@ fn live_fedora_microphone_groq_and_clipboard_smoke() {
     assert!(!clipboard.stdout.is_empty(), "Transcript must remain on the clipboard");
 }
 
-fn recording_outcome(outcome: &str, expected: &str) {
+fn production_recording_quality_failure(script_body: &str, expected: &str) {
     let runtime = TempDir::new().unwrap();
-    let _daemon = Daemon::start_with_env(
+    let commands = TempDir::new().unwrap();
+    write_fake_command(commands.path(), "pw-record", script_body);
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
         runtime.path(),
-        &[("VOISU_TEST_RECORDING_OUTCOME", outcome)],
+        &[("PATH", &path), ("VOISU_GROQ_API_KEY", "controlled-secret")],
     );
     assert!(voisu(runtime.path(), "start").status.success());
     let stopped = voisu(runtime.path(), "stop");
@@ -466,22 +750,66 @@ fn recording_outcome(outcome: &str, expected: &str) {
 
 #[test]
 fn empty_recording_is_distinct_and_recoverable_through_the_public_cli() {
-    recording_outcome("empty", "No audio was captured");
+    production_recording_quality_failure(
+        "#!/bin/sh\ntrap 'exit 0' INT TERM\nwhile :; do sleep 1; done\n",
+        "No audio was captured",
+    );
 }
 
 #[test]
 fn too_short_recording_is_distinct_and_recoverable_through_the_public_cli() {
-    recording_outcome("too-short", "Recording is too short");
+    production_recording_quality_failure(
+        "#!/bin/sh\nprintf '\\001\\000'\ntrap 'exit 0' INT TERM\nwhile :; do sleep 1; done\n",
+        "Recording is too short",
+    );
 }
 
 #[test]
 fn silent_recording_is_distinct_and_recoverable_through_the_public_cli() {
-    recording_outcome("silent", "Recording contains no speech");
+    production_recording_quality_failure(
+        "#!/bin/sh\n/usr/bin/head -c 3200 /dev/zero\ntrap 'exit 0' INT TERM\nwhile :; do sleep 1; done\n",
+        "Recording contains no speech",
+    );
 }
 
 #[test]
 fn over_deadline_recording_is_distinct_and_recoverable_through_the_public_cli() {
-    recording_outcome("over-deadline", "Recording Deadline elapsed");
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        "#!/bin/sh\nprintf '\\100\\000'\ntrap 'exit 0' INT TERM\nwhile :; do sleep 1; done\n",
+    );
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_RECORDING_DEADLINE_MS", "50"),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if stdout(&voisu(runtime.path(), "status")) == "idle\n" {
+            assert!(
+                voisu(runtime.path(), "start").status.success(),
+                "a Recording must be accepted after the Recording Deadline"
+            );
+            let diagnostics = daemon.terminate_and_stderr();
+            assert!(diagnostics.contains("configured Recording Deadline elapsed"));
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the daemon did not self-recover after the Recording Deadline");
 }
 
 #[test]
@@ -1468,6 +1796,7 @@ fn partial_provider_start_failure_aborts_the_capture_and_surfaces_abort_errors()
         runtime.path(),
         &[
             ("VOISU_TEST_PROVIDER_START_FAILURE", "1"),
+            ("VOISU_TEST_PROVIDER_ABORT_FAILURE", "1"),
             ("VOISU_TEST_CAPTURE_ABORT_FAILURE", "1"),
         ],
     );
@@ -1490,8 +1819,10 @@ fn partial_provider_start_failure_aborts_the_capture_and_surfaces_abort_errors()
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
         diagnostics.contains("capture abort failed")
-            && diagnostics.contains("controlled-abort-detail"),
-        "capture-abort failure must be surfaced, got: {diagnostics}"
+            && diagnostics.contains("controlled-abort-detail")
+            && diagnostics.contains("provider abort failed")
+            && diagnostics.contains("controlled-provider-abort-detail"),
+        "partial-start abort failures must be surfaced, got: {diagnostics}"
     );
 }
 

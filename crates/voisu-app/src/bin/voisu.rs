@@ -8,11 +8,12 @@ use voisu_core::{
     ProviderAuthenticator, ReadinessInspector, ReadinessStatus, Request, Response, SecretStore,
     VersionEnvelope, socket_path,
 };
-use voisu_app::system::{FedoraReadiness, ProviderHttpClient, SecretToolStore};
+use voisu_app::system::{
+    FedoraReadiness, PROCESSING_RESPONSE_DEADLINE, ProviderHttpClient, SecretToolStore,
+};
 
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024;
 const IO_DEADLINE: Duration = Duration::from_secs(2);
-const PROCESSING_RESPONSE_DEADLINE: Duration = Duration::from_secs(17);
 
 enum CliAction {
     Daemon(Command),

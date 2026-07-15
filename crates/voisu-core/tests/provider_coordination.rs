@@ -12,6 +12,8 @@ struct ControlledStream {
     delay: Duration,
     completions: Arc<AtomicUsize>,
     chunks: Arc<AtomicUsize>,
+    aborts: Arc<AtomicUsize>,
+    abort_delay: Duration,
 }
 
 impl ProviderStream for ControlledStream {
@@ -22,6 +24,14 @@ impl ProviderStream for ControlledStream {
     fn send_audio(&mut self, _chunk: AudioChunk) -> BoundaryFuture<'_, ()> {
         self.chunks.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
+    }
+
+    fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()> {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            tokio::time::sleep(self.abort_delay).await;
+            Ok(())
+        })
     }
 
     fn complete(
@@ -50,7 +60,40 @@ fn stream(
         delay,
         completions,
         chunks,
+        aborts: Arc::new(AtomicUsize::new(0)),
+        abort_delay: Duration::ZERO,
     })
+}
+
+#[tokio::test]
+async fn coordinator_abort_is_bounded_and_attempts_both_provider_streams() {
+    let deepgram_aborts = Arc::new(AtomicUsize::new(0));
+    let groq_aborts = Arc::new(AtomicUsize::new(0));
+    let controlled = |provider, aborts| {
+        Box::new(ControlledStream {
+            provider,
+            delay: Duration::ZERO,
+            completions: Arc::new(AtomicUsize::new(0)),
+            chunks: Arc::new(AtomicUsize::new(0)),
+            aborts,
+            abort_delay: Duration::from_secs(1),
+        }) as Box<dyn ProviderStream>
+    };
+    let coordinator = ProviderCoordinator::start(
+        Duration::from_millis(50),
+        ProviderStreams {
+            deepgram: controlled(Provider::Deepgram, Arc::clone(&deepgram_aborts)),
+            groq: controlled(Provider::Groq, Arc::clone(&groq_aborts)),
+        },
+    );
+
+    let started = std::time::Instant::now();
+    let error = coordinator.abort().await.unwrap_err();
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(error.kind(), BoundaryKind::Provider);
+    assert_eq!(error.diagnostic(), "provider abort deadline elapsed");
+    assert_eq!(deepgram_aborts.load(Ordering::SeqCst), 1);
+    assert_eq!(groq_aborts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

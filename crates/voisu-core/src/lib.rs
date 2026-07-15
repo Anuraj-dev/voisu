@@ -364,6 +364,7 @@ pub trait TranscriptProvider: Send {
 pub trait ProviderStream: Send {
     fn provider(&self) -> Provider;
     fn send_audio(&mut self, chunk: AudioChunk) -> BoundaryFuture<'_, ()>;
+    fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()>;
     fn complete(self: Box<Self>, audio: CapturedAudio)
     -> BoundaryFuture<'static, SourceTranscript>;
 }
@@ -389,6 +390,20 @@ impl ProviderCoordinator {
         let (deepgram, groq) = tokio::join!(deepgram, groq);
         deepgram?;
         groq
+    }
+
+    pub async fn abort(self) -> Result<(), BoundaryError> {
+        let deepgram = self.streams.deepgram.abort();
+        let groq = self.streams.groq.abort();
+        tokio::time::timeout(self.deadline, async move {
+            let (deepgram, groq) = tokio::join!(deepgram, groq);
+            deepgram?;
+            groq
+        })
+        .await
+        .map_err(|_| {
+            BoundaryError::new(BoundaryKind::Provider, "provider abort deadline elapsed")
+        })?
     }
 
     pub async fn complete(

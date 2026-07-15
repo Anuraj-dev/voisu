@@ -2,8 +2,9 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-15
 
 ## 🚧 In progress / next
-- Ticket 03 is implemented and verified. Retry the pinned independent Sol review when the Codex state directory is
-  writable, then commit `feat(dictation): deliver PipeWire Recordings through Groq (#3)` and dispatch Ticket 04.
+- Ticket 03 review findings are resolved and verified. Retry the pinned independent Sol review when the Codex state
+  directory is writable, then commit `fix(dictation): resolve Ticket 03 lifecycle review findings (#3)` and dispatch
+  Ticket 04.
 
 ## Status
 - The independent `voisu` and `voisu-daemon` binaries communicate over bounded, versioned Unix IPC.
@@ -13,10 +14,14 @@
   bounded overlapping Groq chunks during the Recording, includes final frames after stop, validates the resulting
   Merge Result, and preserves the final Transcript with `wl-copy` Delivery.
 - Empty, too-short, silent, and over-Recording-Deadline outcomes are distinct and recoverable; capture/provider
-  failure returns the daemon to idle for the next Recording.
+  failure or capture EOF automatically returns the daemon to idle for the next Recording without an explicit Stop.
+- Blocking capture/provider startup runs off the lifecycle actor, provider streams expose bounded abort, and shared
+  capture/provider/Delivery constants keep the Stop response budget strictly above daemon processing deadlines.
+- Groq permits plaintext HTTP only for loopback development endpoints; production failure coverage uses real PATH
+  subprocess stubs and local HTTP for validation, 5xx, Provider Deadline, capture death, and missing `wl-copy`.
 - Production Deepgram remains an explicit unavailable stream until Ticket 04; the existing coordinator accepts the
   valid Groq Source Transcript without waiting for an unimplemented provider.
-- `cargo build --workspace`, `cargo test --workspace`, and `git diff --check` pass: 51 tests green plus one ignored,
+- `cargo build --workspace`, `cargo test --workspace`, and `git diff --check` pass: 60 tests green plus one ignored,
   opt-in live Fedora microphone/Groq/clipboard smoke test.
 
 ## Architecture map
