@@ -1277,11 +1277,17 @@ impl ProviderStream for DeepgramStream {
                         // Cancel the siblings so their curl children are killed,
                         // then drop the already-awaited front handle (re-awaiting
                         // a completed JoinHandle panics) and await the rest so
-                        // their reaps complete before this error surfaces.
+                        // their reaps complete before this error surfaces. Each
+                        // sibling is awaited through `front_mut()` and popped only
+                        // AFTER its await completes: if the Provider Deadline drops
+                        // this future mid-cleanup, the unfinished handles are still
+                        // in the deque for the gated `abort()` to own and reap —
+                        // draining first would detach them on drop.
                         self.cancel.cancel();
                         self.chunks.pop_front();
-                        for chunk in self.chunks.drain(..) {
+                        while let Some(chunk) = self.chunks.front_mut() {
                             let _ = chunk.await;
+                            self.chunks.pop_front();
                         }
                         return Err(error);
                     }

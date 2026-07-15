@@ -2136,6 +2136,14 @@ if grep -q 'deepgram.test' "$config"; then
     trap - EXIT
     exit 22
   fi
+  # A pipe-holding descendant inherits stdout and outlives this stub past the
+  # 2000ms Provider Deadline: the daemon's bounded stdout drain (and thus the
+  # chunk JoinHandle) cannot finish before ~3.5s, forcing the Deepgram
+  # completion future to be dropped at the deadline DURING the failed-chunk
+  # cleanup. Only a gated abort() that still owns the retained handles keeps
+  # Idle unobservable until this holder exits.
+  sleep 3.5 &
+  printf '%s\n' "$!" >> "$dir/deepgram.holders"
   i=0
   while [ ! -e "$dir/deepgram.release" ] && [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
   printf '{"results":{"channels":[{"alternatives":[{"transcript":"late"}]}]}}'
@@ -2189,6 +2197,20 @@ fi
         assert!(
             !Path::new(&format!("/proc/{pid}")).exists(),
             "a later Deepgram curl must be reaped before Idle is observable"
+        );
+    }
+    // The pipe-holders prove the deadline fired DURING the failed-chunk
+    // cleanup and that abort() still owned the retained sibling handles: if
+    // the cleanup had detached them (e.g. by draining the deque before
+    // awaiting), Idle would be observable at the 2s deadline while these
+    // descendants are still alive at ~3.5s.
+    for pid in fs::read_to_string(commands.path().join("deepgram.holders"))
+        .expect("later Deepgram curls must have spawned their pipe-holders")
+        .lines()
+    {
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "a late Deepgram pipe-holder must be gone before Idle is observable"
         );
     }
     assert!(!commands.path().join("deepgram.release").exists());
