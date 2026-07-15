@@ -35,3 +35,7 @@
 | 20 | 04 | Escalated fix (regression) | Opus 4.8 (high) | restored peek-then-pop → 7be2329, 76 tests | round 3 review: 1 HIGH (drain in error branch) | — | Found root cause in 1 pass w/ zombie-state proof; ~21 min, 117k tokens |
 | 21 | 04 | Final fix (drain detach) | Opus 4.8 (high, resumed agent) | e1197db + discriminating pipe-holder test → APPROVE | 0 findings | closed ticket | Proved test discriminates by reinstating bug; flagged abort() follow-up (#14) |
 | 22 | 04 | Reviews | Sol (high first, medium re-reviews) | 4 rounds; real HIGH each round until APPROVE | — | — | Sol medium again caught cancellation-window races; one run hung on stdin (env quirk, not model) |
+| 23 | 05 | Feature impl | Sol (medium) | delivered b5c0e29, 92 tests | round 1: 1 HIGH (recon timeout drops spawn_blocking handle) + 1 MEDIUM (script gap) | 1 round | Good pipeline design; repeated the cancellation-ownership miss |
+| 24 | 05 | Fix round | Opus 4.8 (high, resumed) | 59b1caa: pinned-future cancel+grace-await, CancelRegistry into core, token confusable check | round 2: 1 MEDIUM (incomplete Unicode ranges) | — | Both fixes proven discriminating; clean trait promotion |
+| 25 | 05 | Range fixes | Opus 4.8 (high, resumed) | bcabfef + 9769886 → APPROVE | round 3 caught Latin-Ext-F gap; round 4: 0 findings | closed ticket | Caught own non-discriminating test and redesigned it |
+| 26 | 05 | Reviews | Sol (high first, medium re-reviews) | 4 rounds; HIGH + 3 escalating-precision MEDIUMs | — | — | Sol medium even verified Unicode block charts via web search |

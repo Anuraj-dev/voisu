@@ -2,11 +2,11 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-16
 
 ## 🚧 In progress / next
-- Ticket 05 (issue #5) is implemented but uncommitted. Next: run the full workspace/acceptance gate outside the
-  managed sandbox (Unix socket binds are denied here), then first Sol review at high effort and orchestrator commit.
-- Follow-up issue #14 filed: make `DeepgramStream::abort` / `GroqStream::abort` cancellation-safe
-  (drain→peek-then-pop) plus an abort-deadline regression test. Not blocking Ticket 05 but should be picked
-  up soon.
+- Ticket 05 (issue #5, reconcile + guard the final Transcript) is APPROVED and closed. Next up: Ticket 06
+  (06-correlated-local-diagnostics) — regular feature work, routed to Opus 4.8 high per the 2026-07-16 routing
+  update (Sol reserved for architectural tickets and reviews). First review Sol high.
+- Follow-up issue #14 remains open: make `DeepgramStream::abort` / `GroqStream::abort` cancellation-safe
+  (drain→peek-then-pop) plus an abort-deadline regression test. Not blocking; pick up opportunistically.
 
 ## Status
 - The independent `voisu` and `voisu-daemon` binaries communicate over bounded, versioned Unix IPC.
@@ -22,28 +22,32 @@
   await finishes, so a deadline loser remains owned for cancellation, kill, reap, and awaited cleanup before `Idle`.
   Deepgram completion errors also cancel and await every later retained chunk handle before publishing `Idle`.
 - A bounded Transcript decision pipeline selects near-identical Groq text deterministically, invokes a configured Groq
-  reconciliation model only for material disagreement, blocks prompt/meta/suffix/mixed-script/expansion artifacts,
-  permits one bounded repair, and otherwise falls back to a clean Source Transcript or reports a Quality Failure.
-  IPC evidence records selection, validation, fallback, reconciliation, recovery, and exactly-once Delivery outcomes.
-  Structured IPC evidence reports first chunk, capture finalization, per-provider completion, accepted providers,
-  release-to-text timing, and Delivery count.
+  reconciliation model only for material disagreement, blocks prompt/meta/suffix/mixed-script/expansion artifacts
+  (full-Unicode-range Latin/Greek/Cyrillic confusable classification), permits one bounded repair, and otherwise falls
+  back to a clean Source Transcript or reports a Quality Failure. IPC evidence records selection, validation,
+  fallback, reconciliation, recovery, and exactly-once Delivery outcomes, plus first chunk, capture finalization,
+  per-provider completion, accepted providers, release-to-text timing, and Delivery count.
+- Reconciliation cleanup follows the "pin the future, cancel, await same future under bounded grace" discipline:
+  the deadline cancels the pinned reconciliation future and awaits it (bounded 1s grace) so the in-flight curl is
+  killed/reaped before Idle, rather than dropping the handle; Secret Service lookup runs inside the owned
+  `spawn_blocking` task; `CancelRegistry` lives in voisu-core and threads through `ReconciliationModel::request`.
 - Capture/provider failure and capture EOF return the daemon to idle; Deepgram and Groq cancellation use the
   per-Recording `CancelRegistry`, owning-child kill/reap, and awaited request-task cleanup before reuse.
 - Linux capture children request `PR_SET_PDEATHSIG(SIGKILL)`. Acceptance daemons run in isolated process groups whose
   Drop guard kills the whole tree, and all generated shell stubs have signal/exit traps plus bounded wait loops.
 - CI is live: `.github/workflows/ci.yml` runs the workspace suite plus a 3x-parallel voisu-app flake gate on every
-  push/PR; green on all commits pushed so far.
-- Test inventory: 92 (74 voisu-app acceptance including 1 ignored live smoke, 3 app unit, 6 provider-coordination,
-  9 Transcript-decision). All binaries compile; 15 core + 3 app unit tests pass in the managed sandbox.
+  push/PR; green on all commits pushed so far, including all Ticket 05 commits.
+- Test inventory: 97 (74 voisu-app acceptance including 1 ignored live smoke, 3 app unit, 6 provider-coordination,
+  14 Transcript-decision).
 
 ## Architecture map
-- Domain, audio contract, provider coordination/timings, Transcript decision pipeline/guardrails, typed errors, IPC ->
-  `crates/voisu-core/src/lib.rs`
+- Domain, audio contract, provider coordination/timings, Transcript decision pipeline/guardrails, typed errors,
+  `CancelRegistry`, IPC -> `crates/voisu-core/src/lib.rs`
 - Lifecycle actor, secure socket ownership, Recording pump, Provider Deadline evidence, controlled test adapters ->
   `crates/voisu-app/src/bin/voisu-daemon.rs`
 - Thin public CLI and command-specific bounded response waits -> `crates/voisu-app/src/bin/voisu.rs`
-- Hardened PipeWire, Deepgram/Groq HTTP, bounded Groq reconciliation, clipboard, readiness, Secret Service, and process adapters ->
-  `crates/voisu-app/src/system.rs`
+- Hardened PipeWire, Deepgram/Groq HTTP, bounded Groq reconciliation adapter, clipboard, readiness, Secret Service,
+  and process adapters -> `crates/voisu-app/src/system.rs`
 - Public daemon/CLI acceptance suite, PATH stubs, local Groq server, live smoke ->
   `crates/voisu-app/tests/daemon_cli_lifecycle.rs`
 - Provider coordination contract tests -> `crates/voisu-core/tests/provider_coordination.rs`
@@ -64,8 +68,9 @@
 - Near-identical text uses token edit similarity and deterministic Groq selection; material differences use a bounded
   cloud Merge Result. Every candidate is guarded, with at most one bounded repair and clean-source fallback.
 - Recovery remains a first-class actor state; cancellation is an `AtomicBool` observed by the wait loop owning `Child`,
-  never a raw-PID signal.
-- Routing update (2026-07-16): Opus 4.8 subagents (medium/high effort) are now the workhorse for regular
+  never a raw-PID signal — the same discipline now also governs the reconciliation deadline (pin future, cancel,
+  bounded-grace await, never detach).
+- Routing update (2026-07-16): Opus 4.8 subagents (medium/high effort) are the workhorse for regular
   implementation/fix work; Sol is reserved for architectural tickets and ALL code reviews (first review high,
   re-reviews medium).
 
@@ -74,5 +79,8 @@
 - `rustfmt` and `clippy` are unavailable (`sudo dnf install rustfmt clippy` needed); both remain skipped.
 - This managed sandbox denies Unix-domain socket binds with `EPERM`; daemon acceptance tests compile but must run in
   the orchestrator/host gate.
+- Sol's first review on Ticket 05 caught the same "detach on cancellation" bug class a third time (this time the
+  reconciliation timeout dropping the `spawn_blocking` handle) — always pin-cancel-await, never let a timeout race
+  drop an owned handle.
 - A stale git stash ("partial edits from killed codex leak-fix run") and an older one ("partial review-fix from
   killed codex run") both remain on the stack — superseded by the merged fixes; safe to drop.
