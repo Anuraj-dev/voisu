@@ -11,6 +11,14 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+mod diagnostics;
+pub use diagnostics::{
+    correlation_id, export_record, is_secret_env_key, redacted_environment, replay_capture,
+    unix_millis_now, DebugAudioRecord, DiagnosticExport, DiagnosticRecord, DiagnosticStore,
+    PruneOutcome, ReplayOutcome, RetentionPolicy, SourceTranscriptRecord, DEFAULT_DEBUG_AUDIO_TTL,
+    DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS, MAX_STORED_TEXT, REDACTED,
+};
+
 pub const PROTOCOL_VERSION: u32 = 1;
 
 pub fn runtime_dir() -> Result<PathBuf, String> {
@@ -46,13 +54,20 @@ pub fn socket_path() -> Result<PathBuf, String> {
         .join("daemon.sock"))
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Command {
     Start,
     Stop,
     Toggle,
     Status,
+    /// Returns the retained local diagnostic history (newest first).
+    History,
+    /// Returns a redacted, self-contained diagnostic export for one correlation ID.
+    Export(String),
+    /// Replays a fixed captured fixture at the given path through the provider
+    /// and validation boundaries without capturing audio again.
+    Replay(String),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -99,6 +114,10 @@ pub enum LifecycleStage {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LifecycleEvidence {
     pub recording_id: u64,
+    /// The correlation ID that joins every event of this Recording across
+    /// capture, chunk, provider, reconciliation, validation, Delivery, and error.
+    #[serde(default)]
+    pub correlation_id: String,
     pub stages: Vec<LifecycleStage>,
     pub delivery_count: u32,
     #[serde(default)]
@@ -139,6 +158,10 @@ pub struct Response {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence: Option<LifecycleEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<DiagnosticRecord>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export: Option<DiagnosticExport>,
 }
 
 impl Response {
@@ -162,7 +185,21 @@ impl Response {
             state,
             message: message.into(),
             evidence,
+            history: None,
+            export: None,
         }
+    }
+
+    pub fn with_history(records: Vec<DiagnosticRecord>) -> Self {
+        let mut response = Self::success(DaemonState::Idle, "diagnostic history");
+        response.history = Some(records);
+        response
+    }
+
+    pub fn with_export(export: DiagnosticExport) -> Self {
+        let mut response = Self::success(DaemonState::Idle, "diagnostic export");
+        response.export = Some(export);
+        response
     }
 }
 

@@ -18,12 +18,12 @@ use voisu_app::system::{
 };
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
-    CancelRegistry, CapturedAudio, Command, DaemonState, DeliveryAdapter, LifecycleEvidence,
-    LifecycleStage,
-    MergeResult, PROTOCOL_VERSION, Provider, ProviderCoordinator, ProviderStream, ProviderStreams,
-    ReconciliationKind, ReconciliationModel, Request, Response, SourceTranscript, Transcript,
-    TranscriptDecision, TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator,
-    VersionEnvelope, socket_path,
+    CancelRegistry, CapturedAudio, Command, DaemonState, DeliveryAdapter, DiagnosticRecord,
+    DiagnosticStore, LifecycleEvidence, LifecycleStage, MergeResult, PROTOCOL_VERSION, Provider,
+    ProviderCoordinator, ProviderStream, ProviderStreams, ReconciliationKind, ReconciliationModel,
+    ReplayOutcome, Request, Response, RetentionPolicy, SourceTranscript, SourceTranscriptRecord,
+    Transcript, TranscriptDecision, TranscriptDecisionPipeline, TranscriptProvider,
+    TranscriptValidator, VersionEnvelope, replay_capture, socket_path,
 };
 
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
@@ -62,8 +62,20 @@ async fn run() -> Result<(), String> {
         inode: metadata.ino(),
     };
 
+    // Correlated local diagnostics live under the already-hardened private
+    // runtime directory and never leave the local machine. Startup cleanup
+    // removes any debug audio or over-retention records a previous run left.
+    let retention = RetentionPolicy::from_env();
+    let diagnostics = Arc::new(
+        DiagnosticStore::open(parent.join("diagnostics"), retention)
+            .map_err(|error| format!("cannot open diagnostics store: {error}"))?,
+    );
+    if let Err(error) = diagnostics.cleanup_expired() {
+        eprintln!("diagnostics cleanup failed: {error}");
+    }
+
     let (actor_tx, actor_rx) = mpsc::channel(64);
-    tokio::spawn(actor_loop(actor_rx, actor_tx.clone()));
+    tokio::spawn(actor_loop(actor_rx, actor_tx.clone(), diagnostics));
     let connections = std::sync::Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|error| format!("cannot listen for SIGTERM: {error}"))?;
@@ -193,6 +205,19 @@ enum ActorMessage {
     PumpTerminated(u64),
     Completed(Completion),
     Recovered(u64),
+    ReplayCompleted(ReplayCompletion),
+}
+
+/// Ownership handed back once a fixture replay finishes: the provider and
+/// validation adapters return to the actor's pool so the daemon is reusable, and
+/// the client reply carries the replay outcome.
+struct ReplayCompletion {
+    id: u64,
+    deepgram: Box<dyn TranscriptProvider>,
+    groq: Box<dyn TranscriptProvider>,
+    validator: Box<dyn TranscriptValidator>,
+    reply: oneshot::Sender<Response>,
+    response: Response,
 }
 
 struct StartupCompletion {
@@ -242,6 +267,9 @@ enum ActorState {
     /// commands instead would reorder them and could begin a Recording whose
     /// client already gave up (see docs/decisions.md).
     Recovering(u64),
+    /// A fixture replay is borrowing the provider and validation adapters. The
+    /// daemon reads idle but rejects Start/Toggle until the replay returns them.
+    Replaying(u64),
 }
 
 struct Completion {
@@ -253,9 +281,15 @@ struct Completion {
     reply: Option<oneshot::Sender<Response>>,
 }
 
-async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<ActorMessage>) {
+async fn actor_loop(
+    mut rx: mpsc::Receiver<ActorMessage>,
+    tx: mpsc::Sender<ActorMessage>,
+    diagnostics: Arc<DiagnosticStore>,
+) {
     let mut state = ActorState::Idle;
     let mut next_id = 1_u64;
+    // Raw audio is retained only when the user explicitly enables debug capture.
+    let debug_capture = std::env::var_os("VOISU_DEBUG_CAPTURE").is_some();
     let test_mode = std::env::var_os("VOISU_TEST_MODE");
     let controlled = test_mode.as_deref() == Some(std::ffi::OsStr::new("controlled"));
     let controlled_deadlines = controlled
@@ -293,8 +327,61 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                     let response = status_response(&state);
                     let _ = reply.send(response);
                 }
+                Command::History => {
+                    let records = diagnostics.history().unwrap_or_default();
+                    let _ = reply.send(Response::with_history(records));
+                }
+                Command::Export(correlation_id) => {
+                    let response = match diagnostics.find(&correlation_id) {
+                        Ok(Some(record)) => Response::with_export(voisu_core::export_record(
+                            record,
+                            std::env::vars(),
+                        )),
+                        Ok(None) => Response::rejected(
+                            Some(state_label(&state)),
+                            "no diagnostic record for that correlation ID",
+                        ),
+                        Err(_) => Response::rejected(
+                            Some(state_label(&state)),
+                            "diagnostics are unavailable",
+                        ),
+                    };
+                    let _ = reply.send(response);
+                }
+                Command::Replay(path) if matches!(state, ActorState::Idle) => {
+                    let id = next_id;
+                    next_id += 1;
+                    state = ActorState::Replaying(id);
+                    let current_deepgram =
+                        deepgram.take().expect("Deepgram adapter is available");
+                    let current_groq = groq.take().expect("Groq adapter is available");
+                    let current_validator = validator.take().expect("validator is available");
+                    let provider_deadline = if controlled_deadlines
+                        && std::env::var_os("VOISU_TEST_PROVIDER_DEADLINE_MS").is_some()
+                    {
+                        env_millis("VOISU_TEST_PROVIDER_DEADLINE_MS").max(Duration::from_millis(1))
+                    } else {
+                        PROVIDER_DEADLINE
+                    };
+                    tokio::spawn(replay_recording(
+                        path,
+                        id,
+                        current_deepgram,
+                        current_groq,
+                        current_validator,
+                        provider_deadline,
+                        tx.clone(),
+                        reply,
+                    ));
+                }
+                Command::Replay(_) => {
+                    let _ = reply.send(Response::rejected(
+                        Some(state_label(&state)),
+                        "cannot replay a fixture while a Recording is active",
+                    ));
+                }
                 Command::Start | Command::Toggle
-                    if matches!(state, ActorState::Recovering(_)) =>
+                    if matches!(state, ActorState::Recovering(_) | ActorState::Replaying(_)) =>
                 {
                     // Immediate retryable rejection: replaying deferred
                     // commands would reorder Start/Stop and could begin a
@@ -357,6 +444,8 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                         current_delivery,
                         actor,
                         Some(reply),
+                        Arc::clone(&diagnostics),
+                        debug_capture,
                     ));
                 }
                 Command::Stop => {
@@ -397,6 +486,7 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                         Ok((active_capture, streams)) => {
                             let evidence = LifecycleEvidence {
                                 recording_id: id,
+                                correlation_id: voisu_core::correlation_id(id),
                                 stages: vec![
                                     LifecycleStage::CaptureStarted,
                                     LifecycleStage::ProvidersStarted,
@@ -479,6 +569,23 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                     state = ActorState::Idle;
                 }
             }
+            ActorMessage::ReplayCompleted(completed) => {
+                let ReplayCompletion {
+                    id,
+                    deepgram: returned_deepgram,
+                    groq: returned_groq,
+                    validator: returned_validator,
+                    reply,
+                    response,
+                } = completed;
+                deepgram = Some(returned_deepgram);
+                groq = Some(returned_groq);
+                validator = Some(returned_validator);
+                if matches!(&state, ActorState::Replaying(replaying) if *replaying == id) {
+                    state = ActorState::Idle;
+                }
+                let _ = reply.send(response);
+            }
             ActorMessage::PumpTerminated(id) => {
                 if matches!(&state, ActorState::Recording(recording) if recording.id == id) {
                     let ActorState::Recording(recording) =
@@ -500,6 +607,8 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                         current_delivery,
                         tx.clone(),
                         None,
+                        Arc::clone(&diagnostics),
+                        debug_capture,
                     ));
                 }
             }
@@ -537,7 +646,9 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
 
 fn state_label(state: &ActorState) -> DaemonState {
     match state {
-        ActorState::Idle | ActorState::Recovering(_) => DaemonState::Idle,
+        ActorState::Idle | ActorState::Recovering(_) | ActorState::Replaying(_) => {
+            DaemonState::Idle
+        }
         ActorState::Starting(_) => DaemonState::Recording,
         ActorState::Recording(_) => DaemonState::Recording,
         ActorState::Processing(_) => DaemonState::Processing,
@@ -558,7 +669,10 @@ fn status_response(state: &ActorState) -> Response {
                 Some(evidence)
             }
             ActorState::Processing(evidence) => Some(evidence.clone()),
-            ActorState::Idle | ActorState::Starting(_) | ActorState::Recovering(_) => None,
+            ActorState::Idle
+            | ActorState::Starting(_)
+            | ActorState::Recovering(_)
+            | ActorState::Replaying(_) => None,
         },
     )
 }
@@ -774,6 +888,8 @@ async fn process_recording(
     mut delivery: Box<dyn DeliveryAdapter>,
     actor: mpsc::Sender<ActorMessage>,
     reply: Option<oneshot::Sender<Response>>,
+    diagnostics: Arc<DiagnosticStore>,
+    debug_capture: bool,
 ) {
     let ActiveRecording {
         id,
@@ -793,6 +909,14 @@ async fn process_recording(
     evidence.streamed_chunk_count = chunk_counter.load(Ordering::SeqCst);
     evidence.first_chunk_ms = atomic_millis(&first_chunk_ms);
 
+    let correlation_id = evidence.correlation_id.clone();
+    // Local diagnostic evidence collected alongside the lifecycle evidence and
+    // persisted to bounded local history once the Recording completes. Raw audio
+    // is captured only when the user explicitly enabled debug capture.
+    let mut source_records: Vec<SourceTranscriptRecord> = Vec::new();
+    let mut final_transcript: Option<String> = None;
+    let mut debug_audio = None;
+
     let result = async {
         if let Some(error) = stream_error {
             evidence.stages.push(LifecycleStage::CaptureAborted);
@@ -807,11 +931,18 @@ async fn process_recording(
         };
         evidence.capture_finalized_ms = Some(elapsed_millis(started_at));
         evidence.stages.push(LifecycleStage::CaptureFinalized);
+        if debug_capture {
+            match diagnostics.store_debug_audio(&correlation_id, audio.pcm_s16le_mono_16khz()) {
+                Ok(record) => debug_audio = Some(record),
+                Err(error) => eprintln!("Recording {id}: debug audio capture failed: {error}"),
+            }
+        }
         let completed = providers.complete_with_timings(audio).await?;
         let sources = completed.sources;
         evidence.provider_timings_ms = completed.timings_ms;
         evidence.source_transcript_providers =
             sources.iter().map(|source| source.provider).collect();
+        source_records = sources.iter().map(SourceTranscriptRecord::new).collect();
         evidence.stages.push(LifecycleStage::ProvidersCompleted);
         let decision = match validator.validate(sources).await {
             Ok(decision) => decision,
@@ -833,6 +964,7 @@ async fn process_recording(
         evidence.reconciliation_requested = decision.reconciliation_requested;
         evidence.recovery_attempted = decision.recovery_attempted;
         evidence.stages.push(LifecycleStage::ValidationCompleted);
+        final_transcript = Some(decision.transcript.0.clone());
         delivery.deliver(decision.transcript).await?;
         evidence.delivery_count += 1;
         evidence.release_to_text_ms = Some(elapsed_millis(started_at));
@@ -840,6 +972,18 @@ async fn process_recording(
         Ok(())
     }
     .await;
+
+    let record = diagnostic_record(
+        &evidence,
+        source_records,
+        final_transcript,
+        debug_audio,
+        result.as_ref().err(),
+    );
+    if let Err(error) = diagnostics.record(record) {
+        eprintln!("Recording {id}: writing diagnostics failed: {error}");
+    }
+
     let _ = actor
         .send(ActorMessage::Completed(Completion {
             id,
@@ -850,6 +994,156 @@ async fn process_recording(
             reply,
         }))
         .await;
+}
+
+/// Builds the persisted diagnostic record for one completed Recording from its
+/// lifecycle evidence and the collected transcripts. The public error message
+/// (never the internal diagnostic) is recorded so history never leaks a secret.
+fn diagnostic_record(
+    evidence: &LifecycleEvidence,
+    source_transcripts: Vec<SourceTranscriptRecord>,
+    final_transcript: Option<String>,
+    debug_audio: Option<voisu_core::DebugAudioRecord>,
+    error: Option<&BoundaryError>,
+) -> DiagnosticRecord {
+    let mut record = DiagnosticRecord::new(evidence.correlation_id.clone(), evidence.recording_id);
+    record.stages = evidence.stages.clone();
+    record.streamed_chunk_count = evidence.streamed_chunk_count;
+    record.source_transcripts = source_transcripts;
+    if let Some(text) = final_transcript {
+        record.set_final_transcript(text);
+    }
+    record.selection = evidence.transcript_selection;
+    record.validation_reason = evidence.validation_reason.clone();
+    record.fallback_reason = evidence.fallback_reason.clone();
+    record.reconciliation_requested = evidence.reconciliation_requested;
+    record.recovery_attempted = evidence.recovery_attempted;
+    record.delivery_count = evidence.delivery_count;
+    record.first_chunk_ms = evidence.first_chunk_ms;
+    record.capture_finalized_ms = evidence.capture_finalized_ms;
+    record.provider_timings_ms = evidence.provider_timings_ms.clone();
+    record.release_to_text_ms = evidence.release_to_text_ms;
+    record.error = error.map(|error| error.public_message().to_owned());
+    record.debug_audio = debug_audio;
+    record
+}
+
+/// Replays a fixed captured fixture at `path` through the provider and
+/// validation boundaries without capturing audio, then returns the borrowed
+/// adapters to the actor so the daemon is reusable. The fixture is raw
+/// s16le/mono/16 kHz PCM, the same format capture produces.
+async fn replay_recording(
+    path: String,
+    id: u64,
+    mut deepgram: Box<dyn TranscriptProvider>,
+    mut groq: Box<dyn TranscriptProvider>,
+    mut validator: Box<dyn TranscriptValidator>,
+    provider_deadline: Duration,
+    actor: mpsc::Sender<ActorMessage>,
+    reply: oneshot::Sender<Response>,
+) {
+    let response = match run_replay(
+        &path,
+        id,
+        &mut deepgram,
+        &mut groq,
+        validator.as_mut(),
+        provider_deadline,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            let mut evidence = LifecycleEvidence {
+                recording_id: id,
+                correlation_id: voisu_core::correlation_id(id),
+                stages: vec![
+                    LifecycleStage::ProvidersCompleted,
+                    LifecycleStage::ValidationCompleted,
+                ],
+                delivery_count: 0,
+                streamed_chunk_count: 0,
+                source_transcript_providers: outcome
+                    .source_transcripts
+                    .iter()
+                    .map(|source| source.provider)
+                    .collect(),
+                first_chunk_ms: None,
+                capture_finalized_ms: None,
+                provider_timings_ms: outcome.timings_ms,
+                release_to_text_ms: None,
+                transcript_selection: Some(outcome.decision.selection),
+                validation_reason: Some(outcome.decision.validation_reason.clone()),
+                fallback_reason: outcome.decision.fallback_reason.clone(),
+                reconciliation_requested: outcome.decision.reconciliation_requested,
+                recovery_attempted: outcome.decision.recovery_attempted,
+            };
+            evidence.stages.dedup();
+            Response::with_evidence(
+                true,
+                Some(DaemonState::Idle),
+                format!(
+                    "replayed fixture through {} Source Transcript(s)",
+                    outcome.source_transcripts.len()
+                ),
+                Some(evidence),
+            )
+        }
+        Err(error) => {
+            eprintln!("Replay {id}: {}", error.diagnostic());
+            Response::rejected(Some(DaemonState::Idle), error.public_message())
+        }
+    };
+    let _ = actor
+        .send(ActorMessage::ReplayCompleted(ReplayCompletion {
+            id,
+            deepgram,
+            groq,
+            validator,
+            reply,
+            response,
+        }))
+        .await;
+}
+
+const MAX_FIXTURE_BYTES: u64 = 32 * 1024 * 1024;
+
+async fn run_replay(
+    path: &str,
+    id: u64,
+    deepgram: &mut Box<dyn TranscriptProvider>,
+    groq: &mut Box<dyn TranscriptProvider>,
+    validator: &mut dyn TranscriptValidator,
+    provider_deadline: Duration,
+) -> Result<ReplayOutcome, BoundaryError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        BoundaryError::new(BoundaryKind::Capture, format!("cannot inspect fixture: {error}"))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(BoundaryError::new(
+            BoundaryKind::Capture,
+            "fixture must be a regular file",
+        ));
+    }
+    if metadata.len() > MAX_FIXTURE_BYTES {
+        return Err(BoundaryError::new(BoundaryKind::Capture, "fixture is too large"));
+    }
+    let bytes = fs::read(path).map_err(|error| {
+        BoundaryError::new(BoundaryKind::Capture, format!("cannot read fixture: {error}"))
+    })?;
+    if bytes.is_empty() {
+        return Err(BoundaryError::new(BoundaryKind::EmptyRecording, "fixture is empty"));
+    }
+    let deepgram_stream = deepgram.start(id)?;
+    let groq_stream = groq.start(id)?;
+    let coordinator = ProviderCoordinator::start(
+        provider_deadline,
+        RECOVERY_ABORT_DEADLINE,
+        ProviderStreams {
+            deepgram: deepgram_stream,
+            groq: groq_stream,
+        },
+    );
+    replay_capture(CapturedAudio::new(bytes), coordinator, validator).await
 }
 
 async fn serve(stream: UnixStream, actor: mpsc::Sender<ActorMessage>) -> Result<(), String> {

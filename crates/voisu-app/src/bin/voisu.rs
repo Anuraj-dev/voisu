@@ -12,7 +12,11 @@ use voisu_app::system::{
     FedoraReadiness, PROCESSING_RESPONSE_DEADLINE, ProviderHttpClient, SecretToolStore,
 };
 
-const MAX_RESPONSE_BYTES: u64 = 16 * 1024;
+// History and export responses carry bounded local diagnostics, so the CLI
+// accepts a larger response frame than the tiny command replies. The bound
+// comfortably covers the full retained history: bounded record count times the
+// clamped transcript sizes.
+const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 const IO_DEADLINE: Duration = Duration::from_secs(2);
 
 enum CliAction {
@@ -57,6 +61,16 @@ fn daemon_command(command: Command) -> ExitCode {
         return fail(1, "failed to configure daemon connection deadline");
     }
 
+    // A replay drives the same provider/validation boundaries as Stop, so it
+    // shares the longer processing budget.
+    let response_deadline = if matches!(
+        command,
+        Command::Stop | Command::Toggle | Command::Replay(_)
+    ) {
+        PROCESSING_RESPONSE_DEADLINE
+    } else {
+        IO_DEADLINE
+    };
     let request = Request {
         version: PROTOCOL_VERSION,
         command,
@@ -64,12 +78,6 @@ fn daemon_command(command: Command) -> ExitCode {
     if serde_json::to_writer(&mut stream, &request).is_err() || stream.write_all(b"\n").is_err() {
         return fail(1, "failed to send command to daemon");
     }
-
-    let response_deadline = if matches!(command, Command::Stop | Command::Toggle) {
-        PROCESSING_RESPONSE_DEADLINE
-    } else {
-        IO_DEADLINE
-    };
     let response = match read_response_frame(&mut stream, response_deadline) {
         Ok(response) => response,
         Err(message) => return fail(1, &message),
@@ -92,10 +100,44 @@ fn daemon_command(command: Command) -> ExitCode {
         Err(_) => return fail(1, "daemon returned an invalid response"),
     };
     if response.ok {
-        println!("{}", response.message);
+        if let Some(export) = &response.export {
+            match serde_json::to_string_pretty(export) {
+                Ok(encoded) => println!("{encoded}"),
+                Err(_) => return fail(1, "daemon returned an invalid diagnostic export"),
+            }
+        } else if let Some(history) = &response.history {
+            print_history(history);
+        } else {
+            println!("{}", response.message);
+        }
         ExitCode::SUCCESS
     } else {
         fail(4, &response.message)
+    }
+}
+
+fn print_history(records: &[voisu_core::DiagnosticRecord]) {
+    if records.is_empty() {
+        println!("no diagnostic history");
+        return;
+    }
+    for record in records {
+        let selection = record
+            .selection
+            .map(|selection| format!("{selection:?}"))
+            .unwrap_or_else(|| "none".to_owned());
+        let outcome = record
+            .error
+            .as_deref()
+            .unwrap_or("delivered");
+        println!(
+            "{}  recording {}  selection={}  deliveries={}  {}",
+            record.correlation_id,
+            record.recording_id,
+            selection,
+            record.delivery_count,
+            outcome,
+        );
     }
 }
 
@@ -209,6 +251,13 @@ fn parse_command() -> Result<CliAction, String> {
         [command] if command == "stop" => Ok(CliAction::Daemon(Command::Stop)),
         [command] if command == "toggle" => Ok(CliAction::Daemon(Command::Toggle)),
         [command] if command == "status" => Ok(CliAction::Daemon(Command::Status)),
+        [command] if command == "history" => Ok(CliAction::Daemon(Command::History)),
+        [command, correlation_id] if command == "export" => {
+            Ok(CliAction::Daemon(Command::Export((*correlation_id).to_owned())))
+        }
+        [command, path] if command == "replay" => {
+            Ok(CliAction::Daemon(Command::Replay((*path).to_owned())))
+        }
         [command] if command == "doctor" => Ok(CliAction::Doctor),
         [command] if command == "--help" || command == "-h" || command == "help" => {
             Ok(CliAction::Help)
@@ -232,7 +281,7 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: voisu <start|stop|toggle|status|doctor|auth>\n\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>"
+    "usage: voisu <start|stop|toggle|status|history|export|replay|doctor|auth>\n\n  voisu history\n  voisu export <correlation-id>\n  voisu replay <fixture-path>\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>"
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {

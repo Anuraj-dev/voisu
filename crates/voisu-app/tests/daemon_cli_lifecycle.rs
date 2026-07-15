@@ -3381,3 +3381,189 @@ fn oversized_and_slow_frames_do_not_block_or_kill_the_daemon() {
     assert!(response.is_empty());
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 }
+
+fn diagnostics_audio_dir(runtime_dir: &Path) -> PathBuf {
+    runtime_dir
+        .join("voisu")
+        .join(format!("v{PROTOCOL_VERSION}"))
+        .join("diagnostics")
+        .join("audio")
+}
+
+fn pcm_file_count(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("pcm"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn completed_recording_is_correlated_in_local_history_and_export_redacts_secrets() {
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_GROQ_API_KEY", "super-secret-groq-key"),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", "https://groq.test/transcribe"),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Ship the release on Friday."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Ship the release on Friday"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    let correlation_id = stopped["evidence"]["correlation_id"]
+        .as_str()
+        .expect("stop evidence carries the correlation id")
+        .to_owned();
+    assert!(correlation_id.starts_with("rec-"), "correlation id: {correlation_id}");
+
+    // History exposes the Recording, its Source Transcripts, final Transcript,
+    // timing, and decision reasons, joined by the same correlation id.
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let records = history["history"].as_array().expect("history is a list");
+    assert_eq!(records.len(), 1, "one completed Recording is retained: {history}");
+    let record = &records[0];
+    assert_eq!(record["correlation_id"], correlation_id);
+    assert_eq!(record["final_transcript"], "Ship the release on Friday");
+    assert_eq!(record["source_transcripts"].as_array().unwrap().len(), 2);
+    assert!(record["validation_reason"].is_string());
+    assert!(record["provider_timings_ms"].is_array());
+
+    // Export redacts the credential, keeps relevant config, and drops unrelated env.
+    let export_request = format!(
+        r#"{{"version":1,"command":{{"export":"{correlation_id}"}}}}"#
+    );
+    let export = ipc_request(runtime.path(), &export_request);
+    assert_eq!(export["ok"], true, "{export}");
+    let environment = &export["export"]["environment"];
+    assert_eq!(environment["VOISU_GROQ_API_KEY"], "<redacted>");
+    assert_eq!(environment["VOISU_GROQ_TRANSCRIPTION_URL"], "https://groq.test/transcribe");
+    assert!(environment.get("HOME").is_none(), "unrelated env is dropped: {environment}");
+    assert!(
+        !export.to_string().contains("super-secret-groq-key"),
+        "no credential value survives export"
+    );
+
+    let _ = daemon.terminate_and_stderr();
+}
+
+#[test]
+fn raw_audio_is_absent_from_diagnostics_without_debug_capture() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    assert!(record["debug_audio"].is_null(), "no debug audio without opt-in: {record}");
+    assert_eq!(
+        pcm_file_count(&diagnostics_audio_dir(runtime.path())),
+        0,
+        "no raw audio file is written by default"
+    );
+}
+
+#[test]
+fn debug_capture_persists_audio_with_recorded_expiry() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(runtime.path(), &[("VOISU_DEBUG_CAPTURE", "1")]);
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let debug_audio = &history["history"][0]["debug_audio"];
+    assert!(debug_audio.is_object(), "debug capture records audio: {history}");
+    let expires = debug_audio["expires_at_unix_ms"].as_u64().unwrap();
+    let captured = debug_audio["captured_at_unix_ms"].as_u64().unwrap();
+    assert!(expires > captured, "debug audio records a future expiry");
+    assert_eq!(
+        pcm_file_count(&diagnostics_audio_dir(runtime.path())),
+        1,
+        "exactly one debug audio capture is written"
+    );
+}
+
+#[test]
+fn expired_debug_audio_is_cleaned_up_safely() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_DEBUG_CAPTURE", "1"), ("VOISU_DEBUG_AUDIO_TTL_SECS", "0")],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+
+    // A zero TTL expires immediately; the next history read must remove the file
+    // and detach it from the record without failing.
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert!(history["history"][0]["debug_audio"].is_null(), "expired audio is detached: {history}");
+    assert_eq!(
+        pcm_file_count(&diagnostics_audio_dir(runtime.path())),
+        0,
+        "expired debug audio file is removed"
+    );
+}
+
+#[test]
+fn fixed_fixture_replays_through_provider_and_validation_boundaries() {
+    let runtime = TempDir::new().unwrap();
+    let fixture = TempDir::new().unwrap();
+    let fixture_path = fixture.path().join("dictation.pcm");
+    fs::write(&fixture_path, vec![1_u8; 3_200]).unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Replay this dictation."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Replay this dictation"),
+        ],
+    );
+
+    let request = format!(
+        r#"{{"version":1,"command":{{"replay":"{}"}}}}"#,
+        fixture_path.display()
+    );
+    let replayed = ipc_request(runtime.path(), &request);
+    assert_eq!(replayed["ok"], true, "{replayed}");
+    assert_eq!(
+        replayed["evidence"]["source_transcript_providers"],
+        serde_json::json!(["deepgram", "groq"])
+    );
+    assert_eq!(replayed["evidence"]["transcript_selection"], "near_identical_groq");
+    // The daemon stays reusable after a replay: a real Recording still works.
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert!(voisu(runtime.path(), "start").status.success());
+}
+
+#[test]
+fn replay_of_a_missing_fixture_is_rejected_and_leaves_the_daemon_reusable() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+
+    let request = r#"{"version":1,"command":{"replay":"/nonexistent/fixture.pcm"}}"#;
+    let replayed = ipc_request(runtime.path(), request);
+    assert_eq!(replayed["ok"], false, "{replayed}");
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert!(voisu(runtime.path(), "start").status.success());
+}
+
+#[test]
+fn export_of_an_unknown_correlation_id_is_rejected() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+
+    let export = ipc_request(runtime.path(), r#"{"version":1,"command":{"export":"rec-does-not-exist"}}"#);
+    assert_eq!(export["ok"], false, "{export}");
+}
