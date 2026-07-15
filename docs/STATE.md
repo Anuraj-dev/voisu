@@ -2,9 +2,8 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-16
 
 ## 🚧 In progress / next
-- Ticket 05 (issue #5, reconcile + guard the final Transcript) is APPROVED and closed. Next up: Ticket 06
-  (06-correlated-local-diagnostics) — regular feature work, routed to Opus 4.8 high per the 2026-07-16 routing
-  update (Sol reserved for architectural tickets and reviews). First review Sol high.
+- Ticket 06 (issue #6, inspect and expire correlated local diagnostics) is APPROVED and closed. Next up:
+  Ticket 07 (07-global-shortcut-toggle) — Opus 4.8 high implementation, first review Sol high.
 - Follow-up issue #14 remains open: make `DeepgramStream::abort` / `GroqStream::abort` cancellation-safe
   (drain→peek-then-pop) plus an abort-deadline regression test. Not blocking; pick up opportunistically.
 
@@ -36,9 +35,14 @@
 - Linux capture children request `PR_SET_PDEATHSIG(SIGKILL)`. Acceptance daemons run in isolated process groups whose
   Drop guard kills the whole tree, and all generated shell stubs have signal/exit traps plus bounded wait loops.
 - CI is live: `.github/workflows/ci.yml` runs the workspace suite plus a 3x-parallel voisu-app flake gate on every
-  push/PR; green on all commits pushed so far, including all Ticket 05 commits.
-- Test inventory: 97 (74 voisu-app acceptance including 1 ignored live smoke, 3 app unit, 6 provider-coordination,
-  14 Transcript-decision).
+  push/PR; green on all commits pushed so far, including all Ticket 06 commits.
+- A `DiagnosticStore` correlates each Recording under one correlation ID, retains redacted local diagnostics
+  (env allowlist, URL sanitizing, secret scrub) with expiry-in-filename orphan purge, and exposes history/export/
+  replay through both CLI and IPC; replay takes a fixture NAME (not a path) inside the private diagnostics/fixtures
+  dir, validated to its basename with `O_NOFOLLOW` descriptor checks, and runs supervised under a `Replaying` state.
+  Store IO is `create_new` 0600 with basename validation and a store mutex guarding concurrent access.
+- Test inventory: 132 (3 app unit + 89 acceptance incl. 1 ignored live smoke + 20 diagnostics + 6
+  provider-coordination + 14 Transcript-decision).
 
 ## Architecture map
 - Domain, audio contract, provider coordination/timings, Transcript decision pipeline/guardrails, typed errors,
@@ -73,6 +77,8 @@
 - Routing update (2026-07-16): Opus 4.8 subagents (medium/high effort) are the workhorse for regular
   implementation/fix work; Sol is reserved for architectural tickets and ALL code reviews (first review high,
   re-reviews medium).
+- Replay protocol changed pre-release: IPC/CLI takes a fixture NAME inside the private diagnostics/fixtures dir,
+  never a path; `DebugAudioRecord.path` was renamed to `file_name` to match.
 
 ## Gotchas
 - Use CONTEXT.md's ubiquitous language exactly; it lists banned synonyms.
@@ -82,5 +88,8 @@
 - Sol's first review on Ticket 05 caught the same "detach on cancellation" bug class a third time (this time the
   reconciliation timeout dropping the `spawn_blocking` handle) — always pin-cancel-await, never let a timeout race
   drop an owned handle.
+- Sol's first review on Ticket 06 found 8 real security/privacy findings in one round (path traversal via
+  fixture path instead of name, env/URL/secret leakage, TOCTOU on store files, orphan expiry parsing) — diagnostics
+  code touching filesystem paths or exported evidence needs security-first review, not just correctness review.
 - A stale git stash ("partial edits from killed codex leak-fix run") and an older one ("partial review-fix from
   killed codex run") both remain on the stack — superseded by the merged fixes; safe to drop.
