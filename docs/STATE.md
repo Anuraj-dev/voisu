@@ -2,8 +2,11 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-16
 
 ## 🚧 In progress / next
-- Ticket 04 follow-up hardening remains uncommitted. The orchestrator must run `cargo test --workspace` and the
-  parallel acceptance gate outside the managed sandbox, then run the Sol re-review before commit/close/push.
+- Ticket 04 (issue #4) is APPROVED and closed. Next up: dispatch Ticket 05 (reconcile + guard Transcript) —
+  Sol medium implementation (architectural: reconciliation), first review Sol high per the pinned routing.
+- Follow-up issue #14 filed: make `DeepgramStream::abort` / `GroqStream::abort` cancellation-safe
+  (drain→peek-then-pop) plus an abort-deadline regression test. Not blocking Ticket 05 but should be picked
+  up soon.
 
 ## Status
 - The independent `voisu` and `voisu-daemon` binaries communicate over bounded, versioned Unix IPC.
@@ -24,8 +27,9 @@
   per-Recording `CancelRegistry`, owning-child kill/reap, and awaited request-task cleanup before reuse.
 - Linux capture children request `PR_SET_PDEATHSIG(SIGKILL)`. Acceptance daemons run in isolated process groups whose
   Drop guard kills the whole tree, and all generated shell stubs have signal/exit traps plus bounded wait loops.
-- The new failed-Deepgram-chunk regression compiles, but this managed sandbox returns `EPERM` when the process-group
-  daemon binds its Unix socket; run that acceptance test and the full gate in the orchestrator environment.
+- CI is live: `.github/workflows/ci.yml` runs the workspace suite plus a 3x-parallel voisu-app flake gate on every
+  push/PR; green on all commits pushed so far.
+- Test count: 76 (67 voisu-app acceptance + 3 unit + 6 voisu-core), 1 ignored live smoke.
 
 ## Architecture map
 - Domain, audio contract, provider coordination/timings, typed errors, readiness/auth traits, IPC ->
@@ -38,6 +42,7 @@
 - Public daemon/CLI acceptance suite, PATH stubs, local Groq server, live smoke ->
   `crates/voisu-app/tests/daemon_cli_lifecycle.rs`
 - Provider coordination contract tests -> `crates/voisu-core/tests/provider_coordination.rs`
+- CI workflow -> `.github/workflows/ci.yml`
 - Ordered implementation tickets -> `.scratch/voisu-implementation/issues/`
 
 ## Stack & run
@@ -53,10 +58,12 @@
   available Source Transcript proceeds only after any late provider's bounded awaited cleanup completes.
 - Recovery remains a first-class actor state; cancellation is an `AtomicBool` observed by the wait loop owning `Child`,
   never a raw-PID signal.
+- Routing update (2026-07-16): Opus 4.8 subagents (medium/high effort) are now the workhorse for regular
+  implementation/fix work; Sol is reserved for architectural tickets and ALL code reviews (first review high,
+  re-reviews medium).
 
 ## Gotchas
 - Use CONTEXT.md's ubiquitous language exactly; it lists banned synonyms.
 - `rustfmt` and `clippy` are unavailable (`sudo dnf install rustfmt clippy` needed); both remain skipped.
-- Managed-sandbox acceptance runs cannot bind the daemon socket after the required test `setpgid`; library/core tests
-  and `cargo check --workspace --tests` remain runnable locally.
-- The sandbox exposes `.git` read-only; keep the review fixes uncommitted until a writable Git environment is available.
+- A stale git stash ("partial edits from killed codex leak-fix run") and an older one ("partial review-fix from
+  killed codex run") both remain on the stack — superseded by the merged fixes; safe to drop.

@@ -27,3 +27,11 @@
 - Opus: strong on scoped escalation fixes — precise, test-first, no new defects so far (pending verdict).
 - Luna: not yet used (tickets 11–13).
 - Sol medium as re-reviewer (new policy from ticket 03): still catches HIGH-severity concurrency races — the cost cut did not lose review quality so far.
+| 15 | 04 | Feature impl | Sol (medium) | delivered 3e2eecc, 71 tests | round 1: 2 HIGH (unawaited deadline cancel, no curl cap) + 2 MEDIUM | 1 round | Solid slice; missed cancellation-ownership discipline |
+| 16 | 04 | Fix round 1 | Sol (medium) | delivered (uncommitted), semaphore cap + awaited abort | own new reap test failed deterministically | round exhausted | Introduced detached-request-task bug it then had to chase |
+| 17 | 04 | Fix round 2 (root cause) | Sol (medium) | retained-handle VecDeques; 75 tests | parallel-harness flakes remained | — | Correct fix; fixtures still timing-fragile |
+| 18 | 04 | Flake-hardening round | Sol (medium) | 2s test deadline + PID-marker gating → 7f2bf21 | round 2 review: 1 HIGH (error-path early return) | — | Good fixture work; missed error branch |
+| 19 | 04 | Combined leak+error-path round | Sol (medium) | PDEATHSIG + pgroup Drop + bounded stubs | broke reap test 3/4 runs (pop_front refactor) | round exhausted | Fixed the incident but regressed success-path ownership |
+| 20 | 04 | Escalated fix (regression) | Opus 4.8 (high) | restored peek-then-pop → 7be2329, 76 tests | round 3 review: 1 HIGH (drain in error branch) | — | Found root cause in 1 pass w/ zombie-state proof; ~21 min, 117k tokens |
+| 21 | 04 | Final fix (drain detach) | Opus 4.8 (high, resumed agent) | e1197db + discriminating pipe-holder test → APPROVE | 0 findings | closed ticket | Proved test discriminates by reinstating bug; flagged abort() follow-up (#14) |
+| 22 | 04 | Reviews | Sol (high first, medium re-reviews) | 4 rounds; real HIGH each round until APPROVE | — | — | Sol medium again caught cancellation-window races; one run hung on stdin (env quirk, not model) |
