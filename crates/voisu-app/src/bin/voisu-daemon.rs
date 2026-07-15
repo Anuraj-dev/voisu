@@ -571,7 +571,8 @@ async fn actor_loop(
                                     "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
                                 );
                             }
-                            let mut evidence = base_evidence(id, correlation, Vec::new());
+                            let mut evidence =
+                                base_evidence(id, correlation.clone(), Vec::new());
                             evidence.recovery_attempted = recovering;
                             let _ = reply.send(Response::with_evidence(
                                 false,
@@ -584,7 +585,12 @@ async fn actor_loop(
                                 // new Recordings until the bounded aborts
                                 // acknowledge completion (ActorMessage::Recovered).
                                 state = ActorState::Recovering(id);
-                                tokio::spawn(recover_failed_start(id, failure, tx.clone()));
+                                tokio::spawn(recover_failed_start(
+                                    id,
+                                    correlation,
+                                    failure,
+                                    tx.clone(),
+                                ));
                             } else {
                                 state = ActorState::Idle;
                             }
@@ -791,20 +797,31 @@ fn begin_recording(
 /// Aborts everything a failed start already started, off the actor loop, then
 /// acknowledges completion so the actor can leave Recovering. Abort failures
 /// and timeouts are surfaced into local diagnostics rather than discarded.
-async fn recover_failed_start(id: u64, failure: StartFailure, actor: mpsc::Sender<ActorMessage>) {
+async fn recover_failed_start(
+    id: u64,
+    correlation: String,
+    failure: StartFailure,
+    actor: mpsc::Sender<ActorMessage>,
+) {
     let StartFailure {
         capture,
         provider_stream,
         ..
     } = failure;
+    let correlation = correlation.as_str();
     let capture_abort = async {
         if let Some(capture) = capture {
             match timeout(RECOVERY_ABORT_DEADLINE, capture.abort()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    eprintln!("Recording {id}: capture abort failed: {}", error.diagnostic());
+                    eprintln!(
+                        "Recording {id} [{correlation}]: capture abort failed: {}",
+                        error.diagnostic()
+                    );
                 }
-                Err(_) => eprintln!("Recording {id}: capture abort timed out"),
+                Err(_) => {
+                    eprintln!("Recording {id} [{correlation}]: capture abort timed out")
+                }
             }
         }
     };
@@ -813,9 +830,14 @@ async fn recover_failed_start(id: u64, failure: StartFailure, actor: mpsc::Sende
             match timeout(RECOVERY_ABORT_DEADLINE, stream.abort()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    eprintln!("Recording {id}: provider abort failed: {}", error.diagnostic());
+                    eprintln!(
+                        "Recording {id} [{correlation}]: provider abort failed: {}",
+                        error.diagnostic()
+                    );
                 }
-                Err(_) => eprintln!("Recording {id}: provider abort timed out"),
+                Err(_) => {
+                    eprintln!("Recording {id} [{correlation}]: provider abort timed out")
+                }
             }
         }
     };

@@ -3754,3 +3754,39 @@ fn export_scrubs_a_secret_spoken_into_the_transcript_itself() {
         "a secret spoken into the Recording must not survive export: {export}"
     );
 }
+
+#[test]
+fn recovery_diagnostics_carry_the_recordings_correlation_id() {
+    let runtime = TempDir::new().unwrap();
+    // Groq's start fails after capture and Deepgram started, and both aborts
+    // fail, so the recovery path emits its diagnostic lines.
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_PROVIDER_START_FAILURE", "1"),
+            ("VOISU_TEST_CAPTURE_ABORT_FAILURE", "1"),
+            ("VOISU_TEST_PROVIDER_ABORT_FAILURE", "1"),
+        ],
+    );
+
+    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    assert_eq!(started["ok"], false, "{started}");
+    let correlation_id = started["evidence"]["correlation_id"].as_str().unwrap().to_owned();
+    // Let the recovery aborts run and log before draining stderr.
+    assert!(start_recording_when_recovered(runtime.path()).status.success());
+
+    let diagnostics = daemon.terminate_and_stderr();
+    let tag = format!("[{correlation_id}]");
+    assert!(
+        diagnostics
+            .lines()
+            .any(|line| line.contains(&tag) && line.contains("capture abort failed")),
+        "capture recovery diagnostics must carry the correlation ID: {diagnostics}"
+    );
+    assert!(
+        diagnostics
+            .lines()
+            .any(|line| line.contains(&tag) && line.contains("provider abort failed")),
+        "provider recovery diagnostics must carry the correlation ID: {diagnostics}"
+    );
+}

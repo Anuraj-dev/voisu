@@ -339,3 +339,84 @@ async fn replay_runs_a_fixed_fixture_through_provider_and_validation_boundaries(
     assert_eq!(outcome.source_transcripts.len(), 2, "both providers replayed the fixture");
     assert_eq!(outcome.decision.transcript.0, "replayed dictation");
 }
+
+#[test]
+fn sanitize_url_fails_closed_on_malformed_and_unrecognized_inputs() {
+    // Adversarial: scheme-less URLs still carry credentials — the naive parse
+    // would pass "user:pass@host/path" straight through.
+    assert_eq!(voisu_core::sanitize_url("user:hunter2@groq.test/v1"), REDACTED);
+    assert_eq!(voisu_core::sanitize_url("groq.test/v1?key=leak"), REDACTED);
+    assert_eq!(voisu_core::sanitize_url(""), REDACTED);
+    // Unrecognized schemes are not reasoned about — redact entirely.
+    assert_eq!(voisu_core::sanitize_url("ftp://user:pass@host/file"), REDACTED);
+    assert_eq!(voisu_core::sanitize_url("javascript://alert(1)"), REDACTED);
+    // Malformed: empty authority.
+    assert_eq!(voisu_core::sanitize_url("http://"), REDACTED);
+    assert_eq!(voisu_core::sanitize_url("https://user:pass@"), REDACTED);
+    // Well-formed shapes still sanitize rather than redact.
+    assert_eq!(
+        voisu_core::sanitize_url("https://host.test:8443/v1/audio?k=leak"),
+        "https://host.test:8443/v1/audio"
+    );
+    assert_eq!(voisu_core::sanitize_url("HTTPS://host.test"), "HTTPS://host.test");
+}
+
+#[test]
+fn export_scrubs_even_a_one_character_secret_value() {
+    let mut record = record_at(1, unix_millis_now());
+    record.set_final_transcript("the code is 7 exactly".to_owned());
+    let environment = vec![("VOISU_GROQ_API_KEY".to_owned(), "7".to_owned())];
+    let export = export_record(record, environment);
+    let transcript = export.record.final_transcript.as_deref().unwrap();
+    assert!(
+        !transcript.contains('7'),
+        "a credential has no minimum length; even one character must be scrubbed: {transcript}"
+    );
+    assert!(transcript.contains(REDACTED));
+}
+
+#[test]
+fn export_allowlist_passes_the_groq_model_name_through() {
+    let environment = vec![("VOISU_GROQ_MODEL".to_owned(), "whisper-large-v3".to_owned())];
+    let export = export_record(record_at(1, unix_millis_now()), environment);
+    assert_eq!(
+        export.environment.get("VOISU_GROQ_MODEL").map(String::as_str),
+        Some("whisper-large-v3"),
+    );
+}
+
+#[test]
+fn a_preplanted_colliding_temp_file_does_not_lose_the_record() {
+    let dir = TempDir::new().unwrap();
+    let store_dir = dir.path().join("diag");
+    let store = DiagnosticStore::open(store_dir.clone(), RetentionPolicy::default()).unwrap();
+    // Adversarial: crash leftovers after PID reuse occupy the first temp names
+    // this store would pick.
+    for nonce in 0..3 {
+        std::fs::write(
+            store_dir.join(format!("history.json.tmp.{}.{nonce}", std::process::id())),
+            b"stale",
+        )
+        .unwrap();
+    }
+    store
+        .record(DiagnosticRecord::new("corr-collide".to_owned(), 1))
+        .expect("a temp-name collision must retry, not fail");
+    assert!(
+        store.find("corr-collide").unwrap().is_some(),
+        "the record persists despite the collision"
+    );
+    // Startup cleanup purges the stale leftovers.
+    store.cleanup_expired().unwrap();
+    let leftovers = std::fs::read_dir(&store_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("history.json.tmp."))
+        })
+        .count();
+    assert_eq!(leftovers, 0, "stale temp files are purged at startup");
+}

@@ -297,11 +297,12 @@ pub fn is_secret_env_key(key: &str) -> bool {
 /// Everything else — including unknown `VOISU_*` values, which could hold a
 /// secret under an unrecognized name — is omitted entirely. URL values are
 /// additionally sanitized of userinfo credentials and query parameters.
-pub const EXPORT_ENV_ALLOWLIST: [&str; 10] = [
+pub const EXPORT_ENV_ALLOWLIST: [&str; 11] = [
     "VOISU_GROQ_TRANSCRIPTION_URL",
     "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
     "VOISU_GROQ_RECONCILIATION_URL",
     "VOISU_GROQ_RECONCILIATION_MODEL",
+    "VOISU_GROQ_MODEL",
     "VOISU_PIPEWIRE_TARGET",
     "VOISU_RECORDING_DEADLINE_MS",
     "VOISU_DIAGNOSTIC_MAX_RECORDS",
@@ -312,27 +313,44 @@ pub const EXPORT_ENV_ALLOWLIST: [&str; 10] = [
 
 /// Strips credentials and query/fragment parameters from a URL so an exported
 /// endpoint never carries `user:password@` userinfo or `?key=` style secrets.
+/// FAIL CLOSED: only well-formed `http://` / `https://` URLs are sanitized and
+/// passed through — a scheme-less, malformed, or unrecognized-scheme value is
+/// replaced with the redaction mask entirely, because a value we cannot parse
+/// is a value whose credential placement we cannot reason about.
 pub fn sanitize_url(value: &str) -> String {
-    let without_query = value.split(['?', '#']).next().unwrap_or("");
-    match without_query.split_once("://") {
-        Some((scheme, rest)) => {
-            let sanitized_rest = match rest.split_once('/') {
-                Some((authority, path)) => {
-                    format!("{}/{}", strip_userinfo(authority), path)
-                }
-                None => strip_userinfo(rest).to_owned(),
-            };
-            format!("{scheme}://{sanitized_rest}")
-        }
-        None => without_query.to_owned(),
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return REDACTED.to_owned();
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return REDACTED.to_owned();
+    }
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, Some(path)),
+        None => (rest, None),
+    };
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    if host.is_empty() || host.contains([':', '@']) && !is_host_port(host) {
+        return REDACTED.to_owned();
+    }
+    match path {
+        Some(path) => format!("{scheme}://{host}/{path}"),
+        None => format!("{scheme}://{host}"),
     }
 }
 
-fn strip_userinfo(authority: &str) -> &str {
-    authority
-        .rsplit_once('@')
-        .map(|(_, host)| host)
-        .unwrap_or(authority)
+/// True for `host` or `host:port` with a purely numeric port — the only `:`
+/// use permitted in a sanitized authority.
+fn is_host_port(host: &str) -> bool {
+    match host.split_once(':') {
+        None => !host.is_empty(),
+        Some((name, port)) => {
+            !name.is_empty() && !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+        }
+    }
 }
 
 /// A redacted, self-contained diagnostic export for one Recording. It carries
@@ -381,8 +399,10 @@ pub fn scrub_secret_values(text: &str, secrets: &[String]) -> String {
 }
 
 fn secret_values(vars: &[(String, String)]) -> Vec<String> {
+    // Every non-empty secret value is scrubbed: credentials have no minimum
+    // length, so even a one-character value must never survive an export.
     vars.iter()
-        .filter(|(key, value)| is_secret_env_key(key) && value.len() >= 4)
+        .filter(|(key, value)| is_secret_env_key(key) && !value.is_empty())
         .map(|(_, value)| value.clone())
         .collect()
 }
@@ -427,6 +447,7 @@ pub struct DiagnosticStore {
     dir: PathBuf,
     policy: RetentionPolicy,
     lock: Mutex<()>,
+    temp_counter: AtomicU64,
 }
 
 impl DiagnosticStore {
@@ -438,6 +459,7 @@ impl DiagnosticStore {
             dir,
             policy,
             lock: Mutex::new(()),
+            temp_counter: AtomicU64::new(0),
         };
         create_private_dir(&store.audio_dir())?;
         create_private_dir(&store.fixture_dir())?;
@@ -467,23 +489,38 @@ impl DiagnosticStore {
     }
 
     fn write_all(&self, records: &[DiagnosticRecord]) -> io::Result<()> {
-        static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        const TEMP_CREATE_ATTEMPTS: u32 = 32;
         let encoded = serde_json::to_vec(records)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         // A unique, exclusively created temp file per write: O_EXCL refuses to
-        // follow a pre-planted symlink at the temp path, the unique name avoids
-        // any collision between concurrent daemon processes, and the descriptor
-        // is created 0600 rather than trusting pre-existing permissions.
-        let temp = self.dir.join(format!(
-            "history.json.tmp.{}.{}",
-            std::process::id(),
-            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)?;
+        // follow a pre-planted symlink at the temp path and the descriptor is
+        // created 0600 rather than trusting pre-existing permissions. A name
+        // collision (a crash leftover after PID reuse, or a planted file) is
+        // NOT fatal: creation retries with a fresh nonce, bounded, so a record
+        // is never lost to a stale temp file.
+        let (temp, mut file) = 'created: {
+            for _ in 0..TEMP_CREATE_ATTEMPTS {
+                let temp = self.dir.join(format!(
+                    "history.json.tmp.{}.{}",
+                    std::process::id(),
+                    self.temp_counter.fetch_add(1, Ordering::Relaxed)
+                ));
+                match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&temp)
+                {
+                    Ok(file) => break 'created (temp, file),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "cannot create a unique diagnostics temp file",
+            ));
+        };
         let result = file.write_all(&encoded).and_then(|()| file.sync_all());
         if let Err(error) = result {
             let _ = fs::remove_file(&temp);
@@ -554,6 +591,19 @@ impl DiagnosticStore {
     pub fn cleanup_expired(&self) -> io::Result<()> {
         let kept = self.history()?;
         let _guard = self.lock.lock().expect("diagnostics lock is not poisoned");
+        // Purge crash-leftover temp files so a recycled PID can never collide
+        // with a stale name from an earlier daemon run.
+        if let Ok(entries) = fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("history.json.tmp."))
+                {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
         let referenced: Vec<&str> = kept
             .iter()
             .filter_map(|record| record.debug_audio.as_ref())
