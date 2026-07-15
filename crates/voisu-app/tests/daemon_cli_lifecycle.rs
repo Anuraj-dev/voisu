@@ -189,6 +189,105 @@ fn voisu_with_secret(
     child.wait_with_output().expect("CLI should complete")
 }
 
+struct FakeCommands {
+    bin: TempDir,
+}
+
+impl FakeCommands {
+    fn new() -> Self {
+        let bin = TempDir::new().expect("fake command directory should exist");
+        write_fake_command(
+            bin.path(),
+            "secret-tool",
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$@" > "$dir/secret-tool.args"
+env | sort > "$dir/secret-tool.env"
+if [ -e "$dir/secret-tool.stall" ]; then exec sleep 10; fi
+if [ "$1" = "lookup" ]; then printf 'stored-credential'; else cat > "$dir/secret-tool.stdin"; fi
+"#,
+        );
+        write_fake_command(
+            bin.path(),
+            "curl",
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$@" > "$dir/curl.args"
+env | sort > "$dir/curl.env"
+cat > "$dir/curl.stdin"
+if [ -e "$dir/curl.stall" ]; then exec sleep 10; fi
+if [ -e "$dir/curl.redirect" ]; then printf '302'; else printf '200'; fi
+"#,
+        );
+        write_fake_command(
+            bin.path(),
+            "pw-cli",
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$@" > "$dir/pw-cli.args"
+"#,
+        );
+        write_fake_command(
+            bin.path(),
+            "wpctl",
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$@" > "$dir/wpctl.args"
+"#,
+        );
+        write_fake_command(
+            bin.path(),
+            "busctl",
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$@" > "$dir/busctl.args"
+"#,
+        );
+        write_fake_command(
+            bin.path(),
+            "wl-copy",
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+cat > "$dir/clipboard"
+"#,
+        );
+        write_fake_command(
+            bin.path(),
+            "wl-paste",
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+cat "$dir/clipboard"
+"#,
+        );
+        fs::write(bin.path().join("clipboard"), "prior clipboard")
+            .expect("initial clipboard should exist");
+        Self { bin }
+    }
+
+    fn path(&self) -> String {
+        format!(
+            "{}:{}",
+            self.bin.path().display(),
+            std::env::var("PATH").expect("test PATH should exist")
+        )
+    }
+
+    fn read(&self, name: &str) -> String {
+        fs::read_to_string(self.bin.path().join(name)).expect("fake command should capture data")
+    }
+
+    fn touch(&self, name: &str) {
+        fs::write(self.bin.path().join(name), "").expect("fake command marker should be written");
+    }
+}
+
+fn write_fake_command(directory: &Path, name: &str, script: &str) {
+    let path = directory.join(name);
+    fs::write(&path, script).expect("fake command should be written");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+        .expect("fake command should be executable");
+}
+
 fn ipc_request(runtime_dir: &Path, request: &str) -> Value {
     let mut stream = UnixStream::connect(socket_path(runtime_dir)).unwrap();
     stream.write_all(request.as_bytes()).unwrap();
@@ -231,7 +330,7 @@ fn doctor_reports_each_fedora_capability_through_the_public_cli() {
     assert!(doctor.status.success(), "{}", stderr(&doctor));
     assert_eq!(
         stdout(&doctor),
-        "PipeWire: PASS (available)\nMicrophone: PASS (present)\nPortals: PASS (available)\nClipboard: PASS (available)\nSecret storage: PASS (available)\nDaemon: PASS (reachable)\n"
+        "PipeWire: PASS (PipeWire core responds)\nMicrophone: PASS (default source available)\nPortals: PASS (desktop portal responds)\nClipboard: PASS (clipboard roundtrip succeeds)\nSecret storage: PASS (Secret Service responds)\nDaemon: PASS (status handshake succeeds)\n"
     );
 }
 
@@ -245,9 +344,37 @@ fn doctor_exposes_actionable_warn_and_fail_outcomes() {
     );
 
     assert_eq!(doctor.status.code(), Some(4));
-    assert!(stdout(&doctor).contains("PipeWire: FAIL (not available)\n"));
-    assert!(stdout(&doctor).contains("Clipboard: WARN (needs attention)\n"));
-    assert!(stdout(&doctor).contains("Daemon: FAIL (unavailable)\n"));
+    assert!(stdout(&doctor).contains("PipeWire: FAIL (not available; see remediation)\n"));
+    assert!(stdout(&doctor).contains("Clipboard: WARN (needs attention; see remediation)\n"));
+    assert!(stdout(&doctor).contains("Daemon: FAIL (daemon status handshake failed; start voisu-daemon and run voisu doctor again)\n"));
+}
+
+#[test]
+fn doctor_exercises_real_capabilities_instead_of_command_headings_or_socket_connects() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let commands = FakeCommands::new();
+    let doctor = voisu_with_env(runtime.path(), &["doctor"], &[("PATH", &commands.path())]);
+
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    assert_eq!(commands.read("pw-cli.args"), "info\n0\n");
+    assert_eq!(commands.read("wpctl.args"), "inspect\n@DEFAULT_AUDIO_SOURCE@\n");
+    assert_eq!(
+        commands.read("busctl.args"),
+        "--user\n--no-pager\nstatus\norg.freedesktop.portal.Desktop\n"
+    );
+    assert!(
+        commands
+            .read("secret-tool.args")
+            .starts_with("lookup\nvoisu-doctor-probe\n")
+    );
+    assert_eq!(
+        fs::read_to_string(commands.bin.path().join("clipboard")).unwrap(),
+        "prior clipboard"
+    );
+    assert!(stdout(&doctor).contains("Microphone: PASS (default source available)"));
+    assert!(stdout(&doctor).contains("Clipboard: PASS (clipboard roundtrip succeeds"));
+    assert!(stdout(&doctor).contains("Daemon: PASS (status handshake succeeds)"));
 }
 
 #[test]
@@ -294,6 +421,60 @@ fn denied_secret_storage_names_the_headless_fallback_without_leaking_credential(
 }
 
 #[test]
+fn auth_set_writes_exact_credential_bytes_and_isolates_secret_tool_environment() {
+    let runtime = TempDir::new().unwrap();
+    let commands = FakeCommands::new();
+    let credential = "credential-without-a-newline";
+    let stored = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[
+            ("PATH", &commands.path()),
+            ("VOISU_GROQ_API_KEY", "parent-groq-key"),
+            ("VOISU_DEEPGRAM_API_KEY", "parent-deepgram-key"),
+            ("VOISU_TEST_AUTH_GROQ", "authorized"),
+            ("VOISU_TEST_STORED_GROQ_CREDENTIAL", "test-credential"),
+        ],
+        credential,
+    );
+
+    assert!(stored.status.success(), "{}", stderr(&stored));
+    assert_eq!(commands.read("secret-tool.args"), "store\n--label=Voisu cloud credential\nvoisu-provider\ngroq\n");
+    assert_eq!(commands.read("secret-tool.stdin"), credential);
+    let environment = commands.read("secret-tool.env");
+    assert!(!environment.contains("VOISU_GROQ_API_KEY="));
+    assert!(!environment.contains("VOISU_DEEPGRAM_API_KEY="));
+    assert!(!environment.contains("VOISU_TEST_"));
+}
+
+#[test]
+fn auth_set_bounds_stalled_secret_tool_and_reports_missing_tool_without_leaking_credential() {
+    let runtime = TempDir::new().unwrap();
+    let commands = FakeCommands::new();
+    commands.touch("secret-tool.stall");
+    let started = Instant::now();
+    let stalled = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[("PATH", &commands.path())],
+        "controlled-secret",
+    );
+    assert_eq!(stalled.status.code(), Some(4));
+    assert!(started.elapsed() < Duration::from_secs(4), "secret-tool must have a bounded wait");
+    assert!(!stderr(&stalled).contains("controlled-secret"));
+
+    let missing = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[("PATH", runtime.path().to_str().unwrap())],
+        "controlled-secret",
+    );
+    assert_eq!(missing.status.code(), Some(4));
+    assert!(stderr(&missing).contains("Secret storage is unavailable"));
+    assert!(!stderr(&missing).contains("controlled-secret"));
+}
+
+#[test]
 fn auth_verify_checks_each_provider_without_retaining_or_printing_response_content() {
     let runtime = TempDir::new().unwrap();
     let groq = voisu_with_env(
@@ -322,6 +503,76 @@ fn auth_verify_checks_each_provider_without_retaining_or_printing_response_conte
     let combined = format!("{}{}{}{}", stdout(&groq), stderr(&groq), stdout(&deepgram), stderr(&deepgram));
     assert!(!combined.contains("controlled-secret"));
     assert!(!combined.contains("response content"));
+}
+
+#[test]
+fn auth_verify_requires_2xx_discards_response_and_isolates_curl_environment() {
+    let runtime = TempDir::new().unwrap();
+    let commands = FakeCommands::new();
+    commands.touch("curl.redirect");
+    let verified = voisu_with_env(
+        runtime.path(),
+        &["auth", "verify", "groq"],
+        &[
+            ("PATH", &commands.path()),
+            ("VOISU_GROQ_API_KEY", "parent-groq-key"),
+            ("VOISU_DEEPGRAM_API_KEY", "parent-deepgram-key"),
+            ("VOISU_TEST_STORED_GROQ_CREDENTIAL", "test-credential"),
+        ],
+    );
+
+    assert_eq!(verified.status.code(), Some(4), "a redirect is not an authenticated API response");
+    assert_eq!(stderr(&verified), "Provider authentication failed\n");
+    assert!(!format!("{}{}", stdout(&verified), stderr(&verified)).contains("stored-credential"));
+    let arguments = commands.read("curl.args");
+    assert_eq!(arguments.lines().next(), Some("-q"));
+    assert!(arguments.contains("--write-out"));
+    assert!(arguments.contains("%{http_code}"));
+    assert!(arguments.contains("--output"));
+    assert!(arguments.contains("/dev/null"));
+    let environment = commands.read("curl.env");
+    assert!(!environment.contains("VOISU_GROQ_API_KEY="));
+    assert!(!environment.contains("VOISU_DEEPGRAM_API_KEY="));
+    assert!(!environment.contains("VOISU_TEST_"));
+}
+
+#[test]
+fn auth_verify_escapes_credential_before_writing_curl_configuration() {
+    let runtime = TempDir::new().unwrap();
+    let commands = FakeCommands::new();
+    let credential = r#"quote"and\slash"#;
+    let verified = voisu_with_env(
+        runtime.path(),
+        &["auth", "verify", "groq"],
+        &[("PATH", &commands.path()), ("VOISU_GROQ_API_KEY", credential)],
+    );
+
+    assert!(verified.status.success(), "{}", stderr(&verified));
+    assert!(
+        commands
+            .read("curl.stdin")
+            .contains("header = \"Authorization: Bearer quote\\\"and\\\\slash\"\n")
+    );
+    assert!(!format!("{}{}", stdout(&verified), stderr(&verified)).contains(credential));
+}
+
+#[test]
+fn auth_verify_bounds_stalled_curl_without_leaking_the_credential() {
+    let runtime = TempDir::new().unwrap();
+    let commands = FakeCommands::new();
+    commands.touch("curl.stall");
+    let started = Instant::now();
+    let stalled = voisu_with_env(
+        runtime.path(),
+        &["auth", "verify", "groq"],
+        &[
+            ("PATH", &commands.path()),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+        ],
+    );
+    assert_eq!(stalled.status.code(), Some(4));
+    assert!(started.elapsed() < Duration::from_secs(4), "curl must have a bounded wait");
+    assert!(!stderr(&stalled).contains("controlled-secret"));
 }
 
 #[test]

@@ -43,3 +43,8 @@ auto-backgrounding after a 600s foreground timeout is safe and was kept as the o
 **Why:** Command-line credential arguments would leak through shell history or process listings. `secret-tool`
 receives the value on standard input; if Secret Service is denied or unavailable, the only supported fallback is
 the explicit non-persistent `VOISU_GROQ_API_KEY` or `VOISU_DEEPGRAM_API_KEY` environment variable.
+
+## 2026-07-15 — Make desktop and provider subprocesses bounded and environment-isolated
+**Why:** `secret-tool` and curl must receive only the desktop-session variables they need, never inherited provider
+keys, test credentials, or curl configuration. A shared async provider client centralizes the authenticated request
+policy for verification and the future Groq adapter, while a bounded process runner kills stalled child processes.
