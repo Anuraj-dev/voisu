@@ -204,6 +204,17 @@ dir=$(dirname "$0")
 printf '%s\n' "$@" > "$dir/secret-tool.args"
 env | sort > "$dir/secret-tool.env"
 if [ -e "$dir/secret-tool.stall" ]; then exec sleep 10; fi
+if [ -e "$dir/secret-tool.orphan" ]; then
+  # A detached descendant inherits and holds the stdout/stderr pipes open long
+  # after this child exits successfully.
+  setsid sleep 10 &
+  cat > /dev/null
+  exit 0
+fi
+if [ -e "$dir/secret-tool.noisy" ]; then
+  # A noisy child floods stderr (8 MiB) before behaving normally.
+  head -c 8388608 /dev/zero | tr '\0' 'e' >&2
+fi
 if [ "$1" = "lookup" ]; then
   if [ "$2" = "voisu-doctor-probe" ]; then
     # Real secret-tool reports a no-match with a nonzero exit and no output; a
@@ -554,6 +565,55 @@ fn auth_set_bounds_a_child_that_never_drains_a_large_stdin() {
         started.elapsed()
     );
     assert!(!stderr(&stalled).contains(&large_credential));
+}
+
+#[test]
+fn auth_set_is_bounded_when_a_descendant_holds_the_pipes_past_child_exit() {
+    let runtime = TempDir::new().unwrap();
+    let commands = FakeCommands::new();
+    // The child exits successfully but leaves a setsid grandchild holding its
+    // stdout/stderr pipes open; an unbounded pipe-reader join would block the
+    // CLI until the grandchild exits.
+    commands.touch("secret-tool.orphan");
+    let started = Instant::now();
+    let held = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[("PATH", &commands.path())],
+        "controlled-secret",
+    );
+    assert_eq!(held.status.code(), Some(4));
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "pipe-reader joins must be bounded when a descendant holds the pipes, elapsed {:?}",
+        started.elapsed()
+    );
+    assert!(!stderr(&held).contains("controlled-secret"));
+}
+
+#[test]
+fn auth_set_caps_retained_diagnostics_from_a_noisy_child_without_leaking_them() {
+    let runtime = TempDir::new().unwrap();
+    let commands = FakeCommands::new();
+    // The child floods 8 MiB onto stderr before storing normally; the CLI must
+    // drain it (so the child never blocks), succeed, and never echo it.
+    commands.touch("secret-tool.noisy");
+    let started = Instant::now();
+    let stored = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[("PATH", &commands.path())],
+        "controlled-secret",
+    );
+    assert!(stored.status.success(), "{}", stderr(&stored));
+    assert_eq!(stdout(&stored), "Groq credential stored\n");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "noisy stderr must be drained within the budget, elapsed {:?}",
+        started.elapsed()
+    );
+    assert!(!stderr(&stored).contains("eeee"), "child noise must not be echoed");
+    assert_eq!(commands.read("secret-tool.stdin"), "controlled-secret");
 }
 
 #[test]
@@ -1122,6 +1182,49 @@ fn doctor_daemon_probe_is_bounded_under_a_trickling_peer() {
     assert!(
         elapsed < Duration::from_secs(4),
         "doctor's daemon probe must honor a whole-frame deadline, elapsed {elapsed:?}"
+    );
+    assert_eq!(doctor.status.code(), Some(4));
+    assert!(
+        stdout(&doctor).contains("Daemon: FAIL"),
+        "{}",
+        stdout(&doctor)
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn doctor_daemon_probe_rejects_a_flooding_peer_at_the_response_cap() {
+    let runtime = TempDir::new().unwrap();
+    let path = socket_path(runtime.path());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(&path).unwrap();
+
+    // A flooding peer: megabytes of unterminated bytes as fast as it can push
+    // them. The probe must stop accumulating at its 16 KiB cap and reject.
+    let server = thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = String::new();
+            let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut request);
+            let chunk = vec![b'x'; 64 * 1024];
+            for _ in 0..64 {
+                if stream.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let doctor = voisu_with_env(
+        runtime.path(),
+        &["doctor"],
+        &[("VOISU_TEST_READINESS", "pass")],
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "doctor's daemon probe must reject a flood promptly, elapsed {elapsed:?}"
     );
     assert_eq!(doctor.status.code(), Some(4));
     assert!(

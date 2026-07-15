@@ -13,6 +13,7 @@ use voisu_core::{
 const PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 const PROCESS_POLL: Duration = Duration::from_millis(10);
 const MAX_DAEMON_RESPONSE_BYTES: usize = 16 * 1024;
+const MAX_RETAINED_STDERR_BYTES: usize = 4 * 1024;
 
 pub struct FedoraReadiness;
 
@@ -426,10 +427,12 @@ fn read_bounded_frame(stream: &mut UnixStream, started: Instant) -> Result<Strin
         match stream.read(&mut buffer) {
             Ok(0) => return Err(()),
             Ok(read) => {
-                response.extend_from_slice(&buffer[..read]);
-                if response.len() > MAX_DAEMON_RESPONSE_BYTES {
+                // Reject before appending: a flooding peer must never force an
+                // allocation beyond the response cap.
+                if response.len() + read > MAX_DAEMON_RESPONSE_BYTES {
                     return Err(());
                 }
+                response.extend_from_slice(&buffer[..read]);
                 if response.ends_with(b"\n") {
                     return String::from_utf8(response).map_err(|_| ());
                 }
@@ -529,32 +532,72 @@ fn run_restricted(
         })
     });
     let stderr_reader = child.stderr.take().map(|mut stderr| {
-        thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes).map(|_| bytes)
-        })
+        thread::spawn(move || read_capped(&mut stderr, MAX_RETAINED_STDERR_BYTES))
     });
-    let status = wait_for_child(&mut child, started)?;
+    // Every helper thread join is bounded by the same Instant budget on every
+    // path: a descendant of the child can inherit and hold the pipes open past
+    // the child's own exit, which would otherwise block a bare join() forever
+    // (or, on the error path, silently leave detached threads blocked).
+    let status = wait_for_child(&mut child, started);
+    let writer = writer.map(|handle| bounded_join(handle, started, &mut child));
+    let stdout = pipe_bytes(stdout_reader.map(|handle| bounded_join(handle, started, &mut child)))?;
+    let stderr = pipe_bytes(stderr_reader.map(|handle| bounded_join(handle, started, &mut child)))?;
+    let status = status?;
     if let Some(writer) = writer {
-        match writer.join() {
+        match writer {
             Ok(Ok(())) => {}
+            Err(ProcessError::TimedOut) => return Err(ProcessError::TimedOut),
             _ => return Err(ProcessError::Input),
         }
     }
-    let stdout = join_pipe(stdout_reader)?;
-    let stderr = join_pipe(stderr_reader)?;
     Ok(ProcessOutcome { success: status.success(), stdout, stderr })
 }
 
-fn join_pipe(
-    reader: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+/// Joins a helper thread under the remaining process budget. On budget
+/// exhaustion the overdue child is killed and the thread is deliberately
+/// detached — it can never be forced to finish while a descendant holds the
+/// pipe — and the caller receives the timeout error.
+fn bounded_join<T: Send + 'static>(
+    handle: thread::JoinHandle<T>,
+    started: Instant,
+    child: &mut Child,
+) -> Result<T, ProcessError> {
+    while !handle.is_finished() {
+        if started.elapsed() >= PROCESS_DEADLINE {
+            let _ = child.kill();
+            drop(handle);
+            return Err(ProcessError::TimedOut);
+        }
+        thread::sleep(PROCESS_POLL);
+    }
+    handle.join().map_err(|_| ProcessError::Output)
+}
+
+fn pipe_bytes(
+    joined: Option<Result<std::io::Result<Vec<u8>>, ProcessError>>,
 ) -> Result<Vec<u8>, ProcessError> {
-    match reader {
-        Some(reader) => reader
-            .join()
-            .map_err(|_| ProcessError::Output)?
-            .map_err(|_| ProcessError::Output),
+    match joined {
+        Some(result) => result?.map_err(|_| ProcessError::Output),
         None => Ok(Vec::new()),
+    }
+}
+
+/// Drains a pipe to EOF so the child never blocks on a full buffer, but
+/// retains only the first `cap` bytes: a noisy child cannot force unbounded
+/// memory growth inside the deadline window.
+fn read_capped(source: &mut impl Read, cap: usize) -> std::io::Result<Vec<u8>> {
+    let mut retained = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match source.read(&mut buffer) {
+            Ok(0) => return Ok(retained),
+            Ok(read) => {
+                let room = cap.saturating_sub(retained.len());
+                retained.extend_from_slice(&buffer[..read.min(room)]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
     }
 }
 
