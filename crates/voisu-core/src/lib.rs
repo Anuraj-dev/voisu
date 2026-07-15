@@ -14,9 +14,10 @@ use serde::{Deserialize, Serialize};
 mod diagnostics;
 pub use diagnostics::{
     correlation_id, export_record, is_secret_env_key, redacted_environment, replay_capture,
-    unix_millis_now, DebugAudioRecord, DiagnosticExport, DiagnosticRecord, DiagnosticStore,
-    PruneOutcome, ReplayOutcome, RetentionPolicy, SourceTranscriptRecord, DEFAULT_DEBUG_AUDIO_TTL,
-    DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS, MAX_STORED_TEXT, REDACTED,
+    sanitize_url, scrub_secret_values, unix_millis_now, DebugAudioRecord, DiagnosticExport,
+    DiagnosticRecord, DiagnosticStore, PruneOutcome, ReplayOutcome, RetentionPolicy,
+    SourceTranscriptRecord, DEFAULT_DEBUG_AUDIO_TTL, DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS,
+    EXPORT_ENV_ALLOWLIST, MAX_STORED_TEXT, REDACTED,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;

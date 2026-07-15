@@ -3442,7 +3442,10 @@ fn completed_recording_is_correlated_in_local_history_and_export_redacts_secrets
     let export = ipc_request(runtime.path(), &export_request);
     assert_eq!(export["ok"], true, "{export}");
     let environment = &export["export"]["environment"];
-    assert_eq!(environment["VOISU_GROQ_API_KEY"], "<redacted>");
+    assert!(
+        environment.get("VOISU_GROQ_API_KEY").is_none(),
+        "secret keys never appear in an export, even masked: {environment}"
+    );
     assert_eq!(environment["VOISU_GROQ_TRANSCRIPTION_URL"], "https://groq.test/transcribe");
     assert!(environment.get("HOME").is_none(), "unrelated env is dropped: {environment}");
     assert!(
@@ -3517,12 +3520,17 @@ fn expired_debug_audio_is_cleaned_up_safely() {
     );
 }
 
+fn fixture_dir(runtime_dir: &Path) -> PathBuf {
+    runtime_dir
+        .join("voisu")
+        .join(format!("v{PROTOCOL_VERSION}"))
+        .join("diagnostics")
+        .join("fixtures")
+}
+
 #[test]
 fn fixed_fixture_replays_through_provider_and_validation_boundaries() {
     let runtime = TempDir::new().unwrap();
-    let fixture = TempDir::new().unwrap();
-    let fixture_path = fixture.path().join("dictation.pcm");
-    fs::write(&fixture_path, vec![1_u8; 3_200]).unwrap();
     let _daemon = Daemon::start_with_env(
         runtime.path(),
         &[
@@ -3530,12 +3538,13 @@ fn fixed_fixture_replays_through_provider_and_validation_boundaries() {
             ("VOISU_TEST_GROQ_TRANSCRIPT", "Replay this dictation"),
         ],
     );
+    // Replay reads only from the daemon's private fixture directory, by name.
+    fs::write(fixture_dir(runtime.path()).join("dictation.pcm"), vec![1_u8; 3_200]).unwrap();
 
-    let request = format!(
-        r#"{{"version":1,"command":{{"replay":"{}"}}}}"#,
-        fixture_path.display()
+    let replayed = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"replay":"dictation.pcm"}}"#,
     );
-    let replayed = ipc_request(runtime.path(), &request);
     assert_eq!(replayed["ok"], true, "{replayed}");
     assert_eq!(
         replayed["evidence"]["source_transcript_providers"],
@@ -3552,11 +3561,140 @@ fn replay_of_a_missing_fixture_is_rejected_and_leaves_the_daemon_reusable() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start(runtime.path());
 
-    let request = r#"{"version":1,"command":{"replay":"/nonexistent/fixture.pcm"}}"#;
+    let request = r#"{"version":1,"command":{"replay":"nonexistent.pcm"}}"#;
     let replayed = ipc_request(runtime.path(), request);
     assert_eq!(replayed["ok"], false, "{replayed}");
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
+}
+
+#[test]
+fn replay_rejects_a_symlink_planted_inside_the_fixture_directory() {
+    let runtime = TempDir::new().unwrap();
+    let secrets = TempDir::new().unwrap();
+    let key_path = secrets.path().join("id_ed25519");
+    fs::write(&key_path, "-----BEGIN OPENSSH PRIVATE KEY-----\nhostile\n").unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    // Adversarial: a symlink inside the approved directory pointing at a secret.
+    symlink(&key_path, fixture_dir(runtime.path()).join("innocent.pcm")).unwrap();
+
+    let replayed = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"replay":"innocent.pcm"}}"#,
+    );
+    assert_eq!(replayed["ok"], false, "O_NOFOLLOW must refuse the symlink: {replayed}");
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+}
+
+#[test]
+fn replay_rejects_a_fifo_without_wedging_the_daemon() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    // Adversarial: a FIFO with no writer blocks a naive open/read forever,
+    // wedging the daemon in Replaying.
+    let fifo = fixture_dir(runtime.path()).join("pipe.pcm");
+    let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(status.success());
+
+    let started = Instant::now();
+    let replayed = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"replay":"pipe.pcm"}}"#,
+    );
+    assert_eq!(replayed["ok"], false, "a FIFO is not a regular file: {replayed}");
+    assert!(started.elapsed() < Duration::from_secs(2), "the open must not block");
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert!(voisu(runtime.path(), "start").status.success());
+}
+
+#[test]
+fn replay_partial_provider_start_failure_aborts_the_started_stream_and_recovers() {
+    let runtime = TempDir::new().unwrap();
+    // Only Groq fails its start, so the already-started Deepgram stream must be
+    // aborted and awaited before the failure is observable.
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_PROVIDER_START_FAILURE", "1")],
+    );
+    fs::write(fixture_dir(runtime.path()).join("dictation.pcm"), vec![1_u8; 3_200]).unwrap();
+
+    let replayed = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"replay":"dictation.pcm"}}"#,
+    );
+    assert_eq!(replayed["ok"], false, "{replayed}");
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    // The failure was one-shot; the daemon is fully reusable afterwards.
+    let retried = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"replay":"dictation.pcm"}}"#,
+    );
+    assert_eq!(retried["ok"], true, "{retried}");
+}
+
+#[test]
+fn cli_history_renders_the_complete_bounded_records() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Render the full record."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Render the full record"),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+
+    let output = voisu(runtime.path(), "history");
+    assert!(output.status.success());
+    let records: Value = serde_json::from_str(&stdout(&output))
+        .expect("voisu history prints structured JSON");
+    let record = &records[0];
+    assert!(record["correlation_id"].as_str().unwrap().starts_with("rec-"));
+    assert_eq!(record["final_transcript"], "Render the full record");
+    assert_eq!(record["source_transcripts"].as_array().unwrap().len(), 2);
+    assert!(record["validation_reason"].is_string());
+    assert!(record["provider_timings_ms"].is_array());
+    assert_eq!(record["delivery_count"], 1);
+}
+
+#[test]
+fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_PROVIDER_START_FAILURE", "1")],
+    );
+
+    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    assert_eq!(started["ok"], false, "{started}");
+    let correlation_id = started["evidence"]["correlation_id"]
+        .as_str()
+        .expect("a startup failure still carries its correlation ID")
+        .to_owned();
+    assert!(correlation_id.starts_with("rec-"), "{correlation_id}");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        let found = history["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| {
+                record["correlation_id"] == correlation_id.as_str()
+                    && record["error"].is_string()
+            });
+        if found {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the startup failure must be retained with its correlation ID: {history}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -3566,4 +3704,53 @@ fn export_of_an_unknown_correlation_id_is_rejected() {
 
     let export = ipc_request(runtime.path(), r#"{"version":1,"command":{"export":"rec-does-not-exist"}}"#);
     assert_eq!(export["ok"], false, "{export}");
+}
+
+#[test]
+fn replay_rejects_arbitrary_files_outside_the_approved_fixture_directory() {
+    let runtime = TempDir::new().unwrap();
+    let secrets = TempDir::new().unwrap();
+    // An adversary-controlled path: a private key must never be readable
+    // through replay, which would send its bytes to both cloud providers.
+    let key_path = secrets.path().join("id_ed25519");
+    fs::write(&key_path, "-----BEGIN OPENSSH PRIVATE KEY-----\nhostile\n").unwrap();
+    let _daemon = Daemon::start(runtime.path());
+
+    let request = format!(
+        r#"{{"version":1,"command":{{"replay":"{}"}}}}"#,
+        key_path.display()
+    );
+    let replayed = ipc_request(runtime.path(), &request);
+    assert_eq!(
+        replayed["ok"], false,
+        "replay must reject files outside the approved fixture directory: {replayed}"
+    );
+}
+
+#[test]
+fn export_scrubs_a_secret_spoken_into_the_transcript_itself() {
+    let runtime = TempDir::new().unwrap();
+    // Adversarial: the dictated text literally contains the API key value.
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_GROQ_API_KEY", "sk-live-spoken-9x7"),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "my key is sk-live-spoken-9x7 okay."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "my key is sk-live-spoken-9x7 okay"),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    let correlation_id = stopped["evidence"]["correlation_id"].as_str().unwrap().to_owned();
+
+    let export = ipc_request(
+        runtime.path(),
+        &format!(r#"{{"version":1,"command":{{"export":"{correlation_id}"}}}}"#),
+    );
+    assert_eq!(export["ok"], true, "{export}");
+    assert!(
+        !export.to_string().contains("sk-live-spoken-9x7"),
+        "a secret spoken into the Recording must not survive export: {export}"
+    );
 }

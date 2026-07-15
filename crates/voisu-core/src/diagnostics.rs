@@ -12,9 +12,10 @@
 use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -94,10 +95,13 @@ impl SourceTranscriptRecord {
 
 /// The recorded location and expiry of an explicitly captured debug audio file.
 /// Its presence is the only way raw audio is retained; without debug capture it
-/// is `None`.
+/// is `None`. Only a validated basename is stored — never an arbitrary path — so
+/// cleanup can never be steered outside the store's private audio directory by
+/// a tampered history file. The expiry is also encoded in the file name itself,
+/// so a capture orphaned by a crash before its record persisted still expires.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DebugAudioRecord {
-    pub path: String,
+    pub file_name: String,
     pub captured_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
 }
@@ -236,7 +240,7 @@ impl RetentionPolicy {
             .filter_map(|mut record| {
                 if record.recorded_at_unix_ms < age_floor {
                     if let Some(audio) = record.debug_audio.take() {
-                        expired_audio.push(PathBuf::from(audio.path));
+                        expired_audio.push(audio.file_name);
                     }
                     None
                 } else {
@@ -248,14 +252,14 @@ impl RetentionPolicy {
             let overflow = kept.len() - self.max_records;
             for mut record in kept.drain(0..overflow) {
                 if let Some(audio) = record.debug_audio.take() {
-                    expired_audio.push(PathBuf::from(audio.path));
+                    expired_audio.push(audio.file_name);
                 }
             }
         }
         for record in &mut kept {
             if let Some(audio) = &record.debug_audio {
                 if audio.is_expired(now_ms) {
-                    expired_audio.push(PathBuf::from(audio.path.clone()));
+                    expired_audio.push(audio.file_name.clone());
                     record.debug_audio = None;
                 }
             }
@@ -268,43 +272,92 @@ impl RetentionPolicy {
 }
 
 /// The result of pruning: the retained records (newest first) and the debug
-/// audio paths that are now safe to delete.
+/// audio file names that are now safe to delete from the store's audio
+/// directory.
 pub struct PruneOutcome {
     pub kept: Vec<DiagnosticRecord>,
-    pub expired_audio: Vec<PathBuf>,
+    pub expired_audio: Vec<String>,
 }
 
 fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
     std::env::var(name).ok().and_then(|value| value.parse().ok())
 }
 
-/// True when an environment variable name denotes a secret whose value must be
-/// masked in a diagnostic export.
+/// True when an environment variable name denotes a secret whose value must
+/// never appear in a diagnostic export, under any key.
 pub fn is_secret_env_key(key: &str) -> bool {
-    const MARKERS: [&str; 6] = ["API_KEY", "TOKEN", "SECRET", "PASSWORD", "AUTHORIZATION", "CREDENTIAL"];
+    const MARKERS: [&str; 7] = [
+        "API_KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "AUTHORIZATION", "CREDENTIAL",
+    ];
     let upper = key.to_ascii_uppercase();
     MARKERS.iter().any(|marker| upper.contains(marker))
 }
 
+/// The explicit allowlist of environment keys a diagnostic export may carry.
+/// Everything else — including unknown `VOISU_*` values, which could hold a
+/// secret under an unrecognized name — is omitted entirely. URL values are
+/// additionally sanitized of userinfo credentials and query parameters.
+pub const EXPORT_ENV_ALLOWLIST: [&str; 10] = [
+    "VOISU_GROQ_TRANSCRIPTION_URL",
+    "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
+    "VOISU_GROQ_RECONCILIATION_URL",
+    "VOISU_GROQ_RECONCILIATION_MODEL",
+    "VOISU_PIPEWIRE_TARGET",
+    "VOISU_RECORDING_DEADLINE_MS",
+    "VOISU_DIAGNOSTIC_MAX_RECORDS",
+    "VOISU_DIAGNOSTIC_MAX_AGE_SECS",
+    "VOISU_DEBUG_AUDIO_TTL_SECS",
+    "VOISU_DEBUG_CAPTURE",
+];
+
+/// Strips credentials and query/fragment parameters from a URL so an exported
+/// endpoint never carries `user:password@` userinfo or `?key=` style secrets.
+pub fn sanitize_url(value: &str) -> String {
+    let without_query = value.split(['?', '#']).next().unwrap_or("");
+    match without_query.split_once("://") {
+        Some((scheme, rest)) => {
+            let sanitized_rest = match rest.split_once('/') {
+                Some((authority, path)) => {
+                    format!("{}/{}", strip_userinfo(authority), path)
+                }
+                None => strip_userinfo(rest).to_owned(),
+            };
+            format!("{scheme}://{sanitized_rest}")
+        }
+        None => without_query.to_owned(),
+    }
+}
+
+fn strip_userinfo(authority: &str) -> &str {
+    authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority)
+}
+
 /// A redacted, self-contained diagnostic export for one Recording. It carries
-/// the local record plus only the relevant (`VOISU_`) environment, with every
-/// secret value masked. Unrelated environment values are dropped entirely.
+/// the scrubbed local record plus only an explicit allowlist of configuration
+/// environment keys; every secret value is masked and unrelated environment
+/// values are dropped entirely.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DiagnosticExport {
     pub record: DiagnosticRecord,
     pub environment: BTreeMap<String, String>,
 }
 
-/// Filters and redacts an environment for export: keeps only `VOISU_` keys
-/// (dropping unrelated values) and masks any key that denotes a secret.
+/// Filters an environment for export: only explicitly allowlisted keys survive,
+/// URL values are stripped of userinfo and query parameters, and any
+/// allowlisted key that nonetheless denotes a secret is masked.
 pub fn redacted_environment(
     vars: impl IntoIterator<Item = (String, String)>,
 ) -> BTreeMap<String, String> {
     vars.into_iter()
-        .filter(|(key, _)| key.starts_with("VOISU_"))
+        .filter(|(key, _)| EXPORT_ENV_ALLOWLIST.contains(&key.as_str()))
         .map(|(key, value)| {
             let value = if is_secret_env_key(&key) {
                 REDACTED.to_owned()
+            } else if key.ends_with("_URL") {
+                sanitize_url(&value)
             } else {
                 value
             };
@@ -313,11 +366,51 @@ pub fn redacted_environment(
         .collect()
 }
 
-/// Builds a redacted export from a record and the current environment.
+/// Replaces every occurrence of any known secret value inside a free-form
+/// string with the redaction mask. Transcripts can literally contain a spoken
+/// or pasted secret, so export scrubs them against the values of every
+/// secret-denoting environment variable.
+pub fn scrub_secret_values(text: &str, secrets: &[String]) -> String {
+    let mut scrubbed = text.to_owned();
+    for secret in secrets {
+        if !secret.is_empty() {
+            scrubbed = scrubbed.replace(secret.as_str(), REDACTED);
+        }
+    }
+    scrubbed
+}
+
+fn secret_values(vars: &[(String, String)]) -> Vec<String> {
+    vars.iter()
+        .filter(|(key, value)| is_secret_env_key(key) && value.len() >= 4)
+        .map(|(_, value)| value.clone())
+        .collect()
+}
+
+/// Builds a redacted export from a record and the current environment: the
+/// environment is reduced to the explicit allowlist and every free-form string
+/// in the record (Source Transcripts, final Transcript, reasons, error) is
+/// scrubbed of known secret values.
 pub fn export_record(
     record: DiagnosticRecord,
     vars: impl IntoIterator<Item = (String, String)>,
 ) -> DiagnosticExport {
+    let vars: Vec<(String, String)> = vars.into_iter().collect();
+    let secrets = secret_values(&vars);
+    let mut record = record;
+    for source in &mut record.source_transcripts {
+        source.text = scrub_secret_values(&source.text, &secrets);
+    }
+    record.final_transcript = record
+        .final_transcript
+        .map(|text| scrub_secret_values(&text, &secrets));
+    record.validation_reason = record
+        .validation_reason
+        .map(|text| scrub_secret_values(&text, &secrets));
+    record.fallback_reason = record
+        .fallback_reason
+        .map(|text| scrub_secret_values(&text, &secrets));
+    record.error = record.error.map(|text| scrub_secret_values(&text, &secrets));
     DiagnosticExport {
         record,
         environment: redacted_environment(vars),
@@ -326,24 +419,38 @@ pub fn export_record(
 
 /// A bounded, private, on-disk store of correlated diagnostic records. All state
 /// lives under one directory the caller has already secured; the store keeps
-/// files private (0600) and never leaves the local filesystem.
+/// files private (0600) and never leaves the local filesystem. One internal
+/// lock serializes every load-prune-persist cycle so concurrent writers (the
+/// actor answering history/export while a completed Recording persists its
+/// record) can never clobber each other from stale snapshots.
 pub struct DiagnosticStore {
     dir: PathBuf,
     policy: RetentionPolicy,
+    lock: Mutex<()>,
 }
 
 impl DiagnosticStore {
-    /// Opens (creating if needed) a private diagnostics directory and its audio
-    /// subdirectory, both 0700.
+    /// Opens (creating if needed) a private diagnostics directory plus its audio
+    /// and fixture subdirectories, all 0700 and owned by the current user.
     pub fn open(dir: PathBuf, policy: RetentionPolicy) -> io::Result<Self> {
         create_private_dir(&dir)?;
-        let store = Self { dir, policy };
+        let store = Self {
+            dir,
+            policy,
+            lock: Mutex::new(()),
+        };
         create_private_dir(&store.audio_dir())?;
+        create_private_dir(&store.fixture_dir())?;
         Ok(store)
     }
 
     pub fn audio_dir(&self) -> PathBuf {
         self.dir.join("audio")
+    }
+
+    /// The only directory replay may read fixtures from.
+    pub fn fixture_dir(&self) -> PathBuf {
+        self.dir.join("fixtures")
     }
 
     fn history_file(&self) -> PathBuf {
@@ -360,31 +467,52 @@ impl DiagnosticStore {
     }
 
     fn write_all(&self, records: &[DiagnosticRecord]) -> io::Result<()> {
+        static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
         let encoded = serde_json::to_vec(records)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let temp = self.dir.join("history.json.tmp");
+        // A unique, exclusively created temp file per write: O_EXCL refuses to
+        // follow a pre-planted symlink at the temp path, the unique name avoids
+        // any collision between concurrent daemon processes, and the descriptor
+        // is created 0600 rather than trusting pre-existing permissions.
+        let temp = self.dir.join(format!(
+            "history.json.tmp.{}.{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         let mut file = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&temp)?;
-        file.write_all(&encoded)?;
-        file.sync_all()?;
-        fs::rename(&temp, self.history_file())
+        let result = file.write_all(&encoded).and_then(|()| file.sync_all());
+        if let Err(error) = result {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+        let renamed = fs::rename(&temp, self.history_file());
+        if renamed.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        renamed
     }
 
-    fn remove_audio(paths: &[PathBuf]) {
-        for path in paths {
-            let _ = fs::remove_file(path);
+    /// Removes an expired debug audio capture by validated basename only, so a
+    /// tampered or corrupt history file can never steer deletion outside the
+    /// store's private audio directory.
+    fn remove_audio(&self, file_names: &[String]) {
+        for file_name in file_names {
+            if is_safe_file_name(file_name) {
+                let _ = fs::remove_file(self.audio_dir().join(file_name));
+            }
         }
     }
 
     /// Prunes, removes expired audio, and persists the retained records in
     /// chronological (append) order, then returns them newest first for reading.
+    /// Callers must hold the store lock.
     fn prune_and_persist(&self, records: Vec<DiagnosticRecord>) -> io::Result<Vec<DiagnosticRecord>> {
         let outcome = self.policy.prune(records, unix_millis_now());
-        Self::remove_audio(&outcome.expired_audio);
+        self.remove_audio(&outcome.expired_audio);
         self.write_all(&outcome.kept)?;
         let mut newest_first = outcome.kept;
         newest_first.reverse();
@@ -395,6 +523,7 @@ impl DiagnosticStore {
     /// removes any now-expired debug audio, and returns the retained history
     /// (newest first).
     pub fn record(&self, record: DiagnosticRecord) -> io::Result<Vec<DiagnosticRecord>> {
+        let _guard = self.lock.lock().expect("diagnostics lock is not poisoned");
         let mut records = self.load_raw();
         records.push(record);
         self.prune_and_persist(records)
@@ -404,6 +533,7 @@ impl DiagnosticStore {
     /// expired debug audio as a side effect so a reader never sees an entry the
     /// retention policy has already expired.
     pub fn history(&self) -> io::Result<Vec<DiagnosticRecord>> {
+        let _guard = self.lock.lock().expect("diagnostics lock is not poisoned");
         let records = self.load_raw();
         self.prune_and_persist(records)
     }
@@ -416,38 +546,95 @@ impl DiagnosticStore {
             .find(|record| record.correlation_id == correlation_id))
     }
 
-    /// Removes expired debug audio and over-retention records. Safe to call on
-    /// daemon startup so captures left by a previous run cannot linger.
+    /// Removes expired debug audio and over-retention records, then sweeps the
+    /// audio directory itself: any capture whose filename-encoded expiry has
+    /// passed, whose name is unparsable, or that no retained record references
+    /// is removed. Run at daemon startup, so a capture orphaned by a crash
+    /// before its record persisted can never linger.
     pub fn cleanup_expired(&self) -> io::Result<()> {
-        self.history().map(|_| ())
+        let kept = self.history()?;
+        let _guard = self.lock.lock().expect("diagnostics lock is not poisoned");
+        let referenced: Vec<&str> = kept
+            .iter()
+            .filter_map(|record| record.debug_audio.as_ref())
+            .map(|audio| audio.file_name.as_str())
+            .collect();
+        let now = unix_millis_now();
+        for entry in fs::read_dir(self.audio_dir())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                let _ = fs::remove_file(entry.path());
+                continue;
+            };
+            let expired = match expiry_from_file_name(name) {
+                Some(expires_at_unix_ms) => now >= expires_at_unix_ms,
+                None => true,
+            };
+            if expired || !referenced.contains(&name) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        Ok(())
     }
 
     /// Persists an explicit debug audio capture for a correlation ID, returning
-    /// its recorded location and expiry. Only called when the user has enabled
-    /// debug capture.
+    /// its recorded basename and expiry. The expiry is encoded in the file name
+    /// so an orphaned capture still expires, and the file is created exclusively
+    /// (never following a pre-planted symlink) with private 0600 permissions.
+    /// Only called when the user has enabled debug capture.
     pub fn store_debug_audio(
         &self,
         correlation_id: &str,
         pcm_s16le_mono_16khz: &[u8],
     ) -> io::Result<DebugAudioRecord> {
-        let file_name = format!("{}.pcm", sanitize_component(correlation_id));
-        let path = self.audio_dir().join(file_name);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)?;
-        file.write_all(pcm_s16le_mono_16khz)?;
-        file.sync_all()?;
         let now = unix_millis_now();
         let ttl_ms = u64::try_from(self.policy.debug_audio_ttl.as_millis()).unwrap_or(u64::MAX);
+        let expires_at_unix_ms = now.saturating_add(ttl_ms);
+        let file_name = format!(
+            "{}-exp{}.pcm",
+            sanitize_component(correlation_id),
+            expires_at_unix_ms
+        );
+        let path = self.audio_dir().join(&file_name);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        let result = file
+            .write_all(pcm_s16le_mono_16khz)
+            .and_then(|()| file.sync_all());
+        if let Err(error) = result {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
         Ok(DebugAudioRecord {
-            path: path.to_string_lossy().into_owned(),
+            file_name,
             captured_at_unix_ms: now,
-            expires_at_unix_ms: now.saturating_add(ttl_ms),
+            expires_at_unix_ms,
         })
     }
+}
+
+/// Parses the `-exp<unix-ms>.pcm` suffix a debug audio capture encodes so
+/// startup cleanup can expire orphans without a surviving record.
+fn expiry_from_file_name(name: &str) -> Option<u64> {
+    name.strip_suffix(".pcm")?
+        .rsplit_once("-exp")?
+        .1
+        .parse()
+        .ok()
+}
+
+/// True for a plain, traversal-free single path component.
+fn is_safe_file_name(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.contains('\0')
 }
 
 /// Restricts a correlation ID to a safe single path component (defends the audio
@@ -472,6 +659,13 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "diagnostics path is not a private directory",
+                ));
+            }
+            // SAFETY: geteuid has no preconditions and does not mutate memory.
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "diagnostics directory is not owned by the current user",
                 ));
             }
             fs::set_permissions(path, fs::Permissions::from_mode(0o700))

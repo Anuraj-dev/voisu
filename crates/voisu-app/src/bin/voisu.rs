@@ -106,7 +106,12 @@ fn daemon_command(command: Command) -> ExitCode {
                 Err(_) => return fail(1, "daemon returned an invalid diagnostic export"),
             }
         } else if let Some(history) = &response.history {
-            print_history(history);
+            // The complete bounded records — Source Transcripts, final
+            // Transcript, timings, decision reasons — as structured JSON.
+            match serde_json::to_string_pretty(history) {
+                Ok(encoded) => println!("{encoded}"),
+                Err(_) => return fail(1, "daemon returned an invalid diagnostic history"),
+            }
         } else {
             println!("{}", response.message);
         }
@@ -116,30 +121,6 @@ fn daemon_command(command: Command) -> ExitCode {
     }
 }
 
-fn print_history(records: &[voisu_core::DiagnosticRecord]) {
-    if records.is_empty() {
-        println!("no diagnostic history");
-        return;
-    }
-    for record in records {
-        let selection = record
-            .selection
-            .map(|selection| format!("{selection:?}"))
-            .unwrap_or_else(|| "none".to_owned());
-        let outcome = record
-            .error
-            .as_deref()
-            .unwrap_or("delivered");
-        println!(
-            "{}  recording {}  selection={}  deliveries={}  {}",
-            record.correlation_id,
-            record.recording_id,
-            selection,
-            record.delivery_count,
-            outcome,
-        );
-    }
-}
 
 fn doctor() -> ExitCode {
     let findings = FedoraReadiness.inspect();
@@ -281,7 +262,7 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: voisu <start|stop|toggle|status|history|export|replay|doctor|auth>\n\n  voisu history\n  voisu export <correlation-id>\n  voisu replay <fixture-path>\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>"
+    "usage: voisu <start|stop|toggle|status|history|export|replay|doctor|auth>\n\n  voisu history\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>"
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {

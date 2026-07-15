@@ -1,4 +1,5 @@
 use std::fs::{self, File, OpenOptions};
+use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -258,7 +259,7 @@ struct PumpOutput {
 
 enum ActorState {
     Idle,
-    Starting(u64),
+    Starting { id: u64, correlation_id: String },
     Recording(ActiveRecording),
     Processing(LifecycleEvidence),
     /// A failed start's aborts are still in flight. Publicly the daemon reads
@@ -348,7 +349,7 @@ async fn actor_loop(
                     };
                     let _ = reply.send(response);
                 }
-                Command::Replay(path) if matches!(state, ActorState::Idle) => {
+                Command::Replay(fixture_name) if matches!(state, ActorState::Idle) => {
                     let id = next_id;
                     next_id += 1;
                     state = ActorState::Replaying(id);
@@ -363,16 +364,20 @@ async fn actor_loop(
                     } else {
                         PROVIDER_DEADLINE
                     };
-                    tokio::spawn(replay_recording(
-                        path,
+                    // The replay runs supervised: its JoinHandle is awaited by a
+                    // wrapper that reports completion on EVERY path, including a
+                    // panic — otherwise a panic would drop the borrowed adapters
+                    // and wedge the daemon in Replaying forever.
+                    let replay = tokio::spawn(replay_recording(
+                        fixture_name,
                         id,
+                        diagnostics.fixture_dir(),
                         current_deepgram,
                         current_groq,
                         current_validator,
                         provider_deadline,
-                        tx.clone(),
-                        reply,
                     ));
+                    tokio::spawn(supervise_replay(replay, id, controlled, reply, tx.clone()));
                 }
                 Command::Replay(_) => {
                     let _ = reply.send(Response::rejected(
@@ -394,7 +399,13 @@ async fn actor_loop(
                 Command::Start | Command::Toggle if matches!(state, ActorState::Idle) => {
                     let id = next_id;
                     next_id += 1;
-                    state = ActorState::Starting(id);
+                    // The correlation ID exists from the moment the Recording is
+                    // accepted, so startup failures and recovery evidence are
+                    // correlated even though no adapter has started yet.
+                    state = ActorState::Starting {
+                        id,
+                        correlation_id: voisu_core::correlation_id(id),
+                    };
                     let mut current_capture = capture.take().expect("capture adapter is available");
                     let mut current_deepgram =
                         deepgram.take().expect("Deepgram adapter is available");
@@ -481,29 +492,24 @@ async fn actor_loop(
                 capture = Some(returned_capture);
                 deepgram = Some(returned_deepgram);
                 groq = Some(returned_groq);
-                if matches!(&state, ActorState::Starting(starting_id) if *starting_id == id) {
+                let correlation = match &state {
+                    ActorState::Starting {
+                        id: starting_id,
+                        correlation_id,
+                    } if *starting_id == id => Some(correlation_id.clone()),
+                    _ => None,
+                };
+                if let Some(correlation) = correlation {
                     match result {
                         Ok((active_capture, streams)) => {
-                            let evidence = LifecycleEvidence {
-                                recording_id: id,
-                                correlation_id: voisu_core::correlation_id(id),
-                                stages: vec![
+                            let evidence = base_evidence(
+                                id,
+                                correlation,
+                                vec![
                                     LifecycleStage::CaptureStarted,
                                     LifecycleStage::ProvidersStarted,
                                 ],
-                                delivery_count: 0,
-                                streamed_chunk_count: 0,
-                                source_transcript_providers: Vec::new(),
-                                first_chunk_ms: None,
-                                capture_finalized_ms: None,
-                                provider_timings_ms: Vec::new(),
-                                release_to_text_ms: None,
-                                transcript_selection: None,
-                                validation_reason: None,
-                                fallback_reason: None,
-                                reconciliation_requested: false,
-                                recovery_attempted: false,
-                            };
+                            );
                             let (stop_tx, stop_rx) = oneshot::channel();
                             let chunk_counter = Arc::new(AtomicU32::new(0));
                             let first_chunk_ms = Arc::new(AtomicU64::new(u64::MAX));
@@ -546,12 +552,34 @@ async fn actor_loop(
                             ));
                         }
                         Err(failure) => {
-                            eprintln!("Recording {id}: {}", failure.error.diagnostic());
-                            let _ = reply.send(Response::rejected(
+                            let recovering =
+                                failure.capture.is_some() || failure.provider_stream.is_some();
+                            eprintln!(
+                                "Recording {id} [{correlation}]: {}",
+                                failure.error.diagnostic()
+                            );
+                            // A startup failure is correlated and retained like
+                            // any other Recording outcome: its record persists
+                            // locally and the rejection carries the correlated
+                            // evidence back to the client.
+                            let mut record = DiagnosticRecord::new(correlation.clone(), id);
+                            record.error =
+                                Some(failure.error.public_message().to_owned());
+                            record.recovery_attempted = recovering;
+                            if let Err(error) = diagnostics.record(record) {
+                                eprintln!(
+                                    "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
+                                );
+                            }
+                            let mut evidence = base_evidence(id, correlation, Vec::new());
+                            evidence.recovery_attempted = recovering;
+                            let _ = reply.send(Response::with_evidence(
+                                false,
                                 Some(DaemonState::Idle),
                                 failure.error.public_message(),
+                                Some(evidence),
                             ));
-                            if failure.capture.is_some() || failure.provider_stream.is_some() {
+                            if recovering {
                                 // The daemon reads idle immediately but rejects
                                 // new Recordings until the bounded aborts
                                 // acknowledge completion (ActorMessage::Recovered).
@@ -649,7 +677,7 @@ fn state_label(state: &ActorState) -> DaemonState {
         ActorState::Idle | ActorState::Recovering(_) | ActorState::Replaying(_) => {
             DaemonState::Idle
         }
-        ActorState::Starting(_) => DaemonState::Recording,
+        ActorState::Starting { .. } => DaemonState::Recording,
         ActorState::Recording(_) => DaemonState::Recording,
         ActorState::Processing(_) => DaemonState::Processing,
     }
@@ -670,11 +698,37 @@ fn status_response(state: &ActorState) -> Response {
             }
             ActorState::Processing(evidence) => Some(evidence.clone()),
             ActorState::Idle
-            | ActorState::Starting(_)
+            | ActorState::Starting { .. }
             | ActorState::Recovering(_)
             | ActorState::Replaying(_) => None,
         },
     )
+}
+
+/// A fresh lifecycle evidence skeleton stamped with the Recording's correlation
+/// ID, shared by the successful-start, startup-failure, and replay paths.
+fn base_evidence(
+    recording_id: u64,
+    correlation_id: String,
+    stages: Vec<LifecycleStage>,
+) -> LifecycleEvidence {
+    LifecycleEvidence {
+        recording_id,
+        correlation_id,
+        stages,
+        delivery_count: 0,
+        streamed_chunk_count: 0,
+        source_transcript_providers: Vec::new(),
+        first_chunk_ms: None,
+        capture_finalized_ms: None,
+        provider_timings_ms: Vec::new(),
+        release_to_text_ms: None,
+        transcript_selection: None,
+        validation_reason: None,
+        fallback_reason: None,
+        reconciliation_requested: false,
+        recovery_attempted: false,
+    }
 }
 
 fn atomic_millis(value: &AtomicU64) -> Option<u64> {
@@ -1028,22 +1082,94 @@ fn diagnostic_record(
     record
 }
 
-/// Replays a fixed captured fixture at `path` through the provider and
-/// validation boundaries without capturing audio, then returns the borrowed
-/// adapters to the actor so the daemon is reusable. The fixture is raw
-/// s16le/mono/16 kHz PCM, the same format capture produces.
-async fn replay_recording(
-    path: String,
+/// The adapters and response a finished replay hands back through its
+/// supervisor. Adapters travel inside the task's return value, so the ONLY way
+/// they can be lost is a panic — which the supervisor detects and repairs.
+struct ReplayResult {
+    deepgram: Box<dyn TranscriptProvider>,
+    groq: Box<dyn TranscriptProvider>,
+    validator: Box<dyn TranscriptValidator>,
+    response: Response,
+}
+
+/// Awaits the supervised replay task and reports completion to the actor on
+/// EVERY path. If the replay panicked, the borrowed adapters were dropped with
+/// it, so the supervisor rebuilds fresh ones (the adapters are stateless
+/// constructors) and completes with an error — the daemon must never wedge in
+/// Replaying.
+async fn supervise_replay(
+    replay: JoinHandle<ReplayResult>,
     id: u64,
+    controlled: bool,
+    reply: oneshot::Sender<Response>,
+    actor: mpsc::Sender<ActorMessage>,
+) {
+    let completion = match replay.await {
+        Ok(result) => ReplayCompletion {
+            id,
+            deepgram: result.deepgram,
+            groq: result.groq,
+            validator: result.validator,
+            reply,
+            response: result.response,
+        },
+        Err(join_error) => {
+            eprintln!("Replay {id}: replay task failed: {join_error}");
+            let (deepgram, groq, validator) = rebuild_replay_adapters(controlled);
+            ReplayCompletion {
+                id,
+                deepgram,
+                groq,
+                validator,
+                reply,
+                response: Response::rejected(Some(DaemonState::Idle), "fixture replay failed"),
+            }
+        }
+    };
+    let _ = actor.send(ActorMessage::ReplayCompleted(completion)).await;
+}
+
+/// Rebuilds the provider and validation adapters after a replay panic dropped
+/// the originals. Mirrors the actor's startup construction.
+fn rebuild_replay_adapters(
+    controlled: bool,
+) -> (
+    Box<dyn TranscriptProvider>,
+    Box<dyn TranscriptProvider>,
+    Box<dyn TranscriptValidator>,
+) {
+    if controlled {
+        (
+            Box::new(ControlledProvider::from_env(Provider::Deepgram)),
+            Box::new(ControlledProvider::from_env(Provider::Groq)),
+            Box::new(ControlledValidator::from_env()),
+        )
+    } else {
+        (
+            Box::new(DeepgramProvider),
+            Box::new(GroqProvider),
+            Box::new(MergeResultValidator::new()),
+        )
+    }
+}
+
+/// Replays a fixed captured fixture named `fixture_name` — which must live
+/// inside the approved private fixture directory — through the provider and
+/// validation boundaries without capturing audio, then returns the borrowed
+/// adapters through its supervisor so the daemon is reusable. The fixture is
+/// raw s16le/mono/16 kHz PCM, the same format capture produces.
+async fn replay_recording(
+    fixture_name: String,
+    id: u64,
+    fixture_dir: PathBuf,
     mut deepgram: Box<dyn TranscriptProvider>,
     mut groq: Box<dyn TranscriptProvider>,
     mut validator: Box<dyn TranscriptValidator>,
     provider_deadline: Duration,
-    actor: mpsc::Sender<ActorMessage>,
-    reply: oneshot::Sender<Response>,
-) {
+) -> ReplayResult {
     let response = match run_replay(
-        &path,
+        &fixture_name,
+        &fixture_dir,
         id,
         &mut deepgram,
         &mut groq,
@@ -1053,31 +1179,25 @@ async fn replay_recording(
     .await
     {
         Ok(outcome) => {
-            let mut evidence = LifecycleEvidence {
-                recording_id: id,
-                correlation_id: voisu_core::correlation_id(id),
-                stages: vec![
+            let mut evidence = base_evidence(
+                id,
+                voisu_core::correlation_id(id),
+                vec![
                     LifecycleStage::ProvidersCompleted,
                     LifecycleStage::ValidationCompleted,
                 ],
-                delivery_count: 0,
-                streamed_chunk_count: 0,
-                source_transcript_providers: outcome
-                    .source_transcripts
-                    .iter()
-                    .map(|source| source.provider)
-                    .collect(),
-                first_chunk_ms: None,
-                capture_finalized_ms: None,
-                provider_timings_ms: outcome.timings_ms,
-                release_to_text_ms: None,
-                transcript_selection: Some(outcome.decision.selection),
-                validation_reason: Some(outcome.decision.validation_reason.clone()),
-                fallback_reason: outcome.decision.fallback_reason.clone(),
-                reconciliation_requested: outcome.decision.reconciliation_requested,
-                recovery_attempted: outcome.decision.recovery_attempted,
-            };
-            evidence.stages.dedup();
+            );
+            evidence.source_transcript_providers = outcome
+                .source_transcripts
+                .iter()
+                .map(|source| source.provider)
+                .collect();
+            evidence.provider_timings_ms = outcome.timings_ms;
+            evidence.transcript_selection = Some(outcome.decision.selection);
+            evidence.validation_reason = Some(outcome.decision.validation_reason.clone());
+            evidence.fallback_reason = outcome.decision.fallback_reason.clone();
+            evidence.reconciliation_requested = outcome.decision.reconciliation_requested;
+            evidence.recovery_attempted = outcome.decision.recovery_attempted;
             Response::with_evidence(
                 true,
                 Some(DaemonState::Idle),
@@ -1093,48 +1213,106 @@ async fn replay_recording(
             Response::rejected(Some(DaemonState::Idle), error.public_message())
         }
     };
-    let _ = actor
-        .send(ActorMessage::ReplayCompleted(ReplayCompletion {
-            id,
-            deepgram,
-            groq,
-            validator,
-            reply,
-            response,
-        }))
-        .await;
+    ReplayResult {
+        deepgram,
+        groq,
+        validator,
+        response,
+    }
 }
 
 const MAX_FIXTURE_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Opens and reads a replay fixture with no TOCTOU window: the name must be a
+/// plain component inside the approved fixture directory, the open itself
+/// refuses symlinks (O_NOFOLLOW) and never blocks on a FIFO (O_NONBLOCK), and
+/// every property — regular file, owner, size — is validated on the OPENED
+/// descriptor before a bounded read from that same descriptor. Nothing outside
+/// the fixture directory can ever be sent to a provider.
+fn read_fixture(fixture_dir: &Path, name: &str) -> Result<Vec<u8>, BoundaryError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(BoundaryError::new(
+            BoundaryKind::Capture,
+            "fixture must be a plain file name inside the fixture directory",
+        ));
+    }
+    let path = fixture_dir.join(name);
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|error| {
+            BoundaryError::new(BoundaryKind::Capture, format!("cannot open fixture: {error}"))
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        BoundaryError::new(BoundaryKind::Capture, format!("cannot inspect fixture: {error}"))
+    })?;
+    if !metadata.is_file() {
+        return Err(BoundaryError::new(
+            BoundaryKind::Capture,
+            "fixture must be a regular file",
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and does not mutate memory.
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(BoundaryError::new(
+            BoundaryKind::Capture,
+            "fixture must be owned by the current user",
+        ));
+    }
+    if metadata.len() > MAX_FIXTURE_BYTES {
+        return Err(BoundaryError::new(BoundaryKind::Capture, "fixture is too large"));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::take(file, MAX_FIXTURE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            BoundaryError::new(BoundaryKind::Capture, format!("cannot read fixture: {error}"))
+        })?;
+    if bytes.len() as u64 > MAX_FIXTURE_BYTES {
+        return Err(BoundaryError::new(BoundaryKind::Capture, "fixture is too large"));
+    }
+    if bytes.is_empty() {
+        return Err(BoundaryError::new(BoundaryKind::EmptyRecording, "fixture is empty"));
+    }
+    Ok(bytes)
+}
+
 async fn run_replay(
-    path: &str,
+    fixture_name: &str,
+    fixture_dir: &Path,
     id: u64,
     deepgram: &mut Box<dyn TranscriptProvider>,
     groq: &mut Box<dyn TranscriptProvider>,
     validator: &mut dyn TranscriptValidator,
     provider_deadline: Duration,
 ) -> Result<ReplayOutcome, BoundaryError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        BoundaryError::new(BoundaryKind::Capture, format!("cannot inspect fixture: {error}"))
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(BoundaryError::new(
-            BoundaryKind::Capture,
-            "fixture must be a regular file",
-        ));
-    }
-    if metadata.len() > MAX_FIXTURE_BYTES {
-        return Err(BoundaryError::new(BoundaryKind::Capture, "fixture is too large"));
-    }
-    let bytes = fs::read(path).map_err(|error| {
-        BoundaryError::new(BoundaryKind::Capture, format!("cannot read fixture: {error}"))
-    })?;
-    if bytes.is_empty() {
-        return Err(BoundaryError::new(BoundaryKind::EmptyRecording, "fixture is empty"));
-    }
+    let bytes = read_fixture(fixture_dir, fixture_name)?;
     let deepgram_stream = deepgram.start(id)?;
-    let groq_stream = groq.start(id)?;
+    let groq_stream = match groq.start(id) {
+        Ok(stream) => stream,
+        Err(error) => {
+            // A partial start must not detach the already-started stream: abort
+            // it and await the abort under the bounded recovery deadline before
+            // the failure becomes observable — the same ownership discipline as
+            // the dictation start path.
+            match timeout(RECOVERY_ABORT_DEADLINE, deepgram_stream.abort()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(abort_error)) => eprintln!(
+                    "Replay {id}: provider abort failed: {}",
+                    abort_error.diagnostic()
+                ),
+                Err(_) => eprintln!("Replay {id}: provider abort timed out"),
+            }
+            return Err(error);
+        }
+    };
     let coordinator = ProviderCoordinator::start(
         provider_deadline,
         RECOVERY_ABORT_DEADLINE,
