@@ -28,3 +28,13 @@ completion without adding real provider behavior to Ticket 01.
 ## 2026-07-15 — Treat the runtime socket as a user-owned capability
 **Why:** A private validated XDG root, single-instance lock, stale-socket probe, mode-0600 socket, and
 device/inode-checked cleanup prevent one daemon instance from deleting or replacing another instance's path.
+
+## 2026-07-15 — Defer rustfmt/clippy rather than block Ticket 01 on them
+**Why:** Neither tool is installed on this machine (`sudo dnf install rustfmt clippy` required); blocking
+approval on local tooling availability would have stalled a ticket that was otherwise fully green
+(build + 25 tests) and already externally reviewed 3 times. Recorded as a gotcha to fix before relying on
+lint/format cleanliness, not silently dropped.
+
+## 2026-07-15 — Never deliberately background a `codex exec` run
+**Why:** A deliberately-backgrounded codex exec was killed mid-task, losing work; the harness's own
+auto-backgrounding after a 600s foreground timeout is safe and was kept as the only backgrounding path.
