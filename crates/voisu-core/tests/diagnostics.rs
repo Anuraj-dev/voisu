@@ -478,3 +478,16 @@ fn startup_cleanup_survives_all_temp_name_candidates_being_preplanted() {
         "history still works after the purge"
     );
 }
+
+#[test]
+fn sanitize_url_validates_ipv6_structure_not_just_characters() {
+    // Adversarial: hex-and-colon soup that a character check accepts but a
+    // structural parse rejects.
+    assert_eq!(voisu_core::sanitize_url("https://[deadbeef]/v1"), REDACTED);
+    assert_eq!(voisu_core::sanitize_url("https://[2001:db8::1::2]/v1"), REDACTED);
+    // A well-formed literal still sanitizes rather than redacts.
+    assert_eq!(
+        voisu_core::sanitize_url("https://[2001:db8::1]/v1?k=leak"),
+        "https://[2001:db8::1]/v1"
+    );
+}

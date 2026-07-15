@@ -352,10 +352,9 @@ fn is_valid_authority_host(host: &str) -> bool {
         let Some((address, after)) = inner.split_once(']') else {
             return false;
         };
-        let address_ok = !address.is_empty()
-            && address
-                .chars()
-                .all(|character| character.is_ascii_hexdigit() || character == ':' || character == '.');
+        // Structural validation, not just a character check: "[deadbeef]" and
+        // "[2001:db8::1::2]" are hex-and-colon soup, not IPv6 addresses.
+        let address_ok = address.parse::<std::net::Ipv6Addr>().is_ok();
         let port_ok = match after.strip_prefix(':') {
             Some(port) => is_valid_port(port),
             None => after.is_empty(),
