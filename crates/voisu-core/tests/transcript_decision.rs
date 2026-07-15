@@ -1,10 +1,11 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use voisu_core::{
-    BoundaryFuture, MergeResult, Provider, ReconciliationKind, ReconciliationModel,
-    SourceTranscript, TranscriptDecisionPipeline, TranscriptSelection,
+    BoundaryError, BoundaryFuture, BoundaryKind, CancelRegistry, MergeResult, Provider,
+    ReconciliationKind, ReconciliationModel, SourceTranscript, TranscriptDecisionPipeline,
+    TranscriptSelection,
 };
 
 struct CountingModel {
@@ -22,6 +23,7 @@ impl ReconciliationModel for SuccessfulModel {
         kind: ReconciliationKind,
         _sources: Vec<SourceTranscript>,
         _candidate: Option<MergeResult>,
+        _cancel: Arc<CancelRegistry>,
     ) -> BoundaryFuture<'_, MergeResult> {
         self.kinds.lock().unwrap().push(kind);
         let text = self.text.clone();
@@ -35,6 +37,7 @@ impl ReconciliationModel for CountingModel {
         _kind: ReconciliationKind,
         _sources: Vec<SourceTranscript>,
         _candidate: Option<MergeResult>,
+        _cancel: Arc<CancelRegistry>,
     ) -> BoundaryFuture<'_, MergeResult> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { panic!("near-identical Source Transcripts must not invoke reconciliation") })
@@ -57,6 +60,7 @@ impl ReconciliationModel for AlwaysUnsafeModel {
         _kind: ReconciliationKind,
         _sources: Vec<SourceTranscript>,
         _candidate: Option<MergeResult>,
+        _cancel: Arc<CancelRegistry>,
     ) -> BoundaryFuture<'_, MergeResult> {
         Box::pin(async {
             Ok(MergeResult(
@@ -74,6 +78,7 @@ impl ReconciliationModel for SingleSourceRepairModel {
         kind: ReconciliationKind,
         _sources: Vec<SourceTranscript>,
         candidate: Option<MergeResult>,
+        _cancel: Arc<CancelRegistry>,
     ) -> BoundaryFuture<'_, MergeResult> {
         Box::pin(async move {
             assert_eq!(kind, ReconciliationKind::Repair);
@@ -91,9 +96,22 @@ impl ReconciliationModel for StallingModel {
         _kind: ReconciliationKind,
         _sources: Vec<SourceTranscript>,
         _candidate: Option<MergeResult>,
+        cancel: Arc<CancelRegistry>,
     ) -> BoundaryFuture<'_, MergeResult> {
-        Box::pin(async {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+        // Stalls far past any deadline but honors cancellation, as the trait
+        // contract requires of every model.
+        Box::pin(async move {
+            let mut waited = Duration::ZERO;
+            while waited < Duration::from_secs(30) {
+                if cancel.is_cancelled() {
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Validation,
+                        "reconciliation request cancelled",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                waited += Duration::from_millis(5);
+            }
             Ok(MergeResult("late Merge Result".to_owned()))
         })
     }
@@ -105,6 +123,7 @@ impl ReconciliationModel for CandidateThenRepairModel {
         kind: ReconciliationKind,
         _sources: Vec<SourceTranscript>,
         _candidate: Option<MergeResult>,
+        _cancel: Arc<CancelRegistry>,
     ) -> BoundaryFuture<'_, MergeResult> {
         let text = match kind {
             ReconciliationKind::Reconcile => self.candidate.clone(),
@@ -120,6 +139,7 @@ impl ReconciliationModel for RepairingModel {
         kind: ReconciliationKind,
         _sources: Vec<SourceTranscript>,
         candidate: Option<MergeResult>,
+        _cancel: Arc<CancelRegistry>,
     ) -> BoundaryFuture<'_, MergeResult> {
         self.kinds.lock().unwrap().push(kind);
         Box::pin(async move {
@@ -396,4 +416,170 @@ async fn failed_recovery_reports_quality_failure_when_neither_source_is_safe() {
 
     assert_eq!(error.public_message(), "Transcript failed quality validation");
     assert!(error.diagnostic().contains("neither Source Transcript is safe"));
+}
+
+/// Stalls until the pipeline cancels it, then simulates the kill/reap of an
+/// owned subprocess before completing — proving the pipeline awaits the
+/// cancelled request instead of detaching it at the deadline.
+struct CancelObservingModel {
+    cleanup_finished: Arc<AtomicBool>,
+}
+
+impl ReconciliationModel for CancelObservingModel {
+    fn request(
+        &mut self,
+        _kind: ReconciliationKind,
+        _sources: Vec<SourceTranscript>,
+        _candidate: Option<MergeResult>,
+        cancel: Arc<CancelRegistry>,
+    ) -> BoundaryFuture<'_, MergeResult> {
+        let cleanup_finished = Arc::clone(&self.cleanup_finished);
+        Box::pin(async move {
+            while !cancel.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // The kill and reap of an owned subprocess take real time after
+            // cancellation; the pipeline must absorb it before falling back.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cleanup_finished.store(true, Ordering::SeqCst);
+            Err(BoundaryError::new(
+                BoundaryKind::Validation,
+                "reconciliation request cancelled",
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn elapsed_reconciliation_deadline_awaits_the_cancelled_request_before_fallback() {
+    let cleanup_finished = Arc::new(AtomicBool::new(false));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CancelObservingModel {
+            cleanup_finished: Arc::clone(&cleanup_finished),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Book the room Tuesday afternoon.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Schedule the review Wednesday morning.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert!(
+        cleanup_finished.load(Ordering::SeqCst),
+        "the pipeline must cancel AND await the in-flight request's cleanup before the fallback is observable"
+    );
+    assert_eq!(
+        decision.fallback_reason.as_deref(),
+        Some("cloud reconciliation deadline elapsed")
+    );
+    assert!(matches!(
+        decision.selection,
+        TranscriptSelection::SourceDeepgram | TranscriptSelection::SourceGroq
+    ));
+}
+
+#[tokio::test]
+async fn latin_cyrillic_homoglyph_merge_result_is_rejected_and_repaired() {
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    // "pаyment" hides a Cyrillic "а" (U+0430) inside a Latin token: only two
+    // scripts overall, so the old whole-text threshold let it pass.
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        RepairingHomoglyphModel {
+            kinds: Arc::clone(&kinds),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Book the room Tuesday afternoon.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Schedule the payment review Wednesday morning.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::Repaired);
+    assert_eq!(decision.validation_reason, "repaired mixed-script garbage");
+    assert_eq!(
+        *kinds.lock().unwrap(),
+        vec![ReconciliationKind::Reconcile, ReconciliationKind::Repair]
+    );
+}
+
+struct RepairingHomoglyphModel {
+    kinds: Arc<Mutex<Vec<ReconciliationKind>>>,
+}
+
+impl ReconciliationModel for RepairingHomoglyphModel {
+    fn request(
+        &mut self,
+        kind: ReconciliationKind,
+        _sources: Vec<SourceTranscript>,
+        _candidate: Option<MergeResult>,
+        _cancel: Arc<CancelRegistry>,
+    ) -> BoundaryFuture<'_, MergeResult> {
+        self.kinds.lock().unwrap().push(kind);
+        Box::pin(async move {
+            Ok(MergeResult(match kind {
+                ReconciliationKind::Reconcile => {
+                    "Schedule the p\u{0430}yment review Wednesday morning.".to_owned()
+                }
+                ReconciliationKind::Repair => {
+                    "Schedule the payment review Wednesday morning.".to_owned()
+                }
+            }))
+        })
+    }
+}
+
+#[tokio::test]
+async fn legitimate_bilingual_merge_result_passes_validation() {
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    // Two scripts across SEPARATE tokens is legitimate bilingual dictation and
+    // must not be rejected as mixed-script garbage.
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::clone(&kinds),
+            text: "Скажи Марии that the review is Wednesday morning.".to_owned(),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Book the room Tuesday afternoon.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Schedule the review Wednesday morning.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        decision.transcript.0,
+        "Скажи Марии that the review is Wednesday morning."
+    );
+    assert_eq!(decision.selection, TranscriptSelection::Reconciled);
+    assert!(!decision.recovery_attempted);
+    assert!(decision.fallback_reason.is_none());
 }

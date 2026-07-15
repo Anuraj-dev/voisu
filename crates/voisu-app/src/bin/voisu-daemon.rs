@@ -18,7 +18,8 @@ use voisu_app::system::{
 };
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
-    CapturedAudio, Command, DaemonState, DeliveryAdapter, LifecycleEvidence, LifecycleStage,
+    CancelRegistry, CapturedAudio, Command, DaemonState, DeliveryAdapter, LifecycleEvidence,
+    LifecycleStage,
     MergeResult, PROTOCOL_VERSION, Provider, ProviderCoordinator, ProviderStream, ProviderStreams,
     ReconciliationKind, ReconciliationModel, Request, Response, SourceTranscript, Transcript,
     TranscriptDecision, TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator,
@@ -1187,6 +1188,7 @@ impl ReconciliationModel for ControlledReconciliationModel {
         kind: ReconciliationKind,
         _sources: Vec<SourceTranscript>,
         _candidate: Option<MergeResult>,
+        cancel: Arc<CancelRegistry>,
     ) -> BoundaryFuture<'_, MergeResult> {
         let delay = self.delay;
         let fail = self.fail;
@@ -1196,7 +1198,22 @@ impl ReconciliationModel for ControlledReconciliationModel {
         };
         Box::pin(async move {
             if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+                // Honor cancellation during the controlled delay so the
+                // pipeline's post-deadline grace await completes promptly, as
+                // a cancel-honoring production model would.
+                let poll = Duration::from_millis(5);
+                let mut waited = Duration::ZERO;
+                while waited < delay && !cancel.is_cancelled() {
+                    let step = poll.min(delay - waited);
+                    tokio::time::sleep(step).await;
+                    waited += step;
+                }
+            }
+            if cancel.is_cancelled() {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Validation,
+                    "controlled reconciliation cancelled",
+                ));
             }
             if fail {
                 return Err(BoundaryError::new(

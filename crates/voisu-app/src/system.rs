@@ -3,14 +3,14 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use voisu_core::{
     socket_path, ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture,
-    BoundaryKind, CapturedAudio, Command as DaemonCommand, Credential, DeliveryAdapter, Provider,
+    BoundaryKind, CancelRegistry, CapturedAudio, Command as DaemonCommand, Credential,
+    DeliveryAdapter, Provider,
     ProviderAuthenticator, ProviderStream, ReadinessCapability, ReadinessFinding,
     MergeResult, ReadinessInspector, ReadinessStatus, ReconciliationKind, ReconciliationModel,
     Request, Response, SecretStore, SourceTranscript, Transcript, TranscriptDecision,
@@ -530,34 +530,6 @@ fn restricted_command(program: &str) -> Command {
         }
     }
     command
-}
-
-/// Cancellation flag shared between a provider stream and its in-flight
-/// subprocess requests. It deliberately stores NO pids: signaling a raw pid is
-/// unsafe once reaping happens elsewhere (a reaped pid can be recycled by the
-/// kernel and the signal would land on an unrelated process). `cancel()` only
-/// sets the flag; the bounded-wait loop that OWNS each `Child` observes it on
-/// its next poll tick and kills through its own `Child` handle — pid-reuse-safe
-/// because that same loop is the only reaper, so the handle cannot be recycled
-/// while unreaped. Kill latency is at most one poll tick.
-struct CancelRegistry {
-    cancelled: AtomicBool,
-}
-
-impl CancelRegistry {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            cancelled: AtomicBool::new(false),
-        })
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
-    }
-
-    fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
-    }
 }
 
 fn run_restricted(
@@ -1352,11 +1324,27 @@ impl ReconciliationModel for GroqReconciliationModel {
         kind: ReconciliationKind,
         sources: Vec<SourceTranscript>,
         candidate: Option<MergeResult>,
+        cancel: Arc<CancelRegistry>,
     ) -> BoundaryFuture<'_, MergeResult> {
         Box::pin(async move {
-            let credential = SecretStore::load(&mut SecretToolStore, Provider::Groq)?;
+            // The whole operation — including the potentially slow synchronous
+            // Secret Service lookup — runs inside ONE owned blocking task, so
+            // it never blocks the async thread and the pipeline can cancel it
+            // as a unit. curl observes the cancel flag through its bounded
+            // wait: on cancellation the child is killed and reaped by the same
+            // loop that owns its handle, and this future completes only after
+            // that cleanup, keeping the reap ordered before any fallback
+            // becomes observable. The post-lookup check guarantees no curl is
+            // spawned once the deadline has already cancelled the request.
             tokio::task::spawn_blocking(move || {
-                request_groq_reconciliation(credential, kind, sources, candidate)
+                let credential = SecretStore::load(&mut SecretToolStore, Provider::Groq)?;
+                if cancel.is_cancelled() {
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Validation,
+                        "reconciliation request cancelled",
+                    ));
+                }
+                request_groq_reconciliation(credential, kind, sources, candidate, &cancel)
             })
             .await
             .map_err(|_| {
@@ -1371,6 +1359,7 @@ fn request_groq_reconciliation(
     kind: ReconciliationKind,
     sources: Vec<SourceTranscript>,
     candidate: Option<MergeResult>,
+    cancel: &CancelRegistry,
 ) -> Result<MergeResult, BoundaryError> {
     let endpoint = std::env::var("VOISU_GROQ_RECONCILIATION_URL")
         .unwrap_or_else(|_| "https://api.groq.com/openai/v1/chat/completions".to_owned());
@@ -1441,7 +1430,7 @@ fn request_groq_reconciliation(
         Some(config.as_bytes()),
         true,
         RECONCILIATION_PROCESS_DEADLINE,
-        None,
+        Some(cancel),
     )
     .map_err(|error| match error {
         ProcessError::TimedOut => {

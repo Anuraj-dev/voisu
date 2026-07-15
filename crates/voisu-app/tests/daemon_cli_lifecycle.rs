@@ -2251,6 +2251,110 @@ rm -f "$config"
 }
 
 #[test]
+fn elapsed_reconciliation_deadline_kills_and_reaps_the_in_flight_curl_before_idle() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+head -c 32000 /dev/zero | tr '\000' '\001'
+trap 'exit 0' INT TERM
+: > "$dir/pw-record.ready"
+i=0
+while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
+"#,
+    );
+    // The Groq credential comes from the Secret Service, and the lookup turns
+    // slow once the test drops the "slow" marker (i.e. for the reconciliation
+    // lookup only): the synchronous lookup eats ~1.5s of the 3s reconciliation
+    // deadline, so the deadline fires while the reconciliation curl is still
+    // in flight — the exact window in which a dropped handle would detach it.
+    write_fake_command(
+        commands.path(),
+        "secret-tool",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+if [ "$1" = "lookup" ]; then
+  if [ -e "$dir/secret-tool.slow" ]; then
+    i=0
+    while [ "$i" -lt 150 ]; do sleep 0.01; i=$((i + 1)); done
+  fi
+  printf 'groq-controlled-secret'
+fi
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+config=$(mktemp "$dir/curl-config.XXXXXX")
+cat > "$config"
+if grep -q 'deepgram.test' "$config"; then
+  rm -f "$config"
+  printf '{"results":{"channels":[{"alternatives":[{"transcript":"Book the room Tuesday afternoon."}]}]}}'
+elif grep -q 'reconciliation.test' "$config"; then
+  printf '%s\n' "$$" > "$dir/reconciliation.pid"
+  : > "$dir/reconciliation.started"
+  rm -f "$config"
+  i=0
+  while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
+else
+  rm -f "$config"
+  printf '{"text":"Schedule the review Wednesday morning."}'
+fi
+"#,
+    );
+    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_TEST_MODE", "system-boundaries"),
+            ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
+            (
+                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
+                "https://deepgram.test/v1/listen",
+            ),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
+            (
+                "VOISU_GROQ_RECONCILIATION_URL",
+                "https://reconciliation.test/chat/completions",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "pw-record.ready");
+    fs::write(commands.path().join("secret-tool.slow"), b"").unwrap();
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(
+        stopped["evidence"]["fallback_reason"],
+        "cloud reconciliation deadline elapsed"
+    );
+    assert_eq!(stopped["evidence"]["transcript_selection"], "source_groq");
+    assert!(commands.path().join("reconciliation.started").exists());
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    let pid = fs::read_to_string(commands.path().join("reconciliation.pid")).unwrap();
+    assert!(
+        !Path::new(&format!("/proc/{}", pid.trim())).exists(),
+        "the in-flight reconciliation curl must be killed and reaped before Idle is observable"
+    );
+}
+
+#[test]
 fn provider_deadline_releases_the_valid_source_without_waiting_for_the_slow_provider() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start_with_env(

@@ -5,6 +5,7 @@ use std::future::Future;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -399,12 +400,53 @@ pub enum ReconciliationKind {
     Repair,
 }
 
+/// Cancellation flag shared between an owner and its in-flight boundary
+/// operation. It deliberately stores NO pids: signaling a raw pid is unsafe
+/// once reaping happens elsewhere (a reaped pid can be recycled by the kernel
+/// and the signal would land on an unrelated process). `cancel()` only sets
+/// the flag; the bounded loop that OWNS each subprocess handle observes it on
+/// its next poll tick and kills through its own handle — pid-reuse-safe
+/// because that same loop is the only reaper, so the handle cannot be
+/// recycled while unreaped.
+pub struct CancelRegistry {
+    cancelled: AtomicBool,
+}
+
+impl CancelRegistry {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancelled: AtomicBool::new(false),
+        })
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst)
+    }
+}
+
+/// Grace granted, after the reconciliation deadline cancels an in-flight
+/// request, for the cancelled request to kill, reap, and surrender its
+/// subprocess before the fallback Transcript becomes observable. A
+/// cancel-honoring model completes within one subprocess poll tick plus a
+/// brief reap, well inside this bound.
+const RECONCILIATION_CLEANUP_GRACE: Duration = Duration::from_secs(1);
+
 pub trait ReconciliationModel: Send {
+    /// Requests a Merge Result. The request MUST observe `cancel`: once the
+    /// flag is set, any subprocess it owns must be killed and reaped, and the
+    /// returned future must complete promptly — the pipeline keeps the future
+    /// owned after its deadline and awaits it under a bounded grace instead of
+    /// detaching the work.
     fn request(
         &mut self,
         kind: ReconciliationKind,
         sources: Vec<SourceTranscript>,
         candidate: Option<MergeResult>,
+        cancel: Arc<CancelRegistry>,
     ) -> BoundaryFuture<'_, MergeResult>;
 }
 
@@ -469,29 +511,43 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 });
             }
 
-            let merge_result = match tokio::time::timeout(
-                self.deadline,
-                self.model
-                    .request(ReconciliationKind::Reconcile, sources.clone(), None),
-            )
-            .await
-            {
-                Ok(Ok(merge_result)) => merge_result,
-                Ok(Err(error)) => {
-                    return clean_source_fallback(
-                        &sources,
-                        format!("cloud reconciliation failed: {}", error.diagnostic()),
-                        true,
-                        false,
-                    );
-                }
-                Err(_) => {
-                    return clean_source_fallback(
-                        &sources,
-                        "cloud reconciliation deadline elapsed".to_owned(),
-                        true,
-                        false,
-                    );
+            let merge_result = {
+                let cancel = CancelRegistry::new();
+                let request = self.model.request(
+                    ReconciliationKind::Reconcile,
+                    sources.clone(),
+                    None,
+                    Arc::clone(&cancel),
+                );
+                tokio::pin!(request);
+                match tokio::time::timeout(self.deadline, request.as_mut()).await {
+                    Ok(Ok(merge_result)) => merge_result,
+                    Ok(Err(error)) => {
+                        return clean_source_fallback(
+                            &sources,
+                            format!("cloud reconciliation failed: {}", error.diagnostic()),
+                            true,
+                            false,
+                        );
+                    }
+                    Err(_) => {
+                        // The deadline elapsed with the request still owned
+                        // (pinned above, never dropped): cancel it so the model
+                        // kills and reaps any subprocess it spawned, then await
+                        // the SAME future under a bounded grace so no
+                        // reconciliation work survives past the fallback
+                        // becoming observable.
+                        cancel.cancel();
+                        let _ =
+                            tokio::time::timeout(RECONCILIATION_CLEANUP_GRACE, request.as_mut())
+                                .await;
+                        return clean_source_fallback(
+                            &sources,
+                            "cloud reconciliation deadline elapsed".to_owned(),
+                            true,
+                            false,
+                        );
+                    }
                 }
             };
             if let Some(reason) = quality_failure_reason(&merge_result.0, &sources) {
@@ -542,32 +598,40 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         reason: &'static str,
         reconciliation_requested: bool,
     ) -> Result<TranscriptDecision, BoundaryError> {
-        let repaired = match tokio::time::timeout(
-            self.deadline,
-            self.model.request(
+        let repaired = {
+            let cancel = CancelRegistry::new();
+            let request = self.model.request(
                 ReconciliationKind::Repair,
                 sources.to_vec(),
                 Some(candidate),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(repaired)) => repaired,
-            Ok(Err(error)) => {
-                return clean_source_fallback(
-                    sources,
-                    format!("recovery failed: {}", error.diagnostic()),
-                    reconciliation_requested,
-                    true,
-                );
-            }
-            Err(_) => {
-                return clean_source_fallback(
-                    sources,
-                    "recovery deadline elapsed".to_owned(),
-                    reconciliation_requested,
-                    true,
-                );
+                Arc::clone(&cancel),
+            );
+            tokio::pin!(request);
+            match tokio::time::timeout(self.deadline, request.as_mut()).await {
+                Ok(Ok(repaired)) => repaired,
+                Ok(Err(error)) => {
+                    return clean_source_fallback(
+                        sources,
+                        format!("recovery failed: {}", error.diagnostic()),
+                        reconciliation_requested,
+                        true,
+                    );
+                }
+                Err(_) => {
+                    // Same owned-handle discipline as the reconcile path: the
+                    // request future stays pinned across its deadline, so cancel
+                    // and await it under the bounded grace — its subprocess must
+                    // be killed and reaped before the fallback is observable.
+                    cancel.cancel();
+                    let _ = tokio::time::timeout(RECONCILIATION_CLEANUP_GRACE, request.as_mut())
+                        .await;
+                    return clean_source_fallback(
+                        sources,
+                        "recovery deadline elapsed".to_owned(),
+                        reconciliation_requested,
+                        true,
+                    );
+                }
             }
         };
         if let Some(repair_reason) = quality_failure_reason(&repaired.0, sources) {
@@ -684,7 +748,11 @@ fn quality_failure_reason(
     {
         return Some("hallucinated suffix");
     }
-    if script_count(trimmed) >= 3 {
+    if script_count(trimmed) >= 3
+        || trimmed
+            .split_whitespace()
+            .any(token_mixes_confusable_scripts)
+    {
         return Some("mixed-script garbage");
     }
     let source_words = sources
@@ -697,6 +765,26 @@ fn quality_failure_reason(
         return Some("suspicious expansion");
     }
     None
+}
+
+/// Latin, Greek, and Cyrillic letters are visually confusable: a single token
+/// drawing letters from more than one of these scripts is a homoglyph or
+/// garbage signature (e.g. a Latin word smuggling a Cyrillic "а"), while
+/// legitimate bilingual dictation keeps each token in one script — so mixing
+/// scripts across separate tokens stays permitted.
+fn token_mixes_confusable_scripts(token: &str) -> bool {
+    let mut latin = false;
+    let mut greek = false;
+    let mut cyrillic = false;
+    for character in token.chars().filter(|character| character.is_alphabetic()) {
+        match character as u32 {
+            0x0041..=0x024f => latin = true,
+            0x0370..=0x03ff => greek = true,
+            0x0400..=0x052f => cyrillic = true,
+            _ => {}
+        }
+    }
+    usize::from(latin) + usize::from(greek) + usize::from(cyrillic) >= 2
 }
 
 fn script_count(text: &str) -> usize {
