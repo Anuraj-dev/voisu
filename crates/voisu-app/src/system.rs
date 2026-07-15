@@ -13,9 +13,9 @@ use voisu_core::{
     DeliveryAdapter, Provider,
     ProviderAuthenticator, ProviderStream, ReadinessCapability, ReadinessFinding,
     MergeResult, ReadinessInspector, ReadinessStatus, ReconciliationKind, ReconciliationModel,
-    Request, Response, SecretStore, SourceTranscript, Transcript, TranscriptDecision,
-    TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator, VersionEnvelope,
-    PROTOCOL_VERSION,
+    Request, Response, SecretStore, ShortcutPortal, ShortcutSession, SourceTranscript, Transcript,
+    TranscriptDecision, TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator,
+    TriggerKeyBinding, VersionEnvelope, PROTOCOL_VERSION,
 };
 
 const PROCESS_DEADLINE: Duration = Duration::from_secs(2);
@@ -75,6 +75,87 @@ impl ReadinessInspector for FedoraReadiness {
             secret_service_finding(),
             daemon_finding(),
         ]
+    }
+}
+
+/// Production Global Shortcuts portal edge
+/// (`org.freedesktop.portal.GlobalShortcuts`). It binds the Trigger Key through
+/// the desktop portal so Voisu never touches raw input devices.
+///
+/// The GlobalShortcuts portal delivers `Activated` signals only to the D-Bus
+/// connection that created and bound the session, so the session must be held on
+/// a long-lived in-process connection — a per-call `busctl`/`gdbus` subprocess
+/// cannot receive its own session's activations. Until that native session
+/// client is built into the daemon, `bind` probes portal availability and then
+/// fails closed with a `Shortcut` boundary: the daemon degrades gracefully and
+/// keeps CLI start/stop/toggle fully usable (Ticket 07 acceptance: an
+/// unavailable portal never breaks Recording control). The controlled portal
+/// exercises the full activation contract in tests.
+pub struct FedoraShortcutPortal;
+
+impl FedoraShortcutPortal {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for FedoraShortcutPortal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShortcutPortal for FedoraShortcutPortal {
+    fn bind(&mut self) -> BoundaryFuture<'_, Box<dyn ShortcutSession>> {
+        Box::pin(async move {
+            // Probe the desktop portal off the async runtime; the blocking
+            // subprocess must not stall the reactor.
+            let available = tokio::task::spawn_blocking(|| {
+                run_restricted(
+                    "busctl",
+                    &[
+                        "--user",
+                        "--no-pager",
+                        "status",
+                        "org.freedesktop.portal.Desktop",
+                    ],
+                    None,
+                    false,
+                )
+                .map(|outcome| outcome.success)
+                .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+            if !available {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Shortcut,
+                    "desktop Global Shortcuts portal is unavailable",
+                ));
+            }
+            Err::<Box<dyn ShortcutSession>, _>(BoundaryError::new(
+                BoundaryKind::Shortcut,
+                "native Global Shortcuts session client is not yet wired into the daemon; \
+                 use the CLI to control Recording",
+            ))
+        })
+    }
+}
+
+/// Never constructed on the production path today (bind fails closed before a
+/// session exists), but kept so the trait's session shape has a real production
+/// type once the native portal client lands.
+pub struct FedoraShortcutSession {
+    binding: TriggerKeyBinding,
+}
+
+impl ShortcutSession for FedoraShortcutSession {
+    fn binding(&self) -> TriggerKeyBinding {
+        self.binding.clone()
+    }
+
+    fn next_activation(&mut self) -> BoundaryFuture<'_, Option<()>> {
+        Box::pin(async move { Ok(None) })
     }
 }
 

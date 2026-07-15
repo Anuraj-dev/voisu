@@ -232,6 +232,7 @@ fn parse_command() -> Result<CliAction, String> {
         [command] if command == "stop" => Ok(CliAction::Daemon(Command::Stop)),
         [command] if command == "toggle" => Ok(CliAction::Daemon(Command::Toggle)),
         [command] if command == "status" => Ok(CliAction::Daemon(Command::Status)),
+        [command] if command == "shortcut" => Ok(CliAction::Daemon(Command::Shortcut)),
         [command] if command == "history" => Ok(CliAction::Daemon(Command::History)),
         [command, correlation_id] if command == "export" => {
             Ok(CliAction::Daemon(Command::Export((*correlation_id).to_owned())))
@@ -262,7 +263,7 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: voisu <start|stop|toggle|status|history|export|replay|doctor|auth>\n\n  voisu history\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>"
+    "usage: voisu <start|stop|toggle|status|shortcut|history|export|replay|doctor|auth>\n\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>"
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {

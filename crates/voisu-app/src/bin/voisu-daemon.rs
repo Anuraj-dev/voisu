@@ -13,18 +13,19 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use voisu_app::system::{
-    CAPTURE_FINALIZE_DEADLINE, ClipboardDelivery, DeepgramProvider, GroqProvider,
-    MergeResultValidator, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture, RECONCILIATION_DEADLINE,
-    RECOVERY_ABORT_DEADLINE,
+    CAPTURE_FINALIZE_DEADLINE, ClipboardDelivery, DeepgramProvider, FedoraShortcutPortal,
+    GroqProvider, MergeResultValidator, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture,
+    RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
     CancelRegistry, CapturedAudio, Command, DaemonState, DeliveryAdapter, DiagnosticRecord,
     DiagnosticStore, LifecycleEvidence, LifecycleStage, MergeResult, PROTOCOL_VERSION, Provider,
     ProviderCoordinator, ProviderStream, ProviderStreams, ReconciliationKind, ReconciliationModel,
-    ReplayOutcome, Request, Response, RetentionPolicy, SourceTranscript, SourceTranscriptRecord,
-    Transcript, TranscriptDecision, TranscriptDecisionPipeline, TranscriptProvider,
-    TranscriptValidator, VersionEnvelope, replay_capture, socket_path,
+    ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, ShortcutSession,
+    SourceTranscript, SourceTranscriptRecord, Transcript, TranscriptDecision,
+    TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator, TriggerKeyBinding,
+    VersionEnvelope, replay_capture, socket_path,
 };
 
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
@@ -77,6 +78,17 @@ async fn run() -> Result<(), String> {
 
     let (actor_tx, actor_rx) = mpsc::channel(64);
     tokio::spawn(actor_loop(actor_rx, actor_tx.clone(), diagnostics));
+    // The Global Shortcuts portal listener runs off the actor so a slow or
+    // unavailable portal never blocks the IPC surface. Each Trigger Key
+    // activation is fed to the actor as a Toggle, reusing the actor's
+    // serialization so repeated or concurrent activations cannot overlap.
+    // Disabling it (VOISU_DISABLE_SHORTCUTS) keeps the daemon usable in
+    // sessions or tests that have no desktop portal.
+    if std::env::var_os("VOISU_DISABLE_SHORTCUTS").is_none() {
+        let controlled = std::env::var_os("VOISU_TEST_MODE").as_deref()
+            == Some(std::ffi::OsStr::new("controlled"));
+        tokio::spawn(shortcut_listener(actor_tx.clone(), controlled));
+    }
     let connections = std::sync::Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|error| format!("cannot listen for SIGTERM: {error}"))?;
@@ -207,6 +219,10 @@ enum ActorMessage {
     Completed(Completion),
     Recovered(u64),
     ReplayCompleted(ReplayCompletion),
+    /// The Global Shortcuts listener reports the desktop-approved Trigger Key
+    /// binding once (or `None` when the portal is unavailable or denied), so the
+    /// `Shortcut` command can display it. Binding never gates Recording control.
+    ShortcutBound(Option<TriggerKeyBinding>),
 }
 
 /// Ownership handed back once a fixture replay finishes: the provider and
@@ -320,6 +336,10 @@ async fn actor_loop(
     } else {
         Some(Box::new(ClipboardDelivery))
     };
+    // The desktop-approved Trigger Key binding, once the portal listener reports
+    // it. `None` means no Trigger Key is bound (portal unavailable or denied),
+    // which never prevents CLI Recording control.
+    let mut shortcut_binding: Option<TriggerKeyBinding> = None;
 
     while let Some(message) = rx.recv().await {
         match message {
@@ -327,6 +347,15 @@ async fn actor_loop(
                 Command::Status => {
                     let response = status_response(&state);
                     let _ = reply.send(response);
+                }
+                Command::Shortcut => {
+                    let message = match &shortcut_binding {
+                        Some(binding) => format!("Trigger Key: {}", binding.description),
+                        None => "No Trigger Key is bound; start, stop, and toggle \
+                                 remain available"
+                            .to_owned(),
+                    };
+                    let _ = reply.send(Response::success(state_label(&state), message));
                 }
                 Command::History => {
                     let records = diagnostics.history().unwrap_or_default();
@@ -602,6 +631,9 @@ async fn actor_loop(
                 if matches!(&state, ActorState::Recovering(recovering) if *recovering == id) {
                     state = ActorState::Idle;
                 }
+            }
+            ActorMessage::ShortcutBound(binding) => {
+                shortcut_binding = binding;
             }
             ActorMessage::ReplayCompleted(completed) => {
                 let ReplayCompletion {
@@ -1346,6 +1378,167 @@ async fn run_replay(
     replay_capture(CapturedAudio::new(bytes), coordinator, validator).await
 }
 
+/// Upper bound the listener waits for the actor's reply to one Toggle before
+/// it gives up on that activation and reads the next. It comfortably exceeds a
+/// full stop-and-process cycle; exceeding it means the actor is wedged, and the
+/// listener logs and moves on rather than blocking future activations forever.
+const SHORTCUT_TOGGLE_REPLY_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Binds the Trigger Key through the Global Shortcuts portal and turns each
+/// activation into a Toggle. Every failure path — an unavailable portal, denied
+/// or revoked permission, a portal restart, or a stream error — retires the
+/// listener quietly and leaves CLI start/stop/toggle fully usable.
+async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>, controlled: bool) {
+    let mut portal: Box<dyn ShortcutPortal> = if controlled {
+        Box::new(ControlledShortcutPortal::from_env())
+    } else {
+        Box::new(FedoraShortcutPortal::new())
+    };
+    let mut session = match portal.bind().await {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("Trigger Key binding is unavailable: {}", error.diagnostic());
+            let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
+            return;
+        }
+    };
+    if actor
+        .send(ActorMessage::ShortcutBound(Some(session.binding())))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    loop {
+        match session.next_activation().await {
+            Ok(Some(())) => {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                if actor
+                    .send(ActorMessage::Command(Command::Toggle, reply_tx))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                // Await the reply before reading the next activation: the actor
+                // already rejects overlapping Toggles, and processing them one
+                // at a time gives a natural debounce so a burst of activations
+                // cannot spawn overlapping Recordings or duplicate stop
+                // processing.
+                match timeout(SHORTCUT_TOGGLE_REPLY_DEADLINE, reply_rx).await {
+                    Ok(Ok(response)) => {
+                        eprintln!("Trigger Key activation: {}", response.message);
+                    }
+                    Ok(Err(_)) => return,
+                    Err(_) => {
+                        eprintln!("Trigger Key activation timed out awaiting the daemon");
+                    }
+                }
+            }
+            Ok(None) => {
+                eprintln!(
+                    "Trigger Key portal ended; start, stop, and toggle remain available"
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!(
+                    "Trigger Key activation stream failed: {}; start, stop, and toggle \
+                     remain available",
+                    error.diagnostic()
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// A controlled Global Shortcuts portal for `VOISU_TEST_MODE=controlled`.
+/// Binding is approved with `VOISU_TEST_SHORTCUT_BINDING` (default
+/// `"Super+Alt+V"`) unless `VOISU_TEST_SHORTCUT_DENY` is set, which fails the
+/// bind closed. Activations are driven by a test-owned channel file named by
+/// `VOISU_TEST_SHORTCUT_CHANNEL`: each newline-terminated token is one Trigger
+/// Key activation, and the token `end` ends the session (a revocation or portal
+/// restart). With no channel the session binds and idles.
+struct ControlledShortcutPortal {
+    deny: bool,
+    binding: TriggerKeyBinding,
+    channel: Option<PathBuf>,
+}
+
+impl ControlledShortcutPortal {
+    fn from_env() -> Self {
+        let binding = std::env::var("VOISU_TEST_SHORTCUT_BINDING")
+            .unwrap_or_else(|_| "Super+Alt+V".to_owned());
+        Self {
+            deny: std::env::var_os("VOISU_TEST_SHORTCUT_DENY").is_some(),
+            binding: TriggerKeyBinding::new(binding),
+            channel: std::env::var_os("VOISU_TEST_SHORTCUT_CHANNEL").map(PathBuf::from),
+        }
+    }
+}
+
+impl ShortcutPortal for ControlledShortcutPortal {
+    fn bind(&mut self) -> BoundaryFuture<'_, Box<dyn ShortcutSession>> {
+        let deny = self.deny;
+        let binding = self.binding.clone();
+        let channel = self.channel.clone();
+        Box::pin(async move {
+            if deny {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Shortcut,
+                    "controlled Global Shortcuts portal denied the Trigger Key",
+                ));
+            }
+            Ok(Box::new(ControlledShortcutSession {
+                binding,
+                channel,
+                consumed: 0,
+            }) as Box<dyn ShortcutSession>)
+        })
+    }
+}
+
+struct ControlledShortcutSession {
+    binding: TriggerKeyBinding,
+    channel: Option<PathBuf>,
+    consumed: usize,
+}
+
+impl ShortcutSession for ControlledShortcutSession {
+    fn binding(&self) -> TriggerKeyBinding {
+        self.binding.clone()
+    }
+
+    fn next_activation(&mut self) -> BoundaryFuture<'_, Option<()>> {
+        Box::pin(async move {
+            let Some(channel) = self.channel.clone() else {
+                // No channel: the session is bound but idle for the daemon's
+                // lifetime, exactly like a real portal with no activations yet.
+                std::future::pending::<()>().await;
+                unreachable!();
+            };
+            loop {
+                let tokens: Vec<String> = std::fs::read_to_string(&channel)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if self.consumed < tokens.len() {
+                    let token = tokens[self.consumed].clone();
+                    self.consumed += 1;
+                    if token == "end" {
+                        return Ok(None);
+                    }
+                    return Ok(Some(()));
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    }
+}
+
 async fn serve(stream: UnixStream, actor: mpsc::Sender<ActorMessage>) -> Result<(), String> {
     let (reader, mut writer) = stream.into_split();
     let mut request = String::new();
@@ -1395,6 +1588,7 @@ struct ControlledCapture {
     abort_stall: Duration,
     chunks: u32,
     chunk_delay: Duration,
+    deadline_after_chunks: Option<u32>,
 }
 
 fn env_millis(name: &str) -> Duration {
@@ -1419,6 +1613,9 @@ impl ControlledCapture {
             abort_stall: env_millis("VOISU_TEST_CAPTURE_ABORT_STALL_MS"),
             chunks,
             chunk_delay,
+            deadline_after_chunks: std::env::var("VOISU_TEST_DEADLINE_AFTER_CHUNKS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
         }
     }
 }
@@ -1434,6 +1631,8 @@ impl AudioCapture for ControlledCapture {
             abort_stall: self.abort_stall,
             remaining_chunks: self.chunks,
             chunk_delay: self.chunk_delay,
+            deadline_after_chunks: self.deadline_after_chunks,
+            chunks_emitted: 0,
         }))
     }
 }
@@ -1445,16 +1644,31 @@ struct ControlledActiveCapture {
     abort_stall: Duration,
     remaining_chunks: u32,
     chunk_delay: Duration,
+    deadline_after_chunks: Option<u32>,
+    chunks_emitted: u32,
 }
 
 impl ActiveCapture for ControlledActiveCapture {
     fn next_chunk(&mut self) -> BoundaryFuture<'_, Option<AudioChunk>> {
         Box::pin(async move {
+            // The Recording Deadline is enforced on the next-chunk poll, exactly
+            // like the real PipeWire capture: once the configured number of
+            // chunks has streamed, a forgotten Recording stops itself with a
+            // RecordingDeadline boundary instead of running forever.
+            if let Some(limit) = self.deadline_after_chunks
+                && self.chunks_emitted >= limit
+            {
+                return Err(BoundaryError::new(
+                    BoundaryKind::RecordingDeadline,
+                    "controlled Recording Deadline elapsed",
+                ));
+            }
             if self.remaining_chunks == 0 {
                 std::future::pending::<()>().await;
                 unreachable!();
             }
             self.remaining_chunks -= 1;
+            self.chunks_emitted += 1;
             if !self.chunk_delay.is_zero() {
                 tokio::time::sleep(self.chunk_delay).await;
             }

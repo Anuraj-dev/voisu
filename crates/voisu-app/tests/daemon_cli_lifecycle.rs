@@ -2626,6 +2626,233 @@ fn toggle_has_the_same_observable_transitions_as_start_then_stop() {
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 }
 
+fn activate_trigger_key(channel: &Path) {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(channel)
+        .expect("shortcut channel should be writable");
+    file.write_all(b"1\n").expect("activation should be recorded");
+}
+
+fn end_trigger_key_portal(channel: &Path) {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(channel)
+        .expect("shortcut channel should be writable");
+    file.write_all(b"end\n").expect("portal end should be recorded");
+}
+
+fn wait_for_status(runtime_dir: &Path, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let status = stdout(&voisu(runtime_dir, "status"));
+        if status == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "status never became {expected:?}; last was {status:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_shortcut(runtime_dir: &Path, expected: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let shortcut = stdout(&voisu(runtime_dir, "shortcut"));
+        if shortcut == expected {
+            return shortcut;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "shortcut never became {expected:?}; last was {shortcut:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn shortcut_setup_displays_the_desktop_approved_trigger_key_binding() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_SHORTCUT_BINDING", "Super+Alt+V")],
+    );
+
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+}
+
+#[test]
+fn trigger_key_first_activation_starts_and_next_activation_stops_the_recording() {
+    let runtime = TempDir::new().unwrap();
+    let channel = runtime.path().join("shortcut.channel");
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[(
+            "VOISU_TEST_SHORTCUT_CHANNEL",
+            channel.to_str().unwrap(),
+        )],
+    );
+    // The portal must bind before activations mean anything.
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    activate_trigger_key(&channel);
+    wait_for_status(runtime.path(), "Recording\n");
+
+    activate_trigger_key(&channel);
+    wait_for_status(runtime.path(), "idle\n");
+
+    // The Recording that the Trigger Key drove delivered exactly once.
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let records = history["history"].as_array().expect("history is a list");
+    assert_eq!(records.len(), 1, "{history}");
+    assert_eq!(records[0]["delivery_count"], 1, "{history}");
+    assert!(records[0]["error"].is_null(), "{history}");
+}
+
+#[test]
+fn concurrent_trigger_key_activations_cannot_overlap_recordings() {
+    let runtime = TempDir::new().unwrap();
+    let channel = runtime.path().join("shortcut.channel");
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[(
+            "VOISU_TEST_SHORTCUT_CHANNEL",
+            channel.to_str().unwrap(),
+        )],
+    );
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    // Four activations delivered as one burst: the daemon must pair them
+    // deterministically into start/stop/start/stop — two complete Recordings,
+    // never two overlapping ones or a duplicated stop.
+    for _ in 0..4 {
+        activate_trigger_key(&channel);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        let records = history["history"].as_array().unwrap();
+        if records.len() == 2
+            && records.iter().all(|record| record["delivery_count"] == 1)
+            && stdout(&voisu(runtime.path(), "status")) == "idle\n"
+        {
+            return;
+        }
+        assert!(
+            records.len() <= 2,
+            "activations produced more than two Recordings: {history}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the burst of activations never settled into two Recordings: {history}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
+    let runtime = TempDir::new().unwrap();
+    let channel = runtime.path().join("shortcut.channel");
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_SHORTCUT_CHANNEL", channel.to_str().unwrap()),
+            ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
+            ("VOISU_TEST_DEADLINE_AFTER_CHUNKS", "2"),
+        ],
+    );
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    // One activation starts a Recording; the user then forgets the second
+    // activation. The Recording Deadline must stop it on its own and record why.
+    activate_trigger_key(&channel);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        let records = history["history"].as_array().expect("history is a list");
+        if records.len() == 1 {
+            assert_eq!(records[0]["error"], "Recording Deadline elapsed", "{history}");
+            break;
+        }
+        assert!(records.len() <= 1, "the forgotten toggle produced extra Recordings: {history}");
+        assert!(
+            Instant::now() < deadline,
+            "the Recording Deadline never stopped the forgotten Recording: {history}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_status(runtime.path(), "idle\n");
+
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains("controlled Recording Deadline elapsed"),
+        "{diagnostics}"
+    );
+}
+
+#[test]
+fn trigger_key_permission_denial_leaves_cli_control_usable() {
+    let runtime = TempDir::new().unwrap();
+    let daemon =
+        Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_SHORTCUT_DENY", "1")]);
+
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "shortcut")),
+        "No Trigger Key is bound; start, stop, and toggle remain available\n"
+    );
+
+    // CLI Recording control is fully usable despite the denied portal.
+    assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "toggle")),
+        "Recording completed; Transcript delivered\n"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains("Trigger Key binding is unavailable"),
+        "{diagnostics}"
+    );
+}
+
+#[test]
+fn trigger_key_portal_revocation_leaves_cli_control_usable() {
+    let runtime = TempDir::new().unwrap();
+    let channel = runtime.path().join("shortcut.channel");
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[(
+            "VOISU_TEST_SHORTCUT_CHANNEL",
+            channel.to_str().unwrap(),
+        )],
+    );
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    // The portal is revoked / restarts: the listener retires, but the daemon
+    // stays responsive and CLI start/stop/toggle keep working.
+    end_trigger_key_portal(&channel);
+
+    assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
+    wait_for_status(runtime.path(), "Recording\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "toggle")),
+        "Recording completed; Transcript delivered\n"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(diagnostics.contains("Trigger Key portal ended"), "{diagnostics}");
+}
+
 #[test]
 fn injected_xdg_runtime_dirs_are_isolated() {
     let active_runtime = TempDir::new().unwrap();

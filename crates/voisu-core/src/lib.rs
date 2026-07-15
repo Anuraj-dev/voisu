@@ -62,6 +62,9 @@ pub enum Command {
     Stop,
     Toggle,
     Status,
+    /// Returns the desktop-approved Trigger Key binding for display, or a
+    /// notice that no Trigger Key is bound. Never blocks CLI start/stop/toggle.
+    Shortcut,
     /// Returns the retained local diagnostic history (newest first).
     History,
     /// Returns a redacted, self-contained diagnostic export for one correlation ID.
@@ -216,6 +219,7 @@ pub enum BoundaryKind {
     Delivery,
     SecretStorage,
     ProviderAuthentication,
+    Shortcut,
 }
 
 #[derive(Debug)]
@@ -269,6 +273,7 @@ impl BoundaryError {
                 "Secret storage is unavailable; set VOISU_GROQ_API_KEY or VOISU_DEEPGRAM_API_KEY for development or headless use"
             }
             BoundaryKind::ProviderAuthentication => "Provider authentication failed",
+            BoundaryKind::Shortcut => "Trigger Key binding is unavailable",
         }
     }
 
@@ -1120,4 +1125,46 @@ impl<M: ReconciliationModel> TranscriptValidator for TranscriptDecisionPipeline<
 
 pub trait DeliveryAdapter: Send {
     fn deliver(&mut self, transcript: Transcript) -> BoundaryFuture<'_, ()>;
+}
+
+/// The desktop-approved Trigger Key binding, surfaced to the user during setup.
+/// `description` is a display string (for example `"Super+Alt+V"`) obtained from
+/// the Global Shortcuts portal; it is never a secret and never a device path.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TriggerKeyBinding {
+    pub description: String,
+}
+
+impl TriggerKeyBinding {
+    pub fn new(description: impl Into<String>) -> Self {
+        Self {
+            description: description.into(),
+        }
+    }
+}
+
+/// Boundary for the desktop Global Shortcuts portal
+/// (`org.freedesktop.portal.GlobalShortcuts`). Production binds the Trigger Key
+/// through the portal so Voisu never touches raw input devices; tests inject a
+/// controlled portal that replays desktop responses. Binding MUST fail closed:
+/// an unavailable portal or a denied permission returns a `Shortcut` boundary
+/// error rather than a fabricated binding, and the daemon keeps CLI
+/// start/stop/toggle usable regardless.
+pub trait ShortcutPortal: Send {
+    fn bind(&mut self) -> BoundaryFuture<'_, Box<dyn ShortcutSession>>;
+}
+
+/// A live Global Shortcuts session that yields Trigger Key activations. The
+/// session owns whatever portal subscription it created and surrenders it when
+/// dropped.
+pub trait ShortcutSession: Send {
+    /// The desktop-approved binding for display during setup.
+    fn binding(&self) -> TriggerKeyBinding;
+
+    /// Awaits the next Trigger Key activation. Returns `None` once the portal
+    /// edge ends — permission revoked, portal restarted, or the session
+    /// otherwise closed — so the listener can retire without disturbing the IPC
+    /// surface. A `Shortcut` boundary error signals a transient stream failure
+    /// the listener also treats as end-of-stream.
+    fn next_activation(&mut self) -> BoundaryFuture<'_, Option<()>>;
 }
