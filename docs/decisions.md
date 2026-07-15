@@ -124,3 +124,10 @@ so Voisu consistently owns Provider Deadline classification and cleanup instead 
 pipe-drain threads. Deepgram queues request tasks behind a three-permit semaphore, so audio ingestion stays live while at
 most three tasks can own curl processes. Completion awaits the queued handles in creation order, preserving every
 non-overlapping audio chunk and transcript order. Coalescing was rejected because it would change request boundaries.
+
+## 2026-07-16 — Keep Transcript reconciliation and recovery behind one bounded decision boundary
+**Why:** Near-identical Source Transcripts should avoid cloud latency, while material disagreement benefits from a
+configured Groq Merge Result. The validator boundary now owns deterministic selection, a 3s reconciliation deadline,
+candidate guardrails, at most one repair, and clean-source fallback before returning one Transcript to Delivery. The
+curl child has its own shorter 2s owning deadline, so dropping the outer future cannot leave indefinite work behind;
+delivering a first candidate and correcting it later was rejected because it violates exactly-once Delivery.

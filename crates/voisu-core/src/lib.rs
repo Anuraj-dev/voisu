@@ -112,6 +112,16 @@ pub struct LifecycleEvidence {
     pub provider_timings_ms: Vec<ProviderTiming>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_to_text_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_selection: Option<TranscriptSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    #[serde(default)]
+    pub reconciliation_requested: bool,
+    #[serde(default)]
+    pub recovery_attempted: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -173,6 +183,15 @@ pub enum BoundaryKind {
 pub struct BoundaryError {
     kind: BoundaryKind,
     diagnostic: String,
+    transcript_failure: Option<TranscriptFailureEvidence>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TranscriptFailureEvidence {
+    pub validation_reason: String,
+    pub fallback_reason: Option<String>,
+    pub reconciliation_requested: bool,
+    pub recovery_attempted: bool,
 }
 
 impl BoundaryError {
@@ -180,7 +199,17 @@ impl BoundaryError {
         Self {
             kind,
             diagnostic: diagnostic.into(),
+            transcript_failure: None,
         }
+    }
+
+    pub fn with_transcript_failure(mut self, evidence: TranscriptFailureEvidence) -> Self {
+        self.transcript_failure = Some(evidence);
+        self
+    }
+
+    pub fn transcript_failure(&self) -> Option<&TranscriptFailureEvidence> {
+        self.transcript_failure.as_ref()
     }
 
     pub fn kind(&self) -> BoundaryKind {
@@ -360,6 +389,364 @@ pub struct SourceTranscript {
 
 #[derive(Debug)]
 pub struct Transcript(pub String);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeResult(pub String);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconciliationKind {
+    Reconcile,
+    Repair,
+}
+
+pub trait ReconciliationModel: Send {
+    fn request(
+        &mut self,
+        kind: ReconciliationKind,
+        sources: Vec<SourceTranscript>,
+        candidate: Option<MergeResult>,
+    ) -> BoundaryFuture<'_, MergeResult>;
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptSelection {
+    NearIdenticalGroq,
+    Reconciled,
+    Repaired,
+    SourceDeepgram,
+    SourceGroq,
+}
+
+#[derive(Debug)]
+pub struct TranscriptDecision {
+    pub transcript: Transcript,
+    pub selection: TranscriptSelection,
+    pub validation_reason: String,
+    pub fallback_reason: Option<String>,
+    pub reconciliation_requested: bool,
+    pub recovery_attempted: bool,
+}
+
+pub struct TranscriptDecisionPipeline<M> {
+    model: M,
+    deadline: Duration,
+}
+
+impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
+    pub fn new(model: M, deadline: Duration) -> Self {
+        Self { model, deadline }
+    }
+
+    pub async fn decide(
+        &mut self,
+        mut sources: Vec<SourceTranscript>,
+    ) -> Result<TranscriptDecision, BoundaryError> {
+        sources.sort_by_key(|source| source.provider);
+        if let (Some(deepgram), Some(groq)) = (
+            sources.iter().find(|source| source.provider == Provider::Deepgram),
+            sources.iter().find(|source| source.provider == Provider::Groq),
+        ) {
+            if source_similarity(&deepgram.text, &groq.text) >= 0.85 {
+                if let Some(reason) = quality_failure_reason(&groq.text, &sources) {
+                    return self
+                        .repair_candidate(
+                            &sources,
+                            MergeResult(groq.text.trim().to_owned()),
+                            reason,
+                            false,
+                        )
+                        .await;
+                }
+                return Ok(TranscriptDecision {
+                    transcript: Transcript(groq.text.trim().to_owned()),
+                    selection: TranscriptSelection::NearIdenticalGroq,
+                    validation_reason: "near-identical Source Transcripts passed validation"
+                        .to_owned(),
+                    fallback_reason: None,
+                    reconciliation_requested: false,
+                    recovery_attempted: false,
+                });
+            }
+
+            let merge_result = match tokio::time::timeout(
+                self.deadline,
+                self.model
+                    .request(ReconciliationKind::Reconcile, sources.clone(), None),
+            )
+            .await
+            {
+                Ok(Ok(merge_result)) => merge_result,
+                Ok(Err(error)) => {
+                    return clean_source_fallback(
+                        &sources,
+                        format!("cloud reconciliation failed: {}", error.diagnostic()),
+                        true,
+                        false,
+                    );
+                }
+                Err(_) => {
+                    return clean_source_fallback(
+                        &sources,
+                        "cloud reconciliation deadline elapsed".to_owned(),
+                        true,
+                        false,
+                    );
+                }
+            };
+            if let Some(reason) = quality_failure_reason(&merge_result.0, &sources) {
+                return self
+                    .repair_candidate(&sources, merge_result, reason, true)
+                    .await;
+            }
+            return Ok(TranscriptDecision {
+                transcript: Transcript(merge_result.0.trim().to_owned()),
+                selection: TranscriptSelection::Reconciled,
+                validation_reason: "Merge Result passed validation".to_owned(),
+                fallback_reason: None,
+                reconciliation_requested: true,
+                recovery_attempted: false,
+            });
+        }
+
+        let source = sources.first().ok_or_else(|| {
+            BoundaryError::new(BoundaryKind::Validation, "no Source Transcript")
+        })?;
+        if let Some(reason) = quality_failure_reason(&source.text, &sources) {
+            return self
+                .repair_candidate(
+                    &sources,
+                    MergeResult(source.text.trim().to_owned()),
+                    reason,
+                    false,
+                )
+                .await;
+        }
+        Ok(TranscriptDecision {
+            transcript: Transcript(source.text.trim().to_owned()),
+            selection: match source.provider {
+                Provider::Deepgram => TranscriptSelection::SourceDeepgram,
+                Provider::Groq => TranscriptSelection::SourceGroq,
+            },
+            validation_reason: "Source Transcript passed validation".to_owned(),
+            fallback_reason: None,
+            reconciliation_requested: false,
+            recovery_attempted: false,
+        })
+    }
+
+    async fn repair_candidate(
+        &mut self,
+        sources: &[SourceTranscript],
+        candidate: MergeResult,
+        reason: &'static str,
+        reconciliation_requested: bool,
+    ) -> Result<TranscriptDecision, BoundaryError> {
+        let repaired = match tokio::time::timeout(
+            self.deadline,
+            self.model.request(
+                ReconciliationKind::Repair,
+                sources.to_vec(),
+                Some(candidate),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(repaired)) => repaired,
+            Ok(Err(error)) => {
+                return clean_source_fallback(
+                    sources,
+                    format!("recovery failed: {}", error.diagnostic()),
+                    reconciliation_requested,
+                    true,
+                );
+            }
+            Err(_) => {
+                return clean_source_fallback(
+                    sources,
+                    "recovery deadline elapsed".to_owned(),
+                    reconciliation_requested,
+                    true,
+                );
+            }
+        };
+        if let Some(repair_reason) = quality_failure_reason(&repaired.0, sources) {
+            return clean_source_fallback(
+                sources,
+                format!("recovery produced {repair_reason}"),
+                reconciliation_requested,
+                true,
+            );
+        }
+        Ok(TranscriptDecision {
+            transcript: Transcript(repaired.0.trim().to_owned()),
+            selection: TranscriptSelection::Repaired,
+            validation_reason: format!("repaired {reason}"),
+            fallback_reason: None,
+            reconciliation_requested,
+            recovery_attempted: true,
+        })
+    }
+}
+
+fn clean_source_fallback(
+    sources: &[SourceTranscript],
+    reason: String,
+    reconciliation_requested: bool,
+    recovery_attempted: bool,
+) -> Result<TranscriptDecision, BoundaryError> {
+    let source = sources
+        .iter()
+        .filter(|source| quality_failure_reason(&source.text, std::slice::from_ref(*source)).is_none())
+        .max_by_key(|source| source.provider)
+        .ok_or_else(|| {
+            let validation_reason = format!("{reason}; neither Source Transcript is safe");
+            BoundaryError::new(
+                BoundaryKind::Validation,
+                validation_reason.clone(),
+            )
+            .with_transcript_failure(TranscriptFailureEvidence {
+                validation_reason,
+                fallback_reason: Some(reason.clone()),
+                reconciliation_requested,
+                recovery_attempted,
+            })
+        })?;
+    Ok(TranscriptDecision {
+        transcript: Transcript(source.text.trim().to_owned()),
+        selection: match source.provider {
+            Provider::Deepgram => TranscriptSelection::SourceDeepgram,
+            Provider::Groq => TranscriptSelection::SourceGroq,
+        },
+        validation_reason: "clean Source Transcript passed validation".to_owned(),
+        fallback_reason: Some(reason),
+        reconciliation_requested,
+        recovery_attempted,
+    })
+}
+
+fn source_similarity(left: &str, right: &str) -> f64 {
+    let left = normalized_words(left);
+    let right = normalized_words(right);
+    let longest = left.len().max(right.len());
+    if longest == 0 {
+        return 1.0;
+    }
+    1.0 - word_edit_distance(&left, &right) as f64 / longest as f64
+}
+
+fn quality_failure_reason(
+    candidate: &str,
+    sources: &[SourceTranscript],
+) -> Option<&'static str> {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') || trimmed.len() > 100_000 {
+        return Some("invalid candidate text");
+    }
+    let lower = trimmed.to_lowercase();
+    const PROMPT_ARTIFACTS: [&str; 8] = [
+        "ignore previous instructions",
+        "ignore all instructions",
+        "system prompt",
+        "system:",
+        "assistant:",
+        "<|system|>",
+        "<|assistant|>",
+        "### instruction",
+    ];
+    if PROMPT_ARTIFACTS
+        .iter()
+        .any(|artifact| lower.contains(artifact))
+    {
+        return Some("prompt artifact");
+    }
+    const META_REASONING: [&str; 6] = [
+        "i think the user said",
+        "the user said",
+        "my final answer",
+        "here is the transcript",
+        "here is the reconciled",
+        "based on the source",
+    ];
+    if META_REASONING.iter().any(|artifact| lower.contains(artifact)) {
+        return Some("meta-reasoning");
+    }
+    const HALLUCINATED_SUFFIXES: [&str; 5] = [
+        "thank you for watching",
+        "thanks for watching",
+        "like and subscribe",
+        "subtitles by",
+        "transcribed by",
+    ];
+    if HALLUCINATED_SUFFIXES
+        .iter()
+        .any(|suffix| lower.contains(suffix))
+    {
+        return Some("hallucinated suffix");
+    }
+    if script_count(trimmed) >= 3 {
+        return Some("mixed-script garbage");
+    }
+    let source_words = sources
+        .iter()
+        .map(|source| normalized_words(&source.text).len())
+        .max()
+        .unwrap_or(0);
+    let candidate_words = normalized_words(trimmed).len();
+    if source_words > 0 && candidate_words > source_words.saturating_mul(2).saturating_add(8) {
+        return Some("suspicious expansion");
+    }
+    None
+}
+
+fn script_count(text: &str) -> usize {
+    let mut scripts = [false; 7];
+    for character in text.chars().filter(|character| character.is_alphabetic()) {
+        let code = character as u32;
+        let index = match code {
+            0x0041..=0x024f => 0, // Latin and Latin extensions
+            0x0370..=0x03ff => 1, // Greek
+            0x0400..=0x052f => 2, // Cyrillic
+            0x0600..=0x06ff => 3, // Arabic
+            0x0900..=0x097f => 4, // Devanagari
+            0x3040..=0x30ff | 0x3400..=0x9fff => 5, // Japanese/CJK
+            _ => 6,
+        };
+        scripts[index] = true;
+    }
+    scripts.into_iter().filter(|present| *present).count()
+}
+
+fn normalized_words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|word| {
+            word.chars()
+                .filter(|character| character.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn word_edit_distance(left: &[String], right: &[String]) -> usize {
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_word) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_word) in right.iter().enumerate() {
+            current[right_index + 1] = if left_word == right_word {
+                previous[right_index]
+            } else {
+                1 + previous[right_index]
+                    .min(current[right_index])
+                    .min(previous[right_index + 1])
+            };
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
 
 pub trait AudioCapture: Send {
     fn begin(&mut self, recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError>;
@@ -557,7 +944,16 @@ pub trait TranscriptValidator: Send {
     fn validate(
         &mut self,
         sources: Vec<SourceTranscript>,
-    ) -> Result<Transcript, BoundaryError>;
+    ) -> BoundaryFuture<'_, TranscriptDecision>;
+}
+
+impl<M: ReconciliationModel> TranscriptValidator for TranscriptDecisionPipeline<M> {
+    fn validate(
+        &mut self,
+        sources: Vec<SourceTranscript>,
+    ) -> BoundaryFuture<'_, TranscriptDecision> {
+        Box::pin(async move { self.decide(sources).await })
+    }
 }
 
 pub trait DeliveryAdapter: Send {

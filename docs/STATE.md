@@ -2,8 +2,8 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-16
 
 ## 🚧 In progress / next
-- Ticket 04 (issue #4) is APPROVED and closed. Next up: dispatch Ticket 05 (reconcile + guard Transcript) —
-  Sol medium implementation (architectural: reconciliation), first review Sol high per the pinned routing.
+- Ticket 05 (issue #5) is implemented but uncommitted. Next: run the full workspace/acceptance gate outside the
+  managed sandbox (Unix socket binds are denied here), then first Sol review at high effort and orchestrator commit.
 - Follow-up issue #14 filed: make `DeepgramStream::abort` / `GroqStream::abort` cancellation-safe
   (drain→peek-then-pop) plus an abort-deadline regression test. Not blocking Ticket 05 but should be picked
   up soon.
@@ -21,6 +21,10 @@
 - Provider completion is deterministic and exactly-once; completion futures retain spawned request handles until each
   await finishes, so a deadline loser remains owned for cancellation, kill, reap, and awaited cleanup before `Idle`.
   Deepgram completion errors also cancel and await every later retained chunk handle before publishing `Idle`.
+- A bounded Transcript decision pipeline selects near-identical Groq text deterministically, invokes a configured Groq
+  reconciliation model only for material disagreement, blocks prompt/meta/suffix/mixed-script/expansion artifacts,
+  permits one bounded repair, and otherwise falls back to a clean Source Transcript or reports a Quality Failure.
+  IPC evidence records selection, validation, fallback, reconciliation, recovery, and exactly-once Delivery outcomes.
   Structured IPC evidence reports first chunk, capture finalization, per-provider completion, accepted providers,
   release-to-text timing, and Delivery count.
 - Capture/provider failure and capture EOF return the daemon to idle; Deepgram and Groq cancellation use the
@@ -29,15 +33,16 @@
   Drop guard kills the whole tree, and all generated shell stubs have signal/exit traps plus bounded wait loops.
 - CI is live: `.github/workflows/ci.yml` runs the workspace suite plus a 3x-parallel voisu-app flake gate on every
   push/PR; green on all commits pushed so far.
-- Test count: 76 (67 voisu-app acceptance + 3 unit + 6 voisu-core), 1 ignored live smoke.
+- Test inventory: 92 (74 voisu-app acceptance including 1 ignored live smoke, 3 app unit, 6 provider-coordination,
+  9 Transcript-decision). All binaries compile; 15 core + 3 app unit tests pass in the managed sandbox.
 
 ## Architecture map
-- Domain, audio contract, provider coordination/timings, typed errors, readiness/auth traits, IPC ->
+- Domain, audio contract, provider coordination/timings, Transcript decision pipeline/guardrails, typed errors, IPC ->
   `crates/voisu-core/src/lib.rs`
 - Lifecycle actor, secure socket ownership, Recording pump, Provider Deadline evidence, controlled test adapters ->
   `crates/voisu-app/src/bin/voisu-daemon.rs`
 - Thin public CLI and command-specific bounded response waits -> `crates/voisu-app/src/bin/voisu.rs`
-- Hardened PipeWire, Deepgram/Groq HTTP, clipboard, readiness, Secret Service, and process adapters ->
+- Hardened PipeWire, Deepgram/Groq HTTP, bounded Groq reconciliation, clipboard, readiness, Secret Service, and process adapters ->
   `crates/voisu-app/src/system.rs`
 - Public daemon/CLI acceptance suite, PATH stubs, local Groq server, live smoke ->
   `crates/voisu-app/tests/daemon_cli_lifecycle.rs`
@@ -56,6 +61,8 @@
   results are concatenated in chunk order, while Groq retains overlap-removal for its overlapping audio chunks.
 - The 15-second Provider Deadline is shared across both completions; valid sources are attributed and sorted, and one
   available Source Transcript proceeds only after any late provider's bounded awaited cleanup completes.
+- Near-identical text uses token edit similarity and deterministic Groq selection; material differences use a bounded
+  cloud Merge Result. Every candidate is guarded, with at most one bounded repair and clean-source fallback.
 - Recovery remains a first-class actor state; cancellation is an `AtomicBool` observed by the wait loop owning `Child`,
   never a raw-PID signal.
 - Routing update (2026-07-16): Opus 4.8 subagents (medium/high effort) are now the workhorse for regular
@@ -65,5 +72,7 @@
 ## Gotchas
 - Use CONTEXT.md's ubiquitous language exactly; it lists banned synonyms.
 - `rustfmt` and `clippy` are unavailable (`sudo dnf install rustfmt clippy` needed); both remain skipped.
+- This managed sandbox denies Unix-domain socket binds with `EPERM`; daemon acceptance tests compile but must run in
+  the orchestrator/host gate.
 - A stale git stash ("partial edits from killed codex leak-fix run") and an older one ("partial review-fix from
   killed codex run") both remain on the stack — superseded by the merged fixes; safe to drop.

@@ -12,8 +12,10 @@ use voisu_core::{
     socket_path, ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture,
     BoundaryKind, CapturedAudio, Command as DaemonCommand, Credential, DeliveryAdapter, Provider,
     ProviderAuthenticator, ProviderStream, ReadinessCapability, ReadinessFinding,
-    ReadinessInspector, ReadinessStatus, Request, Response, SecretStore, SourceTranscript,
-    Transcript, TranscriptProvider, TranscriptValidator, VersionEnvelope, PROTOCOL_VERSION,
+    MergeResult, ReadinessInspector, ReadinessStatus, ReconciliationKind, ReconciliationModel,
+    Request, Response, SecretStore, SourceTranscript, Transcript, TranscriptDecision,
+    TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator, VersionEnvelope,
+    PROTOCOL_VERSION,
 };
 
 const PROCESS_DEADLINE: Duration = Duration::from_secs(2);
@@ -23,11 +25,13 @@ pub const CLIPBOARD_DELIVERY_DEADLINE: Duration = PROCESS_DEADLINE;
 /// Grace granted to the bounded capture/provider aborts that run when a
 /// Recording fails or a partial start is rolled back.
 pub const RECOVERY_ABORT_DEADLINE: Duration = PROCESS_DEADLINE;
+pub const RECONCILIATION_DEADLINE: Duration = Duration::from_secs(3);
 pub const PROCESSING_RESPONSE_DEADLINE: Duration = Duration::from_secs(
     CAPTURE_FINALIZE_DEADLINE.as_secs()
         + PROVIDER_COMPLETION_DEADLINE.as_secs()
         + CLIPBOARD_DELIVERY_DEADLINE.as_secs()
         + RECOVERY_ABORT_DEADLINE.as_secs()
+        + RECONCILIATION_DEADLINE.as_secs() * 2
         + 1,
 );
 const PROCESS_POLL: Duration = Duration::from_millis(10);
@@ -35,6 +39,7 @@ const MAX_DAEMON_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_RETAINED_STDERR_BYTES: usize = 4 * 1024;
 const MAX_RETAINED_STDOUT_BYTES: usize = 64 * 1024;
 const PROVIDER_PROCESS_DEADLINE: Duration = Duration::from_secs(14);
+const RECONCILIATION_PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 const PCM_CHUNK_BYTES: usize = 3_200;
 const MIN_RECORDING_BYTES: usize = PCM_CHUNK_BYTES;
 const MAX_RECORDING_BYTES: usize = 16_000 * 2 * 60 * 5;
@@ -1309,35 +1314,160 @@ async fn await_deepgram_chunk(
     })?
 }
 
-pub struct MergeResultValidator;
+pub struct MergeResultValidator {
+    pipeline: TranscriptDecisionPipeline<GroqReconciliationModel>,
+}
+
+impl MergeResultValidator {
+    pub fn new() -> Self {
+        Self {
+            pipeline: TranscriptDecisionPipeline::new(
+                GroqReconciliationModel,
+                RECONCILIATION_DEADLINE,
+            ),
+        }
+    }
+}
+
+impl Default for MergeResultValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl TranscriptValidator for MergeResultValidator {
     fn validate(
         &mut self,
         sources: Vec<SourceTranscript>,
-    ) -> Result<Transcript, BoundaryError> {
-        let mut valid: Vec<_> = sources
-            .into_iter()
-            .filter_map(|source| {
-                let text = source.text.trim();
-                (!text.is_empty() && !text.contains('\0') && text.len() <= 100_000)
-                    .then(|| (source.provider, text.to_owned()))
-            })
-            .collect();
-        valid.sort_by_key(|(provider, _)| *provider);
-        let text = valid
-            .iter()
-            .find(|(provider, _)| *provider == Provider::Groq)
-            .or_else(|| valid.first())
-            .map(|(_, text)| text.clone())
-            .ok_or_else(|| {
-                BoundaryError::new(
-                    BoundaryKind::Validation,
-                    "Source Transcripts violated the Merge Result guardrails",
-                )
-            })?;
-        Ok(Transcript(text))
+    ) -> BoundaryFuture<'_, TranscriptDecision> {
+        self.pipeline.validate(sources)
     }
+}
+
+struct GroqReconciliationModel;
+
+impl ReconciliationModel for GroqReconciliationModel {
+    fn request(
+        &mut self,
+        kind: ReconciliationKind,
+        sources: Vec<SourceTranscript>,
+        candidate: Option<MergeResult>,
+    ) -> BoundaryFuture<'_, MergeResult> {
+        Box::pin(async move {
+            let credential = SecretStore::load(&mut SecretToolStore, Provider::Groq)?;
+            tokio::task::spawn_blocking(move || {
+                request_groq_reconciliation(credential, kind, sources, candidate)
+            })
+            .await
+            .map_err(|_| {
+                BoundaryError::new(BoundaryKind::Validation, "reconciliation request task failed")
+            })?
+        })
+    }
+}
+
+fn request_groq_reconciliation(
+    credential: Credential,
+    kind: ReconciliationKind,
+    sources: Vec<SourceTranscript>,
+    candidate: Option<MergeResult>,
+) -> Result<MergeResult, BoundaryError> {
+    let endpoint = std::env::var("VOISU_GROQ_RECONCILIATION_URL")
+        .unwrap_or_else(|_| "https://api.groq.com/openai/v1/chat/completions".to_owned());
+    if !provider_endpoint_is_secure(&endpoint) {
+        return Err(BoundaryError::new(
+            BoundaryKind::Validation,
+            "Groq reconciliation endpoint must use HTTPS except on loopback",
+        ));
+    }
+    let model = std::env::var("VOISU_GROQ_RECONCILIATION_MODEL")
+        .unwrap_or_else(|_| "llama-3.3-70b-versatile".to_owned());
+    if model.trim().is_empty() || model.contains(['\n', '\r']) {
+        return Err(BoundaryError::new(
+            BoundaryKind::Validation,
+            "invalid Groq reconciliation model",
+        ));
+    }
+    let source_text = sources
+        .iter()
+        .map(|source| format!("{}: {}", source.provider.cli_label(), source.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let task = match (kind, candidate) {
+        (ReconciliationKind::Reconcile, _) => format!(
+            "Reconcile these Source Transcripts. Return only the faithful final Transcript, with no labels, explanation, or added content.\n{source_text}"
+        ),
+        (ReconciliationKind::Repair, Some(candidate)) => format!(
+            "Repair this unsafe candidate using only the Source Transcripts. Return only the faithful final Transcript, with no labels, explanation, or added content.\nCandidate: {}\n{source_text}",
+            candidate.0
+        ),
+        (ReconciliationKind::Repair, None) => {
+            return Err(BoundaryError::new(
+                BoundaryKind::Validation,
+                "reconciliation recovery omitted its candidate",
+            ));
+        }
+    };
+    let body = serde_json::json!({
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are Voisu's Transcript reconciliation model. Preserve spoken meaning and never add commentary, prompt text, or facts."
+            },
+            { "role": "user", "content": task }
+        ]
+    })
+    .to_string();
+    let config = format!(
+        "url = \"{}\"\nheader = \"Authorization: Bearer {}\"\nheader = \"Content-Type: application/json\"\ndata = \"{}\"\n",
+        curl_config_escape(&endpoint),
+        curl_config_escape(credential.expose_to_boundary()),
+        curl_config_escape(&body),
+    );
+    let outcome = run_restricted_with_deadline(
+        "curl",
+        &[
+            "-q",
+            "--config",
+            "-",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "2",
+        ],
+        Some(config.as_bytes()),
+        true,
+        RECONCILIATION_PROCESS_DEADLINE,
+        None,
+    )
+    .map_err(|error| match error {
+        ProcessError::TimedOut => {
+            BoundaryError::new(BoundaryKind::Validation, "reconciliation request deadline elapsed")
+        }
+        _ => BoundaryError::new(
+            BoundaryKind::Validation,
+            "Groq reconciliation request unavailable or failed",
+        ),
+    })?;
+    if !outcome.success {
+        return Err(BoundaryError::new(
+            BoundaryKind::Validation,
+            "Groq rejected the reconciliation request",
+        ));
+    }
+    let response: serde_json::Value = serde_json::from_slice(&outcome.stdout).map_err(|_| {
+        BoundaryError::new(BoundaryKind::Validation, "Groq reconciliation returned malformed JSON")
+    })?;
+    response
+        .pointer("/choices/0/message/content")
+        .and_then(|text| text.as_str())
+        .map(|text| MergeResult(text.to_owned()))
+        .ok_or_else(|| {
+            BoundaryError::new(BoundaryKind::Validation, "Groq reconciliation omitted text")
+        })
 }
 
 pub struct ClipboardDelivery;

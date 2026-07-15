@@ -13,13 +13,15 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use voisu_app::system::{
     CAPTURE_FINALIZE_DEADLINE, ClipboardDelivery, DeepgramProvider, GroqProvider,
-    MergeResultValidator, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture, RECOVERY_ABORT_DEADLINE,
+    MergeResultValidator, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture, RECONCILIATION_DEADLINE,
+    RECOVERY_ABORT_DEADLINE,
 };
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
     CapturedAudio, Command, DaemonState, DeliveryAdapter, LifecycleEvidence, LifecycleStage,
-    PROTOCOL_VERSION, Provider, ProviderCoordinator, ProviderStream, ProviderStreams, Request,
-    Response, SourceTranscript, Transcript, TranscriptProvider, TranscriptValidator,
+    MergeResult, PROTOCOL_VERSION, Provider, ProviderCoordinator, ProviderStream, ProviderStreams,
+    ReconciliationKind, ReconciliationModel, Request, Response, SourceTranscript, Transcript,
+    TranscriptDecision, TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator,
     VersionEnvelope, socket_path,
 };
 
@@ -273,9 +275,9 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
         Box::new(GroqProvider)
     });
     let mut validator: Option<Box<dyn TranscriptValidator>> = if controlled {
-        Some(Box::new(ControlledValidator))
+        Some(Box::new(ControlledValidator::from_env()))
     } else {
-        Some(Box::new(MergeResultValidator))
+        Some(Box::new(MergeResultValidator::new()))
     };
     let mut delivery: Option<Box<dyn DeliveryAdapter>> = if controlled {
         Some(Box::new(ControlledDelivery))
@@ -405,6 +407,11 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                                 capture_finalized_ms: None,
                                 provider_timings_ms: Vec::new(),
                                 release_to_text_ms: None,
+                                transcript_selection: None,
+                                validation_reason: None,
+                                fallback_reason: None,
+                                reconciliation_requested: false,
+                                recovery_attempted: false,
                             };
                             let (stop_tx, stop_rx) = oneshot::channel();
                             let chunk_counter = Arc::new(AtomicU32::new(0));
@@ -805,9 +812,27 @@ async fn process_recording(
         evidence.source_transcript_providers =
             sources.iter().map(|source| source.provider).collect();
         evidence.stages.push(LifecycleStage::ProvidersCompleted);
-        let transcript = validator.validate(sources)?;
+        let decision = match validator.validate(sources).await {
+            Ok(decision) => decision,
+            Err(error) => {
+                if let Some(failure) = error.transcript_failure() {
+                    evidence.validation_reason = Some(failure.validation_reason.clone());
+                    evidence.fallback_reason = failure.fallback_reason.clone();
+                    evidence.reconciliation_requested = failure.reconciliation_requested;
+                    evidence.recovery_attempted = failure.recovery_attempted;
+                } else {
+                    evidence.validation_reason = Some(error.diagnostic().to_owned());
+                }
+                return Err(error);
+            }
+        };
+        evidence.transcript_selection = Some(decision.selection);
+        evidence.validation_reason = Some(decision.validation_reason);
+        evidence.fallback_reason = decision.fallback_reason;
+        evidence.reconciliation_requested = decision.reconciliation_requested;
+        evidence.recovery_attempted = decision.recovery_attempted;
         evidence.stages.push(LifecycleStage::ValidationCompleted);
-        delivery.deliver(transcript).await?;
+        delivery.deliver(decision.transcript).await?;
         evidence.delivery_count += 1;
         evidence.release_to_text_ms = Some(elapsed_millis(started_at));
         evidence.stages.push(LifecycleStage::DeliveryCompleted);
@@ -986,6 +1011,7 @@ impl ActiveCapture for ControlledActiveCapture {
 
 struct ControlledProvider {
     provider: Provider,
+    text: String,
     delay: Duration,
     send_stall: Duration,
     fail_start_once: bool,
@@ -1013,8 +1039,15 @@ impl ControlledProvider {
         let fail_complete = std::env::var("VOISU_TEST_PROVIDER_COMPLETE_FAILURE")
             .ok()
             .is_some_and(|value| value == provider.secret_service_value());
+        let transcript_name = match provider {
+            Provider::Deepgram => "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+            Provider::Groq => "VOISU_TEST_GROQ_TRANSCRIPT",
+        };
+        let text = std::env::var(transcript_name)
+            .unwrap_or_else(|_| "controlled Source Transcript".to_owned());
         Self {
             provider,
+            text,
             delay,
             send_stall,
             fail_start_once,
@@ -1034,6 +1067,7 @@ impl TranscriptProvider for ControlledProvider {
         }
         Ok(Box::new(ControlledProviderStream {
             provider: self.provider,
+            text: self.text.clone(),
             delay: self.delay,
             send_stall: self.send_stall,
             fail_abort: self.fail_abort,
@@ -1044,6 +1078,7 @@ impl TranscriptProvider for ControlledProvider {
 
 struct ControlledProviderStream {
     provider: Provider,
+    text: String,
     delay: Duration,
     send_stall: Duration,
     fail_abort: bool,
@@ -1082,6 +1117,7 @@ impl ProviderStream for ControlledProviderStream {
         let provider = self.provider;
         let delay = self.delay;
         let fail_complete = self.fail_complete;
+        let text = self.text.clone();
         Box::pin(async move {
             tokio::time::sleep(delay).await;
             if fail_complete {
@@ -1092,24 +1128,89 @@ impl ProviderStream for ControlledProviderStream {
             }
             Ok(SourceTranscript {
                 provider,
-                text: "controlled Source Transcript".to_owned(),
+                text,
             })
         })
     }
 }
 
-struct ControlledValidator;
+struct ControlledValidator {
+    pipeline: TranscriptDecisionPipeline<ControlledReconciliationModel>,
+}
+
+impl ControlledValidator {
+    fn from_env() -> Self {
+        let deadline = if std::env::var_os("VOISU_TEST_RECONCILIATION_DEADLINE_MS").is_some() {
+            env_millis("VOISU_TEST_RECONCILIATION_DEADLINE_MS").max(Duration::from_millis(1))
+        } else {
+            RECONCILIATION_DEADLINE
+        };
+        Self {
+            pipeline: TranscriptDecisionPipeline::new(
+                ControlledReconciliationModel::from_env(),
+                deadline,
+            ),
+        }
+    }
+}
 
 impl TranscriptValidator for ControlledValidator {
     fn validate(
         &mut self,
         sources: Vec<SourceTranscript>,
-    ) -> Result<Transcript, BoundaryError> {
-        sources
-            .into_iter()
-            .next()
-            .map(|source| Transcript(source.text))
-            .ok_or_else(|| BoundaryError::new(BoundaryKind::Validation, "no Source Transcript"))
+    ) -> BoundaryFuture<'_, TranscriptDecision> {
+        self.pipeline.validate(sources)
+    }
+}
+
+struct ControlledReconciliationModel {
+    delay: Duration,
+    reconcile_result: Option<String>,
+    repair_result: Option<String>,
+    fail: bool,
+}
+
+impl ControlledReconciliationModel {
+    fn from_env() -> Self {
+        Self {
+            delay: env_millis("VOISU_TEST_RECONCILIATION_DELAY_MS"),
+            reconcile_result: std::env::var("VOISU_TEST_RECONCILIATION_RESULT").ok(),
+            repair_result: std::env::var("VOISU_TEST_REPAIR_RESULT").ok(),
+            fail: std::env::var_os("VOISU_TEST_RECONCILIATION_FAILURE").is_some(),
+        }
+    }
+}
+
+impl ReconciliationModel for ControlledReconciliationModel {
+    fn request(
+        &mut self,
+        kind: ReconciliationKind,
+        _sources: Vec<SourceTranscript>,
+        _candidate: Option<MergeResult>,
+    ) -> BoundaryFuture<'_, MergeResult> {
+        let delay = self.delay;
+        let fail = self.fail;
+        let result = match kind {
+            ReconciliationKind::Reconcile => self.reconcile_result.clone(),
+            ReconciliationKind::Repair => self.repair_result.clone(),
+        };
+        Box::pin(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            if fail {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Validation,
+                    "controlled reconciliation failed",
+                ));
+            }
+            result.map(MergeResult).ok_or_else(|| {
+                BoundaryError::new(
+                    BoundaryKind::Validation,
+                    "controlled reconciliation result missing",
+                )
+            })
+        })
     }
 }
 
