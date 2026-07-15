@@ -144,6 +144,8 @@ pub enum BoundaryKind {
     Provider,
     Validation,
     Delivery,
+    SecretStorage,
+    ProviderAuthentication,
 }
 
 #[derive(Debug)]
@@ -170,6 +172,10 @@ impl BoundaryError {
             BoundaryKind::Provider => "Source Transcripts are unavailable",
             BoundaryKind::Validation => "Transcript failed quality validation",
             BoundaryKind::Delivery => "Transcript Delivery failed",
+            BoundaryKind::SecretStorage => {
+                "Secret storage is unavailable; set VOISU_GROQ_API_KEY or VOISU_DEEPGRAM_API_KEY for development or headless use"
+            }
+            BoundaryKind::ProviderAuthentication => "Provider authentication failed",
         }
     }
 
@@ -187,10 +193,119 @@ pub struct AudioChunk(pub Vec<u8>);
 #[derive(Clone, Debug)]
 pub struct CapturedAudio;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Provider {
     Deepgram,
     Groq,
+}
+
+impl Provider {
+    pub fn cli_label(self) -> &'static str {
+        match self {
+            Self::Deepgram => "Deepgram",
+            Self::Groq => "Groq",
+        }
+    }
+
+    pub fn environment_variable(self) -> &'static str {
+        match self {
+            Self::Deepgram => "VOISU_DEEPGRAM_API_KEY",
+            Self::Groq => "VOISU_GROQ_API_KEY",
+        }
+    }
+
+    pub fn secret_service_value(self) -> &'static str {
+        match self {
+            Self::Deepgram => "deepgram",
+            Self::Groq => "groq",
+        }
+    }
+}
+
+/// An API credential deliberately has no `Debug` implementation, preventing
+/// accidental exposure through ordinary diagnostics.
+pub struct Credential(String);
+
+impl Credential {
+    pub fn new(value: String) -> Result<Self, BoundaryError> {
+        if value.is_empty() || value.contains(['\n', '\r']) {
+            return Err(BoundaryError::new(
+                BoundaryKind::SecretStorage,
+                "credential is empty or contains a line break",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn expose_to_boundary(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadinessStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl ReadinessStatus {
+    pub fn cli_label(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Warn => "WARN",
+            Self::Fail => "FAIL",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadinessCapability {
+    PipeWire,
+    Microphone,
+    Portals,
+    Clipboard,
+    SecretStorage,
+    Daemon,
+}
+
+impl ReadinessCapability {
+    pub fn cli_label(self) -> &'static str {
+        match self {
+            Self::PipeWire => "PipeWire",
+            Self::Microphone => "Microphone",
+            Self::Portals => "Portals",
+            Self::Clipboard => "Clipboard",
+            Self::SecretStorage => "Secret storage",
+            Self::Daemon => "Daemon",
+        }
+    }
+}
+
+pub struct ReadinessFinding {
+    pub capability: ReadinessCapability,
+    pub status: ReadinessStatus,
+    pub detail: String,
+}
+
+/// Boundary for Fedora desktop capability checks. Production uses thin command
+/// probes; tests inject controlled outcomes without a desktop session.
+pub trait ReadinessInspector: Send {
+    fn inspect(&mut self) -> Vec<ReadinessFinding>;
+}
+
+/// Boundary for desktop Secret Service. Implementations must never persist a
+/// credential outside the desktop secret service.
+pub trait SecretStore: Send {
+    fn replace(&mut self, provider: Provider, credential: Credential) -> Result<(), BoundaryError>;
+    fn load(&mut self, provider: Provider) -> Result<Credential, BoundaryError>;
+}
+
+/// Boundary for an independent, post-storage provider-auth check. It returns
+/// no provider response content, only an authorization result.
+pub trait ProviderAuthenticator: Send {
+    fn verify(&mut self, provider: Provider, credential: Credential) -> BoundaryFuture<'_, ()>;
 }
 
 #[derive(Clone, Debug)]

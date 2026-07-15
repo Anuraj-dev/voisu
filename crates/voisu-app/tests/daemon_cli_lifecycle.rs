@@ -149,12 +149,44 @@ fn socket_path(runtime_dir: &Path) -> PathBuf {
 }
 
 fn voisu(runtime_dir: &Path, command: &str) -> Output {
+    voisu_with_env(runtime_dir, &[command], &[])
+}
+
+fn voisu_with_env(runtime_dir: &Path, arguments: &[&str], environment: &[(&str, &str)]) -> Output {
     fs::set_permissions(runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_voisu"))
-        .arg(command)
+    let mut command = Command::new(env!("CARGO_BIN_EXE_voisu"));
+    command.args(arguments).env("XDG_RUNTIME_DIR", runtime_dir);
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    command.output().expect("CLI should run")
+}
+
+fn voisu_with_secret(
+    runtime_dir: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+    credential: &str,
+) -> Output {
+    fs::set_permissions(runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_voisu"));
+    command
+        .args(arguments)
         .env("XDG_RUNTIME_DIR", runtime_dir)
-        .output()
-        .expect("CLI should run")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().expect("CLI should run");
+    child
+        .stdin
+        .as_mut()
+        .expect("CLI stdin should be available")
+        .write_all(credential.as_bytes())
+        .expect("credential should be written to stdin");
+    child.wait_with_output().expect("CLI should complete")
 }
 
 fn ipc_request(runtime_dir: &Path, request: &str) -> Value {
@@ -183,6 +215,113 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn doctor_reports_each_fedora_capability_through_the_public_cli() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let doctor = Command::new(env!("CARGO_BIN_EXE_voisu"))
+        .arg("doctor")
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("VOISU_TEST_READINESS", "pass")
+        .output()
+        .expect("doctor should run");
+
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    assert_eq!(
+        stdout(&doctor),
+        "PipeWire: PASS (available)\nMicrophone: PASS (present)\nPortals: PASS (available)\nClipboard: PASS (available)\nSecret storage: PASS (available)\nDaemon: PASS (reachable)\n"
+    );
+}
+
+#[test]
+fn doctor_exposes_actionable_warn_and_fail_outcomes() {
+    let runtime = TempDir::new().unwrap();
+    let doctor = voisu_with_env(
+        runtime.path(),
+        &["doctor"],
+        &[("VOISU_TEST_READINESS", "pipewire=fail,clipboard=warn")],
+    );
+
+    assert_eq!(doctor.status.code(), Some(4));
+    assert!(stdout(&doctor).contains("PipeWire: FAIL (not available)\n"));
+    assert!(stdout(&doctor).contains("Clipboard: WARN (needs attention)\n"));
+    assert!(stdout(&doctor).contains("Daemon: FAIL (unavailable)\n"));
+}
+
+#[test]
+fn auth_set_replaces_a_credential_without_echoing_it() {
+    let runtime = TempDir::new().unwrap();
+    let first = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[("VOISU_TEST_SECRET_STORE", "available")],
+        "controlled-secret-one",
+    );
+    let replacement = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[("VOISU_TEST_SECRET_STORE", "available")],
+        "controlled-secret-two",
+    );
+
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert_eq!(stdout(&first), "Groq credential stored\n");
+    assert!(replacement.status.success(), "{}", stderr(&replacement));
+    assert_eq!(stdout(&replacement), "Groq credential stored\n");
+    let combined = format!("{}{}{}{}", stdout(&first), stderr(&first), stdout(&replacement), stderr(&replacement));
+    assert!(!combined.contains("controlled-secret-one"));
+    assert!(!combined.contains("controlled-secret-two"));
+}
+
+#[test]
+fn denied_secret_storage_names_the_headless_fallback_without_leaking_credential() {
+    let runtime = TempDir::new().unwrap();
+    let denied = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "deepgram"],
+        &[("VOISU_TEST_SECRET_STORE", "denied")],
+        "controlled-secret",
+    );
+
+    assert_eq!(denied.status.code(), Some(4));
+    assert_eq!(
+        stderr(&denied),
+        "Secret storage is unavailable; set VOISU_GROQ_API_KEY or VOISU_DEEPGRAM_API_KEY for development or headless use\n"
+    );
+    assert!(!stderr(&denied).contains("controlled-secret"));
+}
+
+#[test]
+fn auth_verify_checks_each_provider_without_retaining_or_printing_response_content() {
+    let runtime = TempDir::new().unwrap();
+    let groq = voisu_with_env(
+        runtime.path(),
+        &["auth", "verify", "groq"],
+        &[
+            ("VOISU_TEST_SECRET_STORE", "denied"),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_TEST_AUTH_GROQ", "authorized"),
+        ],
+    );
+    let deepgram = voisu_with_env(
+        runtime.path(),
+        &["auth", "verify", "deepgram"],
+        &[
+            ("VOISU_TEST_SECRET_STORE", "available"),
+            ("VOISU_TEST_STORED_DEEPGRAM_CREDENTIAL", "controlled-secret"),
+            ("VOISU_TEST_AUTH_DEEPGRAM", "denied"),
+        ],
+    );
+
+    assert!(groq.status.success(), "{}", stderr(&groq));
+    assert_eq!(stdout(&groq), "Groq authentication verified\n");
+    assert_eq!(deepgram.status.code(), Some(4));
+    assert_eq!(stderr(&deepgram), "Provider authentication failed\n");
+    let combined = format!("{}{}{}{}", stdout(&groq), stderr(&groq), stdout(&deepgram), stderr(&deepgram));
+    assert!(!combined.contains("controlled-secret"));
+    assert!(!combined.contains("response content"));
 }
 
 #[test]

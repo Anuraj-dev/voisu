@@ -38,3 +38,8 @@ lint/format cleanliness, not silently dropped.
 ## 2026-07-15 — Never deliberately background a `codex exec` run
 **Why:** A deliberately-backgrounded codex exec was killed mid-task, losing work; the harness's own
 auto-backgrounding after a 600s foreground timeout is safe and was kept as the only backgrounding path.
+
+## 2026-07-15 — Keep cloud credentials stdin-only and Secret-Service-backed
+**Why:** Command-line credential arguments would leak through shell history or process listings. `secret-tool`
+receives the value on standard input; if Secret Service is denied or unavailable, the only supported fallback is
+the explicit non-persistent `VOISU_GROQ_API_KEY` or `VOISU_DEEPGRAM_API_KEY` environment variable.
