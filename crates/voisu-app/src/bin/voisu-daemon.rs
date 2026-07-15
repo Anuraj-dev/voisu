@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -13,7 +14,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use voisu_app::system::{
     CAPTURE_FINALIZE_DEADLINE, ClipboardDelivery, GroqProvider, MergeResultValidator,
-    PROVIDER_COMPLETION_DEADLINE, PipeWireCapture, UnavailableDeepgram,
+    PROVIDER_COMPLETION_DEADLINE, PipeWireCapture, RECOVERY_ABORT_DEADLINE, UnavailableDeepgram,
 };
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
@@ -189,6 +190,7 @@ enum ActorMessage {
     Started(StartupCompletion),
     PumpTerminated(u64),
     Completed(Completion),
+    Recovered(u64),
 }
 
 struct StartupCompletion {
@@ -196,8 +198,16 @@ struct StartupCompletion {
     capture: Box<dyn AudioCapture>,
     deepgram: Box<dyn TranscriptProvider>,
     groq: Box<dyn TranscriptProvider>,
-    result: Result<(Box<dyn ActiveCapture>, ProviderStreams), BoundaryError>,
+    result: Result<(Box<dyn ActiveCapture>, ProviderStreams), StartFailure>,
     reply: oneshot::Sender<Response>,
+}
+
+/// A failed start sequence hands back everything it already started so the
+/// actor can track the abort to completion before the daemon is reusable.
+struct StartFailure {
+    error: BoundaryError,
+    capture: Option<Box<dyn ActiveCapture>>,
+    provider_stream: Option<Box<dyn ProviderStream>>,
 }
 
 struct ActiveRecording {
@@ -222,6 +232,14 @@ enum ActorState {
     Starting(u64),
     Recording(ActiveRecording),
     Processing(LifecycleEvidence),
+    /// A failed start's aborts are still in flight. Publicly the daemon reads
+    /// idle and stays responsive, but a new Recording is deferred until the
+    /// cleanup acknowledges completion so adapters are never reused while a
+    /// previous abort is still running.
+    Recovering {
+        id: u64,
+        deferred: Vec<(Command, oneshot::Sender<Response>)>,
+    },
 }
 
 struct Completion {
@@ -263,12 +281,27 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
         Some(Box::new(ClipboardDelivery))
     };
 
-    while let Some(message) = rx.recv().await {
+    let mut queued: VecDeque<ActorMessage> = VecDeque::new();
+    loop {
+        let message = match queued.pop_front() {
+            Some(message) => message,
+            None => match rx.recv().await {
+                Some(message) => message,
+                None => break,
+            },
+        };
         match message {
             ActorMessage::Command(command, reply) => match command {
                 Command::Status => {
                     let response = status_response(&state);
                     let _ = reply.send(response);
+                }
+                Command::Start | Command::Toggle
+                    if matches!(state, ActorState::Recovering { .. }) =>
+                {
+                    if let ActorState::Recovering { deferred, .. } = &mut state {
+                        deferred.push((command, reply));
+                    }
                 }
                 Command::Start | Command::Toggle if matches!(state, ActorState::Idle) => {
                     let id = next_id;
@@ -392,14 +425,38 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                                 "Recording started",
                             ));
                         }
-                        Err(error) => {
-                            state = ActorState::Idle;
-                            eprintln!("Recording {id}: {}", error.diagnostic());
+                        Err(failure) => {
+                            eprintln!("Recording {id}: {}", failure.error.diagnostic());
                             let _ = reply.send(Response::rejected(
                                 Some(DaemonState::Idle),
-                                error.public_message(),
+                                failure.error.public_message(),
                             ));
+                            if failure.capture.is_some() || failure.provider_stream.is_some() {
+                                // The daemon reads idle immediately but defers
+                                // the next Recording until the bounded aborts
+                                // acknowledge completion (ActorMessage::Recovered).
+                                state = ActorState::Recovering {
+                                    id,
+                                    deferred: Vec::new(),
+                                };
+                                tokio::spawn(recover_failed_start(id, failure, tx.clone()));
+                            } else {
+                                state = ActorState::Idle;
+                            }
                         }
+                    }
+                }
+            }
+            ActorMessage::Recovered(id) => {
+                if matches!(&state, ActorState::Recovering { id: recovering, .. } if *recovering == id)
+                {
+                    let ActorState::Recovering { deferred, .. } =
+                        std::mem::replace(&mut state, ActorState::Idle)
+                    else {
+                        unreachable!()
+                    };
+                    for (command, reply) in deferred {
+                        queued.push_back(ActorMessage::Command(command, reply));
                     }
                 }
             }
@@ -459,7 +516,7 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
 
 fn state_label(state: &ActorState) -> DaemonState {
     match state {
-        ActorState::Idle => DaemonState::Idle,
+        ActorState::Idle | ActorState::Recovering { .. } => DaemonState::Idle,
         ActorState::Starting(_) => DaemonState::Recording,
         ActorState::Recording(_) => DaemonState::Recording,
         ActorState::Processing(_) => DaemonState::Processing,
@@ -479,35 +536,48 @@ fn status_response(state: &ActorState) -> Response {
                 Some(evidence)
             }
             ActorState::Processing(evidence) => Some(evidence.clone()),
-            ActorState::Idle | ActorState::Starting(_) => None,
+            ActorState::Idle | ActorState::Starting(_) | ActorState::Recovering { .. } => None,
         },
     )
 }
 
-/// Starts a Recording, aborting anything already started if a later step of the
-/// start sequence fails so no capture or provider is left dangling. The abort
-/// runs off the actor loop (see `spawn_capture_abort`) so a stalled abort can
-/// never block subsequent commands such as status.
+/// Starts a Recording. If a later step of the start sequence fails, everything
+/// already started is handed back in the failure so the actor can run the
+/// aborts off its loop and only become reusable once they acknowledge.
 fn begin_recording(
     capture: &mut Box<dyn AudioCapture>,
     deepgram: &mut Box<dyn TranscriptProvider>,
     groq: &mut Box<dyn TranscriptProvider>,
     id: u64,
-) -> Result<(Box<dyn ActiveCapture>, ProviderStreams), BoundaryError> {
-    let active_capture = capture.begin(id)?;
+) -> Result<(Box<dyn ActiveCapture>, ProviderStreams), StartFailure> {
+    let active_capture = match capture.begin(id) {
+        Ok(active_capture) => active_capture,
+        Err(error) => {
+            return Err(StartFailure {
+                error,
+                capture: None,
+                provider_stream: None,
+            });
+        }
+    };
     let deepgram_stream = match deepgram.start(id) {
         Ok(stream) => stream,
         Err(error) => {
-            spawn_capture_abort(id, active_capture);
-            return Err(error);
+            return Err(StartFailure {
+                error,
+                capture: Some(active_capture),
+                provider_stream: None,
+            });
         }
     };
     let groq_stream = match groq.start(id) {
         Ok(stream) => stream,
         Err(error) => {
-            spawn_provider_abort(id, deepgram_stream);
-            spawn_capture_abort(id, active_capture);
-            return Err(error);
+            return Err(StartFailure {
+                error,
+                capture: Some(active_capture),
+                provider_stream: Some(deepgram_stream),
+            });
         }
     };
     Ok((
@@ -519,42 +589,80 @@ fn begin_recording(
     ))
 }
 
-fn spawn_provider_abort(id: u64, stream: Box<dyn ProviderStream>) {
-    tokio::spawn(async move {
-        match timeout(IO_DEADLINE, stream.abort()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                eprintln!("Recording {id}: provider abort failed: {}", error.diagnostic());
+/// Aborts everything a failed start already started, off the actor loop, then
+/// acknowledges completion so the actor can leave Recovering. Abort failures
+/// and timeouts are surfaced into local diagnostics rather than discarded.
+async fn recover_failed_start(id: u64, failure: StartFailure, actor: mpsc::Sender<ActorMessage>) {
+    let StartFailure {
+        capture,
+        provider_stream,
+        ..
+    } = failure;
+    let capture_abort = async {
+        if let Some(capture) = capture {
+            match timeout(RECOVERY_ABORT_DEADLINE, capture.abort()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    eprintln!("Recording {id}: capture abort failed: {}", error.diagnostic());
+                }
+                Err(_) => eprintln!("Recording {id}: capture abort timed out"),
             }
-            Err(_) => eprintln!("Recording {id}: provider abort timed out"),
         }
-    });
-}
-
-/// Aborts an already-started capture without blocking the lifecycle actor: a
-/// stalled abort must never make the daemon unresponsive. Abort failures and
-/// timeouts are surfaced into local diagnostics rather than discarded.
-fn spawn_capture_abort(id: u64, capture: Box<dyn ActiveCapture>) {
-    tokio::spawn(async move {
-        match timeout(IO_DEADLINE, capture.abort()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                eprintln!("Recording {id}: capture abort failed: {}", error.diagnostic());
+    };
+    let provider_abort = async {
+        if let Some(stream) = provider_stream {
+            match timeout(RECOVERY_ABORT_DEADLINE, stream.abort()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    eprintln!("Recording {id}: provider abort failed: {}", error.diagnostic());
+                }
+                Err(_) => eprintln!("Recording {id}: provider abort timed out"),
             }
-            Err(_) => eprintln!("Recording {id}: capture abort timed out"),
         }
-    });
+    };
+    tokio::join!(capture_abort, provider_abort);
+    let _ = actor.send(ActorMessage::Recovered(id)).await;
 }
 
 /// Awaits a capture abort with a bounded deadline, folding any abort failure or
 /// timeout into the originating diagnostic so it is never silently dropped.
 async fn bounded_abort(capture: Box<dyn ActiveCapture>, cause: BoundaryError) -> BoundaryError {
-    match timeout(IO_DEADLINE, capture.abort()).await {
+    match timeout(RECOVERY_ABORT_DEADLINE, capture.abort()).await {
         Ok(Ok(())) => cause,
         Ok(Err(abort_error)) => combine_capture_abort(cause, abort_error),
         Err(_) => BoundaryError::new(
             cause.kind(),
             format!("{}; capture abort timed out", cause.diagnostic()),
+        ),
+    }
+}
+
+/// Aborts BOTH the still-live capture and the provider coordinator when a
+/// Recording fails, concurrently and bounded: dropping the coordinator would
+/// detach its spawned provider work, leaving requests from the failed
+/// Recording live while the next Recording is accepted.
+async fn abort_recording_work(
+    capture: Box<dyn ActiveCapture>,
+    providers: ProviderCoordinator,
+    cause: BoundaryError,
+) -> BoundaryError {
+    let (cause, provider_result) = tokio::join!(
+        bounded_abort(capture, cause),
+        timeout(RECOVERY_ABORT_DEADLINE, providers.abort())
+    );
+    match provider_result {
+        Ok(Ok(())) => cause,
+        Ok(Err(error)) => BoundaryError::new(
+            cause.kind(),
+            format!(
+                "{}; provider abort failed: {}",
+                cause.diagnostic(),
+                error.diagnostic()
+            ),
+        ),
+        Err(_) => BoundaryError::new(
+            cause.kind(),
+            format!("{}; provider abort timed out", cause.diagnostic()),
         ),
     }
 }
@@ -644,13 +752,13 @@ async fn process_recording(
     let result = async {
         if let Some(error) = stream_error {
             evidence.stages.push(LifecycleStage::CaptureAborted);
-            return Err(bounded_abort(capture, error).await);
+            return Err(abort_recording_work(capture, providers, error).await);
         }
         let audio = match capture.finish().await {
             Ok(audio) => audio,
             Err(error) => {
                 evidence.stages.push(LifecycleStage::CaptureAborted);
-                return Err(bounded_abort(capture, error).await);
+                return Err(abort_recording_work(capture, providers, error).await);
             }
         };
         evidence.stages.push(LifecycleStage::CaptureFinalized);

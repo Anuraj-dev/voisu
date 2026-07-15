@@ -65,7 +65,9 @@ fn stream(
     })
 }
 
-#[tokio::test]
+// Paused time: the runtime advances virtual time to the abort deadline instead
+// of racing wall-clock ceilings, so the bound is asserted deterministically.
+#[tokio::test(start_paused = true)]
 async fn coordinator_abort_is_bounded_and_attempts_both_provider_streams() {
     let deepgram_aborts = Arc::new(AtomicUsize::new(0));
     let groq_aborts = Arc::new(AtomicUsize::new(0));
@@ -87,9 +89,13 @@ async fn coordinator_abort_is_bounded_and_attempts_both_provider_streams() {
         },
     );
 
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let error = coordinator.abort().await.unwrap_err();
-    assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_millis(50),
+        "abort must end exactly at its deadline, not at the stream abort delays"
+    );
     assert_eq!(error.kind(), BoundaryKind::Provider);
     assert_eq!(error.diagnostic(), "provider abort deadline elapsed");
     assert_eq!(deepgram_aborts.load(Ordering::SeqCst), 1);

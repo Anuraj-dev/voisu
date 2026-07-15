@@ -14,18 +14,21 @@ use serde_json::Value;
 use tempfile::TempDir;
 use voisu_app::system::{
     CAPTURE_FINALIZE_DEADLINE, CLIPBOARD_DELIVERY_DEADLINE,
-    PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE,
+    PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
 
 const PROTOCOL_VERSION: u32 = 1;
 
 #[test]
 fn stop_response_budget_strictly_exceeds_all_daemon_processing_deadlines() {
+    // The budget must also cover the bounded cleanup/abort grace that runs when
+    // a failed Recording rolls back its capture and provider work.
     assert!(
         PROCESSING_RESPONSE_DEADLINE
             > CAPTURE_FINALIZE_DEADLINE
                 + PROVIDER_COMPLETION_DEADLINE
                 + CLIPBOARD_DELIVERY_DEADLINE
+                + RECOVERY_ABORT_DEADLINE
     );
 }
 
@@ -361,13 +364,16 @@ trap 'exit 0' INT TERM
 while :; do sleep 1; done
 "#,
     );
+    // The Secret Service lookup blocks on an explicit release gate instead of a
+    // wall-clock sleep: Status is proven to complete WHILE the lookup is still
+    // provably blocked, with no timing assumption.
     write_fake_command(
         commands.path(),
         "secret-tool",
         r#"#!/bin/sh
 dir=$(dirname "$0")
 : > "$dir/secret-tool.started"
-sleep 1
+while [ ! -e "$dir/secret-tool.release" ]; do sleep 0.02; done
 printf 'controlled-secret'
 "#,
     );
@@ -380,20 +386,19 @@ printf 'controlled-secret'
 
     let runtime_dir = runtime.path().to_owned();
     let start = thread::spawn(move || voisu(&runtime_dir, "start"));
-    let marker = commands.path().join("secret-tool.started");
-    let marker_deadline = Instant::now() + Duration::from_secs(2);
-    while !marker.exists() && Instant::now() < marker_deadline {
-        thread::sleep(Duration::from_millis(5));
-    }
-    assert!(marker.exists(), "the Secret Service lookup must have started");
+    wait_for_marker(commands.path(), "secret-tool.started");
 
-    let status_started = Instant::now();
     let status = voisu(runtime.path(), "status");
-    assert!(status.status.success(), "{}", stderr(&status));
     assert!(
-        status_started.elapsed() < Duration::from_millis(200),
-        "status must not wait for the Secret Service lookup"
+        !commands.path().join("secret-tool.release").exists(),
+        "the Secret Service lookup must still be blocked"
     );
+    assert!(
+        status.status.success(),
+        "status must not wait for the blocked Secret Service lookup: {}",
+        stderr(&status)
+    );
+    fs::write(commands.path().join("secret-tool.release"), "").unwrap();
     let started = start.join().unwrap();
     assert!(started.status.success(), "{}", stderr(&started));
 }
@@ -445,7 +450,7 @@ fn production_groq_quality_failure_is_classified_through_the_public_cli() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\nwhile :; do sleep 1; done\n",
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
     let (endpoint, request_rx, server) = local_groq_server("   ");
@@ -459,7 +464,7 @@ fn production_groq_quality_failure_is_classified_through_the_public_cli() {
         ],
     );
     assert!(voisu(runtime.path(), "start").status.success());
-    thread::sleep(Duration::from_millis(50));
+    wait_for_marker(commands.path(), "pw-record.ready");
     let rejected = voisu(runtime.path(), "stop");
     assert_eq!(rejected.status.code(), Some(4));
     assert_eq!(stderr(&rejected), "Transcript failed quality validation\n");
@@ -476,7 +481,7 @@ fn production_groq_5xx_is_recoverable_through_the_public_cli() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\nwhile :; do sleep 1; done\n",
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
     let (endpoint, request_rx, server) =
@@ -491,7 +496,7 @@ fn production_groq_5xx_is_recoverable_through_the_public_cli() {
         ],
     );
     assert!(voisu(runtime.path(), "start").status.success());
-    thread::sleep(Duration::from_millis(50));
+    wait_for_marker(commands.path(), "pw-record.ready");
     let rejected = voisu(runtime.path(), "stop");
     assert_eq!(rejected.status.code(), Some(4));
     assert_eq!(stderr(&rejected), "Source Transcripts are unavailable\n");
@@ -508,7 +513,7 @@ fn production_slow_groq_endpoint_is_bounded_and_recoverable() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\nwhile :; do sleep 1; done\n",
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
     let (endpoint, request_rx, server) = local_groq_response_server(
@@ -526,7 +531,7 @@ fn production_slow_groq_endpoint_is_bounded_and_recoverable() {
         ],
     );
     assert!(voisu(runtime.path(), "start").status.success());
-    thread::sleep(Duration::from_millis(50));
+    wait_for_marker(commands.path(), "pw-record.ready");
     let started = Instant::now();
     let rejected = voisu(runtime.path(), "stop");
     assert_eq!(rejected.status.code(), Some(4));
@@ -578,7 +583,7 @@ fn production_missing_wl_copy_is_reported_and_recoverable() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\nwhile :; do /usr/bin/sleep 1; done\n",
+        "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\nwhile :; do /usr/bin/sleep 1; done\n",
     );
     std::os::unix::fs::symlink("/usr/bin/curl", commands.path().join("curl")).unwrap();
     let (endpoint, request_rx, server) = local_groq_server("undeliverable Transcript");
@@ -592,7 +597,7 @@ fn production_missing_wl_copy_is_reported_and_recoverable() {
         ],
     );
     assert!(voisu(runtime.path(), "start").status.success());
-    thread::sleep(Duration::from_millis(50));
+    wait_for_marker(commands.path(), "pw-record.ready");
     let rejected = voisu(runtime.path(), "stop");
     assert_eq!(rejected.status.code(), Some(4));
     assert_eq!(stderr(&rejected), "Transcript Delivery failed\n");
@@ -739,6 +744,9 @@ fn production_recording_quality_failure(script_body: &str, expected: &str) {
         &[("PATH", &path), ("VOISU_GROQ_API_KEY", "controlled-secret")],
     );
     assert!(voisu(runtime.path(), "start").status.success());
+    // Stop only after the stub proved it wrote its PCM and registered its
+    // traps; otherwise Stop can win under load and yield Empty instead.
+    wait_for_marker(commands.path(), "pw-record.ready");
     let stopped = voisu(runtime.path(), "stop");
     assert_eq!(stopped.status.code(), Some(4));
     assert_eq!(stderr(&stopped), format!("{expected}\n"));
@@ -751,7 +759,7 @@ fn production_recording_quality_failure(script_body: &str, expected: &str) {
 #[test]
 fn empty_recording_is_distinct_and_recoverable_through_the_public_cli() {
     production_recording_quality_failure(
-        "#!/bin/sh\ntrap 'exit 0' INT TERM\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\nwhile :; do sleep 1; done\n",
         "No audio was captured",
     );
 }
@@ -759,7 +767,7 @@ fn empty_recording_is_distinct_and_recoverable_through_the_public_cli() {
 #[test]
 fn too_short_recording_is_distinct_and_recoverable_through_the_public_cli() {
     production_recording_quality_failure(
-        "#!/bin/sh\nprintf '\\001\\000'\ntrap 'exit 0' INT TERM\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\nprintf '\\001\\000'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\nwhile :; do sleep 1; done\n",
         "Recording is too short",
     );
 }
@@ -767,7 +775,7 @@ fn too_short_recording_is_distinct_and_recoverable_through_the_public_cli() {
 #[test]
 fn silent_recording_is_distinct_and_recoverable_through_the_public_cli() {
     production_recording_quality_failure(
-        "#!/bin/sh\n/usr/bin/head -c 3200 /dev/zero\ntrap 'exit 0' INT TERM\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 3200 /dev/zero\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\nwhile :; do sleep 1; done\n",
         "Recording contains no speech",
     );
 }
@@ -1040,6 +1048,21 @@ cat "$dir/clipboard"
     fn touch(&self, name: &str) {
         fs::write(self.bin.path().join(name), "").expect("fake command marker should be written");
     }
+}
+
+/// Waits for a stub-created ready marker: a stub writes the marker only after
+/// it has provably produced its output and registered its signal traps, so a
+/// test can Stop without racing the stub under load.
+fn wait_for_marker(directory: &Path, name: &str) {
+    let marker = directory.join(name);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if marker.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    panic!("stub never created its {name} marker");
 }
 
 fn write_fake_command(directory: &Path, name: &str, script: &str) {
@@ -1848,6 +1871,41 @@ fn capture_finalization_abort_failure_is_surfaced_into_diagnostics() {
         diagnostics.contains("capture abort failed")
             && diagnostics.contains("controlled-abort-detail"),
         "finalization-path abort failure must be surfaced, got: {diagnostics}"
+    );
+}
+
+#[test]
+fn provider_work_is_aborted_not_dropped_when_the_recording_capture_fails() {
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_CAPTURE_FINISH_FAILURE", "1"),
+            ("VOISU_TEST_PROVIDER_ABORT_FAILURE", "1"),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+
+    // The capture-failure path must abort the provider coordinator too, not
+    // drop it: dropping detaches its spawned work, leaving provider requests
+    // from the failed Recording live while the next one is accepted. The
+    // controlled provider abort fails loudly, so the abort actually running is
+    // observable in local diagnostics.
+    let failed = voisu(runtime.path(), "stop");
+    assert_eq!(failed.status.code(), Some(4));
+    assert_eq!(stderr(&failed), "Recording capture failed\n");
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+
+    // The next Recording must succeed after the aborted one.
+    assert!(voisu(runtime.path(), "start").status.success());
+    let recovered = voisu(runtime.path(), "stop");
+    assert!(recovered.status.success(), "{}", stderr(&recovered));
+
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains("provider abort failed")
+            && diagnostics.contains("controlled-provider-abort-detail"),
+        "the failed Recording's provider work must be aborted, got: {diagnostics}"
     );
 }
 

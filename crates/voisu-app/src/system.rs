@@ -19,10 +19,14 @@ const PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 pub const CAPTURE_FINALIZE_DEADLINE: Duration = PROCESS_DEADLINE;
 pub const PROVIDER_COMPLETION_DEADLINE: Duration = Duration::from_secs(15);
 pub const CLIPBOARD_DELIVERY_DEADLINE: Duration = PROCESS_DEADLINE;
+/// Grace granted to the bounded capture/provider aborts that run when a
+/// Recording fails or a partial start is rolled back.
+pub const RECOVERY_ABORT_DEADLINE: Duration = PROCESS_DEADLINE;
 pub const PROCESSING_RESPONSE_DEADLINE: Duration = Duration::from_secs(
     CAPTURE_FINALIZE_DEADLINE.as_secs()
         + PROVIDER_COMPLETION_DEADLINE.as_secs()
         + CLIPBOARD_DELIVERY_DEADLINE.as_secs()
+        + RECOVERY_ABORT_DEADLINE.as_secs()
         + 1,
 );
 const PROCESS_POLL: Duration = Duration::from_millis(10);
