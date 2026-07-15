@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -340,17 +340,22 @@ fn clipboard_finding() -> ReadinessFinding {
 }
 
 fn secret_service_finding() -> ReadinessFinding {
+    // Probe a nonexistent attribute. On a healthy, unlocked keyring this exits
+    // without a match and without diagnostics: reaching the service cleanly is
+    // the readiness signal, not whether a credential was found. Real secret-tool
+    // reports a no-match with a nonzero exit and empty stdout/stderr, while a
+    // D-Bus/service failure or a locked keyring prints an error to stderr.
     let probe = std::process::id().to_string();
     match run_restricted("secret-tool", &["lookup", "voisu-doctor-probe", &probe], None, false) {
-        Ok(outcome) if outcome.success => readiness(
+        Ok(outcome) if outcome.success || outcome.stderr.is_empty() => readiness(
             ReadinessCapability::SecretStorage,
             ReadinessStatus::Pass,
-            "Secret Service responds to a credential lookup",
+            "Secret Service is reachable",
         ),
         Ok(_) => readiness(
             ReadinessCapability::SecretStorage,
             ReadinessStatus::Warn,
-            "Secret Service did not return the probe credential; unlock the keyring or log in to the desktop session",
+            "Secret Service reported an error; unlock the keyring or log in to the desktop session",
         ),
         Err(_) => readiness(
             ReadinessCapability::SecretStorage,
@@ -377,26 +382,7 @@ fn command_finding(
 }
 
 fn daemon_finding() -> ReadinessFinding {
-    let result = (|| -> Result<(), ()> {
-        let path = socket_path().map_err(|_| ())?;
-        let mut stream = UnixStream::connect(path).map_err(|_| ())?;
-        stream.set_write_timeout(Some(PROCESS_DEADLINE)).map_err(|_| ())?;
-        stream.set_read_timeout(Some(PROCESS_DEADLINE)).map_err(|_| ())?;
-        serde_json::to_writer(&mut stream, &Request { version: PROTOCOL_VERSION, command: DaemonCommand::Status })
-            .map_err(|_| ())?;
-        stream.write_all(b"\n").map_err(|_| ())?;
-        let mut response = String::new();
-        let mut reader = BufReader::new(stream);
-        reader.read_line(&mut response).map_err(|_| ())?;
-        if response.len() > MAX_DAEMON_RESPONSE_BYTES {
-            return Err(());
-        }
-        let envelope: VersionEnvelope = serde_json::from_str(&response).map_err(|_| ())?;
-        let response: Response = serde_json::from_str(&response).map_err(|_| ())?;
-        (envelope.version == PROTOCOL_VERSION && response.ok && response.state.is_some())
-            .then_some(())
-            .ok_or(())
-    })();
+    let result = daemon_status_handshake();
     readiness(
         ReadinessCapability::Daemon,
         if result.is_ok() { ReadinessStatus::Pass } else { ReadinessStatus::Fail },
@@ -406,6 +392,63 @@ fn daemon_finding() -> ReadinessFinding {
             "daemon status handshake failed; start voisu-daemon and run voisu doctor again"
         },
     )
+}
+
+fn daemon_status_handshake() -> Result<(), ()> {
+    let path = socket_path().map_err(|_| ())?;
+    let mut stream = UnixStream::connect(path).map_err(|_| ())?;
+    // A single Instant budget bounds the whole handshake. A per-read timeout is
+    // reset by every byte, so a peer trickling one byte per interval would hold
+    // doctor forever; the accumulated response is also capped during reading so
+    // an oversized frame can never be fully buffered before the cap is checked.
+    let started = Instant::now();
+    stream.set_write_timeout(Some(PROCESS_DEADLINE)).map_err(|_| ())?;
+    serde_json::to_writer(&mut stream, &Request { version: PROTOCOL_VERSION, command: DaemonCommand::Status })
+        .map_err(|_| ())?;
+    stream.write_all(b"\n").map_err(|_| ())?;
+    let response = read_bounded_frame(&mut stream, started)?;
+    let envelope: VersionEnvelope = serde_json::from_str(&response).map_err(|_| ())?;
+    let response: Response = serde_json::from_str(&response).map_err(|_| ())?;
+    (envelope.version == PROTOCOL_VERSION && response.ok && response.state.is_some())
+        .then_some(())
+        .ok_or(())
+}
+
+fn read_bounded_frame(stream: &mut UnixStream, started: Instant) -> Result<String, ()> {
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let remaining = PROCESS_DEADLINE
+            .checked_sub(started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(())?;
+        stream.set_read_timeout(Some(remaining)).map_err(|_| ())?;
+        match stream.read(&mut buffer) {
+            Ok(0) => return Err(()),
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                if response.len() > MAX_DAEMON_RESPONSE_BYTES {
+                    return Err(());
+                }
+                if response.ends_with(b"\n") {
+                    return String::from_utf8(response).map_err(|_| ());
+                }
+                if response.contains(&b'\n') {
+                    return Err(());
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(()),
+        }
+    }
 }
 
 fn readiness(capability: ReadinessCapability, status: ReadinessStatus, detail: &str) -> ReadinessFinding {
@@ -423,6 +466,7 @@ fn controlled_secret_store(mode: &str) -> Result<(), BoundaryError> {
 struct ProcessOutcome {
     success: bool,
     stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 enum ProcessError {
@@ -458,35 +502,66 @@ fn run_restricted(
         .args(arguments)
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(if capture_stdout { Stdio::piped() } else { Stdio::null() })
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|_| ProcessError::Unavailable)?;
-    if let Some(input) = input {
-        let mut stdin = child.stdin.take().ok_or(ProcessError::Input)?;
-        if stdin.write_all(input).is_err() {
-            reap_after_failure(&mut child);
-            return Err(ProcessError::Input);
+    // The overall deadline starts here and covers the stdin write as well as the
+    // wait: a child that never drains stdin combined with a large input would
+    // otherwise block the parent forever once the pipe buffer fills. The write
+    // runs on its own thread so the polling loop can kill an overdue child,
+    // which breaks the pipe and unblocks the writer.
+    let started = Instant::now();
+    let writer = match input {
+        Some(input) => {
+            let input = input.to_vec();
+            let mut stdin = child.stdin.take().ok_or(ProcessError::Input)?;
+            Some(thread::spawn(move || {
+                let result = stdin.write_all(&input);
+                drop(stdin);
+                result
+            }))
         }
-        drop(stdin);
-    }
+        None => None,
+    };
     let stdout_reader = child.stdout.take().map(|mut stdout| {
         thread::spawn(move || {
             let mut bytes = Vec::new();
             stdout.read_to_end(&mut bytes).map(|_| bytes)
         })
     });
-    let status = wait_for_child(&mut child)?;
-    let stdout = match stdout_reader {
+    let stderr_reader = child.stderr.take().map(|mut stderr| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        })
+    });
+    let status = wait_for_child(&mut child, started)?;
+    if let Some(writer) = writer {
+        match writer.join() {
+            Ok(Ok(())) => {}
+            _ => return Err(ProcessError::Input),
+        }
+    }
+    let stdout = join_pipe(stdout_reader)?;
+    let stderr = join_pipe(stderr_reader)?;
+    Ok(ProcessOutcome { success: status.success(), stdout, stderr })
+}
+
+fn join_pipe(
+    reader: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+) -> Result<Vec<u8>, ProcessError> {
+    match reader {
         Some(reader) => reader
             .join()
             .map_err(|_| ProcessError::Output)?
-            .map_err(|_| ProcessError::Output)?,
-        None => Vec::new(),
-    };
-    Ok(ProcessOutcome { success: status.success(), stdout })
+            .map_err(|_| ProcessError::Output),
+        None => Ok(Vec::new()),
+    }
 }
 
-fn wait_for_child(child: &mut Child) -> Result<std::process::ExitStatus, ProcessError> {
-    let started = Instant::now();
+fn wait_for_child(
+    child: &mut Child,
+    started: Instant,
+) -> Result<std::process::ExitStatus, ProcessError> {
     loop {
         if let Some(status) = child.try_wait().map_err(|_| ProcessError::Wait)? {
             return Ok(status);
@@ -498,9 +573,4 @@ fn wait_for_child(child: &mut Child) -> Result<std::process::ExitStatus, Process
         }
         thread::sleep(PROCESS_POLL);
     }
-}
-
-fn reap_after_failure(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
 }

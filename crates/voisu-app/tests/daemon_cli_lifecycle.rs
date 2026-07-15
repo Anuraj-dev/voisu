@@ -204,7 +204,19 @@ dir=$(dirname "$0")
 printf '%s\n' "$@" > "$dir/secret-tool.args"
 env | sort > "$dir/secret-tool.env"
 if [ -e "$dir/secret-tool.stall" ]; then exec sleep 10; fi
-if [ "$1" = "lookup" ]; then printf 'stored-credential'; else cat > "$dir/secret-tool.stdin"; fi
+if [ "$1" = "lookup" ]; then
+  if [ "$2" = "voisu-doctor-probe" ]; then
+    # Real secret-tool reports a no-match with a nonzero exit and no output; a
+    # service failure or locked keyring instead prints a diagnostic to stderr.
+    if [ -e "$dir/secret-tool.dbuserror" ]; then
+      echo "Cannot create secret service: not provided by any .service files" >&2
+    fi
+    exit 1
+  fi
+  printf 'stored-credential'
+else
+  cat > "$dir/secret-tool.stdin"
+fi
 "#,
         );
         write_fake_command(
@@ -378,6 +390,51 @@ fn doctor_exercises_real_capabilities_instead_of_command_headings_or_socket_conn
 }
 
 #[test]
+fn doctor_reports_a_reachable_secret_service_without_a_match_as_pass() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let commands = FakeCommands::new();
+    // The probe attribute never matches on a healthy unlocked keyring; a clean
+    // no-match (nonzero exit, empty stdout/stderr) proves the service is
+    // reachable and must read PASS, not WARN.
+    let doctor = voisu_with_env(runtime.path(), &["doctor"], &[("PATH", &commands.path())]);
+
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    assert!(
+        commands
+            .read("secret-tool.args")
+            .starts_with("lookup\nvoisu-doctor-probe\n")
+    );
+    assert!(
+        stdout(&doctor).contains("Secret storage: PASS (Secret Service is reachable)"),
+        "{}",
+        stdout(&doctor)
+    );
+}
+
+#[test]
+fn doctor_warns_when_the_secret_service_reports_an_error() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let commands = FakeCommands::new();
+    // A D-Bus/service failure (or locked keyring) exits nonzero AND writes a
+    // diagnostic to stderr; that is the only case that warrants WARN.
+    commands.touch("secret-tool.dbuserror");
+    let doctor = voisu_with_env(runtime.path(), &["doctor"], &[("PATH", &commands.path())]);
+
+    assert!(
+        stdout(&doctor).contains("Secret storage: WARN"),
+        "{}",
+        stdout(&doctor)
+    );
+    assert!(
+        stdout(&doctor).contains("unlock the keyring or log in to the desktop session"),
+        "{}",
+        stdout(&doctor)
+    );
+}
+
+#[test]
 fn auth_set_replaces_a_credential_without_echoing_it() {
     let runtime = TempDir::new().unwrap();
     let first = voisu_with_secret(
@@ -472,6 +529,31 @@ fn auth_set_bounds_stalled_secret_tool_and_reports_missing_tool_without_leaking_
     assert_eq!(missing.status.code(), Some(4));
     assert!(stderr(&missing).contains("Secret storage is unavailable"));
     assert!(!stderr(&missing).contains("controlled-secret"));
+}
+
+#[test]
+fn auth_set_bounds_a_child_that_never_drains_a_large_stdin() {
+    let runtime = TempDir::new().unwrap();
+    let commands = FakeCommands::new();
+    // The stall stub sleeps without ever reading stdin. With a credential larger
+    // than the OS pipe buffer, the parent's stdin write would block forever
+    // unless the write itself is under the overall deadline.
+    commands.touch("secret-tool.stall");
+    let large_credential = "x".repeat(256 * 1024);
+    let started = Instant::now();
+    let stalled = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[("PATH", &commands.path())],
+        &large_credential,
+    );
+    assert_eq!(stalled.status.code(), Some(4));
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "a child that never drains stdin must still be bounded, elapsed {:?}",
+        started.elapsed()
+    );
+    assert!(!stderr(&stalled).contains(&large_credential));
 }
 
 #[test]
@@ -1003,6 +1085,49 @@ fn cli_read_deadline_covers_the_whole_frame_even_under_trickled_traffic() {
     assert!(
         elapsed >= Duration::from_millis(1800) && elapsed < Duration::from_secs(4),
         "CLI must honor a whole-frame deadline under trickled traffic, elapsed {elapsed:?}"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn doctor_daemon_probe_is_bounded_under_a_trickling_peer() {
+    let runtime = TempDir::new().unwrap();
+    let path = socket_path(runtime.path());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(&path).unwrap();
+
+    // A trickle server: one byte every 250ms, never a terminator. A per-read
+    // socket timeout alone would be reset by every byte and hold doctor forever.
+    let server = thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = String::new();
+            let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut request);
+            for _ in 0..24 {
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let doctor = voisu_with_env(
+        runtime.path(),
+        &["doctor"],
+        &[("VOISU_TEST_READINESS", "pass")],
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "doctor's daemon probe must honor a whole-frame deadline, elapsed {elapsed:?}"
+    );
+    assert_eq!(doctor.status.code(), Some(4));
+    assert!(
+        stdout(&doctor).contains("Daemon: FAIL"),
+        "{}",
+        stdout(&doctor)
     );
     server.join().unwrap();
 }
