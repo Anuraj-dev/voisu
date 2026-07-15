@@ -204,6 +204,13 @@ dir=$(dirname "$0")
 printf '%s\n' "$@" > "$dir/secret-tool.args"
 env | sort > "$dir/secret-tool.env"
 if [ -e "$dir/secret-tool.stall" ]; then exec sleep 10; fi
+if [ -e "$dir/secret-tool.orphan-crash" ]; then
+  # A detached descendant holds the pipes while this child exits ABNORMALLY,
+  # exercising the error path through helper-thread cleanup.
+  setsid sleep 10 &
+  cat > /dev/null
+  kill -KILL $$
+fi
 if [ -e "$dir/secret-tool.orphan" ]; then
   # A detached descendant inherits and holds the stdout/stderr pipes open long
   # after this child exits successfully.
@@ -589,6 +596,30 @@ fn auth_set_is_bounded_when_a_descendant_holds_the_pipes_past_child_exit() {
         started.elapsed()
     );
     assert!(!stderr(&held).contains("controlled-secret"));
+}
+
+#[test]
+fn auth_set_is_bounded_when_the_child_crashes_while_a_descendant_holds_the_pipes() {
+    let runtime = TempDir::new().unwrap();
+    let commands = FakeCommands::new();
+    // The child is SIGKILLed (abnormal exit) while a setsid grandchild holds
+    // the pipes: the error path must still give every helper thread a bounded
+    // join and must not hang or leak the credential.
+    commands.touch("secret-tool.orphan-crash");
+    let started = Instant::now();
+    let crashed = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[("PATH", &commands.path())],
+        "controlled-secret",
+    );
+    assert_eq!(crashed.status.code(), Some(4));
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "cleanup after an abnormal child exit must stay bounded, elapsed {:?}",
+        started.elapsed()
+    );
+    assert!(!stderr(&crashed).contains("controlled-secret"));
 }
 
 #[test]

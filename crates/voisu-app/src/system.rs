@@ -538,10 +538,15 @@ fn run_restricted(
     // path: a descendant of the child can inherit and hold the pipes open past
     // the child's own exit, which would otherwise block a bare join() forever
     // (or, on the error path, silently leave detached threads blocked).
+    // Collect every helper-thread result FIRST, then decide the outcome: an
+    // early return between joins would silently detach a later thread while it
+    // may still be blocked on a descendant-held pipe.
     let status = wait_for_child(&mut child, started);
     let writer = writer.map(|handle| bounded_join(handle, started, &mut child));
-    let stdout = pipe_bytes(stdout_reader.map(|handle| bounded_join(handle, started, &mut child)))?;
-    let stderr = pipe_bytes(stderr_reader.map(|handle| bounded_join(handle, started, &mut child)))?;
+    let stdout_joined = stdout_reader.map(|handle| bounded_join(handle, started, &mut child));
+    let stderr_joined = stderr_reader.map(|handle| bounded_join(handle, started, &mut child));
+    let stdout = pipe_bytes(stdout_joined)?;
+    let stderr = pipe_bytes(stderr_joined)?;
     let status = status?;
     if let Some(writer) = writer {
         match writer {
@@ -565,12 +570,26 @@ fn bounded_join<T: Send + 'static>(
     while !handle.is_finished() {
         if started.elapsed() >= PROCESS_DEADLINE {
             let _ = child.kill();
+            reap_briefly(child);
             drop(handle);
             return Err(ProcessError::TimedOut);
         }
         thread::sleep(PROCESS_POLL);
     }
     handle.join().map_err(|_| ProcessError::Output)
+}
+
+/// Best-effort reap of a killed child under a small extra budget so no zombie
+/// is left behind; if it still has not been collected, give up rather than
+/// block the caller further.
+fn reap_briefly(child: &mut Child) {
+    let reap_started = Instant::now();
+    while reap_started.elapsed() < Duration::from_millis(250) {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(PROCESS_POLL),
+        }
+    }
 }
 
 fn pipe_bytes(
@@ -606,8 +625,16 @@ fn wait_for_child(
     started: Instant,
 ) -> Result<std::process::ExitStatus, ProcessError> {
     loop {
-        if let Some(status) = child.try_wait().map_err(|_| ProcessError::Wait)? {
-            return Ok(status);
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(_) => {
+                // The child may still be live even though its status cannot be
+                // read; kill and best-effort reap before surfacing the error.
+                let _ = child.kill();
+                reap_briefly(child);
+                return Err(ProcessError::Wait);
+            }
         }
         if started.elapsed() >= PROCESS_DEADLINE {
             let _ = child.kill();
