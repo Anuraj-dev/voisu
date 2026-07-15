@@ -2,31 +2,35 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-15
 
 ## 🚧 In progress / next
-- Planning is complete and approved; **no code exists yet**. Next: begin implementation with ticket
-  `.scratch/voisu-implementation/issues/01-prove-daemon-cli-lifecycle.md`.
+- Ticket 01 is implemented and acceptance-tested, but the runner mounted `.git` read-only. Next: restore
+  writable Git metadata, recreate the verified RED `test:` commit before the GREEN implementation commit,
+  then run `cargo fmt` and `cargo clippy` with a complete Rust toolchain.
 
 ## Status
-- Zero commits, zero source files — this is a planning-complete, pre-implementation repo.
-- Done: domain language (CONTEXT.md), platform research, 6 ADRs, approved spec, 10 implementation tickets.
+- Initial Cargo workspace exists with independently executed `voisu` and `voisu-daemon` binaries.
+- Versioned Unix IPC proves unavailable/idle status, concurrent start rejection, stop, toggle, and protocol
+  mismatch behavior through six public CLI/IPC acceptance tests.
+- Audio capture, provider, validation, clock, and Delivery behavior use controlled trait-backed adapters.
+- `cargo build --workspace` and `cargo test --workspace` pass; all six acceptance tests are GREEN.
+- Changes remain untracked because `.git` is read-only in this runner.
 
-## Architecture map (planned, not built)
-- Rust daemon (core: Recording → dual cloud transcription → reconcile → Delivery)
-- Separate optional GTK4 Overlay over a versioned Unix socket (build ONLY after daemon milestone)
-- Providers: Groq (bounded overlapping chunks) + Deepgram (continuous stream), bounded Provider Deadline
-- Input/output via XDG portals: Global Shortcuts (Trigger Key), Remote Desktop + libei (Delivery); clipboard fallback
+## Architecture map
+- Domain lifecycle, IPC contract, runtime path, boundary traits -> `crates/voisu-core/src/lib.rs`
+- Tokio Unix-socket daemon and controlled adapters -> `crates/voisu-app/src/bin/voisu-daemon.rs`
+- Thin public CLI -> `crates/voisu-app/src/bin/voisu.rs`
+- Public-surface acceptance suite -> `crates/voisu-app/tests/daemon_cli_lifecycle.rs`
 
 ## Stack & run
-- Stack: Rust (planned; no Cargo.toml yet) · Run: TODO · Test: TODO (RED → GREEN → REFACTOR cycles required)
+- Stack: Rust 2024 + Tokio + serde · Run: `cargo run -p voisu-app --bin voisu-daemon` · Test: `cargo test --workspace`
 
-## Key decisions (see docs/adr/ for full text)
-- Cloud-only dual-provider transcription (Groq + Deepgram), no local model (ADR-0001)
-- Independent Rust codebase, not a HyprVox fork (ADR-0002)
-- Daemon and Overlay are separate processes (ADR-0003)
-- XDG portals only — never raw input devices or privileged uinput (ADR-0004)
-- Concurrent streaming with bounded quality wait (ADR-0005)
-- Diagnostics local-only; raw audio opt-in and auto-expiring (ADR-0006)
+## Key decisions (see docs/decisions.md and docs/adr/)
+- `voisu-core` owns domain/protocol seams; `voisu-app` packages both process binaries for real-binary tests.
+- Protocol v1 is explicit in every payload and in `$XDG_RUNTIME_DIR/voisu/v1/daemon.sock`.
+- External lifecycle boundaries are synchronous traits with controlled Ticket 01 adapters; no provider/audio implementation yet.
+- Existing ADRs 0001–0006 continue to govern later production implementation.
 
 ## Gotchas
-- Use CONTEXT.md's ubiquitous language exactly (Recording, Transcript, Trigger Key, Delivery, …) — it lists banned synonyms.
-- Implementation must follow the approved spec `.scratch/voisu-spec/issues/01-fedora-cloud-dictation.md` and ticket order.
-- Preserve MIT attribution for anything adapted from HyprVox.
+- Use CONTEXT.md's ubiquitous language exactly; it lists banned synonyms.
+- The runner lacks `rustfmt` and `clippy`, so those required checks remain unexecuted despite clean build/tests.
+- Use an injected writable `CARGO_HOME` in the current sandbox; the default Cargo registry is read-only.
+- Do not add `voisu service ...`, systemd integration, real cloud/audio adapters, or the Overlay in Ticket 01.
