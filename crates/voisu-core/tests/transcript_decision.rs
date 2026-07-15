@@ -593,6 +593,11 @@ async fn extended_block_homoglyph_merge_results_are_rejected_and_repaired() {
     let unsafe_candidates = [
         "Schedule the p\u{1f00}yment review Wednesday morning.",
         "Schedule the a\u{a640} review Wednesday morning.",
+        // A Latin Extended-F letter (U+10783) mixed with Cyrillic inside one
+        // token must classify as Latin and be rejected as script mixing. The
+        // surrounding words are Cyrillic so only the token-level classifier —
+        // not the whole-text script count — can catch it.
+        "\u{0417}\u{0430}\u{043f}\u{043b}\u{0430}\u{043d}\u{0438}\u{0440}\u{0443}\u{0439} \u{10783}\u{043b} \u{043f}\u{0440}\u{043e}\u{0432}\u{0435}\u{0440}\u{043a}\u{0443} \u{0432} \u{0441}\u{0440}\u{0435}\u{0434}\u{0443}.",
     ];
 
     for candidate in unsafe_candidates {

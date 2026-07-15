@@ -806,7 +806,8 @@ fn confusable_script(character: char) -> Option<ConfusableScript> {
         | 0x2c60..=0x2c7f // Latin Extended-C
         | 0xa720..=0xa7ff // Latin Extended-D
         | 0xab30..=0xab6f // Latin Extended-E
-        | 0x1df00..=0x1dfff // Latin Extended-F/G
+        | 0x10780..=0x107bf // Latin Extended-F
+        | 0x1df00..=0x1dfff // Latin Extended-G
         => Some(ConfusableScript::Latin),
         0x0370..=0x03ff // Greek and Coptic
         | 0x1f00..=0x1fff // Greek Extended
