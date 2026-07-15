@@ -102,6 +102,22 @@ pub struct LifecycleEvidence {
     pub delivery_count: u32,
     #[serde(default)]
     pub streamed_chunk_count: u32,
+    #[serde(default)]
+    pub source_transcript_providers: Vec<Provider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_chunk_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_finalized_ms: Option<u64>,
+    #[serde(default)]
+    pub provider_timings_ms: Vec<ProviderTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_to_text_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProviderTiming {
+    pub provider: Provider,
+    pub completed_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -379,6 +395,11 @@ pub struct ProviderCoordinator {
     streams: ProviderStreams,
 }
 
+pub struct ProviderCompletion {
+    pub sources: Vec<SourceTranscript>,
+    pub timings_ms: Vec<ProviderTiming>,
+}
+
 impl ProviderCoordinator {
     pub fn start(deadline: Duration, streams: ProviderStreams) -> Self {
         Self { deadline, streams }
@@ -410,6 +431,14 @@ impl ProviderCoordinator {
         self,
         audio: CapturedAudio,
     ) -> Result<Vec<SourceTranscript>, BoundaryError> {
+        Ok(self.complete_with_timings(audio).await?.sources)
+    }
+
+    pub async fn complete_with_timings(
+        self,
+        audio: CapturedAudio,
+    ) -> Result<ProviderCompletion, BoundaryError> {
+        let started = tokio::time::Instant::now();
         let deepgram = self.streams.deepgram.complete(audio.clone());
         let groq = self.streams.groq.complete(audio);
         tokio::pin!(deepgram, groq);
@@ -418,6 +447,7 @@ impl ProviderCoordinator {
         let mut deepgram_done = false;
         let mut groq_done = false;
         let mut transcripts = Vec::new();
+        let mut timings_ms = Vec::new();
         let mut diagnostics = Vec::new();
 
         while !deepgram_done || !groq_done {
@@ -429,14 +459,26 @@ impl ProviderCoordinator {
                 result = &mut deepgram, if !deepgram_done => {
                     deepgram_done = true;
                     match result {
-                        Ok(source) => transcripts.push(source),
+                        Ok(source) => {
+                            timings_ms.push(ProviderTiming {
+                                provider: source.provider,
+                                completed_ms: duration_millis(started.elapsed()),
+                            });
+                            transcripts.push(source);
+                        }
                         Err(error) => diagnostics.push(error.diagnostic().to_owned()),
                     }
                 }
                 result = &mut groq, if !groq_done => {
                     groq_done = true;
                     match result {
-                        Ok(source) => transcripts.push(source),
+                        Ok(source) => {
+                            timings_ms.push(ProviderTiming {
+                                provider: source.provider,
+                                completed_ms: duration_millis(started.elapsed()),
+                            });
+                            transcripts.push(source);
+                        }
                         Err(error) => diagnostics.push(error.diagnostic().to_owned()),
                     }
                 }
@@ -445,6 +487,7 @@ impl ProviderCoordinator {
         }
 
         transcripts.sort_by_key(|source| source.provider);
+        timings_ms.sort_by_key(|timing| timing.provider);
         if transcripts.is_empty() {
             let detail = if diagnostics.is_empty() {
                 "Provider Deadline elapsed".to_owned()
@@ -453,9 +496,16 @@ impl ProviderCoordinator {
             };
             Err(BoundaryError::new(BoundaryKind::Provider, detail))
         } else {
-            Ok(transcripts)
+            Ok(ProviderCompletion {
+                sources: transcripts,
+                timings_ms,
+            })
         }
     }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 pub trait TranscriptValidator: Send {

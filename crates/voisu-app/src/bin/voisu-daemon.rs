@@ -2,9 +2,9 @@ use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -12,8 +12,8 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use voisu_app::system::{
-    CAPTURE_FINALIZE_DEADLINE, ClipboardDelivery, GroqProvider, MergeResultValidator,
-    PROVIDER_COMPLETION_DEADLINE, PipeWireCapture, RECOVERY_ABORT_DEADLINE, UnavailableDeepgram,
+    CAPTURE_FINALIZE_DEADLINE, ClipboardDelivery, DeepgramProvider, GroqProvider,
+    MergeResultValidator, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture, RECOVERY_ABORT_DEADLINE,
 };
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
@@ -214,6 +214,8 @@ struct ActiveRecording {
     stop_tx: oneshot::Sender<()>,
     pump: JoinHandle<PumpOutput>,
     chunk_counter: Arc<AtomicU32>,
+    first_chunk_ms: Arc<AtomicU64>,
+    started_at: Instant,
     evidence: LifecycleEvidence,
 }
 
@@ -260,7 +262,7 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
     let mut deepgram: Option<Box<dyn TranscriptProvider>> = Some(if controlled {
         Box::new(ControlledProvider::from_env(Provider::Deepgram))
     } else {
-        Box::new(UnavailableDeepgram)
+        Box::new(DeepgramProvider)
     });
     let mut groq: Option<Box<dyn TranscriptProvider>> = Some(if controlled {
         Box::new(ControlledProvider::from_env(Provider::Groq))
@@ -337,6 +339,8 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                     let mut processing_evidence = recording.evidence.clone();
                     processing_evidence.streamed_chunk_count =
                         recording.chunk_counter.load(Ordering::SeqCst);
+                    processing_evidence.first_chunk_ms =
+                        atomic_millis(&recording.first_chunk_ms);
                     state = ActorState::Processing(processing_evidence);
                     let actor = tx.clone();
                     let current_validator = validator.take().expect("validator is available");
@@ -393,17 +397,34 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                                 ],
                                 delivery_count: 0,
                                 streamed_chunk_count: 0,
+                                source_transcript_providers: Vec::new(),
+                                first_chunk_ms: None,
+                                capture_finalized_ms: None,
+                                provider_timings_ms: Vec::new(),
+                                release_to_text_ms: None,
                             };
                             let (stop_tx, stop_rx) = oneshot::channel();
                             let chunk_counter = Arc::new(AtomicU32::new(0));
+                            let first_chunk_ms = Arc::new(AtomicU64::new(u64::MAX));
+                            let started_at = Instant::now();
+                            let provider_deadline = if controlled
+                                && std::env::var_os("VOISU_TEST_PROVIDER_DEADLINE_MS").is_some()
+                            {
+                                env_millis("VOISU_TEST_PROVIDER_DEADLINE_MS")
+                                    .max(Duration::from_millis(1))
+                            } else {
+                                PROVIDER_DEADLINE
+                            };
                             let coordinator =
-                                ProviderCoordinator::start(PROVIDER_DEADLINE, streams);
+                                ProviderCoordinator::start(provider_deadline, streams);
                             let pump = tokio::spawn(capture_pump(
                                 id,
                                 active_capture,
                                 coordinator,
                                 stop_rx,
                                 Arc::clone(&chunk_counter),
+                                Arc::clone(&first_chunk_ms),
+                                started_at,
                                 tx.clone(),
                             ));
                             state = ActorState::Recording(ActiveRecording {
@@ -411,6 +432,8 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                                 stop_tx,
                                 pump,
                                 chunk_counter,
+                                first_chunk_ms,
+                                started_at,
                                 evidence,
                             });
                             let _ = reply.send(Response::success(
@@ -452,6 +475,8 @@ async fn actor_loop(mut rx: mpsc::Receiver<ActorMessage>, tx: mpsc::Sender<Actor
                     let mut processing_evidence = recording.evidence.clone();
                     processing_evidence.streamed_chunk_count =
                         recording.chunk_counter.load(Ordering::SeqCst);
+                    processing_evidence.first_chunk_ms =
+                        atomic_millis(&recording.first_chunk_ms);
                     state = ActorState::Processing(processing_evidence);
                     let current_validator = validator.take().expect("validator is available");
                     let current_delivery = delivery.take().expect("Delivery adapter is available");
@@ -515,12 +540,22 @@ fn status_response(state: &ActorState) -> Response {
             ActorState::Recording(recording) => {
                 let mut evidence = recording.evidence.clone();
                 evidence.streamed_chunk_count = recording.chunk_counter.load(Ordering::SeqCst);
+                evidence.first_chunk_ms = atomic_millis(&recording.first_chunk_ms);
                 Some(evidence)
             }
             ActorState::Processing(evidence) => Some(evidence.clone()),
             ActorState::Idle | ActorState::Starting(_) | ActorState::Recovering(_) => None,
         },
     )
+}
+
+fn atomic_millis(value: &AtomicU64) -> Option<u64> {
+    let value = value.load(Ordering::SeqCst);
+    (value != u64::MAX).then_some(value)
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Starts a Recording. If a later step of the start sequence fails, everything
@@ -669,6 +704,8 @@ async fn capture_pump(
     mut providers: ProviderCoordinator,
     mut stop_rx: oneshot::Receiver<()>,
     counter: Arc<AtomicU32>,
+    first_chunk_ms: Arc<AtomicU64>,
+    started_at: Instant,
     actor: mpsc::Sender<ActorMessage>,
 ) -> PumpOutput {
     let mut stream_error = None;
@@ -685,7 +722,15 @@ async fn capture_pump(
                         biased;
                         _ = &mut stop_rx => break,
                         sent = providers.stream_audio(chunk) => match sent {
-                            Ok(()) => { counter.fetch_add(1, Ordering::SeqCst); }
+                            Ok(()) => {
+                                counter.fetch_add(1, Ordering::SeqCst);
+                                let _ = first_chunk_ms.compare_exchange(
+                                    u64::MAX,
+                                    elapsed_millis(started_at),
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                );
+                            }
                             Err(error) => {
                                 stream_error = Some(error);
                                 break;
@@ -721,6 +766,8 @@ async fn process_recording(
         stop_tx,
         pump,
         chunk_counter,
+        first_chunk_ms,
+        started_at,
         mut evidence,
     } = recording;
     let _ = stop_tx.send(());
@@ -730,6 +777,7 @@ async fn process_recording(
         stream_error,
     } = pump.await.expect("capture pump should not panic");
     evidence.streamed_chunk_count = chunk_counter.load(Ordering::SeqCst);
+    evidence.first_chunk_ms = atomic_millis(&first_chunk_ms);
 
     let result = async {
         if let Some(error) = stream_error {
@@ -743,13 +791,19 @@ async fn process_recording(
                 return Err(abort_recording_work(capture, providers, error).await);
             }
         };
+        evidence.capture_finalized_ms = Some(elapsed_millis(started_at));
         evidence.stages.push(LifecycleStage::CaptureFinalized);
-        let sources = providers.complete(audio).await?;
+        let completed = providers.complete_with_timings(audio).await?;
+        let sources = completed.sources;
+        evidence.provider_timings_ms = completed.timings_ms;
+        evidence.source_transcript_providers =
+            sources.iter().map(|source| source.provider).collect();
         evidence.stages.push(LifecycleStage::ProvidersCompleted);
         let transcript = validator.validate(sources)?;
         evidence.stages.push(LifecycleStage::ValidationCompleted);
         delivery.deliver(transcript).await?;
         evidence.delivery_count += 1;
+        evidence.release_to_text_ms = Some(elapsed_millis(started_at));
         evidence.stages.push(LifecycleStage::DeliveryCompleted);
         Ok(())
     }
@@ -930,23 +984,36 @@ struct ControlledProvider {
     send_stall: Duration,
     fail_start_once: bool,
     fail_abort: bool,
+    fail_complete: bool,
 }
 
 impl ControlledProvider {
     fn from_env(provider: Provider) -> Self {
-        let delay = env_millis("VOISU_TEST_PROVIDER_DELAY_MS");
+        let provider_delay_name = match provider {
+            Provider::Deepgram => "VOISU_TEST_DEEPGRAM_DELAY_MS",
+            Provider::Groq => "VOISU_TEST_GROQ_DELAY_MS",
+        };
+        let delay = if std::env::var_os(provider_delay_name).is_some() {
+            env_millis(provider_delay_name)
+        } else {
+            env_millis("VOISU_TEST_PROVIDER_DELAY_MS")
+        };
         let send_stall = env_millis("VOISU_TEST_PROVIDER_SEND_STALL_MS");
         // Only Groq fails its start, so capture and Deepgram are already started
         // when the partial-start-failure abort path is exercised.
         let fail_start_once = provider == Provider::Groq
             && std::env::var_os("VOISU_TEST_PROVIDER_START_FAILURE").is_some();
         let fail_abort = std::env::var_os("VOISU_TEST_PROVIDER_ABORT_FAILURE").is_some();
+        let fail_complete = std::env::var("VOISU_TEST_PROVIDER_COMPLETE_FAILURE")
+            .ok()
+            .is_some_and(|value| value == provider.secret_service_value());
         Self {
             provider,
             delay,
             send_stall,
             fail_start_once,
             fail_abort,
+            fail_complete,
         }
     }
 }
@@ -964,6 +1031,7 @@ impl TranscriptProvider for ControlledProvider {
             delay: self.delay,
             send_stall: self.send_stall,
             fail_abort: self.fail_abort,
+            fail_complete: self.fail_complete,
         }))
     }
 }
@@ -973,6 +1041,7 @@ struct ControlledProviderStream {
     delay: Duration,
     send_stall: Duration,
     fail_abort: bool,
+    fail_complete: bool,
 }
 
 impl ProviderStream for ControlledProviderStream {
@@ -1009,6 +1078,12 @@ impl ProviderStream for ControlledProviderStream {
     ) -> BoundaryFuture<'static, SourceTranscript> {
         Box::pin(async move {
             tokio::time::sleep(self.delay).await;
+            if self.fail_complete {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Provider,
+                    "controlled-provider-completion-detail",
+                ));
+            }
             Ok(SourceTranscript {
                 provider: self.provider,
                 text: "controlled Source Transcript".to_owned(),

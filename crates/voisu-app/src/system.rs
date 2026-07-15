@@ -40,6 +40,7 @@ const MIN_RECORDING_BYTES: usize = PCM_CHUNK_BYTES;
 const MAX_RECORDING_BYTES: usize = 16_000 * 2 * 60 * 5;
 const GROQ_CHUNK_BYTES: usize = 16_000 * 2 * 30;
 const GROQ_CHUNK_OVERLAP_BYTES: usize = 16_000;
+const DEEPGRAM_CHUNK_BYTES: usize = 16_000 * 2;
 
 pub struct FedoraReadiness;
 
@@ -996,7 +997,7 @@ impl TranscriptProvider for GroqProvider {
         let credential = SecretStore::load(&mut SecretToolStore, Provider::Groq)?;
         let endpoint = std::env::var("VOISU_GROQ_TRANSCRIPTION_URL")
             .unwrap_or_else(|_| "https://api.groq.com/openai/v1/audio/transcriptions".to_owned());
-        if !groq_endpoint_is_secure(&endpoint) {
+        if !provider_endpoint_is_secure(&endpoint) {
             return Err(BoundaryError::new(
                 BoundaryKind::Provider,
                 "Groq transcription endpoint must use HTTPS except on loopback",
@@ -1013,7 +1014,7 @@ impl TranscriptProvider for GroqProvider {
     }
 }
 
-fn groq_endpoint_is_secure(endpoint: &str) -> bool {
+fn provider_endpoint_is_secure(endpoint: &str) -> bool {
     if endpoint.contains(['\n', '\r']) {
         return false;
     }
@@ -1043,6 +1044,15 @@ struct GroqStream {
     /// stream and flag, cancelling one Recording can never touch the next
     /// one's requests, and stale results die with their aborted stream.
     cancel: Arc<CancelRegistry>,
+}
+
+impl Drop for GroqStream {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        for chunk in self.chunks.drain(..) {
+            chunk.abort();
+        }
+    }
 }
 
 impl ProviderStream for GroqStream {
@@ -1081,7 +1091,7 @@ impl ProviderStream for GroqStream {
             // Recording overlap the next one.
             self.cancel.cancel();
             for chunk in self.chunks.drain(..) {
-                chunk.abort();
+                let _ = chunk.await;
             }
             Ok(())
         })
@@ -1112,8 +1122,8 @@ impl ProviderStream for GroqStream {
                 transcripts.push(
                     ProviderHttpClient
                         .transcribe_groq_chunk(
-                            self.credential,
-                            self.endpoint,
+                            self.credential.clone(),
+                            self.endpoint.clone(),
                             std::mem::take(&mut self.buffer),
                             Arc::clone(&self.cancel),
                         )
@@ -1129,11 +1139,34 @@ impl ProviderStream for GroqStream {
     }
 }
 
-pub struct UnavailableDeepgram;
+pub struct DeepgramProvider;
 
-impl TranscriptProvider for UnavailableDeepgram {
+impl TranscriptProvider for DeepgramProvider {
     fn start(&mut self, _recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError> {
-        Ok(Box::new(UnavailableDeepgramStream))
+        if std::env::var_os("VOISU_TEST_DEEPGRAM_UNAVAILABLE").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            return Ok(Box::new(UnavailableDeepgramStream));
+        }
+        let credential = SecretStore::load(&mut SecretToolStore, Provider::Deepgram)?;
+        let endpoint = std::env::var("VOISU_DEEPGRAM_TRANSCRIPTION_URL").unwrap_or_else(|_| {
+            "https://api.deepgram.com/v1/listen?model=nova-3&encoding=linear16&sample_rate=16000&channels=1"
+                .to_owned()
+        });
+        if !provider_endpoint_is_secure(&endpoint) {
+            return Err(BoundaryError::new(
+                BoundaryKind::Provider,
+                "Deepgram transcription endpoint must use HTTPS except on loopback",
+            ));
+        }
+        Ok(Box::new(DeepgramStream {
+            credential,
+            endpoint,
+            buffer: Vec::new(),
+            streamed_bytes: 0,
+            chunks: Vec::new(),
+            cancel: CancelRegistry::new(),
+        }))
     }
 }
 
@@ -1159,8 +1192,98 @@ impl ProviderStream for UnavailableDeepgramStream {
         Box::pin(async {
             Err(BoundaryError::new(
                 BoundaryKind::Provider,
-                "Deepgram adapter is not enabled in Ticket 03",
+                "controlled Deepgram adapter unavailable",
             ))
+        })
+    }
+}
+
+struct DeepgramStream {
+    credential: Credential,
+    endpoint: String,
+    buffer: Vec<u8>,
+    streamed_bytes: usize,
+    chunks: Vec<tokio::task::JoinHandle<Result<String, BoundaryError>>>,
+    cancel: Arc<CancelRegistry>,
+}
+
+impl Drop for DeepgramStream {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        for chunk in self.chunks.drain(..) {
+            chunk.abort();
+        }
+    }
+}
+
+impl ProviderStream for DeepgramStream {
+    fn provider(&self) -> Provider {
+        Provider::Deepgram
+    }
+
+    fn send_audio(&mut self, chunk: AudioChunk) -> BoundaryFuture<'_, ()> {
+        Box::pin(async move {
+            self.streamed_bytes = self.streamed_bytes.saturating_add(chunk.0.len());
+            self.buffer.extend_from_slice(&chunk.0);
+            while self.buffer.len() >= DEEPGRAM_CHUNK_BYTES {
+                let pcm = self.buffer.drain(..DEEPGRAM_CHUNK_BYTES).collect();
+                let credential = self.credential.clone();
+                let endpoint = self.endpoint.clone();
+                let cancel = Arc::clone(&self.cancel);
+                self.chunks.push(tokio::spawn(async move {
+                    ProviderHttpClient
+                        .transcribe_deepgram_chunk(credential, endpoint, pcm, cancel)
+                        .await
+                }));
+            }
+            Ok(())
+        })
+    }
+
+    fn abort(mut self: Box<Self>) -> BoundaryFuture<'static, ()> {
+        Box::pin(async move {
+            self.cancel.cancel();
+            for chunk in self.chunks.drain(..) {
+                let _ = chunk.await;
+            }
+            Ok(())
+        })
+    }
+
+    fn complete(
+        mut self: Box<Self>,
+        audio: CapturedAudio,
+    ) -> BoundaryFuture<'static, SourceTranscript> {
+        Box::pin(async move {
+            let pcm = audio.pcm_s16le_mono_16khz();
+            if self.streamed_bytes > pcm.len() {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Provider,
+                    "Deepgram stream exceeded the finalized Recording",
+                ));
+            }
+            self.buffer.extend_from_slice(&pcm[self.streamed_bytes..]);
+            if !self.buffer.is_empty() || self.chunks.is_empty() {
+                let credential = self.credential.clone();
+                let endpoint = self.endpoint.clone();
+                let tail = std::mem::take(&mut self.buffer);
+                let cancel = Arc::clone(&self.cancel);
+                self.chunks.push(tokio::spawn(async move {
+                    ProviderHttpClient
+                        .transcribe_deepgram_chunk(credential, endpoint, tail, cancel)
+                        .await
+                }));
+            }
+            let mut transcripts = Vec::new();
+            for chunk in self.chunks.drain(..) {
+                transcripts.push(chunk.await.map_err(|_| {
+                    BoundaryError::new(BoundaryKind::Provider, "Deepgram chunk task failed")
+                })??);
+            }
+            Ok(SourceTranscript {
+                provider: Provider::Deepgram,
+                text: merge_chunk_transcripts(transcripts),
+            })
         })
     }
 }
@@ -1172,20 +1295,27 @@ impl TranscriptValidator for MergeResultValidator {
         &mut self,
         sources: Vec<SourceTranscript>,
     ) -> Result<Transcript, BoundaryError> {
-        let source = sources
+        let mut valid: Vec<_> = sources
             .into_iter()
-            .find(|source| source.provider == Provider::Groq)
+            .filter_map(|source| {
+                let text = source.text.trim();
+                (!text.is_empty() && !text.contains('\0') && text.len() <= 100_000)
+                    .then(|| (source.provider, text.to_owned()))
+            })
+            .collect();
+        valid.sort_by_key(|(provider, _)| *provider);
+        let text = valid
+            .iter()
+            .find(|(provider, _)| *provider == Provider::Groq)
+            .or_else(|| valid.first())
+            .map(|(_, text)| text.clone())
             .ok_or_else(|| {
-                BoundaryError::new(BoundaryKind::Validation, "Groq Source Transcript missing")
+                BoundaryError::new(
+                    BoundaryKind::Validation,
+                    "Source Transcripts violated the Merge Result guardrails",
+                )
             })?;
-        let text = source.text.trim();
-        if text.is_empty() || text.contains('\0') || text.len() > 100_000 {
-            return Err(BoundaryError::new(
-                BoundaryKind::Validation,
-                "Groq Source Transcript violated the Merge Result guardrails",
-            ));
-        }
-        Ok(Transcript(text.to_owned()))
+        Ok(Transcript(text))
     }
 }
 
@@ -1221,6 +1351,20 @@ impl DeliveryAdapter for ClipboardDelivery {
 }
 
 impl ProviderHttpClient {
+    async fn transcribe_deepgram_chunk(
+        &self,
+        credential: Credential,
+        endpoint: String,
+        pcm: Vec<u8>,
+        cancel: Arc<CancelRegistry>,
+    ) -> Result<String, BoundaryError> {
+        tokio::task::spawn_blocking(move || {
+            request_deepgram_chunk(credential, endpoint, pcm, &cancel)
+        })
+        .await
+        .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "Deepgram request task failed"))?
+    }
+
     async fn transcribe_groq_chunk(
         &self,
         credential: Credential,
@@ -1232,6 +1376,70 @@ impl ProviderHttpClient {
             .await
             .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "Groq request task failed"))?
     }
+}
+
+fn request_deepgram_chunk(
+    credential: Credential,
+    endpoint: String,
+    pcm: Vec<u8>,
+    cancel: &CancelRegistry,
+) -> Result<String, BoundaryError> {
+    let mut file = tempfile::Builder::new()
+        .prefix("voisu-deepgram-")
+        .suffix(".pcm")
+        .tempfile()
+        .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "temporary audio file unavailable"))?;
+    file.write_all(&pcm)
+        .and_then(|()| file.flush())
+        .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "temporary audio write failed"))?;
+    let endpoint = curl_config_escape(&endpoint);
+    let credential = curl_config_escape(credential.expose_to_boundary());
+    let path = curl_config_escape(&file.path().to_string_lossy());
+    let config = format!(
+        "url = \"{endpoint}\"\nheader = \"Authorization: Token {credential}\"\nheader = \"Content-Type: audio/raw\"\ndata-binary = \"@{path}\"\n"
+    );
+    let outcome = run_restricted_with_deadline(
+        "curl",
+        &[
+            "-q",
+            "--config",
+            "-",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "15",
+        ],
+        Some(config.as_bytes()),
+        true,
+        PROVIDER_PROCESS_DEADLINE,
+        Some(cancel),
+    )
+    .map_err(|error| match error {
+        ProcessError::TimedOut => {
+            BoundaryError::new(BoundaryKind::Provider, "Deepgram Provider Deadline elapsed")
+        }
+        _ => BoundaryError::new(
+            BoundaryKind::Provider,
+            "Deepgram request unavailable or failed",
+        ),
+    })?;
+    if !outcome.success {
+        return Err(BoundaryError::new(
+            BoundaryKind::Provider,
+            "Deepgram rejected the audio request",
+        ));
+    }
+    let response: serde_json::Value = serde_json::from_slice(&outcome.stdout).map_err(|_| {
+        BoundaryError::new(BoundaryKind::Provider, "Deepgram returned malformed JSON")
+    })?;
+    response
+        .pointer("/results/channels/0/alternatives/0/transcript")
+        .and_then(|text| text.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            BoundaryError::new(BoundaryKind::Provider, "Deepgram response omitted text")
+        })
 }
 
 fn request_groq_chunk(
@@ -1271,7 +1479,7 @@ fn request_groq_chunk(
             "--silent",
             "--show-error",
             "--max-time",
-            "14",
+            "15",
         ],
         Some(config.as_bytes()),
         true,

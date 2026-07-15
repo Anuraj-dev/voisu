@@ -111,3 +111,10 @@ fail fast without spawning.
 **Why:** Ticket 03 needed 5 Sol review rounds; running every round at high effort wastes Codex quota once the
 first pass has surfaced the architecture-level findings. First review of a ticket runs Sol high; subsequent
 re-reviews until merge run Sol medium. Recorded in `AGENTS.md`/`CLAUDE.md`.
+
+## 2026-07-15 — Stream Deepgram through the existing hardened HTTP process boundary
+**Why:** The approved specification requires Deepgram to receive audio during the Recording but does not mandate a
+WebSocket library. One-second linear16 HTTP chunks begin cloud work live, preserve the existing stdin-only credential,
+`env_clear`, response-cap, cancellation, and owning-child kill/reap guarantees, and avoid adding a second networking
+stack. Voisu's 14-second whole-operation `Instant` budget intentionally expires before curl's 15-second internal limit,
+so Voisu consistently owns Provider Deadline classification and cleanup instead of racing curl's exit status.
