@@ -78,19 +78,39 @@ impl ReadinessInspector for FedoraReadiness {
     }
 }
 
+const PORTAL_BUS_NAME: &str = "org.freedesktop.portal.Desktop";
+const PORTAL_OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
+const GLOBAL_SHORTCUTS_INTERFACE: &str = "org.freedesktop.portal.GlobalShortcuts";
+const PORTAL_REQUEST_INTERFACE: &str = "org.freedesktop.portal.Request";
+const PORTAL_SESSION_INTERFACE: &str = "org.freedesktop.portal.Session";
+/// The single shortcut id Voisu binds: its activation toggles the Recording.
+pub const TRIGGER_KEY_ID: &str = "voisu-toggle";
+const TRIGGER_KEY_DESCRIPTION: &str = "Toggle Voisu Recording";
+/// Bound wait for the CreateSession portal round trip — no user interaction is
+/// involved, so a portal that does not answer within this is treated as absent.
+const PORTAL_SESSION_DEADLINE: Duration = Duration::from_secs(10);
+/// Bound wait for the BindShortcuts response. Binding can require the user to
+/// approve the Trigger Key in a desktop dialog, so this is generous; if the
+/// user walks away the listener fails closed and CLI control stays usable.
+const PORTAL_BIND_DEADLINE: Duration = Duration::from_secs(300);
+/// Bound wait for the best-effort Session.Close on retirement.
+const PORTAL_CLOSE_DEADLINE: Duration = Duration::from_secs(2);
+
+fn shortcut_error(detail: impl Into<String>) -> BoundaryError {
+    BoundaryError::new(BoundaryKind::Shortcut, detail)
+}
+
 /// Production Global Shortcuts portal edge
 /// (`org.freedesktop.portal.GlobalShortcuts`). It binds the Trigger Key through
 /// the desktop portal so Voisu never touches raw input devices.
 ///
-/// The GlobalShortcuts portal delivers `Activated` signals only to the D-Bus
-/// connection that created and bound the session, so the session must be held on
-/// a long-lived in-process connection — a per-call `busctl`/`gdbus` subprocess
-/// cannot receive its own session's activations. Until that native session
-/// client is built into the daemon, `bind` probes portal availability and then
-/// fails closed with a `Shortcut` boundary: the daemon degrades gracefully and
-/// keeps CLI start/stop/toggle fully usable (Ticket 07 acceptance: an
-/// unavailable portal never breaks Recording control). The controlled portal
-/// exercises the full activation contract in tests.
+/// The portal delivers `Activated` signals — and resolves request/session
+/// handles — against the caller's own D-Bus identity, so the session must live
+/// on a persistent native connection owned by the daemon; a per-call
+/// `busctl`/`gdbus` subprocess can create a session but can never receive its
+/// activations (see docs/decisions.md). Every failure — no session bus, portal
+/// name absent, permission denied — fails closed with a `Shortcut` boundary and
+/// never fabricates a binding.
 pub struct FedoraShortcutPortal;
 
 impl FedoraShortcutPortal {
@@ -105,48 +125,262 @@ impl Default for FedoraShortcutPortal {
     }
 }
 
+/// The portal request/session handle convention: predictable object paths are
+/// derived from the caller's unique name (`:1.42` -> `1_42`) plus a
+/// caller-chosen token, letting the caller subscribe to the `Response` signal
+/// BEFORE issuing the request so no response can be missed.
+fn escaped_sender(connection: &zbus::Connection) -> Result<String, BoundaryError> {
+    Ok(connection
+        .unique_name()
+        .ok_or_else(|| shortcut_error("session bus assigned no unique name"))?
+        .trim_start_matches(':')
+        .replace('.', "_"))
+}
+
+/// Performs one portal request round trip: subscribes to the expected
+/// `Request.Response` path, invokes `method` on the GlobalShortcuts portal, and
+/// awaits the response under `deadline`. Returns the response's results
+/// vardict; a non-zero response code (the user or desktop denied or cancelled
+/// the request) fails closed.
+async fn portal_request<B>(
+    connection: &zbus::Connection,
+    portal: &zbus::Proxy<'_>,
+    token: &str,
+    method: &str,
+    body: &B,
+    deadline: Duration,
+) -> Result<std::collections::HashMap<String, zbus::zvariant::OwnedValue>, BoundaryError>
+where
+    B: zbus::export::serde::ser::Serialize + zbus::zvariant::DynamicType,
+{
+    use zbus::export::ordered_stream::OrderedStreamExt;
+
+    let request_path = format!(
+        "/org/freedesktop/portal/desktop/request/{}/{token}",
+        escaped_sender(connection)?
+    );
+    let request_proxy = zbus::Proxy::new(
+        connection,
+        PORTAL_BUS_NAME,
+        request_path.as_str(),
+        PORTAL_REQUEST_INTERFACE,
+    )
+    .await
+    .map_err(|error| shortcut_error(format!("portal request proxy failed: {error}")))?;
+    let mut responses = request_proxy
+        .receive_signal("Response")
+        .await
+        .map_err(|error| shortcut_error(format!("portal response subscription failed: {error}")))?;
+
+    let reply = portal
+        .call_method(method, body)
+        .await
+        .map_err(|error| shortcut_error(format!("portal {method} failed: {error}")))?;
+    // Since xdg-desktop-portal 0.9 the returned handle equals the predictable
+    // path subscribed to above; on an older portal the actual handle differs
+    // and the subscription must move to it before the response is awaited.
+    let handle: zbus::zvariant::OwnedObjectPath = reply
+        .body()
+        .deserialize()
+        .map_err(|error| shortcut_error(format!("portal {method} returned no handle: {error}")))?;
+    if handle.as_str() != request_path {
+        let request_proxy = zbus::Proxy::new(
+            connection,
+            PORTAL_BUS_NAME,
+            handle.as_str().to_owned(),
+            PORTAL_REQUEST_INTERFACE,
+        )
+        .await
+        .map_err(|error| shortcut_error(format!("portal request proxy failed: {error}")))?;
+        responses = request_proxy.receive_signal("Response").await.map_err(|error| {
+            shortcut_error(format!("portal response subscription failed: {error}"))
+        })?;
+    }
+
+    let response = tokio::time::timeout(deadline, responses.next())
+        .await
+        .map_err(|_| shortcut_error(format!("portal {method} response deadline elapsed")))?
+        .ok_or_else(|| shortcut_error(format!("portal {method} response stream ended")))?;
+    let (code, results): (u32, std::collections::HashMap<String, zbus::zvariant::OwnedValue>) =
+        response
+            .body()
+            .deserialize()
+            .map_err(|error| shortcut_error(format!("portal {method} response malformed: {error}")))?;
+    if code != 0 {
+        return Err(shortcut_error(format!(
+            "the desktop denied or cancelled the {method} request (response {code})"
+        )));
+    }
+    Ok(results)
+}
+
+/// Extracts the desktop-approved trigger description for `TRIGGER_KEY_ID` from
+/// a BindShortcuts response (`shortcuts: a(sa{sv})`).
+fn approved_trigger_description(
+    results: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+) -> Option<String> {
+    use zbus::zvariant::Value;
+    let Value::Array(shortcuts) = &**results.get("shortcuts")? else {
+        return None;
+    };
+    for entry in shortcuts.iter() {
+        let Value::Structure(fields) = entry else {
+            continue;
+        };
+        let [Value::Str(id), Value::Dict(properties)] = fields.fields() else {
+            continue;
+        };
+        if id.as_str() != TRIGGER_KEY_ID {
+            continue;
+        }
+        if let Ok(Some(description)) =
+            properties.get::<_, zbus::zvariant::Str<'_>>(&"trigger_description")
+        {
+            return Some(description.as_str().to_owned());
+        }
+    }
+    None
+}
+
 impl ShortcutPortal for FedoraShortcutPortal {
     fn bind(&mut self) -> BoundaryFuture<'_, Box<dyn ShortcutSession>> {
         Box::pin(async move {
-            // Probe the desktop portal off the async runtime; the blocking
-            // subprocess must not stall the reactor.
-            let available = tokio::task::spawn_blocking(|| {
-                run_restricted(
-                    "busctl",
-                    &[
-                        "--user",
-                        "--no-pager",
-                        "status",
-                        "org.freedesktop.portal.Desktop",
-                    ],
-                    None,
-                    false,
-                )
-                .map(|outcome| outcome.success)
-                .unwrap_or(false)
-            })
+            use zbus::zvariant::Value;
+
+            let connection = zbus::Connection::session()
+                .await
+                .map_err(|error| shortcut_error(format!("session bus is unavailable: {error}")))?;
+            let portal = zbus::Proxy::new(
+                &connection,
+                PORTAL_BUS_NAME,
+                PORTAL_OBJECT_PATH,
+                GLOBAL_SHORTCUTS_INTERFACE,
+            )
             .await
-            .unwrap_or(false);
-            if !available {
-                return Err(BoundaryError::new(
-                    BoundaryKind::Shortcut,
-                    "desktop Global Shortcuts portal is unavailable",
-                ));
-            }
-            Err::<Box<dyn ShortcutSession>, _>(BoundaryError::new(
-                BoundaryKind::Shortcut,
-                "native Global Shortcuts session client is not yet wired into the daemon; \
-                 use the CLI to control Recording",
-            ))
+            .map_err(|error| shortcut_error(format!("portal proxy failed: {error}")))?;
+
+            // Tokens are unique per daemon process; the daemon binds at most one
+            // Global Shortcuts session per run.
+            let unique = std::process::id();
+            let session_token = format!("voisu_session_{unique}");
+            let create_token = format!("voisu_create_{unique}");
+            let bind_token = format!("voisu_bind_{unique}");
+            let session_path = format!(
+                "/org/freedesktop/portal/desktop/session/{}/{session_token}",
+                escaped_sender(&connection)?
+            );
+
+            let create_options: std::collections::HashMap<&str, Value<'_>> =
+                std::collections::HashMap::from([
+                    ("handle_token", Value::from(create_token.as_str())),
+                    ("session_handle_token", Value::from(session_token.as_str())),
+                ]);
+            portal_request(
+                &connection,
+                &portal,
+                &create_token,
+                "CreateSession",
+                &(create_options,),
+                PORTAL_SESSION_DEADLINE,
+            )
+            .await?;
+
+            // Subscribe to this session's signals BEFORE binding so an
+            // activation racing the bind response cannot be missed.
+            let session_object_path: zbus::zvariant::OwnedObjectPath =
+                zbus::zvariant::ObjectPath::try_from(session_path.as_str())
+                    .map_err(|error| shortcut_error(format!("session handle malformed: {error}")))?
+                    .into();
+            let activations = portal
+                .receive_signal("Activated")
+                .await
+                .map_err(|error| shortcut_error(format!("activation subscription failed: {error}")))?;
+            let session_proxy = zbus::Proxy::new(
+                &connection,
+                PORTAL_BUS_NAME,
+                session_path.as_str().to_owned(),
+                PORTAL_SESSION_INTERFACE,
+            )
+            .await
+            .map_err(|error| shortcut_error(format!("session proxy failed: {error}")))?;
+            let closures = session_proxy
+                .receive_signal("Closed")
+                .await
+                .map_err(|error| shortcut_error(format!("closure subscription failed: {error}")))?;
+
+            let shortcut_properties: std::collections::HashMap<&str, Value<'_>> =
+                std::collections::HashMap::from([(
+                    "description",
+                    Value::from(TRIGGER_KEY_DESCRIPTION),
+                )]);
+            let shortcuts = vec![(TRIGGER_KEY_ID, shortcut_properties)];
+            let bind_options: std::collections::HashMap<&str, Value<'_>> =
+                std::collections::HashMap::from([("handle_token", Value::from(bind_token.as_str()))]);
+            let results = portal_request(
+                &connection,
+                &portal,
+                &bind_token,
+                "BindShortcuts",
+                &(
+                    session_object_path.clone(),
+                    shortcuts,
+                    // No parent window: the daemon has no surface of its own.
+                    "",
+                    bind_options,
+                ),
+                PORTAL_BIND_DEADLINE,
+            )
+            .await?;
+            let binding = TriggerKeyBinding::new(
+                approved_trigger_description(&results)
+                    .unwrap_or_else(|| TRIGGER_KEY_DESCRIPTION.to_owned()),
+            );
+
+            Ok(Box::new(FedoraShortcutSession {
+                connection,
+                session_path: session_object_path,
+                binding,
+                activations,
+                closures,
+                retired: false,
+            }) as Box<dyn ShortcutSession>)
         })
     }
 }
 
-/// Never constructed on the production path today (bind fails closed before a
-/// session exists), but kept so the trait's session shape has a real production
-/// type once the native portal client lands.
+/// A live Global Shortcuts session on the daemon's persistent D-Bus connection.
+/// The session owns the connection and both signal subscriptions; retirement
+/// closes the portal session with a bounded best-effort `Session.Close` so the
+/// desktop does not keep a dangling session for a listener that is gone.
 pub struct FedoraShortcutSession {
+    connection: zbus::Connection,
+    session_path: zbus::zvariant::OwnedObjectPath,
     binding: TriggerKeyBinding,
+    activations: zbus::proxy::SignalStream<'static>,
+    closures: zbus::proxy::SignalStream<'static>,
+    retired: bool,
+}
+
+impl FedoraShortcutSession {
+    /// Best-effort, bounded `Session.Close`; runs at most once.
+    async fn close(&mut self) {
+        if std::mem::replace(&mut self.retired, true) {
+            return;
+        }
+        let close = async {
+            if let Ok(session) = zbus::Proxy::new(
+                &self.connection,
+                PORTAL_BUS_NAME,
+                self.session_path.as_str().to_owned(),
+                PORTAL_SESSION_INTERFACE,
+            )
+            .await
+            {
+                let _ = session.call_method("Close", &()).await;
+            }
+        };
+        let _ = tokio::time::timeout(PORTAL_CLOSE_DEADLINE, close).await;
+    }
 }
 
 impl ShortcutSession for FedoraShortcutSession {
@@ -155,7 +389,76 @@ impl ShortcutSession for FedoraShortcutSession {
     }
 
     fn next_activation(&mut self) -> BoundaryFuture<'_, Option<()>> {
-        Box::pin(async move { Ok(None) })
+        Box::pin(async move {
+            use zbus::export::ordered_stream::OrderedStreamExt;
+            loop {
+                tokio::select! {
+                    activated = self.activations.next() => match activated {
+                        Some(message) => {
+                            // Activated(session_handle o, shortcut_id s,
+                            //           timestamp t, options a{sv})
+                            let Ok((session, shortcut_id, _timestamp, _options)) =
+                                message.body().deserialize::<(
+                                    zbus::zvariant::OwnedObjectPath,
+                                    String,
+                                    u64,
+                                    std::collections::HashMap<
+                                        String,
+                                        zbus::zvariant::OwnedValue,
+                                    >,
+                                )>()
+                            else {
+                                continue;
+                            };
+                            if session == self.session_path && shortcut_id == TRIGGER_KEY_ID {
+                                return Ok(Some(()));
+                            }
+                        }
+                        None => {
+                            self.close().await;
+                            return Ok(None);
+                        }
+                    },
+                    closed = self.closures.next() => {
+                        // The desktop revoked the session (or the portal
+                        // restarted and dropped it); either ends the stream.
+                        let _ = closed;
+                        self.retired = true;
+                        return Ok(None);
+                    }
+                }
+            }
+        })
+    }
+}
+
+impl Drop for FedoraShortcutSession {
+    fn drop(&mut self) {
+        if self.retired {
+            return;
+        }
+        // Backstop only: graceful retirement paths already awaited `close`.
+        // Drop cannot await, so the bounded close is detached onto the runtime
+        // when one is still available.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let connection = self.connection.clone();
+            let session_path = self.session_path.clone();
+            handle.spawn(async move {
+                let close = async {
+                    if let Ok(session) = zbus::Proxy::new(
+                        &connection,
+                        PORTAL_BUS_NAME,
+                        session_path.as_str().to_owned(),
+                        PORTAL_SESSION_INTERFACE,
+                    )
+                    .await
+                    {
+                        let _ = session.call_method("Close", &()).await;
+                    }
+                };
+                let _ = tokio::time::timeout(PORTAL_CLOSE_DEADLINE, close).await;
+            });
+        }
     }
 }
 

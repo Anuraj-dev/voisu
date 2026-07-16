@@ -40,6 +40,18 @@ struct Daemon {
     _provider_stub: Option<TempDir>,
 }
 
+/// Every acceptance daemon keeps its Global Shortcuts listener OFF unless the
+/// test explicitly injects a private session bus: otherwise daemons would reach
+/// the host session bus and bind a real Trigger Key on the developer's desktop.
+fn disable_shortcuts_unless_bus_injected(command: &mut Command, environment: &[(&str, &str)]) {
+    if !environment
+        .iter()
+        .any(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
+    {
+        command.env("VOISU_DISABLE_SHORTCUTS", "1");
+    }
+}
+
 fn isolate_process_group(command: &mut Command) {
     // SAFETY: setpgid is an async-signal-safe syscall and this hook runs in the
     // child after fork, before exec, without touching shared process state.
@@ -68,6 +80,7 @@ impl Daemon {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        disable_shortcuts_unless_bus_injected(&mut command, environment);
         for (name, value) in environment {
             command.env(name, value);
         }
@@ -105,6 +118,7 @@ impl Daemon {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .env_remove("VOISU_DEEPGRAM_API_KEY");
+        disable_shortcuts_unless_bus_injected(&mut command, environment);
         let explicit_deepgram = environment
             .iter()
             .any(|(name, _)| *name == "VOISU_DEEPGRAM_API_KEY");
@@ -2626,22 +2640,358 @@ fn toggle_has_the_same_observable_transitions_as_start_then_stop() {
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 }
 
-fn activate_trigger_key(channel: &Path) {
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(channel)
-        .expect("shortcut channel should be writable");
-    file.write_all(b"1\n").expect("activation should be recorded");
+/// A private D-Bus session bus for one test: a real `dbus-daemon` in an
+/// isolated process group, torn down with the test. It runs from a minimal
+/// configuration with NO service directories, so the host's real
+/// `org.freedesktop.portal.Desktop.service` can never be auto-activated onto
+/// the test bus — the only portal a test daemon can reach is the mock the test
+/// itself registered.
+struct PrivateBus {
+    child: Child,
+    address: String,
+    _config: TempDir,
 }
 
-fn end_trigger_key_portal(channel: &Path) {
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(channel)
-        .expect("shortcut channel should be writable");
-    file.write_all(b"end\n").expect("portal end should be recorded");
+impl PrivateBus {
+    fn start() -> Self {
+        let config = TempDir::new().expect("bus config directory should exist");
+        let config_path = config.path().join("bus.conf");
+        fs::write(
+            &config_path,
+            format!(
+                r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:dir={}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"#,
+                config.path().display()
+            ),
+        )
+        .expect("bus config should be written");
+        let mut command = Command::new("dbus-daemon");
+        command
+            .arg(format!("--config-file={}", config_path.display()))
+            .args(["--nofork", "--print-address"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        isolate_process_group(&mut command);
+        let mut child = command.spawn().expect("dbus-daemon should start");
+        let stdout = child.stdout.take().expect("dbus-daemon stdout");
+        let mut address = String::new();
+        BufReader::new(stdout)
+            .read_line(&mut address)
+            .expect("dbus-daemon should print its address");
+        let address = address.trim().to_owned();
+        assert!(!address.is_empty(), "dbus-daemon printed no address");
+        Self {
+            child,
+            address,
+            _config: config,
+        }
+    }
+}
+
+impl Drop for PrivateBus {
+    fn drop(&mut self) {
+        let process_group = -(self.child.id() as i32);
+        // SAFETY: dbus-daemon was made a process-group leader; the negative
+        // pgid targets only this test's private bus.
+        let _ = unsafe { libc::kill(process_group, libc::SIGKILL) };
+        let _ = self.child.wait();
+    }
+}
+
+enum PortalCommand {
+    Activate,
+    CloseSession,
+}
+
+/// Shared state between the mock portal's D-Bus interface and its controller:
+/// the session path the daemon created, so activations target the right session.
+#[derive(Clone)]
+struct PortalShared {
+    session: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+struct GlobalShortcutsService {
+    shared: PortalShared,
+    deny_bind: bool,
+    trigger_description: String,
+}
+
+fn escaped_portal_sender(header: &zbus::message::Header<'_>) -> String {
+    header
+        .sender()
+        .expect("portal calls carry a sender")
+        .as_str()
+        .trim_start_matches(':')
+        .replace('.', "_")
+}
+
+fn portal_token(
+    options: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    name: &str,
+) -> String {
+    options
+        .get(name)
+        .and_then(|value| value.downcast_ref::<zbus::zvariant::Str<'_>>().ok())
+        .map(|token| token.as_str().to_owned())
+        .unwrap_or_else(|| "t".to_owned())
+}
+
+async fn emit_portal_response(
+    connection: &zbus::Connection,
+    request_path: &str,
+    code: u32,
+    results: std::collections::HashMap<&str, zbus::zvariant::Value<'_>>,
+) {
+    connection
+        .emit_signal(
+            None::<zbus::names::BusName<'_>>,
+            request_path,
+            "org.freedesktop.portal.Request",
+            "Response",
+            &(code, results),
+        )
+        .await
+        .expect("mock portal response should be emitted");
+}
+
+#[zbus::interface(name = "org.freedesktop.portal.GlobalShortcuts")]
+impl GlobalShortcutsService {
+    async fn create_session(
+        &self,
+        options: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> zbus::zvariant::OwnedObjectPath {
+        let sender = escaped_portal_sender(&header);
+        let request_path = format!(
+            "/org/freedesktop/portal/desktop/request/{sender}/{}",
+            portal_token(&options, "handle_token")
+        );
+        let session_path = format!(
+            "/org/freedesktop/portal/desktop/session/{sender}/{}",
+            portal_token(&options, "session_handle_token")
+        );
+        *self.shared.session.lock().unwrap() = Some(session_path.clone());
+        let results = std::collections::HashMap::from([(
+            "session_handle",
+            zbus::zvariant::Value::from(session_path.as_str()),
+        )]);
+        emit_portal_response(connection, &request_path, 0, results).await;
+        zbus::zvariant::OwnedObjectPath::try_from(request_path).unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bind_shortcuts(
+        &self,
+        _session_handle: zbus::zvariant::OwnedObjectPath,
+        shortcuts: Vec<(
+            String,
+            std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+        )>,
+        _parent_window: String,
+        options: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> zbus::zvariant::OwnedObjectPath {
+        let sender = escaped_portal_sender(&header);
+        let request_path = format!(
+            "/org/freedesktop/portal/desktop/request/{sender}/{}",
+            portal_token(&options, "handle_token")
+        );
+        if self.deny_bind {
+            // The user (or desktop policy) refused the Trigger Key dialog.
+            emit_portal_response(connection, &request_path, 1, std::collections::HashMap::new())
+                .await;
+        } else {
+            // The response's `shortcuts` must be a typed a(sa{sv}) array — the
+            // wire format the real portal produces — not an array of variants.
+            let signature: zbus::zvariant::Signature =
+                "(sa{sv})".try_into().expect("shortcut signature parses");
+            let mut approved = zbus::zvariant::Array::new(&signature);
+            for (id, _) in &shortcuts {
+                let properties = std::collections::HashMap::from([(
+                    "trigger_description",
+                    zbus::zvariant::Value::from(self.trigger_description.as_str()),
+                )]);
+                approved
+                    .append(zbus::zvariant::Value::from(zbus::zvariant::Structure::from((
+                        id.as_str(),
+                        properties,
+                    ))))
+                    .expect("approved shortcut should append");
+            }
+            let results = std::collections::HashMap::from([(
+                "shortcuts",
+                zbus::zvariant::Value::Array(approved),
+            )]);
+            emit_portal_response(connection, &request_path, 0, results).await;
+        }
+        zbus::zvariant::OwnedObjectPath::try_from(request_path).unwrap()
+    }
+}
+
+/// A controlled `org.freedesktop.portal.GlobalShortcuts` service running as a
+/// REAL D-Bus service on a private session bus: acceptance tests point the
+/// daemon at the bus with `DBUS_SESSION_BUS_ADDRESS` and drive desktop
+/// responses (approval, denial, Activated signals, session closure) over the
+/// wire, exercising the daemon's actual portal client end to end.
+struct MockPortal {
+    bus: PrivateBus,
+    control: tokio::sync::mpsc::UnboundedSender<PortalCommand>,
+    service: Option<thread::JoinHandle<()>>,
+}
+
+impl MockPortal {
+    fn start() -> Self {
+        Self::start_configured(false, "Super+Alt+V")
+    }
+
+    fn start_denying() -> Self {
+        Self::start_configured(true, "")
+    }
+
+    fn start_configured(deny_bind: bool, trigger_description: &str) -> Self {
+        let bus = PrivateBus::start();
+        let address = bus.address.clone();
+        let trigger_description = trigger_description.to_owned();
+        let shared = PortalShared {
+            session: Arc::new(std::sync::Mutex::new(None)),
+        };
+        let service_shared = shared.clone();
+        let (control, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let service = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("mock portal runtime should build");
+            runtime.block_on(async move {
+                let connection = zbus::connection::Builder::address(address.as_str())
+                    .expect("mock portal address should parse")
+                    .name("org.freedesktop.portal.Desktop")
+                    .expect("mock portal name should be valid")
+                    .serve_at(
+                        "/org/freedesktop/portal/desktop",
+                        GlobalShortcutsService {
+                            shared: service_shared.clone(),
+                            deny_bind,
+                            trigger_description,
+                        },
+                    )
+                    .expect("mock portal object should be served")
+                    .build()
+                    .await
+                    .expect("mock portal should join the private bus");
+                ready_tx.send(()).expect("mock portal readiness should be reported");
+                while let Some(command) = commands.recv().await {
+                    let session = {
+                        let deadline = Instant::now() + Duration::from_secs(3);
+                        loop {
+                            if let Some(session) =
+                                service_shared.session.lock().unwrap().clone()
+                            {
+                                break session;
+                            }
+                            assert!(
+                                Instant::now() < deadline,
+                                "no portal session was created before the command"
+                            );
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    };
+                    match command {
+                        PortalCommand::Activate => {
+                            let options: std::collections::HashMap<
+                                &str,
+                                zbus::zvariant::Value<'_>,
+                            > = std::collections::HashMap::new();
+                            connection
+                                .emit_signal(
+                                    None::<zbus::names::BusName<'_>>,
+                                    "/org/freedesktop/portal/desktop",
+                                    "org.freedesktop.portal.GlobalShortcuts",
+                                    "Activated",
+                                    &(
+                                        zbus::zvariant::ObjectPath::try_from(session.as_str())
+                                            .unwrap(),
+                                        voisu_app::system::TRIGGER_KEY_ID,
+                                        0_u64,
+                                        options,
+                                    ),
+                                )
+                                .await
+                                .expect("mock portal activation should be emitted");
+                        }
+                        PortalCommand::CloseSession => {
+                            connection
+                                .emit_signal(
+                                    None::<zbus::names::BusName<'_>>,
+                                    session.as_str(),
+                                    "org.freedesktop.portal.Session",
+                                    "Closed",
+                                    &(),
+                                )
+                                .await
+                                .expect("mock portal closure should be emitted");
+                        }
+                    }
+                }
+            });
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mock portal should become ready");
+        Self {
+            bus,
+            control,
+            service: Some(service),
+        }
+    }
+
+    fn address(&self) -> &str {
+        &self.bus.address
+    }
+
+    /// One user press of the desktop-approved Trigger Key.
+    fn activate(&self) {
+        self.control
+            .send(PortalCommand::Activate)
+            .expect("mock portal should accept activations");
+    }
+
+    /// The desktop revokes the session (permission withdrawn / portal restart).
+    fn close_session(&self) {
+        self.control
+            .send(PortalCommand::CloseSession)
+            .expect("mock portal should accept the closure");
+    }
+}
+
+impl Drop for MockPortal {
+    fn drop(&mut self) {
+        // Closing the control channel ends the service loop; killing the
+        // private bus (PrivateBus::drop) unblocks it if it is mid-await.
+        let (closed, _) = tokio::sync::mpsc::unbounded_channel();
+        let _ = std::mem::replace(&mut self.control, closed);
+        let process_group = -(self.bus.child.id() as i32);
+        // SAFETY: the private bus is a process-group leader owned by this test.
+        let _ = unsafe { libc::kill(process_group, libc::SIGKILL) };
+        if let Some(service) = self.service.take() {
+            let _ = service.join();
+        }
+    }
 }
 
 fn wait_for_status(runtime_dir: &Path, expected: &str) {
@@ -2677,9 +3027,10 @@ fn wait_for_shortcut(runtime_dir: &Path, expected: &str) -> String {
 #[test]
 fn shortcut_setup_displays_the_desktop_approved_trigger_key_binding() {
     let runtime = TempDir::new().unwrap();
+    let portal = MockPortal::start();
     let _daemon = Daemon::start_with_env(
         runtime.path(),
-        &[("VOISU_TEST_SHORTCUT_BINDING", "Super+Alt+V")],
+        &[("DBUS_SESSION_BUS_ADDRESS", portal.address())],
     );
 
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
@@ -2688,21 +3039,18 @@ fn shortcut_setup_displays_the_desktop_approved_trigger_key_binding() {
 #[test]
 fn trigger_key_first_activation_starts_and_next_activation_stops_the_recording() {
     let runtime = TempDir::new().unwrap();
-    let channel = runtime.path().join("shortcut.channel");
+    let portal = MockPortal::start();
     let _daemon = Daemon::start_with_env(
         runtime.path(),
-        &[(
-            "VOISU_TEST_SHORTCUT_CHANNEL",
-            channel.to_str().unwrap(),
-        )],
+        &[("DBUS_SESSION_BUS_ADDRESS", portal.address())],
     );
     // The portal must bind before activations mean anything.
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
-    activate_trigger_key(&channel);
+    portal.activate();
     wait_for_status(runtime.path(), "Recording\n");
 
-    activate_trigger_key(&channel);
+    portal.activate();
     wait_for_status(runtime.path(), "idle\n");
 
     // The Recording that the Trigger Key drove delivered exactly once.
@@ -2716,21 +3064,18 @@ fn trigger_key_first_activation_starts_and_next_activation_stops_the_recording()
 #[test]
 fn concurrent_trigger_key_activations_cannot_overlap_recordings() {
     let runtime = TempDir::new().unwrap();
-    let channel = runtime.path().join("shortcut.channel");
+    let portal = MockPortal::start();
     let _daemon = Daemon::start_with_env(
         runtime.path(),
-        &[(
-            "VOISU_TEST_SHORTCUT_CHANNEL",
-            channel.to_str().unwrap(),
-        )],
+        &[("DBUS_SESSION_BUS_ADDRESS", portal.address())],
     );
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
-    // Four activations delivered as one burst: the daemon must pair them
-    // deterministically into start/stop/start/stop — two complete Recordings,
-    // never two overlapping ones or a duplicated stop.
+    // Four Activated signals delivered as one burst on the bus: the daemon must
+    // pair them deterministically into start/stop/start/stop — two complete
+    // Recordings, never two overlapping ones or a duplicated stop.
     for _ in 0..4 {
-        activate_trigger_key(&channel);
+        portal.activate();
     }
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -2758,11 +3103,11 @@ fn concurrent_trigger_key_activations_cannot_overlap_recordings() {
 #[test]
 fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
     let runtime = TempDir::new().unwrap();
-    let channel = runtime.path().join("shortcut.channel");
+    let portal = MockPortal::start();
     let daemon = Daemon::start_with_env(
         runtime.path(),
         &[
-            ("VOISU_TEST_SHORTCUT_CHANNEL", channel.to_str().unwrap()),
+            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
             ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
             ("VOISU_TEST_DEADLINE_AFTER_CHUNKS", "2"),
         ],
@@ -2771,7 +3116,7 @@ fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
 
     // One activation starts a Recording; the user then forgets the second
     // activation. The Recording Deadline must stop it on its own and record why.
-    activate_trigger_key(&channel);
+    portal.activate();
 
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -2800,8 +3145,12 @@ fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
 #[test]
 fn trigger_key_permission_denial_leaves_cli_control_usable() {
     let runtime = TempDir::new().unwrap();
-    let daemon =
-        Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_SHORTCUT_DENY", "1")]);
+    // The controlled desktop refuses the BindShortcuts request over the bus.
+    let portal = MockPortal::start_denying();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("DBUS_SESSION_BUS_ADDRESS", portal.address())],
+    );
 
     assert_eq!(
         stdout(&voisu(runtime.path(), "shortcut")),
@@ -2827,19 +3176,21 @@ fn trigger_key_permission_denial_leaves_cli_control_usable() {
 #[test]
 fn trigger_key_portal_revocation_leaves_cli_control_usable() {
     let runtime = TempDir::new().unwrap();
-    let channel = runtime.path().join("shortcut.channel");
+    let portal = MockPortal::start();
     let daemon = Daemon::start_with_env(
         runtime.path(),
-        &[(
-            "VOISU_TEST_SHORTCUT_CHANNEL",
-            channel.to_str().unwrap(),
-        )],
+        &[("DBUS_SESSION_BUS_ADDRESS", portal.address())],
     );
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
-    // The portal is revoked / restarts: the listener retires, but the daemon
-    // stays responsive and CLI start/stop/toggle keep working.
-    end_trigger_key_portal(&channel);
+    // The desktop revokes the session (the same observable path as a portal
+    // restart dropping it): the listener retires, the displayed binding is
+    // cleared, and CLI start/stop/toggle keep working.
+    portal.close_session();
+    wait_for_shortcut(
+        runtime.path(),
+        "No Trigger Key is bound; start, stop, and toggle remain available\n",
+    );
 
     assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
     wait_for_status(runtime.path(), "Recording\n");
@@ -2851,6 +3202,35 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(diagnostics.contains("Trigger Key portal ended"), "{diagnostics}");
+}
+
+#[test]
+fn unavailable_portal_leaves_cli_control_usable() {
+    let runtime = TempDir::new().unwrap();
+    // A real private session bus with NO portal service on it: binding must
+    // fail closed while the daemon stays fully usable over the CLI.
+    let bus = PrivateBus::start();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("DBUS_SESSION_BUS_ADDRESS", bus.address.as_str())],
+    );
+
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "shortcut")),
+        "No Trigger Key is bound; start, stop, and toggle remain available\n"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "toggle")),
+        "Recording completed; Transcript delivered\n"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains("Trigger Key binding is unavailable"),
+        "{diagnostics}"
+    );
 }
 
 #[test]

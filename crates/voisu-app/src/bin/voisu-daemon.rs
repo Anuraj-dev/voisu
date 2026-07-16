@@ -22,10 +22,10 @@ use voisu_core::{
     CancelRegistry, CapturedAudio, Command, DaemonState, DeliveryAdapter, DiagnosticRecord,
     DiagnosticStore, LifecycleEvidence, LifecycleStage, MergeResult, PROTOCOL_VERSION, Provider,
     ProviderCoordinator, ProviderStream, ProviderStreams, ReconciliationKind, ReconciliationModel,
-    ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, ShortcutSession,
-    SourceTranscript, SourceTranscriptRecord, Transcript, TranscriptDecision,
-    TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator, TriggerKeyBinding,
-    VersionEnvelope, replay_capture, socket_path,
+    ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SourceTranscript,
+    SourceTranscriptRecord, Transcript, TranscriptDecision, TranscriptDecisionPipeline,
+    TranscriptProvider, TranscriptValidator, TriggerKeyBinding, VersionEnvelope, replay_capture,
+    socket_path,
 };
 
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
@@ -85,9 +85,7 @@ async fn run() -> Result<(), String> {
     // Disabling it (VOISU_DISABLE_SHORTCUTS) keeps the daemon usable in
     // sessions or tests that have no desktop portal.
     if std::env::var_os("VOISU_DISABLE_SHORTCUTS").is_none() {
-        let controlled = std::env::var_os("VOISU_TEST_MODE").as_deref()
-            == Some(std::ffi::OsStr::new("controlled"));
-        tokio::spawn(shortcut_listener(actor_tx.clone(), controlled));
+        tokio::spawn(shortcut_listener(actor_tx.clone()));
     }
     let connections = std::sync::Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -1387,13 +1385,12 @@ const SHORTCUT_TOGGLE_REPLY_DEADLINE: Duration = Duration::from_secs(60);
 /// Binds the Trigger Key through the Global Shortcuts portal and turns each
 /// activation into a Toggle. Every failure path — an unavailable portal, denied
 /// or revoked permission, a portal restart, or a stream error — retires the
-/// listener quietly and leaves CLI start/stop/toggle fully usable.
-async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>, controlled: bool) {
-    let mut portal: Box<dyn ShortcutPortal> = if controlled {
-        Box::new(ControlledShortcutPortal::from_env())
-    } else {
-        Box::new(FedoraShortcutPortal::new())
-    };
+/// listener quietly, clears the displayed binding, and leaves CLI
+/// start/stop/toggle fully usable. Tests substitute the portal edge by pointing
+/// `DBUS_SESSION_BUS_ADDRESS` at a private bus running a controlled portal
+/// service — the daemon itself always runs this production listener.
+async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>) {
+    let mut portal: Box<dyn ShortcutPortal> = Box::new(FedoraShortcutPortal::new());
     let mut session = match portal.bind().await {
         Ok(session) => session,
         Err(error) => {
@@ -1439,6 +1436,9 @@ async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>, controlled: bool) 
                 eprintln!(
                     "Trigger Key portal ended; start, stop, and toggle remain available"
                 );
+                // Clear the displayed binding: a revoked or restarted portal
+                // must not leave `voisu shortcut` claiming a retired Trigger Key.
+                let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
                 return;
             }
             Err(error) => {
@@ -1447,95 +1447,10 @@ async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>, controlled: bool) 
                      remain available",
                     error.diagnostic()
                 );
+                let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
                 return;
             }
         }
-    }
-}
-
-/// A controlled Global Shortcuts portal for `VOISU_TEST_MODE=controlled`.
-/// Binding is approved with `VOISU_TEST_SHORTCUT_BINDING` (default
-/// `"Super+Alt+V"`) unless `VOISU_TEST_SHORTCUT_DENY` is set, which fails the
-/// bind closed. Activations are driven by a test-owned channel file named by
-/// `VOISU_TEST_SHORTCUT_CHANNEL`: each newline-terminated token is one Trigger
-/// Key activation, and the token `end` ends the session (a revocation or portal
-/// restart). With no channel the session binds and idles.
-struct ControlledShortcutPortal {
-    deny: bool,
-    binding: TriggerKeyBinding,
-    channel: Option<PathBuf>,
-}
-
-impl ControlledShortcutPortal {
-    fn from_env() -> Self {
-        let binding = std::env::var("VOISU_TEST_SHORTCUT_BINDING")
-            .unwrap_or_else(|_| "Super+Alt+V".to_owned());
-        Self {
-            deny: std::env::var_os("VOISU_TEST_SHORTCUT_DENY").is_some(),
-            binding: TriggerKeyBinding::new(binding),
-            channel: std::env::var_os("VOISU_TEST_SHORTCUT_CHANNEL").map(PathBuf::from),
-        }
-    }
-}
-
-impl ShortcutPortal for ControlledShortcutPortal {
-    fn bind(&mut self) -> BoundaryFuture<'_, Box<dyn ShortcutSession>> {
-        let deny = self.deny;
-        let binding = self.binding.clone();
-        let channel = self.channel.clone();
-        Box::pin(async move {
-            if deny {
-                return Err(BoundaryError::new(
-                    BoundaryKind::Shortcut,
-                    "controlled Global Shortcuts portal denied the Trigger Key",
-                ));
-            }
-            Ok(Box::new(ControlledShortcutSession {
-                binding,
-                channel,
-                consumed: 0,
-            }) as Box<dyn ShortcutSession>)
-        })
-    }
-}
-
-struct ControlledShortcutSession {
-    binding: TriggerKeyBinding,
-    channel: Option<PathBuf>,
-    consumed: usize,
-}
-
-impl ShortcutSession for ControlledShortcutSession {
-    fn binding(&self) -> TriggerKeyBinding {
-        self.binding.clone()
-    }
-
-    fn next_activation(&mut self) -> BoundaryFuture<'_, Option<()>> {
-        Box::pin(async move {
-            let Some(channel) = self.channel.clone() else {
-                // No channel: the session is bound but idle for the daemon's
-                // lifetime, exactly like a real portal with no activations yet.
-                std::future::pending::<()>().await;
-                unreachable!();
-            };
-            loop {
-                let tokens: Vec<String> = std::fs::read_to_string(&channel)
-                    .unwrap_or_default()
-                    .lines()
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_owned)
-                    .collect();
-                if self.consumed < tokens.len() {
-                    let token = tokens[self.consumed].clone();
-                    self.consumed += 1;
-                    if token == "end" {
-                        return Ok(None);
-                    }
-                    return Ok(Some(()));
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
     }
 }
 

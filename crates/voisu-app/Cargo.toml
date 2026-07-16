@@ -19,6 +19,9 @@ serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 voisu-core = { path = "../voisu-core" }
+zbus = { version = "5.13.2", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+zbus = { version = "5.13.2", default-features = false, features = ["tokio"] }

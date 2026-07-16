@@ -131,3 +131,14 @@ configured Groq Merge Result. The validator boundary now owns deterministic sele
 candidate guardrails, at most one repair, and clean-source fallback before returning one Transcript to Delivery. The
 curl child has its own shorter 2s owning deadline, so dropping the outer future cannot leave indefinite work behind;
 delivering a first candidate and correcting it later was rejected because it violates exactly-once Delivery.
+
+## 2026-07-16 — Bind the Trigger Key on a persistent native zbus connection, not per-call subprocesses
+**Why:** The `org.freedesktop.portal.GlobalShortcuts` portal resolves request/session handles against the caller's
+D-Bus identity and delivers `Activated` signals only to the connection that created and bound the session, so the
+repo's established per-call `busctl`/`gdbus` subprocess edge can create a session but can never receive its own
+activations — a long-lived in-process client is structurally required (confirmed in Sol's Ticket 07 review). The
+daemon therefore takes `zbus` (default features off, `tokio` integration) and holds one persistent session-bus
+connection owning the Global Shortcuts session; the listener subscribes to `Activated`/`Closed` before binding,
+fails closed on an absent or denying portal, and closes the session on retirement. Acceptance tests keep the edge
+substituted by pointing `DBUS_SESSION_BUS_ADDRESS` at a private `dbus-daemon` (service activation disabled) running
+a controlled portal service, so the production client is exercised over a real bus without touching the host desktop.
