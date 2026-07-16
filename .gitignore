@@ -1,1 +1,4 @@
 /target/
+
+# RPM build artifacts (packaging/build-rpm.sh output)
+/dist/
