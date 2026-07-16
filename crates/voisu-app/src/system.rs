@@ -1494,19 +1494,35 @@ struct GroqStream {
     reaper: ProviderReaper,
 }
 
-/// Actor-owned supervisor that keeps every provider-stream cleanup task alive
-/// and awaitable. When a provider stream is dropped mid-abort — for example the
+/// A retained provider-stream cleanup: a future that awaits an adopted chunk
+/// task deque until every chunk task — and therefore every nested
+/// `spawn_blocking` curl reap those tasks own — has completed.
+type ReapTask = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// Actor-owned supervisor that keeps every provider-stream cleanup alive and
+/// awaitable. When a provider stream is dropped mid-abort — for example the
 /// abort deadline elapsed and Tokio dropped the abort future that owned the
 /// boxed stream — the stream signals cancellation and hands its still-live chunk
-/// tasks here. Adoption AWAITS each chunk task (it never aborts it, which would
-/// detach the task's nested `spawn_blocking` curl before the child is reaped)
-/// and RETAINS the resulting reaper task's handle. The actor drains this
-/// supervisor under an explicit bound before it publishes Idle and before the
-/// runtime is torn down, so no killed-but-unreaped curl work outlives a
-/// Recording and Idle is never observable while blocking cleanup is detached.
+/// tasks here. Adoption is SYNCHRONOUS: it retains the raw handles inside a
+/// future without spawning and without touching `Handle::try_current()`, so a
+/// stream dropped from any thread — including during runtime teardown — always
+/// lands its cleanup in this supervisor. The retained cleanup AWAITS each chunk
+/// task (never `abort()`, which would drop the task's nested `spawn_blocking`
+/// handle and detach the still-running curl before the child is reaped).
+/// Drains are serialized: a concurrent drain waits for the in-flight one and
+/// then re-checks, so it can never observe an empty supervisor while another
+/// drain still holds unfinished cleanup. Each workflow task drains this
+/// supervisor under an explicit bound after its streams have dropped and before
+/// it acknowledges completion to the actor — the acknowledgement that alone
+/// permits Idle — and the daemon drains it again after the actor has joined,
+/// before the runtime is torn down.
 #[derive(Clone, Default)]
 pub struct ProviderReaper {
-    tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    tasks: Arc<std::sync::Mutex<Vec<ReapTask>>>,
+    /// Serializes `drain` calls. While one drain temporarily holds cleanup
+    /// futures out of `tasks`, a concurrent drain must wait here instead of
+    /// reading `tasks` as empty and reporting a completed drain over live work.
+    serial: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ProviderReaper {
@@ -1515,43 +1531,29 @@ impl ProviderReaper {
     }
 
     /// Adopts the still-live chunk tasks of a dropped stream. Cancellation MUST
-    /// already be signalled so each task's owning bounded wait observes the flag,
-    /// kills and reaps its curl child, and returns. The reaper task AWAITS each
-    /// chunk task — never `abort()`, which drops the nested `spawn_blocking`
-    /// handle and detaches the still-running curl — and its handle is retained
-    /// so a later drain awaits the reap to completion.
+    /// already be signalled so each task's owning bounded wait observes the
+    /// flag, kills and reaps its curl child, and returns. Synchronous and
+    /// runtime-free: the handles are wrapped in a future and retained; only a
+    /// later `drain` polls them, so adopting from a non-runtime thread or a
+    /// shutting-down runtime can never detach or abort the cleanup.
     fn adopt<T: Send + 'static>(&self, mut chunks: VecDeque<tokio::task::JoinHandle<T>>) {
         if chunks.is_empty() {
             return;
         }
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                let handle = runtime.spawn(async move {
-                    while let Some(chunk) = chunks.pop_front() {
-                        let _ = chunk.await;
-                    }
-                });
-                self.tasks
-                    .lock()
-                    .expect("provider reaper mutex poisoned")
-                    .push(handle);
-            }
-            Err(_) => {
-                // No runtime is available to await on. The daemon always drops
-                // provider streams inside its runtime, and shutdown drains this
-                // supervisor before the runtime is torn down, so this branch is
-                // unreachable there. As a last resort abort the tasks so they
-                // cannot linger unreaped rather than silently leaking handles.
-                for chunk in chunks {
-                    chunk.abort();
+        self.tasks
+            .lock()
+            .expect("provider reaper mutex poisoned")
+            .push(Box::pin(async move {
+                while let Some(chunk) = chunks.pop_front() {
+                    let _ = chunk.await;
                 }
-            }
-        }
+            }));
     }
 
-    /// Number of cleanup tasks currently retained (awaiting a drain). Exposed so
-    /// the actor and tests can observe that a dropped stream handed its curl reap
-    /// to this supervisor instead of detaching it.
+    /// Number of cleanup futures currently retained and not being drained.
+    /// Exposed so tests can observe that a dropped stream handed its curl reap
+    /// to this supervisor instead of detaching it. A cleanup being awaited by an
+    /// in-flight `drain` is not counted; use `drain` itself for completion.
     pub fn pending(&self) -> usize {
         self.tasks
             .lock()
@@ -1559,33 +1561,33 @@ impl ProviderReaper {
             .len()
     }
 
-    /// Awaits every retained reaper task, bounded by `within`. Returns `true`
-    /// when the supervisor fully drained. On timeout it retains any still-live
-    /// task — so cleanup is never detached — and returns `false`.
+    /// Awaits every retained cleanup future, bounded by `within`. Returns
+    /// `true` when the supervisor fully drained, re-checking for cleanup adopted
+    /// while draining. On timeout it puts every unfinished future back — so
+    /// cleanup is retained, never detached — and returns `false`. Serialized
+    /// with every other drain.
     pub async fn drain(&self, within: Duration) -> bool {
-        let mut tasks: Vec<_> = {
-            let mut guard = self.tasks.lock().expect("provider reaper mutex poisoned");
-            std::mem::take(&mut *guard)
-        };
-        if tasks.is_empty() {
-            return true;
-        }
-        let drained = tokio::time::timeout(within, async {
-            for task in &mut tasks {
-                let _ = task.await;
+        let _serial = self.serial.lock().await;
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let mut batch: Vec<ReapTask> = {
+                let mut guard = self.tasks.lock().expect("provider reaper mutex poisoned");
+                std::mem::take(&mut *guard)
+            };
+            if batch.is_empty() {
+                return true;
             }
-        })
-        .await
-        .is_ok();
-        if !drained {
-            let mut guard = self.tasks.lock().expect("provider reaper mutex poisoned");
-            for task in tasks {
-                if !task.is_finished() {
+            while let Some(mut task) = batch.pop() {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if tokio::time::timeout(remaining, &mut task).await.is_err() {
+                    let mut guard =
+                        self.tasks.lock().expect("provider reaper mutex poisoned");
                     guard.push(task);
+                    guard.append(&mut batch);
+                    return false;
                 }
             }
         }
-        drained
     }
 }
 
@@ -3759,6 +3761,90 @@ mod tests {
             "draining must not return until the Groq blocking reap completed"
         );
         assert_eq!(reaper.pending(), 0, "a full drain must leave nothing retained");
+    }
+
+    #[tokio::test]
+    async fn stream_dropped_without_a_runtime_still_retains_its_blocking_cleanup() {
+        // Runtime teardown (and any non-runtime thread) can drop a provider
+        // stream where Handle::try_current() fails. Adoption must be synchronous
+        // and runtime-free: the cleanup is retained for a later drain, never
+        // aborted — aborting would detach the nested spawn_blocking curl reap.
+        let reaper = ProviderReaper::new();
+        let cancel = CancelRegistry::new();
+        let (chunk, probe) = spawn_blocking_backed_chunk(Arc::clone(&cancel));
+        wait_for(&probe.entered).await;
+        let stream = GroqStream {
+            credential: Credential::new("controlled-credential".to_owned()).unwrap(),
+            endpoint: "http://localhost/groq".to_owned(),
+            buffer: Vec::new(),
+            streamed_bytes: 0,
+            chunks: VecDeque::from([chunk]),
+            cancel,
+            reaper: reaper.clone(),
+        };
+        std::thread::spawn(move || drop(stream))
+            .join()
+            .expect("dropping a stream off the runtime must not panic");
+        assert_eq!(
+            reaper.pending(),
+            1,
+            "a stream dropped without a runtime must still retain its cleanup"
+        );
+        let _ = probe.release.send(());
+        assert!(
+            reaper.drain(Duration::from_secs(2)).await,
+            "the retained cleanup must drain once released"
+        );
+        assert!(
+            probe.reap_done.load(Ordering::SeqCst),
+            "draining must await the blocking reap to completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_drains_never_report_completion_over_live_cleanup() {
+        // While one drain temporarily holds cleanup futures out of the
+        // supervisor, a concurrent drain must serialize behind it — never
+        // observe an empty supervisor and report a completed drain while the
+        // blocking reap is still running.
+        let reaper = ProviderReaper::new();
+        let cancel = CancelRegistry::new();
+        cancel.cancel();
+        let (chunk, probe) = spawn_blocking_backed_chunk(Arc::clone(&cancel));
+        wait_for(&probe.entered).await;
+        let mut chunks = VecDeque::new();
+        chunks.push_back(chunk);
+        reaper.adopt(chunks);
+
+        let first = tokio::spawn({
+            let reaper = reaper.clone();
+            async move { reaper.drain(Duration::from_secs(2)).await }
+        });
+        // Give the first drain time to take the cleanup batch out of the
+        // supervisor before the concurrent drain starts.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second = tokio::spawn({
+            let reaper = reaper.clone();
+            let reap_done = Arc::clone(&probe.reap_done);
+            async move {
+                let drained = reaper.drain(Duration::from_secs(2)).await;
+                (drained, reap_done.load(Ordering::SeqCst))
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = probe.release.send(());
+
+        assert!(
+            first.await.expect("first drain must not panic"),
+            "the first drain must complete once the reap is released"
+        );
+        let (second_drained, reap_done_when_second_returned) =
+            second.await.expect("second drain must not panic");
+        assert!(second_drained, "the concurrent drain must also complete");
+        assert!(
+            reap_done_when_second_returned,
+            "a concurrent drain must not report completion while the blocking reap runs"
+        );
     }
 
     /// Spins until an `entered` latch is set, bounded so a genuine failure to

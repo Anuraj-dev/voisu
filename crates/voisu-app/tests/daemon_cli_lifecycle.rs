@@ -3639,6 +3639,31 @@ fn trigger_key_first_activation_starts_and_next_activation_stops_the_recording()
 }
 
 #[test]
+fn sigterm_during_an_active_recording_completes_the_recording_before_exit() {
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start(runtime.path());
+
+    let started = voisu(runtime.path(), "start");
+    assert!(started.status.success(), "{}", stderr(&started));
+    wait_for_status(runtime.path(), "Recording\n");
+
+    // SIGTERM with an active Recording: the daemon must stop the Recording,
+    // process it to completion (Delivery included), and only then exit — never
+    // return from its accept loop and let runtime teardown drop the live
+    // capture, provider, and cleanup work.
+    daemon.terminate();
+
+    // The interrupted Recording's outcome was persisted before exit; a fresh
+    // daemon over the same runtime directory serves the retained history.
+    let _daemon = Daemon::start(runtime.path());
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let records = history["history"].as_array().expect("history is a list");
+    assert_eq!(records.len(), 1, "{history}");
+    assert_eq!(records[0]["delivery_count"], 1, "{history}");
+    assert!(records[0]["error"].is_null(), "{history}");
+}
+
+#[test]
 fn concurrent_trigger_key_activations_cannot_overlap_recordings() {
     let runtime = TempDir::new().unwrap();
     let portal = MockPortal::start();
