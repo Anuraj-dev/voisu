@@ -2,12 +2,13 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-16
 
 ## 🚧 In progress / next
-- Ticket 08 merged through PR #15 at `a5771a9`; exact-head CI passed and issue #8 is closed.
-- Ticket 09 merged through PR #16 at `9b58f99`; exact-head CI passed and issue #9 is closed.
-- Ticket 10 round-1 review findings are fixed on `ticket-10-recovery`; next step is re-review, exact-head CI,
-  PR/merge, and issue #10 closure.
-- Follow-up issue #14 is implemented and verified on `issue-14-cancellation-safe-abort`; next step is to commit from
-  a checkout where `.git` is writable, then review/merge and close the issue.
+- Ticket 10 merged through PR #17 at `aa8055a` (squash); exact-head CI passed and issue #10 is closed.
+  Reviews: Sol high round 1 (2 BLOCKER + 1 HIGH + 1 MEDIUM), fixes in `0865286`, Sol medium round 2 APPROVE.
+- Issue #14 (cancellation-safe Deepgram/Groq abort) is implemented, verified (regression test proven RED with
+  `drain(..)` reinstated), and committed as `d52c7d7` on pushed branch `issue-14-cancellation-safe-abort`.
+  NOT yet reviewed or merged — next step: Sol medium review, PR, exact-head CI, merge, close #14.
+- After #14: Ticket 11 (issue #11, GTK4 voice capsule) starts the overlay phase — routing note: Luna per the
+  benchmark plan (Luna unused so far). Benchmark log current through Ticket 10 (`docs/model-benchmark.md`).
 
 ## Status
 - `voisu` and `voisu-daemon` communicate over bounded, versioned Unix IPC; the actor keeps status responsive while
