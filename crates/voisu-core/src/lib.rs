@@ -200,6 +200,13 @@ pub enum OverlayOutcome {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OverlayEvent {
     pub id: u64,
+    /// Identifies the daemon process instance that emitted this event. The id
+    /// counter resets to 1 on every daemon restart, so an observer must scope
+    /// event identity by `(instance, id)`; otherwise a restarted daemon's first
+    /// terminal event (id 1) collides with the last one shown and is suppressed.
+    /// Defaults to 0 for responses from a daemon that predates this field.
+    #[serde(default)]
+    pub instance: u64,
     pub outcome: OverlayOutcome,
     pub message: String,
 }

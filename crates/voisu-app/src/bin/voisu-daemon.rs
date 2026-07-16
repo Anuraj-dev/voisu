@@ -367,7 +367,10 @@ async fn actor_loop(
 ) {
     let mut state = ActorState::Idle;
     // Retained only for the observer-facing Status response. It never controls
-    // the lifecycle and is replaced by the next Recording outcome.
+    // the lifecycle and is replaced by the next Recording outcome. The instance
+    // marker scopes event ids to this daemon process, so a restart (which resets
+    // the id counter) can never reuse an id an observer already displayed.
+    let daemon_instance = daemon_instance_id();
     let mut next_overlay_event_id = 1_u64;
     let mut last_overlay_event: Option<OverlayEvent> = None;
     let mut next_id = 1_u64;
@@ -758,6 +761,7 @@ async fn actor_loop(
                             retain_overlay_event(
                                 &mut next_overlay_event_id,
                                 &mut last_overlay_event,
+                                daemon_instance,
                                 overlay_outcome(&failure.error),
                                 failure.error.public_message().to_owned(),
                             );
@@ -864,6 +868,7 @@ async fn actor_loop(
                             retain_overlay_event(
                                 &mut next_overlay_event_id,
                                 &mut last_overlay_event,
+                                daemon_instance,
                                 OverlayOutcome::Delivered,
                                 "Delivered".to_owned(),
                             );
@@ -880,6 +885,7 @@ async fn actor_loop(
                             retain_overlay_event(
                                 &mut next_overlay_event_id,
                                 &mut last_overlay_event,
+                                daemon_instance,
                                 overlay_outcome(&error),
                                 error.public_message().to_owned(),
                             );
@@ -987,15 +993,28 @@ fn status_response_with_feedback(state: &ActorState) -> Response {
 fn retain_overlay_event(
     next_id: &mut u64,
     last: &mut Option<OverlayEvent>,
+    instance: u64,
     outcome: OverlayOutcome,
     message: String,
 ) {
     *last = Some(OverlayEvent {
         id: *next_id,
+        instance,
         outcome,
         message,
     });
     *next_id += 1;
+}
+
+/// A value unique to this daemon process launch, used to scope observer event
+/// ids per instance. Combining the wall-clock start time with the pid keeps
+/// sequential restarts distinct even when they land in the same runtime dir.
+fn daemon_instance_id() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ ((std::process::id() as u64) << 32)
 }
 
 fn overlay_outcome(error: &BoundaryError) -> OverlayOutcome {

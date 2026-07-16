@@ -2458,52 +2458,55 @@ fn overlay_status_classifies_a_non_guardrail_capture_failure() {
     assert_eq!(observed["overlay_event"]["outcome"], "capture_failure", "{observed}");
 }
 
+// Matches the daemon's MAX_CONNECTIONS. Holding one fewer connection genuinely
+// pending leaves exactly the headroom a real lifecycle client needs.
+const MAX_DAEMON_CONNECTIONS: usize = 32;
+
 #[test]
-fn overlay_observation_never_perturbs_recording_delivery_or_the_next_recording() {
+fn saturating_observers_stuck_mid_frame_never_perturb_recording_delivery_or_the_next_recording() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start(runtime.path());
     let path = socket_path(runtime.path());
 
     assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
 
-    // A crop of observers that connect and die without reading their response,
-    // exactly as a killed/disconnected Overlay would during a Recording.
-    for _ in 0..8 {
-        if let Ok(mut dead) = UnixStream::connect(&path) {
-            dead.write_all(OVERLAY_STATUS.as_bytes()).unwrap();
-            dead.write_all(b"\n").unwrap();
-            // Dropped here without reading the reply.
-        }
+    // Occupy the connection permits with observers whose request never
+    // completes: each trickles a partial frame with no terminating newline, so
+    // the daemon's bounded read stays genuinely pending and the permit is held
+    // for the full read deadline — not merely an unread tiny response that the
+    // socket buffer would drain instantly. Two permits are left free for the
+    // real lifecycle client. The streams are held alive across the Delivery.
+    let mut stuck = Vec::new();
+    for _ in 0..(MAX_DAEMON_CONNECTIONS - 2) {
+        let mut trickle = UnixStream::connect(&path).unwrap();
+        // A valid prefix of an OverlayStatus request, deliberately unterminated.
+        trickle.write_all(br#"{"version":1,"command":"overlay"#).unwrap();
+        trickle.flush().unwrap();
+        stuck.push(trickle);
     }
 
-    // A slow/trickling observer that reads a single byte and stalls, held alive
-    // across the Delivery below.
-    let mut slow = UnixStream::connect(&path).unwrap();
-    slow.write_all(OVERLAY_STATUS.as_bytes()).unwrap();
-    slow.write_all(b"\n").unwrap();
-    slow.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-    let mut one = [0u8; 1];
-    let _ = slow.read(&mut one);
-
-    // The daemon stays fully responsive to the real lifecycle client.
+    // Under that saturation the real lifecycle client is still served promptly,
+    // proving per-connection read isolation: a blocked accept/serve path would
+    // instead stall this Status until the readers' deadline elapsed.
     let responsive = Instant::now();
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
-    assert!(responsive.elapsed() < Duration::from_millis(500));
+    assert!(responsive.elapsed() < Duration::from_secs(1), "status stalled under saturation");
 
-    // Delivery completes exactly once despite the abandoned observers.
+    // Delivery completes exactly once despite the stuck observers.
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
-    drop(slow);
 
     let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
     assert_eq!(observed["overlay_event"]["outcome"], "delivered", "{observed}");
 
-    // The next Recording is fully usable.
+    // The next Recording is fully usable while the observers are still stuck.
     assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
     let next = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(next["ok"], true, "{next}");
     assert_eq!(next["evidence"]["delivery_count"], 1, "{next}");
+
+    drop(stuck);
 }
 
 #[test]
@@ -2526,6 +2529,43 @@ fn an_unknown_observer_command_is_rejected_without_disturbing_the_daemon() {
     assert!(response.is_empty(), "unknown command was not rejected: {response}");
 
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+}
+
+#[test]
+fn a_restarted_daemon_reuses_the_terminal_id_under_a_distinct_instance_marker() {
+    // Each daemon resets its observer id counter to 1, so the first terminal
+    // event after a restart reuses the exact id (1) the previous daemon emitted.
+    // The instance marker scopes that id per daemon process, so an observer can
+    // tell the two apart and is never left suppressing the restarted flash.
+    let runtime = TempDir::new().unwrap();
+
+    let daemon = Daemon::start(runtime.path());
+    assert!(voisu(runtime.path(), "start").status.success());
+    assert_eq!(
+        ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#)["ok"],
+        true
+    );
+    let first = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(first["overlay_event"]["id"], 1, "{first}");
+    let first_instance = first["overlay_event"]["instance"].clone();
+
+    // A clean restart on the SAME runtime dir releases the lock and socket, then
+    // a fresh daemon binds with its own instance marker.
+    daemon.terminate();
+    let _restarted = Daemon::start(runtime.path());
+    assert!(voisu(runtime.path(), "start").status.success());
+    assert_eq!(
+        ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#)["ok"],
+        true
+    );
+    let second = ipc_request(runtime.path(), OVERLAY_STATUS);
+
+    // The reused id collides exactly; only the instance marker distinguishes them.
+    assert_eq!(second["overlay_event"]["id"], 1, "{second}");
+    assert_ne!(
+        second["overlay_event"]["instance"], first_instance,
+        "restarted daemon reused the previous instance marker: {second}"
+    );
 }
 
 #[test]

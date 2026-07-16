@@ -84,7 +84,10 @@ const TERMINAL_DISPLAY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Default)]
 pub struct PresentationController {
-    displayed_event: Option<u64>,
+    /// The `(instance, id)` of the last terminal event shown. Scoping by daemon
+    /// instance is what lets a restarted daemon reuse id 1 without the observer
+    /// mistaking it for the already-displayed event and suppressing the flash.
+    displayed_event: Option<(u64, u64)>,
     terminal_until: Option<Instant>,
 }
 
@@ -102,9 +105,9 @@ impl PresentationController {
             return OverlayView::from_response(response);
         }
         if let Some(event) = response.overlay_event.as_ref()
-            && self.displayed_event != Some(event.id)
+            && self.displayed_event != Some((event.instance, event.id))
         {
-            self.displayed_event = Some(event.id);
+            self.displayed_event = Some((event.instance, event.id));
             self.terminal_until = Some(now + TERMINAL_DISPLAY);
             return OverlayView::from_terminal_event(event);
         }
@@ -123,7 +126,11 @@ mod tests {
     use voisu_core::{DaemonState, OverlayEvent, OverlayOutcome, Response, VersionEnvelope};
 
     fn event(id: u64, outcome: OverlayOutcome) -> OverlayEvent {
-        OverlayEvent { id, outcome, message: "exact public outcome".into() }
+        event_from(0, id, outcome)
+    }
+
+    fn event_from(instance: u64, id: u64, outcome: OverlayOutcome) -> OverlayEvent {
+        OverlayEvent { id, instance, outcome, message: "exact public outcome".into() }
     }
 
     /// Mirrors a real `OverlayStatus` reply: the observer path always attaches
@@ -197,25 +204,34 @@ mod tests {
     }
 
     #[test]
-    fn terminal_event_ids_reused_after_a_daemon_restart_are_still_shown() {
-        // A restarted daemon resets its event-id counter to 1. The controller
-        // must key freshness on inequality, not monotonic growth, or every
-        // post-restart terminal event would be permanently suppressed.
+    fn the_exact_terminal_id_reused_by_a_restarted_daemon_is_still_shown() {
+        // A restarted daemon resets its id counter to 1, so its first terminal
+        // event reuses the EXACT id (1) the observer just displayed. Identity is
+        // scoped by (instance, id), so the new instance disambiguates it; keying
+        // on the bare id would suppress this flash entirely.
+        let instance_a = 0xAAAA_0001;
+        let instance_b = 0xBBBB_0002;
         let mut controller = PresentationController::default();
         let t0 = Instant::now();
         assert_eq!(
-            controller.observe(&overlay_status(DaemonState::Idle, Some(event(1, OverlayOutcome::DeliveryFailure))), t0).phase,
-            OverlayPhase::Failure,
-        );
-        let t1 = t0 + TERMINAL_DISPLAY + Duration::from_millis(1);
-        assert_eq!(
-            controller.observe(&overlay_status(DaemonState::Idle, Some(event(2, OverlayOutcome::Delivered))), t1).phase,
+            controller
+                .observe(&overlay_status(DaemonState::Idle, Some(event_from(instance_a, 1, OverlayOutcome::Delivered))), t0)
+                .phase,
             OverlayPhase::Success,
         );
-        let t2 = t1 + TERMINAL_DISPLAY + Duration::from_millis(1);
-        // Daemon restarted: id counter reset, a distinct outcome reuses id 1.
+        // The terminal window expires and the same retained event stays hidden.
+        let t1 = t0 + TERMINAL_DISPLAY + Duration::from_millis(1);
         assert_eq!(
-            controller.observe(&overlay_status(DaemonState::Idle, Some(event(1, OverlayOutcome::DeliveryFailure))), t2).phase,
+            controller
+                .observe(&overlay_status(DaemonState::Idle, Some(event_from(instance_a, 1, OverlayOutcome::Delivered))), t1)
+                .phase,
+            OverlayPhase::Hidden,
+        );
+        // Daemon restarts: new instance, id counter reset to 1 (exact collision).
+        assert_eq!(
+            controller
+                .observe(&overlay_status(DaemonState::Idle, Some(event_from(instance_b, 1, OverlayOutcome::DeliveryFailure))), t1)
+                .phase,
             OverlayPhase::Failure,
         );
     }
