@@ -235,7 +235,7 @@ dir=$(dirname "$0")
 printf '%s\n' "$@" > "$dir/pw-record.args"
 env | sort > "$dir/pw-record.env"
 head -c 6400 /dev/zero | tr '\000' '\001'
-trap 'printf "\002\003"; exit 0' INT TERM
+trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
 i=0
 while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
 "#,
@@ -311,7 +311,7 @@ fn clipboard_delivery_succeeds_while_wl_copy_serves_the_clipboard_past_exit() {
         r#"#!/bin/sh
 dir=$(dirname "$0")
 head -c 6400 /dev/zero | tr '\000' '\001'
-trap 'printf "\002\003"; exit 0' INT TERM
+trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
 i=0
 while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
 "#,
@@ -751,7 +751,7 @@ fn groq_receives_bounded_overlapping_chunks_and_the_merge_result_is_delivered_on
         "pw-record",
         r#"#!/bin/sh
 head -c 1000000 /dev/zero | tr '\000' '\001'
-trap 'printf "\002\003"; exit 0' INT TERM
+trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
 i=0
 while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
 "#,
@@ -816,7 +816,7 @@ fn production_capture_is_reaped_after_provider_start_failure_and_the_next_record
 dir=$(dirname "$0")
 printf '%s\n' "$$" >> "$dir/pw-record.pids"
 head -c 6400 /dev/zero | tr '\000' '\001'
-trap 'printf "\002\003"; exit 0' INT TERM
+trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
 i=0
 while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
 "#,
@@ -1569,6 +1569,60 @@ fn production_recording_quality_failure(script_body: &str, expected: &str) {
 
     // Every rejected Recording must leave the daemon ready for the next one.
     assert!(voisu(runtime.path(), "start").status.success());
+}
+
+#[test]
+fn a_capture_that_dies_silently_before_stop_never_delivers_a_transcript() {
+    // Real pw-record exits 1 silently when interrupted, but a tool that
+    // already died before the graceful stop — even silently, even after
+    // producing audible frames — must never be read as a clean interrupt.
+    // Either the daemon's own EOF handling or the explicit Stop notices
+    // first; both must fail the Recording and neither may deliver.
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\nhead -c 6400 /dev/zero | tr '\\000' '\\001'\n: > \"$dir/pw-record.ready\"\ntrap - EXIT\nexit 1\n",
+    );
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\ncat > \"$dir/clipboard\"\n",
+    );
+    let (endpoint, request_rx, _server) = local_groq_server("must never be delivered");
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", &endpoint),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "pw-record.ready");
+    let stopped = voisu(runtime.path(), "stop");
+    assert!(!stopped.status.success());
+    let message = stderr(&stopped);
+    assert!(
+        message == "Recording capture failed\n" || message == "No Recording active\n",
+        "a silently dead capture must fail the Recording, got: {message}"
+    );
+    assert!(
+        request_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "a silently dead capture must never reach a provider"
+    );
+    assert!(!commands.path().join("clipboard").exists());
+
+    // Every rejected Recording must leave the daemon ready for the next one.
+    let recovered = start_recording_when_recovered(runtime.path());
+    assert!(recovered.status.success(), "{}", stderr(&recovered));
 }
 
 #[test]

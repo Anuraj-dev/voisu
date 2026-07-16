@@ -1314,6 +1314,9 @@ impl PipeWireActiveCapture {
         let mut child = self.child.take().ok_or_else(|| {
             BoundaryError::new(BoundaryKind::Capture, "pw-record already finalized")
         })?;
+        // A tool that already exited before the stop failed on its own; only a
+        // process that was still capturing when interrupted may exit nonzero.
+        let exited_before_stop = matches!(child.try_wait(), Ok(Some(_)));
         if graceful {
             if let Some(pid) = child.id().try_into().ok() {
                 unsafe {
@@ -1351,7 +1354,15 @@ impl PipeWireActiveCapture {
         };
         let status = status.map_err(|error| capture_process_error(error, &stderr))?;
         let expected_signal = if graceful { libc::SIGINT } else { libc::SIGKILL };
-        if !status.success() && status.signal() != Some(expected_signal) {
+        // Real pw-record catches SIGINT and exits nonzero with no diagnostics
+        // rather than dying by the signal; that silent nonzero exit is its
+        // normal interrupted shape, not a failure. Anything with diagnostics,
+        // or that had already died before the interrupt, stays rejected.
+        let interrupted_cleanly = graceful && !exited_before_stop && stderr.is_empty();
+        if !status.success()
+            && status.signal() != Some(expected_signal)
+            && !interrupted_cleanly
+        {
             return Err(BoundaryError::new(
                 BoundaryKind::Capture,
                 process_diagnostic("pw-record failed", &stderr),
