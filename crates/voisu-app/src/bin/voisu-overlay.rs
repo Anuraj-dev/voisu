@@ -1,40 +1,162 @@
-//! Optional GTK4 Layer Shell observer. It has no command path into the daemon.
+//! Optional GTK feedback observer. It has no command path into the daemon.
 
+use std::cell::RefCell;
+use std::env;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::process::Command as ProcessCommand;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk4 as gtk;
 use gtk::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use voisu_app::overlay::{OverlayPhase, PresentationController};
+use voisu_app::feedback::{
+    after_surface_creation, select_feedback_backend, FeedbackBackend, FeedbackCapabilities,
+    FeedbackDegradation, FeedbackSelection, GtkAvailability, OverlayRestartPolicy, SessionKind,
+};
+use voisu_app::overlay::{OverlayPhase, OverlayView, PresentationController};
 use voisu_core::{Command, PROTOCOL_VERSION, Request, Response, socket_path};
 
 fn main() {
+    let arguments: Vec<_> = env::args().skip(1).collect();
+    let exit_code = if arguments.as_slice() == ["--supervise"] {
+        supervise_overlay()
+    } else {
+        run_overlay(arguments.as_slice())
+    };
+    std::process::exit(exit_code);
+}
+
+/// Runs the observer under a bounded, process-local restart policy. It only
+/// respawns this executable; the daemon is never addressed, signalled, or
+/// restarted by this code.
+fn supervise_overlay() -> i32 {
+    let executable = match env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            eprintln!("overlay_feedback backend=none degradation=supervisor-current-exe-error error={error}");
+            return 1;
+        }
+    };
+    let started = Instant::now();
+    let mut policy = OverlayRestartPolicy::default();
+    loop {
+        let status = match ProcessCommand::new(&executable).status() {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!("overlay_feedback backend=none degradation=supervisor-spawn-failure error={error}");
+                return 1;
+            }
+        };
+        if status.success() {
+            return 0;
+        }
+        if !policy.record_failure(started.elapsed()).should_restart() {
+            eprintln!("overlay_feedback backend=none degradation=restart-limit-reached");
+            // Exit cleanly so a systemd unit invoking --supervise cannot undo
+            // this process's bounded policy with an outer failure restart.
+            return 0;
+        }
+        eprintln!("overlay_feedback backend=none degradation=overlay-process-failure action=restart");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn run_overlay(arguments: &[String]) -> i32 {
+    let report_only = match arguments {
+        [] => false,
+        [flag] if flag == "--report-backend" => true,
+        _ => {
+            eprintln!("usage: voisu-overlay [--report-backend|--supervise]");
+            return 2;
+        }
+    };
+
+    // Do not ask GTK to initialize when no graphical display can exist. This
+    // is the explicit missing-display degradation path and remains useful in
+    // a journal even where a desktop notification is impossible by definition.
+    let preflight = environment_capabilities(GtkAvailability::Available, false);
+    let preliminary = select_feedback_backend(preflight);
+    if preliminary.backend == FeedbackBackend::DesktopNotification {
+        report(preliminary);
+        return 0;
+    }
+
+    if let Err(error) = gtk::init() {
+        let selection = FeedbackSelection {
+            backend: FeedbackBackend::DesktopNotification,
+            degradation: Some(FeedbackDegradation::MissingDisplay),
+        };
+        report_with_error(selection, &error.to_string());
+        return 0;
+    }
+
+    let capabilities = environment_capabilities(GtkAvailability::Available, gtk4_layer_shell::is_supported());
+    let selection = select_feedback_backend(capabilities);
+    report(selection);
+    if report_only {
+        return 0;
+    }
+
     let application = gtk::Application::builder()
         .application_id("org.voisu.Overlay")
         .build();
-    application.connect_activate(build_overlay);
+    application.connect_activate(move |application| build_feedback(application, selection));
     application.run();
+    0
 }
 
-fn build_overlay(application: &gtk::Application) {
+/// Inputs collected outside the pure selector. GTK and Layer Shell APIs stay
+/// in this adapter so contract tests need neither a compositor nor a display.
+fn environment_capabilities(gtk: GtkAvailability, layer_shell_supported: bool) -> FeedbackCapabilities {
+    let session = match env::var("XDG_SESSION_TYPE").ok().as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("wayland") => SessionKind::Wayland,
+        Some(value) if value.eq_ignore_ascii_case("x11") => SessionKind::X11,
+        _ if env::var_os("WAYLAND_DISPLAY").is_some() => SessionKind::Wayland,
+        _ if env::var_os("DISPLAY").is_some() => SessionKind::X11,
+        _ => SessionKind::Unknown,
+    };
+    let display_available = match session {
+        SessionKind::Wayland => env::var_os("WAYLAND_DISPLAY").is_some(),
+        SessionKind::X11 => env::var_os("DISPLAY").is_some(),
+        SessionKind::Unknown => env::var_os("WAYLAND_DISPLAY").is_some() || env::var_os("DISPLAY").is_some(),
+    };
+    FeedbackCapabilities { session, display_available, gtk, layer_shell_supported }
+}
+
+fn report(selection: FeedbackSelection) {
+    eprintln!("{}", selection.report_line());
+}
+
+fn report_with_error(selection: FeedbackSelection, error: &str) {
+    eprintln!("{} error={error}", selection.report_line());
+}
+
+fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) {
+    if selection.backend == FeedbackBackend::DesktopNotification {
+        install_notification_feedback(application);
+        return;
+    }
+
     let window = gtk::ApplicationWindow::builder()
         .application(application)
         .default_width(280)
         .default_height(64)
         .resizable(false)
+        .decorated(false)
         .focusable(false)
         .can_focus(false)
         .build();
 
-    window.init_layer_shell();
-    window.set_layer(Layer::Overlay);
-    window.set_anchor(Edge::Bottom, true);
-    window.set_margin(Edge::Bottom, 24);
-    window.set_keyboard_mode(KeyboardMode::None);
-    window.set_exclusive_zone(-1);
+    if selection.backend == FeedbackBackend::LayerShell {
+        window.init_layer_shell();
+        window.set_layer(Layer::Overlay);
+        window.set_anchor(Edge::Bottom, true);
+        window.set_margin(Edge::Bottom, 24);
+        window.set_keyboard_mode(KeyboardMode::None);
+        window.set_exclusive_zone(-1);
+    }
     window.connect_realize(|window| {
         if let Some(surface) = window.surface() {
             let empty_region = gtk::cairo::Region::create();
@@ -79,69 +201,108 @@ fn build_overlay(application: &gtk::Application) {
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    let controller = Rc::new(std::cell::RefCell::new(PresentationController::default()));
+    // Realize before polling so a compositor rejection becomes a named
+    // notification fallback instead of a hidden, inert GTK window.
+    gtk::prelude::WidgetExt::realize(&window);
+    let effective_selection = after_surface_creation(selection, window.surface().is_some());
+    if effective_selection.backend == FeedbackBackend::DesktopNotification {
+        report(effective_selection);
+        window.close();
+        install_notification_feedback(application);
+        return;
+    }
+
+    install_surface_feedback(window, label, meter, capsule);
+}
+
+fn install_surface_feedback(
+    window: gtk::ApplicationWindow,
+    label: gtk::Label,
+    meter: gtk::Label,
+    capsule: gtk::Box,
+) {
+    let controller = Rc::new(RefCell::new(PresentationController::default()));
     let reduced_motion = gtk::Settings::default()
         .map(|settings| !settings.is_gtk_enable_animations())
         .unwrap_or(true);
-    let window_ref = window.clone();
-    let label_ref = label.clone();
-    let meter_ref = meter.clone();
-    let controller_ref = controller.clone();
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
-        let Some(response) = read_status() else {
-            capsule.remove_css_class("recording");
-            capsule.remove_css_class("processing");
-            capsule.remove_css_class("success");
-            capsule.add_css_class("failure");
-            label_ref.set_label("Daemon unavailable");
-            meter_ref.set_label("");
-            label_ref.update_property(&[gtk::accessible::Property::Description(
-                "Daemon unavailable; the optional Overlay cannot reach voisu-daemon",
-            )]);
-            window_ref.set_visible(true);
-            return gtk::glib::ControlFlow::Continue;
-        };
-        let view = controller_ref.borrow_mut().observe(&response, std::time::Instant::now());
-        for class in ["recording", "processing", "success", "failure"] {
-            capsule.remove_css_class(class);
-        }
-        let class = match view.phase {
-            OverlayPhase::Recording => "recording",
-            OverlayPhase::Processing => "processing",
-            OverlayPhase::Success => "success",
-            OverlayPhase::Failure => "failure",
-            OverlayPhase::Hidden => "",
-        };
-        if !class.is_empty() {
-            capsule.add_css_class(class);
-        }
-        if view.phase == OverlayPhase::Hidden {
-            window_ref.set_visible(false);
-            return gtk::glib::ControlFlow::Continue;
-        }
-        label_ref.set_label(view.visible_label);
-        label_ref.update_property(&[gtk::accessible::Property::Description(view.accessible_label)]);
-        meter_ref.set_label(if view.phase == OverlayPhase::Recording {
-            match view.activity {
-                3 => "▂▆█",
-                2 => "▂▅▆",
-                _ => "▂▃▂",
-            }
-        } else if view.phase == OverlayPhase::Processing {
-            "⋯"
-        } else if view.phase == OverlayPhase::Failure {
-            "⚠"
-        } else {
-            ""
-        });
-        if view.is_visible() {
-            window_ref.set_visible(true);
-        }
-        // No animation source is installed for hidden, Processing, terminal,
-        // or reduced-motion states. Recording activity is status-driven.
-        let _ = view.animation_interval(reduced_motion);
+        let view = read_status().map(|response| controller.borrow_mut().observe(&response, Instant::now()))
+            .unwrap_or_else(daemon_unavailable_view);
+        render_surface(&window, &label, &meter, &capsule, view, reduced_motion);
         gtk::glib::ControlFlow::Continue
     });
+}
+
+fn install_notification_feedback(application: &gtk::Application) {
+    let controller = Rc::new(RefCell::new(PresentationController::default()));
+    let previous = Rc::new(RefCell::new(OverlayView::HIDDEN));
+    let application = application.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
+        let view = read_status().map(|response| controller.borrow_mut().observe(&response, Instant::now()))
+            .unwrap_or_else(daemon_unavailable_view);
+        if view.is_visible() && *previous.borrow() != view {
+            let notification = gtk::gio::Notification::new("Voisu");
+            notification.set_body(Some(view.visible_label));
+            application.send_notification(Some("overlay-feedback"), &notification);
+        }
+        *previous.borrow_mut() = view;
+        gtk::glib::ControlFlow::Continue
+    });
+}
+
+fn daemon_unavailable_view() -> OverlayView {
+    OverlayView {
+        phase: OverlayPhase::Failure,
+        activity: 0,
+        visible_label: "Daemon unavailable",
+        accessible_label: "Daemon unavailable; the optional Overlay cannot reach voisu-daemon",
+    }
+}
+
+fn render_surface(
+    window: &gtk::ApplicationWindow,
+    label: &gtk::Label,
+    meter: &gtk::Label,
+    capsule: &gtk::Box,
+    view: OverlayView,
+    reduced_motion: bool,
+) {
+    for class in ["recording", "processing", "success", "failure"] {
+        capsule.remove_css_class(class);
+    }
+    let class = match view.phase {
+        OverlayPhase::Recording => "recording",
+        OverlayPhase::Processing => "processing",
+        OverlayPhase::Success => "success",
+        OverlayPhase::Failure => "failure",
+        OverlayPhase::Hidden => "",
+    };
+    if !class.is_empty() {
+        capsule.add_css_class(class);
+    }
+    if view.phase == OverlayPhase::Hidden {
+        window.set_visible(false);
+        return;
+    }
+    label.set_label(view.visible_label);
+    label.update_property(&[gtk::accessible::Property::Description(view.accessible_label)]);
+    meter.set_label(if view.phase == OverlayPhase::Recording {
+        match view.activity {
+            3 => "▂▆█",
+            2 => "▂▅▆",
+            _ => "▂▃▂",
+        }
+    } else if view.phase == OverlayPhase::Processing {
+        "⋯"
+    } else if view.phase == OverlayPhase::Failure {
+        "⚠"
+    } else {
+        ""
+    });
+    window.set_visible(true);
+    // No animation source is installed for hidden, Processing, terminal, or
+    // reduced-motion states. Recording activity is status-driven.
+    let _ = view.animation_interval(reduced_motion);
 }
 
 fn read_status() -> Option<Response> {

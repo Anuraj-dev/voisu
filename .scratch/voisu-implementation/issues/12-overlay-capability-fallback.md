@@ -8,12 +8,11 @@ daemon.
 
 **Blocked by:** 11 — Show daemon state in a separate GTK4 voice capsule.
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] Runtime capability detection selects Layer Shell only when the compositor advertises support.
-- [ ] A regular unfocusable GTK surface or desktop notification reports essential states when Layer Shell is unavailable.
-- [ ] X11, missing display, missing GTK dependency, and surface-creation failure produce explicit degraded behavior.
-- [ ] Repeated Overlay failure uses bounded restart policy and never restarts or terminates the daemon.
-- [ ] CLI status and logs identify the selected feedback backend and degradation reason.
-- [ ] Contract tests cover selection and failure behavior without requiring every compositor in CI.
-
+- [x] Runtime capability detection selects Layer Shell only when the compositor advertises support.
+- [x] A regular unfocusable GTK surface or desktop notification reports essential states when Layer Shell is unavailable.
+- [x] X11, missing display, missing GTK dependency, and surface-creation failure produce explicit degraded behavior.
+- [x] Repeated Overlay failure uses bounded restart policy and never restarts or terminates the daemon.
+- [x] CLI status and logs identify the selected feedback backend and degradation reason.
+- [x] Contract tests cover selection and failure behavior without requiring every compositor in CI.

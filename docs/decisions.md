@@ -191,3 +191,12 @@ fork-to-prctl race. Per-command hooks were rejected because they had already lef
 uncovered and allowed the PipeWire hook to omit the race check.
 ## 2026-07-16 — Version terminal Overlay feedback independently of daemon lifecycle status
 **Why:** The Overlay needs display-once terminal feedback without making CLI Status sticky or coupling presentation to Recording/Delivery ownership. Typed event IDs let an observer deduplicate and expire feedback while the daemon remains authoritative and reusable.
+
+## 2026-07-16 — Keep Overlay fallback and supervision outside the daemon
+**Why:** GTK Layer Shell support belongs to the running compositor, not Cargo target selection. The Overlay therefore
+selects Layer Shell only after the GTK runtime advertises it; X11 and unavailable Layer Shell use an unfocusable
+regular GTK surface, while missing display, GTK, or a failed surface select desktop-notification feedback with a
+specific degradation reason. `voisu status` deliberately remains daemon-only: the separate observer emits its chosen
+backend and reason to structured stderr/journal logs and `voisu-overlay --report-backend`. `voisu-overlay --supervise`
+limits its own failures to three in 30 seconds and has no daemon IPC command, signal, or lifecycle path; restarting the
+daemon to recover presentation was rejected because it could interrupt a Recording or duplicate Delivery.
