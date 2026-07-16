@@ -499,22 +499,28 @@ fn validate_packaged_execs(fragment: &Path, execs: &[PathBuf]) -> Result<(), Str
 }
 
 fn parse_show_execstart_binaries(lines: &[String]) -> Vec<PathBuf> {
-    // systemd renders one `ExecStart=` line per command as
-    // `{ path=/bin/x ; argv[]=/bin/x --f ; ... }`. The command binary is the
-    // `path=` field opening each `{ … }` block; a `path=` substring inside an
-    // argv[] argument (e.g. `--config-path=/tmp`) must never match, so only
-    // block-opening `{ path=` occurrences are collected.
+    // systemd renders each command as `{ path=/bin/x ; argv[]=/bin/x --f ; … }`
+    // and joins multiple commands with `} ; {`. The command binary is only the
+    // `path=` field OPENING a block — at the start of the value or right after
+    // a `} ; ` block close. A `{ path=` sequence inside an argv[] argument
+    // (e.g. `--config-path=/tmp`, or a literal `{ path=/tmp` argument) must
+    // never be collected as an executable.
     let mut binaries = Vec::new();
     for line in lines {
-        let mut rest = line.as_str();
-        while let Some(index) = rest.find("{ path=") {
-            let after = &rest[index + "{ path=".len()..];
+        let value = line.trim_start();
+        let mut offset = 0;
+        while let Some(found) = value[offset..].find("{ path=") {
+            let index = offset + found;
+            let opens_block = index == 0 || value[..index].ends_with("} ; ");
+            let after = &value[index + "{ path=".len()..];
             let end = after.find(" ;").unwrap_or(after.len());
-            let path = after[..end].trim();
-            if !path.is_empty() {
-                binaries.push(PathBuf::from(path));
+            if opens_block {
+                let path = after[..end].trim();
+                if !path.is_empty() {
+                    binaries.push(PathBuf::from(path));
+                }
             }
-            rest = &after[end..];
+            offset = index + "{ path=".len() + end;
         }
     }
     binaries
@@ -532,10 +538,26 @@ fn parse_unit_file_execstart_binaries(contents: &str) -> Result<Vec<PathBuf>, St
         return Err("unit file uses line continuations".to_owned());
     }
     let mut binaries = Vec::new();
+    let mut in_service_section = false;
     for line in contents.lines() {
-        let Some(value) = line.trim().strip_prefix("ExecStart=") else {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            // Only [Service] assignments are systemd commands; an ExecStart=
+            // under any other section must never collect into — or reset — the
+            // command list.
+            in_service_section = line == "[Service]";
+            continue;
+        }
+        if !in_service_section {
+            continue;
+        }
+        // systemd trims whitespace around the key, so `ExecStart =` also counts.
+        let Some((key, value)) = line.split_once('=') else {
             continue;
         };
+        if key.trim_end() != "ExecStart" {
+            continue;
+        }
         let value = value.trim();
         if value.is_empty() {
             // systemd reset semantics: an empty assignment clears the list.

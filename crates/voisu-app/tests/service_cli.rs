@@ -598,6 +598,55 @@ fn an_execstart_reset_in_the_packaged_unit_clears_earlier_commands() {
 }
 
 #[test]
+fn an_execstart_outside_the_service_section_never_resets_or_substitutes_commands() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    // Only [Service] assignments are commands systemd runs. A reset and a valid
+    // executable under a foreign section must not clear or replace the broken
+    // [Service] command, so the unit stays untrusted and install stays on
+    // Ticket 09.
+    assert!(fixture.run(&["service", "install"]).status.success());
+    fixture.install_packaged_unit();
+    fs::write(
+        fixture.packaged_unit_file(),
+        format!(
+            "[Service]\nExecStart=/nonexistent-first --systemd\n\n[X-Custom]\nExecStart=\nExecStart={} --systemd\n",
+            fixture.packaged_daemon.display()
+        ),
+    )
+    .unwrap();
+
+    let installed = fixture.run(&["service", "install"]);
+
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    assert!(
+        stdout(&installed).contains("packaged unit was ignored")
+            && stdout(&installed).contains("/nonexistent-first"),
+        "{}",
+        stdout(&installed)
+    );
+    assert!(fixture.unit_path().exists());
+}
+
+#[test]
+fn show_argv_arguments_containing_a_block_opener_do_not_reject_a_valid_packaged_unit() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    // Even a literal `{ path=…` sequence inside an argv[] argument is not a
+    // command binary: only a `{ path=` that opens a rendered block (start of
+    // value or after `} ; `) counts, so the valid packaged unit is selected.
+    fixture.install_packaged_unit();
+    fixture.override_effective_argv_extra("{ path=/tmp");
+
+    let installed = fixture.run(&["service", "install"]);
+
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    assert!(
+        stdout(&installed).contains("packaged systemd user service selected"),
+        "{}",
+        stdout(&installed)
+    );
+}
+
+#[test]
 fn quoted_or_continued_packaged_execstart_syntax_is_never_guessed_at() {
     let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
     // Unit-file syntax the conservative parser does not faithfully support —

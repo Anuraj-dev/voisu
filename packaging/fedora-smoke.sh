@@ -161,8 +161,9 @@ cleanup() {
         if test -n "$current_nevra"; then
             "${dnf_cmd[@]}" remove -y voisu >/dev/null 2>&1 || true
         fi
-        # Judged on the end state: the smoke-installed RPM must be gone and the
-        # unit must not be left enabled; either leftover forces a failure exit.
+        # Judged on the end state: the smoke-installed RPM must be gone, the
+        # unit must not be left enabled, and the smoke-started service must not
+        # still be running; any leftover forces a failure exit.
         if rpm -q voisu >/dev/null 2>&1; then
             printf 'cleanup: smoke-installed Voisu RPM is still installed\n' >&2
             if test "$rc" -eq 0; then rc=1; fi
@@ -174,6 +175,15 @@ cleanup() {
                 if test "$rc" -eq 0; then rc=1; fi
                 ;;
         esac
+        # A removed unit can keep running as a loaded-runtime service; stop it
+        # and verify it actually stopped.
+        if test "$(systemctl --user is-active voisu.service 2>/dev/null || true)" = active; then
+            systemctl --user stop voisu.service >/dev/null 2>&1 || true
+        fi
+        if test "$(systemctl --user is-active voisu.service 2>/dev/null || true)" = active; then
+            printf 'cleanup: voisu.service is still active after removal\n' >&2
+            if test "$rc" -eq 0; then rc=1; fi
+        fi
     fi
     if ! restore_user_service; then
         printf 'user-service state could not be fully restored\n' >&2
