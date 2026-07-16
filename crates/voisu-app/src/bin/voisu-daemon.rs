@@ -14,8 +14,9 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use voisu_app::system::{
     CAPTURE_FINALIZE_DEADLINE, DeepgramProvider, FedoraShortcutPortal,
-    GroqProvider, MergeResultValidator, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture,
-    PortalClipboardDelivery, RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
+    GroqProvider, MergeResultValidator, PROCESSING_RESPONSE_DEADLINE,
+    PROVIDER_COMPLETION_DEADLINE, PipeWireCapture, PortalClipboardDelivery, ProviderReaper,
+    RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
@@ -89,7 +90,16 @@ async fn run() -> Result<(), String> {
     }
 
     let (actor_tx, actor_rx) = mpsc::channel(64);
-    tokio::spawn(actor_loop(actor_rx, actor_tx.clone(), diagnostics));
+    // The actor-owned provider reaper supervises every provider-stream cleanup.
+    // A clone stays here so shutdown, after the actor has joined, drains any
+    // curl reap still retained before the Tokio runtime is torn down.
+    let reaper = ProviderReaper::new();
+    let actor = tokio::spawn(actor_loop(
+        actor_rx,
+        actor_tx.clone(),
+        diagnostics,
+        reaper.clone(),
+    ));
     // The Global Shortcuts portal listener runs off the actor so a slow or
     // unavailable portal never blocks the IPC surface. Each Trigger Key
     // activation is fed to the actor as a Toggle, reusing the actor's
@@ -125,11 +135,45 @@ async fn run() -> Result<(), String> {
             }
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|error| format!("cannot listen for shutdown: {error}"))?;
-                return Ok(());
+                return shutdown(actor, actor_tx, reaper).await;
             }
-            _ = terminate.recv() => return Ok(()),
+            _ = terminate.recv() => return shutdown(actor, actor_tx, reaper).await,
         }
     }
+}
+
+/// Gates runtime teardown on the actor finishing its work: any active Recording
+/// is stopped and processed to completion, every in-flight workflow acknowledges
+/// (each drains the provider reaper before acknowledging), and the actor task is
+/// joined. Only after every stream Drop and adoption is therefore complete does
+/// the final bounded drain run, so provider streams are never dropped by runtime
+/// teardown and no retained curl reap outlives the runtime.
+async fn shutdown(
+    actor: JoinHandle<()>,
+    actor_tx: mpsc::Sender<ActorMessage>,
+    reaper: ProviderReaper,
+) -> Result<(), String> {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if actor_tx.send(ActorMessage::Shutdown(ack_tx)).await.is_ok()
+        && timeout(PROCESSING_RESPONSE_DEADLINE, ack_rx).await.is_err()
+    {
+        eprintln!("shutdown: actor did not acknowledge within the processing bound");
+    }
+    drop(actor_tx);
+    // Join the actor WITHOUT racing it against a deadline: dropping this handle
+    // on a timeout would detach the still-running actor while it owns provider
+    // streams, and the final drain below could then observe an empty supervisor
+    // before those streams drop. Every wait inside the actor is itself bounded,
+    // so this join terminates within the actor's internal budget; the unit's
+    // explicit TimeoutStopSec is the external last-resort backstop.
+    if actor.await.is_err() {
+        eprintln!("shutdown: actor task panicked");
+    }
+    // All stream Drops and adoptions are complete now, so drain to completion:
+    // a single bounded drain that timed out would retain the unfinished cleanup
+    // only for this function to return and drop the runtime over it.
+    reaper.drain_to_completion(RECOVERY_ABORT_DEADLINE).await;
+    Ok(())
 }
 
 fn create_private_runtime_dirs(parent: &Path) -> Result<(), String> {
@@ -233,6 +277,12 @@ enum ActorMessage {
     /// binding once (or `None` when the portal is unavailable or denied), so the
     /// `Shortcut` command can display it. Binding never gates Recording control.
     ShortcutBound(Option<TriggerKeyBinding>),
+    /// Graceful shutdown request from the signal handler. The actor stops any
+    /// active Recording, waits for every in-flight workflow to acknowledge —
+    /// each workflow drains the provider reaper before acknowledging — and only
+    /// then replies and returns, so the runtime is never torn down over live
+    /// capture, provider, or blocking cleanup work.
+    Shutdown(oneshot::Sender<()>),
 }
 
 /// Ownership handed back once a fixture replay finishes: the provider and
@@ -312,6 +362,7 @@ async fn actor_loop(
     mut rx: mpsc::Receiver<ActorMessage>,
     tx: mpsc::Sender<ActorMessage>,
     diagnostics: Arc<DiagnosticStore>,
+    reaper: ProviderReaper,
 ) {
     let mut state = ActorState::Idle;
     let mut next_id = 1_u64;
@@ -329,12 +380,12 @@ async fn actor_loop(
     let mut deepgram: Option<Box<dyn TranscriptProvider>> = Some(if controlled {
         Box::new(ControlledProvider::from_env(Provider::Deepgram))
     } else {
-        Box::new(DeepgramProvider)
+        Box::new(DeepgramProvider::new(reaper.clone()))
     });
     let mut groq: Option<Box<dyn TranscriptProvider>> = Some(if controlled {
         Box::new(ControlledProvider::from_env(Provider::Groq))
     } else {
-        Box::new(GroqProvider)
+        Box::new(GroqProvider::new(reaper.clone()))
     });
     let mut validator: Option<Box<dyn TranscriptValidator>> = if controlled {
         Some(Box::new(ControlledValidator::from_env()))
@@ -352,6 +403,11 @@ async fn actor_loop(
     // it. `None` means no Trigger Key is bound (portal unavailable or denied),
     // which never prevents CLI Recording control.
     let mut shortcut_binding: Option<TriggerKeyBinding> = None;
+    // A pending graceful-shutdown acknowledgement. Once set, the actor keeps
+    // processing messages until every in-flight workflow has acknowledged and
+    // the state returns to Idle, then acknowledges and returns so `shutdown`
+    // can join this task before the runtime is torn down.
+    let mut shutdown_ack: Option<oneshot::Sender<()>> = None;
 
     while let Some(message) = rx.recv().await {
         match message {
@@ -418,7 +474,14 @@ async fn actor_loop(
                         current_validator,
                         provider_deadline,
                     ));
-                    tokio::spawn(supervise_replay(replay, id, controlled, reply, tx.clone()));
+                    tokio::spawn(supervise_replay(
+                        replay,
+                        id,
+                        controlled,
+                        reply,
+                        tx.clone(),
+                        reaper.clone(),
+                    ));
                 }
                 Command::Replay(_) => {
                     let _ = reply.send(Response::rejected(
@@ -498,6 +561,7 @@ async fn actor_loop(
                         Some(reply),
                         Arc::clone(&diagnostics),
                         debug_capture,
+                        reaper.clone(),
                     ));
                 }
                 Command::Stop => {
@@ -542,6 +606,67 @@ async fn actor_loop(
                 };
                 if let Some(correlation) = correlation {
                     match result {
+                        Ok((active_capture, streams)) if shutdown_ack.is_some() => {
+                            // Shutdown arrived while this Recording was starting:
+                            // never start the pump. Abort everything the start
+                            // sequence produced, off the loop, drain the reaper,
+                            // and leave through Recovering -> Recovered -> Idle.
+                            // Like any other Recording outcome, this one is
+                            // correlated: its record persists locally and the
+                            // rejection carries the correlated evidence back.
+                            let mut record = DiagnosticRecord::new(correlation.clone(), id);
+                            record.error = Some("daemon is shutting down".to_owned());
+                            record.recovery_attempted = true;
+                            if let Err(error) = diagnostics.record(record) {
+                                eprintln!(
+                                    "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
+                                );
+                            }
+                            let mut evidence = base_evidence(
+                                id,
+                                correlation,
+                                vec![
+                                    LifecycleStage::CaptureStarted,
+                                    LifecycleStage::ProvidersStarted,
+                                ],
+                            );
+                            evidence.recovery_attempted = true;
+                            let _ = reply.send(Response::with_evidence(
+                                false,
+                                Some(DaemonState::Idle),
+                                "daemon is shutting down",
+                                Some(evidence),
+                            ));
+                            state = ActorState::Recovering(id);
+                            let actor = tx.clone();
+                            let shutdown_reaper = reaper.clone();
+                            tokio::spawn(async move {
+                                let ProviderStreams { deepgram, groq } = streams;
+                                let (capture_result, deepgram_result, groq_result) = tokio::join!(
+                                    timeout(RECOVERY_ABORT_DEADLINE, active_capture.abort()),
+                                    timeout(RECOVERY_ABORT_DEADLINE, deepgram.abort()),
+                                    timeout(RECOVERY_ABORT_DEADLINE, groq.abort()),
+                                );
+                                for (label, result) in [
+                                    ("capture", capture_result),
+                                    ("Deepgram", deepgram_result),
+                                    ("Groq", groq_result),
+                                ] {
+                                    match result {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(error)) => eprintln!(
+                                            "Recording {id}: shutdown {label} abort failed: {}",
+                                            error.diagnostic()
+                                        ),
+                                        Err(_) => eprintln!(
+                                            "Recording {id}: shutdown {label} abort timed out"
+                                        ),
+                                    }
+                                }
+                                shutdown_reaper.drain(RECOVERY_ABORT_DEADLINE).await;
+                                let _ = actor.send(ActorMessage::Recovered(id)).await;
+                            });
+                        }
                         Ok((active_capture, streams)) => {
                             let evidence = base_evidence(
                                 id,
@@ -631,6 +756,7 @@ async fn actor_loop(
                                     correlation,
                                     failure,
                                     tx.clone(),
+                                    reaper.clone(),
                                 ));
                             } else {
                                 state = ActorState::Idle;
@@ -640,6 +766,8 @@ async fn actor_loop(
                 }
             }
             ActorMessage::Recovered(id) => {
+                // The recovery workflow drained the provider reaper before this
+                // acknowledgement, so the Idle transition never blocks the loop.
                 if matches!(&state, ActorState::Recovering(recovering) if *recovering == id) {
                     state = ActorState::Idle;
                 }
@@ -659,6 +787,8 @@ async fn actor_loop(
                 deepgram = Some(returned_deepgram);
                 groq = Some(returned_groq);
                 validator = Some(returned_validator);
+                // `supervise_replay` drained the provider reaper before this
+                // acknowledgement, so the Idle transition never blocks the loop.
                 if matches!(&state, ActorState::Replaying(replaying) if *replaying == id) {
                     state = ActorState::Idle;
                 }
@@ -687,6 +817,7 @@ async fn actor_loop(
                         None,
                         Arc::clone(&diagnostics),
                         debug_capture,
+                        reaper.clone(),
                     ));
                 }
             }
@@ -695,6 +826,11 @@ async fn actor_loop(
                 delivery = Some(completed.delivery);
                 if matches!(&state, ActorState::Processing(evidence) if evidence.recording_id == completed.id)
                 {
+                    // `process_recording` drained the provider reaper before
+                    // sending this acknowledgement, so any stream dropped
+                    // mid-cleanup has already completed its retained curl reap;
+                    // the acknowledgement alone permits this Idle transition and
+                    // the actor loop never blocks on the drain.
                     state = ActorState::Idle;
                     let response = match completed.result {
                         Ok(()) => Response::with_evidence(
@@ -723,6 +859,49 @@ async fn actor_loop(
                     }
                 }
             }
+            ActorMessage::Shutdown(ack) => {
+                shutdown_ack = Some(ack);
+                if matches!(state, ActorState::Recording(_)) {
+                    // Stop the active Recording exactly like a Stop command with
+                    // no client reply: processing runs to completion (Delivery
+                    // included) and its acknowledgement returns the actor to
+                    // Idle, which releases the shutdown acknowledgement below.
+                    let ActorState::Recording(recording) =
+                        std::mem::replace(&mut state, ActorState::Idle)
+                    else {
+                        unreachable!()
+                    };
+                    let mut processing_evidence = recording.evidence.clone();
+                    processing_evidence.streamed_chunk_count =
+                        recording.chunk_counter.load(Ordering::SeqCst);
+                    processing_evidence.first_chunk_ms =
+                        atomic_millis(&recording.first_chunk_ms);
+                    state = ActorState::Processing(processing_evidence);
+                    let current_validator = validator.take().expect("validator is available");
+                    let current_delivery =
+                        delivery.take().expect("Delivery adapter is available");
+                    tokio::spawn(process_recording(
+                        recording,
+                        current_validator,
+                        current_delivery,
+                        tx.clone(),
+                        None,
+                        Arc::clone(&diagnostics),
+                        debug_capture,
+                        reaper.clone(),
+                    ));
+                }
+            }
+        }
+        // Graceful shutdown leaves only from Idle: every in-flight workflow has
+        // acknowledged (each drained the provider reaper first), so no stream
+        // Drop or adoption can still be outstanding when the actor returns and
+        // `shutdown` joins it ahead of runtime teardown.
+        if shutdown_ack.is_some() && matches!(state, ActorState::Idle) {
+            if let Some(ack) = shutdown_ack.take() {
+                let _ = ack.send(());
+            }
+            return;
         }
     }
 }
@@ -853,6 +1032,7 @@ async fn recover_failed_start(
     correlation: String,
     failure: StartFailure,
     actor: mpsc::Sender<ActorMessage>,
+    reaper: ProviderReaper,
 ) {
     let StartFailure {
         capture,
@@ -893,6 +1073,12 @@ async fn recover_failed_start(
         }
     };
     tokio::join!(capture_abort, provider_abort);
+    // A timed-out provider abort dropped its stream above, adopting the still-
+    // live cleanup into the reaper. Drain it before acknowledging: Recovered
+    // alone permits the Idle transition.
+    if !reaper.drain(RECOVERY_ABORT_DEADLINE).await {
+        eprintln!("Recording {id} [{correlation}]: provider cleanup did not drain in bound");
+    }
     let _ = actor.send(ActorMessage::Recovered(id)).await;
 }
 
@@ -1017,6 +1203,7 @@ async fn process_recording(
     reply: Option<oneshot::Sender<Response>>,
     diagnostics: Arc<DiagnosticStore>,
     debug_capture: bool,
+    reaper: ProviderReaper,
 ) {
     let ActiveRecording {
         id,
@@ -1113,6 +1300,15 @@ async fn process_recording(
         eprintln!("Recording {id}: writing diagnostics failed: {error}");
     }
 
+    // Every provider stream of this Recording has been consumed or dropped by
+    // now, so any cleanup a mid-abort drop adopted is already retained in the
+    // reaper. Drain it here — off the actor loop — before acknowledging: the
+    // Completed acknowledgement alone permits the Idle transition, so Idle is
+    // never observable while this Recording's blocking cleanup is live.
+    if !reaper.drain(RECOVERY_ABORT_DEADLINE).await {
+        eprintln!("Recording {id}: provider cleanup did not drain within the abort bound");
+    }
+
     let _ = actor
         .send(ActorMessage::Completed(Completion {
             id,
@@ -1180,6 +1376,7 @@ async fn supervise_replay(
     controlled: bool,
     reply: oneshot::Sender<Response>,
     actor: mpsc::Sender<ActorMessage>,
+    reaper: ProviderReaper,
 ) {
     let completion = match replay.await {
         Ok(result) => ReplayCompletion {
@@ -1192,7 +1389,7 @@ async fn supervise_replay(
         },
         Err(join_error) => {
             eprintln!("Replay {id}: replay task failed: {join_error}");
-            let (deepgram, groq, validator) = rebuild_replay_adapters(controlled);
+            let (deepgram, groq, validator) = rebuild_replay_adapters(controlled, &reaper);
             ReplayCompletion {
                 id,
                 deepgram,
@@ -1203,6 +1400,12 @@ async fn supervise_replay(
             }
         }
     };
+    // A replay whose provider abort timed out dropped its streams above,
+    // adopting their cleanup into the reaper. Drain it before acknowledging:
+    // ReplayCompleted alone permits the Idle transition.
+    if !reaper.drain(RECOVERY_ABORT_DEADLINE).await {
+        eprintln!("Replay {id}: provider cleanup did not drain within the abort bound");
+    }
     let _ = actor.send(ActorMessage::ReplayCompleted(completion)).await;
 }
 
@@ -1210,6 +1413,7 @@ async fn supervise_replay(
 /// the originals. Mirrors the actor's startup construction.
 fn rebuild_replay_adapters(
     controlled: bool,
+    reaper: &ProviderReaper,
 ) -> (
     Box<dyn TranscriptProvider>,
     Box<dyn TranscriptProvider>,
@@ -1223,8 +1427,8 @@ fn rebuild_replay_adapters(
         )
     } else {
         (
-            Box::new(DeepgramProvider),
-            Box::new(GroqProvider),
+            Box::new(DeepgramProvider::new(reaper.clone())),
+            Box::new(GroqProvider::new(reaper.clone())),
             Box::new(MergeResultValidator::new()),
         )
     }
@@ -1688,6 +1892,9 @@ struct ControlledProvider {
     text: String,
     delay: Duration,
     send_stall: Duration,
+    /// Blocking stall inside `start`, holding the Recording in Starting long
+    /// enough for tests to interleave a shutdown with the start sequence.
+    start_stall: Duration,
     fail_start_once: bool,
     fail_abort: bool,
     fail_complete: bool,
@@ -1724,6 +1931,7 @@ impl ControlledProvider {
             text,
             delay,
             send_stall,
+            start_stall: env_millis("VOISU_TEST_START_STALL_MS"),
             fail_start_once,
             fail_abort,
             fail_complete,
@@ -1733,6 +1941,11 @@ impl ControlledProvider {
 
 impl TranscriptProvider for ControlledProvider {
     fn start(&mut self, _recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError> {
+        if !self.start_stall.is_zero() {
+            // `start` runs inside the actor's `begin_recording` blocking task,
+            // so a blocking sleep is the faithful stand-in for a slow adapter.
+            std::thread::sleep(self.start_stall);
+        }
         if std::mem::take(&mut self.fail_start_once) {
             return Err(BoundaryError::new(
                 BoundaryKind::Provider,
@@ -1914,5 +2127,45 @@ impl DeliveryAdapter for ControlledDelivery {
                 Err(_) => DeliveryOutcome::compositor_submitted(),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The graceful shutdown must JOIN the actor, never abandon the join on a
+    /// deadline: an abandoned actor keeps running detached while it still owns
+    /// provider streams, and the final drain can observe an empty supervisor
+    /// before those streams drop. The stand-in actor here acknowledges promptly
+    /// but keeps working past the abandoned implementation's former 2s join
+    /// bound; `shutdown` must not return until that work has finished.
+    #[tokio::test]
+    async fn shutdown_joins_the_actor_instead_of_abandoning_it_on_a_deadline() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let reaper = ProviderReaper::new();
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let actor_finished = Arc::clone(&finished);
+        let actor = tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if let ActorMessage::Shutdown(ack) = message {
+                    let _ = ack.send(());
+                    // Live Recording work the actor still owns after
+                    // acknowledging — for example a stream whose Drop has not
+                    // run yet. It outlasts any former join bound.
+                    tokio::time::sleep(Duration::from_millis(2_500)).await;
+                    actor_finished.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        });
+
+        shutdown(actor, tx, reaper)
+            .await
+            .expect("shutdown must succeed");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "shutdown must not return while the actor still runs live work"
+        );
     }
 }

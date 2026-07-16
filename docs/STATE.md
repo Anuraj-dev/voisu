@@ -2,11 +2,14 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-16
 
 ## 🚧 In progress / next
-- Ticket 08 merged through PR #15 at `a5771a9`; exact-head CI passed and issue #8 is closed.
-- Ticket 09 merged through PR #16 at `9b58f99`; exact-head CI passed and issue #9 is closed.
-- Ticket 10 round-1 review findings are fixed on `ticket-10-recovery`; next step is re-review, exact-head CI,
-  PR/merge, and issue #10 closure.
-- Follow-up issue #14 remains open: make Deepgram/Groq abort cancellation-safe plus its regression test.
+- Ticket 10 merged through PR #17 at `aa8055a` (squash); exact-head CI passed and issue #10 is closed.
+  Reviews: Sol high round 1 (2 BLOCKER + 1 HIGH + 1 MEDIUM), fixes in `0865286`, Sol medium round 2 APPROVE.
+- Issue #14 review round 1 is fixed on `issue-14-cancellation-safe-abort`: abort-deadline drop now actively cancels
+  and retains each adapter task through a reaper, while provider cancellation preserves curl child reap. The
+  deterministic regression is proven RED with `drain(..)` reinstated. Next: Sol medium re-review, PR, exact-head
+  CI, merge, and close #14.
+- After #14: Ticket 11 (issue #11, GTK4 voice capsule) starts the overlay phase — routing note: Luna per the
+  benchmark plan (Luna unused so far). Benchmark log current through Ticket 10 (`docs/model-benchmark.md`).
 
 ## Status
 - `voisu` and `voisu-daemon` communicate over bounded, versioned Unix IPC; the actor keeps status responsive while
@@ -45,8 +48,8 @@
 - Portal revocation/restart acceptance now runs real PipeWire/provider/clipboard adapters against a private portal
   bus and asserts exact clipboard bytes. The live Fedora recovery smoke refuses an existing Voisu installation,
   verifies the daemon PID changes after interruption, and disables/removes its debug service even after panic.
-- Current inventory: 172 tests listed (10 app unit + 106 daemon/CLI acceptance + 6 Delivery + 10 user-service +
-  20 diagnostics + 6 provider-coordination + 14 Transcript-decision). The full host gate is green: 170 passed,
+- Current inventory: 173 tests listed (11 app unit + 106 daemon/CLI acceptance + 6 Delivery + 10 user-service +
+  20 diagnostics + 6 provider-coordination + 14 Transcript-decision). The full host gate is green: 171 passed,
   2 opt-in live smokes ignored, 0 failed; `cargo build --workspace` is clean.
 
 ## Architecture map

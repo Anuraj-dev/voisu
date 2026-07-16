@@ -3639,6 +3639,68 @@ fn trigger_key_first_activation_starts_and_next_activation_stops_the_recording()
 }
 
 #[test]
+fn sigterm_during_an_active_recording_completes_the_recording_before_exit() {
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start(runtime.path());
+
+    let started = voisu(runtime.path(), "start");
+    assert!(started.status.success(), "{}", stderr(&started));
+    wait_for_status(runtime.path(), "Recording\n");
+
+    // SIGTERM with an active Recording: the daemon must stop the Recording,
+    // process it to completion (Delivery included), and only then exit — never
+    // return from its accept loop and let runtime teardown drop the live
+    // capture, provider, and cleanup work.
+    daemon.terminate();
+
+    // The interrupted Recording's outcome was persisted before exit; a fresh
+    // daemon over the same runtime directory serves the retained history.
+    let _daemon = Daemon::start(runtime.path());
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let records = history["history"].as_array().expect("history is a list");
+    assert_eq!(records.len(), 1, "{history}");
+    assert_eq!(records[0]["delivery_count"], 1, "{history}");
+    assert!(records[0]["error"].is_null(), "{history}");
+}
+
+#[test]
+fn sigterm_while_a_recording_is_starting_persists_a_correlated_record() {
+    let runtime = TempDir::new().unwrap();
+    // Provider start stalls hold the Recording in its start sequence long
+    // enough for the SIGTERM to arrive while it is still Starting.
+    let daemon = Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_START_STALL_MS", "700")]);
+
+    let runtime_dir = runtime.path().to_path_buf();
+    let start = thread::spawn(move || voisu(&runtime_dir, "start"));
+    thread::sleep(Duration::from_millis(150));
+    daemon.terminate();
+
+    // The start that shutdown interrupted is rejected like any other Recording
+    // outcome: with the shutdown reason and never a started Recording.
+    let rejected = start.join().expect("start CLI must not panic");
+    assert!(!rejected.status.success(), "{}", stdout(&rejected));
+    assert!(
+        stderr(&rejected).contains("daemon is shutting down"),
+        "{}",
+        stderr(&rejected)
+    );
+
+    // The interrupted start persisted a correlated diagnostic record before the
+    // daemon exited; a fresh daemon over the same runtime directory serves it.
+    let _daemon = Daemon::start(runtime.path());
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let records = history["history"].as_array().expect("history is a list");
+    assert_eq!(records.len(), 1, "{history}");
+    assert_eq!(records[0]["error"], "daemon is shutting down", "{history}");
+    assert!(
+        records[0]["correlation_id"]
+            .as_str()
+            .is_some_and(|correlation| !correlation.is_empty()),
+        "{history}"
+    );
+}
+
+#[test]
 fn concurrent_trigger_key_activations_cannot_overlap_recordings() {
     let runtime = TempDir::new().unwrap();
     let portal = MockPortal::start();

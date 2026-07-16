@@ -354,7 +354,13 @@ fn service_unit(executable: &Path) -> Result<String, String> {
         "Type=simple\n",
         "ExecStart={} --systemd\n",
         "Restart=on-failure\n",
-        "RestartSec=2s\n\n",
+        "RestartSec=2s\n",
+        // Graceful shutdown stops an active Recording, processes it to
+        // completion, joins the actor, and drains retained provider cleanup;
+        // that internal budget peaks near 37 seconds, so the stop bound is set
+        // explicitly and comfortably above it instead of relying on the
+        // distribution's default.
+        "TimeoutStopSec=60s\n\n",
         "[Install]\n",
         "WantedBy=graphical-session.target\n",
     ), executable))
