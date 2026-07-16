@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use gtk4 as gtk;
 use gtk::prelude::*;
-use gtk4_layer_shell::{Edge, KeyboardInteractivity, Layer};
+use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use voisu_app::overlay::{OverlayPhase, PresentationController};
 use voisu_core::{Command, PROTOCOL_VERSION, Request, Response, socket_path};
 
@@ -29,12 +29,12 @@ fn build_overlay(application: &gtk::Application) {
         .can_focus(false)
         .build();
 
-    gtk4_layer_shell::init_for_window(&window);
-    gtk4_layer_shell::set_layer(&window, Layer::Overlay);
-    gtk4_layer_shell::set_anchor(&window, Edge::Bottom, true);
-    gtk4_layer_shell::set_margin(&window, Edge::Bottom, 24);
-    gtk4_layer_shell::set_keyboard_interactivity(&window, KeyboardInteractivity::None);
-    gtk4_layer_shell::set_exclusive_zone(&window, -1);
+    window.init_layer_shell();
+    window.set_layer(Layer::Overlay);
+    window.set_anchor(Edge::Bottom, true);
+    window.set_margin(Edge::Bottom, 24);
+    window.set_keyboard_mode(KeyboardMode::None);
+    window.set_exclusive_zone(-1);
     window.connect_realize(|window| {
         if let Some(surface) = window.surface() {
             let empty_region = gtk::cairo::Region::create();
@@ -60,7 +60,7 @@ fn build_overlay(application: &gtk::Application) {
     capsule.append(&label);
     capsule.append(&meter);
     window.set_child(Some(&capsule));
-    window.hide();
+    window.set_visible(false);
 
     let css = gtk::CssProvider::new();
     css.load_from_data(
@@ -73,14 +73,15 @@ fn build_overlay(application: &gtk::Application) {
     );
     capsule.add_css_class("capsule");
     gtk::style_context_add_provider_for_display(
-        &window.display(),
+        &gtk::prelude::RootExt::display(&window),
         &css,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
     let controller = Rc::new(std::cell::RefCell::new(PresentationController::default()));
     let reduced_motion = gtk::Settings::default()
-        .map(|settings| !settings.is_gtk_enable_animations());
+        .map(|settings| !settings.is_gtk_enable_animations())
+        .unwrap_or(true);
     let window_ref = window.clone();
     let label_ref = label.clone();
     let meter_ref = meter.clone();
@@ -96,7 +97,7 @@ fn build_overlay(application: &gtk::Application) {
             label_ref.update_property(&[gtk::accessible::Property::Description(
                 "Daemon unavailable; the optional Overlay cannot reach voisu-daemon",
             )]);
-            window_ref.show();
+            window_ref.set_visible(true);
             return gtk::glib::ControlFlow::Continue;
         };
         let view = controller_ref.borrow_mut().observe(&response, std::time::Instant::now());
@@ -114,7 +115,7 @@ fn build_overlay(application: &gtk::Application) {
             capsule.add_css_class(class);
         }
         if view.phase == OverlayPhase::Hidden {
-            window_ref.hide();
+            window_ref.set_visible(false);
             return gtk::glib::ControlFlow::Continue;
         }
         label_ref.set_label(view.visible_label);
@@ -133,7 +134,7 @@ fn build_overlay(application: &gtk::Application) {
             ""
         });
         if view.is_visible() {
-            window_ref.show();
+            window_ref.set_visible(true);
         }
         // No animation source is installed for hidden, Processing, terminal,
         // or reduced-motion states. Recording activity is status-driven.

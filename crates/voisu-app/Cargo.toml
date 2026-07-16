@@ -29,7 +29,7 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 voisu-core = { path = "../voisu-core" }
 xkbcommon = { version = "0.9", default-features = false }
 zbus = { version = "5.13.2", default-features = false, features = ["tokio"] }
-gtk4 = { version = "0.11", optional = true }
+gtk4 = { version = "0.11", features = ["v4_10"], optional = true }
 gtk4-layer-shell = { version = "0.8", optional = true }
 
 [dev-dependencies]
