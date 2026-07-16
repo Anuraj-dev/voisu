@@ -18,7 +18,11 @@ const SYSTEMCTL_DEADLINE: Duration = Duration::from_secs(5);
 const SERVICE_TRANSITION_DEADLINE: Duration = Duration::from_secs(3);
 const IPC_DEADLINE: Duration = Duration::from_millis(300);
 const MAX_SYSTEMCTL_OUTPUT: u64 = 16 * 1024;
-const PACKAGED_UNIT_DIRS: &[&str] = &["/usr/lib/systemd/user", "/etc/systemd/user"];
+// systemd precedence: an administrator unit under /etc overrides the packaged
+// unit under /usr/lib. This order is only consulted by the static fallback used
+// when systemctl cannot resolve the effective unit; the primary path asks
+// systemd itself.
+const PACKAGED_UNIT_DIRS: &[&str] = &["/etc/systemd/user", "/usr/lib/systemd/user"];
 const PACKAGED_DAEMON_PATH: &str = "/usr/bin/voisu-daemon";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -358,17 +362,133 @@ fn service_paths() -> Result<ServicePaths, String> {
     })
 }
 
+enum EffectiveLookup {
+    /// systemd resolved a packaged unit; `exec` is the effective ExecStart
+    /// binary (None when its ExecStart could not be parsed).
+    Packaged {
+        fragment: PathBuf,
+        exec: Option<PathBuf>,
+    },
+    /// systemd answered, but there is no packaged unit (none loaded, or the
+    /// effective unit is the user-owned Ticket 09 unit under XDG config).
+    NoPackagedUnit,
+    /// systemctl could not answer; consult the static-precedence search.
+    SystemctlUnavailable,
+}
+
 fn packaged_unit_path() -> PackagedUnitDetection {
+    // Ask systemd which unit it would actually run. `systemctl --user show`
+    // reflects administrator /etc overrides and drop-ins that a static on-disk
+    // search silently ignores, so we validate the EFFECTIVE ExecStart binary
+    // rather than the text of a file at a guessed path. Falling back to a static
+    // search only when systemctl is unavailable keeps the CLI honest: it never
+    // "validates" a unit systemd will not launch.
+    match effective_packaged_unit() {
+        EffectiveLookup::Packaged { fragment, exec } => {
+            let reason = match exec {
+                Some(binary) => validate_effective_daemon(&binary).err(),
+                None => Some(format!(
+                    "packaged unit {} has no resolvable ExecStart",
+                    fragment.display()
+                )),
+            };
+            match reason {
+                None => PackagedUnitDetection {
+                    path: Some(fragment),
+                    fallback_reason: None,
+                },
+                Some(reason) => PackagedUnitDetection {
+                    path: None,
+                    fallback_reason: Some(reason),
+                },
+            }
+        }
+        EffectiveLookup::NoPackagedUnit => PackagedUnitDetection {
+            path: None,
+            fallback_reason: None,
+        },
+        EffectiveLookup::SystemctlUnavailable => static_packaged_unit_path(),
+    }
+}
+
+fn effective_packaged_unit() -> EffectiveLookup {
+    let output = match systemctl(&[
+        "show",
+        UNIT_NAME,
+        "-p",
+        "LoadState",
+        "-p",
+        "FragmentPath",
+        "-p",
+        "ExecStart",
+    ]) {
+        Ok(output) if output.success => output,
+        // systemctl could not answer (unavailable, deadline, or error); the
+        // static-precedence search is the honest fallback.
+        _ => return EffectiveLookup::SystemctlUnavailable,
+    };
+
+    let mut load_state = None;
+    let mut fragment = None;
+    let mut exec_line = None;
+    for line in output.stdout.lines() {
+        if let Some(value) = line.strip_prefix("LoadState=") {
+            load_state.get_or_insert_with(|| value.trim().to_owned());
+        } else if let Some(value) = line.strip_prefix("FragmentPath=") {
+            fragment.get_or_insert_with(|| value.trim().to_owned());
+        } else if let Some(value) = line.strip_prefix("ExecStart=") {
+            exec_line.get_or_insert_with(|| value.to_owned());
+        }
+    }
+
+    if load_state.as_deref() == Some("not-found") {
+        return EffectiveLookup::NoPackagedUnit;
+    }
+    let Some(fragment) = fragment.filter(|value| !value.is_empty()) else {
+        return EffectiveLookup::NoPackagedUnit;
+    };
+    let fragment = PathBuf::from(fragment);
+    // A unit resolved outside the packaged directories (i.e. the user-owned
+    // Ticket 09 unit under XDG config) is not a package and must not migrate.
+    if !is_packaged_fragment(&fragment) {
+        return EffectiveLookup::NoPackagedUnit;
+    }
+    let exec = exec_line.as_deref().and_then(parse_execstart_binary);
+    EffectiveLookup::Packaged { fragment, exec }
+}
+
+fn parse_execstart_binary(value: &str) -> Option<PathBuf> {
+    // systemd renders ExecStart as `{ path=/bin/x ; argv[]=/bin/x --f ; ... }`;
+    // the effective binary is the `path=` token.
+    let start = value.find("path=")? + "path=".len();
+    let rest = &value[start..];
+    let end = rest.find(" ;").unwrap_or(rest.len());
+    let path = rest[..end].trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+fn is_packaged_fragment(fragment: &Path) -> bool {
+    fragment
+        .parent()
+        .is_some_and(|parent| packaged_unit_dirs().iter().any(|dir| dir == parent))
+}
+
+fn packaged_unit_dirs() -> Vec<PathBuf> {
     // Tests provide a private directory so the public CLI tests never inspect
     // or modify the host's systemd unit directories. Production uses Fedora's
-    // system and administrator user-unit locations.
-    let configured = std::env::var_os("VOISU_PACKAGED_UNIT_DIR");
-    let directories = configured
-        .as_deref()
-        .map(|directory| vec![PathBuf::from(directory)])
-        .unwrap_or_else(|| PACKAGED_UNIT_DIRS.iter().map(PathBuf::from).collect());
+    // administrator and system user-unit locations.
+    match std::env::var_os("VOISU_PACKAGED_UNIT_DIR") {
+        Some(directory) => vec![PathBuf::from(directory)],
+        None => PACKAGED_UNIT_DIRS.iter().map(PathBuf::from).collect(),
+    }
+}
+
+fn static_packaged_unit_path() -> PackagedUnitDetection {
+    // Fallback for when systemctl cannot resolve the effective unit: search the
+    // packaged directories in systemd precedence order (/etc before /usr/lib)
+    // and validate the first regular unit file present.
     let mut fallback_reason = None;
-    for directory in directories {
+    for directory in packaged_unit_dirs() {
         let path = directory.join(UNIT_NAME);
         let is_regular_file = fs::symlink_metadata(&path).is_ok_and(|metadata| {
             metadata.is_file() && !metadata.file_type().is_symlink()
@@ -392,6 +512,22 @@ fn packaged_unit_path() -> PackagedUnitDetection {
         path: None,
         fallback_reason,
     }
+}
+
+fn validate_effective_daemon(daemon: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(daemon).map_err(|_| {
+        format!(
+            "packaged unit ExecStart binary {} is missing",
+            daemon.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.mode() & 0o111 == 0 {
+        return Err(format!(
+            "packaged unit ExecStart binary {} is not a trusted executable",
+            daemon.display()
+        ));
+    }
+    Ok(())
 }
 
 fn validate_packaged_unit(unit: &Path) -> Result<(), String> {

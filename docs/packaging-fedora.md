@@ -33,13 +33,19 @@ VOISU_COMMIT=$(git rev-parse HEAD) packaging/build-rpm.sh
 
 `packaging/build-rpm.sh` runs the standard workspace suite, release workspace
 build, and opt-in Overlay check before creating a Cargo.lock-pinned source
-archive with `git archive`. It also runs `cargo vendor --locked` from that
-exact commit and creates `voisu-vendor-<version>.tar.gz` as `Source1`. During
-`%prep`, the RPM unpacks that archive and writes `.cargo/config.toml` with a
+archive with `git archive`. It then extracts that exact-commit archive and runs
+`cargo vendor --locked` from the extraction — never the working tree — so the
+vendored `Source1` is a pure function of the commit. The vendor tarball is
+written deterministically (`tar --sort=name --owner=0 --group=0 --numeric-owner
+--mtime="@<commit-epoch>"` piped through `gzip -n`, so no ordering, ownership,
+mtime, or gzip-header timestamp varies), and the script re-archives the same
+tree and aborts unless the two are byte-identical. The same commit therefore
+yields a byte-identical `voisu-vendor-<version>.tar.gz`. During `%prep`, the RPM
+unpacks that archive and writes `.cargo/config.toml` with a
 `[source.crates-io] replace-with = "vendored-sources"` source. `%build` and
 `%check` use `--offline`, so a clean mock build cannot fetch crates from
-crates.io. The Cargo.lock plus vendor archive generated from the exact commit
-is the reproducibility mechanism.
+crates.io. The Cargo.lock plus this reproducible vendor archive generated from
+the exact commit is the reproducibility mechanism.
 
 `rpmbuild` then repeats the standard suite in the archive's `%check` section.
 The full commit is included in the RPM Release as `1.git<commit>`, so the
@@ -80,10 +86,18 @@ voisu service status
 ```
 
 The packaged user unit is `/usr/lib/systemd/user/voisu.service` and points at
-`/usr/bin/voisu-daemon --systemd`. `voisu service install` detects that unit
-before considering the Ticket 09 XDG user-data copy. If an old user unit or
-daemon copy shadows the package, it disables the old owner, removes only those
-Voisu-managed stale files, reloads systemd, and enables the packaged unit.
+`/usr/bin/voisu-daemon --systemd`. `voisu service install` asks systemd for the
+unit it would actually run — `systemctl --user show voisu.service -p
+FragmentPath -p ExecStart` — so an administrator override under
+`/etc/systemd/user` or a drop-in is honored rather than a stale static file, and
+it validates the effective `ExecStart` binary. A unit resolved under XDG config
+is the Ticket 09 user unit, not a package, and is never migrated as one. Only
+when systemctl cannot answer does it fall back to a static search of
+`/etc/systemd/user` before `/usr/lib/systemd/user`. If an old user unit or daemon
+copy shadows a valid packaged unit, it disables the old owner, removes only those
+Voisu-managed stale files, reloads systemd, and enables the packaged unit; if the
+effective packaged `ExecStart` binary is missing or untrusted, it clearly falls
+back to the Ticket 09 user-data path instead.
 
 ## Upgrade and removal
 
@@ -132,10 +146,18 @@ VOISU_FEDORA_LIVE_SMOKE=1 packaging/fedora-smoke.sh \
 ```
 
 The first invocation verifies RPM ownership, declared dependency names,
-artifact paths, the packaged unit, CLI startup, and packaged-unit migration.
-The opt-in invocation additionally runs readiness, starts the packaged user
-service, performs a real three-second Recording, stops it, and verifies that a
-Transcript is available through `wl-paste`. The orchestrator must complete the
+artifact paths, the packaged unit, CLI startup, and packaged-unit migration. It
+binds to the exact supplied RPM by comparing the full `rpm -qp --dump` manifest
+(path, size, mtime, digest, mode, owner, group for every file) against the
+installed `rpm -q --dump`, and refuses when a same-NEVRA package is already
+installed with a different payload — `dnf` will not replace a same-NEVRA package,
+so this stops the smoke from silently exercising the wrong artifact. It snapshots
+the user-service state that `voisu service install` mutates (enablement, active
+state, and any Ticket 09 XDG shadow it migrates away) and restores it in a
+cleanup trap that runs on success and on failure; RPM-owned files are never
+modified. The opt-in invocation additionally runs readiness, starts the packaged
+user service, performs a real three-second Recording, stops it, and verifies that
+a Transcript is available through `wl-paste`. The orchestrator must complete the
 interactive KDE/Wayland checks in `docs/release-evidence.md`, including portal
 approval, direct Delivery, clipboard fallback, login start, and upgrade/removal
 behavior. These checks are intentionally not run by the default build.

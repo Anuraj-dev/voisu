@@ -2,10 +2,23 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-16
 
 ## 🚧 In progress / next
-- Ticket 13 round-1 review fixes are complete on `ticket-13-fedora-package`; next is the orchestrator's Fedora host
-  run of the exact RPM artifact and the live checks listed in `docs/release-evidence.md`.
-- `rpmbuild` is unavailable in this managed sandbox, so the RPM build script/spec are headlessly reviewed and the
-  actual package, install, upgrade, removal, portal, Recording, Delivery, and clipboard checks remain PENDING.
+- Ticket 13 on `ticket-13-fedora-package`. Sol round-2 review found 3 HIGH + 1 MEDIUM; all four are now FIXED on the
+  branch: (1) packaged-unit detection resolves the EFFECTIVE unit via `systemctl --user show -p FragmentPath -p
+  ExecStart` (honors `/etc` overrides + drop-ins, validates the effective ExecStart binary, XDG-config units are not
+  packaged, static `/etc`-before-`/usr/lib` fallback only when systemctl is unavailable) with three discriminating
+  tests; (2) the smoke binds to the supplied RPM by comparing full `rpm -qp --dump` vs `rpm -q --dump` manifests and
+  refuses a same-NEVRA payload mismatch; (3) the vendor `Source1` is reproducible — vendored from the exact-commit
+  git-archive extraction and archived with deterministic tar (`--sort`/`--owner`/`--group`/`--numeric-owner`/`--mtime`
+  + `gzip -n`), with a byte-identical re-archive self-test; (4) the smoke snapshots and restores the user-service
+  state it mutates in a cleanup trap that runs on failure too. Next: Sol MEDIUM round-3 re-review.
+- After APPROVE: add Ticket 13 rows to `docs/model-benchmark.md` (Luna high impl `a6b7934` ~296k tokens; Luna xhigh
+  fix `a4e978e` ~301k tokens; Opus escalation; Sol high + medium reviews), open the PR, exact-head CI, squash-merge,
+  close issue #13.
+- Blocked on Raja: `sudo dnf install -y rpm-build rpmlint systemd-rpm-macros`, then `packaging/build-rpm.sh` on the
+  host plus the live `packaging/fedora-smoke.sh` checks in `docs/release-evidence.md`; ticket host checkboxes stay
+  unchecked until then.
+- After Ticket 13 merges: write the final model-benchmark report (Sol/Terra/Luna vs Opus, incl. Luna
+  medium/high/xhigh effort comparison) that Raja requested.
 
 ## Status
 - `voisu` and `voisu-daemon` communicate over bounded, versioned Unix IPC; the actor keeps status responsive while
@@ -16,9 +29,12 @@
   Unicode-aware guardrails, permits one bounded repair, and otherwise falls back to a clean Source Transcript or
   reports a Quality Failure. Only the final Transcript reaches Delivery.
 - Ticket 09 installs a graphical-session-owned daemon service with atomic binaries and a three-starts-per-30-seconds
-  failure bound; packaged `/usr/lib/systemd/user/voisu.service` is preferred over and migrates away old XDG
-  user-data ownership only after validating `/usr/bin/voisu-daemon` and the unit's `ExecStart`; invalid packaged
-  metadata clearly falls back to the Ticket 09 user-data path; daemon lifecycle remains independent from the optional Overlay.
+  failure bound; the packaged unit is preferred over and migrates away old XDG user-data ownership. Packaged-unit
+  detection asks systemd for the EFFECTIVE unit (`systemctl --user show -p FragmentPath -p ExecStart`) so
+  administrator `/etc` overrides and drop-ins are honored, validates the effective ExecStart binary, and only falls
+  back to a static `/etc`-before-`/usr/lib` search when systemctl is unavailable; a user unit under XDG config is
+  never treated as packaged; invalid packaged metadata clearly falls back to the Ticket 09 user-data path; daemon
+  lifecycle remains independent from the optional Overlay.
 - Ticket 12 keeps the Overlay observer-only: a pure, headless selection layer chooses runtime-advertised Layer Shell,
   an unfocusable regular GTK surface, desktop notification, or a persistent journal observer when no display exists.
   Structured Overlay logs and `voisu-overlay --report-backend` expose `backend` plus `degradation`; normal `voisu
@@ -28,9 +44,9 @@
 - Ticket 12 round-2 review fixes are in: the Overlay's surface probe is now honest local GTK realization (no unsound
   compositor-map timer, no false fallback on a healthy compositor), and the capsule stays hidden at Idle with no startup
   flash while status polling starts immediately.
-- Current gates: `cargo test --workspace` — 202 passed, 2 ignored, 0 failed;
-  `cargo check -p voisu-app --features overlay`, `cargo build --workspace`, `bash -n` for packaging scripts, and
-  `git diff --check` are clean. Offline vendor/archive construction passed; `rpmbuild` and RPM/live Fedora
+- Current gates: `cargo test --workspace` — 205 passed, 2 ignored, 0 failed (3 new effective-unit tests);
+  `cargo check -p voisu-app --features overlay`, `cargo build --workspace`, and `bash -n` for packaging scripts are
+  clean. Deterministic vendor-archive tar/gzip verified byte-identical headlessly; `rpmbuild` and RPM/live Fedora
   evidence are pending the host.
 
 ## Architecture map

@@ -91,29 +91,52 @@ impl ServiceFixture {
         self.data.join("voisu/bin/voisu-daemon")
     }
 
+    fn packaged_unit_file(&self) -> PathBuf {
+        self.packaged_unit_dir.join("voisu.service")
+    }
+
+    /// Make the fake `systemctl show` report `fragment` as the effective unit
+    /// with `exec` as its resolved ExecStart binary, without disturbing any
+    /// `daemon=`/`forced=` lifecycle state already recorded.
+    fn set_packaged_fragment(&self, fragment: &Path, exec: &Path) {
+        let mut lines: Vec<String> = fs::read_to_string(&self.systemctl_state)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.starts_with("fragment=") && !line.starts_with("exec="))
+            .map(str::to_owned)
+            .collect();
+        lines.push(format!("fragment={}", fragment.display()));
+        lines.push(format!("exec={}", exec.display()));
+        let mut body = lines.join("\n");
+        body.push('\n');
+        fs::write(&self.systemctl_state, body).unwrap();
+    }
+
     fn install_packaged_unit(&self) {
         fs::create_dir_all(self.packaged_daemon.parent().unwrap()).unwrap();
         fs::copy(&self.source_daemon, &self.packaged_daemon).unwrap();
         fs::set_permissions(&self.packaged_daemon, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(
-            self.packaged_unit_dir.join("voisu.service"),
+            self.packaged_unit_file(),
             format!(
                 "[Unit]\nDescription=Packaged Voisu dictation daemon\n\n[Service]\nExecStart={} --systemd\n",
                 self.packaged_daemon.display()
             ),
         )
         .unwrap();
+        self.set_packaged_fragment(&self.packaged_unit_file(), &self.packaged_daemon);
     }
 
     fn install_packaged_unit_without_daemon(&self) {
         fs::write(
-            self.packaged_unit_dir.join("voisu.service"),
+            self.packaged_unit_file(),
             format!(
                 "[Unit]\nDescription=Packaged Voisu dictation daemon\n\n[Service]\nExecStart={} --systemd\n",
                 self.packaged_daemon.display()
             ),
         )
         .unwrap();
+        self.set_packaged_fragment(&self.packaged_unit_file(), &self.packaged_daemon);
     }
 
     fn use_real_managed_daemon(&self) {
@@ -144,12 +167,21 @@ pid_file="${state}.pid"
 daemon=$(sed -n 's/^daemon=//p' "$state" 2>/dev/null || true)
 forced=$(sed -n 's/^forced=//p' "$state" 2>/dev/null || true)
 fragment=$(sed -n 's/^fragment=//p' "$state" 2>/dev/null || true)
+exec_bin=$(sed -n 's/^exec=//p' "$state" 2>/dev/null || true)
 stuck_stop=$(sed -n 's/^stuck_stop=//p' "$state" 2>/dev/null || true)
 active() { test -f "$pid_file" && kill -0 "$(cat "$pid_file")" 2>/dev/null; }
 case "$command" in
   show)
-    if test -n "$fragment"; then printf '%s\n' "$fragment"; exit 0; fi
-    exit 1
+    if test -n "$fragment"; then
+      printf 'LoadState=loaded\n'
+      printf 'FragmentPath=%s\n' "$fragment"
+      printf 'ExecStart={ path=%s ; argv[]=%s --systemd ; ignore_errors=no }\n' "$exec_bin" "$exec_bin"
+    else
+      printf 'LoadState=not-found\n'
+      printf 'FragmentPath=\n'
+      printf 'ExecStart=\n'
+    fi
+    exit 0
     ;;
   is-active)
     if test -n "$forced"; then printf '%s\n' "$forced"; exit 3; fi
@@ -324,6 +356,71 @@ fn packaged_unit_without_daemon_binary_falls_back_to_ticket_09_user_data_service
     assert!(
         stdout(&installed).contains("packaged unit was ignored")
             && stdout(&installed).contains("Ticket 09 user-data path")
+    );
+    assert!(fixture.unit_path().exists());
+    assert!(fixture.installed_daemon().exists());
+}
+
+#[test]
+fn effective_execstart_override_binary_missing_falls_back_to_ticket_09_user_data() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    // The static packaged unit and its packaged daemon on disk are both valid,
+    // so a naive on-disk search would trust them. But the unit systemd would
+    // actually run (an administrator /etc override or drop-in) points ExecStart
+    // at a binary that is not installed, so the CLI must not migrate to it.
+    fixture.install_packaged_unit();
+    let overridden = fixture.root.path().join("etc-override/voisu-daemon");
+    fixture.set_packaged_fragment(&fixture.packaged_unit_file(), &overridden);
+
+    let installed = fixture.run(&["service", "install"]);
+
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    assert!(
+        stdout(&installed).contains("packaged unit was ignored")
+            && stdout(&installed).contains("Ticket 09 user-data path"),
+        "{}",
+        stdout(&installed)
+    );
+    assert!(fixture.unit_path().exists());
+    assert!(fixture.installed_daemon().exists());
+}
+
+#[test]
+fn effective_execstart_override_selects_packaged_when_the_static_daemon_is_absent() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    // The static packaged unit references a daemon that is not present, so an
+    // on-disk search would ignore the package. systemd's effective ExecStart (an
+    // administrator override) points at a valid installed binary, so the CLI
+    // must select and migrate to the packaged unit.
+    fixture.install_packaged_unit_without_daemon();
+    fixture.set_packaged_fragment(&fixture.packaged_unit_file(), &fixture.source_daemon);
+
+    let installed = fixture.run(&["service", "install"]);
+
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    assert!(
+        stdout(&installed).contains("packaged systemd user service selected"),
+        "{}",
+        stdout(&installed)
+    );
+    assert!(!fixture.unit_path().exists(), "user unit must not shadow the package");
+}
+
+#[test]
+fn xdg_user_unit_fragment_is_not_treated_as_a_packaged_unit() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    // systemctl resolves the effective unit to the Ticket 09 user unit under XDG
+    // config. Because it is not in a packaged directory, install must take the
+    // Ticket 09 user-data path, never the packaged migration path.
+    fixture.set_packaged_fragment(&fixture.unit_path(), &fixture.installed_daemon());
+
+    let installed = fixture.run(&["service", "install"]);
+
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    assert!(
+        !stdout(&installed).contains("packaged"),
+        "{}",
+        stdout(&installed)
     );
     assert!(fixture.unit_path().exists());
     assert!(fixture.installed_daemon().exists());
