@@ -1478,12 +1478,28 @@ struct GroqStream {
     cancel: Arc<CancelRegistry>,
 }
 
+fn cancel_and_reap_provider_chunks(
+    chunks: &mut VecDeque<tokio::task::JoinHandle<Result<String, BoundaryError>>>,
+) {
+    while let Some(chunk) = chunks.pop_front() {
+        chunk.abort();
+        // Dropping a JoinHandle after `abort()` would still detach the task
+        // before Tokio observes the cancellation. Keep the handle owned by a
+        // reaper until cancellation has completed. Provider cancellation is
+        // signalled before this helper runs, so an already-running
+        // spawn_blocking request still kills and reaps its owned curl child.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = chunk.await;
+            });
+        }
+    }
+}
+
 impl Drop for GroqStream {
     fn drop(&mut self) {
         self.cancel.cancel();
-        for chunk in self.chunks.drain(..) {
-            chunk.abort();
-        }
+        cancel_and_reap_provider_chunks(&mut self.chunks);
     }
 }
 
@@ -1611,9 +1627,7 @@ struct DeepgramStream {
 impl Drop for DeepgramStream {
     fn drop(&mut self) {
         self.cancel.cancel();
-        for chunk in self.chunks.drain(..) {
-            chunk.abort();
-        }
+        cancel_and_reap_provider_chunks(&mut self.chunks);
     }
 }
 
@@ -3509,8 +3523,8 @@ mod tests {
     async fn provider_abort_deadline_does_not_detach_adapter_tasks() {
         let deepgram_completions = Arc::new(AtomicUsize::new(0));
         let groq_completions = Arc::new(AtomicUsize::new(0));
-        let (deepgram_gate, deepgram_wait) = tokio::sync::oneshot::channel();
-        let (groq_gate, groq_wait) = tokio::sync::oneshot::channel();
+        let (mut deepgram_gate, deepgram_wait) = tokio::sync::oneshot::channel();
+        let (mut groq_gate, groq_wait) = tokio::sync::oneshot::channel();
         let credential = Credential::new("controlled-credential".to_owned()).unwrap();
         let streams = ProviderStreams {
             deepgram: Box::new(DeepgramStream {
@@ -3548,9 +3562,26 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.diagnostic(), "provider deadline cleanup timed out");
 
-        let _ = deepgram_gate.send(());
-        let _ = groq_gate.send(());
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_millis(100), async {
+            tokio::join!(deepgram_gate.closed(), groq_gate.closed());
+        })
+        .await
+        .expect("timed-out abort futures must cancel and reap both adapter tasks");
+        assert!(
+            deepgram_gate.send(()).is_err(),
+            "the Deepgram gate receiver must be dropped before cleanup returns"
+        );
+        assert!(
+            groq_gate.send(()).is_err(),
+            "the Groq gate receiver must be dropped before cleanup returns"
+        );
+        tokio::time::timeout(Duration::from_millis(100), async {
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded scheduler observation window elapsed");
         assert_eq!(
             deepgram_completions.load(Ordering::SeqCst),
             0,

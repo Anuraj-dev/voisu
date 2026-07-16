@@ -4,9 +4,10 @@
 ## 🚧 In progress / next
 - Ticket 10 merged through PR #17 at `aa8055a` (squash); exact-head CI passed and issue #10 is closed.
   Reviews: Sol high round 1 (2 BLOCKER + 1 HIGH + 1 MEDIUM), fixes in `0865286`, Sol medium round 2 APPROVE.
-- Issue #14 (cancellation-safe Deepgram/Groq abort) is implemented, verified (regression test proven RED with
-  `drain(..)` reinstated), and committed as `d52c7d7` on pushed branch `issue-14-cancellation-safe-abort`.
-  NOT yet reviewed or merged — next step: Sol medium review, PR, exact-head CI, merge, close #14.
+- Issue #14 review round 1 is fixed on `issue-14-cancellation-safe-abort`: abort-deadline drop now actively cancels
+  and retains each adapter task through a reaper, while provider cancellation preserves curl child reap. The
+  deterministic regression is proven RED with `drain(..)` reinstated. Next: Sol medium re-review, PR, exact-head
+  CI, merge, and close #14.
 - After #14: Ticket 11 (issue #11, GTK4 voice capsule) starts the overlay phase — routing note: Luna per the
   benchmark plan (Luna unused so far). Benchmark log current through Ticket 10 (`docs/model-benchmark.md`).
 
