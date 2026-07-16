@@ -73,3 +73,48 @@
 | 58 | 13 | Escalated fixes | Opus 4.8 (high, resumed) | ca43905 effective-unit resolution + full-manifest smoke binding + deterministic vendor; a65787b shadowed-unit migration + LoadState/multi-exec validation + independent-vendor self-test | rounds 3–4 still found real parser/restore defects (shadow case initially unreachable, permissive unit-file parsing) | round exhausted (2 rounds) | ~143k + ~232k tokens; strong systemd research and RED proofs, but ExecStart parsing discipline fell short twice → driver took over |
 | 59 | 13 | Driver fixes | Driver (Fable) | 674b93e SIGPIPE-141 (exposed by the first real host rpmbuild run); 8d37e38 strict conservative unit-file parser + block-anchored show parser + end-state smoke verification; f625a73 section-aware parsing + block-opening anchor + stop verification; 390883d fresh-install active-service restore; 213 tests, every fix RED-proven | rounds 5–6 narrowed to edge semantics; round 7: 0 findings → APPROVE | closed review cycle | Host RPM gate executed for the first time: offline vendored rpmbuild + %check green, base/overlay/debuginfo + SRPM produced, rpmlint polish |
 | 60 | 13 | Reviews | Sol (high first, medium re-reviews) | 7 rounds; round 1 the deepest of the project (12 confirmed findings with Fedora package-list citations); rounds 3–6 kept finding real semantic edges (XDG shadow precedence, section-blind parsing, silent restore) | — | — | ~51k–115k tokens/round at medium; sustained precision across 7 rounds without a single cosmetic-only round |
+
+## Final report — Sol / Terra / Luna vs Opus (tickets 01–13, 2026-07-16)
+
+60 dispatches across 14 delivery efforts (tickets 01–13 + issue #14). Every implementation was reviewed
+by Sol (high first review, medium re-reviews) until APPROVE; every fix claim was verified against the diff.
+
+### Scorecard by role
+
+| Model (role) | Dispatches | Closed its ticket without escalation | Typical failure mode | Verdict |
+|---|---|---|---|---|
+| Sol — implementer (medium) | 01,03,04,05,08,09,10,#14 | 3 of 8 (08, 09, 10) | detached tasks / cancellation-ownership; repeated the same class across tickets | Good architecture fast; budget one escalation round |
+| Sol — reviewer (high→medium) | every ticket | — | none observed; 7 sustained rounds on ticket 13, zero cosmetic-only rounds | The single highest-ROI Codex spend of the project |
+| Terra — implementer (high) | 02, 12 | 0 of 2 | security edges (02), honesty gaps + unsound probe (12) | Fast, clean decomposition; always pair with a hard review |
+| Luna — implementer (medium/high/xhigh) | 11, 13 (+2 fix rounds) | 0 of 2 | platform semantics: Wayland input regions, Fedora ownership facts, systemd precedence | Best for mechanical/glue/frontend work at medium |
+| Opus 4.8 — escalation fixer (high, resumed) | 02–05,#14,11,12,13 | cleared the round it was given in ~70% of rounds | parser/edge discipline under repeated adversarial review (13 rounds 3–4) | The workhorse: RED proofs, honest claims, rarely introduces defects |
+| Driver (Fable) | screenshot gate, host RPM gate, 13 rounds 4–6 fixes | — | — | Gates no sandbox can run + final-mile fixes when both tiers exhausted |
+
+### Luna effort experiment (medium → high → xhigh)
+
+Ticket 11 (medium) and ticket 13 (high impl ~296k tokens, xhigh fix ~301k tokens): raising effort did not
+buy semantic depth. Xhigh cleared all 12 mechanical review findings but still missed systemd precedence
+and RPM binding semantics — the same class medium-Luna missed on Wayland in ticket 11. Cost was flat
+(~300k either way). Conclusion: when Luna misses, escalate the MODEL, not the effort.
+
+### Escalation economics
+
+- Codex implementation dispatches ended in Opus escalation in ~60% of tickets; Codex review dispatches
+  never needed rescue and repeatedly found post-Opus defects (tickets 11–13).
+- Opus escalations cost ~85k–240k tokens per round (worst case #14: ~510k total) and closed every
+  escalation eventually except ticket 13's parser tail, which the driver finished.
+- The two tickets implemented Opus-first (06, 07) still took 3–5 review rounds — review depth, not
+  implementer choice, was the constant quality driver.
+
+### Routing recommendation (going forward)
+
+1. Keep **Sol high for first reviews, Sol medium for re-reviews** — protect this quota above all else.
+2. **Heavy/architectural backend**: Sol medium remains the right first bat, but pre-plan the Opus
+   escalation round; for work whose core risk is process/lifecycle/cancellation ownership, go
+   **Opus-first** — that class defeated Sol implementation five times.
+3. **Regular feature work**: Terra high is fine with a mandatory security/honesty review round.
+4. **Mechanical, glue, packaging scaffolds, frontend**: Luna medium; never Luna above high — use the
+   savings on review rounds instead.
+5. Keep the **driver** on gates that need the real desktop/host (screenshots, rpmbuild, live smoke) —
+   both real-hardware defects of this project (opaque capsule window, SIGPIPE-141) were invisible to
+   every sandboxed agent.
