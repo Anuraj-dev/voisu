@@ -571,6 +571,103 @@ cat > "$dir/clipboard"
 }
 
 #[test]
+fn provider_disconnect_malformed_response_and_quota_error_fall_back_and_recover() {
+    for failure in ["disconnect", "malformed", "quota"] {
+        let runtime = TempDir::new().unwrap();
+        let commands = TempDir::new().unwrap();
+        write_fake_command(
+            commands.path(),
+            "pw-record",
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+head -c 6400 /dev/zero | tr '\000' '\100'
+trap 'exit 0' INT TERM
+: > "$dir/pw-record.ready"
+i=0
+while test "$i" -lt 6000; do sleep 0.01; i=$((i + 1)); done
+"#,
+        );
+        write_fake_command(
+            commands.path(),
+            "curl",
+            r#"#!/bin/sh
+config=$(mktemp)
+cat > "$config"
+if grep -q 'deepgram.test' "$config"; then
+  rm -f "$config"
+  printf '{"results":{"channels":[{"alternatives":[{"transcript":"Provider fallback"}]}]}}'
+  exit 0
+fi
+rm -f "$config"
+case "${VOISU_TEST_PROVIDER_FAILURE_MODE:?}" in
+  disconnect) exit 56 ;;
+  malformed) printf '{'; exit 0 ;;
+  quota) printf 'quota exhausted' >&2; exit 22 ;;
+esac
+"#,
+        );
+        write_fake_command(
+            commands.path(),
+            "wl-copy",
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+cat > "$dir/clipboard"
+count=$(cat "$dir/delivery.count" 2>/dev/null || printf '0')
+printf '%s' "$((count + 1))" > "$dir/delivery.count"
+"#,
+        );
+        let path = format!(
+            "{}:{}",
+            commands.path().display(),
+            std::env::var("PATH").unwrap()
+        );
+        let daemon = Daemon::start_production_with_env(
+            runtime.path(),
+            &[
+                ("PATH", &path),
+                ("VOISU_TEST_PROVIDER_FAILURE_MODE", failure),
+                ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
+                ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
+                (
+                    "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
+                    "https://deepgram.test/v1/listen",
+                ),
+                (
+                    "VOISU_GROQ_TRANSCRIPTION_URL",
+                    "https://groq.test/audio/transcriptions",
+                ),
+            ],
+        );
+
+        for expected_delivery_count in 1..=2 {
+            fs::remove_file(commands.path().join("pw-record.ready")).ok();
+            assert!(voisu(runtime.path(), "start").status.success(), "{failure}");
+            wait_for_marker(commands.path(), "pw-record.ready");
+            let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+            assert_eq!(stopped["ok"], true, "{failure}: {stopped}");
+            assert_eq!(stopped["evidence"]["delivery_count"], 1, "{failure}: {stopped}");
+            assert_eq!(
+                stopped["evidence"]["source_transcript_providers"],
+                serde_json::json!(["deepgram"]),
+                "{failure}: {stopped}"
+            );
+            assert_eq!(
+                fs::read_to_string(commands.path().join("delivery.count")).unwrap(),
+                expected_delivery_count.to_string(),
+                "{failure}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(commands.path().join("clipboard")).unwrap(),
+            "Provider fallback",
+            "{failure}"
+        );
+        assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n", "{failure}");
+        daemon.terminate();
+    }
+}
+
+#[test]
 fn groq_receives_bounded_overlapping_chunks_and_the_merge_result_is_delivered_once() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
@@ -953,6 +1050,88 @@ fn production_capture_death_mid_recording_self_recovers_without_stop() {
 }
 
 #[test]
+fn microphone_disappearance_and_reconnection_leave_the_next_recording_usable() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+count=$(cat "$dir/pw-record.count" 2>/dev/null || printf '0')
+count=$((count + 1))
+printf '%s' "$count" > "$dir/pw-record.count"
+if test "$count" = "1"; then
+  printf '\100\000'
+  trap - EXIT
+  exit 7
+fi
+head -c 6400 /dev/zero | tr '\000' '\100'
+trap 'exit 0' INT TERM
+: > "$dir/pw-record.reconnected"
+i=0
+while test "$i" -lt 6000; do sleep 0.01; i=$((i + 1)); done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+config=$(mktemp)
+cat > "$config"
+if grep -q 'deepgram.test' "$config"; then
+  printf '{"results":{"channels":[{"alternatives":[{"transcript":"Recovered microphone"}]}]}}'
+else
+  printf '{"text":"Recovered microphone"}'
+fi
+rm -f "$config"
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+cat > "$dir/clipboard"
+"#,
+    );
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
+            ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
+            (
+                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
+                "https://deepgram.test/v1/listen",
+            ),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_status(runtime.path(), "idle\n");
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "pw-record.reconnected");
+    let recovered = voisu(runtime.path(), "stop");
+    assert!(recovered.status.success(), "{}", stderr(&recovered));
+    assert_eq!(
+        fs::read_to_string(commands.path().join("clipboard")).unwrap(),
+        "Recovered microphone"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+}
+
+#[test]
 fn production_missing_wl_copy_is_reported_and_recoverable() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
@@ -1101,6 +1280,86 @@ fn live_fedora_microphone_groq_and_clipboard_smoke() {
     thread::sleep(Duration::from_secs(3));
     let stopped = voisu(&runtime, "stop");
     assert!(stopped.status.success(), "{}", stderr(&stopped));
+    let clipboard = Command::new("wl-paste").output().unwrap();
+    assert!(clipboard.status.success());
+    assert!(!clipboard.stdout.is_empty(), "Transcript must remain on the clipboard");
+}
+
+#[test]
+#[ignore = "requires Fedora PipeWire, Groq and Deepgram credentials, portals, systemd user service, wl-paste, and VOISU_LIVE_RECOVERY_SMOKE=1"]
+fn live_fedora_full_workflow_recovers_the_next_recording_after_daemon_interruption() {
+    assert_eq!(
+        std::env::var("VOISU_LIVE_RECOVERY_SMOKE").as_deref(),
+        Ok("1")
+    );
+    let runtime = PathBuf::from(
+        std::env::var_os("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR is required"),
+    );
+    let run = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_voisu"))
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+
+    let installed = run(&["service", "install"]);
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    let started = run(&["service", "start"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+
+    let shortcut_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let shortcut = run(&["shortcut"]);
+        if shortcut.status.success() && stdout(&shortcut).starts_with("Trigger Key: ") {
+            break;
+        }
+        assert!(
+            Instant::now() < shortcut_deadline,
+            "Global Shortcuts portal did not bind a Trigger Key: {}",
+            stdout(&shortcut)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let exercise_recording = || {
+        assert!(run(&["start"]).status.success());
+        eprintln!("Speak now; the live recovery Recording lasts three seconds");
+        thread::sleep(Duration::from_secs(3));
+        let stopped = ipc_request(&runtime, r#"{"version":1,"command":"stop"}"#);
+        assert_eq!(stopped["ok"], true, "{stopped}");
+        assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
+        assert_eq!(
+            stopped["evidence"]["source_transcript_providers"],
+            serde_json::json!(["deepgram", "groq"]),
+            "both real providers must complete: {stopped}"
+        );
+    };
+
+    exercise_recording();
+    let interrupted = Command::new("systemctl")
+        .args(["--user", "kill", "--signal=KILL", "voisu.service"])
+        .output()
+        .unwrap();
+    assert!(interrupted.status.success(), "{}", stderr(&interrupted));
+
+    let restart_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = run(&["service", "status"]);
+        if status.status.success()
+            && stdout(&status).contains("systemd user service active; daemon IPC idle")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < restart_deadline,
+            "systemd did not restart the daemon into observable Idle: {} {}",
+            stdout(&status),
+            stderr(&status)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    exercise_recording();
     let clipboard = Command::new("wl-paste").output().unwrap();
     assert!(clipboard.status.success());
     assert!(!clipboard.stdout.is_empty(), "Transcript must remain on the clipboard");
@@ -3325,7 +3584,10 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
     let portal = MockPortal::start();
     let daemon = Daemon::start_with_env(
         runtime.path(),
-        &[("DBUS_SESSION_BUS_ADDRESS", portal.address())],
+        &[
+            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
+            ("VOISU_TEST_DELIVERY_FALLBACK", "portal unavailable"),
+        ],
     );
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
@@ -3342,7 +3604,7 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
     wait_for_status(runtime.path(), "Recording\n");
     assert_eq!(
         stdout(&voisu(runtime.path(), "toggle")),
-        "Transcript submitted through the compositor; preserved on the clipboard\n"
+        "Direct Delivery unavailable; Transcript is on the clipboard\n"
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 
@@ -3356,7 +3618,10 @@ fn portal_restart_clears_the_stale_binding_and_rebinds_the_trigger_key() {
     let mut portal = MockPortal::start();
     let daemon = Daemon::start_with_env(
         runtime.path(),
-        &[("DBUS_SESSION_BUS_ADDRESS", portal.address())],
+        &[
+            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
+            ("VOISU_TEST_DELIVERY_FALLBACK", "portal restarted"),
+        ],
     );
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
@@ -3377,6 +3642,12 @@ fn portal_restart_clears_the_stale_binding_and_rebinds_the_trigger_key() {
     wait_for_status(runtime.path(), "Recording\n");
     portal.activate();
     wait_for_status(runtime.path(), "idle\n");
+
+    assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "toggle")),
+        "Direct Delivery unavailable; Transcript is on the clipboard\n"
+    );
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
@@ -3527,6 +3798,79 @@ fn sigterm_cleans_up_and_a_crash_leaves_a_safely_recoverable_socket() {
     let replacement = Daemon::start(runtime.path());
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
     drop(replacement);
+}
+
+#[test]
+fn daemon_interruption_reaps_boundary_processes_and_restarts_in_a_safe_state() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s' "$$" > "$dir/pw-record.pid"
+head -c 1000000 /dev/zero | tr '\000' '\001'
+trap 'exit 0' INT TERM
+i=0
+while test "$i" -lt 6000; do sleep 0.01; i=$((i + 1)); done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+cat >/dev/null
+printf '%s' "$$" > "$dir/curl.pid"
+: > "$dir/curl.started"
+i=0
+while test "$i" -lt 6000; do sleep 0.01; i=$((i + 1)); done
+"#,
+    );
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "curl.started");
+    let boundary_pids = ["pw-record.pid", "curl.pid"].map(|name| {
+        fs::read_to_string(commands.path().join(name))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+    });
+
+    daemon.crash();
+    assert!(socket_path(runtime.path()).exists());
+    let reap_deadline = Instant::now() + Duration::from_secs(2);
+    for pid in boundary_pids {
+        while Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(
+                Instant::now() < reap_deadline,
+                "boundary process {pid} survived daemon interruption"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let replacement = Daemon::start(runtime.path());
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert!(voisu(runtime.path(), "start").status.success());
+    assert!(voisu(runtime.path(), "stop").status.success());
+    replacement.terminate();
 }
 
 #[test]
@@ -3919,6 +4263,78 @@ fn provider_work_is_aborted_not_dropped_when_the_recording_capture_fails() {
             && diagnostics.contains("controlled-provider-abort-detail"),
         "the failed Recording's provider work must be aborted, got: {diagnostics}"
     );
+}
+
+#[test]
+fn repeated_failures_never_deliver_and_the_next_recording_delivers_once() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_CAPTURE_FINISH_FAILURES", "3")],
+    );
+
+    for _ in 0..3 {
+        assert!(voisu(runtime.path(), "start").status.success());
+        let failed = voisu(runtime.path(), "stop");
+        assert_eq!(failed.status.code(), Some(4));
+        assert_eq!(stderr(&failed), "Recording capture failed\n");
+        assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    }
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let recovered = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(recovered["ok"], true, "{recovered}");
+    assert_eq!(recovered["evidence"]["delivery_count"], 1, "{recovered}");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let delivery_counts: Vec<u64> = history["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["delivery_count"].as_u64().unwrap())
+        .collect();
+    assert_eq!(delivery_counts.iter().filter(|count| **count == 0).count(), 3);
+    assert_eq!(delivery_counts.iter().filter(|count| **count == 1).count(), 1);
+    assert!(delivery_counts.iter().all(|count| *count <= 1));
+}
+
+#[test]
+fn cli_termination_during_stop_cannot_abandon_the_daemon_or_duplicate_delivery() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_PROVIDER_DELAY_MS", "750")],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+
+    let mut stop = Command::new(env!("CARGO_BIN_EXE_voisu"));
+    stop.arg("stop")
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut stop = stop.spawn().unwrap();
+
+    let processing_deadline = Instant::now() + Duration::from_secs(2);
+    while stdout(&voisu(runtime.path(), "status")) != "processing\n" {
+        assert!(
+            Instant::now() < processing_deadline,
+            "daemon never accepted Stop before CLI termination"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    stop.kill().unwrap();
+    let _ = stop.wait();
+
+    wait_for_status(runtime.path(), "idle\n");
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let records = history["history"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "{history}");
+    assert_eq!(records[0]["delivery_count"], 1, "{history}");
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let recovered = voisu(runtime.path(), "stop");
+    assert!(recovered.status.success(), "{}", stderr(&recovered));
 }
 
 #[test]

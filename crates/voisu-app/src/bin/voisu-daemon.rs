@@ -1541,7 +1541,7 @@ async fn serve(stream: UnixStream, actor: mpsc::Sender<ActorMessage>) -> Result<
 }
 
 struct ControlledCapture {
-    fail_finish_once: bool,
+    finish_failures_remaining: u32,
     recording_outcome_once: Option<String>,
     fail_abort: bool,
     abort_stall: Duration,
@@ -1566,7 +1566,12 @@ impl ControlledCapture {
             .unwrap_or(1);
         let chunk_delay = env_millis("VOISU_TEST_CHUNK_DELAY_MS");
         Self {
-            fail_finish_once: std::env::var_os("VOISU_TEST_CAPTURE_FINISH_FAILURE").is_some(),
+            finish_failures_remaining: std::env::var("VOISU_TEST_CAPTURE_FINISH_FAILURES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| {
+                    u32::from(std::env::var_os("VOISU_TEST_CAPTURE_FINISH_FAILURE").is_some())
+                }),
             recording_outcome_once: std::env::var("VOISU_TEST_RECORDING_OUTCOME").ok(),
             fail_abort: std::env::var_os("VOISU_TEST_CAPTURE_ABORT_FAILURE").is_some(),
             abort_stall: env_millis("VOISU_TEST_CAPTURE_ABORT_STALL_MS"),
@@ -1581,7 +1586,8 @@ impl ControlledCapture {
 
 impl AudioCapture for ControlledCapture {
     fn begin(&mut self, _recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError> {
-        let fail_finish = std::mem::take(&mut self.fail_finish_once);
+        let fail_finish = self.finish_failures_remaining > 0;
+        self.finish_failures_remaining = self.finish_failures_remaining.saturating_sub(1);
         let recording_outcome = self.recording_outcome_once.take();
         Ok(Box::new(ControlledActiveCapture {
             fail_finish,
