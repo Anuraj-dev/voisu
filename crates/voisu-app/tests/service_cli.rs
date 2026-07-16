@@ -16,6 +16,7 @@ struct ServiceFixture {
     data: PathBuf,
     systemctl_log: PathBuf,
     systemctl_state: PathBuf,
+    packaged_unit_dir: PathBuf,
 }
 
 impl ServiceFixture {
@@ -39,6 +40,8 @@ impl ServiceFixture {
         fs::create_dir(&fake_bin).unwrap();
         let systemctl_log = root.path().join("systemctl.log");
         let systemctl_state = root.path().join("systemctl.state");
+        let packaged_unit_dir = root.path().join("usr/lib/systemd/user");
+        fs::create_dir_all(&packaged_unit_dir).unwrap();
         write_systemctl(&fake_bin.join("systemctl"));
 
         Self {
@@ -50,6 +53,7 @@ impl ServiceFixture {
             data,
             systemctl_log,
             systemctl_state,
+            packaged_unit_dir,
         }
     }
 
@@ -64,6 +68,7 @@ impl ServiceFixture {
             .env("PATH", format!("{}/fake-bin:/usr/bin:/bin", self.root.path().display()))
             .env("FAKE_SYSTEMCTL_LOG", &self.systemctl_log)
             .env("FAKE_SYSTEMCTL_STATE", &self.systemctl_state)
+            .env("VOISU_PACKAGED_UNIT_DIR", &self.packaged_unit_dir)
             .env("VOISU_DISABLE_SHORTCUTS", "1")
             .env("VOISU_DISABLE_DIRECT_DELIVERY", "1")
             .env("VOISU_TEST_MODE", "controlled");
@@ -80,6 +85,14 @@ impl ServiceFixture {
 
     fn installed_daemon(&self) -> PathBuf {
         self.data.join("voisu/bin/voisu-daemon")
+    }
+
+    fn install_packaged_unit(&self) {
+        fs::write(
+            self.packaged_unit_dir.join("voisu.service"),
+            "[Unit]\nDescription=Packaged Voisu dictation daemon\n\n[Service]\nExecStart=/usr/bin/voisu-daemon --systemd\n",
+        )
+        .unwrap();
     }
 
     fn use_real_managed_daemon(&self) {
@@ -109,9 +122,14 @@ command=${2:-}
 pid_file="${state}.pid"
 daemon=$(sed -n 's/^daemon=//p' "$state" 2>/dev/null || true)
 forced=$(sed -n 's/^forced=//p' "$state" 2>/dev/null || true)
+fragment=$(sed -n 's/^fragment=//p' "$state" 2>/dev/null || true)
 stuck_stop=$(sed -n 's/^stuck_stop=//p' "$state" 2>/dev/null || true)
 active() { test -f "$pid_file" && kill -0 "$(cat "$pid_file")" 2>/dev/null; }
 case "$command" in
+  show)
+    if test -n "$fragment"; then printf '%s\n' "$fragment"; exit 0; fi
+    exit 1
+    ;;
   is-active)
     if test -n "$forced"; then printf '%s\n' "$forced"; exit 3; fi
     if active; then printf 'active\n'; exit 0; fi
@@ -248,6 +266,52 @@ fn install_is_idempotent_atomic_and_free_of_stale_session_or_checkout_values() {
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
     assert_eq!(calls.matches("--user daemon-reload").count(), 2);
     assert_eq!(calls.matches("--user enable voisu.service").count(), 2);
+}
+
+#[test]
+fn packaged_install_migrates_a_stale_user_service_without_shadowing_the_package() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+
+    assert!(fixture.run(&["service", "install"]).status.success());
+    assert!(fixture.unit_path().exists());
+    assert!(fixture.installed_daemon().exists());
+
+    fixture.install_packaged_unit();
+    let installed = fixture.run(&["service", "install"]);
+
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    assert!(stdout(&installed).contains("packaged systemd user service selected"));
+    assert!(!fixture.unit_path().exists(), "user unit must not shadow the package");
+    assert!(
+        !fixture.installed_daemon().exists(),
+        "stale XDG user-data daemon must not own the package service"
+    );
+    assert!(fixture.packaged_unit_dir.join("voisu.service").exists());
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    assert!(calls.contains("--user daemon-reload"));
+    assert!(calls.contains("--user enable voisu.service"));
+}
+
+#[test]
+fn packaged_install_restarts_an_active_service_after_migrating_its_user_shadow() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+
+    assert!(fixture.run(&["service", "install"]).status.success());
+    fs::write(
+        &fixture.systemctl_state,
+        format!("daemon={}\n", fixture.source_daemon.display()),
+    )
+    .unwrap();
+    assert!(fixture.run(&["service", "start"]).status.success());
+
+    fixture.install_packaged_unit();
+    let migrated = fixture.run(&["service", "install"]);
+
+    assert!(migrated.status.success(), "{}", stderr(&migrated));
+    assert!(stdout(&migrated).contains("packaged systemd user service selected"));
+    assert!(stdout(&fixture.run(&["service", "status"])).contains("systemd user service active"));
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    assert!(calls.contains("--user restart voisu.service"));
 }
 
 #[test]
@@ -401,4 +465,20 @@ fn uninstall_disables_service_removes_installed_files_and_leaves_no_runtime_sock
     assert!(calls.contains("--user disable --now voisu.service"));
     assert!(calls.contains("--user daemon-reload"));
     assert!(calls.contains("--user reset-failed voisu.service"));
+}
+
+#[test]
+fn packaged_uninstall_disables_only_the_service_and_preserves_packaged_unit_and_user_data() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    fixture.install_packaged_unit();
+    fs::create_dir_all(fixture.installed_daemon().parent().unwrap()).unwrap();
+    fs::write(fixture.installed_daemon(), b"stale user-data daemon").unwrap();
+
+    let removed = fixture.run(&["service", "uninstall"]);
+
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    assert!(stdout(&removed).contains("packaged systemd user service disabled"));
+    assert!(fixture.packaged_unit_dir.join("voisu.service").exists());
+    assert!(!fixture.installed_daemon().exists());
+    assert!(!fixture.unit_path().exists());
 }

@@ -189,6 +189,13 @@ clipboard, secret-store, and systemctl child must also have a kernel-enforced ow
 spawn hook sets `PR_SET_PDEATHSIG=SIGKILL` and refuses exec when the expected parent is already gone, closing the
 fork-to-prctl race. Per-command hooks were rejected because they had already left provider and service children
 uncovered and allowed the PipeWire hook to omit the race check.
+
+## 2026-07-16 — Ship one GTK-free Fedora RPM with an optional Overlay subpackage
+**Why:** The release candidate is built by `rpmbuild` from a Cargo.lock-pinned source archive created from the exact
+tested git commit. The base package owns `/usr/bin/voisu`, `/usr/bin/voisu-daemon`, and one graphical-session user unit;
+`voisu-overlay` owns the optional GTK4 binary and dependencies. A packaged unit is preferred over Ticket 09's XDG
+user-data copy, which is migrated and removed on upgrade so a stale executable cannot silently own the daemon. RPM
+scriptlets disable the unit on removal while leaving credentials, supported state, and diagnostics for the user.
 ## 2026-07-16 — Version terminal Overlay feedback independently of daemon lifecycle status
 **Why:** The Overlay needs display-once terminal feedback without making CLI Status sticky or coupling presentation to Recording/Delivery ownership. Typed event IDs let an observer deduplicate and expire feedback while the daemon remains authoritative and reusable.
 

@@ -2,10 +2,10 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-16
 
 ## 🚧 In progress / next
-- Ticket 12 round-2 review fixes are implemented on `ticket-12-overlay-fallback`; next: re-review and merge this
-  focused branch, then take Ticket 13 (Fedora package verification).
-- Issue #14 (cancellation-safe provider abort) is merged through PR #18 at `8d8dbba` and closed; Ticket 11
-  (GTK4 voice capsule + completed Fedora screenshot gate) is merged through PR #19 at `66f8aa1` and closed.
+- Ticket 13 implementation is complete on `ticket-13-fedora-package`; next is the orchestrator's Fedora host run
+  of the exact RPM artifact and the live checks listed in `docs/release-evidence.md`.
+- `rpmbuild` is unavailable in this managed sandbox, so the RPM build script/spec are headlessly reviewed and the
+  actual package, install, upgrade, removal, portal, Recording, Delivery, and clipboard checks remain PENDING.
 
 ## Status
 - `voisu` and `voisu-daemon` communicate over bounded, versioned Unix IPC; the actor keeps status responsive while
@@ -16,7 +16,8 @@
   Unicode-aware guardrails, permits one bounded repair, and otherwise falls back to a clean Source Transcript or
   reports a Quality Failure. Only the final Transcript reaches Delivery.
 - Ticket 09 installs a graphical-session-owned daemon service with atomic binaries and a three-starts-per-30-seconds
-  failure bound; daemon lifecycle remains independent from the optional Overlay.
+  failure bound; packaged `/usr/lib/systemd/user/voisu.service` is preferred over and migrates away old XDG
+  user-data ownership; daemon lifecycle remains independent from the optional Overlay.
 - Ticket 12 keeps the Overlay observer-only: a pure, headless selection layer chooses runtime-advertised Layer Shell,
   an unfocusable regular GTK surface, desktop notification, or a persistent journal observer when no display exists.
   Structured Overlay logs and `voisu-overlay --report-backend` expose `backend` plus `degradation`; normal `voisu
@@ -26,13 +27,17 @@
 - Ticket 12 round-2 review fixes are in: the Overlay's surface probe is now honest local GTK realization (no unsound
   compositor-map timer, no false fallback on a healthy compositor), and the capsule stays hidden at Idle with no startup
   flash while status polling starts immediately.
-- Current gates: `cargo test --workspace` — 198 passed, 2 ignored, 0 failed;
-  `cargo check -p voisu-app --features overlay` and `cargo build --workspace` are clean.
+- Current gates: `cargo test --workspace` — 201 passed, 2 ignored, 0 failed;
+  `cargo check -p voisu-app --features overlay`, `cargo build --workspace`, `bash -n` for packaging scripts, and
+  `git diff --check` are clean. RPM/live Fedora evidence is pending the host.
 
 ## Architecture map
 - Domain, IPC, lifecycle/Delivery evidence, provider coordination, decision pipeline -> `crates/voisu-core/src/lib.rs`
 - Fedora adapters: PipeWire, providers, clipboard, zbus portals, native libei -> `crates/voisu-app/src/system.rs`
 - systemd user-service installation, lifecycle, ownership/IPC reporting -> `crates/voisu-app/src/service.rs`
+- Fedora RPM spec, exact-commit build, and smoke harness -> `packaging/`; install/upgrade/removal procedure ->
+  `docs/packaging-fedora.md`
+- Release evidence matrix and host checklist -> `docs/release-evidence.md`
 - Headless Overlay backend selection and restart policy -> `crates/voisu-app/src/feedback.rs`
 - Overlay presentation controller -> `crates/voisu-app/src/overlay.rs`
 - GTK Overlay runtime adapter and observer-only status polling -> `crates/voisu-app/src/bin/voisu-overlay.rs`
@@ -52,6 +57,8 @@
 - Overlay presentation is observer-only and may disappear; Layer Shell is a runtime compositor capability, with
   separate regular-surface/notification feedback and a bounded Overlay-only supervisor.
 - Every spawned external process receives a guarded Linux parent-death signal.
+- The Fedora release uses one GTK-free base RPM plus an optional Overlay subpackage; `Cargo.lock` and the exact git
+  commit bind the tested source to the RPM metadata.
 
 ## Gotchas
 - Use `CONTEXT.md` terms exactly; several ordinary synonyms are banned.

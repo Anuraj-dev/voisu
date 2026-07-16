@@ -18,6 +18,7 @@ const SYSTEMCTL_DEADLINE: Duration = Duration::from_secs(5);
 const SERVICE_TRANSITION_DEADLINE: Duration = Duration::from_secs(3);
 const IPC_DEADLINE: Duration = Duration::from_millis(300);
 const MAX_SYSTEMCTL_OUTPUT: u64 = 16 * 1024;
+const PACKAGED_UNIT_DIRS: &[&str] = &["/usr/lib/systemd/user", "/etc/systemd/user"];
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +49,7 @@ struct ServicePaths {
     source_daemon: PathBuf,
     installed_daemon: PathBuf,
     unit: PathBuf,
+    packaged_unit: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +72,9 @@ pub fn manage_user_service(action: UserServiceAction) -> Result<UserServiceRepor
 
 fn install() -> Result<UserServiceReport, String> {
     let paths = service_paths()?;
+    if paths.packaged_unit.is_some() {
+        return install_packaged(&paths);
+    }
     install_executable(&paths.source_daemon, &paths.installed_daemon)?;
     atomic_write(
         &paths.unit,
@@ -91,6 +96,32 @@ fn install() -> Result<UserServiceReport, String> {
     }
     Ok(UserServiceReport::success(
         "systemd user service installed and enabled",
+    ))
+}
+
+fn install_packaged(paths: &ServicePaths) -> Result<UserServiceReport, String> {
+    let has_user_shadow = paths.unit.exists() || paths.installed_daemon.exists();
+    let was_active = systemd_is_active()?;
+
+    if has_user_shadow {
+        // The XDG user unit has higher precedence than /usr/lib/systemd/user.
+        // Stop and remove our old copy before reloading systemd, otherwise an
+        // upgrade would silently continue running the stale daemon.
+        systemctl_required(&["disable", "--now", UNIT_NAME])?;
+        wait_for_service_stop()?;
+        remove_if_file(&paths.unit)?;
+        remove_if_file(&paths.installed_daemon)?;
+        remove_stale_runtime_socket()?;
+    }
+
+    systemctl_required(&["daemon-reload"])?;
+    systemctl_required(&["enable", UNIT_NAME])?;
+    if was_active {
+        systemctl_required(&["restart", UNIT_NAME])?;
+        wait_for_managed_daemon()?;
+    }
+    Ok(UserServiceReport::success(
+        "packaged systemd user service selected, enabled, and migrated",
     ))
 }
 
@@ -134,6 +165,30 @@ fn stop() -> Result<UserServiceReport, String> {
         report.exit_code = 0;
     }
     Ok(report)
+}
+
+fn wait_for_service_stop() -> Result<(), String> {
+    let deadline = Instant::now() + SERVICE_TRANSITION_DEADLINE;
+    while Instant::now() < deadline {
+        if !systemd_is_active()? && matches!(probe_daemon(), DaemonIpc::Unavailable) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if systemd_is_active()? {
+        return Err("systemd user service did not stop before the deadline".to_owned());
+    }
+    match probe_daemon() {
+        DaemonIpc::Unavailable => Ok(()),
+        DaemonIpc::Available(_) => Err(
+            "daemon is running outside systemd; stop it before migrating to the packaged service"
+                .to_owned(),
+        ),
+        DaemonIpc::ProtocolMismatch => Err(
+            "an incompatible daemon is running outside systemd; stop it before migrating to the packaged service"
+                .to_owned(),
+        ),
+    }
 }
 
 fn restart() -> Result<UserServiceReport, String> {
@@ -201,6 +256,9 @@ fn status() -> Result<UserServiceReport, String> {
 
 fn uninstall() -> Result<UserServiceReport, String> {
     let paths = service_paths()?;
+    if paths.packaged_unit.is_some() {
+        return uninstall_packaged(&paths);
+    }
     // Disable first so no future graphical session can start the old unit.
     // A missing unit is already disabled, so tolerate that one idempotent edge;
     // an existing unit must be disabled successfully or removal would leave a
@@ -247,6 +305,22 @@ fn uninstall() -> Result<UserServiceReport, String> {
     ))
 }
 
+fn uninstall_packaged(paths: &ServicePaths) -> Result<UserServiceReport, String> {
+    // RPM owns the packaged unit and binaries. The CLI may disable the user
+    // service and clean a stale pre-RPM shadow, but must never remove files
+    // owned by the package or user configuration/credentials.
+    systemctl_required(&["disable", "--now", UNIT_NAME])?;
+    wait_for_service_stop()?;
+    remove_if_file(&paths.unit)?;
+    remove_if_file(&paths.installed_daemon)?;
+    remove_stale_runtime_socket()?;
+    systemctl_required(&["daemon-reload"])?;
+    let _ = systemctl(&["reset-failed", UNIT_NAME])?;
+    Ok(UserServiceReport::success(
+        "packaged systemd user service disabled; remove the RPM to remove packaged artifacts",
+    ))
+}
+
 fn service_paths() -> Result<ServicePaths, String> {
     let current = std::env::current_exe()
         .map_err(|_| "cannot locate the Voisu executable".to_owned())?;
@@ -260,6 +334,22 @@ fn service_paths() -> Result<ServicePaths, String> {
         source_daemon,
         installed_daemon: data.join("voisu/bin/voisu-daemon"),
         unit: config.join("systemd/user/voisu.service"),
+        packaged_unit: packaged_unit_path(),
+    })
+}
+
+fn packaged_unit_path() -> Option<PathBuf> {
+    // Tests provide a private directory so the public CLI tests never inspect
+    // or modify the host's systemd unit directories. Production uses Fedora's
+    // system and administrator user-unit locations.
+    let configured = std::env::var_os("VOISU_PACKAGED_UNIT_DIR");
+    let directories = configured
+        .as_deref()
+        .map(|directory| vec![PathBuf::from(directory)])
+        .unwrap_or_else(|| PACKAGED_UNIT_DIRS.iter().map(PathBuf::from).collect());
+    directories.into_iter().map(|directory| directory.join(UNIT_NAME)).find(|path| {
+        fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
     })
 }
 
