@@ -3,11 +3,9 @@
 
 ## 🚧 In progress / next
 - Ticket 08 merged through PR #15 at `a5771a9`; exact-head CI passed and issue #8 is closed.
-- Ticket 09 (issue #9, systemd user service ownership) is implemented and manually review-complete after the required
-  Sol reviewer remained unavailable due its account usage cap. Next: commit, publish, require exact-head green CI,
-  and merge.
-- Follow-up issue #14 remains open: make Deepgram/Groq abort cancellation-safe plus its regression test; out of
-  Ticket 08 scope.
+- Ticket 09 merged through PR #16 at `9b58f99`; exact-head CI passed and issue #9 is closed.
+- Next ordered implementation work is Ticket 10 (issue #10): recover cleanly from real workflow failures.
+- Follow-up issue #14 remains open: make Deepgram/Groq abort cancellation-safe plus its regression test.
 
 ## Status
 - `voisu` and `voisu-daemon` communicate over bounded, versioned Unix IPC; the actor keeps status responsive while
@@ -35,7 +33,7 @@
   trusted daemon copy under XDG user data and enables one unit under `graphical-session.target`, ordered after the
   user D-Bus socket, PipeWire, and desktop portal without baking session variables or checkout paths. Service reports
   combine real systemd state with daemon IPC state; manual ownership and duplicate races fail without restart loops.
-- Current inventory: 161 tests listed (7 app unit + 100 daemon/CLI acceptance + 6 Delivery + 8 user-service +
+- Current inventory at `9b58f99`: 161 tests listed (7 app unit + 100 daemon/CLI acceptance + 6 Delivery + 8 user-service +
   20 diagnostics + 6 provider-coordination + 14 Transcript-decision). The full host gate is green: 160 passed,
   1 opt-in live smoke
   ignored, 0 failed.

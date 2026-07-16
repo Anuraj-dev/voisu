@@ -7,7 +7,7 @@ daemon owner across install, login, restart, upgrade, and removal.
 
 **Blocked by:** 03 — Dictate through PipeWire and Groq into the clipboard.
 
-**Status:** implemented and review-complete; pending exact-head CI and merge
+**Status:** completed in PR #16 (`9b58f99`); exact-head CI green and issue #9 closed
 
 - [x] Service install creates or updates one user unit pointing at the intended Voisu build.
 - [x] Service start, stop, restart, and status report actual systemd ownership and daemon IPC state.

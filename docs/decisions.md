@@ -168,3 +168,8 @@ with the graphical session. Management reports both systemd state and versioned 
 without being killed: the CLI avoids starting a duplicate, and the `--systemd` race guard exits cleanly so
 `Restart=on-failure` cannot loop. Upgrade swaps the executable inode before restarting an already-managed service;
 uninstall disables first, waits for ownership and IPC to clear, then removes the unit, executable, and stale socket.
+
+## 2026-07-16 — Codex dispatch prompts are self-contained (no Claude delegation)
+**Why:** GPT/codex agents prompt `claude -p` poorly, wasting tokens on both sides. Rejected alternative: keeping the
+mandatory delegation-to-Claude block in every codex dispatch. Codex now gets all needed context inline; Claude-side
+subagents remain the orchestrator's tool only.
