@@ -18,6 +18,11 @@ const SYSTEMCTL_DEADLINE: Duration = Duration::from_secs(5);
 const SERVICE_TRANSITION_DEADLINE: Duration = Duration::from_secs(3);
 const IPC_DEADLINE: Duration = Duration::from_millis(300);
 const MAX_SYSTEMCTL_OUTPUT: u64 = 16 * 1024;
+// systemd precedence among packaged locations: an administrator unit under /etc
+// overrides the packaged unit under /usr/lib. (A user unit under XDG config
+// outranks both, which is why a stale Ticket 09 shadow must be detected on disk
+// rather than trusted as the effective unit.)
+const PACKAGED_UNIT_DIRS: &[&str] = &["/etc/systemd/user", "/usr/lib/systemd/user"];
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +53,13 @@ struct ServicePaths {
     source_daemon: PathBuf,
     installed_daemon: PathBuf,
     unit: PathBuf,
+    packaged_unit: Option<PathBuf>,
+    packaged_fallback: Option<String>,
+}
+
+struct PackagedUnitDetection {
+    path: Option<PathBuf>,
+    fallback_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +82,9 @@ pub fn manage_user_service(action: UserServiceAction) -> Result<UserServiceRepor
 
 fn install() -> Result<UserServiceReport, String> {
     let paths = service_paths()?;
+    if paths.packaged_unit.is_some() {
+        return install_packaged(&paths);
+    }
     install_executable(&paths.source_daemon, &paths.installed_daemon)?;
     atomic_write(
         &paths.unit,
@@ -85,12 +100,49 @@ fn install() -> Result<UserServiceReport, String> {
     if systemd_is_active()? {
         systemctl_required(&["restart", UNIT_NAME])?;
         wait_for_managed_daemon()?;
-        return Ok(UserServiceReport::success(
+        return Ok(UserServiceReport::success(install_message(
+            &paths,
             "systemd user service updated, enabled, and restarted",
-        ));
+        )));
+    }
+    Ok(UserServiceReport::success(install_message(
+        &paths,
+        "systemd user service installed and enabled",
+    )))
+}
+
+fn install_message(paths: &ServicePaths, message: &str) -> String {
+    match &paths.packaged_fallback {
+        Some(reason) => format!(
+            "{message} via Ticket 09 user-data path; packaged unit was ignored: {reason}"
+        ),
+        None => message.to_owned(),
+    }
+}
+
+fn install_packaged(paths: &ServicePaths) -> Result<UserServiceReport, String> {
+    let has_user_shadow = paths.unit.exists() || paths.installed_daemon.exists();
+    let was_active = systemd_is_active()?;
+
+    if has_user_shadow {
+        // The XDG user unit has higher precedence than /usr/lib/systemd/user.
+        // Stop and remove our old copy before reloading systemd, otherwise an
+        // upgrade would silently continue running the stale daemon.
+        systemctl_required(&["disable", "--now", UNIT_NAME])?;
+        wait_for_service_stop()?;
+        remove_if_file(&paths.unit)?;
+        remove_if_file(&paths.installed_daemon)?;
+        remove_stale_runtime_socket()?;
+    }
+
+    systemctl_required(&["daemon-reload"])?;
+    systemctl_required(&["enable", UNIT_NAME])?;
+    if was_active {
+        systemctl_required(&["restart", UNIT_NAME])?;
+        wait_for_managed_daemon()?;
     }
     Ok(UserServiceReport::success(
-        "systemd user service installed and enabled",
+        "packaged systemd user service selected, enabled, and migrated",
     ))
 }
 
@@ -134,6 +186,30 @@ fn stop() -> Result<UserServiceReport, String> {
         report.exit_code = 0;
     }
     Ok(report)
+}
+
+fn wait_for_service_stop() -> Result<(), String> {
+    let deadline = Instant::now() + SERVICE_TRANSITION_DEADLINE;
+    while Instant::now() < deadline {
+        if !systemd_is_active()? && matches!(probe_daemon(), DaemonIpc::Unavailable) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if systemd_is_active()? {
+        return Err("systemd user service did not stop before the deadline".to_owned());
+    }
+    match probe_daemon() {
+        DaemonIpc::Unavailable => Ok(()),
+        DaemonIpc::Available(_) => Err(
+            "daemon is running outside systemd; stop it before migrating to the packaged service"
+                .to_owned(),
+        ),
+        DaemonIpc::ProtocolMismatch => Err(
+            "an incompatible daemon is running outside systemd; stop it before migrating to the packaged service"
+                .to_owned(),
+        ),
+    }
 }
 
 fn restart() -> Result<UserServiceReport, String> {
@@ -201,6 +277,9 @@ fn status() -> Result<UserServiceReport, String> {
 
 fn uninstall() -> Result<UserServiceReport, String> {
     let paths = service_paths()?;
+    if paths.packaged_unit.is_some() {
+        return uninstall_packaged(&paths);
+    }
     // Disable first so no future graphical session can start the old unit.
     // A missing unit is already disabled, so tolerate that one idempotent edge;
     // an existing unit must be disabled successfully or removal would leave a
@@ -247,6 +326,22 @@ fn uninstall() -> Result<UserServiceReport, String> {
     ))
 }
 
+fn uninstall_packaged(paths: &ServicePaths) -> Result<UserServiceReport, String> {
+    // RPM owns the packaged unit and binaries. The CLI may disable the user
+    // service and clean a stale pre-RPM shadow, but must never remove files
+    // owned by the package or user configuration/credentials.
+    systemctl_required(&["disable", "--now", UNIT_NAME])?;
+    wait_for_service_stop()?;
+    remove_if_file(&paths.unit)?;
+    remove_if_file(&paths.installed_daemon)?;
+    remove_stale_runtime_socket()?;
+    systemctl_required(&["daemon-reload"])?;
+    let _ = systemctl(&["reset-failed", UNIT_NAME])?;
+    Ok(UserServiceReport::success(
+        "packaged systemd user service disabled; run this before removing the RPM to remove packaged artifacts",
+    ))
+}
+
 fn service_paths() -> Result<ServicePaths, String> {
     let current = std::env::current_exe()
         .map_err(|_| "cannot locate the Voisu executable".to_owned())?;
@@ -256,11 +351,290 @@ fn service_paths() -> Result<ServicePaths, String> {
         .join("voisu-daemon");
     let data = xdg_home("XDG_DATA_HOME", ".local/share")?;
     let config = xdg_home("XDG_CONFIG_HOME", ".config")?;
+    let packaged = packaged_unit_path();
     Ok(ServicePaths {
         source_daemon,
         installed_daemon: data.join("voisu/bin/voisu-daemon"),
         unit: config.join("systemd/user/voisu.service"),
+        packaged_unit: packaged.path,
+        packaged_fallback: packaged.fallback_reason,
     })
+}
+
+enum EffectiveLookup {
+    /// A packaged unit that systemd will run; `execs` holds every effective
+    /// ExecStart command binary that must validate.
+    Packaged {
+        fragment: PathBuf,
+        execs: Vec<PathBuf>,
+    },
+    /// A packaged unit is the effective unit but is not cleanly loaded
+    /// (LoadState is error/bad-setting/masked/…); it must not be migrated to.
+    Unloadable {
+        fragment: PathBuf,
+        load_state: String,
+    },
+    /// A packaged unit file exists on disk but its ExecStart could not be
+    /// faithfully read; migration must never trust a unit it cannot parse.
+    Unparseable { fragment: PathBuf, reason: String },
+    /// There is no packaged unit to consider.
+    NoPackagedUnit,
+}
+
+fn packaged_unit_path() -> PackagedUnitDetection {
+    // Ask systemd which unit it would actually run. `systemctl --user show`
+    // reflects administrator /etc overrides and drop-ins, so the effective
+    // ExecStart is validated rather than the text of a file at a guessed path.
+    match effective_packaged_unit() {
+        EffectiveLookup::Packaged { fragment, execs } => {
+            match validate_packaged_execs(&fragment, &execs) {
+                Ok(()) => PackagedUnitDetection {
+                    path: Some(fragment),
+                    fallback_reason: None,
+                },
+                Err(reason) => PackagedUnitDetection {
+                    path: None,
+                    fallback_reason: Some(reason),
+                },
+            }
+        }
+        EffectiveLookup::Unloadable {
+            fragment,
+            load_state,
+        } => PackagedUnitDetection {
+            path: None,
+            fallback_reason: Some(format!(
+                "packaged unit {} is not cleanly loaded (LoadState={load_state})",
+                fragment.display()
+            )),
+        },
+        EffectiveLookup::Unparseable { fragment, reason } => PackagedUnitDetection {
+            path: None,
+            fallback_reason: Some(format!(
+                "packaged unit {} was not trusted: {reason}",
+                fragment.display()
+            )),
+        },
+        EffectiveLookup::NoPackagedUnit => PackagedUnitDetection {
+            path: None,
+            fallback_reason: None,
+        },
+    }
+}
+
+fn effective_packaged_unit() -> EffectiveLookup {
+    let output = systemctl(&[
+        "show",
+        UNIT_NAME,
+        "-p",
+        "LoadState",
+        "-p",
+        "FragmentPath",
+        "-p",
+        "ExecStart",
+    ])
+    .ok()
+    .filter(|output| output.success);
+
+    if let Some(output) = output {
+        let mut load_state = None;
+        let mut fragment = None;
+        let mut exec_lines: Vec<String> = Vec::new();
+        for line in output.stdout.lines() {
+            if let Some(value) = line.strip_prefix("LoadState=") {
+                load_state.get_or_insert_with(|| value.trim().to_owned());
+            } else if let Some(value) = line.strip_prefix("FragmentPath=") {
+                fragment.get_or_insert_with(|| value.trim().to_owned());
+            } else if let Some(value) = line.strip_prefix("ExecStart=") {
+                exec_lines.push(value.to_owned());
+            }
+        }
+
+        let fragment = fragment.filter(|value| !value.is_empty()).map(PathBuf::from);
+        // Case A: systemd's effective unit is itself a packaged unit (possibly
+        // via an /etc override or drop-in). Trust exactly what systemd will run.
+        if let Some(fragment) = fragment.filter(|fragment| is_packaged_fragment(fragment)) {
+            return match load_state.as_deref() {
+                Some("loaded") => EffectiveLookup::Packaged {
+                    fragment,
+                    execs: parse_show_execstart_binaries(&exec_lines),
+                },
+                other => EffectiveLookup::Unloadable {
+                    fragment,
+                    load_state: other.unwrap_or("unknown").to_owned(),
+                },
+            };
+        }
+        // Otherwise the effective unit is the user-owned Ticket 09 unit (systemd
+        // ranks XDG config above the packaged dirs) or nothing is loaded. A
+        // packaged unit may still exist on disk, shadowed — fall through to the
+        // on-disk detection below, which is exactly the stale-shadow migration
+        // case the migration exists for.
+    }
+
+    // systemctl could not answer, or the effective unit is a shadowing XDG user
+    // unit. Detect a packaged unit directly on disk and validate its ExecStart
+    // from the unit file (the best available signal when systemd is not showing
+    // it).
+    match disk_packaged_unit() {
+        Some((fragment, Ok(execs))) => EffectiveLookup::Packaged { fragment, execs },
+        Some((fragment, Err(reason))) => EffectiveLookup::Unparseable { fragment, reason },
+        None => EffectiveLookup::NoPackagedUnit,
+    }
+}
+
+fn validate_packaged_execs(fragment: &Path, execs: &[PathBuf]) -> Result<(), String> {
+    if execs.is_empty() {
+        return Err(format!(
+            "packaged unit {} has no resolvable ExecStart",
+            fragment.display()
+        ));
+    }
+    // Every command systemd would run must be trusted; a valid first command
+    // does not excuse a missing or untrusted later one.
+    for exec in execs {
+        validate_effective_daemon(exec)?;
+    }
+    Ok(())
+}
+
+fn parse_show_execstart_binaries(lines: &[String]) -> Vec<PathBuf> {
+    // systemd renders each command as `{ path=/bin/x ; argv[]=/bin/x --f ; … }`
+    // and joins multiple commands with `} ; {`. The command binary is only the
+    // `path=` field OPENING a block — at the start of the value or right after
+    // a `} ; ` block close. A `{ path=` sequence inside an argv[] argument
+    // (e.g. `--config-path=/tmp`, or a literal `{ path=/tmp` argument) must
+    // never be collected as an executable.
+    let mut binaries = Vec::new();
+    for line in lines {
+        let value = line.trim_start();
+        let mut offset = 0;
+        while let Some(found) = value[offset..].find("{ path=") {
+            let index = offset + found;
+            let opens_block = index == 0 || value[..index].ends_with("} ; ");
+            let after = &value[index + "{ path=".len()..];
+            let end = after.find(" ;").unwrap_or(after.len());
+            if opens_block {
+                let path = after[..end].trim();
+                if !path.is_empty() {
+                    binaries.push(PathBuf::from(path));
+                }
+            }
+            offset = index + "{ path=".len() + end;
+        }
+    }
+    binaries
+}
+
+fn parse_unit_file_execstart_binaries(contents: &str) -> Result<Vec<PathBuf>, String> {
+    // Conservative unit-file reading for the shadowed-migration decision only:
+    // accept exactly the syntax Voisu ships — an absolute, unquoted executable,
+    // optionally with execute prefixes (`@-:+!`) attached directly to it — and
+    // honor systemd's empty-assignment reset. Everything else (quoting, line
+    // continuations, a prefix separated from its executable, relative paths) is
+    // rejected with a reason so migration never trusts a unit this parser
+    // cannot faithfully read; the install then stays on the Ticket 09 path.
+    if contents.lines().any(|line| line.trim_end().ends_with('\\')) {
+        return Err("unit file uses line continuations".to_owned());
+    }
+    let mut binaries = Vec::new();
+    let mut in_service_section = false;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            // Only [Service] assignments are systemd commands; an ExecStart=
+            // under any other section must never collect into — or reset — the
+            // command list.
+            in_service_section = line == "[Service]";
+            continue;
+        }
+        if !in_service_section {
+            continue;
+        }
+        // systemd trims whitespace around the key, so `ExecStart =` also counts.
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim_end() != "ExecStart" {
+            continue;
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            // systemd reset semantics: an empty assignment clears the list.
+            binaries.clear();
+            continue;
+        }
+        let token = value
+            .split_whitespace()
+            .next()
+            .expect("non-empty value has a first token");
+        let executable = token.trim_start_matches(['@', '-', ':', '+', '!']);
+        if executable.is_empty() {
+            return Err(format!(
+                "ExecStart prefix \"{token}\" is separated from its executable"
+            ));
+        }
+        if value.starts_with(['"', '\'']) || executable.contains(['"', '\'']) {
+            return Err("quoted ExecStart executables are not supported".to_owned());
+        }
+        if !executable.starts_with('/') {
+            return Err(format!(
+                "ExecStart executable \"{executable}\" is not an absolute path"
+            ));
+        }
+        binaries.push(PathBuf::from(executable));
+    }
+    Ok(binaries)
+}
+
+fn disk_packaged_unit() -> Option<(PathBuf, Result<Vec<PathBuf>, String>)> {
+    // Search the packaged directories in systemd precedence order (/etc before
+    // /usr/lib) for a regular unit file, and parse its ExecStart commands.
+    for directory in packaged_unit_dirs() {
+        let path = directory.join(UNIT_NAME);
+        let is_regular_file = fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
+        if !is_regular_file {
+            continue;
+        }
+        let execs = fs::read_to_string(&path)
+            .map_err(|error| format!("unit file is unreadable ({error})"))
+            .and_then(|contents| parse_unit_file_execstart_binaries(&contents));
+        return Some((path, execs));
+    }
+    None
+}
+
+fn is_packaged_fragment(fragment: &Path) -> bool {
+    fragment
+        .parent()
+        .is_some_and(|parent| packaged_unit_dirs().iter().any(|dir| dir == parent))
+}
+
+fn packaged_unit_dirs() -> Vec<PathBuf> {
+    // Tests provide a private directory so the public CLI tests never inspect
+    // or modify the host's systemd unit directories. Production uses Fedora's
+    // administrator and system user-unit locations.
+    match std::env::var_os("VOISU_PACKAGED_UNIT_DIR") {
+        Some(directory) => vec![PathBuf::from(directory)],
+        None => PACKAGED_UNIT_DIRS.iter().map(PathBuf::from).collect(),
+    }
+}
+
+fn validate_effective_daemon(daemon: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(daemon).map_err(|_| {
+        format!(
+            "packaged unit ExecStart binary {} is missing",
+            daemon.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.mode() & 0o111 == 0 {
+        return Err(format!(
+            "packaged unit ExecStart binary {} is not a trusted executable",
+            daemon.display()
+        ));
+    }
+    Ok(())
 }
 
 fn xdg_home(variable: &str, fallback: &str) -> Result<PathBuf, String> {

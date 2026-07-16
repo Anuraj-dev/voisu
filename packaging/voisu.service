@@ -1,0 +1,17 @@
+[Unit]
+Description=Voisu dictation daemon
+After=dbus.socket pipewire.service xdg-desktop-portal.service
+Wants=dbus.socket pipewire.service xdg-desktop-portal.service
+PartOf=graphical-session.target
+StartLimitIntervalSec=30s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/voisu-daemon --systemd
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=60s
+
+[Install]
+WantedBy=graphical-session.target

@@ -7,6 +7,8 @@
 | ../DESIGN.md | Ticket 11 Overlay visual tokens, accessibility gate, and screenshot checklist |
 | decisions.md | Append-only log of load-bearing choices + why |
 | conventions.md | Stack, run/test commands, naming (ubiquitous language) |
+| packaging-fedora.md | Exact Fedora RPM build, install, upgrade, removal, and smoke procedure |
+| release-evidence.md | Ticket 13 evidence matrix: proven tests and host-pending checks |
 | model-benchmark.md | Standing experiment: per-dispatch log comparing codex models (Sol/Terra/Luna) vs Opus as coder/reviewer agents |
 | old_context.md | Honest pre-tracking backstory (planning phase summary) |
 | adr/ | Six architectural decision records (hard-to-reverse choices) |

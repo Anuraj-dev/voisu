@@ -16,5 +16,4 @@ that install-to-dictation works on the target desktop.
 - [ ] Removal disables the service and removes packaged artifacts while preserving user data unless explicitly purged.
 - [ ] The exact packaged build passes the standard suite and opt-in Fedora smoke suite.
 - [ ] Release evidence includes process ownership, portal behavior, provider fallback, latency spans, log redaction, and Overlay isolation.
-- [ ] APT/DEB work remains a subsequent milestone rather than silently expanding this Fedora release.
-
+- [x] APT/DEB work remains a subsequent milestone rather than silently expanding this Fedora release.

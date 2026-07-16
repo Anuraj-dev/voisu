@@ -189,6 +189,13 @@ clipboard, secret-store, and systemctl child must also have a kernel-enforced ow
 spawn hook sets `PR_SET_PDEATHSIG=SIGKILL` and refuses exec when the expected parent is already gone, closing the
 fork-to-prctl race. Per-command hooks were rejected because they had already left provider and service children
 uncovered and allowed the PipeWire hook to omit the race check.
+
+## 2026-07-16 — Ship one GTK-free Fedora RPM with an optional Overlay subpackage
+**Why:** The release candidate is built by `rpmbuild` from a Cargo.lock-pinned source archive created from the exact
+tested git commit. The base package owns `/usr/bin/voisu`, `/usr/bin/voisu-daemon`, and one graphical-session user unit;
+`voisu-overlay` owns the optional GTK4 binary and dependencies. A packaged unit is preferred over Ticket 09's XDG
+user-data copy, which is migrated and removed on upgrade so a stale executable cannot silently own the daemon. RPM
+scriptlets disable the unit on removal while leaving credentials, supported state, and diagnostics for the user.
 ## 2026-07-16 — Version terminal Overlay feedback independently of daemon lifecycle status
 **Why:** The Overlay needs display-once terminal feedback without making CLI Status sticky or coupling presentation to Recording/Delivery ownership. Typed event IDs let an observer deduplicate and expire feedback while the daemon remains authoritative and reusable.
 
@@ -206,3 +213,14 @@ daemon to recover presentation was rejected because it could interrupt a Recordi
 
 ## 2026-07-16 — Overlay surface creation is local realization, not a compositor map probe (round-2)
 **Why:** Round-1 declared surface success only after a bounded GTK `map` signal following `present()`. That probe was unsound: `GtkWidget::map` reflects GTK's local widget lifecycle, not compositor acceptance, so the flag turned true even when the Wayland surface later failed, and a locally delayed map beyond the 500 ms grace produced a false, permanent desktop-notification fallback on a perfectly healthy compositor. The Overlay now treats successful GTK realization (`window.surface().is_some()` on the first real show) as surface creation, and falls back to a desktop notification only when GTK realizes without a surface — the sole in-process-detectable surface failure. A compositor that *rejects* the surface (e.g. a Layer Shell protocol error) instead raises a Wayland protocol error that terminates the process; the bounded `voisu-overlay --supervise` policy, not a false in-process timer, converts that into explicit degraded behavior. A false fallback on a healthy compositor is therefore impossible. This chooses acceptable direction (a): drop the pretense of compositor confirmation and keep an honest, testable story. The window also stays hidden at Idle — no startup `present()` and no styled empty-capsule flash — and becomes visible only when a visible phase arrives, while status polling starts immediately so an early Recording is never missed. Reintroducing a map/timeout probe was rejected as dishonest; a startup `present()` was rejected as a DESIGN.md 'hidden at Idle' violation.
+## 2026-07-16 — Make the Fedora RPM build offline with an exact-commit vendor archive
+**Why:** A Cargo.lock alone does not make a clean mock build reproducible when crates are not present in the build
+root. `packaging/build-rpm.sh` therefore creates `Source1` with `cargo vendor --locked` from the same clean commit,
+and the spec writes a Cargo source replacement before every offline build/check. Fetching crates during `%build` or
+`%check` was rejected because it would make the tested artifact depend on network state.
+
+## 2026-07-16 — Validate packaged service ownership before migrating Ticket 09 data
+**Why:** A regular packaged unit file without `/usr/bin/voisu-daemon` could make `voisu service install` report
+success for a service that cannot start. Detection now validates the executable and exact `ExecStart`, then clearly
+falls back to the Ticket 09 user-data path. RPM removal also requires the desktop user's uninstall command first,
+because systemd user scriptlets cannot reliably clear live per-user ownership and enablement.
