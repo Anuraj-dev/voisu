@@ -4,11 +4,11 @@ set -euo pipefail
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 
-commit=${VOISU_COMMIT:-$(git rev-parse HEAD)}
+requested_commit=${VOISU_COMMIT:-HEAD}
+commit=$(git rev-parse --verify "${requested_commit}^{commit}")
 version=0.1.0
 output_dir=${VOISU_RPM_OUTPUT_DIR:-"$root/dist/rpm"}
 
-git cat-file -e "${commit}^{commit}"
 if test -n "$(git status --porcelain)"; then
     printf '%s\n' 'refusing to package a dirty checkout; commit the tested tree first' >&2
     exit 1
@@ -31,7 +31,17 @@ mkdir -p "$topdir"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
 archive="$topdir/SOURCES/voisu-${version}.tar.gz"
 git archive --format=tar.gz --prefix="voisu-${version}/" "$commit" > "$archive"
 tar -tzf "$archive" | grep -qx "voisu-${version}/Cargo.lock"
+tar -tzf "$archive" | grep -qx "voisu-${version}/LICENSE"
 tar -tzf "$archive" | grep -qx "voisu-${version}/packaging/voisu.service"
+
+vendor_dir="$topdir/vendor/voisu-vendor-${version}"
+mkdir -p "$topdir/vendor"
+cargo vendor --locked "$vendor_dir" >/dev/null
+vendor_archive="$topdir/SOURCES/voisu-vendor-${version}.tar.gz"
+tar -czf "$vendor_archive" -C "$topdir/vendor" "voisu-vendor-${version}"
+tar -tzf "$vendor_archive" > "$topdir/vendor-archive.list"
+grep -q "^voisu-vendor-${version}/" "$topdir/vendor-archive.list"
+
 cp packaging/voisu.spec "$topdir/SPECS/voisu.spec"
 
 rpmbuild -ba \

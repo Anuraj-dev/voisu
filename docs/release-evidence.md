@@ -12,9 +12,9 @@ credentials are required.
 |---|---|
 | Git commit | PENDING — record the full commit from `git rev-parse HEAD` |
 | RPM Release | PENDING — record `rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n'` |
-| Cargo lockfile | PROVEN by `packaging/build-rpm.sh` archive checks and `--locked` builds |
-| Standard suite | PROVEN by `cargo test --locked --workspace` and the spec `%check` |
-| Overlay check | PROVEN by `cargo check --locked -p voisu-app --features overlay` and the spec `%check` |
+| Cargo lockfile | PENDING — the source archive and vendored `Source1` have not been produced because `rpmbuild` is unavailable |
+| Standard suite | PENDING — the repository gate ran, but the exact RPM `%check` has not run because `rpmbuild` is unavailable |
+| Overlay check | PENDING — the repository gate ran, but the exact RPM overlay build/check has not run because `rpmbuild` is unavailable |
 
 ## Evidence categories
 
@@ -27,7 +27,7 @@ credentials are required.
 | Log redaction | `boundary_errors_separate_redacted_public_text_from_local_diagnostics`, `export_scrubs_secret_values_from_transcripts_and_reasons`, `capture_finalization_failure_is_redacted_and_the_next_recording_succeeds`, `non_loopback_plaintext_groq_endpoint_is_rejected_without_disclosing_secrets` | PENDING — inspect `journalctl --user -u voisu.service` and an export for API-key, authorization, token, and endpoint-userinfo absence |
 | Overlay isolation | `red_bounded_overlay_restarts_stop_without_a_daemon_control_path`, `next_recording_clears_terminal_feedback_and_is_not_lifecycle_coupled`, `missing_display_uses_a_persistent_journal_observer_instead_of_a_noop_notification`, `a_realized_surface_keeps_its_backend_and_only_genuine_absence_falls_back` | PENDING — install `voisu-overlay` only when wanted, verify Overlay exit/restart never changes daemon ownership or interrupts a Recording, and capture the selected backend/degradation |
 | Package contents and dependencies | `packaging/fedora-smoke.sh` checks RPM file ownership and dependency declarations; `packaging/voisu.spec` separates the GTK-free base from `voisu-overlay` | PENDING — run the smoke harness against the exact RPM and record `rpm -qpl`, `rpm -q --requires`, and `rpm -q --recommends` |
-| Upgrade and removal | `install_is_idempotent_atomic_and_free_of_stale_session_or_checkout_values`, `uninstall_disables_service_removes_installed_files_and_leaves_no_runtime_socket`, `packaged_uninstall_disables_only_the_service_and_preserves_packaged_unit_and_user_data` | PENDING — verify credentials, supported state, and diagnostics survive upgrade/removal; verify packaged binaries/unit disappear and the user unit is disabled |
+| Upgrade and removal | `install_is_idempotent_atomic_and_free_of_stale_session_or_checkout_values`, `uninstall_disables_service_removes_installed_files_and_leaves_no_runtime_socket`, `packaged_uninstall_disables_only_the_service_and_preserves_packaged_unit_and_user_data` | PENDING — as the desktop user run `voisu service uninstall` before `dnf remove`; then verify credentials, supported state, and diagnostics survive upgrade/removal, packaged binaries/unit disappear, and the user unit is disabled |
 
 ## Host run checklist
 
@@ -42,8 +42,9 @@ credentials are required.
       unavailable, or the optional `libei` capability is absent.
 - [ ] Upgrade removes any old XDG user-data daemon/unit ownership while
       preserving credentials, supported state, and diagnostics.
-- [ ] Removal disables the service and removes RPM artifacts while preserving
-      user data; an explicit purge is tested separately, if approved.
+- [ ] As the desktop user, `voisu service uninstall` runs before `dnf remove`;
+      removal then disables the service and removes RPM artifacts while
+      preserving user data; an explicit purge is tested separately, if approved.
 - [ ] `VOISU_FEDORA_LIVE_SMOKE=1 packaging/fedora-smoke.sh ...` passes.
 
 APT/DEB packaging is not part of this evidence sheet or the Fedora release

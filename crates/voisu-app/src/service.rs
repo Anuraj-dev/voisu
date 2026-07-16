@@ -19,6 +19,7 @@ const SERVICE_TRANSITION_DEADLINE: Duration = Duration::from_secs(3);
 const IPC_DEADLINE: Duration = Duration::from_millis(300);
 const MAX_SYSTEMCTL_OUTPUT: u64 = 16 * 1024;
 const PACKAGED_UNIT_DIRS: &[&str] = &["/usr/lib/systemd/user", "/etc/systemd/user"];
+const PACKAGED_DAEMON_PATH: &str = "/usr/bin/voisu-daemon";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +51,12 @@ struct ServicePaths {
     installed_daemon: PathBuf,
     unit: PathBuf,
     packaged_unit: Option<PathBuf>,
+    packaged_fallback: Option<String>,
+}
+
+struct PackagedUnitDetection {
+    path: Option<PathBuf>,
+    fallback_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,13 +97,24 @@ fn install() -> Result<UserServiceReport, String> {
     if systemd_is_active()? {
         systemctl_required(&["restart", UNIT_NAME])?;
         wait_for_managed_daemon()?;
-        return Ok(UserServiceReport::success(
+        return Ok(UserServiceReport::success(install_message(
+            &paths,
             "systemd user service updated, enabled, and restarted",
-        ));
+        )));
     }
-    Ok(UserServiceReport::success(
+    Ok(UserServiceReport::success(install_message(
+        &paths,
         "systemd user service installed and enabled",
-    ))
+    )))
+}
+
+fn install_message(paths: &ServicePaths, message: &str) -> String {
+    match &paths.packaged_fallback {
+        Some(reason) => format!(
+            "{message} via Ticket 09 user-data path; packaged unit was ignored: {reason}"
+        ),
+        None => message.to_owned(),
+    }
 }
 
 fn install_packaged(paths: &ServicePaths) -> Result<UserServiceReport, String> {
@@ -317,7 +335,7 @@ fn uninstall_packaged(paths: &ServicePaths) -> Result<UserServiceReport, String>
     systemctl_required(&["daemon-reload"])?;
     let _ = systemctl(&["reset-failed", UNIT_NAME])?;
     Ok(UserServiceReport::success(
-        "packaged systemd user service disabled; remove the RPM to remove packaged artifacts",
+        "packaged systemd user service disabled; run this before removing the RPM to remove packaged artifacts",
     ))
 }
 
@@ -330,15 +348,17 @@ fn service_paths() -> Result<ServicePaths, String> {
         .join("voisu-daemon");
     let data = xdg_home("XDG_DATA_HOME", ".local/share")?;
     let config = xdg_home("XDG_CONFIG_HOME", ".config")?;
+    let packaged = packaged_unit_path();
     Ok(ServicePaths {
         source_daemon,
         installed_daemon: data.join("voisu/bin/voisu-daemon"),
         unit: config.join("systemd/user/voisu.service"),
-        packaged_unit: packaged_unit_path(),
+        packaged_unit: packaged.path,
+        packaged_fallback: packaged.fallback_reason,
     })
 }
 
-fn packaged_unit_path() -> Option<PathBuf> {
+fn packaged_unit_path() -> PackagedUnitDetection {
     // Tests provide a private directory so the public CLI tests never inspect
     // or modify the host's systemd unit directories. Production uses Fedora's
     // system and administrator user-unit locations.
@@ -347,10 +367,67 @@ fn packaged_unit_path() -> Option<PathBuf> {
         .as_deref()
         .map(|directory| vec![PathBuf::from(directory)])
         .unwrap_or_else(|| PACKAGED_UNIT_DIRS.iter().map(PathBuf::from).collect());
-    directories.into_iter().map(|directory| directory.join(UNIT_NAME)).find(|path| {
-        fs::symlink_metadata(path)
-            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-    })
+    let mut fallback_reason = None;
+    for directory in directories {
+        let path = directory.join(UNIT_NAME);
+        let is_regular_file = fs::symlink_metadata(&path).is_ok_and(|metadata| {
+            metadata.is_file() && !metadata.file_type().is_symlink()
+        });
+        if !is_regular_file {
+            continue;
+        }
+        match validate_packaged_unit(&path) {
+            Ok(()) => {
+                return PackagedUnitDetection {
+                    path: Some(path),
+                    fallback_reason: None,
+                };
+            }
+            Err(reason) => {
+                fallback_reason.get_or_insert(reason);
+            }
+        }
+    }
+    PackagedUnitDetection {
+        path: None,
+        fallback_reason,
+    }
+}
+
+fn validate_packaged_unit(unit: &Path) -> Result<(), String> {
+    let daemon = packaged_daemon_path();
+    let metadata = fs::symlink_metadata(&daemon).map_err(|_| {
+        format!(
+            "packaged daemon binary {} is missing",
+            daemon.display()
+        )
+    })?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.mode() & 0o111 == 0
+    {
+        return Err(format!(
+            "packaged daemon binary {} is not a trusted executable",
+            daemon.display()
+        ));
+    }
+    let contents = fs::read_to_string(unit)
+        .map_err(|_| format!("cannot read packaged unit {}", unit.display()))?;
+    let expected = format!("ExecStart={} --systemd", daemon.display());
+    if !contents.lines().any(|line| line.trim() == expected) {
+        return Err(format!(
+            "packaged unit {} does not reference {}",
+            unit.display(),
+            daemon.display()
+        ));
+    }
+    Ok(())
+}
+
+fn packaged_daemon_path() -> PathBuf {
+    std::env::var_os("VOISU_PACKAGED_DAEMON_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(PACKAGED_DAEMON_PATH))
 }
 
 fn xdg_home(variable: &str, fallback: &str) -> Result<PathBuf, String> {

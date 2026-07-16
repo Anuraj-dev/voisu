@@ -2,8 +2,8 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-16
 
 ## 🚧 In progress / next
-- Ticket 13 implementation is complete on `ticket-13-fedora-package`; next is the orchestrator's Fedora host run
-  of the exact RPM artifact and the live checks listed in `docs/release-evidence.md`.
+- Ticket 13 round-1 review fixes are complete on `ticket-13-fedora-package`; next is the orchestrator's Fedora host
+  run of the exact RPM artifact and the live checks listed in `docs/release-evidence.md`.
 - `rpmbuild` is unavailable in this managed sandbox, so the RPM build script/spec are headlessly reviewed and the
   actual package, install, upgrade, removal, portal, Recording, Delivery, and clipboard checks remain PENDING.
 
@@ -17,7 +17,8 @@
   reports a Quality Failure. Only the final Transcript reaches Delivery.
 - Ticket 09 installs a graphical-session-owned daemon service with atomic binaries and a three-starts-per-30-seconds
   failure bound; packaged `/usr/lib/systemd/user/voisu.service` is preferred over and migrates away old XDG
-  user-data ownership; daemon lifecycle remains independent from the optional Overlay.
+  user-data ownership only after validating `/usr/bin/voisu-daemon` and the unit's `ExecStart`; invalid packaged
+  metadata clearly falls back to the Ticket 09 user-data path; daemon lifecycle remains independent from the optional Overlay.
 - Ticket 12 keeps the Overlay observer-only: a pure, headless selection layer chooses runtime-advertised Layer Shell,
   an unfocusable regular GTK surface, desktop notification, or a persistent journal observer when no display exists.
   Structured Overlay logs and `voisu-overlay --report-backend` expose `backend` plus `degradation`; normal `voisu
@@ -27,9 +28,10 @@
 - Ticket 12 round-2 review fixes are in: the Overlay's surface probe is now honest local GTK realization (no unsound
   compositor-map timer, no false fallback on a healthy compositor), and the capsule stays hidden at Idle with no startup
   flash while status polling starts immediately.
-- Current gates: `cargo test --workspace` — 201 passed, 2 ignored, 0 failed;
+- Current gates: `cargo test --workspace` — 202 passed, 2 ignored, 0 failed;
   `cargo check -p voisu-app --features overlay`, `cargo build --workspace`, `bash -n` for packaging scripts, and
-  `git diff --check` are clean. RPM/live Fedora evidence is pending the host.
+  `git diff --check` are clean. Offline vendor/archive construction passed; `rpmbuild` and RPM/live Fedora
+  evidence are pending the host.
 
 ## Architecture map
 - Domain, IPC, lifecycle/Delivery evidence, provider coordination, decision pipeline -> `crates/voisu-core/src/lib.rs`
@@ -57,8 +59,10 @@
 - Overlay presentation is observer-only and may disappear; Layer Shell is a runtime compositor capability, with
   separate regular-surface/notification feedback and a bounded Overlay-only supervisor.
 - Every spawned external process receives a guarded Linux parent-death signal.
-- The Fedora release uses one GTK-free base RPM plus an optional Overlay subpackage; `Cargo.lock` and the exact git
-  commit bind the tested source to the RPM metadata.
+- The Fedora release uses one GTK-free base RPM plus an optional Overlay subpackage; `Cargo.lock`, an exact-commit
+  vendor archive, and `--offline` bind the tested source to a reproducible RPM build.
+- RPM removal follows desktop-user `voisu service uninstall` before `dnf remove`, because per-user systemd
+  scriptlets cannot reliably clear a running unit or enablement under `~/.config`.
 
 ## Gotchas
 - Use `CONTEXT.md` terms exactly; several ordinary synonyms are banned.

@@ -17,6 +17,7 @@ struct ServiceFixture {
     systemctl_log: PathBuf,
     systemctl_state: PathBuf,
     packaged_unit_dir: PathBuf,
+    packaged_daemon: PathBuf,
 }
 
 impl ServiceFixture {
@@ -41,6 +42,7 @@ impl ServiceFixture {
         let systemctl_log = root.path().join("systemctl.log");
         let systemctl_state = root.path().join("systemctl.state");
         let packaged_unit_dir = root.path().join("usr/lib/systemd/user");
+        let packaged_daemon = root.path().join("usr/bin/voisu-daemon");
         fs::create_dir_all(&packaged_unit_dir).unwrap();
         write_systemctl(&fake_bin.join("systemctl"));
 
@@ -54,6 +56,7 @@ impl ServiceFixture {
             systemctl_log,
             systemctl_state,
             packaged_unit_dir,
+            packaged_daemon,
         }
     }
 
@@ -69,6 +72,7 @@ impl ServiceFixture {
             .env("FAKE_SYSTEMCTL_LOG", &self.systemctl_log)
             .env("FAKE_SYSTEMCTL_STATE", &self.systemctl_state)
             .env("VOISU_PACKAGED_UNIT_DIR", &self.packaged_unit_dir)
+            .env("VOISU_PACKAGED_DAEMON_PATH", &self.packaged_daemon)
             .env("VOISU_DISABLE_SHORTCUTS", "1")
             .env("VOISU_DISABLE_DIRECT_DELIVERY", "1")
             .env("VOISU_TEST_MODE", "controlled");
@@ -88,9 +92,26 @@ impl ServiceFixture {
     }
 
     fn install_packaged_unit(&self) {
+        fs::create_dir_all(self.packaged_daemon.parent().unwrap()).unwrap();
+        fs::copy(&self.source_daemon, &self.packaged_daemon).unwrap();
+        fs::set_permissions(&self.packaged_daemon, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(
             self.packaged_unit_dir.join("voisu.service"),
-            "[Unit]\nDescription=Packaged Voisu dictation daemon\n\n[Service]\nExecStart=/usr/bin/voisu-daemon --systemd\n",
+            format!(
+                "[Unit]\nDescription=Packaged Voisu dictation daemon\n\n[Service]\nExecStart={} --systemd\n",
+                self.packaged_daemon.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn install_packaged_unit_without_daemon(&self) {
+        fs::write(
+            self.packaged_unit_dir.join("voisu.service"),
+            format!(
+                "[Unit]\nDescription=Packaged Voisu dictation daemon\n\n[Service]\nExecStart={} --systemd\n",
+                self.packaged_daemon.display()
+            ),
         )
         .unwrap();
     }
@@ -290,6 +311,22 @@ fn packaged_install_migrates_a_stale_user_service_without_shadowing_the_package(
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
     assert!(calls.contains("--user daemon-reload"));
     assert!(calls.contains("--user enable voisu.service"));
+}
+
+#[test]
+fn packaged_unit_without_daemon_binary_falls_back_to_ticket_09_user_data_service() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    fixture.install_packaged_unit_without_daemon();
+
+    let installed = fixture.run(&["service", "install"]);
+
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    assert!(
+        stdout(&installed).contains("packaged unit was ignored")
+            && stdout(&installed).contains("Ticket 09 user-data path")
+    );
+    assert!(fixture.unit_path().exists());
+    assert!(fixture.installed_daemon().exists());
 }
 
 #[test]

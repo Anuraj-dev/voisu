@@ -8,7 +8,8 @@ GTK4 plus GTK4 Layer Shell runtime dependencies.
 The base package declares only the boundaries used by the application:
 
 - `wl-clipboard` for `wl-copy` and `wl-paste`;
-- `pipewire-utils` for the spawned `pw-record` and `wpctl` tools;
+- `pipewire-utils` for the spawned `pw-record` tool;
+- `wireplumber` for the spawned `wpctl` tool;
 - `curl` for cloud provider requests;
 - `libsecret` for the `secret-tool` credential boundary;
 - an optional `libei` Recommends entry because Voisu loads `libei.so.1` at
@@ -32,10 +33,18 @@ VOISU_COMMIT=$(git rev-parse HEAD) packaging/build-rpm.sh
 
 `packaging/build-rpm.sh` runs the standard workspace suite, release workspace
 build, and opt-in Overlay check before creating a Cargo.lock-pinned source
-archive with `git archive`. `rpmbuild` then repeats the standard suite in the
-archive's `%check` section. The full commit is included in the RPM Release as
-`1.git<commit>`, so the package cannot be mistaken for an artifact from a
-different tested tree. No Debian or APT artifacts are produced.
+archive with `git archive`. It also runs `cargo vendor --locked` from that
+exact commit and creates `voisu-vendor-<version>.tar.gz` as `Source1`. During
+`%prep`, the RPM unpacks that archive and writes `.cargo/config.toml` with a
+`[source.crates-io] replace-with = "vendored-sources"` source. `%build` and
+`%check` use `--offline`, so a clean mock build cannot fetch crates from
+crates.io. The Cargo.lock plus vendor archive generated from the exact commit
+is the reproducibility mechanism.
+
+`rpmbuild` then repeats the standard suite in the archive's `%check` section.
+The full commit is included in the RPM Release as `1.git<commit>`, so the
+package cannot be mistaken for an artifact from a different tested tree. No
+Debian or APT artifacts are produced.
 
 The base and Overlay RPMs are written to `dist/rpm/`. Inspect them before
 installation:
@@ -91,17 +100,22 @@ The migration never removes Secret Service credentials, supported user state,
 or diagnostics. The packaged daemon path remains `/usr/bin/voisu-daemon`; no
 checkout or XDG user-data executable is allowed to keep owning the unit.
 
-Removal disables the packaged user unit through the RPM systemd user scriptlets
-and removes packaged binaries and the packaged unit. User data is preserved:
+Removal must first disable the packaged user unit as the desktop user. The
+user-owned command is required before `dnf remove`: `%systemd_user_preun` cannot
+reliably stop a running per-user unit or remove per-user enablement under
+`~/.config`. The RPM removal then removes packaged binaries and the packaged
+unit. User data is preserved:
 
 ```sh
+voisu service uninstall
 sudo dnf remove voisu voisu-overlay
 systemctl --user daemon-reload
 ```
 
-`voisu service uninstall` is safe before package removal: it disables the
-packaged service and removes only a stale Ticket 09 shadow. It does not remove
-RPM-owned files. An explicit purge is a separate, destructive user action:
+`voisu service uninstall` reports that it must run before removing the RPM. It
+disables the packaged service and removes only a stale Ticket 09 shadow. It does
+not remove RPM-owned files. An explicit purge is a separate, destructive user
+action:
 remove the Voisu state/configuration directories under `XDG_STATE_HOME`,
 `XDG_CONFIG_HOME`, and `XDG_DATA_HOME`, then clear the `voisu-provider` Secret
 Service entries for `groq` and `deepgram` with the user's keyring tool.

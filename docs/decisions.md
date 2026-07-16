@@ -213,3 +213,14 @@ daemon to recover presentation was rejected because it could interrupt a Recordi
 
 ## 2026-07-16 — Overlay surface creation is local realization, not a compositor map probe (round-2)
 **Why:** Round-1 declared surface success only after a bounded GTK `map` signal following `present()`. That probe was unsound: `GtkWidget::map` reflects GTK's local widget lifecycle, not compositor acceptance, so the flag turned true even when the Wayland surface later failed, and a locally delayed map beyond the 500 ms grace produced a false, permanent desktop-notification fallback on a perfectly healthy compositor. The Overlay now treats successful GTK realization (`window.surface().is_some()` on the first real show) as surface creation, and falls back to a desktop notification only when GTK realizes without a surface — the sole in-process-detectable surface failure. A compositor that *rejects* the surface (e.g. a Layer Shell protocol error) instead raises a Wayland protocol error that terminates the process; the bounded `voisu-overlay --supervise` policy, not a false in-process timer, converts that into explicit degraded behavior. A false fallback on a healthy compositor is therefore impossible. This chooses acceptable direction (a): drop the pretense of compositor confirmation and keep an honest, testable story. The window also stays hidden at Idle — no startup `present()` and no styled empty-capsule flash — and becomes visible only when a visible phase arrives, while status polling starts immediately so an early Recording is never missed. Reintroducing a map/timeout probe was rejected as dishonest; a startup `present()` was rejected as a DESIGN.md 'hidden at Idle' violation.
+## 2026-07-16 — Make the Fedora RPM build offline with an exact-commit vendor archive
+**Why:** A Cargo.lock alone does not make a clean mock build reproducible when crates are not present in the build
+root. `packaging/build-rpm.sh` therefore creates `Source1` with `cargo vendor --locked` from the same clean commit,
+and the spec writes a Cargo source replacement before every offline build/check. Fetching crates during `%build` or
+`%check` was rejected because it would make the tested artifact depend on network state.
+
+## 2026-07-16 — Validate packaged service ownership before migrating Ticket 09 data
+**Why:** A regular packaged unit file without `/usr/bin/voisu-daemon` could make `voisu service install` report
+success for a service that cannot start. Detection now validates the executable and exact `ExecStart`, then clearly
+falls back to the Ticket 09 user-data path. RPM removal also requires the desktop user's uninstall command first,
+because systemd user scriptlets cannot reliably clear live per-user ownership and enablement.
