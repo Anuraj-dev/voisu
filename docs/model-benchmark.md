@@ -118,3 +118,14 @@ and RPM binding semantics — the same class medium-Luna missed on Wayland in ti
 5. Keep the **driver** on gates that need the real desktop/host (screenshots, rpmbuild, live smoke) —
    both real-hardware defects of this project (opaque capsule window, SIGPIPE-141) were invisible to
    every sandboxed agent.
+
+### Post-merge addendum (2026-07-17, live smoke day)
+
+The first live desktop smoke runs after the ticket 13 merge surfaced **four** more defects no sandboxed
+agent could have seen, all diagnosed and fixed by the driver on the real machine (RED→GREEN, full gate
+3x): the smoke harness parsed rpm's "not installed" notice as a NEVRA; `wl-copy`'s clipboard-serving
+child was misread as a deadline timeout (broke doctor and Delivery); real `pw-record` exits 1 silently
+on SIGINT so every live graceful stop failed (the fakes had modeled `exit 0` — reality disagreed); and
+the stored provider credentials turned out to be placeholders, caught only by `auth verify` against the
+real APIs. This quadruples the evidence for recommendation 5: the sandbox proves contracts, only the
+host proves the tools.

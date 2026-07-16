@@ -224,3 +224,12 @@ and the spec writes a Cargo source replacement before every offline build/check.
 success for a service that cannot start. Detection now validates the executable and exact `ExecStart`, then clearly
 falls back to the Ticket 09 user-data path. RPM removal also requires the desktop user's uninstall command first,
 because systemd user scriptlets cannot reliably clear live per-user ownership and enablement.
+
+## 2026-07-17 — Model external tools by their real behavior, not their documented contract
+**Why:** The live desktop smoke disproved two assumptions the whole test suite had encoded: `wl-copy` forks a
+clipboard-serving child that inherits the parent's pipes (so capturing its output reads the healthy case as a
+timeout — its output is now discarded and only the parent's exit status is trusted), and `pw-record` catches SIGINT
+and exits 1 silently instead of dying by the signal (so a nonzero exit is accepted only when the child was alive at
+the interrupt and stderr is empty; a capture already dead before stop still fails and never delivers). The
+alternative — keeping strict status contracts and wrapping the tools — was rejected because the tools' real shapes
+ARE the boundary contract; realistic test fakes now encode them.

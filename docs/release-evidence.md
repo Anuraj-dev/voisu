@@ -10,17 +10,22 @@ credentials are required.
 
 | Item | Evidence |
 |---|---|
-| Git commit | PENDING final release run — record the full commit from `git rev-parse HEAD`; the build pipeline itself is PROVEN (see below) |
-| RPM Release | PENDING final release run — record `rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n'`; a host build at `674b93e` produced `voisu-0.1.0-1.git674b93e….fc43.x86_64` |
+| Git commit | PROVEN — `73f57274734cdcbd188b407e277e291546b0f80e` (main; includes the two live-desktop fixes below) |
+| RPM Release | PROVEN — `voisu-0.1.0-1.git73f57274734cdcbd188b407e277e291546b0f80e.fc43.x86_64` |
+| Live desktop smoke | PROVEN 2026-07-17 — `VOISU_FEDORA_LIVE_SMOKE=1 packaging/fedora-smoke.sh` passed on Fedora KDE Wayland: all six doctor capabilities PASS, a real 8-second Recording reached the cloud providers with real credentials, and the Transcript was submitted through the compositor and preserved on the clipboard; cleanup restored the pre-smoke state |
 | Cargo lockfile | PROVEN — `packaging/build-rpm.sh` produced the exact-commit source archive and deterministic vendored `Source1` on the Fedora host; the offline `--locked` build consumed them |
 | Standard suite | PROVEN — the exact RPM `%check` ran the full release test suite inside `rpmbuild` on the Fedora host with 0 failures |
 | Overlay check | PROVEN — the exact RPM overlay release build and `cargo check --features overlay` ran inside `rpmbuild` on the Fedora host |
 | rpmlint | PROVEN — 0 substantive findings after polish; remaining warnings are cosmetic (no man pages, changelog carries the static base version while Release embeds the commit) |
 
-The host `rpmbuild` gate first ran at commit `674b93e` (artifacts in `dist/rpm/`:
-base, overlay, debuginfo RPMs and the SRPM). The final release artifact is
-rebuilt at the merged commit and its NEVRA recorded above at that time. The live
-desktop rows below remain host work.
+The host `rpmbuild` gate first ran at commit `674b93e`; the final release
+artifacts (base, overlay, debuginfo RPMs and the SRPM in `dist/rpm/`) were
+rebuilt at `73f5727`. The first live smoke attempts surfaced two real
+desktop-only defects, both fixed and covered by tests before the passing run:
+`wl-copy`'s clipboard-serving child was misread as a timeout (`f876425`), and
+real `pw-record`'s silent nonzero exit on SIGINT failed every graceful stop
+(`73f5727`). Categories below not exercised by the live smoke (portal
+revocation, upgrade paths, explicit fallback scenarios) remain PENDING.
 
 ## Evidence categories
 
@@ -37,13 +42,17 @@ desktop rows below remain host work.
 
 ## Host run checklist
 
-- [ ] Fresh RPM install has only the declared runtime dependencies and both
-      base binaries at `/usr/bin`.
-- [ ] `voisu doctor`, both credential setup commands, and both auth checks pass.
-- [ ] `voisu service install`, login start, `voisu service status`, and the
-      packaged `ExecStart` point at `/usr/bin/voisu-daemon`.
-- [ ] A real Recording reaches both cloud providers and direct Delivery is
-      observed in the focused application.
+- [x] Fresh RPM install has only the declared runtime dependencies and both
+      base binaries at `/usr/bin` (smoke harness, 2026-07-17).
+- [x] `voisu doctor`, both credential setup commands, and both auth checks pass
+      (all six doctor capabilities PASS; `auth set`/`auth verify` succeeded for
+      groq and deepgram against the real APIs, 2026-07-17).
+- [x] `voisu service install`, `voisu service status`, and the packaged
+      `ExecStart` point at `/usr/bin/voisu-daemon` (smoke harness; login start
+      remains to be observed across a real login).
+- [x] A real Recording reaches the cloud providers and direct Delivery is
+      observed in the focused application (Transcript submitted through the
+      compositor and preserved on the clipboard, 2026-07-17).
 - [ ] Clipboard preservation remains available when direct Delivery is denied,
       unavailable, or the optional `libei` capability is absent.
 - [ ] Upgrade removes any old XDG user-data daemon/unit ownership while
@@ -51,7 +60,9 @@ desktop rows below remain host work.
 - [ ] As the desktop user, `voisu service uninstall` runs before `dnf remove`;
       removal then disables the service and removes RPM artifacts while
       preserving user data; an explicit purge is tested separately, if approved.
-- [ ] `VOISU_FEDORA_LIVE_SMOKE=1 packaging/fedora-smoke.sh ...` passes.
+- [x] `VOISU_FEDORA_LIVE_SMOKE=1 packaging/fedora-smoke.sh ...` passes
+      (2026-07-17, against the exact `73f5727` RPM; cleanup restored the
+      pre-smoke state).
 
 APT/DEB packaging is not part of this evidence sheet or the Fedora release
 candidate.
