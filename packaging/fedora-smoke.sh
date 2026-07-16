@@ -44,9 +44,10 @@ rpm -qip "$rpm_path" >/dev/null
 artifact_name=$(rpm -qp --qf '%{NAME}' "$rpm_path")
 test "$artifact_name" = voisu
 expected_nevra=$(rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' "$rpm_path")
-installed_nevra=$(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' voisu 2>/dev/null || true)
+# `rpm -q` prints "package voisu is not installed" to STDOUT when absent, so
+# the query result is only meaningful when the query itself succeeds.
 installed_before=0
-if test -n "$installed_nevra"; then
+if installed_nevra=$(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' voisu 2>/dev/null); then
     installed_before=1
     if test "$installed_nevra" != "$expected_nevra"; then
         printf 'refusing to clobber installed Voisu %s with %s\n' "$installed_nevra" "$expected_nevra" >&2
@@ -163,8 +164,7 @@ cleanup() {
             /usr/bin/voisu service uninstall >/dev/null 2>&1 \
                 || printf 'cleanup: voisu service uninstall failed\n' >&2
         fi
-        current_nevra=$(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' voisu 2>/dev/null || true)
-        if test -n "$current_nevra"; then
+        if rpm -q voisu >/dev/null 2>&1; then
             "${dnf_cmd[@]}" remove -y voisu >/dev/null 2>&1 || true
         fi
         # Judged on the end state: the smoke-installed RPM must be gone, the
