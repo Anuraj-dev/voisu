@@ -158,9 +158,13 @@ so this stops the smoke from silently exercising the wrong artifact. It snapshot
 the user-service state that `voisu service install` mutates (enablement including
 enabled-runtime, active state, and any Ticket 09 XDG shadow it migrates away) and
 restores it in a cleanup trap that runs on success and on failure. Restoration is
-verified rather than best-effort: any failed step is printed and forces a
-non-zero exit even when the smoke otherwise passed, and enablement states that
-cannot be faithfully reproduced are reported instead of silently downgraded.
+judged on the end state rather than on individual step exit codes: after
+restoring, the harness compares systemd's reported enablement and active state
+against the pre-smoke snapshot (and, for a fresh install, verifies the
+smoke-installed RPM is removed and the unit is not left enabled); any mismatch is
+printed and forces a non-zero exit even when the smoke otherwise passed, and
+enablement states that cannot be faithfully reproduced are reported instead of
+silently downgraded.
 RPM-owned files are never modified. The opt-in invocation additionally runs readiness, starts the packaged
 user service, performs a real three-second Recording, stops it, and verifies that
 a Transcript is available through `wl-paste`. The orchestrator must complete the

@@ -127,6 +127,12 @@ impl ServiceFixture {
         self.set_show_state("loadstate", load_state);
     }
 
+    /// Append extra argv[] arguments to the rendered `systemctl show` ExecStart
+    /// blocks (e.g. `--config-path=/tmp`), without changing the command binary.
+    fn override_effective_argv_extra(&self, extra: &str) {
+        self.set_show_state("argv_extra", extra);
+    }
+
     fn install_packaged_unit(&self) {
         fs::create_dir_all(self.packaged_daemon.parent().unwrap()).unwrap();
         fs::copy(&self.source_daemon, &self.packaged_daemon).unwrap();
@@ -205,10 +211,12 @@ case "$command" in
     if test -z "$execs"; then
       execs=$(sed -n 's/^ExecStart=\(.*\) --systemd$/\1/p' "$unit_file" | head -1)
     fi
+    argv_extra=$(sed -n 's/^argv_extra=//p' "$state" 2>/dev/null || true)
     old_ifs=$IFS
     IFS='|'
     for e in $execs; do
-      printf 'ExecStart={ path=%s ; argv[]=%s --systemd ; ignore_errors=no }\n' "$e" "$e"
+      printf 'ExecStart={ path=%s ; argv[]=%s --systemd%s ; ignore_errors=no }\n' \
+        "$e" "$e" "${argv_extra:+ $argv_extra}"
     done
     IFS=$old_ifs
     exit 0
@@ -508,6 +516,129 @@ fn packaged_unit_with_a_missing_later_execstart_command_falls_back_to_ticket_09(
     );
     assert!(fixture.unit_path().exists());
     assert!(fixture.installed_daemon().exists());
+}
+
+#[test]
+fn show_argv_arguments_containing_path_do_not_reject_a_valid_packaged_unit() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    // The effective packaged unit is valid; its rendered argv merely contains a
+    // `path=`-like argument. Only the `path=` field opening each rendered block
+    // is a command binary — an argument must never be validated as one, so the
+    // packaged unit is selected.
+    fixture.install_packaged_unit();
+    fixture.override_effective_argv_extra("--config-path=/tmp");
+
+    let installed = fixture.run(&["service", "install"]);
+
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    assert!(
+        stdout(&installed).contains("packaged systemd user service selected"),
+        "{}",
+        stdout(&installed)
+    );
+}
+
+#[test]
+fn a_packaged_execstart_prefix_separated_from_its_executable_is_not_trusted() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    // A Ticket 09 install first, so the packaged unit file is read on disk (the
+    // XDG unit stays effective). `ExecStart=- /path` is invalid systemd syntax —
+    // an execute prefix must be attached to its executable — so the parser must
+    // refuse to trust the unit rather than guess, and install stays on Ticket 09.
+    assert!(fixture.run(&["service", "install"]).status.success());
+    fixture.install_packaged_unit();
+    fs::write(
+        fixture.packaged_unit_file(),
+        format!(
+            "[Service]\nExecStart=- {} --systemd\n",
+            fixture.packaged_daemon.display()
+        ),
+    )
+    .unwrap();
+
+    let installed = fixture.run(&["service", "install"]);
+
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    assert!(
+        stdout(&installed).contains("packaged unit was ignored")
+            && stdout(&installed).contains("separated from its executable"),
+        "{}",
+        stdout(&installed)
+    );
+    assert!(fixture.unit_path().exists());
+    assert!(fixture.installed_daemon().exists());
+}
+
+#[test]
+fn an_execstart_reset_in_the_packaged_unit_clears_earlier_commands() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    // systemd's empty-assignment reset semantics: commands before `ExecStart=`
+    // are cleared, so only the final command must validate and the stale XDG
+    // shadow migrates to the packaged unit.
+    assert!(fixture.run(&["service", "install"]).status.success());
+    fixture.install_packaged_unit();
+    fs::write(
+        fixture.packaged_unit_file(),
+        format!(
+            "[Service]\nExecStart=/nonexistent-first --systemd\nExecStart=\nExecStart={} --systemd\n",
+            fixture.packaged_daemon.display()
+        ),
+    )
+    .unwrap();
+
+    let installed = fixture.run(&["service", "install"]);
+
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    assert!(
+        stdout(&installed).contains("packaged systemd user service selected"),
+        "{}",
+        stdout(&installed)
+    );
+    assert!(!fixture.unit_path().exists(), "user unit must not shadow the package");
+}
+
+#[test]
+fn quoted_or_continued_packaged_execstart_syntax_is_never_guessed_at() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    // Unit-file syntax the conservative parser does not faithfully support —
+    // quoted executables and line continuations — must surface a specific
+    // refusal reason instead of a guessed binary, keeping install on Ticket 09.
+    assert!(fixture.run(&["service", "install"]).status.success());
+    fixture.install_packaged_unit();
+    fs::write(
+        fixture.packaged_unit_file(),
+        format!(
+            "[Service]\nExecStart=\"{}\" --systemd\n",
+            fixture.packaged_daemon.display()
+        ),
+    )
+    .unwrap();
+
+    let quoted = fixture.run(&["service", "install"]);
+    assert!(quoted.status.success(), "{}", stderr(&quoted));
+    assert!(
+        stdout(&quoted).contains("quoted ExecStart executables"),
+        "{}",
+        stdout(&quoted)
+    );
+
+    fs::write(
+        fixture.packaged_unit_file(),
+        format!(
+            "[Service]\nExecStart={} \\\n  --systemd\n",
+            fixture.packaged_daemon.display()
+        ),
+    )
+    .unwrap();
+
+    let continued = fixture.run(&["service", "install"]);
+    assert!(continued.status.success(), "{}", stderr(&continued));
+    assert!(
+        stdout(&continued).contains("line continuations"),
+        "{}",
+        stdout(&continued)
+    );
+    assert!(fixture.unit_path().exists());
 }
 
 #[test]

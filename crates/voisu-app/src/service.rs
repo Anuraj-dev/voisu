@@ -374,6 +374,9 @@ enum EffectiveLookup {
         fragment: PathBuf,
         load_state: String,
     },
+    /// A packaged unit file exists on disk but its ExecStart could not be
+    /// faithfully read; migration must never trust a unit it cannot parse.
+    Unparseable { fragment: PathBuf, reason: String },
     /// There is no packaged unit to consider.
     NoPackagedUnit,
 }
@@ -402,6 +405,13 @@ fn packaged_unit_path() -> PackagedUnitDetection {
             path: None,
             fallback_reason: Some(format!(
                 "packaged unit {} is not cleanly loaded (LoadState={load_state})",
+                fragment.display()
+            )),
+        },
+        EffectiveLookup::Unparseable { fragment, reason } => PackagedUnitDetection {
+            path: None,
+            fallback_reason: Some(format!(
+                "packaged unit {} was not trusted: {reason}",
                 fragment.display()
             )),
         },
@@ -467,7 +477,8 @@ fn effective_packaged_unit() -> EffectiveLookup {
     // from the unit file (the best available signal when systemd is not showing
     // it).
     match disk_packaged_unit() {
-        Some((fragment, execs)) => EffectiveLookup::Packaged { fragment, execs },
+        Some((fragment, Ok(execs))) => EffectiveLookup::Packaged { fragment, execs },
+        Some((fragment, Err(reason))) => EffectiveLookup::Unparseable { fragment, reason },
         None => EffectiveLookup::NoPackagedUnit,
     }
 }
@@ -489,13 +500,15 @@ fn validate_packaged_execs(fragment: &Path, execs: &[PathBuf]) -> Result<(), Str
 
 fn parse_show_execstart_binaries(lines: &[String]) -> Vec<PathBuf> {
     // systemd renders one `ExecStart=` line per command as
-    // `{ path=/bin/x ; argv[]=/bin/x --f ; ... }`. Collect the `path=` token of
-    // every command, tolerating multiple `{ … }` blocks concatenated on a line.
+    // `{ path=/bin/x ; argv[]=/bin/x --f ; ... }`. The command binary is the
+    // `path=` field opening each `{ … }` block; a `path=` substring inside an
+    // argv[] argument (e.g. `--config-path=/tmp`) must never match, so only
+    // block-opening `{ path=` occurrences are collected.
     let mut binaries = Vec::new();
     for line in lines {
         let mut rest = line.as_str();
-        while let Some(index) = rest.find("path=") {
-            let after = &rest[index + "path=".len()..];
+        while let Some(index) = rest.find("{ path=") {
+            let after = &rest[index + "{ path=".len()..];
             let end = after.find(" ;").unwrap_or(after.len());
             let path = after[..end].trim();
             if !path.is_empty() {
@@ -507,25 +520,52 @@ fn parse_show_execstart_binaries(lines: &[String]) -> Vec<PathBuf> {
     binaries
 }
 
-fn parse_unit_file_execstart_binaries(contents: &str) -> Vec<PathBuf> {
-    // A packaged unit file renders `ExecStart=<binary> <args>`, optionally with
-    // a leading special prefix (`-`, `@`, `+`, `!`, `:`). The command binary is
-    // the first whitespace-separated token after any prefix.
-    contents
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("ExecStart="))
-        .filter_map(|value| {
-            let value = value.trim_start_matches(['-', '@', '+', '!', ':']);
-            value
-                .split_whitespace()
-                .next()
-                .filter(|binary| !binary.is_empty())
-                .map(PathBuf::from)
-        })
-        .collect()
+fn parse_unit_file_execstart_binaries(contents: &str) -> Result<Vec<PathBuf>, String> {
+    // Conservative unit-file reading for the shadowed-migration decision only:
+    // accept exactly the syntax Voisu ships — an absolute, unquoted executable,
+    // optionally with execute prefixes (`@-:+!`) attached directly to it — and
+    // honor systemd's empty-assignment reset. Everything else (quoting, line
+    // continuations, a prefix separated from its executable, relative paths) is
+    // rejected with a reason so migration never trusts a unit this parser
+    // cannot faithfully read; the install then stays on the Ticket 09 path.
+    if contents.lines().any(|line| line.trim_end().ends_with('\\')) {
+        return Err("unit file uses line continuations".to_owned());
+    }
+    let mut binaries = Vec::new();
+    for line in contents.lines() {
+        let Some(value) = line.trim().strip_prefix("ExecStart=") else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            // systemd reset semantics: an empty assignment clears the list.
+            binaries.clear();
+            continue;
+        }
+        let token = value
+            .split_whitespace()
+            .next()
+            .expect("non-empty value has a first token");
+        let executable = token.trim_start_matches(['@', '-', ':', '+', '!']);
+        if executable.is_empty() {
+            return Err(format!(
+                "ExecStart prefix \"{token}\" is separated from its executable"
+            ));
+        }
+        if value.starts_with(['"', '\'']) || executable.contains(['"', '\'']) {
+            return Err("quoted ExecStart executables are not supported".to_owned());
+        }
+        if !executable.starts_with('/') {
+            return Err(format!(
+                "ExecStart executable \"{executable}\" is not an absolute path"
+            ));
+        }
+        binaries.push(PathBuf::from(executable));
+    }
+    Ok(binaries)
 }
 
-fn disk_packaged_unit() -> Option<(PathBuf, Vec<PathBuf>)> {
+fn disk_packaged_unit() -> Option<(PathBuf, Result<Vec<PathBuf>, String>)> {
     // Search the packaged directories in systemd precedence order (/etc before
     // /usr/lib) for a regular unit file, and parse its ExecStart commands.
     for directory in packaged_unit_dirs() {
@@ -536,8 +576,8 @@ fn disk_packaged_unit() -> Option<(PathBuf, Vec<PathBuf>)> {
             continue;
         }
         let execs = fs::read_to_string(&path)
-            .map(|contents| parse_unit_file_execstart_binaries(&contents))
-            .unwrap_or_default();
+            .map_err(|error| format!("unit file is unreadable ({error})"))
+            .and_then(|contents| parse_unit_file_execstart_binaries(&contents));
         return Some((path, execs));
     }
     None

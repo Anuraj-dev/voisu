@@ -13,14 +13,26 @@
   forces non-zero exit even on an otherwise-passing smoke; enabled-runtime handled; unrestorable states reported).
   The vendor `Source1` self-test now runs an INDEPENDENT `cargo vendor` of the same commit and compares byte-for-byte
   (proving cargo-vendor stability, not just tar determinism), with `--mode` normalization against umask drift. Both
-  packaging scripts capture `rpm`/`tar` output before grepping to avoid SIGPIPE-141 under pipefail. Next: Sol MEDIUM
-  round-4 re-review.
-- After APPROVE: add Ticket 13 rows to `docs/model-benchmark.md` (Luna high impl `a6b7934` ~296k tokens; Luna xhigh
-  fix `a4e978e` ~301k tokens; Opus escalation; Sol high + medium reviews), open the PR, exact-head CI, squash-merge,
-  close issue #13.
-- Blocked on Raja: `sudo dnf install -y rpm-build rpmlint systemd-rpm-macros`, then `packaging/build-rpm.sh` on the
-  host plus the live `packaging/fedora-smoke.sh` checks in `docs/release-evidence.md`; ticket host checkboxes stay
-  unchecked until then.
+  packaging scripts capture `rpm`/`tar` output before grepping to avoid SIGPIPE-141 under pipefail.
+- Sol round-4 findings (1 HIGH + 2 MEDIUM) are fixed by the driver: the on-disk unit-file ExecStart parser is strict
+  and conservative — absolute unquoted executables with attached `@-:+!` prefixes and empty-assignment reset only;
+  quoting, line continuations, and prefixes separated from their executable are refused with an explicit reason
+  instead of guessed at (install then stays on the Ticket 09 path). The `systemctl show` parser only matches
+  block-opening `{ path=`, so argv arguments like `--config-path=/tmp` are never validated as command binaries. The
+  smoke's restoration is judged on END STATE: post-restore enablement/active is compared to the snapshot, and the
+  fresh-install cleanup verifies the RPM is gone and the unit not left enabled — any mismatch forces a non-zero exit.
+  Four new tests, all RED-proven against the round-3 parsers. Next: Sol MEDIUM round-5 re-review.
+- Host RPM build gate PASSED (rpm-build/rpmlint/systemd-rpm-macros installed): `packaging/build-rpm.sh` at `674b93e`
+  produced base + overlay + debuginfo RPMs and the SRPM in `dist/rpm/` with the offline vendored build and the full
+  `%check` release suite green; the first host run caught the real SIGPIPE defect fixed in `674b93e`. `rpmlint`: 2
+  minor errors (explicit-lib-dependency libsecret → polish to `/usr/bin/secret-tool`; cosmetic changelog version) and
+  6 cosmetic warnings.
+- After APPROVE: rpmlint spec polish, refresh `docs/release-evidence.md` (rpmbuild/%check rows PROVEN; live rows
+  pending), add Ticket 13 rows to `docs/model-benchmark.md` (Luna high impl `a6b7934` ~296k tokens; Luna xhigh fix
+  `a4e978e` ~301k tokens; Opus escalations ~143k + ~232k; Sol reviews; driver round-4 fixes), rebuild the RPM at the
+  final HEAD, open the PR, exact-head CI, squash-merge, close issue #13.
+- Still needs Raja/desktop: the live `packaging/fedora-smoke.sh` run (`VOISU_FEDORA_LIVE_SMOKE=1`: real install,
+  service start, Recording, Delivery via `wl-paste`); ticket live checkboxes stay unchecked until then.
 - After Ticket 13 merges: write the final model-benchmark report (Sol/Terra/Luna vs Opus, incl. Luna
   medium/high/xhigh effort comparison) that Raja requested.
 
@@ -50,7 +62,7 @@
 - Ticket 12 round-2 review fixes are in: the Overlay's surface probe is now honest local GTK realization (no unsound
   compositor-map timer, no false fallback on a healthy compositor), and the capsule stays hidden at Idle with no startup
   flash while status polling starts immediately.
-- Current gates: `cargo test --workspace` — 207 passed, 2 ignored, 0 failed (effective-unit + shadow-migration +
+- Current gates: `cargo test --workspace` — 211 passed, 2 ignored, 0 failed (effective-unit + shadow-migration +
   LoadState + multi-ExecStart tests; shadow-migration RED-proven); `cargo check -p voisu-app --features overlay`,
   `cargo build --workspace`, `bash -n` for packaging scripts, and `git diff --check` are clean. Deterministic vendor
   archiving verified byte-identical across umasks headlessly; `rpmbuild` and RPM/live Fedora evidence are pending the

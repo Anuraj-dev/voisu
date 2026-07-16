@@ -21,9 +21,12 @@ set -euo pipefail
 # failure and restores the mutated user-service state: it restores any Ticket 09
 # XDG shadow unit/daemon it backed up before mutating, and — when the package was
 # already installed before the smoke — restores the unit's prior enablement
-# (including enabled-runtime) and active state. Restoration is verified, not
-# best-effort: any step that fails is printed and forces a non-zero exit even
-# when the smoke itself passed. Enablement states other than
+# (including enabled-runtime) and active state. Restoration is judged on the END
+# STATE, not on individual step exit codes: after restoring, the harness compares
+# systemd's reported enablement/active state against the snapshot (and, for a
+# fresh install, verifies the smoke-installed RPM is gone and the unit is not
+# left enabled); any mismatch is printed and forces a non-zero exit even when the
+# smoke itself passed. Enablement states other than
 # enabled/enabled-runtime/disabled cannot be faithfully reproduced and are
 # reported rather than silently downgraded. Unrelated drop-ins and non-Voisu user
 # state are out of scope.
@@ -97,30 +100,49 @@ restore_user_service() {
             failed=1
         fi
     fi
-    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user daemon-reload >/dev/null 2>&1 \
+        || { printf 'restore: daemon-reload failed\n' >&2; failed=1; }
     # Only a pre-existing package is left installed, so only then can the unit's
     # prior enablement/active state be faithfully restored.
     if test "$installed_before" -eq 1; then
-        case "${pre_enabled:-}" in
+        expected_enabled=${pre_enabled:-disabled}
+        case "$expected_enabled" in
             enabled)
-                systemctl --user enable voisu.service >/dev/null 2>&1 \
-                    || { printf 'restore: could not re-enable voisu.service\n' >&2; failed=1; }
+                systemctl --user enable voisu.service >/dev/null 2>&1 || true
                 ;;
             enabled-runtime)
-                systemctl --user enable --runtime voisu.service >/dev/null 2>&1 \
-                    || { printf 'restore: could not re-enable (runtime) voisu.service\n' >&2; failed=1; }
+                systemctl --user enable --runtime voisu.service >/dev/null 2>&1 || true
                 ;;
-            ""|disabled)
+            disabled)
                 : # pre-smoke state was not enabled; leaving it disabled is faithful.
                 ;;
             *)
                 printf 'restore: cannot faithfully restore enablement state "%s"; left disabled\n' "$pre_enabled" >&2
                 failed=1
+                expected_enabled=
                 ;;
         esac
         if test "${pre_active:-}" = active; then
-            systemctl --user start voisu.service >/dev/null 2>&1 \
-                || { printf 'restore: could not restart voisu.service to its pre-smoke active state\n' >&2; failed=1; }
+            systemctl --user start voisu.service >/dev/null 2>&1 || true
+        fi
+        # Restoration is judged on the END STATE, never on individual step exit
+        # codes: compare what systemd now reports against the snapshot.
+        final_enabled=$(systemctl --user is-enabled voisu.service 2>/dev/null || true)
+        final_enabled=${final_enabled:-disabled}
+        if test -n "$expected_enabled" && test "$final_enabled" != "$expected_enabled"; then
+            printf 'restore: enablement is "%s" but was "%s" before the smoke\n' \
+                "$final_enabled" "$expected_enabled" >&2
+            failed=1
+        fi
+        final_active=$(systemctl --user is-active voisu.service 2>/dev/null || true)
+        if test "${pre_active:-}" = active && test "$final_active" != active; then
+            printf 'restore: voisu.service is "%s" but was active before the smoke\n' "$final_active" >&2
+            failed=1
+        fi
+        if test "${pre_active:-}" != active && test "$final_active" = active; then
+            printf 'restore: voisu.service left active but was "%s" before the smoke\n' \
+                "${pre_active:-inactive}" >&2
+            failed=1
         fi
     fi
     rm -rf "$snapshot_dir"
@@ -132,12 +154,26 @@ cleanup() {
     rc=$?
     if test "$installed_before" -eq 0; then
         if test -x /usr/bin/voisu; then
-            /usr/bin/voisu service uninstall >/dev/null 2>&1 || true
+            /usr/bin/voisu service uninstall >/dev/null 2>&1 \
+                || printf 'cleanup: voisu service uninstall failed\n' >&2
         fi
         current_nevra=$(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' voisu 2>/dev/null || true)
         if test -n "$current_nevra"; then
             "${dnf_cmd[@]}" remove -y voisu >/dev/null 2>&1 || true
         fi
+        # Judged on the end state: the smoke-installed RPM must be gone and the
+        # unit must not be left enabled; either leftover forces a failure exit.
+        if rpm -q voisu >/dev/null 2>&1; then
+            printf 'cleanup: smoke-installed Voisu RPM is still installed\n' >&2
+            if test "$rc" -eq 0; then rc=1; fi
+        fi
+        leftover_enabled=$(systemctl --user is-enabled voisu.service 2>/dev/null || true)
+        case "$leftover_enabled" in
+            enabled|enabled-runtime)
+                printf 'cleanup: voisu.service left %s after removal\n' "$leftover_enabled" >&2
+                if test "$rc" -eq 0; then rc=1; fi
+                ;;
+        esac
     fi
     if ! restore_user_service; then
         printf 'user-service state could not be fully restored\n' >&2
