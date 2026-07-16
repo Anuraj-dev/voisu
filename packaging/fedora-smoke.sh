@@ -19,9 +19,10 @@ set -euo pipefail
 # `voisu service start`) enable the user unit, may restart it, and migrate away
 # any Ticket 09 XDG user-data shadow. The cleanup trap runs on success and on
 # failure and restores the mutated user-service state: it restores any Ticket 09
-# XDG shadow unit/daemon it backed up before mutating, and — when the package was
-# already installed before the smoke — restores the unit's prior enablement
-# (including enabled-runtime) and active state. Restoration is judged on the END
+# XDG shadow unit/daemon it backed up before mutating, and — whenever a unit
+# exists again after restoration (the package was already installed before the
+# smoke, or the Ticket 09 shadow was put back) — restores the unit's prior
+# enablement (including enabled-runtime) and active state. Restoration is judged on the END
 # STATE, not on individual step exit codes: after restoring, the harness compares
 # systemd's reported enablement/active state against the snapshot (and, for a
 # fresh install, verifies the smoke-installed RPM is gone and the unit is not
@@ -81,14 +82,17 @@ restore_user_service() {
         return 0
     fi
     local failed=0
+    local unit_restored=0
     # Best-effort quiesce whatever the smoke enabled before restoring.
     systemctl --user stop voisu.service >/dev/null 2>&1 || true
     systemctl --user disable voisu.service >/dev/null 2>&1 || true
     # Restore any Ticket 09 XDG shadow the smoke migrated away (user data,
     # independent of the RPM).
     if test -f "$snapshot_dir/voisu.service"; then
-        if ! { mkdir -p "$(dirname "$shadow_unit")" \
+        if { mkdir -p "$(dirname "$shadow_unit")" \
             && cp -p "$snapshot_dir/voisu.service" "$shadow_unit"; }; then
+            unit_restored=1
+        else
             printf 'restore: could not restore Ticket 09 unit %s\n' "$shadow_unit" >&2
             failed=1
         fi
@@ -102,9 +106,11 @@ restore_user_service() {
     fi
     systemctl --user daemon-reload >/dev/null 2>&1 \
         || { printf 'restore: daemon-reload failed\n' >&2; failed=1; }
-    # Only a pre-existing package is left installed, so only then can the unit's
-    # prior enablement/active state be faithfully restored.
-    if test "$installed_before" -eq 1; then
+    # The unit's prior enablement/active state can be faithfully restored when a
+    # unit exists again after restoration: either the pre-existing package is
+    # left installed, or the Ticket 09 XDG shadow was just put back (a fresh
+    # install can have had an active Ticket 09 service before the smoke).
+    if test "$installed_before" -eq 1 || test "$unit_restored" -eq 1; then
         expected_enabled=${pre_enabled:-disabled}
         case "$expected_enabled" in
             enabled)

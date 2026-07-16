@@ -160,8 +160,11 @@ enabled-runtime, active state, and any Ticket 09 XDG shadow it migrates away) an
 restores it in a cleanup trap that runs on success and on failure. Restoration is
 judged on the end state rather than on individual step exit codes: after
 restoring, the harness compares systemd's reported enablement and active state
-against the pre-smoke snapshot (and, for a fresh install, verifies the
-smoke-installed RPM is removed and the unit is not left enabled); any mismatch is
+against the pre-smoke snapshot whenever a unit exists again after restoration —
+a pre-existing package install or a restored Ticket 09 shadow, so an active
+Ticket 09 service is restarted even on the fresh-install path (and, for a fresh
+install, verifies the smoke-installed RPM is removed, the packaged unit is not
+left enabled, and the smoke-started service is stopped); any mismatch is
 printed and forces a non-zero exit even when the smoke otherwise passed, and
 enablement states that cannot be faithfully reproduced are reported instead of
 silently downgraded.
