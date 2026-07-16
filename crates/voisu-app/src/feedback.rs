@@ -12,6 +12,7 @@ pub enum FeedbackBackend {
     LayerShell,
     RegularSurface,
     DesktopNotification,
+    JournalLog,
 }
 
 impl FeedbackBackend {
@@ -20,6 +21,7 @@ impl FeedbackBackend {
             Self::LayerShell => "layer-shell",
             Self::RegularSurface => "regular-surface",
             Self::DesktopNotification => "desktop-notification",
+            Self::JournalLog => "journal-log",
         }
     }
 }
@@ -27,8 +29,8 @@ impl FeedbackBackend {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FeedbackDegradation {
     X11,
+    XwaylandFallback,
     MissingDisplay,
-    MissingGtkDependency,
     LayerShellUnavailable,
     SurfaceCreationFailure,
     UnknownSession,
@@ -38,19 +40,13 @@ impl FeedbackDegradation {
     pub const fn label(self) -> &'static str {
         match self {
             Self::X11 => "x11",
+            Self::XwaylandFallback => "xwayland-fallback",
             Self::MissingDisplay => "missing-display",
-            Self::MissingGtkDependency => "missing-gtk-dependency",
             Self::LayerShellUnavailable => "layer-shell-unavailable",
             Self::SurfaceCreationFailure => "surface-creation-failure",
             Self::UnknownSession => "unknown-session",
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GtkAvailability {
-    Available,
-    MissingDependency,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,7 +60,8 @@ pub enum SessionKind {
 pub struct FeedbackCapabilities {
     pub session: SessionKind,
     pub display_available: bool,
-    pub gtk: GtkAvailability,
+    /// A Wayland session has no usable Wayland display but can present via X11.
+    pub xwayland_fallback: bool,
     pub layer_shell_supported: bool,
 }
 
@@ -89,15 +86,9 @@ impl FeedbackSelection {
 /// Layer Shell is deliberately a runtime capability, never a Cargo target
 /// assumption: a Wayland compositor must advertise it before it is selected.
 pub const fn select_feedback_backend(capabilities: FeedbackCapabilities) -> FeedbackSelection {
-    if matches!(capabilities.gtk, GtkAvailability::MissingDependency) {
-        return FeedbackSelection {
-            backend: FeedbackBackend::DesktopNotification,
-            degradation: Some(FeedbackDegradation::MissingGtkDependency),
-        };
-    }
     if !capabilities.display_available {
         return FeedbackSelection {
-            backend: FeedbackBackend::DesktopNotification,
+            backend: FeedbackBackend::JournalLog,
             degradation: Some(FeedbackDegradation::MissingDisplay),
         };
     }
@@ -112,7 +103,11 @@ pub const fn select_feedback_backend(capabilities: FeedbackCapabilities) -> Feed
         },
         SessionKind::X11 => FeedbackSelection {
             backend: FeedbackBackend::RegularSurface,
-            degradation: Some(FeedbackDegradation::X11),
+            degradation: Some(if capabilities.xwayland_fallback {
+                FeedbackDegradation::XwaylandFallback
+            } else {
+                FeedbackDegradation::X11
+            }),
         },
         SessionKind::Unknown => FeedbackSelection {
             backend: FeedbackBackend::RegularSurface,
@@ -123,18 +118,50 @@ pub const fn select_feedback_backend(capabilities: FeedbackCapabilities) -> Feed
 
 /// A GTK surface can still fail after a viable backend was selected. Preserve
 /// the reason and fall back to a desktop notification rather than retrying the
-/// daemon or silently losing feedback.
+/// daemon or silently losing feedback. `surface_mapped` is intentionally the
+/// compositor-confirmed map result, not merely local GTK realization.
 pub const fn after_surface_creation(
     selection: FeedbackSelection,
-    surface_created: bool,
+    surface_mapped: bool,
 ) -> FeedbackSelection {
-    if surface_created {
+    if surface_mapped {
         selection
     } else {
         FeedbackSelection {
             backend: FeedbackBackend::DesktopNotification,
             degradation: Some(FeedbackDegradation::SurfaceCreationFailure),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_display_uses_a_persistent_journal_observer_instead_of_a_noop_notification() {
+        let selection = select_feedback_backend(FeedbackCapabilities {
+            session: SessionKind::Wayland,
+            display_available: false,
+            xwayland_fallback: false,
+            layer_shell_supported: true,
+        });
+
+        assert_eq!(selection.backend, FeedbackBackend::JournalLog);
+        assert_eq!(selection.degradation, Some(FeedbackDegradation::MissingDisplay));
+    }
+
+    #[test]
+    fn available_x11_display_is_a_named_xwayland_fallback_when_wayland_is_absent() {
+        let selection = select_feedback_backend(FeedbackCapabilities {
+            session: SessionKind::X11,
+            display_available: true,
+            xwayland_fallback: true,
+            layer_shell_supported: false,
+        });
+
+        assert_eq!(selection.backend, FeedbackBackend::RegularSurface);
+        assert_eq!(selection.degradation, Some(FeedbackDegradation::XwaylandFallback));
     }
 }
 

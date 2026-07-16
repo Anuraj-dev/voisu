@@ -2,8 +2,8 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-16
 
 ## 🚧 In progress / next
-- Ticket 12 is implemented on `ticket-12-overlay-fallback`; next: review and merge this focused branch, then take
-  Ticket 13 (Fedora package verification).
+- Ticket 12 round-1 review fixes are implemented on `ticket-12-overlay-fallback`; next: re-review and merge this
+  focused branch, then take Ticket 13 (Fedora package verification).
 - Issue #14 (cancellation-safe provider abort) is merged through PR #18 at `8d8dbba` and closed; Ticket 11
   (GTK4 voice capsule + completed Fedora screenshot gate) is merged through PR #19 at `66f8aa1` and closed.
 
@@ -18,11 +18,12 @@
 - Ticket 09 installs a graphical-session-owned daemon service with atomic binaries and a three-starts-per-30-seconds
   failure bound; daemon lifecycle remains independent from the optional Overlay.
 - Ticket 12 keeps the Overlay observer-only: a pure, headless selection layer chooses runtime-advertised Layer Shell,
-  an unfocusable regular GTK surface, or desktop-notification feedback. Structured Overlay logs and
-  `voisu-overlay --report-backend` expose `backend` plus `degradation`; normal `voisu status` remains daemon-only.
-  `voisu-overlay --supervise` bounds separate Overlay restarts to three failures in 30 seconds and never touches the
-  daemon.
-- Current gates: `cargo test --workspace` — 194 passed, 2 ignored, 0 failed;
+  an unfocusable regular GTK surface, desktop notification, or a persistent journal observer when no display exists.
+  Structured Overlay logs and `voisu-overlay --report-backend` expose `backend` plus `degradation`; normal `voisu
+  status` remains daemon-only. A missing dynamic GTK runtime fails before `main` and is recorded by the launching
+  service/journal rather than falsely selected as an Overlay backend. `voisu-overlay --supervise` bounds separate
+  Overlay restarts to three failures in 30 seconds and never touches the daemon.
+- Current gates: `cargo test --workspace` — 196 passed, 2 ignored, 0 failed;
   `cargo check -p voisu-app --features overlay` and `cargo build --workspace` are clean.
 
 ## Architecture map

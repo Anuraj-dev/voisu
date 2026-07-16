@@ -200,3 +200,6 @@ specific degradation reason. `voisu status` deliberately remains daemon-only: th
 backend and reason to structured stderr/journal logs and `voisu-overlay --report-backend`. `voisu-overlay --supervise`
 limits its own failures to three in 30 seconds and has no daemon IPC command, signal, or lifecycle path; restarting the
 daemon to recover presentation was rejected because it could interrupt a Recording or duplicate Delivery.
+
+## 2026-07-16 — Report only Overlay degradations the running process can observe
+**Why:** `voisu-overlay` dynamically links GTK, so a missing GTK runtime fails in the ELF loader before `main`; it cannot honestly select or log a `missing-gtk-dependency` backend. The launching systemd unit and journal are the explicit failure record for that case. With no display, the Overlay instead remains a read-only status observer and writes transition logs as its real last-resort feedback surface. A Wayland session without `WAYLAND_DISPLAY` but with `DISPLAY` uses a named XWayland regular-surface fallback. Surface success requires a bounded GTK map signal after `present`, not merely a locally realized surface; a windowless desktop-notification backend holds its application for its polling lifetime.

@@ -1,6 +1,6 @@
 //! Optional GTK feedback observer. It has no command path into the daemon.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::env;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -13,7 +13,7 @@ use gtk::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use voisu_app::feedback::{
     after_surface_creation, select_feedback_backend, FeedbackBackend, FeedbackCapabilities,
-    FeedbackDegradation, FeedbackSelection, GtkAvailability, OverlayRestartPolicy, SessionKind,
+    FeedbackDegradation, FeedbackSelection, OverlayRestartPolicy, SessionKind,
 };
 use voisu_app::overlay::{OverlayPhase, OverlayView, PresentationController};
 use voisu_core::{Command, PROTOCOL_VERSION, Request, Response, socket_path};
@@ -73,26 +73,26 @@ fn run_overlay(arguments: &[String]) -> i32 {
         }
     };
 
-    // Do not ask GTK to initialize when no graphical display can exist. This
-    // is the explicit missing-display degradation path and remains useful in
-    // a journal even where a desktop notification is impossible by definition.
-    let preflight = environment_capabilities(GtkAvailability::Available, false);
+    // Do not ask GTK to initialize when no graphical display can exist. A
+    // desktop notification cannot be delivered there; the persistent journal
+    // observer below is the truthful last-resort feedback backend.
+    let preflight = environment_capabilities(false);
     let preliminary = select_feedback_backend(preflight);
-    if preliminary.backend == FeedbackBackend::DesktopNotification {
+    if preliminary.backend == FeedbackBackend::JournalLog {
         report(preliminary);
-        return 0;
+        return if report_only { 0 } else { run_journal_feedback(preliminary) };
     }
 
     if let Err(error) = gtk::init() {
         let selection = FeedbackSelection {
-            backend: FeedbackBackend::DesktopNotification,
+            backend: FeedbackBackend::JournalLog,
             degradation: Some(FeedbackDegradation::MissingDisplay),
         };
         report_with_error(selection, &error.to_string());
-        return 0;
+        return if report_only { 0 } else { run_journal_feedback(selection) };
     }
 
-    let capabilities = environment_capabilities(GtkAvailability::Available, gtk4_layer_shell::is_supported());
+    let capabilities = environment_capabilities(gtk4_layer_shell::is_supported());
     let selection = select_feedback_backend(capabilities);
     report(selection);
     if report_only {
@@ -103,26 +103,36 @@ fn run_overlay(arguments: &[String]) -> i32 {
         .application_id("org.voisu.Overlay")
         .build();
     application.connect_activate(move |application| build_feedback(application, selection));
-    application.run();
-    0
+    i32::from(application.run())
 }
 
 /// Inputs collected outside the pure selector. GTK and Layer Shell APIs stay
 /// in this adapter so contract tests need neither a compositor nor a display.
-fn environment_capabilities(gtk: GtkAvailability, layer_shell_supported: bool) -> FeedbackCapabilities {
-    let session = match env::var("XDG_SESSION_TYPE").ok().as_deref() {
+fn environment_capabilities(layer_shell_supported: bool) -> FeedbackCapabilities {
+    let wayland_display = env::var_os("WAYLAND_DISPLAY").is_some();
+    let x11_display = env::var_os("DISPLAY").is_some();
+    let declared_wayland = matches!(
+        env::var("XDG_SESSION_TYPE").ok().as_deref(),
+        Some(value) if value.eq_ignore_ascii_case("wayland")
+    );
+    let xwayland_fallback = declared_wayland && !wayland_display && x11_display;
+    let session = if xwayland_fallback {
+        SessionKind::X11
+    } else {
+        match env::var("XDG_SESSION_TYPE").ok().as_deref() {
         Some(value) if value.eq_ignore_ascii_case("wayland") => SessionKind::Wayland,
         Some(value) if value.eq_ignore_ascii_case("x11") => SessionKind::X11,
-        _ if env::var_os("WAYLAND_DISPLAY").is_some() => SessionKind::Wayland,
-        _ if env::var_os("DISPLAY").is_some() => SessionKind::X11,
+        _ if wayland_display => SessionKind::Wayland,
+        _ if x11_display => SessionKind::X11,
         _ => SessionKind::Unknown,
+        }
     };
     let display_available = match session {
-        SessionKind::Wayland => env::var_os("WAYLAND_DISPLAY").is_some(),
-        SessionKind::X11 => env::var_os("DISPLAY").is_some(),
-        SessionKind::Unknown => env::var_os("WAYLAND_DISPLAY").is_some() || env::var_os("DISPLAY").is_some(),
+        SessionKind::Wayland => wayland_display,
+        SessionKind::X11 => x11_display,
+        SessionKind::Unknown => wayland_display || x11_display,
     };
-    FeedbackCapabilities { session, display_available, gtk, layer_shell_supported }
+    FeedbackCapabilities { session, display_available, xwayland_fallback, layer_shell_supported }
 }
 
 fn report(selection: FeedbackSelection) {
@@ -131,6 +141,34 @@ fn report(selection: FeedbackSelection) {
 
 fn report_with_error(selection: FeedbackSelection, error: &str) {
     eprintln!("{} error={error}", selection.report_line());
+}
+
+/// Keeps the observer useful where no graphical feedback backend can exist.
+/// This has no GTK application or daemon control path: it only polls the
+/// public OverlayStatus response and writes state transitions to the journal.
+fn run_journal_feedback(selection: FeedbackSelection) -> i32 {
+    let mut controller = PresentationController::default();
+    let mut previous = OverlayView::HIDDEN;
+    loop {
+        let view = read_status()
+            .map(|response| controller.observe(&response, Instant::now()))
+            .unwrap_or_else(daemon_unavailable_view);
+        if view != previous {
+            eprintln!("{} phase={}", selection.report_line(), overlay_phase_label(view.phase));
+            previous = view;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+const fn overlay_phase_label(phase: OverlayPhase) -> &'static str {
+    match phase {
+        OverlayPhase::Hidden => "hidden",
+        OverlayPhase::Recording => "recording",
+        OverlayPhase::Processing => "processing",
+        OverlayPhase::Success => "success",
+        OverlayPhase::Failure => "failure",
+    }
 }
 
 fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) {
@@ -201,18 +239,26 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    // Realize before polling so a compositor rejection becomes a named
-    // notification fallback instead of a hidden, inert GTK window.
-    gtk::prelude::WidgetExt::realize(&window);
-    let effective_selection = after_surface_creation(selection, window.surface().is_some());
-    if effective_selection.backend == FeedbackBackend::DesktopNotification {
-        report(effective_selection);
-        window.close();
-        install_notification_feedback(application);
-        return;
-    }
-
-    install_surface_feedback(window, label, meter, capsule);
+    // Wayland can reject a surface asynchronously. `surface()` only proves
+    // GTK realized its local object, so wait for the compositor-facing map
+    // signal through a bounded grace window before declaring surface success.
+    let mapped = Rc::new(Cell::new(false));
+    window.connect_map({
+        let mapped = Rc::clone(&mapped);
+        move |_| mapped.set(true)
+    });
+    window.present();
+    let application = application.clone();
+    gtk::glib::timeout_add_local_once(Duration::from_millis(500), move || {
+        let effective_selection = after_surface_creation(selection, mapped.get());
+        if effective_selection.backend == FeedbackBackend::DesktopNotification {
+            report(effective_selection);
+            window.close();
+            install_notification_feedback(&application);
+        } else {
+            install_surface_feedback(window, label, meter, capsule);
+        }
+    });
 }
 
 fn install_surface_feedback(
@@ -234,10 +280,14 @@ fn install_surface_feedback(
 }
 
 fn install_notification_feedback(application: &gtk::Application) {
+    // A notification backend has no window. Keep its GApplication alive for
+    // the source lifetime so the polling timeout can actually run.
+    let hold = application.hold();
     let controller = Rc::new(RefCell::new(PresentationController::default()));
     let previous = Rc::new(RefCell::new(OverlayView::HIDDEN));
     let application = application.clone();
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
+        let _hold = &hold;
         let view = read_status().map(|response| controller.borrow_mut().observe(&response, Instant::now()))
             .unwrap_or_else(daemon_unavailable_view);
         if view.is_visible() && *previous.borrow() != view {

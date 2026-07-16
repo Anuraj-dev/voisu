@@ -123,7 +123,7 @@ impl PresentationController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feedback::{select_feedback_backend, FeedbackBackend, FeedbackCapabilities, GtkAvailability, SessionKind};
+    use crate::feedback::{select_feedback_backend, FeedbackBackend, FeedbackCapabilities, SessionKind};
     use voisu_core::{DaemonState, OverlayEvent, OverlayOutcome, Response, VersionEnvelope};
 
     fn event(id: u64, outcome: OverlayOutcome) -> OverlayEvent {
@@ -280,7 +280,7 @@ mod tests {
         let selection = select_feedback_backend(FeedbackCapabilities {
             session: SessionKind::Wayland,
             display_available: true,
-            gtk: GtkAvailability::Available,
+            xwayland_fallback: false,
             layer_shell_supported: true,
         });
         assert_eq!(selection.backend, FeedbackBackend::LayerShell);
@@ -294,24 +294,19 @@ mod tests {
         // silently ignored or crash in GTK-dependent tests.
         let cases = [
             (
-                FeedbackCapabilities { session: SessionKind::X11, display_available: true, gtk: GtkAvailability::Available, layer_shell_supported: false },
+                FeedbackCapabilities { session: SessionKind::X11, display_available: true, xwayland_fallback: false, layer_shell_supported: false },
                 FeedbackBackend::RegularSurface,
                 Some(crate::feedback::FeedbackDegradation::X11),
             ),
             (
-                FeedbackCapabilities { session: SessionKind::Wayland, display_available: true, gtk: GtkAvailability::Available, layer_shell_supported: false },
+                FeedbackCapabilities { session: SessionKind::Wayland, display_available: true, xwayland_fallback: false, layer_shell_supported: false },
                 FeedbackBackend::RegularSurface,
                 Some(crate::feedback::FeedbackDegradation::LayerShellUnavailable),
             ),
             (
-                FeedbackCapabilities { session: SessionKind::Wayland, display_available: false, gtk: GtkAvailability::Available, layer_shell_supported: true },
-                FeedbackBackend::DesktopNotification,
+                FeedbackCapabilities { session: SessionKind::Wayland, display_available: false, xwayland_fallback: false, layer_shell_supported: true },
+                FeedbackBackend::JournalLog,
                 Some(crate::feedback::FeedbackDegradation::MissingDisplay),
-            ),
-            (
-                FeedbackCapabilities { session: SessionKind::Wayland, display_available: true, gtk: GtkAvailability::MissingDependency, layer_shell_supported: true },
-                FeedbackBackend::DesktopNotification,
-                Some(crate::feedback::FeedbackDegradation::MissingGtkDependency),
             ),
         ];
         for (capabilities, backend, degradation) in cases {
@@ -319,7 +314,7 @@ mod tests {
             assert_eq!((selection.backend, selection.degradation), (backend, degradation));
         }
         let surface_failure = crate::feedback::after_surface_creation(
-            select_feedback_backend(FeedbackCapabilities { session: SessionKind::Wayland, display_available: true, gtk: GtkAvailability::Available, layer_shell_supported: true }),
+            select_feedback_backend(FeedbackCapabilities { session: SessionKind::Wayland, display_available: true, xwayland_fallback: false, layer_shell_supported: true }),
             false,
         );
         assert_eq!(surface_failure.backend, FeedbackBackend::DesktopNotification);
