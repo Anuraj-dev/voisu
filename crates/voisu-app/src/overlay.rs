@@ -143,6 +143,31 @@ mod tests {
     }
 
     #[test]
+    fn startup_is_hidden_at_idle_and_an_immediate_recording_is_visible_without_a_grace_window() {
+        // Round-2 finding 2: the window must stay hidden at Idle (no styled
+        // empty-capsule flash) and polling must start immediately so an early
+        // Recording is never missed. The pure decision the adapter honors is
+        // tested here; only a live compositor can prove the absence of the
+        // startup visual flash, which the adapter now guarantees by never
+        // calling `present()` at startup.
+        let now = Instant::now();
+        // Before any status arrives the view is HIDDEN — the window stays down.
+        assert_eq!(OverlayView::HIDDEN.phase, OverlayPhase::Hidden);
+        assert!(!OverlayView::HIDDEN.is_visible());
+        // An Idle daemon keeps the window hidden: no startup flash.
+        let mut at_idle = PresentationController::default();
+        let idle = at_idle.observe(&overlay_status(DaemonState::Idle, None), now);
+        assert_eq!(idle.phase, OverlayPhase::Hidden);
+        assert!(!idle.is_visible());
+        // The very first observed status can be Recording; it is immediately
+        // visible with no grace window, so immediate polling shows it at once.
+        let mut fresh = PresentationController::default();
+        let recording = fresh.observe(&overlay_status(DaemonState::Recording, None), now);
+        assert_eq!(recording.phase, OverlayPhase::Recording);
+        assert!(recording.is_visible());
+    }
+
+    #[test]
     fn public_observer_response_is_typed_and_terminal_events_are_displayed_once() {
         let terminal = overlay_status(DaemonState::Idle, Some(event(7, OverlayOutcome::DeliveryFailure)));
         let mut controller = PresentationController::default();

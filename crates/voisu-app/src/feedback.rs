@@ -116,15 +116,21 @@ pub const fn select_feedback_backend(capabilities: FeedbackCapabilities) -> Feed
     }
 }
 
-/// A GTK surface can still fail after a viable backend was selected. Preserve
-/// the reason and fall back to a desktop notification rather than retrying the
-/// daemon or silently losing feedback. `surface_mapped` is intentionally the
-/// compositor-confirmed map result, not merely local GTK realization.
+/// A GTK surface can still fail to be created locally after a viable backend
+/// was selected. `surface_created` reflects local GTK realization
+/// (`window.surface().is_some()` on the first real show) — the only surface
+/// failure the observer can honestly detect in-process. A compositor that
+/// *rejects* the surface (e.g. a Layer Shell protocol error) does not surface
+/// here: it raises a Wayland protocol error that terminates the process, and
+/// the bounded `voisu-overlay --supervise` policy — not a false in-process
+/// timer — converts that into explicit degraded behavior. On genuine local
+/// failure, fall back to a desktop notification rather than retrying the daemon
+/// or silently losing feedback.
 pub const fn after_surface_creation(
     selection: FeedbackSelection,
-    surface_mapped: bool,
+    surface_created: bool,
 ) -> FeedbackSelection {
-    if surface_mapped {
+    if surface_created {
         selection
     } else {
         FeedbackSelection {
@@ -149,6 +155,34 @@ mod tests {
 
         assert_eq!(selection.backend, FeedbackBackend::JournalLog);
         assert_eq!(selection.degradation, Some(FeedbackDegradation::MissingDisplay));
+    }
+
+    #[test]
+    fn a_realized_surface_keeps_its_backend_and_only_genuine_absence_falls_back() {
+        // Honesty contract (round-2 finding 1): `after_surface_creation`'s flag
+        // is LOCAL GTK realization (`window.surface().is_some()`), not a
+        // compositor map confirmation. A realized surface must never be
+        // downgraded, so a false desktop-notification fallback on a healthy
+        // compositor is impossible. Only a genuinely absent surface object
+        // degrades to a notification. A compositor that *rejects* the surface
+        // raises a Wayland protocol error that terminates the process; the
+        // bounded --supervise policy (exercised by
+        // `red_bounded_overlay_restarts_stop_without_a_daemon_control_path`)
+        // converts that into explicit degraded behavior. Only a live compositor
+        // can prove that process-termination half of the story.
+        let layer = select_feedback_backend(FeedbackCapabilities {
+            session: SessionKind::Wayland,
+            display_available: true,
+            xwayland_fallback: false,
+            layer_shell_supported: true,
+        });
+        assert_eq!(layer.backend, FeedbackBackend::LayerShell);
+        // A created (realized) surface preserves the selected backend verbatim.
+        assert_eq!(after_surface_creation(layer, true), layer);
+        // Only genuine local absence degrades to a desktop notification.
+        let fallback = after_surface_creation(layer, false);
+        assert_eq!(fallback.backend, FeedbackBackend::DesktopNotification);
+        assert_eq!(fallback.degradation, Some(FeedbackDegradation::SurfaceCreationFailure));
     }
 
     #[test]

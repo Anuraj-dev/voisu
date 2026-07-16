@@ -2,7 +2,7 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-16
 
 ## 🚧 In progress / next
-- Ticket 12 round-1 review fixes are implemented on `ticket-12-overlay-fallback`; next: re-review and merge this
+- Ticket 12 round-2 review fixes are implemented on `ticket-12-overlay-fallback`; next: re-review and merge this
   focused branch, then take Ticket 13 (Fedora package verification).
 - Issue #14 (cancellation-safe provider abort) is merged through PR #18 at `8d8dbba` and closed; Ticket 11
   (GTK4 voice capsule + completed Fedora screenshot gate) is merged through PR #19 at `66f8aa1` and closed.
@@ -23,7 +23,10 @@
   status` remains daemon-only. A missing dynamic GTK runtime fails before `main` and is recorded by the launching
   service/journal rather than falsely selected as an Overlay backend. `voisu-overlay --supervise` bounds separate
   Overlay restarts to three failures in 30 seconds and never touches the daemon.
-- Current gates: `cargo test --workspace` — 196 passed, 2 ignored, 0 failed;
+- Ticket 12 round-2 review fixes are in: the Overlay's surface probe is now honest local GTK realization (no unsound
+  compositor-map timer, no false fallback on a healthy compositor), and the capsule stays hidden at Idle with no startup
+  flash while status polling starts immediately.
+- Current gates: `cargo test --workspace` — 198 passed, 2 ignored, 0 failed;
   `cargo check -p voisu-app --features overlay` and `cargo build --workspace` are clean.
 
 ## Architecture map

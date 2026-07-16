@@ -195,10 +195,30 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         window.set_keyboard_mode(KeyboardMode::None);
         window.set_exclusive_zone(-1);
     }
-    window.connect_realize(|window| {
-        if let Some(surface) = window.surface() {
-            let empty_region = gtk::cairo::Region::create();
-            surface.set_input_region(Some(&empty_region));
+    // Realization creates the GdkSurface on the first real show. A present
+    // surface is honest proof of local surface creation, so install the
+    // click-through input region. GTK realizing without a surface is the only
+    // surface failure detectable in-process; fall back to a desktop
+    // notification then. A compositor that REJECTS the surface — e.g. a Layer
+    // Shell protocol error — instead terminates the process, and the bounded
+    // `--supervise` policy converts that into explicit degraded behavior, never
+    // a false in-process timer on a healthy compositor.
+    let switched = Rc::new(Cell::new(false));
+    window.connect_realize({
+        let application = application.clone();
+        let switched = Rc::clone(&switched);
+        move |window| match window.surface() {
+            Some(surface) => {
+                let empty_region = gtk::cairo::Region::create();
+                surface.set_input_region(Some(&empty_region));
+            }
+            None => {
+                let effective = after_surface_creation(selection, false);
+                report(effective);
+                switched.set(true);
+                window.set_visible(false);
+                install_notification_feedback(&application);
+            }
         }
     });
 
@@ -239,26 +259,13 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    // Wayland can reject a surface asynchronously. `surface()` only proves
-    // GTK realized its local object, so wait for the compositor-facing map
-    // signal through a bounded grace window before declaring surface success.
-    let mapped = Rc::new(Cell::new(false));
-    window.connect_map({
-        let mapped = Rc::clone(&mapped);
-        move |_| mapped.set(true)
-    });
-    window.present();
-    let application = application.clone();
-    gtk::glib::timeout_add_local_once(Duration::from_millis(500), move || {
-        let effective_selection = after_surface_creation(selection, mapped.get());
-        if effective_selection.backend == FeedbackBackend::DesktopNotification {
-            report(effective_selection);
-            window.close();
-            install_notification_feedback(&application);
-        } else {
-            install_surface_feedback(window, label, meter, capsule);
-        }
-    });
+    // Hidden at Idle: no startup present() and no styled empty-capsule flash
+    // (window.set_visible(false) above stays in effect). The window becomes
+    // visible only when a visible phase arrives via render_surface, and the
+    // realize probe above runs on that first real show — not on a startup
+    // flash. Polling starts immediately so an early Recording is shown without
+    // the old 500 ms + 200 ms grace.
+    install_surface_feedback(window, label, meter, capsule, switched);
 }
 
 fn install_surface_feedback(
@@ -266,12 +273,18 @@ fn install_surface_feedback(
     label: gtk::Label,
     meter: gtk::Label,
     capsule: gtk::Box,
+    switched: Rc<Cell<bool>>,
 ) {
     let controller = Rc::new(RefCell::new(PresentationController::default()));
     let reduced_motion = gtk::Settings::default()
         .map(|settings| !settings.is_gtk_enable_animations())
         .unwrap_or(true);
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
+        if switched.get() {
+            // A genuine surface-creation failure handed feedback to the
+            // notification backend; stop driving the retired window.
+            return gtk::glib::ControlFlow::Break;
+        }
         let view = read_status().map(|response| controller.borrow_mut().observe(&response, Instant::now()))
             .unwrap_or_else(daemon_unavailable_view);
         render_surface(&window, &label, &meter, &capsule, view, reduced_motion);
