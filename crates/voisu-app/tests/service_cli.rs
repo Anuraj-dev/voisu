@@ -261,6 +261,10 @@ fn installed_service_bounds_repeated_startup_failures() {
     assert!(unit.contains("Restart=on-failure\n"), "{unit}");
     assert!(unit.contains("StartLimitIntervalSec=30s\n"), "{unit}");
     assert!(unit.contains("StartLimitBurst=3\n"), "{unit}");
+    // Graceful shutdown's internal budget (stop, process, join, drain) peaks
+    // near 37 seconds; the unit must bound the stop explicitly above it rather
+    // than rely on the distribution's default.
+    assert!(unit.contains("TimeoutStopSec=60s\n"), "{unit}");
 }
 
 #[test]

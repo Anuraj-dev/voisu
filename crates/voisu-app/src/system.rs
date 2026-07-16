@@ -1551,10 +1551,11 @@ impl ProviderReaper {
     }
 
     /// Number of cleanup futures currently retained and not being drained.
-    /// Exposed so tests can observe that a dropped stream handed its curl reap
-    /// to this supervisor instead of detaching it. A cleanup being awaited by an
-    /// in-flight `drain` is not counted; use `drain` itself for completion.
-    pub fn pending(&self) -> usize {
+    /// Test-observability only — production callers gate on `drain` /
+    /// `drain_to_completion`, never on this count, because a cleanup being
+    /// awaited by an in-flight `drain` is not counted.
+    #[cfg(test)]
+    fn pending(&self) -> usize {
         self.tasks
             .lock()
             .expect("provider reaper mutex poisoned")
@@ -1566,6 +1567,20 @@ impl ProviderReaper {
     /// while draining. On timeout it puts every unfinished future back — so
     /// cleanup is retained, never detached — and returns `false`. Serialized
     /// with every other drain.
+    /// Drains to completion in bounded passes, returning only once the
+    /// supervisor is empty. A single bounded `drain` that times out RETAINS the
+    /// unfinished cleanup — but a caller about to tear down the runtime would
+    /// then drop the supervisor and detach that cleanup after all, so teardown
+    /// paths must use this instead and keep draining. Each retained cleanup is
+    /// internally bounded (a cancelled curl wait kills and reaps its child
+    /// within its own poll bound), so this terminates; the service unit's
+    /// explicit TimeoutStopSec is the external last-resort backstop.
+    pub async fn drain_to_completion(&self, pass: Duration) {
+        while !self.drain(pass).await {
+            eprintln!("provider cleanup still draining");
+        }
+    }
+
     pub async fn drain(&self, within: Duration) -> bool {
         let _serial = self.serial.lock().await;
         let deadline = tokio::time::Instant::now() + within;
@@ -3844,6 +3859,37 @@ mod tests {
         assert!(
             reap_done_when_second_returned,
             "a concurrent drain must not report completion while the blocking reap runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_to_completion_survives_pass_timeouts_without_detaching_cleanup() {
+        // A teardown path whose single bounded drain times out would retain the
+        // unfinished cleanup only to drop it with the runtime immediately
+        // after. drain_to_completion must keep draining across pass timeouts
+        // and return only once the blocking reap has actually completed.
+        let reaper = ProviderReaper::new();
+        let cancel = CancelRegistry::new();
+        cancel.cancel();
+        let (chunk, probe) = spawn_blocking_backed_chunk(Arc::clone(&cancel));
+        wait_for(&probe.entered).await;
+        reaper.adopt(VecDeque::from([chunk]));
+
+        // Release the reap well after several 50ms passes have timed out.
+        let release = probe.release.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = release.send(());
+        });
+        reaper.drain_to_completion(Duration::from_millis(50)).await;
+        assert!(
+            probe.reap_done.load(Ordering::SeqCst),
+            "drain_to_completion must not return before the blocking reap completed"
+        );
+        assert_eq!(
+            reaper.pending(),
+            0,
+            "a completed teardown drain must leave nothing retained"
         );
     }
 

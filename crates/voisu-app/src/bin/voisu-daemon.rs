@@ -160,12 +160,19 @@ async fn shutdown(
         eprintln!("shutdown: actor did not acknowledge within the processing bound");
     }
     drop(actor_tx);
-    if timeout(RECOVERY_ABORT_DEADLINE, actor).await.is_err() {
-        eprintln!("shutdown: actor task did not finish within the abort bound");
+    // Join the actor WITHOUT racing it against a deadline: dropping this handle
+    // on a timeout would detach the still-running actor while it owns provider
+    // streams, and the final drain below could then observe an empty supervisor
+    // before those streams drop. Every wait inside the actor is itself bounded,
+    // so this join terminates within the actor's internal budget; the unit's
+    // explicit TimeoutStopSec is the external last-resort backstop.
+    if actor.await.is_err() {
+        eprintln!("shutdown: actor task panicked");
     }
-    if !reaper.drain(RECOVERY_ABORT_DEADLINE).await {
-        eprintln!("shutdown: provider cleanup did not drain within the abort bound");
-    }
+    // All stream Drops and adoptions are complete now, so drain to completion:
+    // a single bounded drain that timed out would retain the unfinished cleanup
+    // only for this function to return and drop the runtime over it.
+    reaper.drain_to_completion(RECOVERY_ABORT_DEADLINE).await;
     Ok(())
 }
 
@@ -604,9 +611,31 @@ async fn actor_loop(
                             // never start the pump. Abort everything the start
                             // sequence produced, off the loop, drain the reaper,
                             // and leave through Recovering -> Recovered -> Idle.
-                            let _ = reply.send(Response::rejected(
+                            // Like any other Recording outcome, this one is
+                            // correlated: its record persists locally and the
+                            // rejection carries the correlated evidence back.
+                            let mut record = DiagnosticRecord::new(correlation.clone(), id);
+                            record.error = Some("daemon is shutting down".to_owned());
+                            record.recovery_attempted = true;
+                            if let Err(error) = diagnostics.record(record) {
+                                eprintln!(
+                                    "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
+                                );
+                            }
+                            let mut evidence = base_evidence(
+                                id,
+                                correlation,
+                                vec![
+                                    LifecycleStage::CaptureStarted,
+                                    LifecycleStage::ProvidersStarted,
+                                ],
+                            );
+                            evidence.recovery_attempted = true;
+                            let _ = reply.send(Response::with_evidence(
+                                false,
                                 Some(DaemonState::Idle),
                                 "daemon is shutting down",
+                                Some(evidence),
                             ));
                             state = ActorState::Recovering(id);
                             let actor = tx.clone();
@@ -1863,6 +1892,9 @@ struct ControlledProvider {
     text: String,
     delay: Duration,
     send_stall: Duration,
+    /// Blocking stall inside `start`, holding the Recording in Starting long
+    /// enough for tests to interleave a shutdown with the start sequence.
+    start_stall: Duration,
     fail_start_once: bool,
     fail_abort: bool,
     fail_complete: bool,
@@ -1899,6 +1931,7 @@ impl ControlledProvider {
             text,
             delay,
             send_stall,
+            start_stall: env_millis("VOISU_TEST_START_STALL_MS"),
             fail_start_once,
             fail_abort,
             fail_complete,
@@ -1908,6 +1941,11 @@ impl ControlledProvider {
 
 impl TranscriptProvider for ControlledProvider {
     fn start(&mut self, _recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError> {
+        if !self.start_stall.is_zero() {
+            // `start` runs inside the actor's `begin_recording` blocking task,
+            // so a blocking sleep is the faithful stand-in for a slow adapter.
+            std::thread::sleep(self.start_stall);
+        }
         if std::mem::take(&mut self.fail_start_once) {
             return Err(BoundaryError::new(
                 BoundaryKind::Provider,
@@ -2089,5 +2127,45 @@ impl DeliveryAdapter for ControlledDelivery {
                 Err(_) => DeliveryOutcome::compositor_submitted(),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The graceful shutdown must JOIN the actor, never abandon the join on a
+    /// deadline: an abandoned actor keeps running detached while it still owns
+    /// provider streams, and the final drain can observe an empty supervisor
+    /// before those streams drop. The stand-in actor here acknowledges promptly
+    /// but keeps working past the abandoned implementation's former 2s join
+    /// bound; `shutdown` must not return until that work has finished.
+    #[tokio::test]
+    async fn shutdown_joins_the_actor_instead_of_abandoning_it_on_a_deadline() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let reaper = ProviderReaper::new();
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let actor_finished = Arc::clone(&finished);
+        let actor = tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if let ActorMessage::Shutdown(ack) = message {
+                    let _ = ack.send(());
+                    // Live Recording work the actor still owns after
+                    // acknowledging — for example a stream whose Drop has not
+                    // run yet. It outlasts any former join bound.
+                    tokio::time::sleep(Duration::from_millis(2_500)).await;
+                    actor_finished.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        });
+
+        shutdown(actor, tx, reaper)
+            .await
+            .expect("shutdown must succeed");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "shutdown must not return while the actor still runs live work"
+        );
     }
 }
