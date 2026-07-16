@@ -2,10 +2,10 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-16
 
 ## 🚧 In progress / next
-- Ticket 08 (issue #8, libei Delivery through the RemoteDesktop portal) is review-complete locally. Sol first review
-  found protocol, compatibility, acknowledgement, persistence, and re-prompt defects; all were fixed. The requested
-  Sol re-review was unavailable because its account hit the usage cap, so the fixes received a focused manual
-  re-review against the official APIs. Next: publish the branch, require exact-head green CI, and merge.
+- Ticket 08 merged through PR #15 at `a5771a9`; exact-head CI passed and issue #8 is closed.
+- Ticket 09 (issue #9, systemd user service ownership) is implemented and manually review-complete after the required
+  Sol reviewer remained unavailable due its account usage cap. Next: commit, publish, require exact-head green CI,
+  and merge.
 - Follow-up issue #14 remains open: make Deepgram/Groq abort cancellation-safe plus its regression test; out of
   Ticket 08 scope.
 
@@ -31,18 +31,25 @@
 - Native libei is loaded by SONAME at runtime, so building does not require `libei-devel`; libei 1.6 TEXT is preferred,
   while 1.5 uses the active EIS XKB keymap to submit Ctrl+V for the preserved clipboard. Standard acceptance daemons set `VOISU_DISABLE_DIRECT_DELIVERY=1` unless they
   inject a private bus, so tests never prompt the host desktop; the opt-in live smoke keeps compositor Delivery enabled.
-- Current inventory: 153 tests listed (7 app unit + 100 daemon/CLI acceptance + 6 Delivery + 20 diagnostics +
-  6 provider-coordination + 14 Transcript-decision). The full host gate is green: 152 passed, 1 opt-in live smoke
+- Ticket 09 adds `voisu service install|start|stop|restart|status|uninstall`. Installation atomically replaces a
+  trusted daemon copy under XDG user data and enables one unit under `graphical-session.target`, ordered after the
+  user D-Bus socket, PipeWire, and desktop portal without baking session variables or checkout paths. Service reports
+  combine real systemd state with daemon IPC state; manual ownership and duplicate races fail without restart loops.
+- Current inventory: 161 tests listed (7 app unit + 100 daemon/CLI acceptance + 6 Delivery + 8 user-service +
+  20 diagnostics + 6 provider-coordination + 14 Transcript-decision). The full host gate is green: 160 passed,
+  1 opt-in live smoke
   ignored, 0 failed.
 
 ## Architecture map
 - Domain, IPC, lifecycle/Delivery evidence, provider coordination, decision pipeline -> `crates/voisu-core/src/lib.rs`
 - Local diagnostic record/store/export/replay -> `crates/voisu-core/src/diagnostics.rs`
 - Fedora adapters: PipeWire, providers, clipboard, zbus portals, native libei -> `crates/voisu-app/src/system.rs`
+- systemd user-service installation, lifecycle, ownership/IPC reporting -> `crates/voisu-app/src/service.rs`
 - Lifecycle actor, cancellation ownership, Delivery response/evidence -> `crates/voisu-app/src/bin/voisu-daemon.rs`
 - Public CLI -> `crates/voisu-app/src/bin/voisu.rs`
 - Daemon/CLI and private portal-bus acceptance -> `crates/voisu-app/tests/daemon_cli_lifecycle.rs`
 - Delivery boundary and RemoteDesktop/libei acceptance -> `crates/voisu-app/tests/delivery.rs`
+- User-service public CLI acceptance -> `crates/voisu-app/tests/service_cli.rs`
 - Ordered implementation tickets -> `.scratch/voisu-implementation/issues/`
 
 ## Stack & run
@@ -57,6 +64,8 @@
   pending or failed setup immediately falls back to the already-preserved clipboard.
 - zbus portal sessions retain the caller identity that created them; libei uses TEXT when advertised and otherwise
   resolves Ctrl+V from the active EIS XKB keymap. A pong confirms compositor processing, never application acceptance.
+- The daemon service is enabled by the graphical session, inherits that session's current environment, and orders
+  after D-Bus, PipeWire, and the desktop portal; no checkout or volatile session value is embedded in the unit.
 
 ## Gotchas
 - Use `CONTEXT.md` terms exactly; several ordinary synonyms are banned.
@@ -65,5 +74,6 @@
   run their acceptance gate on the orchestrator/host.
 - The installed Fedora libei here is 1.5 and lacks TEXT symbols introduced in 1.6; the keyboard path therefore needs
   the EIS device to provide an XKB keymap, while a missing keymap fails closed to the preserved clipboard.
-- Claude delegation was attempted twice as mandated but its backend returned `API Error: Unable to connect to API
-  (ENOTIMP)`; the implementation used narrowly scoped local reads instead.
+- External review workers may be unavailable even after their quota resets: Ticket 09's final Sonnet reader produced
+  no output and was stopped after several minutes, so the already-green implementation received a focused manual
+  review instead.

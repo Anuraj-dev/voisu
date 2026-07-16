@@ -158,3 +158,13 @@ acceptance, and Fedora 43 ships libei 1.5 without TEXT. Delivery evidence theref
 `compositor_submitted`, never application acceptance. libei 1.6 TEXT remains preferred; 1.5 resolves Ctrl+V from the
 EIS-provided active XKB keymap and submits the already-preserved clipboard. RemoteDesktop restore tokens rotate in a
 private 0600 state file, while denial or revocation is terminal for the daemon lifetime to avoid repeated prompts.
+
+## 2026-07-16 — Install one graphical-session-owned user service from an atomic daemon copy
+**Why:** A unit that points into a checkout becomes stale across rebuilds, while embedding display, Wayland, D-Bus,
+or authorization values becomes stale across logins. `voisu service install` therefore atomically copies the trusted
+sibling `voisu-daemon` into the XDG user data directory and writes one user unit containing only that stable path.
+The unit is enabled by `graphical-session.target`, ordered after D-Bus, PipeWire, and the desktop portal, and stopped
+with the graphical session. Management reports both systemd state and versioned IPC state. A manual daemon wins
+without being killed: the CLI avoids starting a duplicate, and the `--systemd` race guard exits cleanly so
+`Restart=on-failure` cannot loop. Upgrade swaps the executable inode before restarting an already-managed service;
+uninstall disables first, waits for ownership and IPC to clear, then removes the unit, executable, and stale socket.

@@ -36,7 +36,18 @@ const PROVIDER_DEADLINE: Duration = PROVIDER_COMPLETION_DEADLINE;
 
 #[tokio::main]
 async fn main() {
+    let systemd_owned = matches!(
+        std::env::args().skip(1).collect::<Vec<_>>().as_slice(),
+        [argument] if argument == "--systemd"
+    );
     if let Err(message) = run().await {
+        // The service manager checks IPC before starting, but a manual daemon
+        // may win the race after that check. A systemd-launched duplicate exits
+        // cleanly so Restart=on-failure cannot create a crash loop.
+        if systemd_owned && message == "voisu-daemon is already running" {
+            eprintln!("manual or existing daemon detected; systemd instance not started");
+            return;
+        }
         eprintln!("{message}");
         std::process::exit(1);
     }

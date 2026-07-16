@@ -8,6 +8,7 @@ use voisu_core::{
     ProviderAuthenticator, ReadinessInspector, ReadinessStatus, Request, Response, SecretStore,
     VersionEnvelope, socket_path,
 };
+use voisu_app::service::{UserServiceAction, manage_user_service};
 use voisu_app::system::{
     FedoraReadiness, PROCESSING_RESPONSE_DEADLINE, ProviderHttpClient, SecretToolStore,
 };
@@ -24,6 +25,7 @@ enum CliAction {
     Doctor,
     AuthSet(Provider),
     AuthVerify(Provider),
+    Service(UserServiceAction),
     Help,
 }
 
@@ -36,6 +38,13 @@ fn main() -> ExitCode {
             Err(error) => fail(2, error.public_message()),
         },
         Ok(CliAction::AuthVerify(provider)) => auth_verify(provider),
+        Ok(CliAction::Service(action)) => match manage_user_service(action) {
+            Ok(report) => {
+                println!("{}", report.message);
+                ExitCode::from(report.exit_code)
+            }
+            Err(message) => fail(4, &message),
+        },
         Ok(CliAction::Help) => {
             println!("{}", usage());
             ExitCode::SUCCESS
@@ -250,7 +259,24 @@ fn parse_command() -> Result<CliAction, String> {
         [auth, verify, provider] if auth == "auth" && verify == "verify" => {
             Ok(CliAction::AuthVerify(parse_provider(provider)?))
         }
+        [service, action] if service == "service" => {
+            Ok(CliAction::Service(parse_service_action(action)?))
+        }
         _ => Err(usage().to_owned()),
+    }
+}
+
+fn parse_service_action(value: &str) -> Result<UserServiceAction, String> {
+    match value {
+        "install" => Ok(UserServiceAction::Install),
+        "start" => Ok(UserServiceAction::Start),
+        "stop" => Ok(UserServiceAction::Stop),
+        "restart" => Ok(UserServiceAction::Restart),
+        "status" => Ok(UserServiceAction::Status),
+        "uninstall" => Ok(UserServiceAction::Uninstall),
+        _ => Err(
+            "service action must be install, start, stop, restart, status, or uninstall".to_owned(),
+        ),
     }
 }
 
@@ -263,7 +289,7 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: voisu <start|stop|toggle|status|shortcut|history|export|replay|doctor|auth>\n\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>"
+    "usage: voisu <start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|service>\n\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu service <install|start|stop|restart|status|uninstall>"
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {
