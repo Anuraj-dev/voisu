@@ -1130,7 +1130,10 @@ impl<M: ReconciliationModel> TranscriptValidator for TranscriptDecisionPipeline<
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryMethod {
-    Direct,
+    /// The compositor processed Voisu's libei frame. This intentionally does
+    /// not claim that the focused application accepted or inserted the text;
+    /// libei exposes no application-level acknowledgement.
+    CompositorSubmitted,
     ClipboardFallback,
 }
 
@@ -1141,9 +1144,9 @@ pub struct DeliveryOutcome {
 }
 
 impl DeliveryOutcome {
-    pub fn direct() -> Self {
+    pub fn compositor_submitted() -> Self {
         Self {
-            method: DeliveryMethod::Direct,
+            method: DeliveryMethod::CompositorSubmitted,
             fallback_reason: None,
         }
     }

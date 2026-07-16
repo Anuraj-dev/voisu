@@ -11,9 +11,8 @@ not possible.
 **Status:** ready-for-agent
 
 - [ ] Setup requests persistent keyboard-emulation permission through the desktop portal where supported.
-- [ ] A final Transcript is placed into the focused Fedora KDE application through libei.
+- [ ] A final Transcript is submitted to the Fedora KDE compositor through libei; the public result does not claim the focused application accepted it because libei exposes no application-level acknowledgement.
 - [ ] Unicode, punctuation, multiline text, and active keyboard layouts are covered by observable Delivery tests.
-- [ ] Clipboard preservation succeeds before direct Delivery is reported successful.
-- [ ] Denial, revocation, unavailable text capability, disconnection, and application rejection produce explicit clipboard fallback.
+- [ ] Clipboard preservation succeeds before compositor submission is reported.
+- [ ] Denial, revocation, unavailable usable input capability, disconnection, and compositor rejection produce explicit clipboard fallback.
 - [ ] Partial or candidate text is never sent to the focused application.
-

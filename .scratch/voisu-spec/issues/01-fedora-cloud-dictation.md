@@ -115,10 +115,10 @@ processing, success, and failure states through versioned Unix IPC.
 - Use the XDG Global Shortcuts portal as the Fedora Trigger Key integration.
   Retain explicit CLI Recording commands for desktop-specific bindings and
   recovery.
-- Use the XDG Remote Desktop portal and libei for direct Delivery. Never require
+- Use the XDG Remote Desktop portal and libei for compositor-authorized Delivery. Never require
   raw input-device membership or privileged `uinput` access on the standard
   Fedora path.
-- Write the final Transcript to the clipboard before or as part of direct
+- Write the final Transcript to the clipboard before or as part of compositor
   Delivery so a failed insertion has a recoverable user path.
 - Prefer the desktop Secret Service for cloud credentials. Permit controlled
   environment-based credentials for development and headless diagnostics, but
@@ -158,7 +158,7 @@ processing, success, and failure states through versioned Unix IPC.
 - Portal tests use a controlled D-Bus service implementing the required public
   interfaces. They cover permission granted, denied, revoked, unavailable, and
   restored behavior.
-- Delivery tests observe the public Delivery result and fallback clipboard,
+- Delivery tests distinguish compositor submission from focused-application acceptance and observe the fallback clipboard,
   including Unicode text and applications that reject emulated input.
 - Diagnostic tests verify correlation, redaction, retention, expiry, and export
   behavior through CLI output and files in isolated XDG directories.
@@ -198,4 +198,3 @@ processing, success, and failure states through versioned Unix IPC.
   screenshot critique before it can be considered complete.
 - Package and model versions will be locked when their implementation tickets
   begin, based on then-current Fedora and provider support.
-

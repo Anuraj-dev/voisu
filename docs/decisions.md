@@ -151,3 +151,10 @@ in the background with persistent keyboard permission (`persist_mode=2`) on one 
 dialog cannot extend stop-to-Delivery latency; pending or failed setup is an explicit clipboard fallback. libei is
 loaded by SONAME at runtime and TEXT is required, preserving Unicode independently of the active layout without a
 build-time `libei-devel` dependency or an unsafe raw-input/`uinput` alternative.
+
+## 2026-07-16 — Report compositor submission honestly and support libei 1.5
+**Why:** Sol review confirmed that a libei pong acknowledges compositor processing, not focused-application
+acceptance, and Fedora 43 ships libei 1.5 without TEXT. Delivery evidence therefore reports
+`compositor_submitted`, never application acceptance. libei 1.6 TEXT remains preferred; 1.5 resolves Ctrl+V from the
+EIS-provided active XKB keymap and submits the already-preserved clipboard. RemoteDesktop restore tokens rotate in a
+private 0600 state file, while denial or revocation is terminal for the daemon lifetime to avoid repeated prompts.
