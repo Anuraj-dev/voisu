@@ -2,8 +2,9 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-16
 
 ## 🚧 In progress / next
-- Ticket 06 (issue #6, inspect and expire correlated local diagnostics) is APPROVED and closed. Next up:
-  Ticket 07 (07-global-shortcut-toggle) — Opus 4.8 high implementation, first review Sol high.
+- Ticket 07 (issue #7, "Toggle Recording through the Global Shortcuts portal") is APPROVED (Sol round 3)
+  and closed. Next up: Ticket 08 (08-libei-delivery, input synthesis via libei/portal RemoteDesktop) —
+  likely architectural; evaluate impl at Sol medium per pinned routing, first review Sol high.
 - Follow-up issue #14 remains open: make `DeepgramStream::abort` / `GroqStream::abort` cancellation-safe
   (drain→peek-then-pop) plus an abort-deadline regression test. Not blocking; pick up opportunistically.
 
@@ -41,8 +42,17 @@
   replay through both CLI and IPC; replay takes a fixture NAME (not a path) inside the private diagnostics/fixtures
   dir, validated to its basename with `O_NOFOLLOW` descriptor checks, and runs supervised under a `Replaying` state.
   Store IO is `create_new` 0600 with basename validation and a store mutex guarding concurrent access.
-- Test inventory: 132 (3 app unit + 89 acceptance incl. 1 ignored live smoke + 20 diagnostics + 6
-  provider-coordination + 14 Transcript-decision).
+- Test inventory: 141 (3 app unit + 98 acceptance incl. 1 ignored live smoke + 20 diagnostics + 6
+  provider-coordination + 14 Transcript-decision). CI green.
+- Ticket 07 delivered portal-based global shortcut toggle: portal boundary traits, listener, controlled
+  portal test double, and the `voisu` shortcut integration (commit d593f8a, Opus 4.8 high) — production
+  zbus client was initially deferred fail-closed, which Sol ruled BLOCKING; commit b4f39ba added a
+  persistent zbus client plus a real controlled GlobalShortcuts D-Bus service running on private per-test
+  dbus-daemon buses (channel-file fake removed), with `VOISU_DISABLE_SHORTCUTS=1` so non-shortcut tests
+  never touch the host desktop. Commit 900f456 added NameOwnerChanged rebind-loop handling (ShortcutEvent
+  enum, broad Request.Response subscription, authoritative session_handle adoption, session closed on bind
+  failure; mock now serves Session.Close).
+- New dependency: zbus 5 (tokio feature) in voisu-app — see docs/decisions.md.
 
 ## Architecture map
 - Domain, audio contract, provider coordination/timings, Transcript decision pipeline/guardrails, typed errors,
@@ -93,3 +103,6 @@
   code touching filesystem paths or exported evidence needs security-first review, not just correctness review.
 - A stale git stash ("partial edits from killed codex leak-fix run") and an older one ("partial review-fix from
   killed codex run") both remain on the stack — superseded by the merged fixes; safe to drop.
+- Daemon acceptance tests now spin up private per-test `dbus-daemon` buses for the controlled
+  GlobalShortcuts portal service — keep that pattern for any future portal/D-Bus work rather than reaching
+  for the host session bus.
