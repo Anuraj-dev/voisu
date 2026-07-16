@@ -18,11 +18,15 @@ set -euo pipefail
 # User-service state: `voisu service install` (and, in the live smoke,
 # `voisu service start`) enable the user unit, may restart it, and migrate away
 # any Ticket 09 XDG user-data shadow. The cleanup trap runs on success and on
-# failure and restores the mutated user-service state: it stops and disables the
-# unit the smoke enabled, restores any Ticket 09 XDG shadow unit/daemon it
-# backed up before mutating, and returns enablement/active state to the values
-# observed before the smoke. It does not attempt to restore unrelated drop-ins
-# or non-Voisu user state.
+# failure and restores the mutated user-service state: it restores any Ticket 09
+# XDG shadow unit/daemon it backed up before mutating, and — when the package was
+# already installed before the smoke — restores the unit's prior enablement
+# (including enabled-runtime) and active state. Restoration is verified, not
+# best-effort: any step that fails is printed and forces a non-zero exit even
+# when the smoke itself passed. Enablement states other than
+# enabled/enabled-runtime/disabled cannot be faithfully reproduced and are
+# reported rather than silently downgraded. Unrelated drop-ins and non-Voisu user
+# state are out of scope.
 
 rpm_path=${1:-}
 expected_commit=${2:-}
@@ -66,32 +70,62 @@ shadow_unit="$xdg_config/systemd/user/voisu.service"
 shadow_daemon="$xdg_data/voisu/bin/voisu-daemon"
 
 restore_user_service() {
-    # Undo the user-service mutations from `voisu service install`/`start`:
-    # stop and disable what the smoke enabled, restore any Ticket 09 XDG shadow
-    # it migrated away, and return enablement/active state to the pre-smoke
-    # values captured in the snapshot.
+    # Undo the user-service mutations from `voisu service install`/`start` and
+    # return 0 only if every promised restoration succeeded. Restoration failures
+    # are printed individually; the caller forces a non-zero exit so a "success"
+    # smoke can never silently leave the service disabled/stopped.
     if test -z "${snapshot_dir:-}"; then
-        return
+        return 0
     fi
+    local failed=0
+    # Best-effort quiesce whatever the smoke enabled before restoring.
     systemctl --user stop voisu.service >/dev/null 2>&1 || true
     systemctl --user disable voisu.service >/dev/null 2>&1 || true
+    # Restore any Ticket 09 XDG shadow the smoke migrated away (user data,
+    # independent of the RPM).
     if test -f "$snapshot_dir/voisu.service"; then
-        mkdir -p "$(dirname "$shadow_unit")"
-        cp -p "$snapshot_dir/voisu.service" "$shadow_unit"
+        if ! { mkdir -p "$(dirname "$shadow_unit")" \
+            && cp -p "$snapshot_dir/voisu.service" "$shadow_unit"; }; then
+            printf 'restore: could not restore Ticket 09 unit %s\n' "$shadow_unit" >&2
+            failed=1
+        fi
     fi
     if test -f "$snapshot_dir/voisu-daemon"; then
-        mkdir -p "$(dirname "$shadow_daemon")"
-        cp -p "$snapshot_dir/voisu-daemon" "$shadow_daemon"
+        if ! { mkdir -p "$(dirname "$shadow_daemon")" \
+            && cp -p "$snapshot_dir/voisu-daemon" "$shadow_daemon"; }; then
+            printf 'restore: could not restore Ticket 09 daemon %s\n' "$shadow_daemon" >&2
+            failed=1
+        fi
     fi
     systemctl --user daemon-reload >/dev/null 2>&1 || true
-    if test "${pre_enabled:-}" = enabled; then
-        systemctl --user enable voisu.service >/dev/null 2>&1 || true
-    fi
-    if test "${pre_active:-}" = active; then
-        systemctl --user start voisu.service >/dev/null 2>&1 || true
+    # Only a pre-existing package is left installed, so only then can the unit's
+    # prior enablement/active state be faithfully restored.
+    if test "$installed_before" -eq 1; then
+        case "${pre_enabled:-}" in
+            enabled)
+                systemctl --user enable voisu.service >/dev/null 2>&1 \
+                    || { printf 'restore: could not re-enable voisu.service\n' >&2; failed=1; }
+                ;;
+            enabled-runtime)
+                systemctl --user enable --runtime voisu.service >/dev/null 2>&1 \
+                    || { printf 'restore: could not re-enable (runtime) voisu.service\n' >&2; failed=1; }
+                ;;
+            ""|disabled)
+                : # pre-smoke state was not enabled; leaving it disabled is faithful.
+                ;;
+            *)
+                printf 'restore: cannot faithfully restore enablement state "%s"; left disabled\n' "$pre_enabled" >&2
+                failed=1
+                ;;
+        esac
+        if test "${pre_active:-}" = active; then
+            systemctl --user start voisu.service >/dev/null 2>&1 \
+                || { printf 'restore: could not restart voisu.service to its pre-smoke active state\n' >&2; failed=1; }
+        fi
     fi
     rm -rf "$snapshot_dir"
     snapshot_dir=
+    return "$failed"
 }
 
 cleanup() {
@@ -105,7 +139,12 @@ cleanup() {
             "${dnf_cmd[@]}" remove -y voisu >/dev/null 2>&1 || true
         fi
     fi
-    restore_user_service
+    if ! restore_user_service; then
+        printf 'user-service state could not be fully restored\n' >&2
+        if test "$rc" -eq 0; then
+            rc=1
+        fi
+    fi
     exit "$rc"
 }
 trap cleanup EXIT
@@ -133,15 +172,21 @@ if test -n "$expected_commit"; then
         *) printf 'RPM Release %s does not contain tested commit %s\n' "$release" "$expected_commit" >&2; exit 1 ;;
     esac
 fi
-rpm -qpl "$rpm_path" | grep -qx '/usr/bin/voisu'
-rpm -qpl "$rpm_path" | grep -qx '/usr/bin/voisu-daemon'
-rpm -qpl "$rpm_path" | grep -qx '/usr/lib/systemd/user/voisu.service'
-rpm -qp --requires "$rpm_path" | grep -qx 'wl-clipboard'
-rpm -qp --requires "$rpm_path" | grep -qx 'pipewire-utils'
-rpm -qp --requires "$rpm_path" | grep -qx 'wireplumber'
-rpm -qp --requires "$rpm_path" | grep -qx 'curl'
-rpm -qp --requires "$rpm_path" | grep -qx 'libsecret'
-rpm -qp --recommends "$rpm_path" | grep -q '^libei'
+# Capture rpm output once and grep the here-string. Piping `rpm | grep -q`
+# under `set -o pipefail` can abort with 141 when grep exits on an early match
+# and rpm dies of SIGPIPE mid-write; here-strings avoid the pipeline entirely.
+rpm_files=$(rpm -qpl "$rpm_path")
+grep -qx '/usr/bin/voisu' <<<"$rpm_files"
+grep -qx '/usr/bin/voisu-daemon' <<<"$rpm_files"
+grep -qx '/usr/lib/systemd/user/voisu.service' <<<"$rpm_files"
+rpm_requires=$(rpm -qp --requires "$rpm_path")
+grep -qx 'wl-clipboard' <<<"$rpm_requires"
+grep -qx 'pipewire-utils' <<<"$rpm_requires"
+grep -qx 'wireplumber' <<<"$rpm_requires"
+grep -qx 'curl' <<<"$rpm_requires"
+grep -qx 'libsecret' <<<"$rpm_requires"
+rpm_recommends=$(rpm -qp --recommends "$rpm_path")
+grep -q '^libei' <<<"$rpm_recommends"
 
 test -x /usr/bin/voisu
 test -x /usr/bin/voisu-daemon

@@ -37,10 +37,13 @@ archive with `git archive`. It then extracts that exact-commit archive and runs
 `cargo vendor --locked` from the extraction — never the working tree — so the
 vendored `Source1` is a pure function of the commit. The vendor tarball is
 written deterministically (`tar --sort=name --owner=0 --group=0 --numeric-owner
---mtime="@<commit-epoch>"` piped through `gzip -n`, so no ordering, ownership,
-mtime, or gzip-header timestamp varies), and the script re-archives the same
-tree and aborts unless the two are byte-identical. The same commit therefore
-yields a byte-identical `voisu-vendor-<version>.tar.gz`. During `%prep`, the RPM
+--mtime="@<commit-epoch>" --mode='u+rw,go=rX'` piped through `gzip -n`, so no
+ordering, ownership, mtime, permission-bit, or gzip-header variation survives).
+The self-test then runs an independent `cargo vendor --locked` of the same commit
+into a separate directory, archives it the same way, and aborts unless the two
+tarballs are byte-identical — proving cargo vendor output stability, not merely
+tar/gzip determinism. The same commit therefore yields a byte-identical
+`voisu-vendor-<version>.tar.gz`. During `%prep`, the RPM
 unpacks that archive and writes `.cargo/config.toml` with a
 `[source.crates-io] replace-with = "vendored-sources"` source. `%build` and
 `%check` use `--offline`, so a clean mock build cannot fetch crates from
@@ -152,10 +155,13 @@ binds to the exact supplied RPM by comparing the full `rpm -qp --dump` manifest
 installed `rpm -q --dump`, and refuses when a same-NEVRA package is already
 installed with a different payload — `dnf` will not replace a same-NEVRA package,
 so this stops the smoke from silently exercising the wrong artifact. It snapshots
-the user-service state that `voisu service install` mutates (enablement, active
-state, and any Ticket 09 XDG shadow it migrates away) and restores it in a
-cleanup trap that runs on success and on failure; RPM-owned files are never
-modified. The opt-in invocation additionally runs readiness, starts the packaged
+the user-service state that `voisu service install` mutates (enablement including
+enabled-runtime, active state, and any Ticket 09 XDG shadow it migrates away) and
+restores it in a cleanup trap that runs on success and on failure. Restoration is
+verified rather than best-effort: any failed step is printed and forces a
+non-zero exit even when the smoke otherwise passed, and enablement states that
+cannot be faithfully reproduced are reported instead of silently downgraded.
+RPM-owned files are never modified. The opt-in invocation additionally runs readiness, starts the packaged
 user service, performs a real three-second Recording, stops it, and verifies that
 a Transcript is available through `wl-paste`. The orchestrator must complete the
 interactive KDE/Wayland checks in `docs/release-evidence.md`, including portal

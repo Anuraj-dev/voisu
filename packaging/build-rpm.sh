@@ -38,33 +38,47 @@ grep -qx "voisu-${version}/LICENSE" "$topdir/source-archive.list"
 grep -qx "voisu-${version}/packaging/voisu.service" "$topdir/source-archive.list"
 
 # Reproducibility: vendor from an extraction of the exact-commit git archive
-# (never the working tree), then archive deterministically so the same commit
-# always yields a byte-identical Source1 tarball. cargo vendor is a pure
-# function of Cargo.lock; --sort/--owner/--group/--numeric-owner/--mtime plus
-# `gzip -n` (no name/timestamp in the gzip header) remove every remaining
-# source of nondeterminism.
+# (never the working tree), and archive deterministically. --sort fixes entry
+# order, --owner/--group/--numeric-owner fix ownership, --mtime fixes timestamps,
+# --mode normalizes permission bits (so a differing build umask cannot change the
+# headers), and `gzip -n` drops the gzip name/timestamp. The self-test then runs
+# an INDEPENDENT cargo vendor of the same commit and requires a byte-identical
+# archive, proving cargo vendor output stability rather than only tar/gzip
+# determinism.
 commit_epoch=$(git show -s --format=%ct "$commit")
 extract_dir="$topdir/extract"
 mkdir -p "$extract_dir"
 tar -xzf "$archive" -C "$extract_dir"
-vendor_dir="$topdir/vendor/voisu-vendor-${version}"
-mkdir -p "$topdir/vendor"
-( cd "$extract_dir/voisu-${version}" && cargo vendor --locked "$vendor_dir" >/dev/null )
 
+vendor_into() {
+    # $1 = parent directory to hold voisu-vendor-${version}
+    mkdir -p "$1"
+    ( cd "$extract_dir/voisu-${version}" \
+        && cargo vendor --locked "$1/voisu-vendor-${version}" >/dev/null )
+}
+
+deterministic_vendor_archive() {
+    # $1 = parent directory containing voisu-vendor-${version}, $2 = output path
+    tar --sort=name --mtime="@${commit_epoch}" \
+        --owner=0 --group=0 --numeric-owner --mode='u+rw,go=rX' \
+        -C "$1" -cf - "voisu-vendor-${version}" | gzip -n > "$2"
+}
+
+vendor_into "$topdir/vendor"
 vendor_archive="$topdir/SOURCES/voisu-vendor-${version}.tar.gz"
-tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@${commit_epoch}" \
-    -C "$topdir/vendor" -cf - "voisu-vendor-${version}" | gzip -n > "$vendor_archive"
+deterministic_vendor_archive "$topdir/vendor" "$vendor_archive"
 
-# Self-test: re-archiving the same vendored tree must be byte-identical. This
-# fails loudly if the deterministic tar/gzip invariants ever regress.
+# Discriminating self-test: an independent cargo vendor of the same commit must
+# produce a byte-identical archive. This fails loudly on either cargo vendor
+# instability or a regression in the deterministic tar/gzip invariants.
+vendor_into "$topdir/vendor-verify"
 repro_archive="$topdir/voisu-vendor-repro.tar.gz"
-tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@${commit_epoch}" \
-    -C "$topdir/vendor" -cf - "voisu-vendor-${version}" | gzip -n > "$repro_archive"
+deterministic_vendor_archive "$topdir/vendor-verify" "$repro_archive"
 if ! cmp -s "$vendor_archive" "$repro_archive"; then
-    printf '%s\n' 'vendor archive is not reproducible; deterministic tar invariants regressed' >&2
+    printf '%s\n' 'vendor archive is not reproducible: an independent cargo vendor of the same commit differs' >&2
     exit 1
 fi
-rm -f "$repro_archive"
+rm -rf "$topdir/vendor-verify" "$repro_archive"
 
 tar -tzf "$vendor_archive" > "$topdir/vendor-archive.list"
 grep -q "^voisu-vendor-${version}/" "$topdir/vendor-archive.list"
