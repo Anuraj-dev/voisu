@@ -9,11 +9,10 @@ observes the stable daemon state stream without owning any dictation work.
 
 **Status:** ready-for-agent
 
-- [ ] `DESIGN.md` locks the approved visual tokens before UI implementation begins.
-- [ ] The Overlay is hidden and performs no animation work while the daemon is idle.
-- [ ] Recording shows restrained voice activity; processing, success, and failure have distinct accessible states.
-- [ ] The surface cannot take keyboard focus or interfere with the focused application.
-- [ ] Killing, disconnecting, or restarting the Overlay cannot interrupt a Recording or Delivery.
-- [ ] Reduced motion and contrast requirements pass the design review gate.
-- [ ] Rendered Fedora screenshots are critiqued against `DESIGN.md`, corrected, and captured again before completion.
-
+- [x] `DESIGN.md` locks the approved visual tokens before UI implementation begins.
+- [x] The Overlay is hidden and performs no animation work while the daemon is idle.
+- [x] Recording shows restrained voice activity; processing, success, and failure have distinct accessible states.
+- [x] The surface cannot take keyboard focus or interfere with the focused application.
+- [x] Killing, disconnecting, or restarting the Overlay cannot interrupt a Recording or Delivery.
+- [x] Reduced motion and contrast requirements pass the design review gate.
+- [x] Rendered Fedora screenshots are critiqued against `DESIGN.md`, corrected, and captured again before completion.

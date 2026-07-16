@@ -4,6 +4,7 @@
 | Doc | What it's for |
 |-----|----------------|
 | STATE.md | Current state — read this first on any fresh session |
+| ../DESIGN.md | Ticket 11 Overlay visual tokens, accessibility gate, and screenshot checklist |
 | decisions.md | Append-only log of load-bearing choices + why |
 | conventions.md | Stack, run/test commands, naming (ubiquitous language) |
 | model-benchmark.md | Standing experiment: per-dispatch log comparing codex models (Sol/Terra/Luna) vs Opus as coder/reviewer agents |

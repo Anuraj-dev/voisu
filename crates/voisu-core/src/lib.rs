@@ -62,6 +62,9 @@ pub enum Command {
     Stop,
     Toggle,
     Status,
+    /// Observer-only status with the most recent terminal event retained.
+    /// This is not a lifecycle command and cannot mutate daemon state.
+    OverlayStatus,
     /// Returns the desktop-approved Trigger Key binding for display, or a
     /// notice that no Trigger Key is bound. Never blocks CLI start/stop/toggle.
     Shortcut,
@@ -170,6 +173,42 @@ pub struct Response {
     pub history: Option<Vec<DiagnosticRecord>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export: Option<DiagnosticExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_event: Option<OverlayEvent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayOutcome {
+    Delivered,
+    QualityFailure,
+    CaptureFailure,
+    EmptyRecording,
+    TooShortRecording,
+    SilentRecording,
+    RecordingDeadline,
+    ProviderFailure,
+    DeliveryFailure,
+    OtherFailure,
+    /// A newer daemon may report an outcome this client does not know. It must
+    /// deserialize into a safe, generic failure rather than break the whole
+    /// observer response.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OverlayEvent {
+    pub id: u64,
+    /// Identifies the daemon process instance that emitted this event. The id
+    /// counter resets to 1 on every daemon restart, so an observer must scope
+    /// event identity by `(instance, id)`; otherwise a restarted daemon's first
+    /// terminal event (id 1) collides with the last one shown and is suppressed.
+    /// Defaults to 0 for responses from a daemon that predates this field.
+    #[serde(default)]
+    pub instance: u64,
+    pub outcome: OverlayOutcome,
+    pub message: String,
 }
 
 impl Response {
@@ -195,6 +234,7 @@ impl Response {
             evidence,
             history: None,
             export: None,
+            overlay_event: None,
         }
     }
 
