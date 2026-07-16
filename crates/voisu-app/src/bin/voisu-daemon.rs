@@ -693,7 +693,7 @@ async fn actor_loop(
                                 Some(DeliveryMethod::ClipboardFallback) => {
                                     "Direct Delivery unavailable; Transcript is on the clipboard"
                                 }
-                                _ => "Recording completed; Transcript delivered",
+                                _ => "Transcript submitted through the compositor; preserved on the clipboard",
                             },
                             Some(completed.evidence),
                         ),
@@ -1894,7 +1894,7 @@ impl DeliveryAdapter for ControlledDelivery {
         Box::pin(async {
             Ok(match std::env::var("VOISU_TEST_DELIVERY_FALLBACK") {
                 Ok(reason) => DeliveryOutcome::clipboard_fallback(reason),
-                Err(_) => DeliveryOutcome::direct(),
+                Err(_) => DeliveryOutcome::compositor_submitted(),
             })
         })
     }

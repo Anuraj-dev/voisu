@@ -1980,7 +1980,7 @@ fn stop_completes_recording_and_delivery_then_returns_to_idle() {
     assert_eq!(stop["ok"], true);
     assert_eq!(
         stop["message"],
-        "Recording completed; Transcript delivered"
+        "Transcript submitted through the compositor; preserved on the clipboard"
     );
     assert_eq!(
         stop["evidence"]["stages"],
@@ -2664,7 +2664,7 @@ fn toggle_has_the_same_observable_transitions_as_start_then_stop() {
     assert!(stop.status.success(), "{}", stderr(&stop));
     assert_eq!(
         stdout(&stop),
-        "Recording completed; Transcript delivered\n"
+        "Transcript submitted through the compositor; preserved on the clipboard\n"
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 }
@@ -3296,7 +3296,7 @@ fn trigger_key_permission_denial_leaves_cli_control_usable() {
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
     assert_eq!(
         stdout(&voisu(runtime.path(), "toggle")),
-        "Recording completed; Transcript delivered\n"
+        "Transcript submitted through the compositor; preserved on the clipboard\n"
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 
@@ -3342,7 +3342,7 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
     wait_for_status(runtime.path(), "Recording\n");
     assert_eq!(
         stdout(&voisu(runtime.path(), "toggle")),
-        "Recording completed; Transcript delivered\n"
+        "Transcript submitted through the compositor; preserved on the clipboard\n"
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 
@@ -3425,7 +3425,7 @@ fn unavailable_portal_leaves_cli_control_usable() {
     assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
     assert_eq!(
         stdout(&voisu(runtime.path(), "toggle")),
-        "Recording completed; Transcript delivered\n"
+        "Transcript submitted through the compositor; preserved on the clipboard\n"
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 

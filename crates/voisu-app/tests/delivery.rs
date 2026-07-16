@@ -1,8 +1,10 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -74,6 +76,19 @@ impl RemoteDesktopPortal for FailingPortal {
     }
 }
 
+struct CountingFailingPortal {
+    reason: &'static str,
+    attempts: Arc<AtomicUsize>,
+}
+
+impl RemoteDesktopPortal for CountingFailingPortal {
+    fn connect(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        let reason = self.reason;
+        Box::pin(async move { Err(BoundaryError::new(BoundaryKind::Delivery, reason)) })
+    }
+}
+
 struct FailingSession(&'static str);
 
 impl DirectDeliverySession for FailingSession {
@@ -93,7 +108,7 @@ impl RemoteDesktopPortal for SessionPortal {
 }
 
 #[tokio::test]
-async fn clipboard_is_preserved_before_unicode_multiline_direct_delivery() {
+async fn clipboard_is_preserved_before_unicode_multiline_compositor_submission() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let mut delivery = PortalClipboardDelivery::with_boundaries(
         Box::new(RecordingClipboard(Arc::clone(&events))),
@@ -104,7 +119,7 @@ async fn clipboard_is_preserved_before_unicode_multiline_direct_delivery() {
 
     let outcome = delivery.deliver(transcript).await.unwrap();
 
-    assert_eq!(outcome.method, DeliveryMethod::Direct);
+    assert_eq!(outcome.method, DeliveryMethod::CompositorSubmitted);
     assert_eq!(
         *events.lock().unwrap(),
         vec![
@@ -132,8 +147,8 @@ async fn direct_delivery_is_never_attempted_when_clipboard_preservation_fails() 
 }
 
 #[tokio::test]
-async fn portal_denial_and_unavailable_text_capability_fall_back_explicitly() {
-    for reason in ["permission denied", "text capability unavailable"] {
+async fn portal_denial_and_unavailable_input_capability_fall_back_explicitly() {
+    for reason in ["permission denied", "libei capability unavailable"] {
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut delivery = PortalClipboardDelivery::with_boundaries(
             Box::new(RecordingClipboard(Arc::clone(&events))),
@@ -149,11 +164,36 @@ async fn portal_denial_and_unavailable_text_capability_fall_back_explicitly() {
 }
 
 #[tokio::test]
-async fn revocation_disconnection_and_application_rejection_fall_back_explicitly() {
+async fn permission_denial_is_terminal_for_the_daemon_lifetime() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut delivery = PortalClipboardDelivery::with_boundaries(
+        Box::new(RecordingClipboard(Arc::clone(&events))),
+        Box::new(CountingFailingPortal {
+            reason: "permission denied",
+            attempts: Arc::clone(&attempts),
+        }),
+    );
+
+    for text in ["first", "second"] {
+        let outcome = delivery.deliver(Transcript(text.to_owned())).await.unwrap();
+        assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
+        assert_eq!(outcome.fallback_reason.as_deref(), Some("permission denied"));
+    }
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["clipboard:first", "clipboard:second"]
+    );
+}
+
+#[tokio::test]
+async fn revocation_disconnection_and_compositor_rejection_fall_back_explicitly() {
     for reason in [
         "permission revoked",
         "libei disconnected",
-        "application rejected direct Delivery",
+        "compositor rejected libei submission",
     ] {
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut delivery = PortalClipboardDelivery::with_boundaries(
@@ -220,9 +260,9 @@ impl Drop for PrivateBus {
 struct RemoteDesktopCalls {
     selected_types: u32,
     persist_mode: u32,
-    started: bool,
-    connected_to_eis: bool,
-    _eis_peer: Option<UnixStream>,
+    restore_tokens: Vec<Option<String>>,
+    started: usize,
+    connected_to_eis: usize,
 }
 
 struct SessionService;
@@ -312,6 +352,12 @@ impl RemoteDesktopService {
             let mut calls = self.0.lock().unwrap();
             calls.selected_types = options["types"].downcast_ref::<u32>().unwrap();
             calls.persist_mode = options["persist_mode"].downcast_ref::<u32>().unwrap();
+            calls.restore_tokens.push(
+                options
+                    .get("restore_token")
+                    .and_then(|value| value.downcast_ref::<zbus::zvariant::Str<'_>>().ok())
+                    .map(|value| value.as_str().to_owned()),
+            );
         }
         let request = format!(
             "/org/freedesktop/portal/desktop/request/{}/{}",
@@ -330,7 +376,11 @@ impl RemoteDesktopService {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> zbus::zvariant::OwnedObjectPath {
-        self.0.lock().unwrap().started = true;
+        let restore_token = {
+            let mut calls = self.0.lock().unwrap();
+            calls.started += 1;
+            format!("restore-{}", calls.started)
+        };
         let request = format!(
             "/org/freedesktop/portal/desktop/request/{}/{}",
             sender(&header),
@@ -339,7 +389,13 @@ impl RemoteDesktopService {
         respond(
             connection,
             &request,
-            std::collections::HashMap::from([("devices", zbus::zvariant::Value::from(1_u32))]),
+            std::collections::HashMap::from([
+                ("devices", zbus::zvariant::Value::from(1_u32)),
+                (
+                    "restore_token",
+                    zbus::zvariant::Value::from(restore_token.as_str()),
+                ),
+            ]),
         )
         .await;
         zbus::zvariant::OwnedObjectPath::try_from(request).unwrap()
@@ -352,16 +408,16 @@ impl RemoteDesktopService {
         _options: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
     ) -> zbus::zvariant::OwnedFd {
         let (client, server) = UnixStream::pair().unwrap();
+        drop(server);
         let client: OwnedFd = client.into();
         let mut calls = self.0.lock().unwrap();
-        calls.connected_to_eis = true;
-        calls._eis_peer = Some(server);
+        calls.connected_to_eis += 1;
         client.into()
     }
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn production_portal_requests_persistent_keyboard_permission_and_connects_libei() {
+async fn production_portal_rotates_persistent_permission_and_connects_libei() {
     let bus = PrivateBus::start();
     let calls = Arc::new(Mutex::new(RemoteDesktopCalls::default()));
     let (ready_tx, ready_rx) = mpsc::channel();
@@ -392,27 +448,45 @@ async fn production_portal_requests_persistent_keyboard_permission_and_connects_
     });
     ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     let prior = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
+    let prior_token_file = std::env::var_os("VOISU_REMOTE_DESKTOP_TOKEN_FILE");
+    let token_dir = TempDir::new().unwrap();
+    let token_file = token_dir.path().join("restore-token");
     unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &bus.address) };
+    unsafe { std::env::set_var("VOISU_REMOTE_DESKTOP_TOKEN_FILE", &token_file) };
 
     let events = Arc::new(Mutex::new(Vec::new()));
-    let mut delivery = PortalClipboardDelivery::with_boundaries(
-        Box::new(RecordingClipboard(Arc::clone(&events))),
-        Box::new(FedoraRemoteDesktopPortal),
-    );
-    let outcome = delivery.deliver(Transcript("final".to_owned())).await;
+    for text in ["first", "second"] {
+        let mut delivery = PortalClipboardDelivery::with_boundaries(
+            Box::new(RecordingClipboard(Arc::clone(&events))),
+            Box::new(FedoraRemoteDesktopPortal),
+        );
+        let outcome = delivery.deliver(Transcript(text.to_owned())).await.unwrap();
+        assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
+    }
 
     match prior {
         Some(value) => unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", value) },
         None => unsafe { std::env::remove_var("DBUS_SESSION_BUS_ADDRESS") },
     }
-    drop(delivery);
+    match prior_token_file {
+        Some(value) => unsafe { std::env::set_var("VOISU_REMOTE_DESKTOP_TOKEN_FILE", value) },
+        None => unsafe { std::env::remove_var("VOISU_REMOTE_DESKTOP_TOKEN_FILE") },
+    }
     let _ = stop_tx.send(());
     let _ = service.join();
-    let outcome = outcome.unwrap();
-    assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
     let calls = calls.lock().unwrap();
     assert_eq!(calls.selected_types, 1);
     assert_eq!(calls.persist_mode, 2);
-    assert!(calls.started);
-    assert!(calls.connected_to_eis);
+    assert_eq!(calls.restore_tokens, vec![None, Some("restore-1".to_owned())]);
+    assert_eq!(calls.started, 2);
+    assert_eq!(calls.connected_to_eis, 2);
+    assert_eq!(fs::read_to_string(token_file).unwrap(), "restore-2");
+    assert_eq!(
+        fs::metadata(token_dir.path().join("restore-token"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
