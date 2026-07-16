@@ -1422,7 +1422,18 @@ fn process_diagnostic(prefix: &str, stderr: &[u8]) -> String {
     }
 }
 
-pub struct GroqProvider;
+pub struct GroqProvider {
+    reaper: ProviderReaper,
+}
+
+impl GroqProvider {
+    /// Builds a Groq provider whose streams share the actor-owned `reaper`, so a
+    /// stream dropped mid-abort hands its curl reap to the supervisor the actor
+    /// drains before Idle.
+    pub fn new(reaper: ProviderReaper) -> Self {
+        Self { reaper }
+    }
+}
 
 impl TranscriptProvider for GroqProvider {
     fn start(&mut self, _recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError> {
@@ -1442,6 +1453,7 @@ impl TranscriptProvider for GroqProvider {
             streamed_bytes: 0,
             chunks: VecDeque::new(),
             cancel: CancelRegistry::new(),
+            reaper: self.reaper.clone(),
         }))
     }
 }
@@ -1476,30 +1488,117 @@ struct GroqStream {
     /// stream and flag, cancelling one Recording can never touch the next
     /// one's requests, and stale results die with their aborted stream.
     cancel: Arc<CancelRegistry>,
+    /// Actor-owned supervisor that adopts this stream's chunk tasks if the
+    /// stream is dropped mid-abort, so their curl reap is retained and awaited
+    /// rather than detached.
+    reaper: ProviderReaper,
 }
 
-fn cancel_and_reap_provider_chunks(
-    chunks: &mut VecDeque<tokio::task::JoinHandle<Result<String, BoundaryError>>>,
-) {
-    while let Some(chunk) = chunks.pop_front() {
-        chunk.abort();
-        // Dropping a JoinHandle after `abort()` would still detach the task
-        // before Tokio observes the cancellation. Keep the handle owned by a
-        // reaper until cancellation has completed. Provider cancellation is
-        // signalled before this helper runs, so an already-running
-        // spawn_blocking request still kills and reaps its owned curl child.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = chunk.await;
-            });
+/// Actor-owned supervisor that keeps every provider-stream cleanup task alive
+/// and awaitable. When a provider stream is dropped mid-abort — for example the
+/// abort deadline elapsed and Tokio dropped the abort future that owned the
+/// boxed stream — the stream signals cancellation and hands its still-live chunk
+/// tasks here. Adoption AWAITS each chunk task (it never aborts it, which would
+/// detach the task's nested `spawn_blocking` curl before the child is reaped)
+/// and RETAINS the resulting reaper task's handle. The actor drains this
+/// supervisor under an explicit bound before it publishes Idle and before the
+/// runtime is torn down, so no killed-but-unreaped curl work outlives a
+/// Recording and Idle is never observable while blocking cleanup is detached.
+#[derive(Clone, Default)]
+pub struct ProviderReaper {
+    tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl ProviderReaper {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adopts the still-live chunk tasks of a dropped stream. Cancellation MUST
+    /// already be signalled so each task's owning bounded wait observes the flag,
+    /// kills and reaps its curl child, and returns. The reaper task AWAITS each
+    /// chunk task — never `abort()`, which drops the nested `spawn_blocking`
+    /// handle and detaches the still-running curl — and its handle is retained
+    /// so a later drain awaits the reap to completion.
+    fn adopt<T: Send + 'static>(&self, mut chunks: VecDeque<tokio::task::JoinHandle<T>>) {
+        if chunks.is_empty() {
+            return;
         }
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let handle = runtime.spawn(async move {
+                    while let Some(chunk) = chunks.pop_front() {
+                        let _ = chunk.await;
+                    }
+                });
+                self.tasks
+                    .lock()
+                    .expect("provider reaper mutex poisoned")
+                    .push(handle);
+            }
+            Err(_) => {
+                // No runtime is available to await on. The daemon always drops
+                // provider streams inside its runtime, and shutdown drains this
+                // supervisor before the runtime is torn down, so this branch is
+                // unreachable there. As a last resort abort the tasks so they
+                // cannot linger unreaped rather than silently leaking handles.
+                for chunk in chunks {
+                    chunk.abort();
+                }
+            }
+        }
+    }
+
+    /// Number of cleanup tasks currently retained (awaiting a drain). Exposed so
+    /// the actor and tests can observe that a dropped stream handed its curl reap
+    /// to this supervisor instead of detaching it.
+    pub fn pending(&self) -> usize {
+        self.tasks
+            .lock()
+            .expect("provider reaper mutex poisoned")
+            .len()
+    }
+
+    /// Awaits every retained reaper task, bounded by `within`. Returns `true`
+    /// when the supervisor fully drained. On timeout it retains any still-live
+    /// task — so cleanup is never detached — and returns `false`.
+    pub async fn drain(&self, within: Duration) -> bool {
+        let mut tasks: Vec<_> = {
+            let mut guard = self.tasks.lock().expect("provider reaper mutex poisoned");
+            std::mem::take(&mut *guard)
+        };
+        if tasks.is_empty() {
+            return true;
+        }
+        let drained = tokio::time::timeout(within, async {
+            for task in &mut tasks {
+                let _ = task.await;
+            }
+        })
+        .await
+        .is_ok();
+        if !drained {
+            let mut guard = self.tasks.lock().expect("provider reaper mutex poisoned");
+            for task in tasks {
+                if !task.is_finished() {
+                    guard.push(task);
+                }
+            }
+        }
+        drained
     }
 }
 
 impl Drop for GroqStream {
     fn drop(&mut self) {
+        // Signal cancellation FIRST so each in-flight curl request's owning
+        // bounded wait kills and reaps its child, then hand the still-live chunk
+        // tasks to the actor-owned reaper. Never abort them here: aborting the
+        // outer task drops its nested `spawn_blocking` handle and detaches the
+        // curl kill/reap, which is exactly the window that let Idle be published
+        // over live blocking work.
         self.cancel.cancel();
-        cancel_and_reap_provider_chunks(&mut self.chunks);
+        self.reaper.adopt(std::mem::take(&mut self.chunks));
     }
 }
 
@@ -1587,7 +1686,18 @@ impl ProviderStream for GroqStream {
     }
 }
 
-pub struct DeepgramProvider;
+pub struct DeepgramProvider {
+    reaper: ProviderReaper,
+}
+
+impl DeepgramProvider {
+    /// Builds a Deepgram provider whose streams share the actor-owned `reaper`,
+    /// so a stream dropped mid-abort hands its curl reap to the supervisor the
+    /// actor drains before Idle.
+    pub fn new(reaper: ProviderReaper) -> Self {
+        Self { reaper }
+    }
+}
 
 impl TranscriptProvider for DeepgramProvider {
     fn start(&mut self, _recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError> {
@@ -1610,6 +1720,7 @@ impl TranscriptProvider for DeepgramProvider {
             chunks: VecDeque::new(),
             permits: Arc::new(tokio::sync::Semaphore::new(MAX_DEEPGRAM_IN_FLIGHT)),
             cancel: CancelRegistry::new(),
+            reaper: self.reaper.clone(),
         }))
     }
 }
@@ -1622,12 +1733,19 @@ struct DeepgramStream {
     chunks: VecDeque<tokio::task::JoinHandle<Result<String, BoundaryError>>>,
     permits: Arc<tokio::sync::Semaphore>,
     cancel: Arc<CancelRegistry>,
+    /// Actor-owned supervisor that adopts this stream's chunk tasks if the
+    /// stream is dropped mid-abort, so their curl reap is retained and awaited
+    /// rather than detached.
+    reaper: ProviderReaper,
 }
 
 impl Drop for DeepgramStream {
     fn drop(&mut self) {
+        // See `Drop for GroqStream`: cancel first, then adopt (await, never
+        // abort) so the nested `spawn_blocking` curl is reaped before the
+        // reaper task completes and Idle becomes observable.
         self.cancel.cancel();
-        cancel_and_reap_provider_chunks(&mut self.chunks);
+        self.reaper.adopt(std::mem::take(&mut self.chunks));
     }
 }
 
@@ -3504,94 +3622,155 @@ fn wav_from_pcm(pcm: &[u8]) -> Result<Vec<u8>, BoundaryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use voisu_core::{ProviderCoordinator, ProviderStreams};
 
-    fn gated_provider_chunk(
-        gate: tokio::sync::oneshot::Receiver<()>,
-        completions: Arc<AtomicUsize>,
-    ) -> tokio::task::JoinHandle<Result<String, BoundaryError>> {
-        tokio::spawn(async move {
-            let _ = gate.await;
-            completions.fetch_add(1, Ordering::SeqCst);
-            Ok(String::new())
-        })
+    /// A probe chunk task shaped like a real provider chunk: the outer async
+    /// task awaits an inner `spawn_blocking` request. The blocking closure — the
+    /// one holding a live curl child in production — waits for cancellation, then
+    /// performs a kill-and-reap that the test releases explicitly, so the test
+    /// can observe cleanup ownership at the exact instant the coordinator's error
+    /// surfaces. `entered` proves the blocking task actually started; `reap_done`
+    /// is the reap-completion latch that is set only after the child is reaped.
+    struct BlockingChunkProbe {
+        entered: Arc<AtomicBool>,
+        reap_done: Arc<AtomicBool>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    fn spawn_blocking_backed_chunk(
+        cancel: Arc<CancelRegistry>,
+    ) -> (
+        tokio::task::JoinHandle<Result<String, BoundaryError>>,
+        BlockingChunkProbe,
+    ) {
+        let entered = Arc::new(AtomicBool::new(false));
+        let reap_done = Arc::new(AtomicBool::new(false));
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let entered_task = Arc::clone(&entered);
+        let reap_done_task = Arc::clone(&reap_done);
+        let handle = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                entered_task.store(true, Ordering::SeqCst);
+                // Mirror an in-flight curl request owned by this blocking task:
+                // run until the owning bounded wait observes cancellation.
+                while !cancel.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // Cancellation observed. The kill-and-reap of the child is gated
+                // by the test so the reap deliberately outlasts the abort
+                // deadline, forcing the coordinator down its timeout path while
+                // the blocking work is still live.
+                let _ = release_rx.recv();
+                reap_done_task.store(true, Ordering::SeqCst);
+                Err(BoundaryError::new(BoundaryKind::Provider, "request cancelled"))
+            })
+            .await
+            .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "request task failed"))?
+        });
+        (
+            handle,
+            BlockingChunkProbe {
+                entered,
+                reap_done,
+                release,
+            },
+        )
     }
 
     #[tokio::test]
-    async fn provider_abort_deadline_does_not_detach_adapter_tasks() {
-        let deepgram_completions = Arc::new(AtomicUsize::new(0));
-        let groq_completions = Arc::new(AtomicUsize::new(0));
-        let (mut deepgram_gate, deepgram_wait) = tokio::sync::oneshot::channel();
-        let (mut groq_gate, groq_wait) = tokio::sync::oneshot::channel();
+    async fn provider_abort_deadline_retains_and_reaps_blocking_work_before_idle() {
+        let reaper = ProviderReaper::new();
         let credential = Credential::new("controlled-credential".to_owned()).unwrap();
+        let deepgram_cancel = CancelRegistry::new();
+        let groq_cancel = CancelRegistry::new();
+        let (deepgram_chunk, deepgram_probe) =
+            spawn_blocking_backed_chunk(Arc::clone(&deepgram_cancel));
+        let (groq_chunk, groq_probe) = spawn_blocking_backed_chunk(Arc::clone(&groq_cancel));
         let streams = ProviderStreams {
             deepgram: Box::new(DeepgramStream {
                 credential: credential.clone(),
                 endpoint: "http://localhost/deepgram".to_owned(),
                 buffer: Vec::new(),
                 streamed_bytes: 0,
-                chunks: VecDeque::from([gated_provider_chunk(
-                    deepgram_wait,
-                    Arc::clone(&deepgram_completions),
-                )]),
+                chunks: VecDeque::from([deepgram_chunk]),
                 permits: Arc::new(tokio::sync::Semaphore::new(MAX_DEEPGRAM_IN_FLIGHT)),
-                cancel: CancelRegistry::new(),
+                cancel: deepgram_cancel,
+                reaper: reaper.clone(),
             }),
             groq: Box::new(GroqStream {
                 credential,
                 endpoint: "http://localhost/groq".to_owned(),
                 buffer: Vec::new(),
                 streamed_bytes: 0,
-                chunks: VecDeque::from([gated_provider_chunk(
-                    groq_wait,
-                    Arc::clone(&groq_completions),
-                )]),
-                cancel: CancelRegistry::new(),
+                chunks: VecDeque::from([groq_chunk]),
+                cancel: groq_cancel,
+                reaper: reaper.clone(),
             }),
         };
 
-        let error = ProviderCoordinator::start(
-            Duration::from_millis(10),
-            Duration::from_millis(10),
-            streams,
-        )
-        .complete(CapturedAudio::empty())
-        .await
-        .unwrap_err();
+        // Both blocking requests must actually be executing inside spawn_blocking
+        // before the deadline fires, so cleanup has real nested ownership to lose.
+        wait_for(&deepgram_probe.entered).await;
+        wait_for(&groq_probe.entered).await;
+
+        let error =
+            ProviderCoordinator::start(Duration::from_millis(10), Duration::from_millis(10), streams)
+                .complete(CapturedAudio::empty())
+                .await
+                .unwrap_err();
         assert_eq!(error.diagnostic(), "provider deadline cleanup timed out");
 
-        tokio::time::timeout(Duration::from_millis(100), async {
-            tokio::join!(deepgram_gate.closed(), groq_gate.closed());
-        })
-        .await
-        .expect("timed-out abort futures must cancel and reap both adapter tasks");
+        // The moment the coordinator's cleanup-timeout error surfaces, the
+        // blocking curl work is still live (its reap has not been released).
+        // Publishing Idle here without draining would strand that live work.
         assert!(
-            deepgram_gate.send(()).is_err(),
-            "the Deepgram gate receiver must be dropped before cleanup returns"
+            !deepgram_probe.reap_done.load(Ordering::SeqCst),
+            "Deepgram curl reap must still be in flight when cleanup times out"
         );
         assert!(
-            groq_gate.send(()).is_err(),
-            "the Groq gate receiver must be dropped before cleanup returns"
+            !groq_probe.reap_done.load(Ordering::SeqCst),
+            "Groq curl reap must still be in flight when cleanup times out"
         );
-        tokio::time::timeout(Duration::from_millis(100), async {
-            for _ in 0..32 {
-                tokio::task::yield_now().await;
+        // Cleanup ownership was RETAINED by the actor-owned supervisor rather
+        // than aborted and detached: with the detach defect this count is zero.
+        assert_eq!(
+            reaper.pending(),
+            2,
+            "both dropped streams must hand their curl reap to the supervisor"
+        );
+
+        // Release the reaps and drain the supervisor, exactly as the actor does
+        // before it publishes Idle. Draining must await the retained reaper tasks
+        // until the nested blocking work has actually completed its reap.
+        let _ = deepgram_probe.release.send(());
+        let _ = groq_probe.release.send(());
+        assert!(
+            reaper.drain(Duration::from_secs(2)).await,
+            "the supervisor must fully drain within the bound"
+        );
+        assert!(
+            deepgram_probe.reap_done.load(Ordering::SeqCst),
+            "draining must not return until the Deepgram blocking reap completed"
+        );
+        assert!(
+            groq_probe.reap_done.load(Ordering::SeqCst),
+            "draining must not return until the Groq blocking reap completed"
+        );
+        assert_eq!(reaper.pending(), 0, "a full drain must leave nothing retained");
+    }
+
+    /// Spins until an `entered` latch is set, bounded so a genuine failure to
+    /// enter spawn_blocking surfaces as a timeout rather than a hang.
+    async fn wait_for(flag: &Arc<AtomicBool>) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !flag.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
-        .expect("bounded scheduler observation window elapsed");
-        assert_eq!(
-            deepgram_completions.load(Ordering::SeqCst),
-            0,
-            "the Deepgram abort future must retain its handle until await completes"
-        );
-        assert_eq!(
-            groq_completions.load(Ordering::SeqCst),
-            0,
-            "the Groq abort future must retain its handle until await completes"
-        );
+        .expect("probe blocking task must enter spawn_blocking");
     }
 
     #[test]

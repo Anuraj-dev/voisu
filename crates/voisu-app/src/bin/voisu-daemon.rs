@@ -15,7 +15,7 @@ use tokio::time::timeout;
 use voisu_app::system::{
     CAPTURE_FINALIZE_DEADLINE, DeepgramProvider, FedoraShortcutPortal,
     GroqProvider, MergeResultValidator, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture,
-    PortalClipboardDelivery, RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
+    PortalClipboardDelivery, ProviderReaper, RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
@@ -89,7 +89,16 @@ async fn run() -> Result<(), String> {
     }
 
     let (actor_tx, actor_rx) = mpsc::channel(64);
-    tokio::spawn(actor_loop(actor_rx, actor_tx.clone(), diagnostics));
+    // The actor-owned provider reaper supervises every provider-stream cleanup
+    // task. A clone stays here so runtime shutdown drains any curl reap still in
+    // flight before this function returns and the Tokio runtime is torn down.
+    let reaper = ProviderReaper::new();
+    tokio::spawn(actor_loop(
+        actor_rx,
+        actor_tx.clone(),
+        diagnostics,
+        reaper.clone(),
+    ));
     // The Global Shortcuts portal listener runs off the actor so a slow or
     // unavailable portal never blocks the IPC surface. Each Trigger Key
     // activation is fed to the actor as a Toggle, reusing the actor's
@@ -125,9 +134,15 @@ async fn run() -> Result<(), String> {
             }
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|error| format!("cannot listen for shutdown: {error}"))?;
+                reaper.drain(RECOVERY_ABORT_DEADLINE).await;
                 return Ok(());
             }
-            _ = terminate.recv() => return Ok(()),
+            _ = terminate.recv() => {
+                // Gate runtime shutdown on draining any in-flight provider reap,
+                // so the runtime is not torn down over detached curl cleanup.
+                reaper.drain(RECOVERY_ABORT_DEADLINE).await;
+                return Ok(());
+            }
         }
     }
 }
@@ -312,6 +327,7 @@ async fn actor_loop(
     mut rx: mpsc::Receiver<ActorMessage>,
     tx: mpsc::Sender<ActorMessage>,
     diagnostics: Arc<DiagnosticStore>,
+    reaper: ProviderReaper,
 ) {
     let mut state = ActorState::Idle;
     let mut next_id = 1_u64;
@@ -329,12 +345,12 @@ async fn actor_loop(
     let mut deepgram: Option<Box<dyn TranscriptProvider>> = Some(if controlled {
         Box::new(ControlledProvider::from_env(Provider::Deepgram))
     } else {
-        Box::new(DeepgramProvider)
+        Box::new(DeepgramProvider::new(reaper.clone()))
     });
     let mut groq: Option<Box<dyn TranscriptProvider>> = Some(if controlled {
         Box::new(ControlledProvider::from_env(Provider::Groq))
     } else {
-        Box::new(GroqProvider)
+        Box::new(GroqProvider::new(reaper.clone()))
     });
     let mut validator: Option<Box<dyn TranscriptValidator>> = if controlled {
         Some(Box::new(ControlledValidator::from_env()))
@@ -418,7 +434,14 @@ async fn actor_loop(
                         current_validator,
                         provider_deadline,
                     ));
-                    tokio::spawn(supervise_replay(replay, id, controlled, reply, tx.clone()));
+                    tokio::spawn(supervise_replay(
+                        replay,
+                        id,
+                        controlled,
+                        reply,
+                        tx.clone(),
+                        reaper.clone(),
+                    ));
                 }
                 Command::Replay(_) => {
                     let _ = reply.send(Response::rejected(
@@ -641,6 +664,9 @@ async fn actor_loop(
             }
             ActorMessage::Recovered(id) => {
                 if matches!(&state, ActorState::Recovering(recovering) if *recovering == id) {
+                    // A failed start's provider stream may have been dropped
+                    // mid-abort; gate Idle on draining its retained curl reap.
+                    reaper.drain(RECOVERY_ABORT_DEADLINE).await;
                     state = ActorState::Idle;
                 }
             }
@@ -660,6 +686,7 @@ async fn actor_loop(
                 groq = Some(returned_groq);
                 validator = Some(returned_validator);
                 if matches!(&state, ActorState::Replaying(replaying) if *replaying == id) {
+                    reaper.drain(RECOVERY_ABORT_DEADLINE).await;
                     state = ActorState::Idle;
                 }
                 let _ = reply.send(response);
@@ -695,6 +722,10 @@ async fn actor_loop(
                 delivery = Some(completed.delivery);
                 if matches!(&state, ActorState::Processing(evidence) if evidence.recording_id == completed.id)
                 {
+                    // The provider coordinator may have hit its abort deadline
+                    // and dropped a stream mid-cleanup; gate Idle on draining the
+                    // retained curl reap so no blocking work outlives Idle.
+                    reaper.drain(RECOVERY_ABORT_DEADLINE).await;
                     state = ActorState::Idle;
                     let response = match completed.result {
                         Ok(()) => Response::with_evidence(
@@ -1180,6 +1211,7 @@ async fn supervise_replay(
     controlled: bool,
     reply: oneshot::Sender<Response>,
     actor: mpsc::Sender<ActorMessage>,
+    reaper: ProviderReaper,
 ) {
     let completion = match replay.await {
         Ok(result) => ReplayCompletion {
@@ -1192,7 +1224,7 @@ async fn supervise_replay(
         },
         Err(join_error) => {
             eprintln!("Replay {id}: replay task failed: {join_error}");
-            let (deepgram, groq, validator) = rebuild_replay_adapters(controlled);
+            let (deepgram, groq, validator) = rebuild_replay_adapters(controlled, &reaper);
             ReplayCompletion {
                 id,
                 deepgram,
@@ -1210,6 +1242,7 @@ async fn supervise_replay(
 /// the originals. Mirrors the actor's startup construction.
 fn rebuild_replay_adapters(
     controlled: bool,
+    reaper: &ProviderReaper,
 ) -> (
     Box<dyn TranscriptProvider>,
     Box<dyn TranscriptProvider>,
@@ -1223,8 +1256,8 @@ fn rebuild_replay_adapters(
         )
     } else {
         (
-            Box::new(DeepgramProvider),
-            Box::new(GroqProvider),
+            Box::new(DeepgramProvider::new(reaper.clone())),
+            Box::new(GroqProvider::new(reaper.clone())),
             Box::new(MergeResultValidator::new()),
         )
     }
