@@ -179,3 +179,10 @@ subagents remain the orchestrator's tool only.
 spin forever. The user unit permits three starts per 30 seconds, while microphone, provider, portal, CLI, and
 Delivery failures stay inside one Recording and recover to a fresh next Recording. Retrying or replaying a failed
 Recording was rejected because it risks duplicate Delivery and ghost cloud work.
+
+## 2026-07-16 — Guard every external child against abrupt owner death
+**Why:** Bounded cancellation cannot run after an uncatchable process interruption, so each PipeWire, provider,
+clipboard, secret-store, and systemctl child must also have a kernel-enforced owner-death contract. One shared Linux
+spawn hook sets `PR_SET_PDEATHSIG=SIGKILL` and refuses exec when the expected parent is already gone, closing the
+fork-to-prctl race. Per-command hooks were rejected because they had already left provider and service children
+uncovered and allowed the PipeWire hook to omit the race check.

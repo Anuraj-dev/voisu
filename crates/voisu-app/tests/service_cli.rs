@@ -155,6 +155,27 @@ esac
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+fn write_parent_death_probing_systemctl(path: &Path) {
+    fs::write(
+        path,
+        r#"#!/usr/bin/python3
+import ctypes
+import signal
+import sys
+
+value = ctypes.c_int()
+if ctypes.CDLL(None).prctl(2, ctypes.byref(value)) != 0 or value.value != signal.SIGKILL:
+    sys.exit(9)
+if len(sys.argv) > 2 and sys.argv[2] == "is-active":
+    print("inactive")
+    sys.exit(3)
+sys.exit(0)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -173,6 +194,17 @@ fn wait_for_socket(runtime: &Path, present: bool) {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("daemon socket did not reach present={present}: {}", socket.display());
+}
+
+#[test]
+fn service_manager_guards_its_systemctl_child_with_parent_death_signal() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    write_parent_death_probing_systemctl(&fixture.root.path().join("fake-bin/systemctl"));
+
+    let status = fixture.run(&["service", "status"]);
+
+    assert_eq!(status.status.code(), Some(3), "{}", stderr(&status));
+    assert!(stdout(&status).contains("systemd user service inactive"));
 }
 
 #[test]

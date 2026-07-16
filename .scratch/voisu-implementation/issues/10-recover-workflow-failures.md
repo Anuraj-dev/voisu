@@ -7,8 +7,8 @@ failures in every external boundary and after abrupt process interruption.
 
 **Blocked by:** 06 — Inspect and expire correlated local diagnostics; 07 — Toggle Recording through the Global Shortcuts portal; 08 — Deliver text through libei with clipboard fallback; 09 — Own the daemon through a systemd user service.
 
-**Status:** implemented on `ticket-10-recovery` at `86b2225` and `d6bd6b0`; workspace gate green,
-review and PR pending
+**Status:** implemented on `ticket-10-recovery`; round-1 review findings fixed with discriminating parent-death
+probes and production-boundary portal Delivery coverage; re-review pending
 
 - [x] Microphone disappearance and reconnection leave the next Recording usable.
 - [x] Provider disconnect, malformed response, quota error, and deadline expiry follow documented fallback behavior.

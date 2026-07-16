@@ -195,7 +195,14 @@ impl Daemon {
     }
 
     fn crash(mut self) {
-        self.child.kill().expect("daemon should be killed");
+        // Send SIGKILL to the daemon PID only. Killing the process group here
+        // would also kill its external children and falsely credit the daemon
+        // with a parent-death cleanup contract it never established.
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGKILL) },
+            0,
+            "daemon should be killed"
+        );
         let _ = self.child.wait();
     }
 
@@ -571,6 +578,8 @@ cat > "$dir/clipboard"
 }
 
 #[test]
+// Acceptance proof for provider fallback that already existed on `main`; no
+// Ticket 10 production algorithm is claimed by this test.
 fn provider_disconnect_malformed_response_and_quota_error_fall_back_and_recover() {
     for failure in ["disconnect", "malformed", "quota"] {
         let runtime = TempDir::new().unwrap();
@@ -1050,6 +1059,8 @@ fn production_capture_death_mid_recording_self_recovers_without_stop() {
 }
 
 #[test]
+// Acceptance proof for PipeWire recovery that already existed on `main`; no
+// Ticket 10 production algorithm is claimed by this test.
 fn microphone_disappearance_and_reconnection_leave_the_next_recording_usable() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
@@ -1287,6 +1298,8 @@ fn live_fedora_microphone_groq_and_clipboard_smoke() {
 
 #[test]
 #[ignore = "requires Fedora PipeWire, Groq and Deepgram credentials, portals, systemd user service, wl-paste, and VOISU_LIVE_RECOVERY_SMOKE=1"]
+// Opt-in integration proof for pre-existing systemd restart and workflow
+// recovery. Ticket 10's discriminating service change is the start-rate limit.
 fn live_fedora_full_workflow_recovers_the_next_recording_after_daemon_interruption() {
     assert_eq!(
         std::env::var("VOISU_LIVE_RECOVERY_SMOKE").as_deref(),
@@ -1301,6 +1314,7 @@ fn live_fedora_full_workflow_recovers_the_next_recording_after_daemon_interrupti
             .output()
             .unwrap()
     };
+    let mut cleanup = LiveServiceCleanup::require_absent();
 
     let installed = run(&["service", "install"]);
     assert!(installed.status.success(), "{}", stderr(&installed));
@@ -1336,6 +1350,7 @@ fn live_fedora_full_workflow_recovers_the_next_recording_after_daemon_interrupti
     };
 
     exercise_recording();
+    let original_main_pid = live_service_main_pid();
     let interrupted = Command::new("systemctl")
         .args(["--user", "kill", "--signal=KILL", "voisu.service"])
         .output()
@@ -1360,9 +1375,108 @@ fn live_fedora_full_workflow_recovers_the_next_recording_after_daemon_interrupti
     }
 
     exercise_recording();
+    let restarted_main_pid = live_service_main_pid();
+    assert_ne!(original_main_pid, restarted_main_pid);
     let clipboard = Command::new("wl-paste").output().unwrap();
     assert!(clipboard.status.success());
     assert!(!clipboard.stdout.is_empty(), "Transcript must remain on the clipboard");
+    cleanup.finish();
+}
+
+struct LiveServiceCleanup {
+    unit: PathBuf,
+    daemon: PathBuf,
+    finished: bool,
+}
+
+impl LiveServiceCleanup {
+    fn require_absent() -> Self {
+        let config_home = live_xdg_home("XDG_CONFIG_HOME", ".config");
+        let data_home = live_xdg_home("XDG_DATA_HOME", ".local/share");
+        let cleanup = Self {
+            unit: config_home.join("systemd/user/voisu.service"),
+            daemon: data_home.join("voisu/bin/voisu-daemon"),
+            finished: false,
+        };
+        assert!(
+            !cleanup.unit.exists() && !cleanup.daemon.exists(),
+            "live recovery smoke requires Voisu to be uninstalled so it cannot overwrite a real installation"
+        );
+        assert!(
+            !live_systemctl(&["is-active", "voisu.service"]).status.success(),
+            "live recovery smoke requires an inactive voisu.service"
+        );
+        assert!(
+            !live_systemctl(&["is-enabled", "voisu.service"]).status.success(),
+            "live recovery smoke requires a disabled voisu.service"
+        );
+        cleanup
+    }
+
+    fn finish(&mut self) {
+        self.cleanup(true);
+        self.finished = true;
+    }
+
+    fn cleanup(&self, required: bool) {
+        let disabled = live_systemctl(&["disable", "--now", "voisu.service"]);
+        if required {
+            assert!(disabled.status.success(), "{}", stderr(&disabled));
+        }
+        for path in [&self.unit, &self.daemon] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if !required => eprintln!("live smoke cleanup failed: {error}"),
+                Err(error) => panic!("live smoke cleanup failed: {error}"),
+            }
+        }
+        let reloaded = live_systemctl(&["daemon-reload"]);
+        if required {
+            assert!(reloaded.status.success(), "{}", stderr(&reloaded));
+            assert!(!self.unit.exists());
+            assert!(!self.daemon.exists());
+            assert!(!live_systemctl(&["is-active", "voisu.service"]).status.success());
+            assert!(!live_systemctl(&["is-enabled", "voisu.service"]).status.success());
+        }
+        let _ = live_systemctl(&["reset-failed", "voisu.service"]);
+    }
+}
+
+impl Drop for LiveServiceCleanup {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cleanup(false);
+        }
+    }
+}
+
+fn live_xdg_home(variable: &str, fallback: &str) -> PathBuf {
+    if let Some(value) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(value);
+        assert!(path.is_absolute(), "{variable} must be absolute");
+        return path;
+    }
+    PathBuf::from(std::env::var_os("HOME").expect("HOME is required")).join(fallback)
+}
+
+fn live_systemctl(arguments: &[&str]) -> Output {
+    Command::new("systemctl")
+        .arg("--user")
+        .args(arguments)
+        .output()
+        .unwrap()
+}
+
+fn live_service_main_pid() -> u32 {
+    let output = live_systemctl(&[
+        "show",
+        "--property=MainPID",
+        "--value",
+        "voisu.service",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    stdout(&output).trim().parse().unwrap()
 }
 
 fn production_recording_quality_failure(script_body: &str, expected: &str) {
@@ -1732,6 +1846,76 @@ fn write_fake_command(directory: &Path, name: &str, script: &str) {
     fs::write(&path, script).expect("fake command should be written");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
         .expect("fake command should be executable");
+}
+
+fn start_portal_clipboard_daemon(
+    runtime: &Path,
+    commands: &Path,
+    portal_address: &str,
+) -> Daemon {
+    write_fake_command(
+        commands,
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+head -c 6400 /dev/zero | tr '\000' '\100'
+trap 'exit 0' INT TERM
+: > "$dir/pw-record.ready"
+while :; do sleep 0.01; done
+"#,
+    );
+    write_fake_command(
+        commands,
+        "curl",
+        r#"#!/bin/sh
+config=$(mktemp)
+cat > "$config"
+if grep -q 'deepgram.test' "$config"; then
+  printf '{"results":{"channels":[{"alternatives":[{"transcript":"Portal recovery Transcript"}]}]}}'
+else
+  printf '{"text":"Portal recovery Transcript"}'
+fi
+rm -f "$config"
+"#,
+    );
+    write_fake_command(
+        commands,
+        "wl-copy",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+cat > "$dir/clipboard"
+count=$(cat "$dir/delivery.count" 2>/dev/null || printf '0')
+printf '%s' "$((count + 1))" > "$dir/delivery.count"
+"#,
+    );
+    let path = format!(
+        "{}:{}",
+        commands.display(),
+        std::env::var("PATH").unwrap()
+    );
+    Daemon::start_production_with_env(
+        runtime,
+        &[
+            ("PATH", &path),
+            ("DBUS_SESSION_BUS_ADDRESS", portal_address),
+            ("VOISU_TEST_MODE", "system-boundaries"),
+            ("VOISU_DISABLE_DIRECT_DELIVERY", "1"),
+            ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
+            ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
+            (
+                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
+                "https://deepgram.test/v1/listen",
+            ),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
+        ],
+    )
+}
+
+fn wait_for_portal_capture(commands: &Path) {
+    wait_for_marker(commands, "pw-record.ready");
 }
 
 fn ipc_request(runtime_dir: &Path, request: &str) -> Value {
@@ -3579,15 +3763,16 @@ fn trigger_key_permission_denial_leaves_cli_control_usable() {
 }
 
 #[test]
+// Acceptance proof for portal recovery that already existed on `main`; Ticket
+// 10 adds production-boundary clipboard evidence, not a new portal algorithm.
 fn trigger_key_portal_revocation_leaves_cli_control_usable() {
     let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
     let portal = MockPortal::start();
-    let daemon = Daemon::start_with_env(
+    let daemon = start_portal_clipboard_daemon(
         runtime.path(),
-        &[
-            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
-            ("VOISU_TEST_DELIVERY_FALLBACK", "portal unavailable"),
-        ],
+        commands.path(),
+        portal.address(),
     );
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
@@ -3602,26 +3787,38 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
 
     assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
     wait_for_status(runtime.path(), "Recording\n");
+    wait_for_portal_capture(commands.path());
+    let stopped = voisu(runtime.path(), "toggle");
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
     assert_eq!(
-        stdout(&voisu(runtime.path(), "toggle")),
+        stdout(&stopped),
         "Direct Delivery unavailable; Transcript is on the clipboard\n"
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(
+        fs::read_to_string(commands.path().join("clipboard")).unwrap(),
+        "Portal recovery Transcript"
+    );
+    assert_eq!(
+        fs::read_to_string(commands.path().join("delivery.count")).unwrap(),
+        "1"
+    );
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(diagnostics.contains("Trigger Key portal ended"), "{diagnostics}");
 }
 
 #[test]
+// Acceptance proof for portal restart/rebind that already existed on `main`;
+// Ticket 10 strengthens it with real clipboard Delivery through system edges.
 fn portal_restart_clears_the_stale_binding_and_rebinds_the_trigger_key() {
     let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
     let mut portal = MockPortal::start();
-    let daemon = Daemon::start_with_env(
+    let daemon = start_portal_clipboard_daemon(
         runtime.path(),
-        &[
-            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
-            ("VOISU_TEST_DELIVERY_FALLBACK", "portal restarted"),
-        ],
+        commands.path(),
+        portal.address(),
     );
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
@@ -3640,13 +3837,30 @@ fn portal_restart_clears_the_stale_binding_and_rebinds_the_trigger_key() {
 
     portal.activate();
     wait_for_status(runtime.path(), "Recording\n");
+    wait_for_portal_capture(commands.path());
     portal.activate();
     wait_for_status(runtime.path(), "idle\n");
-
-    assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
     assert_eq!(
-        stdout(&voisu(runtime.path(), "toggle")),
+        fs::read_to_string(commands.path().join("clipboard")).unwrap(),
+        "Portal recovery Transcript"
+    );
+
+    fs::remove_file(commands.path().join("pw-record.ready")).unwrap();
+    assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
+    wait_for_portal_capture(commands.path());
+    let stopped = voisu(runtime.path(), "toggle");
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    assert_eq!(
+        stdout(&stopped),
         "Direct Delivery unavailable; Transcript is on the clipboard\n"
+    );
+    assert_eq!(
+        fs::read_to_string(commands.path().join("clipboard")).unwrap(),
+        "Portal recovery Transcript"
+    );
+    assert_eq!(
+        fs::read_to_string(commands.path().join("delivery.count")).unwrap(),
+        "2"
     );
 
     let diagnostics = daemon.terminate_and_stderr();
@@ -3801,6 +4015,9 @@ fn sigterm_cleans_up_and_a_crash_leaves_a_safely_recoverable_socket() {
 }
 
 #[test]
+// Ticket 10 hardens the shared external-child spawn path. The deterministic
+// parent-death probes fail when that guard is reverted; this acceptance slice
+// additionally proves stale ownership and the next Recording through IPC.
 fn daemon_interruption_reaps_boundary_processes_and_restarts_in_a_safe_state() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
@@ -3822,10 +4039,11 @@ while test "$i" -lt 6000; do sleep 0.01; i=$((i + 1)); done
         r#"#!/bin/sh
 dir=$(dirname "$0")
 cat >/dev/null
+exec </dev/null >/dev/null 2>&1
+trap '' EXIT HUP INT TERM PIPE
 printf '%s' "$$" > "$dir/curl.pid"
 : > "$dir/curl.started"
-i=0
-while test "$i" -lt 6000; do sleep 0.01; i=$((i + 1)); done
+exec setsid sleep infinity
 "#,
     );
     let path = format!(
@@ -3852,6 +4070,12 @@ while test "$i" -lt 6000; do sleep 0.01; i=$((i + 1)); done
             .parse::<u32>()
             .unwrap()
     });
+    for pid in boundary_pids {
+        assert!(
+            Path::new(&format!("/proc/{pid}")).exists(),
+            "boundary process {pid} must be live before daemon interruption"
+        );
+    }
 
     daemon.crash();
     assert!(socket_path(runtime.path()).exists());
@@ -4299,6 +4523,8 @@ fn repeated_failures_never_deliver_and_the_next_recording_delivers_once() {
 }
 
 #[test]
+// Acceptance proof for CLI independence that already existed on `main`; no
+// Ticket 10 production algorithm is claimed by this test.
 fn cli_termination_during_stop_cannot_abandon_the_daemon_or_duplicate_delivery() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start_with_env(
