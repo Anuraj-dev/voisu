@@ -64,7 +64,8 @@ fn build_overlay(application: &gtk::Application) {
 
     let css = gtk::CssProvider::new();
     css.load_from_data(
-        ".capsule { background: rgba(23, 25, 29, 0.96); border-radius: 32px; }
+        "window.background { background: transparent; }
+         .capsule { background: rgba(23, 25, 29, 0.96); border-radius: 32px; }
          .capsule .state-label, .capsule .meter { color: #F4F5F7; font-size: 11pt; font-weight: 600; }
          .capsule.recording .state-label, .capsule.recording .meter { color: #65D6A0; }
          .capsule.processing .state-label, .capsule.processing .meter { color: #8FB4FF; }

@@ -56,6 +56,12 @@ same labels, spacing, and contrast targets; no state depends on hue alone.
 
 Before Ticket 11 is closed, capture the Overlay on Fedora KDE Plasma / Wayland
 for Recording, Processing, Success, Failure, and Idle. Critique each capture
-against the tokens above, correct any mismatch, and recapture. This sandbox
-cannot open a real desktop surface, so the Fedora screenshot gate is **PENDING
-for the orchestrator/host**; no screenshots are claimed here.
+against the tokens above, correct any mismatch, and recapture.
+
+**Completed 2026-07-16 on Fedora KDE Plasma / Wayland.** Round 1 found one
+mismatch: the GTK window background rendered as a visible square-cornered
+rectangle behind the rounded capsule. Corrected with a transparent window
+background so only the 32 px-radius capsule surface is drawn, then all states
+(Recording, Processing, Success, Failure, Daemon unavailable, Idle-hidden)
+were recaptured and pass. Captures are stored in
+`.scratch/voisu-implementation/screenshots/ticket-11/`.
