@@ -10,11 +10,17 @@ credentials are required.
 
 | Item | Evidence |
 |---|---|
-| Git commit | PENDING — record the full commit from `git rev-parse HEAD` |
-| RPM Release | PENDING — record `rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n'` |
-| Cargo lockfile | PENDING — the source archive and vendored `Source1` have not been produced because `rpmbuild` is unavailable |
-| Standard suite | PENDING — the repository gate ran, but the exact RPM `%check` has not run because `rpmbuild` is unavailable |
-| Overlay check | PENDING — the repository gate ran, but the exact RPM overlay build/check has not run because `rpmbuild` is unavailable |
+| Git commit | PENDING final release run — record the full commit from `git rev-parse HEAD`; the build pipeline itself is PROVEN (see below) |
+| RPM Release | PENDING final release run — record `rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n'`; a host build at `674b93e` produced `voisu-0.1.0-1.git674b93e….fc43.x86_64` |
+| Cargo lockfile | PROVEN — `packaging/build-rpm.sh` produced the exact-commit source archive and deterministic vendored `Source1` on the Fedora host; the offline `--locked` build consumed them |
+| Standard suite | PROVEN — the exact RPM `%check` ran the full release test suite inside `rpmbuild` on the Fedora host with 0 failures |
+| Overlay check | PROVEN — the exact RPM overlay release build and `cargo check --features overlay` ran inside `rpmbuild` on the Fedora host |
+| rpmlint | PROVEN — 0 substantive findings after polish; remaining warnings are cosmetic (no man pages, changelog carries the static base version while Release embeds the commit) |
+
+The host `rpmbuild` gate first ran at commit `674b93e` (artifacts in `dist/rpm/`:
+base, overlay, debuginfo RPMs and the SRPM). The final release artifact is
+rebuilt at the merged commit and its NEVRA recorded above at that time. The live
+desktop rows below remain host work.
 
 ## Evidence categories
 

@@ -236,7 +236,7 @@ grep -qx 'wl-clipboard' <<<"$rpm_requires"
 grep -qx 'pipewire-utils' <<<"$rpm_requires"
 grep -qx 'wireplumber' <<<"$rpm_requires"
 grep -qx 'curl' <<<"$rpm_requires"
-grep -qx 'libsecret' <<<"$rpm_requires"
+grep -qx '/usr/bin/secret-tool' <<<"$rpm_requires"
 rpm_recommends=$(rpm -qp --recommends "$rpm_path")
 grep -q '^libei' <<<"$rpm_recommends"
 

@@ -31,13 +31,15 @@ BuildRequires:  pkgconfig(xkbcommon)
 # (https://packages.fedoraproject.org/pkgs/wireplumber/wireplumber/fedora-43-updates.html),
 # and libsecret ships secret-tool
 # (https://packages.fedoraproject.org/pkgs/libsecret/libsecret/fedora-43-updates.html).
+# secret-tool is required as a FILE dependency: Voisu needs the binary, not the
+# library, and `Requires: libsecret` trips rpmlint's explicit-lib-dependency.
 # libei is dlopen()'d by SONAME and is therefore an optional runtime capability
 # rather than a hard build/link dependency.
 Requires:       wl-clipboard
 Requires:       pipewire-utils
 Requires:       wireplumber
 Requires:       curl
-Requires:       libsecret
+Requires:       /usr/bin/secret-tool
 Recommends:     libei%{?_isa}
 %{?systemd_requires}
 
@@ -58,7 +60,7 @@ Requires:       gtk4-layer-shell%{?_isa}
 
 %description overlay
 Optional observer-only GTK4 Overlay feedback for Voisu. The base package is
-GTK-free; installing this subpackage adds the separate Overlay process.
+GTK-free; installing this package adds the separate Overlay process.
 
 %prep
 %autosetup -n %{name}-%{version}

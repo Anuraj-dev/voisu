@@ -65,8 +65,8 @@
 - Current gates: `cargo test --workspace` — 213 passed, 2 ignored, 0 failed (effective-unit + shadow-migration +
   LoadState + multi-ExecStart tests; shadow-migration RED-proven); `cargo check -p voisu-app --features overlay`,
   `cargo build --workspace`, `bash -n` for packaging scripts, and `git diff --check` are clean. Deterministic vendor
-  archiving verified byte-identical across umasks headlessly; `rpmbuild` and RPM/live Fedora evidence are pending the
-  host (build-rpm.sh had its first real host run; SIGPIPE fix at 674b93e).
+  archiving verified byte-identical across umasks headlessly. Host `rpmbuild` gate PROVEN (build + `%check` release
+  suite + artifacts at `674b93e`); live desktop smoke evidence remains pending.
 
 ## Architecture map
 - Domain, IPC, lifecycle/Delivery evidence, provider coordination, decision pipeline -> `crates/voisu-core/src/lib.rs`

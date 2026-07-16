@@ -11,7 +11,8 @@ The base package declares only the boundaries used by the application:
 - `pipewire-utils` for the spawned `pw-record` tool;
 - `wireplumber` for the spawned `wpctl` tool;
 - `curl` for cloud provider requests;
-- `libsecret` for the `secret-tool` credential boundary;
+- `/usr/bin/secret-tool` (owned by `libsecret`) for the credential boundary,
+  declared as a file dependency because Voisu needs the binary, not the library;
 - an optional `libei` Recommends entry because Voisu loads `libei.so.1` at
   runtime. If it is absent or lacks the required capability, Delivery remains
   available through clipboard preservation.
