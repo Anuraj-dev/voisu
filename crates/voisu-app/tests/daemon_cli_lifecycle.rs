@@ -2362,24 +2362,169 @@ fn status_distinguishes_daemon_unavailable_from_idle() {
     assert_eq!(stdout(&idle), "idle\n");
 }
 
+const OVERLAY_STATUS: &str = r#"{"version":1,"command":"overlaystatus"}"#;
+
 #[test]
-fn overlay_status_is_typed_once_without_changing_cli_status() {
+fn overlay_status_carries_the_delivered_event_while_lifecycle_responses_do_not() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start(runtime.path());
 
-    let idle = ipc_request(runtime.path(), r#"{"version":1,"command":"overlaystatus"}"#);
+    let idle = ipc_request(runtime.path(), OVERLAY_STATUS);
     assert_eq!(idle["state"], "idle");
     assert_eq!(idle["message"], "idle");
     assert!(idle.get("overlay_event").is_none());
 
+    // Normal CLI Status is unchanged by the observer path.
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
+
+    // The lifecycle Stop response must NOT carry the observer payload; the
+    // terminal outcome reaches the Overlay only through OverlayStatus.
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
-    assert_eq!(stopped["overlay_event"]["outcome"], "delivered");
-    let observed = ipc_request(runtime.path(), r#"{"version":1,"command":"overlaystatus"}"#);
+    assert!(
+        stopped.get("overlay_event").is_none(),
+        "Stop response leaked the observer payload: {stopped}"
+    );
+
+    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(observed["state"], "idle");
     assert_eq!(observed["message"], "idle");
-    assert_eq!(observed["overlay_event"]["id"], stopped["overlay_event"]["id"]);
+    assert_eq!(observed["overlay_event"]["outcome"], "delivered");
+    // The retained event is stable across repeated observation (the daemon keeps
+    // returning it; showing it once is the client's concern).
+    let again = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(again["overlay_event"]["id"], observed["overlay_event"]["id"]);
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+}
+
+#[test]
+fn overlay_status_reports_a_startup_failure_without_touching_lifecycle_responses() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon =
+        Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_PROVIDER_START_FAILURE", "1")]);
+
+    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    assert_eq!(started["ok"], false, "{started}");
+    assert!(
+        started.get("overlay_event").is_none(),
+        "start rejection leaked the observer payload: {started}"
+    );
+
+    // The startup failure is a non-guardrail provider failure, visible only
+    // through the observer path.
+    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(observed["overlay_event"]["outcome"], "provider_failure", "{observed}");
+}
+
+#[test]
+fn overlay_status_classifies_a_guardrail_quality_failure() {
+    let runtime = TempDir::new().unwrap();
+    // One surviving Source Transcript is an unrepairable prompt artifact, so the
+    // decision pipeline reports a Quality Failure through the validation guardrail.
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_PROVIDER_COMPLETE_FAILURE", "groq"),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "system prompt"),
+            ("VOISU_TEST_REPAIR_RESULT", "system prompt"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], false, "{stopped}");
+    assert_eq!(stopped["message"], "Transcript failed quality validation");
+    assert!(stopped.get("overlay_event").is_none(), "{stopped}");
+
+    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(observed["overlay_event"]["outcome"], "quality_failure", "{observed}");
+}
+
+#[test]
+fn overlay_status_classifies_a_non_guardrail_capture_failure() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon =
+        Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_CAPTURE_FINISH_FAILURE", "1")]);
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], false, "{stopped}");
+    assert_eq!(stopped["message"], "Recording capture failed");
+    assert!(stopped.get("overlay_event").is_none(), "{stopped}");
+
+    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+    // A capture failure is not a guardrail Quality Failure.
+    assert_eq!(observed["overlay_event"]["outcome"], "capture_failure", "{observed}");
+}
+
+#[test]
+fn overlay_observation_never_perturbs_recording_delivery_or_the_next_recording() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let path = socket_path(runtime.path());
+
+    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+
+    // A crop of observers that connect and die without reading their response,
+    // exactly as a killed/disconnected Overlay would during a Recording.
+    for _ in 0..8 {
+        if let Ok(mut dead) = UnixStream::connect(&path) {
+            dead.write_all(OVERLAY_STATUS.as_bytes()).unwrap();
+            dead.write_all(b"\n").unwrap();
+            // Dropped here without reading the reply.
+        }
+    }
+
+    // A slow/trickling observer that reads a single byte and stalls, held alive
+    // across the Delivery below.
+    let mut slow = UnixStream::connect(&path).unwrap();
+    slow.write_all(OVERLAY_STATUS.as_bytes()).unwrap();
+    slow.write_all(b"\n").unwrap();
+    slow.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    let mut one = [0u8; 1];
+    let _ = slow.read(&mut one);
+
+    // The daemon stays fully responsive to the real lifecycle client.
+    let responsive = Instant::now();
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    assert!(responsive.elapsed() < Duration::from_millis(500));
+
+    // Delivery completes exactly once despite the abandoned observers.
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
+    drop(slow);
+
+    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(observed["overlay_event"]["outcome"], "delivered", "{observed}");
+
+    // The next Recording is fully usable.
+    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    let next = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(next["ok"], true, "{next}");
+    assert_eq!(next["evidence"]["delivery_count"], 1, "{next}");
+}
+
+#[test]
+fn an_unknown_observer_command_is_rejected_without_disturbing_the_daemon() {
+    // Models a newer client whose command an older daemon cannot decode: the
+    // daemon rejects the frame and closes without a parseable response, and
+    // stays alive for the commands it does understand.
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let path = socket_path(runtime.path());
+
+    let mut stream = UnixStream::connect(&path).unwrap();
+    stream
+        .write_all(br#"{"version":1,"command":"observerpush"}"#)
+        .unwrap();
+    stream.write_all(b"\n").unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut response = String::new();
+    let _ = BufReader::new(stream).read_line(&mut response);
+    assert!(response.is_empty(), "unknown command was not rejected: {response}");
+
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 }
 

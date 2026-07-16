@@ -90,7 +90,14 @@ pub struct PresentationController {
 
 impl PresentationController {
     pub fn observe(&mut self, response: &Response, now: Instant) -> OverlayView {
-        if matches!(response.state, Some(DaemonState::Recording)) {
+        // Any live in-progress state (Recording or Processing) is driven straight
+        // from status and supersedes the previous terminal feedback window. The
+        // retained observer event stays attached to every OverlayStatus response,
+        // so it must be ignored while the daemon is not Idle.
+        if matches!(
+            response.state,
+            Some(DaemonState::Recording) | Some(DaemonState::Processing)
+        ) {
             self.terminal_until = None;
             return OverlayView::from_response(response);
         }
@@ -113,17 +120,23 @@ impl PresentationController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voisu_core::{DaemonState, OverlayEvent, OverlayOutcome, Response};
+    use voisu_core::{DaemonState, OverlayEvent, OverlayOutcome, Response, VersionEnvelope};
 
     fn event(id: u64, outcome: OverlayOutcome) -> OverlayEvent {
         OverlayEvent { id, outcome, message: "exact public outcome".into() }
     }
 
+    /// Mirrors a real `OverlayStatus` reply: the observer path always attaches
+    /// the retained terminal event, whatever the current daemon state is.
+    fn overlay_status(state: DaemonState, retained: Option<OverlayEvent>) -> Response {
+        let mut response = Response::success(state, state.cli_label());
+        response.overlay_event = retained;
+        response
+    }
+
     #[test]
     fn public_observer_response_is_typed_and_terminal_events_are_displayed_once() {
-        let terminal = Response { version: 1, ok: true, state: Some(DaemonState::Idle),
-            message: "idle".into(), evidence: None, history: None, export: None,
-            overlay_event: Some(event(7, OverlayOutcome::DeliveryFailure)) };
+        let terminal = overlay_status(DaemonState::Idle, Some(event(7, OverlayOutcome::DeliveryFailure)));
         let mut controller = PresentationController::default();
         let now = Instant::now();
         assert_eq!(controller.observe(&terminal, now).phase, OverlayPhase::Failure);
@@ -133,25 +146,112 @@ mod tests {
 
     #[test]
     fn next_recording_clears_terminal_feedback_and_is_not_lifecycle_coupled() {
+        // The daemon retains the last terminal event on every OverlayStatus
+        // reply, so the next-Recording sequence must still carry it — unlike a
+        // response with no field, this proves the controller dedups by id and
+        // respects expiry rather than trivially going hidden.
         let mut controller = PresentationController::default();
         let now = Instant::now();
-        let terminal = Response { version: 1, ok: true, state: Some(DaemonState::Idle),
-            message: "idle".into(), evidence: None, history: None, export: None,
-            overlay_event: Some(event(1, OverlayOutcome::QualityFailure)) };
+        let stale = event(1, OverlayOutcome::QualityFailure);
+        let terminal = overlay_status(DaemonState::Idle, Some(stale.clone()));
         assert_eq!(controller.observe(&terminal, now).phase, OverlayPhase::Failure);
-        let recording = Response::success(DaemonState::Recording, "Recording");
+        // The next Recording (with the stale event still retained) overrides the
+        // terminal feedback and is driven live from status.
+        let recording = overlay_status(DaemonState::Recording, Some(stale.clone()));
         assert_eq!(controller.observe(&recording, now).phase, OverlayPhase::Recording);
-        assert_eq!(controller.observe(&Response::success(DaemonState::Idle, "idle"), now).phase,
-            OverlayPhase::Hidden);
+        // Returning to Idle with the same already-shown, expired event stays hidden.
+        let idle = overlay_status(DaemonState::Idle, Some(stale));
+        assert_eq!(controller.observe(&idle, now).phase, OverlayPhase::Hidden);
+    }
+
+    #[test]
+    fn processing_is_shown_live_from_status_over_a_retained_terminal_event() {
+        // The retained observer event stays attached during Processing. A
+        // status-driven live state must win over that stale terminal feedback,
+        // whether or not the event was already displayed.
+        let mut controller = PresentationController::default();
+        let now = Instant::now();
+        let delivered = event(5, OverlayOutcome::Delivered);
+        assert_eq!(
+            controller.observe(&overlay_status(DaemonState::Idle, Some(delivered.clone())), now).phase,
+            OverlayPhase::Success,
+        );
+        assert_eq!(
+            controller.observe(&overlay_status(DaemonState::Recording, Some(delivered.clone())), now).phase,
+            OverlayPhase::Recording,
+        );
+        // Already-displayed retained event + Processing must render Processing,
+        // not the stale terminal event and not hidden.
+        assert_eq!(
+            controller.observe(&overlay_status(DaemonState::Processing, Some(delivered)), now).phase,
+            OverlayPhase::Processing,
+        );
+        // A fresh observer that first sees Processing with an undisplayed
+        // retained event still renders Processing, never the terminal event.
+        assert_eq!(
+            PresentationController::default()
+                .observe(&overlay_status(DaemonState::Processing, Some(event(9, OverlayOutcome::DeliveryFailure))), now)
+                .phase,
+            OverlayPhase::Processing,
+        );
+    }
+
+    #[test]
+    fn terminal_event_ids_reused_after_a_daemon_restart_are_still_shown() {
+        // A restarted daemon resets its event-id counter to 1. The controller
+        // must key freshness on inequality, not monotonic growth, or every
+        // post-restart terminal event would be permanently suppressed.
+        let mut controller = PresentationController::default();
+        let t0 = Instant::now();
+        assert_eq!(
+            controller.observe(&overlay_status(DaemonState::Idle, Some(event(1, OverlayOutcome::DeliveryFailure))), t0).phase,
+            OverlayPhase::Failure,
+        );
+        let t1 = t0 + TERMINAL_DISPLAY + Duration::from_millis(1);
+        assert_eq!(
+            controller.observe(&overlay_status(DaemonState::Idle, Some(event(2, OverlayOutcome::Delivered))), t1).phase,
+            OverlayPhase::Success,
+        );
+        let t2 = t1 + TERMINAL_DISPLAY + Duration::from_millis(1);
+        // Daemon restarted: id counter reset, a distinct outcome reuses id 1.
+        assert_eq!(
+            controller.observe(&overlay_status(DaemonState::Idle, Some(event(1, OverlayOutcome::DeliveryFailure))), t2).phase,
+            OverlayPhase::Failure,
+        );
+    }
+
+    #[test]
+    fn a_future_or_unknown_terminal_outcome_degrades_to_a_generic_failure() {
+        // A newer daemon may report an outcome variant this client predates. It
+        // must deserialize into a safe generic failure, not break the response.
+        let response: Response = serde_json::from_str(
+            r#"{"version":1,"ok":true,"state":"idle","message":"idle","overlay_event":{"id":9,"outcome":"teleported_transcript","message":"x"}}"#,
+        ).unwrap();
+        assert_eq!(response.overlay_event.as_ref().unwrap().outcome, OverlayOutcome::Unknown);
+        assert_eq!(
+            PresentationController::default().observe(&response, Instant::now()).phase,
+            OverlayPhase::Failure,
+        );
     }
 
     #[test]
     fn responses_from_a_pre_event_daemon_are_safe_and_have_no_stale_feedback() {
+        // New client, old daemon: the observer field is simply absent.
         let response: Response = serde_json::from_str(
             r#"{"version":1,"ok":true,"state":"idle","message":"idle"}"#,
         ).unwrap();
         assert!(response.overlay_event.is_none());
         assert_eq!(PresentationController::default().observe(&response, Instant::now()),
             OverlayView::HIDDEN);
+    }
+
+    #[test]
+    fn an_older_client_tolerates_the_new_observer_only_field() {
+        // Old client, new daemon: a reader that only knows the version envelope
+        // still parses a response carrying the added observer payload.
+        let envelope: VersionEnvelope = serde_json::from_str(
+            r#"{"version":1,"ok":true,"state":"idle","message":"idle","overlay_event":{"id":3,"outcome":"delivered","message":"Delivered"}}"#,
+        ).unwrap();
+        assert_eq!(envelope.version, 1);
     }
 }

@@ -190,6 +190,11 @@ pub enum OverlayOutcome {
     ProviderFailure,
     DeliveryFailure,
     OtherFailure,
+    /// A newer daemon may report an outcome this client does not know. It must
+    /// deserialize into a safe, generic failure rather than break the whole
+    /// observer response.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

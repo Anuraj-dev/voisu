@@ -749,19 +749,18 @@ async fn actor_loop(
                             let mut evidence =
                                 base_evidence(id, correlation.clone(), Vec::new());
                             evidence.recovery_attempted = recovering;
-                            let mut response = Response::with_evidence(
+                            let response = Response::with_evidence(
                                 false,
                                 Some(DaemonState::Idle),
                                 failure.error.public_message(),
                                 Some(evidence),
                             );
-                            response.overlay_event = Some(OverlayEvent {
-                                id: next_overlay_event_id,
-                                outcome: overlay_outcome(&failure.error),
-                                message: failure.error.public_message().to_owned(),
-                            });
-                            next_overlay_event_id += 1;
-                            last_overlay_event = response.overlay_event.clone();
+                            retain_overlay_event(
+                                &mut next_overlay_event_id,
+                                &mut last_overlay_event,
+                                overlay_outcome(&failure.error),
+                                failure.error.public_message().to_owned(),
+                            );
                             let _ = reply.send(response);
                             if recovering {
                                 // The daemon reads idle immediately but rejects
@@ -851,7 +850,7 @@ async fn actor_loop(
                     state = ActorState::Idle;
                     let response = match completed.result {
                         Ok(()) => {
-                            let mut response = Response::with_evidence(
+                            let response = Response::with_evidence(
                             true,
                             Some(DaemonState::Idle),
                             match completed.evidence.delivery_method {
@@ -862,30 +861,28 @@ async fn actor_loop(
                             },
                             Some(completed.evidence),
                         );
-                            response.overlay_event = Some(OverlayEvent {
-                                id: next_overlay_event_id,
-                                outcome: OverlayOutcome::Delivered,
-                                message: "Delivered".to_owned(),
-                            });
-                            next_overlay_event_id += 1;
-                            last_overlay_event = response.overlay_event.clone();
+                            retain_overlay_event(
+                                &mut next_overlay_event_id,
+                                &mut last_overlay_event,
+                                OverlayOutcome::Delivered,
+                                "Delivered".to_owned(),
+                            );
                             response
                         }
                         Err(error) => {
                             eprintln!("Recording {}: {}", completed.id, error.diagnostic());
-                            let mut response = Response::with_evidence(
+                            let response = Response::with_evidence(
                                 false,
                                 Some(DaemonState::Idle),
                                 error.public_message(),
                                 Some(completed.evidence),
                             );
-                            response.overlay_event = Some(OverlayEvent {
-                                id: next_overlay_event_id,
-                                outcome: overlay_outcome(&error),
-                                message: error.public_message().to_owned(),
-                            });
-                            next_overlay_event_id += 1;
-                            last_overlay_event = response.overlay_event.clone();
+                            retain_overlay_event(
+                                &mut next_overlay_event_id,
+                                &mut last_overlay_event,
+                                overlay_outcome(&error),
+                                error.public_message().to_owned(),
+                            );
                             response
                         }
                     };
@@ -982,6 +979,23 @@ fn status_response_with_feedback(state: &ActorState) -> Response {
             | ActorState::Replaying(_) => None,
         },
     )
+}
+
+/// Retain a terminal outcome for the observer path only. Lifecycle-command
+/// responses (start/stop) never carry the observer payload; the Overlay learns
+/// terminal outcomes exclusively through `Command::OverlayStatus`.
+fn retain_overlay_event(
+    next_id: &mut u64,
+    last: &mut Option<OverlayEvent>,
+    outcome: OverlayOutcome,
+    message: String,
+) {
+    *last = Some(OverlayEvent {
+        id: *next_id,
+        outcome,
+        message,
+    });
+    *next_id += 1;
 }
 
 fn overlay_outcome(error: &BoundaryError) -> OverlayOutcome {
