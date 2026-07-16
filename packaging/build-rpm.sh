@@ -30,9 +30,12 @@ mkdir -p "$topdir"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
 
 archive="$topdir/SOURCES/voisu-${version}.tar.gz"
 git archive --format=tar.gz --prefix="voisu-${version}/" "$commit" > "$archive"
-tar -tzf "$archive" | grep -qx "voisu-${version}/Cargo.lock"
-tar -tzf "$archive" | grep -qx "voisu-${version}/LICENSE"
-tar -tzf "$archive" | grep -qx "voisu-${version}/packaging/voisu.service"
+# List once to a file: `tar -tzf | grep -q` dies of SIGPIPE under pipefail
+# when grep exits on an early match while tar is still writing.
+tar -tzf "$archive" > "$topdir/source-archive.list"
+grep -qx "voisu-${version}/Cargo.lock" "$topdir/source-archive.list"
+grep -qx "voisu-${version}/LICENSE" "$topdir/source-archive.list"
+grep -qx "voisu-${version}/packaging/voisu.service" "$topdir/source-archive.list"
 
 # Reproducibility: vendor from an extraction of the exact-commit git archive
 # (never the working tree), then archive deterministically so the same commit
