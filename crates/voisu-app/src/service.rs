@@ -11,6 +11,8 @@ use voisu_core::{
     Command, PROTOCOL_VERSION, Request, Response, VersionEnvelope, socket_path,
 };
 
+use crate::process::guard_external_child;
+
 const UNIT_NAME: &str = "voisu.service";
 const SYSTEMCTL_DEADLINE: Duration = Duration::from_secs(5);
 const SERVICE_TRANSITION_DEADLINE: Duration = Duration::from_secs(3);
@@ -345,7 +347,9 @@ fn service_unit(executable: &Path) -> Result<String, String> {
         "Description=Voisu dictation daemon\n",
         "After=dbus.socket pipewire.service xdg-desktop-portal.service\n",
         "Wants=dbus.socket pipewire.service xdg-desktop-portal.service\n",
-        "PartOf=graphical-session.target\n\n",
+        "PartOf=graphical-session.target\n",
+        "StartLimitIntervalSec=30s\n",
+        "StartLimitBurst=3\n\n",
         "[Service]\n",
         "Type=simple\n",
         "ExecStart={} --systemd\n",
@@ -388,12 +392,15 @@ fn systemctl_required(arguments: &[&str]) -> Result<(), String> {
 }
 
 fn systemctl(arguments: &[&str]) -> Result<ProcessOutput, String> {
-    let mut child = ProcessCommand::new("systemctl")
+    let mut command = ProcessCommand::new("systemctl");
+    command
         .arg("--user")
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    guard_external_child(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|_| "systemctl is unavailable".to_owned())?;
     let deadline = Instant::now() + SYSTEMCTL_DEADLINE;

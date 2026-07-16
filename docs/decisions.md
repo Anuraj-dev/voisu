@@ -173,3 +173,16 @@ uninstall disables first, waits for ownership and IPC to clear, then removes the
 **Why:** GPT/codex agents prompt `claude -p` poorly, wasting tokens on both sides. Rejected alternative: keeping the
 mandatory delegation-to-Claude block in every codex dispatch. Codex now gets all needed context inline; Claude-side
 subagents remain the orchestrator's tool only.
+
+## 2026-07-16 — Bound persistent service failure without retrying Recording work
+**Why:** `Restart=on-failure` is useful for abrupt daemon interruption but an unrecoverable startup defect must not
+spin forever. The user unit permits three starts per 30 seconds, while microphone, provider, portal, CLI, and
+Delivery failures stay inside one Recording and recover to a fresh next Recording. Retrying or replaying a failed
+Recording was rejected because it risks duplicate Delivery and ghost cloud work.
+
+## 2026-07-16 — Guard every external child against abrupt owner death
+**Why:** Bounded cancellation cannot run after an uncatchable process interruption, so each PipeWire, provider,
+clipboard, secret-store, and systemctl child must also have a kernel-enforced owner-death contract. One shared Linux
+spawn hook sets `PR_SET_PDEATHSIG=SIGKILL` and refuses exec when the expected parent is already gone, closing the
+fork-to-prctl race. Per-command hooks were rejected because they had already left provider and service children
+uncovered and allowed the PipeWire hook to omit the race check.

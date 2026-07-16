@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -22,6 +22,8 @@ use voisu_core::{
     TranscriptDecision, TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator,
     TriggerKeyBinding, VersionEnvelope, PROTOCOL_VERSION,
 };
+
+use crate::process::guard_external_child;
 
 const PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 pub const CAPTURE_FINALIZE_DEADLINE: Duration = PROCESS_DEADLINE;
@@ -966,6 +968,7 @@ enum ProcessError {
 
 fn restricted_command(program: &str) -> Command {
     let mut command = Command::new(program);
+    guard_external_child(&mut command);
     command.env_clear();
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
@@ -1182,18 +1185,6 @@ impl AudioCapture for PipeWireCapture {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(target_os = "linux")]
-        // SAFETY: this hook only invokes the async-signal-safe `prctl` syscall
-        // between fork and exec; it does not allocate or touch shared state.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            });
-        }
         let mut child = command.spawn().map_err(|_| {
             BoundaryError::new(BoundaryKind::Capture, "pw-record unavailable")
         })?;
@@ -3497,6 +3488,17 @@ fn wav_from_pcm(pcm: &[u8]) -> Result<Vec<u8>, BoundaryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_restricted_external_child_receives_the_parent_death_contract() {
+        let mut child = restricted_command("python3");
+        child.args([
+            "-c",
+            "import ctypes, signal, sys; value = ctypes.c_int(); result = ctypes.CDLL(None).prctl(2, ctypes.byref(value)); sys.exit(result != 0 or value.value != signal.SIGKILL)",
+        ]);
+
+        assert!(child.status().unwrap().success());
+    }
 
     #[test]
     fn cancel_set_mid_wait_kills_the_owned_child_within_the_poll_bound() {
