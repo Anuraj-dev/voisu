@@ -3,6 +3,9 @@
 > Format: `## YYYY-MM-DD — <decision>` then a short **Why:** line.
 > Hard-to-reverse architectural decisions live in `docs/adr/` — this log is for everything lighter.
 
+## 2026-07-16 — Keep Overlay feedback on a separate observer status command
+**Why:** The GTK Overlay uses read-only `OverlayStatus` so terminal Delivered or Quality Failure feedback does not change established CLI `Status` output; the Overlay remains disposable and cannot mutate daemon state.
+
 ## 2026-07-15 — Adopt ADRs 0001–0006 as governing architecture (inferred at adoption)
 **Why:** See `docs/adr/` — cloud-only dual-provider transcription, independent Rust codebase,
 daemon/Overlay separation, portals-only input access, bounded quality wait, local-only diagnostics.

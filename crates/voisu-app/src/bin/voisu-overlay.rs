@@ -1,0 +1,151 @@
+//! Optional GTK4 Layer Shell observer. It has no command path into the daemon.
+
+use std::cell::Cell;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+use std::rc::Rc;
+use std::time::Duration;
+
+use gtk4 as gtk;
+use gtk::prelude::*;
+use gtk4_layer_shell::{Edge, KeyboardInteractivity, Layer};
+use voisu_app::overlay::{OverlayPhase, OverlayView};
+use voisu_core::{Command, DaemonState, PROTOCOL_VERSION, Request, Response, socket_path};
+
+fn main() {
+    let application = gtk::Application::builder()
+        .application_id("org.voisu.Overlay")
+        .build();
+    application.connect_activate(build_overlay);
+    application.run();
+}
+
+fn build_overlay(application: &gtk::Application) {
+    let window = gtk::ApplicationWindow::builder()
+        .application(application)
+        .default_width(280)
+        .default_height(64)
+        .resizable(false)
+        .focusable(false)
+        .can_focus(false)
+        .build();
+
+    gtk4_layer_shell::init_for_window(&window);
+    gtk4_layer_shell::set_layer(&window, Layer::Overlay);
+    gtk4_layer_shell::set_anchor(&window, Edge::Bottom, true);
+    gtk4_layer_shell::set_margin(&window, Edge::Bottom, 24);
+    gtk4_layer_shell::set_keyboard_interactivity(&window, KeyboardInteractivity::None);
+    gtk4_layer_shell::set_exclusive_zone(&window, -1);
+
+    let label = gtk::Label::builder()
+        .label("")
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+    label.set_hexpand(true);
+    label.set_vexpand(true);
+    let meter = gtk::Label::builder().label("").build();
+    let capsule = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    capsule.set_margin_start(20);
+    capsule.set_margin_end(20);
+    capsule.set_margin_top(12);
+    capsule.set_margin_bottom(12);
+    capsule.append(&label);
+    capsule.append(&meter);
+    window.set_child(Some(&capsule));
+    window.hide();
+
+    let css = gtk::CssProvider::new();
+    css.load_from_data(
+        ".capsule { background: #17191D; border-radius: 32px; }
+         .capsule label { color: #F4F5F7; font-size: 11pt; font-weight: 600; }
+         .recording { color: #65D6A0; }
+         .processing { color: #8FB4FF; }
+         .success { color: #B8E986; }
+         .failure { color: #FF8A8A; }",
+    );
+    capsule.add_css_class("capsule");
+    gtk::style_context_add_provider_for_display(
+        &window.display(),
+        &css,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
+    let previous = Rc::new(Cell::new(OverlayPhase::Hidden));
+    let reduced_motion = gtk::Settings::default()
+        .map(|settings| !settings.is_gtk_enable_animations());
+    let window_ref = window.clone();
+    let label_ref = label.clone();
+    let meter_ref = meter.clone();
+    let previous_ref = previous.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
+        let Some(response) = read_status() else {
+            if previous_ref.get() != OverlayPhase::Failure {
+                label_ref.set_label("Daemon unavailable");
+                previous_ref.set(OverlayPhase::Failure);
+                window_ref.show();
+            }
+            return gtk::glib::ControlFlow::Continue;
+        };
+        let view = if response.state == Some(DaemonState::Idle) {
+            match response.message.as_str() {
+                "delivered" => OverlayView::success(),
+                "quality failure" => OverlayView::failure(),
+                _ => OverlayView::HIDDEN,
+            }
+        } else {
+            OverlayView::from_response(&response)
+        };
+        for class in ["recording", "processing", "success", "failure"] {
+            capsule.remove_css_class(class);
+        }
+        let class = match view.phase {
+            OverlayPhase::Recording => "recording",
+            OverlayPhase::Processing => "processing",
+            OverlayPhase::Success => "success",
+            OverlayPhase::Failure => "failure",
+            OverlayPhase::Hidden => "",
+        };
+        if !class.is_empty() {
+            capsule.add_css_class(class);
+        }
+        if view.phase == OverlayPhase::Hidden {
+            window_ref.hide();
+            previous_ref.set(OverlayPhase::Hidden);
+            return gtk::glib::ControlFlow::Continue;
+        }
+        label_ref.set_label(view.accessible_label);
+        meter_ref.set_label(if view.phase == OverlayPhase::Recording {
+            match view.activity {
+                3 => "▂▆█",
+                2 => "▂▅▆",
+                _ => "▂▃▂",
+            }
+        } else {
+            ""
+        });
+        if view.is_visible() && previous_ref.get() == OverlayPhase::Hidden {
+            window_ref.show();
+        }
+        // No animation source is installed for hidden, Processing, terminal,
+        // or reduced-motion states. Recording activity is status-driven.
+        let _ = view.animation_interval(reduced_motion);
+        previous_ref.set(view.phase);
+        gtk::glib::ControlFlow::Continue
+    });
+}
+
+fn read_status() -> Option<Response> {
+    let mut stream = UnixStream::connect(socket_path().ok()?).ok()?;
+    let request = serde_json::to_vec(&Request {
+        version: PROTOCOL_VERSION,
+        command: Command::OverlayStatus,
+    })
+    .ok()?;
+    stream.write_all(&request).ok()?;
+    stream.write_all(b"\n").ok()?;
+    stream.set_read_timeout(Some(Duration::from_millis(150))).ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok()?;
+    serde_json::from_slice(&response).ok()
+}

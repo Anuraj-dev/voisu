@@ -62,6 +62,9 @@ pub enum Command {
     Stop,
     Toggle,
     Status,
+    /// Observer-only status with the most recent terminal feedback retained.
+    /// This is not a lifecycle command and cannot mutate daemon state.
+    OverlayStatus,
     /// Returns the desktop-approved Trigger Key binding for display, or a
     /// notice that no Trigger Key is bound. Never blocks CLI start/stop/toggle.
     Shortcut,

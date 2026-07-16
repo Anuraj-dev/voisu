@@ -365,6 +365,9 @@ async fn actor_loop(
     reaper: ProviderReaper,
 ) {
     let mut state = ActorState::Idle;
+    // Retained only for the observer-facing Status response. It never controls
+    // the lifecycle and is replaced by the next Recording outcome.
+    let mut last_feedback: Option<bool> = None;
     let mut next_id = 1_u64;
     // Raw audio is retained only when the user explicitly enables debug capture.
     let debug_capture = std::env::var_os("VOISU_DEBUG_CAPTURE").is_some();
@@ -414,6 +417,10 @@ async fn actor_loop(
             ActorMessage::Command(command, reply) => match command {
                 Command::Status => {
                     let response = status_response(&state);
+                    let _ = reply.send(response);
+                }
+                Command::OverlayStatus => {
+                    let response = overlay_status_response(&state, last_feedback);
                     let _ = reply.send(response);
                 }
                 Command::Shortcut => {
@@ -833,7 +840,9 @@ async fn actor_loop(
                     // the actor loop never blocks on the drain.
                     state = ActorState::Idle;
                     let response = match completed.result {
-                        Ok(()) => Response::with_evidence(
+                        Ok(()) => {
+                            last_feedback = Some(true);
+                            Response::with_evidence(
                             true,
                             Some(DaemonState::Idle),
                             match completed.evidence.delivery_method {
@@ -843,8 +852,10 @@ async fn actor_loop(
                                 _ => "Transcript submitted through the compositor; preserved on the clipboard",
                             },
                             Some(completed.evidence),
-                        ),
+                        )
+                        }
                         Err(error) => {
+                            last_feedback = Some(false);
                             eprintln!("Recording {}: {}", completed.id, error.diagnostic());
                             Response::with_evidence(
                                 false,
@@ -918,11 +929,24 @@ fn state_label(state: &ActorState) -> DaemonState {
 }
 
 fn status_response(state: &ActorState) -> Response {
+    status_response_with_feedback(state, None)
+}
+
+fn overlay_status_response(state: &ActorState, last_feedback: Option<bool>) -> Response {
+    status_response_with_feedback(state, last_feedback)
+}
+
+fn status_response_with_feedback(state: &ActorState, last_feedback: Option<bool>) -> Response {
     let daemon_state = state_label(state);
+    let message = match (daemon_state, last_feedback) {
+        (DaemonState::Idle, Some(true)) => "delivered",
+        (DaemonState::Idle, Some(false)) => "quality failure",
+        _ => daemon_state.cli_label(),
+    };
     Response::with_evidence(
         true,
         Some(daemon_state),
-        daemon_state.cli_label(),
+        message,
         match state {
             ActorState::Recording(recording) => {
                 let mut evidence = recording.evidence.clone();

@@ -2,6 +2,7 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-16
 
 ## 🚧 In progress / next
+- Ticket 11 implementation is complete on `ticket-11-voice-capsule`; next: host/orchestrator must compile the opt-in GTK feature and complete the Fedora KDE screenshot gate.
 - Ticket 10 merged through PR #17 at `aa8055a` (squash); exact-head CI passed and issue #10 is closed.
   Reviews: Sol high round 1 (2 BLOCKER + 1 HIGH + 1 MEDIUM), fixes in `0865286`, Sol medium round 2 APPROVE.
 - Issue #14 review round 1 is fixed on `issue-14-cancellation-safe-abort`: abort-deadline drop now actively cancels
@@ -51,6 +52,7 @@
 - Current inventory: 173 tests listed (11 app unit + 106 daemon/CLI acceptance + 6 Delivery + 10 user-service +
   20 diagnostics + 6 provider-coordination + 14 Transcript-decision). The full host gate is green: 171 passed,
   2 opt-in live smokes ignored, 0 failed; `cargo build --workspace` is clean.
+- Ticket 11 adds `DESIGN.md`, a presentation-only Overlay state model, a separate `voisu-overlay` GTK4/Layer Shell binary behind the `overlay` feature, and an observer-only `OverlayStatus` IPC command. Standard CLI `Status` remains unchanged. GTK compilation and real Fedora screenshots are pending host verification because this sandbox lacks GTK development libraries and a desktop surface.
 
 ## Architecture map
 - Domain, IPC, lifecycle/Delivery evidence, provider coordination, decision pipeline -> `crates/voisu-core/src/lib.rs`
