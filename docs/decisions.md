@@ -173,3 +173,9 @@ uninstall disables first, waits for ownership and IPC to clear, then removes the
 **Why:** GPT/codex agents prompt `claude -p` poorly, wasting tokens on both sides. Rejected alternative: keeping the
 mandatory delegation-to-Claude block in every codex dispatch. Codex now gets all needed context inline; Claude-side
 subagents remain the orchestrator's tool only.
+
+## 2026-07-16 — Bound persistent service failure without retrying Recording work
+**Why:** `Restart=on-failure` is useful for abrupt daemon interruption but an unrecoverable startup defect must not
+spin forever. The user unit permits three starts per 30 seconds, while microphone, provider, portal, CLI, and
+Delivery failures stay inside one Recording and recover to a fresh next Recording. Retrying or replaying a failed
+Recording was rejected because it risks duplicate Delivery and ghost cloud work.

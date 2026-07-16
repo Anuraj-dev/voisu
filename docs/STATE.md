@@ -4,7 +4,8 @@
 ## 🚧 In progress / next
 - Ticket 08 merged through PR #15 at `a5771a9`; exact-head CI passed and issue #8 is closed.
 - Ticket 09 merged through PR #16 at `9b58f99`; exact-head CI passed and issue #9 is closed.
-- Next ordered implementation work is Ticket 10 (issue #10): recover cleanly from real workflow failures.
+- Ticket 10 is implemented on `ticket-10-recovery` at `86b2225` and `d6bd6b0`; next step is first review,
+  exact-head CI, PR/merge, and issue #10 closure.
 - Follow-up issue #14 remains open: make Deepgram/Groq abort cancellation-safe plus its regression test.
 
 ## Status
@@ -33,10 +34,14 @@
   trusted daemon copy under XDG user data and enables one unit under `graphical-session.target`, ordered after the
   user D-Bus socket, PipeWire, and desktop portal without baking session variables or checkout paths. Service reports
   combine real systemd state with daemon IPC state; manual ownership and duplicate races fail without restart loops.
-- Current inventory at `9b58f99`: 161 tests listed (7 app unit + 100 daemon/CLI acceptance + 6 Delivery + 8 user-service +
-  20 diagnostics + 6 provider-coordination + 14 Transcript-decision). The full host gate is green: 160 passed,
-  1 opt-in live smoke
-  ignored, 0 failed.
+- Ticket 10 proves next-Recording recovery across real PipeWire process death/reconnection, provider disconnect/
+  malformed/quota/deadline fallback, portal revocation/restart with clipboard Delivery, killed CLI and daemon
+  processes, repeated failure, stale socket takeover, and owned boundary-process reap. Persistent service failures
+  are limited to three starts in 30 seconds. A separate ignored Fedora smoke covers microphone, both providers,
+  portals, systemd interruption/restart, Delivery, and the next Recording.
+- Current inventory at `d6bd6b0`: 168 tests listed (7 app unit + 106 daemon/CLI acceptance + 6 Delivery + 9 user-service +
+  20 diagnostics + 6 provider-coordination + 14 Transcript-decision). The full host gate is green: 166 passed,
+  2 opt-in live smokes ignored, 0 failed; `cargo build --workspace` is clean.
 
 ## Architecture map
 - Domain, IPC, lifecycle/Delivery evidence, provider coordination, decision pipeline -> `crates/voisu-core/src/lib.rs`
@@ -64,6 +69,8 @@
   resolves Ctrl+V from the active EIS XKB keymap. A pong confirms compositor processing, never application acceptance.
 - The daemon service is enabled by the graphical session, inherits that session's current environment, and orders
   after D-Bus, PipeWire, and the desktop portal; no checkout or volatile session value is embedded in the unit.
+- Repeated service startup failures are rate-limited by systemd; workflow failures remain Recording-scoped and
+  never cross the exactly-once Delivery boundary.
 
 ## Gotchas
 - Use `CONTEXT.md` terms exactly; several ordinary synonyms are banned.
@@ -73,5 +80,6 @@
 - The installed Fedora libei here is 1.5 and lacks TEXT symbols introduced in 1.6; the keyboard path therefore needs
   the EIS device to provide an XKB keymap, while a missing keymap fails closed to the preserved clipboard.
 - External review workers may be unavailable even after their quota resets: Ticket 09's final Sonnet reader produced
-  no output and was stopped after several minutes, so the already-green implementation received a focused manual
-  review instead.
+  no output, and both Ticket 10 Sonnet attempts also returned no usable review; do not wait on them as a gate.
+- The Ticket 10 full Fedora recovery smoke is intentionally unrun in standard gates; it requires explicit
+  `VOISU_LIVE_RECOVERY_SMOKE=1` plus a real Fedora desktop, credentials, portals, and systemd user session.
