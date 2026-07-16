@@ -6,7 +6,8 @@
 - Ticket 09 merged through PR #16 at `9b58f99`; exact-head CI passed and issue #9 is closed.
 - Ticket 10 round-1 review findings are fixed on `ticket-10-recovery`; next step is re-review, exact-head CI,
   PR/merge, and issue #10 closure.
-- Follow-up issue #14 remains open: make Deepgram/Groq abort cancellation-safe plus its regression test.
+- Follow-up issue #14 is implemented and verified on `issue-14-cancellation-safe-abort`; next step is to commit from
+  a checkout where `.git` is writable, then review/merge and close the issue.
 
 ## Status
 - `voisu` and `voisu-daemon` communicate over bounded, versioned Unix IPC; the actor keeps status responsive while
@@ -45,8 +46,8 @@
 - Portal revocation/restart acceptance now runs real PipeWire/provider/clipboard adapters against a private portal
   bus and asserts exact clipboard bytes. The live Fedora recovery smoke refuses an existing Voisu installation,
   verifies the daemon PID changes after interruption, and disables/removes its debug service even after panic.
-- Current inventory: 172 tests listed (10 app unit + 106 daemon/CLI acceptance + 6 Delivery + 10 user-service +
-  20 diagnostics + 6 provider-coordination + 14 Transcript-decision). The full host gate is green: 170 passed,
+- Current inventory: 173 tests listed (11 app unit + 106 daemon/CLI acceptance + 6 Delivery + 10 user-service +
+  20 diagnostics + 6 provider-coordination + 14 Transcript-decision). The full host gate is green: 171 passed,
   2 opt-in live smokes ignored, 0 failed; `cargo build --workspace` is clean.
 
 ## Architecture map

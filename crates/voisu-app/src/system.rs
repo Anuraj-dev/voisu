@@ -1522,8 +1522,9 @@ impl ProviderStream for GroqStream {
             // already-running blocking requests, letting work from the failed
             // Recording overlap the next one.
             self.cancel.cancel();
-            for chunk in self.chunks.drain(..) {
+            while let Some(chunk) = self.chunks.front_mut() {
                 let _ = chunk.await;
+                self.chunks.pop_front();
             }
             Ok(())
         })
@@ -1647,8 +1648,9 @@ impl ProviderStream for DeepgramStream {
     fn abort(mut self: Box<Self>) -> BoundaryFuture<'static, ()> {
         Box::pin(async move {
             self.cancel.cancel();
-            for chunk in self.chunks.drain(..) {
+            while let Some(chunk) = self.chunks.front_mut() {
                 let _ = chunk.await;
+                self.chunks.pop_front();
             }
             Ok(())
         })
@@ -3488,6 +3490,78 @@ fn wav_from_pcm(pcm: &[u8]) -> Result<Vec<u8>, BoundaryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use voisu_core::{ProviderCoordinator, ProviderStreams};
+
+    fn gated_provider_chunk(
+        gate: tokio::sync::oneshot::Receiver<()>,
+        completions: Arc<AtomicUsize>,
+    ) -> tokio::task::JoinHandle<Result<String, BoundaryError>> {
+        tokio::spawn(async move {
+            let _ = gate.await;
+            completions.fetch_add(1, Ordering::SeqCst);
+            Ok(String::new())
+        })
+    }
+
+    #[tokio::test]
+    async fn provider_abort_deadline_does_not_detach_adapter_tasks() {
+        let deepgram_completions = Arc::new(AtomicUsize::new(0));
+        let groq_completions = Arc::new(AtomicUsize::new(0));
+        let (deepgram_gate, deepgram_wait) = tokio::sync::oneshot::channel();
+        let (groq_gate, groq_wait) = tokio::sync::oneshot::channel();
+        let credential = Credential::new("controlled-credential".to_owned()).unwrap();
+        let streams = ProviderStreams {
+            deepgram: Box::new(DeepgramStream {
+                credential: credential.clone(),
+                endpoint: "http://localhost/deepgram".to_owned(),
+                buffer: Vec::new(),
+                streamed_bytes: 0,
+                chunks: VecDeque::from([gated_provider_chunk(
+                    deepgram_wait,
+                    Arc::clone(&deepgram_completions),
+                )]),
+                permits: Arc::new(tokio::sync::Semaphore::new(MAX_DEEPGRAM_IN_FLIGHT)),
+                cancel: CancelRegistry::new(),
+            }),
+            groq: Box::new(GroqStream {
+                credential,
+                endpoint: "http://localhost/groq".to_owned(),
+                buffer: Vec::new(),
+                streamed_bytes: 0,
+                chunks: VecDeque::from([gated_provider_chunk(
+                    groq_wait,
+                    Arc::clone(&groq_completions),
+                )]),
+                cancel: CancelRegistry::new(),
+            }),
+        };
+
+        let error = ProviderCoordinator::start(
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            streams,
+        )
+        .complete(CapturedAudio::empty())
+        .await
+        .unwrap_err();
+        assert_eq!(error.diagnostic(), "provider deadline cleanup timed out");
+
+        let _ = deepgram_gate.send(());
+        let _ = groq_gate.send(());
+        tokio::task::yield_now().await;
+        assert_eq!(
+            deepgram_completions.load(Ordering::SeqCst),
+            0,
+            "the Deepgram abort future must retain its handle until await completes"
+        );
+        assert_eq!(
+            groq_completions.load(Ordering::SeqCst),
+            0,
+            "the Groq abort future must retain its handle until await completes"
+        );
+    }
 
     #[test]
     fn every_restricted_external_child_receives_the_parent_death_contract() {
