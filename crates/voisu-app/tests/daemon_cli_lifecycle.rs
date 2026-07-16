@@ -302,6 +302,72 @@ cat > "$dir/clipboard"
 }
 
 #[test]
+fn clipboard_delivery_succeeds_while_wl_copy_serves_the_clipboard_past_exit() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+head -c 6400 /dev/zero | tr '\000' '\001'
+trap 'printf "\002\003"; exit 0' INT TERM
+i=0
+while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
+"#,
+    );
+    // Real wl-copy consumes stdin, forks a clipboard-serving child that
+    // inherits its stdout/stderr, and exits; the server outlives the parent.
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+cat > "$dir/clipboard"
+/usr/bin/sleep 10 &
+exit 0
+"#,
+    );
+
+    let (endpoint, _request_rx, server) = local_groq_server("hello from Groq");
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", &endpoint),
+            ("VOISU_RECORDING_DEADLINE_MS", "5000"),
+        ],
+    );
+
+    let started = voisu(runtime.path(), "start");
+    assert!(started.status.success(), "{}", stderr(&started));
+    thread::sleep(Duration::from_millis(50));
+    let stop_started = Instant::now();
+    let stopped = voisu(runtime.path(), "stop");
+    assert!(
+        stopped.status.success(),
+        "delivery must not fail because the clipboard server holds the pipes: {}",
+        stderr(&stopped)
+    );
+    assert!(
+        stop_started.elapsed() < Duration::from_secs(4),
+        "delivery must not stall on the serving child, elapsed {:?}",
+        stop_started.elapsed()
+    );
+    assert_eq!(
+        fs::read_to_string(commands.path().join("clipboard")).unwrap(),
+        "hello from Groq"
+    );
+    server.join().unwrap();
+}
+
+#[test]
 fn deepgram_receives_live_audio_during_the_recording_through_a_hardened_boundary() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
@@ -1771,6 +1837,11 @@ printf '%s\n' "$@" > "$dir/busctl.args"
             r#"#!/bin/sh
 dir=$(dirname "$0")
 cat > "$dir/clipboard"
+if [ -e "$dir/wl-copy.serving" ]; then
+  # Real wl-copy forks a clipboard-serving child that inherits stdout/stderr
+  # and outlives this parent's own immediate, successful exit.
+  /usr/bin/sleep 10 &
+fi
 "#,
         );
         write_fake_command(
@@ -2005,6 +2076,34 @@ fn doctor_exercises_real_capabilities_instead_of_command_headings_or_socket_conn
     assert!(stdout(&doctor).contains("Microphone: PASS (default source available)"));
     assert!(stdout(&doctor).contains("Clipboard: PASS (clipboard roundtrip succeeds"));
     assert!(stdout(&doctor).contains("Daemon: PASS (status handshake succeeds)"));
+}
+
+#[test]
+fn doctor_clipboard_passes_while_wl_copy_serves_the_clipboard_past_exit() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let commands = FakeCommands::new();
+    // Real wl-copy's SUCCESS mode leaves a serving child holding the pipes;
+    // the roundtrip must read that as a healthy clipboard, not a timeout.
+    commands.touch("wl-copy.serving");
+    let started = Instant::now();
+    let doctor = voisu_with_env(runtime.path(), &["doctor"], &[("PATH", &commands.path())]);
+
+    assert!(doctor.status.success(), "{}", stdout(&doctor));
+    assert!(
+        stdout(&doctor).contains("Clipboard: PASS (clipboard roundtrip succeeds"),
+        "{}",
+        stdout(&doctor)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "the roundtrip must not stall on the serving children, elapsed {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        fs::read_to_string(commands.bin.path().join("clipboard")).unwrap(),
+        "prior clipboard"
+    );
 }
 
 #[test]

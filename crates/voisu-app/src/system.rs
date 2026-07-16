@@ -798,14 +798,14 @@ fn clipboard_finding() -> ReadinessFinding {
         ),
     };
     let probe = format!("voisu-readiness-{}", std::process::id());
-    let copied = run_restricted("wl-copy", &["--"], Some(probe.as_bytes()), false)
+    let copied = run_restricted_serving("wl-copy", &["--"], Some(probe.as_bytes()))
         .is_ok_and(|outcome| outcome.success);
     let observed = run_restricted("wl-paste", &["--no-newline"], None, true)
         .ok()
         .filter(|outcome| outcome.success)
         .map(|outcome| outcome.stdout == probe.as_bytes())
         .unwrap_or(false);
-    let restored = run_restricted("wl-copy", &["--"], Some(&original), false)
+    let restored = run_restricted_serving("wl-copy", &["--"], Some(&original))
         .is_ok_and(|outcome| outcome.success);
     match (copied && observed, restored) {
         (true, true) => readiness(
@@ -993,6 +993,49 @@ fn run_restricted(
     capture_stdout: bool,
 ) -> Result<ProcessOutcome, ProcessError> {
     run_restricted_with_deadline(program, arguments, input, capture_stdout, PROCESS_DEADLINE, None)
+}
+
+/// Runs a helper whose SUCCESS mode is to fork a descendant that keeps
+/// serving after the parent exits — real `wl-copy` serves the clipboard this
+/// way. The descendant inherits the parent's pipes, so capturing output would
+/// read the healthy case as a pipe held past the deadline; both streams are
+/// discarded and only the parent's own exit status is observed.
+fn run_restricted_serving(
+    program: &str,
+    arguments: &[&str],
+    input: Option<&[u8]>,
+) -> Result<ProcessOutcome, ProcessError> {
+    let started = Instant::now();
+    let mut command = restricted_command(program);
+    command
+        .args(arguments)
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(|_| ProcessError::Unavailable)?;
+    let writer = match input {
+        Some(input) => {
+            let input = input.to_vec();
+            let mut stdin = child.stdin.take().ok_or(ProcessError::Input)?;
+            Some(thread::spawn(move || {
+                let result = stdin.write_all(&input);
+                drop(stdin);
+                result
+            }))
+        }
+        None => None,
+    };
+    let status = wait_for_child(&mut child, started, PROCESS_DEADLINE, None);
+    let writer = writer.map(|handle| bounded_join(handle, started, &mut child, PROCESS_DEADLINE));
+    let status = status?;
+    if let Some(writer) = writer {
+        match writer {
+            Ok(Ok(())) => {}
+            Err(ProcessError::TimedOut) => return Err(ProcessError::TimedOut),
+            _ => return Err(ProcessError::Input),
+        }
+    }
+    Ok(ProcessOutcome { success: status.success(), stdout: Vec::new(), stderr: Vec::new() })
 }
 
 fn run_restricted_with_deadline(
@@ -2202,7 +2245,7 @@ impl ClipboardBoundary for WlClipboard {
         let text = transcript.0.clone();
         Box::pin(async move {
             let result = tokio::task::spawn_blocking(move || {
-                run_restricted("wl-copy", &[], Some(text.as_bytes()), false)
+                run_restricted_serving("wl-copy", &[], Some(text.as_bytes()))
             })
             .await
             .map_err(|_| {
