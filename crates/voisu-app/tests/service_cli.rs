@@ -219,6 +219,19 @@ fn install_is_idempotent_atomic_and_free_of_stale_session_or_checkout_values() {
 }
 
 #[test]
+fn installed_service_bounds_repeated_startup_failures() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+
+    let installed = fixture.run(&["service", "install"]);
+    assert!(installed.status.success(), "{}", stderr(&installed));
+
+    let unit = fs::read_to_string(fixture.unit_path()).unwrap();
+    assert!(unit.contains("Restart=on-failure\n"), "{unit}");
+    assert!(unit.contains("StartLimitIntervalSec=30s\n"), "{unit}");
+    assert!(unit.contains("StartLimitBurst=3\n"), "{unit}");
+}
+
+#[test]
 fn inactive_status_reports_both_systemd_and_ipc_state() {
     let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
 
