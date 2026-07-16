@@ -123,6 +123,7 @@ impl PresentationController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feedback::{select_feedback_backend, FeedbackBackend, FeedbackCapabilities, SessionKind};
     use voisu_core::{DaemonState, OverlayEvent, OverlayOutcome, Response, VersionEnvelope};
 
     fn event(id: u64, outcome: OverlayOutcome) -> OverlayEvent {
@@ -139,6 +140,31 @@ mod tests {
         let mut response = Response::success(state, state.cli_label());
         response.overlay_event = retained;
         response
+    }
+
+    #[test]
+    fn startup_is_hidden_at_idle_and_an_immediate_recording_is_visible_without_a_grace_window() {
+        // Round-2 finding 2: the window must stay hidden at Idle (no styled
+        // empty-capsule flash) and polling must start immediately so an early
+        // Recording is never missed. The pure decision the adapter honors is
+        // tested here; only a live compositor can prove the absence of the
+        // startup visual flash, which the adapter now guarantees by never
+        // calling `present()` at startup.
+        let now = Instant::now();
+        // Before any status arrives the view is HIDDEN — the window stays down.
+        assert_eq!(OverlayView::HIDDEN.phase, OverlayPhase::Hidden);
+        assert!(!OverlayView::HIDDEN.is_visible());
+        // An Idle daemon keeps the window hidden: no startup flash.
+        let mut at_idle = PresentationController::default();
+        let idle = at_idle.observe(&overlay_status(DaemonState::Idle, None), now);
+        assert_eq!(idle.phase, OverlayPhase::Hidden);
+        assert!(!idle.is_visible());
+        // The very first observed status can be Recording; it is immediately
+        // visible with no grace window, so immediate polling shows it at once.
+        let mut fresh = PresentationController::default();
+        let recording = fresh.observe(&overlay_status(DaemonState::Recording, None), now);
+        assert_eq!(recording.phase, OverlayPhase::Recording);
+        assert!(recording.is_visible());
     }
 
     #[test]
@@ -269,5 +295,66 @@ mod tests {
             r#"{"version":1,"ok":true,"state":"idle","message":"idle","overlay_event":{"id":3,"outcome":"delivered","message":"Delivered"}}"#,
         ).unwrap();
         assert_eq!(envelope.version, 1);
+    }
+
+    #[test]
+    fn red_layer_shell_is_selected_only_for_an_advertised_wayland_compositor() {
+        // RED proof: this contract names the public capability seam before the
+        // implementation exists. Removing the runtime Layer Shell probe makes
+        // this test fail rather than silently choosing a Layer Shell surface.
+        let selection = select_feedback_backend(FeedbackCapabilities {
+            session: SessionKind::Wayland,
+            display_available: true,
+            xwayland_fallback: false,
+            layer_shell_supported: true,
+        });
+        assert_eq!(selection.backend, FeedbackBackend::LayerShell);
+        assert_eq!(selection.degradation, None);
+    }
+
+    #[test]
+    fn red_degraded_cases_keep_a_visible_feedback_path_and_name_the_cause() {
+        // RED proof: without the pure fallback selector, X11, unavailable
+        // Layer Shell, a missing display, and a failed surface are all either
+        // silently ignored or crash in GTK-dependent tests.
+        let cases = [
+            (
+                FeedbackCapabilities { session: SessionKind::X11, display_available: true, xwayland_fallback: false, layer_shell_supported: false },
+                FeedbackBackend::RegularSurface,
+                Some(crate::feedback::FeedbackDegradation::X11),
+            ),
+            (
+                FeedbackCapabilities { session: SessionKind::Wayland, display_available: true, xwayland_fallback: false, layer_shell_supported: false },
+                FeedbackBackend::RegularSurface,
+                Some(crate::feedback::FeedbackDegradation::LayerShellUnavailable),
+            ),
+            (
+                FeedbackCapabilities { session: SessionKind::Wayland, display_available: false, xwayland_fallback: false, layer_shell_supported: true },
+                FeedbackBackend::JournalLog,
+                Some(crate::feedback::FeedbackDegradation::MissingDisplay),
+            ),
+        ];
+        for (capabilities, backend, degradation) in cases {
+            let selection = select_feedback_backend(capabilities);
+            assert_eq!((selection.backend, selection.degradation), (backend, degradation));
+        }
+        let surface_failure = crate::feedback::after_surface_creation(
+            select_feedback_backend(FeedbackCapabilities { session: SessionKind::Wayland, display_available: true, xwayland_fallback: false, layer_shell_supported: true }),
+            false,
+        );
+        assert_eq!(surface_failure.backend, FeedbackBackend::DesktopNotification);
+        assert_eq!(surface_failure.degradation, Some(crate::feedback::FeedbackDegradation::SurfaceCreationFailure));
+    }
+
+    #[test]
+    fn red_bounded_overlay_restarts_stop_without_a_daemon_control_path() {
+        // RED proof: this policy is pure and takes no daemon handle. Replacing
+        // it with an unbounded retry loop or a daemon restart cannot satisfy
+        // this contract test.
+        let mut policy = crate::feedback::OverlayRestartPolicy::default();
+        assert!(policy.record_failure(Duration::from_secs(0)).should_restart());
+        assert!(policy.record_failure(Duration::from_secs(10)).should_restart());
+        assert!(!policy.record_failure(Duration::from_secs(20)).should_restart());
+        assert!(policy.record_failure(Duration::from_secs(51)).should_restart());
     }
 }
