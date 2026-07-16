@@ -15,8 +15,8 @@ use serde_json::Value;
 use tempfile::TempDir;
 use voisu_app::system::{
     CAPTURE_FINALIZE_DEADLINE, CLIPBOARD_DELIVERY_DEADLINE,
-    PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE, RECONCILIATION_DEADLINE,
-    RECOVERY_ABORT_DEADLINE,
+    LIBEI_DELIVERY_DEADLINE, PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE,
+    RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -30,6 +30,7 @@ fn stop_response_budget_strictly_exceeds_all_daemon_processing_deadlines() {
             > CAPTURE_FINALIZE_DEADLINE
                 + PROVIDER_COMPLETION_DEADLINE
                 + CLIPBOARD_DELIVERY_DEADLINE
+                + LIBEI_DELIVERY_DEADLINE
                 + RECOVERY_ABORT_DEADLINE
                 + RECONCILIATION_DEADLINE * 2
     );
@@ -49,6 +50,11 @@ fn disable_shortcuts_unless_bus_injected(command: &mut Command, environment: &[(
         .any(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
     {
         command.env("VOISU_DISABLE_SHORTCUTS", "1");
+        if std::env::var_os("VOISU_LIVE_SMOKE").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            command.env("VOISU_DISABLE_DIRECT_DELIVERY", "1");
+        }
     }
 }
 
@@ -1992,6 +1998,29 @@ fn stop_completes_recording_and_delivery_then_returns_to_idle() {
     let status = voisu(runtime.path(), "status");
     assert!(status.status.success(), "{}", stderr(&status));
     assert_eq!(stdout(&status), "idle\n");
+}
+
+#[test]
+fn unavailable_direct_delivery_reports_that_the_transcript_is_on_the_clipboard() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_DELIVERY_FALLBACK", "permission denied")],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = voisu(runtime.path(), "stop");
+
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    assert_eq!(
+        stdout(&stopped),
+        "Direct Delivery unavailable; Transcript is on the clipboard\n"
+    );
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    assert_eq!(record["delivery_method"], "clipboard_fallback", "{history}");
+    assert_eq!(record["delivery_fallback_reason"], "permission denied", "{history}");
+    assert_eq!(record["delivery_count"], 1, "{history}");
 }
 
 #[test]

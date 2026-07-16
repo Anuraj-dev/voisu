@@ -124,6 +124,10 @@ pub struct LifecycleEvidence {
     pub correlation_id: String,
     pub stages: Vec<LifecycleStage>,
     pub delivery_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_method: Option<DeliveryMethod>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_fallback_reason: Option<String>,
     #[serde(default)]
     pub streamed_chunk_count: u32,
     #[serde(default)]
@@ -1123,8 +1127,37 @@ impl<M: ReconciliationModel> TranscriptValidator for TranscriptDecisionPipeline<
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryMethod {
+    Direct,
+    ClipboardFallback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliveryOutcome {
+    pub method: DeliveryMethod,
+    pub fallback_reason: Option<String>,
+}
+
+impl DeliveryOutcome {
+    pub fn direct() -> Self {
+        Self {
+            method: DeliveryMethod::Direct,
+            fallback_reason: None,
+        }
+    }
+
+    pub fn clipboard_fallback(reason: impl Into<String>) -> Self {
+        Self {
+            method: DeliveryMethod::ClipboardFallback,
+            fallback_reason: Some(reason.into()),
+        }
+    }
+}
+
 pub trait DeliveryAdapter: Send {
-    fn deliver(&mut self, transcript: Transcript) -> BoundaryFuture<'_, ()>;
+    fn deliver(&mut self, transcript: Transcript) -> BoundaryFuture<'_, DeliveryOutcome>;
 }
 
 /// The desktop-approved Trigger Key binding, surfaced to the user during setup.

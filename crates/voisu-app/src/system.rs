@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::os::fd::IntoRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant};
 use voisu_core::{
     socket_path, ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture,
     BoundaryKind, CancelRegistry, CapturedAudio, Command as DaemonCommand, Credential,
-    DeliveryAdapter, Provider,
+    DeliveryAdapter, DeliveryOutcome, Provider,
     ProviderAuthenticator, ProviderStream, ReadinessCapability, ReadinessFinding,
     MergeResult, ReadinessInspector, ReadinessStatus, ReconciliationKind, ReconciliationModel,
     Request, Response, SecretStore, ShortcutPortal, ShortcutSession, SourceTranscript, Transcript,
@@ -22,6 +23,7 @@ const PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 pub const CAPTURE_FINALIZE_DEADLINE: Duration = PROCESS_DEADLINE;
 pub const PROVIDER_COMPLETION_DEADLINE: Duration = Duration::from_secs(15);
 pub const CLIPBOARD_DELIVERY_DEADLINE: Duration = PROCESS_DEADLINE;
+pub const LIBEI_DELIVERY_DEADLINE: Duration = Duration::from_secs(5);
 /// Grace granted to the bounded capture/provider aborts that run when a
 /// Recording fails or a partial start is rolled back.
 pub const RECOVERY_ABORT_DEADLINE: Duration = PROCESS_DEADLINE;
@@ -30,6 +32,7 @@ pub const PROCESSING_RESPONSE_DEADLINE: Duration = Duration::from_secs(
     CAPTURE_FINALIZE_DEADLINE.as_secs()
         + PROVIDER_COMPLETION_DEADLINE.as_secs()
         + CLIPBOARD_DELIVERY_DEADLINE.as_secs()
+        + LIBEI_DELIVERY_DEADLINE.as_secs()
         + RECOVERY_ABORT_DEADLINE.as_secs()
         + RECONCILIATION_DEADLINE.as_secs() * 2
         + 1,
@@ -148,6 +151,7 @@ fn escaped_sender(connection: &zbus::Connection) -> Result<String, BoundaryError
 async fn portal_request<B>(
     connection: &zbus::Connection,
     portal: &zbus::Proxy<'_>,
+    kind: BoundaryKind,
     method: &str,
     body: &B,
     deadline: Duration,
@@ -161,40 +165,40 @@ where
         .msg_type(zbus::message::Type::Signal)
         .interface(PORTAL_REQUEST_INTERFACE)
         .and_then(|builder| builder.member("Response"))
-        .map_err(|error| shortcut_error(format!("portal response rule invalid: {error}")))?
+        .map_err(|error| BoundaryError::new(kind, format!("portal response rule invalid: {error}")))?
         .build();
     let mut responses = zbus::MessageStream::for_match_rule(rule, connection, Some(16))
         .await
-        .map_err(|error| shortcut_error(format!("portal response subscription failed: {error}")))?;
+        .map_err(|error| BoundaryError::new(kind, format!("portal response subscription failed: {error}")))?;
 
     let reply = portal
         .call_method(method, body)
         .await
-        .map_err(|error| shortcut_error(format!("portal {method} failed: {error}")))?;
+        .map_err(|error| BoundaryError::new(kind, format!("portal {method} failed: {error}")))?;
     // Since xdg-desktop-portal 0.9 the returned handle equals the predictable
     // path; on an older portal it differs — either way the broad subscription
     // above already buffers its Response, so only the filter changes.
     let handle: zbus::zvariant::OwnedObjectPath = reply
         .body()
         .deserialize()
-        .map_err(|error| shortcut_error(format!("portal {method} returned no handle: {error}")))?;
+        .map_err(|error| BoundaryError::new(kind, format!("portal {method} returned no handle: {error}")))?;
     let deadline_at = tokio::time::Instant::now() + deadline;
     loop {
         let message = tokio::time::timeout_at(deadline_at, responses.next())
             .await
-            .map_err(|_| shortcut_error(format!("portal {method} response deadline elapsed")))?
-            .ok_or_else(|| shortcut_error(format!("portal {method} response stream ended")))?
-            .map_err(|error| shortcut_error(format!("portal {method} response failed: {error}")))?;
+            .map_err(|_| BoundaryError::new(kind, format!("portal {method} response deadline elapsed")))?
+            .ok_or_else(|| BoundaryError::new(kind, format!("portal {method} response stream ended")))?
+            .map_err(|error| BoundaryError::new(kind, format!("portal {method} response failed: {error}")))?;
         let header = message.header();
         if header.path().map(|path| path.as_str()) != Some(handle.as_str()) {
             continue;
         }
         let (code, results): (u32, std::collections::HashMap<String, zbus::zvariant::OwnedValue>) =
             message.body().deserialize().map_err(|error| {
-                shortcut_error(format!("portal {method} response malformed: {error}"))
+                BoundaryError::new(kind, format!("portal {method} response malformed: {error}"))
             })?;
         if code != 0 {
-            return Err(shortcut_error(format!(
+            return Err(BoundaryError::new(kind, format!(
                 "the desktop denied or cancelled the {method} request (response {code})"
             )));
         }
@@ -266,6 +270,7 @@ impl ShortcutPortal for FedoraShortcutPortal {
             let create_results = portal_request(
                 &connection,
                 &portal,
+                BoundaryKind::Shortcut,
                 "CreateSession",
                 &(create_options,),
                 PORTAL_SESSION_DEADLINE,
@@ -326,6 +331,7 @@ impl ShortcutPortal for FedoraShortcutPortal {
             let results = match portal_request(
                 &connection,
                 &portal,
+                BoundaryKind::Shortcut,
                 "BindShortcuts",
                 &(
                     session_object_path.clone(),
@@ -1900,13 +1906,122 @@ fn request_groq_reconciliation(
         })
 }
 
-pub struct ClipboardDelivery;
+pub trait ClipboardBoundary: Send {
+    fn preserve(&mut self, transcript: &Transcript) -> BoundaryFuture<'_, ()>;
+}
 
-impl DeliveryAdapter for ClipboardDelivery {
-    fn deliver(&mut self, transcript: Transcript) -> BoundaryFuture<'_, ()> {
+pub trait DirectDeliverySession: Send {
+    fn deliver_text(&mut self, text: &str) -> BoundaryFuture<'_, ()>;
+}
+
+pub trait RemoteDesktopPortal: Send {
+    fn connect(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>>;
+}
+
+pub struct PortalClipboardDelivery {
+    clipboard: Box<dyn ClipboardBoundary>,
+    portal: Box<dyn RemoteDesktopPortal>,
+    session: Option<Box<dyn DirectDeliverySession>>,
+    setup: Option<tokio::task::JoinHandle<Result<Box<dyn DirectDeliverySession>, BoundaryError>>>,
+    setup_failure: Option<String>,
+    background_setup: bool,
+}
+
+impl PortalClipboardDelivery {
+    pub fn with_boundaries(
+        clipboard: Box<dyn ClipboardBoundary>,
+        portal: Box<dyn RemoteDesktopPortal>,
+    ) -> Self {
+        Self {
+            clipboard,
+            portal,
+            session: None,
+            setup: None,
+            setup_failure: None,
+            background_setup: false,
+        }
+    }
+
+    pub fn clipboard_only() -> Self {
+        Self::with_boundaries(Box::new(WlClipboard), Box::new(DisabledRemoteDesktopPortal))
+    }
+}
+
+impl DeliveryAdapter for PortalClipboardDelivery {
+    fn deliver(&mut self, transcript: Transcript) -> BoundaryFuture<'_, DeliveryOutcome> {
+        Box::pin(async move {
+            // Clipboard preservation is the recoverability guarantee. Direct
+            // Delivery is never reported unless this succeeds first.
+            self.clipboard.preserve(&transcript).await?;
+
+            if self.session.is_none() {
+                if let Some(reason) = self.setup_failure.take() {
+                    if self.background_setup {
+                        self.setup = Some(spawn_remote_desktop_setup());
+                    }
+                    return Ok(DeliveryOutcome::clipboard_fallback(reason));
+                }
+                if let Some(setup) = self.setup.take() {
+                    if setup.is_finished() {
+                        match setup.await {
+                            Ok(Ok(session)) => self.session = Some(session),
+                            Ok(Err(error)) => {
+                                let reason = error.diagnostic().to_owned();
+                                self.setup_failure = Some(reason.clone());
+                                return Ok(DeliveryOutcome::clipboard_fallback(reason));
+                            }
+                            Err(_) => {
+                                return Ok(DeliveryOutcome::clipboard_fallback(
+                                    "RemoteDesktop setup unavailable",
+                                ));
+                            }
+                        }
+                    } else {
+                        self.setup = Some(setup);
+                        return Ok(DeliveryOutcome::clipboard_fallback(
+                            "RemoteDesktop permission request pending",
+                        ));
+                    }
+                } else {
+                    match self.portal.connect().await {
+                        Ok(session) => self.session = Some(session),
+                        Err(error) => {
+                            return Ok(DeliveryOutcome::clipboard_fallback(error.diagnostic()));
+                        }
+                    }
+                }
+            }
+
+            let result = self
+                .session
+                .as_mut()
+                .expect("RemoteDesktop session was established")
+                .deliver_text(&transcript.0)
+                .await;
+            match result {
+                Ok(()) => Ok(DeliveryOutcome::direct()),
+                Err(error) => {
+                    // A revoked/disconnected/rejecting libei session cannot be
+                    // reused. The next Recording may request a fresh grant.
+                    self.session = None;
+                    if self.background_setup {
+                        self.setup = Some(spawn_remote_desktop_setup());
+                    }
+                    Ok(DeliveryOutcome::clipboard_fallback(error.diagnostic()))
+                }
+            }
+        })
+    }
+}
+
+pub struct WlClipboard;
+
+impl ClipboardBoundary for WlClipboard {
+    fn preserve(&mut self, transcript: &Transcript) -> BoundaryFuture<'_, ()> {
+        let text = transcript.0.clone();
         Box::pin(async move {
             let result = tokio::task::spawn_blocking(move || {
-                run_restricted("wl-copy", &[], Some(transcript.0.as_bytes()), false)
+                run_restricted("wl-copy", &[], Some(text.as_bytes()), false)
             })
             .await
             .map_err(|_| {
@@ -1929,6 +2044,556 @@ impl DeliveryAdapter for ClipboardDelivery {
             }
         })
     }
+}
+
+const REMOTE_DESKTOP_INTERFACE: &str = "org.freedesktop.portal.RemoteDesktop";
+const KEYBOARD_DEVICE: u32 = 1;
+const PERSIST_UNTIL_REVOKED: u32 = 2;
+static REMOTE_DESKTOP_TOKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+pub struct FedoraRemoteDesktopPortal;
+
+struct DisabledRemoteDesktopPortal;
+
+impl RemoteDesktopPortal for DisabledRemoteDesktopPortal {
+    fn connect(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>> {
+        Box::pin(async {
+            Err(BoundaryError::new(
+                BoundaryKind::Delivery,
+                "direct Delivery disabled for this run",
+            ))
+        })
+    }
+}
+
+impl RemoteDesktopPortal for FedoraRemoteDesktopPortal {
+    fn connect(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>> {
+        Box::pin(async move {
+            use std::sync::atomic::Ordering;
+            use zbus::zvariant::Value;
+
+            let connection = zbus::Connection::session().await.map_err(|_| {
+                BoundaryError::new(BoundaryKind::Delivery, "RemoteDesktop portal unavailable")
+            })?;
+            let portal = zbus::Proxy::new(
+                &connection,
+                PORTAL_BUS_NAME,
+                PORTAL_OBJECT_PATH,
+                REMOTE_DESKTOP_INTERFACE,
+            )
+            .await
+            .map_err(|_| {
+                BoundaryError::new(BoundaryKind::Delivery, "RemoteDesktop portal unavailable")
+            })?;
+
+            let unique = REMOTE_DESKTOP_TOKEN.fetch_add(1, Ordering::Relaxed);
+            let prefix = format!("voisu_delivery_{}_{}", std::process::id(), unique);
+            let session_token = format!("{prefix}_session");
+            let session_path = format!(
+                "/org/freedesktop/portal/desktop/session/{}/{session_token}",
+                escaped_sender(&connection).map_err(|_| BoundaryError::new(
+                    BoundaryKind::Delivery,
+                    "RemoteDesktop portal unavailable",
+                ))?
+            );
+            let create_options: std::collections::HashMap<&str, Value<'_>> =
+                std::collections::HashMap::from([
+                    ("handle_token", Value::from(format!("{prefix}_create"))),
+                    ("session_handle_token", Value::from(session_token.as_str())),
+                ]);
+            let create_results = portal_request(
+                &connection,
+                &portal,
+                BoundaryKind::Delivery,
+                "CreateSession",
+                &(create_options,),
+                PORTAL_SESSION_DEADLINE,
+            )
+            .await
+            .map_err(classify_remote_desktop_failure)?;
+            let session_path = session_handle_from(&create_results).unwrap_or(session_path);
+            let session_object: zbus::zvariant::OwnedObjectPath =
+                zbus::zvariant::ObjectPath::try_from(session_path.as_str())
+                    .map_err(|_| BoundaryError::new(BoundaryKind::Delivery, "permission denied"))?
+                    .into();
+            let session_proxy = zbus::Proxy::new(
+                &connection,
+                PORTAL_BUS_NAME,
+                session_path.clone(),
+                PORTAL_SESSION_INTERFACE,
+            )
+            .await
+            .map_err(|_| BoundaryError::new(BoundaryKind::Delivery, "permission denied"))?;
+            let closures = session_proxy.receive_signal("Closed").await.map_err(|_| {
+                BoundaryError::new(BoundaryKind::Delivery, "permission denied")
+            })?;
+
+            let select_options: std::collections::HashMap<&str, Value<'_>> =
+                std::collections::HashMap::from([
+                    ("handle_token", Value::from(format!("{prefix}_select"))),
+                    ("types", Value::from(KEYBOARD_DEVICE)),
+                    ("persist_mode", Value::from(PERSIST_UNTIL_REVOKED)),
+                ]);
+            if let Err(error) = portal_request(
+                &connection,
+                &portal,
+                BoundaryKind::Delivery,
+                "SelectDevices",
+                &(session_object.clone(), select_options),
+                PORTAL_BIND_DEADLINE,
+            )
+            .await
+            {
+                close_portal_session(&connection, session_path.as_str()).await;
+                return Err(classify_remote_desktop_failure(error));
+            }
+
+            let start_options: std::collections::HashMap<&str, Value<'_>> =
+                std::collections::HashMap::from([(
+                    "handle_token",
+                    Value::from(format!("{prefix}_start")),
+                )]);
+            let started = match portal_request(
+                &connection,
+                &portal,
+                BoundaryKind::Delivery,
+                "Start",
+                &(session_object.clone(), "", start_options),
+                PORTAL_BIND_DEADLINE,
+            )
+            .await
+            {
+                Ok(results) => results,
+                Err(error) => {
+                    close_portal_session(&connection, session_path.as_str()).await;
+                    return Err(classify_remote_desktop_failure(error));
+                }
+            };
+            let devices = started
+                .get("devices")
+                .and_then(|value| value.downcast_ref::<u32>().ok())
+                .unwrap_or(0);
+            if devices & KEYBOARD_DEVICE == 0 {
+                close_portal_session(&connection, session_path.as_str()).await;
+                return Err(BoundaryError::new(
+                    BoundaryKind::Delivery,
+                    "keyboard permission unavailable",
+                ));
+            }
+
+            let options: std::collections::HashMap<&str, Value<'_>> =
+                std::collections::HashMap::new();
+            let reply = portal
+                .call_method("ConnectToEIS", &(session_object.clone(), options))
+                .await
+                .map_err(|_| {
+                    BoundaryError::new(BoundaryKind::Delivery, "libei connection unavailable")
+                })?;
+            let fd: zbus::zvariant::OwnedFd = reply.body().deserialize().map_err(|_| {
+                BoundaryError::new(BoundaryKind::Delivery, "libei connection unavailable")
+            })?;
+            let fd: std::os::fd::OwnedFd = fd.into();
+            let sender_result = tokio::task::spawn_blocking(move || {
+                NativeEiSender::connect(fd.into_raw_fd())
+            })
+            .await
+            .map_err(|_| {
+                BoundaryError::new(BoundaryKind::Delivery, "libei connection unavailable")
+            })?;
+            let sender = match sender_result {
+                Ok(sender) => sender,
+                Err(error) => {
+                    close_portal_session(&connection, session_path.as_str()).await;
+                    return Err(error);
+                }
+            };
+
+            Ok(Box::new(FedoraDirectDeliverySession {
+                connection,
+                session_path: session_object,
+                closures,
+                sender: Some(sender),
+            }) as Box<dyn DirectDeliverySession>)
+        })
+    }
+}
+
+fn classify_remote_desktop_failure(error: BoundaryError) -> BoundaryError {
+    let reason = if error.diagnostic().contains("denied or cancelled") {
+        "permission denied"
+    } else {
+        "RemoteDesktop portal unavailable"
+    };
+    BoundaryError::new(BoundaryKind::Delivery, reason)
+}
+
+struct FedoraDirectDeliverySession {
+    connection: zbus::Connection,
+    session_path: zbus::zvariant::OwnedObjectPath,
+    closures: zbus::proxy::SignalStream<'static>,
+    sender: Option<NativeEiSender>,
+}
+
+impl DirectDeliverySession for FedoraDirectDeliverySession {
+    fn deliver_text(&mut self, text: &str) -> BoundaryFuture<'_, ()> {
+        let text = text.to_owned();
+        Box::pin(async move {
+            use zbus::export::ordered_stream::OrderedStreamExt;
+            if matches!(
+                tokio::time::timeout(Duration::from_millis(1), self.closures.next()).await,
+                Ok(Some(_))
+            ) {
+                return Err(BoundaryError::new(BoundaryKind::Delivery, "permission revoked"));
+            }
+            let mut sender = self.sender.take().ok_or_else(|| {
+                BoundaryError::new(BoundaryKind::Delivery, "libei disconnected")
+            })?;
+            let (returned, result) = tokio::task::spawn_blocking(move || {
+                let result = sender.deliver(&text);
+                (sender, result)
+            })
+            .await
+            .map_err(|_| BoundaryError::new(BoundaryKind::Delivery, "libei disconnected"))?;
+            self.sender = Some(returned);
+            result
+        })
+    }
+}
+
+impl Drop for FedoraDirectDeliverySession {
+    fn drop(&mut self) {
+        let connection = self.connection.clone();
+        let path = self.session_path.to_string();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { close_portal_session(&connection, &path).await });
+        }
+    }
+}
+
+#[repr(C)]
+struct EiContext {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct EiEvent {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct EiSeat {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct EiDevice {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct EiPing {
+    _private: [u8; 0],
+}
+
+type SeatBindCapabilities = unsafe extern "C" fn(*mut EiSeat, ...);
+
+struct EiApi {
+    library: *mut libc::c_void,
+    new_sender: unsafe extern "C" fn(*mut libc::c_void) -> *mut EiContext,
+    configure_name: unsafe extern "C" fn(*mut EiContext, *const libc::c_char),
+    setup_backend_fd: unsafe extern "C" fn(*mut EiContext, libc::c_int) -> libc::c_int,
+    get_fd: unsafe extern "C" fn(*mut EiContext) -> libc::c_int,
+    dispatch: unsafe extern "C" fn(*mut EiContext),
+    get_event: unsafe extern "C" fn(*mut EiContext) -> *mut EiEvent,
+    event_type: unsafe extern "C" fn(*mut EiEvent) -> libc::c_int,
+    event_device: unsafe extern "C" fn(*mut EiEvent) -> *mut EiDevice,
+    event_seat: unsafe extern "C" fn(*mut EiEvent) -> *mut EiSeat,
+    event_unref: unsafe extern "C" fn(*mut EiEvent) -> *mut EiEvent,
+    seat_has_capability: unsafe extern "C" fn(*mut EiSeat, libc::c_int) -> bool,
+    seat_bind_capabilities: SeatBindCapabilities,
+    device_has_capability: unsafe extern "C" fn(*mut EiDevice, libc::c_int) -> bool,
+    device_ref: unsafe extern "C" fn(*mut EiDevice) -> *mut EiDevice,
+    device_unref: unsafe extern "C" fn(*mut EiDevice) -> *mut EiDevice,
+    start_emulating: unsafe extern "C" fn(*mut EiDevice, u32),
+    text_utf8: unsafe extern "C" fn(*mut EiDevice, *const libc::c_char, usize),
+    frame: unsafe extern "C" fn(*mut EiDevice, u64),
+    stop_emulating: unsafe extern "C" fn(*mut EiDevice),
+    now: unsafe extern "C" fn(*mut EiContext) -> u64,
+    new_ping: unsafe extern "C" fn(*mut EiContext) -> *mut EiPing,
+    ping: unsafe extern "C" fn(*mut EiPing),
+    ping_unref: unsafe extern "C" fn(*mut EiPing) -> *mut EiPing,
+    disconnect: unsafe extern "C" fn(*mut EiContext),
+    context_unref: unsafe extern "C" fn(*mut EiContext) -> *mut EiContext,
+}
+
+// The loaded libei objects are owned exclusively by one spawn_blocking task at
+// a time. No pointer is ever accessed concurrently.
+unsafe impl Send for EiApi {}
+
+impl EiApi {
+    fn load() -> Result<Self, BoundaryError> {
+        unsafe fn symbol<T: Copy>(
+            library: *mut libc::c_void,
+            name: &'static [u8],
+        ) -> Result<T, BoundaryError> {
+            // SAFETY: every name is NUL-terminated and each T below is the exact
+            // C ABI function-pointer type documented by libei.
+            let pointer = unsafe { libc::dlsym(library, name.as_ptr().cast()) };
+            if pointer.is_null() {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Delivery,
+                    "text capability unavailable",
+                ));
+            }
+            // SAFETY: function pointers and dlsym pointers have pointer size on
+            // the supported Fedora target; T is Copy and contains no references.
+            Ok(unsafe { std::mem::transmute_copy(&pointer) })
+        }
+
+        // Load by SONAME so the build does not require libei-devel or a linker
+        // symlink; Fedora's portal stack provides the runtime library.
+        let library = unsafe { libc::dlopen(c"libei.so.1".as_ptr(), libc::RTLD_NOW) };
+        if library.is_null() {
+            return Err(BoundaryError::new(
+                BoundaryKind::Delivery,
+                "libei connection unavailable",
+            ));
+        }
+        let loaded = unsafe {
+            (|| {
+                Ok(Self {
+                    library,
+                    new_sender: symbol(library, b"ei_new_sender\0")?,
+                    configure_name: symbol(library, b"ei_configure_name\0")?,
+                    setup_backend_fd: symbol(library, b"ei_setup_backend_fd\0")?,
+                    get_fd: symbol(library, b"ei_get_fd\0")?,
+                    dispatch: symbol(library, b"ei_dispatch\0")?,
+                    get_event: symbol(library, b"ei_get_event\0")?,
+                    event_type: symbol(library, b"ei_event_get_type\0")?,
+                    event_device: symbol(library, b"ei_event_get_device\0")?,
+                    event_seat: symbol(library, b"ei_event_get_seat\0")?,
+                    event_unref: symbol(library, b"ei_event_unref\0")?,
+                    seat_has_capability: symbol(library, b"ei_seat_has_capability\0")?,
+                    seat_bind_capabilities: symbol(library, b"ei_seat_bind_capabilities\0")?,
+                    device_has_capability: symbol(library, b"ei_device_has_capability\0")?,
+                    device_ref: symbol(library, b"ei_device_ref\0")?,
+                    device_unref: symbol(library, b"ei_device_unref\0")?,
+                    start_emulating: symbol(library, b"ei_device_start_emulating\0")?,
+                    text_utf8: symbol(library, b"ei_device_text_utf8_with_length\0")?,
+                    frame: symbol(library, b"ei_device_frame\0")?,
+                    stop_emulating: symbol(library, b"ei_device_stop_emulating\0")?,
+                    now: symbol(library, b"ei_now\0")?,
+                    new_ping: symbol(library, b"ei_new_ping\0")?,
+                    ping: symbol(library, b"ei_ping\0")?,
+                    ping_unref: symbol(library, b"ei_ping_unref\0")?,
+                    disconnect: symbol(library, b"ei_disconnect\0")?,
+                    context_unref: symbol(library, b"ei_unref\0")?,
+                })
+            })()
+        };
+        if loaded.is_err() {
+            unsafe { libc::dlclose(library) };
+        }
+        loaded
+    }
+}
+
+impl Drop for EiApi {
+    fn drop(&mut self) {
+        unsafe { libc::dlclose(self.library) };
+    }
+}
+
+struct NativeEiSender {
+    api: EiApi,
+    context: *mut EiContext,
+    device: *mut EiDevice,
+    sequence: u32,
+}
+
+unsafe impl Send for NativeEiSender {}
+
+impl NativeEiSender {
+    fn connect(fd: libc::c_int) -> Result<Self, BoundaryError> {
+        const EVENT_DISCONNECT: libc::c_int = 1;
+        const EVENT_SEAT_ADDED: libc::c_int = 2;
+        const EVENT_DEVICE_ADDED: libc::c_int = 4;
+        const CAP_TEXT: libc::c_int = 6;
+
+        let api = match EiApi::load() {
+            Ok(api) => api,
+            Err(error) => {
+                unsafe { libc::close(fd) };
+                return Err(error);
+            }
+        };
+        let context = unsafe { (api.new_sender)(std::ptr::null_mut()) };
+        if context.is_null() {
+            unsafe { libc::close(fd) };
+            return Err(BoundaryError::new(
+                BoundaryKind::Delivery,
+                "libei connection unavailable",
+            ));
+        }
+        unsafe { (api.configure_name)(context, c"Voisu Delivery".as_ptr()) };
+        if unsafe { (api.setup_backend_fd)(context, fd) } != 0 {
+            unsafe { (api.context_unref)(context) };
+            return Err(BoundaryError::new(
+                BoundaryKind::Delivery,
+                "libei connection unavailable",
+            ));
+        }
+
+        let deadline = Instant::now() + LIBEI_DELIVERY_DEADLINE;
+        let mut device: *mut EiDevice = std::ptr::null_mut();
+        while Instant::now() < deadline && device.is_null() {
+            poll_libei(&api, context, deadline)?;
+            loop {
+                let event = unsafe { (api.get_event)(context) };
+                if event.is_null() {
+                    break;
+                }
+                let event_type = unsafe { (api.event_type)(event) };
+                if event_type == EVENT_SEAT_ADDED {
+                    let seat = unsafe { (api.event_seat)(event) };
+                    if !seat.is_null() && unsafe { (api.seat_has_capability)(seat, CAP_TEXT) } {
+                        unsafe { (api.seat_bind_capabilities)(seat, CAP_TEXT, -1_i32) };
+                    }
+                } else if event_type == EVENT_DEVICE_ADDED {
+                    let candidate = unsafe { (api.event_device)(event) };
+                    if !candidate.is_null()
+                        && unsafe { (api.device_has_capability)(candidate, CAP_TEXT) }
+                    {
+                        device = unsafe { (api.device_ref)(candidate) };
+                    }
+                }
+                unsafe { (api.event_unref)(event) };
+                if event_type == EVENT_DISCONNECT {
+                    unsafe { (api.context_unref)(context) };
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Delivery,
+                        "libei disconnected",
+                    ));
+                }
+            }
+        }
+        if device.is_null() {
+            unsafe {
+                (api.disconnect)(context);
+                (api.context_unref)(context);
+            }
+            return Err(BoundaryError::new(
+                BoundaryKind::Delivery,
+                "text capability unavailable",
+            ));
+        }
+        Ok(Self {
+            api,
+            context,
+            device,
+            sequence: 0,
+        })
+    }
+
+    fn deliver(&mut self, text: &str) -> Result<(), BoundaryError> {
+        const EVENT_DISCONNECT: libc::c_int = 1;
+        const EVENT_PONG: libc::c_int = 9;
+        self.sequence = self.sequence.wrapping_add(1).max(1);
+        unsafe {
+            (self.api.start_emulating)(self.device, self.sequence);
+            (self.api.text_utf8)(self.device, text.as_ptr().cast(), text.len());
+            (self.api.frame)(self.device, (self.api.now)(self.context));
+            (self.api.stop_emulating)(self.device);
+        }
+        let ping = unsafe { (self.api.new_ping)(self.context) };
+        if ping.is_null() {
+            return Err(BoundaryError::new(
+                BoundaryKind::Delivery,
+                "application rejected direct Delivery",
+            ));
+        }
+        unsafe {
+            (self.api.ping)(ping);
+            (self.api.ping_unref)(ping);
+        }
+        let deadline = Instant::now() + LIBEI_DELIVERY_DEADLINE;
+        while Instant::now() < deadline {
+            poll_libei(&self.api, self.context, deadline)?;
+            loop {
+                let event = unsafe { (self.api.get_event)(self.context) };
+                if event.is_null() {
+                    break;
+                }
+                let event_type = unsafe { (self.api.event_type)(event) };
+                unsafe { (self.api.event_unref)(event) };
+                match event_type {
+                    EVENT_PONG => return Ok(()),
+                    EVENT_DISCONNECT => {
+                        return Err(BoundaryError::new(
+                            BoundaryKind::Delivery,
+                            "libei disconnected or application rejected direct Delivery",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(BoundaryError::new(
+            BoundaryKind::Delivery,
+            "application rejected direct Delivery",
+        ))
+    }
+}
+
+fn poll_libei(
+    api: &EiApi,
+    context: *mut EiContext,
+    deadline: Instant,
+) -> Result<(), BoundaryError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let millis = remaining.as_millis().min(100).max(1) as libc::c_int;
+    let mut pollfd = libc::pollfd {
+        fd: unsafe { (api.get_fd)(context) },
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut pollfd, 1, millis) };
+    if result < 0 {
+        return Err(BoundaryError::new(
+            BoundaryKind::Delivery,
+            "libei disconnected",
+        ));
+    }
+    unsafe { (api.dispatch)(context) };
+    Ok(())
+}
+
+impl Drop for NativeEiSender {
+    fn drop(&mut self) {
+        unsafe {
+            (self.api.device_unref)(self.device);
+            (self.api.disconnect)(self.context);
+            (self.api.context_unref)(self.context);
+        }
+    }
+}
+
+impl Default for PortalClipboardDelivery {
+    fn default() -> Self {
+        Self {
+            clipboard: Box::new(WlClipboard),
+            portal: Box::new(FedoraRemoteDesktopPortal),
+            session: None,
+            setup: Some(spawn_remote_desktop_setup()),
+            setup_failure: None,
+            background_setup: true,
+        }
+    }
+}
+
+fn spawn_remote_desktop_setup(
+) -> tokio::task::JoinHandle<Result<Box<dyn DirectDeliverySession>, BoundaryError>> {
+    tokio::spawn(async {
+        let mut portal = FedoraRemoteDesktopPortal;
+        portal.connect().await
+    })
 }
 
 impl ProviderHttpClient {

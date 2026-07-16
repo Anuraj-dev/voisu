@@ -13,14 +13,15 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use voisu_app::system::{
-    CAPTURE_FINALIZE_DEADLINE, ClipboardDelivery, DeepgramProvider, FedoraShortcutPortal,
+    CAPTURE_FINALIZE_DEADLINE, DeepgramProvider, FedoraShortcutPortal,
     GroqProvider, MergeResultValidator, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture,
-    RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
+    PortalClipboardDelivery, RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
-    CancelRegistry, CapturedAudio, Command, DaemonState, DeliveryAdapter, DiagnosticRecord,
-    DiagnosticStore, LifecycleEvidence, LifecycleStage, MergeResult, PROTOCOL_VERSION, Provider,
+    CancelRegistry, CapturedAudio, Command, DaemonState, DeliveryAdapter, DeliveryMethod,
+    DeliveryOutcome, DiagnosticRecord, DiagnosticStore, LifecycleEvidence, LifecycleStage,
+    MergeResult, PROTOCOL_VERSION, Provider,
     ProviderCoordinator, ProviderStream, ProviderStreams, ReconciliationKind, ReconciliationModel,
     ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SourceTranscript,
     SourceTranscriptRecord, Transcript, TranscriptDecision, TranscriptDecisionPipeline,
@@ -331,8 +332,10 @@ async fn actor_loop(
     };
     let mut delivery: Option<Box<dyn DeliveryAdapter>> = if controlled {
         Some(Box::new(ControlledDelivery))
+    } else if std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_some() {
+        Some(Box::new(PortalClipboardDelivery::clipboard_only()))
     } else {
-        Some(Box::new(ClipboardDelivery))
+        Some(Box::new(PortalClipboardDelivery::default()))
     };
     // The desktop-approved Trigger Key binding, once the portal listener reports
     // it. `None` means no Trigger Key is bound (portal unavailable or denied),
@@ -686,7 +689,12 @@ async fn actor_loop(
                         Ok(()) => Response::with_evidence(
                             true,
                             Some(DaemonState::Idle),
-                            "Recording completed; Transcript delivered",
+                            match completed.evidence.delivery_method {
+                                Some(DeliveryMethod::ClipboardFallback) => {
+                                    "Direct Delivery unavailable; Transcript is on the clipboard"
+                                }
+                                _ => "Recording completed; Transcript delivered",
+                            },
                             Some(completed.evidence),
                         ),
                         Err(error) => {
@@ -753,6 +761,8 @@ fn base_evidence(
         correlation_id,
         stages,
         delivery_count: 0,
+        delivery_method: None,
+        delivery_fallback_reason: None,
         streamed_chunk_count: 0,
         source_transcript_providers: Vec::new(),
         first_chunk_ms: None,
@@ -1071,8 +1081,10 @@ async fn process_recording(
         evidence.recovery_attempted = decision.recovery_attempted;
         evidence.stages.push(LifecycleStage::ValidationCompleted);
         final_transcript = Some(decision.transcript.0.clone());
-        delivery.deliver(decision.transcript).await?;
+        let delivery_outcome = delivery.deliver(decision.transcript).await?;
         evidence.delivery_count += 1;
+        evidence.delivery_method = Some(delivery_outcome.method);
+        evidence.delivery_fallback_reason = delivery_outcome.fallback_reason;
         evidence.release_to_text_ms = Some(elapsed_millis(started_at));
         evidence.stages.push(LifecycleStage::DeliveryCompleted);
         Ok(())
@@ -1125,6 +1137,8 @@ fn diagnostic_record(
     record.reconciliation_requested = evidence.reconciliation_requested;
     record.recovery_attempted = evidence.recovery_attempted;
     record.delivery_count = evidence.delivery_count;
+    record.delivery_method = evidence.delivery_method;
+    record.delivery_fallback_reason = evidence.delivery_fallback_reason.clone();
     record.first_chunk_ms = evidence.first_chunk_ms;
     record.capture_finalized_ms = evidence.capture_finalized_ms;
     record.provider_timings_ms = evidence.provider_timings_ms.clone();
@@ -1876,7 +1890,12 @@ impl ReconciliationModel for ControlledReconciliationModel {
 struct ControlledDelivery;
 
 impl DeliveryAdapter for ControlledDelivery {
-    fn deliver(&mut self, _transcript: Transcript) -> BoundaryFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
+    fn deliver(&mut self, _transcript: Transcript) -> BoundaryFuture<'_, DeliveryOutcome> {
+        Box::pin(async {
+            Ok(match std::env::var("VOISU_TEST_DELIVERY_FALLBACK") {
+                Ok(reason) => DeliveryOutcome::clipboard_fallback(reason),
+                Err(_) => DeliveryOutcome::direct(),
+            })
+        })
     }
 }

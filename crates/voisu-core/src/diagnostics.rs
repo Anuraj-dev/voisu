@@ -21,8 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BoundaryError, CapturedAudio, LifecycleStage, Provider, ProviderCoordinator, ProviderTiming,
-    SourceTranscript, TranscriptDecision, TranscriptSelection, TranscriptValidator,
+    BoundaryError, CapturedAudio, DeliveryMethod, LifecycleStage, Provider, ProviderCoordinator,
+    ProviderTiming, SourceTranscript, TranscriptDecision, TranscriptSelection, TranscriptValidator,
 };
 
 /// A stored transcript text is clamped so a bounded history never grows without
@@ -139,6 +139,10 @@ pub struct DiagnosticRecord {
     #[serde(default)]
     pub delivery_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_method: Option<DeliveryMethod>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_chunk_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_finalized_ms: Option<u64>,
@@ -170,6 +174,8 @@ impl DiagnosticRecord {
             reconciliation_requested: false,
             recovery_attempted: false,
             delivery_count: 0,
+            delivery_method: None,
+            delivery_fallback_reason: None,
             first_chunk_ms: None,
             capture_finalized_ms: None,
             provider_timings_ms: Vec::new(),

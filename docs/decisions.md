@@ -142,3 +142,12 @@ connection owning the Global Shortcuts session; the listener subscribes to `Acti
 fails closed on an absent or denying portal, and closes the session on retirement. Acceptance tests keep the edge
 substituted by pointing `DBUS_SESSION_BUS_ADDRESS` at a private `dbus-daemon` (service activation disabled) running
 a controlled portal service, so the production client is exercised over a real bus without touching the host desktop.
+
+## 2026-07-16 — Preserve the Transcript before background-prepared libei Delivery
+**Why:** Direct Delivery must never strand speech when desktop permission, the RemoteDesktop portal, EIS TEXT
+capability, the connection, or the focused application fails. The daemon therefore writes the final Transcript to
+the clipboard first and only reports direct success after a bounded libei frame plus pong. RemoteDesktop setup runs
+in the background with persistent keyboard permission (`persist_mode=2`) on one zbus connection, so an approval
+dialog cannot extend stop-to-Delivery latency; pending or failed setup is an explicit clipboard fallback. libei is
+loaded by SONAME at runtime and TEXT is required, preserving Unicode independently of the active layout without a
+build-time `libei-devel` dependency or an unsafe raw-input/`uinput` alternative.
