@@ -22,6 +22,7 @@ use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
     CancelRegistry, CapturedAudio, Command, DaemonState, DeliveryAdapter, DeliveryMethod,
     DeliveryOutcome, DiagnosticRecord, DiagnosticStore, LifecycleEvidence, LifecycleStage,
+    OverlayEvent, OverlayOutcome,
     MergeResult, PROTOCOL_VERSION, Provider,
     ProviderCoordinator, ProviderStream, ProviderStreams, ReconciliationKind, ReconciliationModel,
     ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SourceTranscript,
@@ -367,7 +368,8 @@ async fn actor_loop(
     let mut state = ActorState::Idle;
     // Retained only for the observer-facing Status response. It never controls
     // the lifecycle and is replaced by the next Recording outcome.
-    let mut last_feedback: Option<bool> = None;
+    let mut next_overlay_event_id = 1_u64;
+    let mut last_overlay_event: Option<OverlayEvent> = None;
     let mut next_id = 1_u64;
     // Raw audio is retained only when the user explicitly enables debug capture.
     let debug_capture = std::env::var_os("VOISU_DEBUG_CAPTURE").is_some();
@@ -420,7 +422,7 @@ async fn actor_loop(
                     let _ = reply.send(response);
                 }
                 Command::OverlayStatus => {
-                    let response = overlay_status_response(&state, last_feedback);
+                    let response = overlay_status_response(&state, last_overlay_event.as_ref());
                     let _ = reply.send(response);
                 }
                 Command::Shortcut => {
@@ -747,12 +749,20 @@ async fn actor_loop(
                             let mut evidence =
                                 base_evidence(id, correlation.clone(), Vec::new());
                             evidence.recovery_attempted = recovering;
-                            let _ = reply.send(Response::with_evidence(
+                            let mut response = Response::with_evidence(
                                 false,
                                 Some(DaemonState::Idle),
                                 failure.error.public_message(),
                                 Some(evidence),
-                            ));
+                            );
+                            response.overlay_event = Some(OverlayEvent {
+                                id: next_overlay_event_id,
+                                outcome: overlay_outcome(&failure.error),
+                                message: failure.error.public_message().to_owned(),
+                            });
+                            next_overlay_event_id += 1;
+                            last_overlay_event = response.overlay_event.clone();
+                            let _ = reply.send(response);
                             if recovering {
                                 // The daemon reads idle immediately but rejects
                                 // new Recordings until the bounded aborts
@@ -841,8 +851,7 @@ async fn actor_loop(
                     state = ActorState::Idle;
                     let response = match completed.result {
                         Ok(()) => {
-                            last_feedback = Some(true);
-                            Response::with_evidence(
+                            let mut response = Response::with_evidence(
                             true,
                             Some(DaemonState::Idle),
                             match completed.evidence.delivery_method {
@@ -852,17 +861,32 @@ async fn actor_loop(
                                 _ => "Transcript submitted through the compositor; preserved on the clipboard",
                             },
                             Some(completed.evidence),
-                        )
+                        );
+                            response.overlay_event = Some(OverlayEvent {
+                                id: next_overlay_event_id,
+                                outcome: OverlayOutcome::Delivered,
+                                message: "Delivered".to_owned(),
+                            });
+                            next_overlay_event_id += 1;
+                            last_overlay_event = response.overlay_event.clone();
+                            response
                         }
                         Err(error) => {
-                            last_feedback = Some(false);
                             eprintln!("Recording {}: {}", completed.id, error.diagnostic());
-                            Response::with_evidence(
+                            let mut response = Response::with_evidence(
                                 false,
                                 Some(DaemonState::Idle),
                                 error.public_message(),
                                 Some(completed.evidence),
-                            )
+                            );
+                            response.overlay_event = Some(OverlayEvent {
+                                id: next_overlay_event_id,
+                                outcome: overlay_outcome(&error),
+                                message: error.public_message().to_owned(),
+                            });
+                            next_overlay_event_id += 1;
+                            last_overlay_event = response.overlay_event.clone();
+                            response
                         }
                     };
                     if let Some(reply) = completed.reply {
@@ -929,24 +953,21 @@ fn state_label(state: &ActorState) -> DaemonState {
 }
 
 fn status_response(state: &ActorState) -> Response {
-    status_response_with_feedback(state, None)
+    status_response_with_feedback(state)
 }
 
-fn overlay_status_response(state: &ActorState, last_feedback: Option<bool>) -> Response {
-    status_response_with_feedback(state, last_feedback)
+fn overlay_status_response(state: &ActorState, event: Option<&OverlayEvent>) -> Response {
+    let mut response = status_response_with_feedback(state);
+    response.overlay_event = event.cloned();
+    response
 }
 
-fn status_response_with_feedback(state: &ActorState, last_feedback: Option<bool>) -> Response {
+fn status_response_with_feedback(state: &ActorState) -> Response {
     let daemon_state = state_label(state);
-    let message = match (daemon_state, last_feedback) {
-        (DaemonState::Idle, Some(true)) => "delivered",
-        (DaemonState::Idle, Some(false)) => "quality failure",
-        _ => daemon_state.cli_label(),
-    };
     Response::with_evidence(
         true,
         Some(daemon_state),
-        message,
+        daemon_state.cli_label(),
         match state {
             ActorState::Recording(recording) => {
                 let mut evidence = recording.evidence.clone();
@@ -961,6 +982,22 @@ fn status_response_with_feedback(state: &ActorState, last_feedback: Option<bool>
             | ActorState::Replaying(_) => None,
         },
     )
+}
+
+fn overlay_outcome(error: &BoundaryError) -> OverlayOutcome {
+    if error.transcript_failure().is_some() {
+        return OverlayOutcome::QualityFailure;
+    }
+    match error.kind() {
+        BoundaryKind::Capture => OverlayOutcome::CaptureFailure,
+        BoundaryKind::EmptyRecording => OverlayOutcome::EmptyRecording,
+        BoundaryKind::TooShortRecording => OverlayOutcome::TooShortRecording,
+        BoundaryKind::SilentRecording => OverlayOutcome::SilentRecording,
+        BoundaryKind::RecordingDeadline => OverlayOutcome::RecordingDeadline,
+        BoundaryKind::Provider => OverlayOutcome::ProviderFailure,
+        BoundaryKind::Delivery => OverlayOutcome::DeliveryFailure,
+        _ => OverlayOutcome::OtherFailure,
+    }
 }
 
 /// A fresh lifecycle evidence skeleton stamped with the Recording's correlation

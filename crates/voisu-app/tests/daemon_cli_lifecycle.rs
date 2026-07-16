@@ -2363,6 +2363,27 @@ fn status_distinguishes_daemon_unavailable_from_idle() {
 }
 
 #[test]
+fn overlay_status_is_typed_once_without_changing_cli_status() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+
+    let idle = ipc_request(runtime.path(), r#"{"version":1,"command":"overlaystatus"}"#);
+    assert_eq!(idle["state"], "idle");
+    assert_eq!(idle["message"], "idle");
+    assert!(idle.get("overlay_event").is_none());
+
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["overlay_event"]["outcome"], "delivered");
+    let observed = ipc_request(runtime.path(), r#"{"version":1,"command":"overlaystatus"}"#);
+    assert_eq!(observed["message"], "idle");
+    assert_eq!(observed["overlay_event"]["id"], stopped["overlay_event"]["id"]);
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+}
+
+#[test]
 fn concurrent_start_begins_exactly_one_recording() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start(runtime.path());

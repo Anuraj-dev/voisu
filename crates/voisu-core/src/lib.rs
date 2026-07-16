@@ -62,7 +62,7 @@ pub enum Command {
     Stop,
     Toggle,
     Status,
-    /// Observer-only status with the most recent terminal feedback retained.
+    /// Observer-only status with the most recent terminal event retained.
     /// This is not a lifecycle command and cannot mutate daemon state.
     OverlayStatus,
     /// Returns the desktop-approved Trigger Key binding for display, or a
@@ -173,6 +173,30 @@ pub struct Response {
     pub history: Option<Vec<DiagnosticRecord>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export: Option<DiagnosticExport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_event: Option<OverlayEvent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayOutcome {
+    Delivered,
+    QualityFailure,
+    CaptureFailure,
+    EmptyRecording,
+    TooShortRecording,
+    SilentRecording,
+    RecordingDeadline,
+    ProviderFailure,
+    DeliveryFailure,
+    OtherFailure,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OverlayEvent {
+    pub id: u64,
+    pub outcome: OverlayOutcome,
+    pub message: String,
 }
 
 impl Response {
@@ -198,6 +222,7 @@ impl Response {
             evidence,
             history: None,
             export: None,
+            overlay_event: None,
         }
     }
 

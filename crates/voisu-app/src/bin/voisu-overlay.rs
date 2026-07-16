@@ -1,6 +1,5 @@
 //! Optional GTK4 Layer Shell observer. It has no command path into the daemon.
 
-use std::cell::Cell;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
@@ -9,8 +8,8 @@ use std::time::Duration;
 use gtk4 as gtk;
 use gtk::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardInteractivity, Layer};
-use voisu_app::overlay::{OverlayPhase, OverlayView};
-use voisu_core::{Command, DaemonState, PROTOCOL_VERSION, Request, Response, socket_path};
+use voisu_app::overlay::{OverlayPhase, PresentationController};
+use voisu_core::{Command, PROTOCOL_VERSION, Request, Response, socket_path};
 
 fn main() {
     let application = gtk::Application::builder()
@@ -36,15 +35,23 @@ fn build_overlay(application: &gtk::Application) {
     gtk4_layer_shell::set_margin(&window, Edge::Bottom, 24);
     gtk4_layer_shell::set_keyboard_interactivity(&window, KeyboardInteractivity::None);
     gtk4_layer_shell::set_exclusive_zone(&window, -1);
+    window.connect_realize(|window| {
+        if let Some(surface) = window.surface() {
+            let empty_region = gtk::cairo::Region::create();
+            surface.set_input_region(Some(&empty_region));
+        }
+    });
 
     let label = gtk::Label::builder()
         .label("")
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
         .build();
+    label.add_css_class("state-label");
     label.set_hexpand(true);
     label.set_vexpand(true);
     let meter = gtk::Label::builder().label("").build();
+    meter.add_css_class("meter");
     let capsule = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     capsule.set_margin_start(20);
     capsule.set_margin_end(20);
@@ -57,12 +64,12 @@ fn build_overlay(application: &gtk::Application) {
 
     let css = gtk::CssProvider::new();
     css.load_from_data(
-        ".capsule { background: #17191D; border-radius: 32px; }
-         .capsule label { color: #F4F5F7; font-size: 11pt; font-weight: 600; }
-         .recording { color: #65D6A0; }
-         .processing { color: #8FB4FF; }
-         .success { color: #B8E986; }
-         .failure { color: #FF8A8A; }",
+        ".capsule { background: rgba(23, 25, 29, 0.96); border-radius: 32px; }
+         .capsule .state-label, .capsule .meter { color: #F4F5F7; font-size: 11pt; font-weight: 600; }
+         .capsule.recording .state-label, .capsule.recording .meter { color: #65D6A0; }
+         .capsule.processing .state-label, .capsule.processing .meter { color: #8FB4FF; }
+         .capsule.success .state-label, .capsule.success .meter { color: #B8E986; }
+         .capsule.failure .state-label, .capsule.failure .meter { color: #FF8A8A; }",
     );
     capsule.add_css_class("capsule");
     gtk::style_context_add_provider_for_display(
@@ -71,31 +78,28 @@ fn build_overlay(application: &gtk::Application) {
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    let previous = Rc::new(Cell::new(OverlayPhase::Hidden));
+    let controller = Rc::new(std::cell::RefCell::new(PresentationController::default()));
     let reduced_motion = gtk::Settings::default()
         .map(|settings| !settings.is_gtk_enable_animations());
     let window_ref = window.clone();
     let label_ref = label.clone();
     let meter_ref = meter.clone();
-    let previous_ref = previous.clone();
+    let controller_ref = controller.clone();
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
         let Some(response) = read_status() else {
-            if previous_ref.get() != OverlayPhase::Failure {
-                label_ref.set_label("Daemon unavailable");
-                previous_ref.set(OverlayPhase::Failure);
-                window_ref.show();
-            }
+            capsule.remove_css_class("recording");
+            capsule.remove_css_class("processing");
+            capsule.remove_css_class("success");
+            capsule.add_css_class("failure");
+            label_ref.set_label("Daemon unavailable");
+            meter_ref.set_label("");
+            label_ref.update_property(&[gtk::accessible::Property::Description(
+                "Daemon unavailable; the optional Overlay cannot reach voisu-daemon",
+            )]);
+            window_ref.show();
             return gtk::glib::ControlFlow::Continue;
         };
-        let view = if response.state == Some(DaemonState::Idle) {
-            match response.message.as_str() {
-                "delivered" => OverlayView::success(),
-                "quality failure" => OverlayView::failure(),
-                _ => OverlayView::HIDDEN,
-            }
-        } else {
-            OverlayView::from_response(&response)
-        };
+        let view = controller_ref.borrow_mut().observe(&response, std::time::Instant::now());
         for class in ["recording", "processing", "success", "failure"] {
             capsule.remove_css_class(class);
         }
@@ -111,26 +115,29 @@ fn build_overlay(application: &gtk::Application) {
         }
         if view.phase == OverlayPhase::Hidden {
             window_ref.hide();
-            previous_ref.set(OverlayPhase::Hidden);
             return gtk::glib::ControlFlow::Continue;
         }
-        label_ref.set_label(view.accessible_label);
+        label_ref.set_label(view.visible_label);
+        label_ref.update_property(&[gtk::accessible::Property::Description(view.accessible_label)]);
         meter_ref.set_label(if view.phase == OverlayPhase::Recording {
             match view.activity {
                 3 => "▂▆█",
                 2 => "▂▅▆",
                 _ => "▂▃▂",
             }
+        } else if view.phase == OverlayPhase::Processing {
+            "⋯"
+        } else if view.phase == OverlayPhase::Failure {
+            "⚠"
         } else {
             ""
         });
-        if view.is_visible() && previous_ref.get() == OverlayPhase::Hidden {
+        if view.is_visible() {
             window_ref.show();
         }
         // No animation source is installed for hidden, Processing, terminal,
         // or reduced-motion states. Recording activity is status-driven.
         let _ = view.animation_interval(reduced_motion);
-        previous_ref.set(view.phase);
         gtk::glib::ControlFlow::Continue
     });
 }

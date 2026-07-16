@@ -52,7 +52,7 @@
 - Current inventory: 173 tests listed (11 app unit + 106 daemon/CLI acceptance + 6 Delivery + 10 user-service +
   20 diagnostics + 6 provider-coordination + 14 Transcript-decision). The full host gate is green: 171 passed,
   2 opt-in live smokes ignored, 0 failed; `cargo build --workspace` is clean.
-- Ticket 11 adds `DESIGN.md`, a presentation-only Overlay state model, a separate `voisu-overlay` GTK4/Layer Shell binary behind the `overlay` feature, and an observer-only `OverlayStatus` IPC command. Standard CLI `Status` remains unchanged. GTK compilation and real Fedora screenshots are pending host verification because this sandbox lacks GTK development libraries and a desktop surface.
+- Ticket 11 review round is fixed on `ticket-11-voice-capsule`: OverlayStatus now carries typed, ID-versioned terminal events; normal CLI Status remains unchanged; the presentation controller consumes terminal events once and expires them; GTK input-region, token, glyph, disconnect, and accessibility treatments are implemented behind the opt-in feature. Full default workspace tests/build are green. GTK feature compilation and real Fedora screenshots remain pending host verification because this sandbox lacks GTK development libraries and a desktop surface.
 
 ## Architecture map
 - Domain, IPC, lifecycle/Delivery evidence, provider coordination, decision pipeline -> `crates/voisu-core/src/lib.rs`
