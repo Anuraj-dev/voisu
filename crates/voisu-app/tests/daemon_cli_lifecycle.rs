@@ -2716,16 +2716,40 @@ enum PortalCommand {
 }
 
 /// Shared state between the mock portal's D-Bus interface and its controller:
-/// the session path the daemon created, so activations target the right session.
+/// the session path the daemon created (so activations target the right
+/// session) and how many times the daemon called `Session.Close`.
 #[derive(Clone)]
 struct PortalShared {
     session: Arc<std::sync::Mutex<Option<String>>>,
+    close_calls: Arc<AtomicUsize>,
+}
+
+/// How the controlled portal behaves on the bus.
+#[derive(Clone)]
+struct PortalBehavior {
+    deny_bind: bool,
+    trigger_description: String,
+    /// Answer with request handles and a session handle DIFFERENT from the
+    /// predictable client-constructed paths, like a pre-0.9 portal.
+    divergent: bool,
+}
+
+/// The mock `org.freedesktop.portal.Session` object registered at each created
+/// session path; the daemon's graceful close path calls `Close` on it.
+struct PortalSessionService {
+    shared: PortalShared,
+}
+
+#[zbus::interface(name = "org.freedesktop.portal.Session")]
+impl PortalSessionService {
+    async fn close(&self) {
+        self.shared.close_calls.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 struct GlobalShortcutsService {
     shared: PortalShared,
-    deny_bind: bool,
-    trigger_description: String,
+    behavior: PortalBehavior,
 }
 
 fn escaped_portal_sender(header: &zbus::message::Header<'_>) -> String {
@@ -2775,15 +2799,31 @@ impl GlobalShortcutsService {
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> zbus::zvariant::OwnedObjectPath {
         let sender = escaped_portal_sender(&header);
+        // A divergent portal (like pre-0.9 xdg-desktop-portal) answers on
+        // request/session handles that do NOT match the client's predictable
+        // paths; the client must honor the returned handles, not its guesses.
+        let suffix = if self.behavior.divergent { "_actual" } else { "" };
         let request_path = format!(
-            "/org/freedesktop/portal/desktop/request/{sender}/{}",
+            "/org/freedesktop/portal/desktop/request/{sender}/{}{suffix}",
             portal_token(&options, "handle_token")
         );
         let session_path = format!(
-            "/org/freedesktop/portal/desktop/session/{sender}/{}",
+            "/org/freedesktop/portal/desktop/session/{sender}/{}{suffix}",
             portal_token(&options, "session_handle_token")
         );
         *self.shared.session.lock().unwrap() = Some(session_path.clone());
+        // Serve a real Session object at the session path so the daemon's
+        // graceful `Session.Close` lands on something observable.
+        let _ = connection
+            .object_server()
+            .at(
+                session_path.as_str(),
+                PortalSessionService {
+                    shared: self.shared.clone(),
+                },
+            )
+            .await
+            .expect("mock session object should be served");
         let results = std::collections::HashMap::from([(
             "session_handle",
             zbus::zvariant::Value::from(session_path.as_str()),
@@ -2806,11 +2846,12 @@ impl GlobalShortcutsService {
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> zbus::zvariant::OwnedObjectPath {
         let sender = escaped_portal_sender(&header);
+        let suffix = if self.behavior.divergent { "_actual" } else { "" };
         let request_path = format!(
-            "/org/freedesktop/portal/desktop/request/{sender}/{}",
+            "/org/freedesktop/portal/desktop/request/{sender}/{}{suffix}",
             portal_token(&options, "handle_token")
         );
-        if self.deny_bind {
+        if self.behavior.deny_bind {
             // The user (or desktop policy) refused the Trigger Key dialog.
             emit_portal_response(connection, &request_path, 1, std::collections::HashMap::new())
                 .await;
@@ -2823,7 +2864,7 @@ impl GlobalShortcutsService {
             for (id, _) in &shortcuts {
                 let properties = std::collections::HashMap::from([(
                     "trigger_description",
-                    zbus::zvariant::Value::from(self.trigger_description.as_str()),
+                    zbus::zvariant::Value::from(self.behavior.trigger_description.as_str()),
                 )]);
                 approved
                     .append(zbus::zvariant::Value::from(zbus::zvariant::Structure::from((
@@ -2849,26 +2890,67 @@ impl GlobalShortcutsService {
 /// wire, exercising the daemon's actual portal client end to end.
 struct MockPortal {
     bus: PrivateBus,
+    shared: PortalShared,
+    behavior: PortalBehavior,
     control: tokio::sync::mpsc::UnboundedSender<PortalCommand>,
     service: Option<thread::JoinHandle<()>>,
 }
 
 impl MockPortal {
     fn start() -> Self {
-        Self::start_configured(false, "Super+Alt+V")
+        Self::start_configured(PortalBehavior {
+            deny_bind: false,
+            trigger_description: "Super+Alt+V".to_owned(),
+            divergent: false,
+        })
     }
 
     fn start_denying() -> Self {
-        Self::start_configured(true, "")
+        Self::start_configured(PortalBehavior {
+            deny_bind: true,
+            trigger_description: String::new(),
+            divergent: false,
+        })
     }
 
-    fn start_configured(deny_bind: bool, trigger_description: &str) -> Self {
+    /// A portal answering on divergent (non-predictable) request and session
+    /// handles, like pre-0.9 xdg-desktop-portal.
+    fn start_divergent() -> Self {
+        Self::start_configured(PortalBehavior {
+            deny_bind: false,
+            trigger_description: "Super+Alt+V".to_owned(),
+            divergent: true,
+        })
+    }
+
+    fn start_configured(behavior: PortalBehavior) -> Self {
         let bus = PrivateBus::start();
-        let address = bus.address.clone();
-        let trigger_description = trigger_description.to_owned();
         let shared = PortalShared {
             session: Arc::new(std::sync::Mutex::new(None)),
+            close_calls: Arc::new(AtomicUsize::new(0)),
         };
+        let (control, service) =
+            Self::spawn_service(bus.address.clone(), behavior.clone(), shared.clone());
+        Self {
+            bus,
+            shared,
+            behavior,
+            control,
+            service: Some(service),
+        }
+    }
+
+    /// Runs one portal-service lifetime on the bus: connects, owns the portal
+    /// name, and serves commands until the control channel closes (a "portal
+    /// crash"), at which point the connection drops and the name is released.
+    fn spawn_service(
+        address: String,
+        behavior: PortalBehavior,
+        shared: PortalShared,
+    ) -> (
+        tokio::sync::mpsc::UnboundedSender<PortalCommand>,
+        thread::JoinHandle<()>,
+    ) {
         let service_shared = shared.clone();
         let (control, mut commands) = tokio::sync::mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -2886,8 +2968,7 @@ impl MockPortal {
                         "/org/freedesktop/portal/desktop",
                         GlobalShortcutsService {
                             shared: service_shared.clone(),
-                            deny_bind,
-                            trigger_description,
+                            behavior,
                         },
                     )
                     .expect("mock portal object should be served")
@@ -2953,15 +3034,39 @@ impl MockPortal {
         ready_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("mock portal should become ready");
-        Self {
-            bus,
-            control,
-            service: Some(service),
-        }
+        (control, service)
     }
 
     fn address(&self) -> &str {
         &self.bus.address
+    }
+
+    /// How many times the daemon called `org.freedesktop.portal.Session.Close`.
+    fn close_calls(&self) -> usize {
+        self.shared.close_calls.load(Ordering::SeqCst)
+    }
+
+    /// The portal process crashes: its service loop ends and its connection
+    /// drops, releasing `org.freedesktop.portal.Desktop` on the still-running
+    /// bus (observable as NameOwnerChanged with an empty new owner).
+    fn stop_service(&mut self) {
+        let (closed, _) = tokio::sync::mpsc::unbounded_channel();
+        let _ = std::mem::replace(&mut self.control, closed);
+        if let Some(service) = self.service.take() {
+            service.join().expect("mock portal service should stop");
+        }
+    }
+
+    /// A new portal process starts and claims the name on the same bus.
+    fn restart_service(&mut self) {
+        assert!(self.service.is_none(), "stop_service must run first");
+        let (control, service) = Self::spawn_service(
+            self.bus.address.clone(),
+            self.behavior.clone(),
+            self.shared.clone(),
+        );
+        self.control = control;
+        self.service = Some(service);
     }
 
     /// One user press of the desktop-approved Trigger Key.
@@ -3166,6 +3271,18 @@ fn trigger_key_permission_denial_leaves_cli_control_usable() {
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 
+    // The denied bind must not leak the already-created portal session: the
+    // daemon closes it, observable as a real Session.Close on the mock.
+    let close_deadline = Instant::now() + Duration::from_secs(3);
+    while portal.close_calls() == 0 {
+        assert!(
+            Instant::now() < close_deadline,
+            "the denied bind never closed its portal session"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(portal.close_calls(), 1);
+
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
         diagnostics.contains("Trigger Key binding is unavailable"),
@@ -3202,6 +3319,63 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(diagnostics.contains("Trigger Key portal ended"), "{diagnostics}");
+}
+
+#[test]
+fn portal_restart_clears_the_stale_binding_and_rebinds_the_trigger_key() {
+    let runtime = TempDir::new().unwrap();
+    let mut portal = MockPortal::start();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("DBUS_SESSION_BUS_ADDRESS", portal.address())],
+    );
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    // The portal process crashes: no Session.Closed is emitted, only the bus
+    // name changing owner. The stale binding must clear.
+    portal.stop_service();
+    wait_for_shortcut(
+        runtime.path(),
+        "No Trigger Key is bound; start, stop, and toggle remain available\n",
+    );
+
+    // A restarted portal claims the name on the same bus: the daemon must
+    // rebind and end up with a working Trigger Key again.
+    portal.restart_service();
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    portal.activate();
+    wait_for_status(runtime.path(), "Recording\n");
+    portal.activate();
+    wait_for_status(runtime.path(), "idle\n");
+
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains("Trigger Key portal restarted; rebinding"),
+        "{diagnostics}"
+    );
+}
+
+#[test]
+fn divergent_portal_request_and_session_handles_are_honored() {
+    let runtime = TempDir::new().unwrap();
+    // The portal answers instantly on request handles and a session handle
+    // that differ from the predictable client-constructed paths; the daemon
+    // must receive those responses without a subscription gap and adopt the
+    // returned session handle as authoritative.
+    let portal = MockPortal::start_divergent();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("DBUS_SESSION_BUS_ADDRESS", portal.address())],
+    );
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    // Activations are emitted against the DIVERGENT session handle; they only
+    // toggle if the daemon adopted it instead of trusting its predicted path.
+    portal.activate();
+    wait_for_status(runtime.path(), "Recording\n");
+    portal.activate();
+    wait_for_status(runtime.path(), "idle\n");
 }
 
 #[test]

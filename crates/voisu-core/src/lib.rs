@@ -1154,6 +1154,23 @@ pub trait ShortcutPortal: Send {
     fn bind(&mut self) -> BoundaryFuture<'_, Box<dyn ShortcutSession>>;
 }
 
+/// What a live Global Shortcuts session observed next. The distinction matters
+/// to the listener: revocation is final, while a portal restart must clear the
+/// stale binding and then rebind once the portal returns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShortcutEvent {
+    /// The user pressed the Trigger Key.
+    Activated,
+    /// The desktop closed the session (permission revoked). Do not rebind.
+    Revoked,
+    /// The portal vanished from the bus (crash or shutdown). The binding is
+    /// stale and must be cleared; the session keeps waiting for a new owner.
+    PortalLost,
+    /// A (new) portal owns the bus name again. The session is dead; the
+    /// listener should drop it and bind a fresh session.
+    PortalRestarted,
+}
+
 /// A live Global Shortcuts session that yields Trigger Key activations. The
 /// session owns whatever portal subscription it created and surrenders it when
 /// dropped.
@@ -1161,10 +1178,8 @@ pub trait ShortcutSession: Send {
     /// The desktop-approved binding for display during setup.
     fn binding(&self) -> TriggerKeyBinding;
 
-    /// Awaits the next Trigger Key activation. Returns `None` once the portal
-    /// edge ends — permission revoked, portal restarted, or the session
-    /// otherwise closed — so the listener can retire without disturbing the IPC
-    /// surface. A `Shortcut` boundary error signals a transient stream failure
-    /// the listener also treats as end-of-stream.
-    fn next_activation(&mut self) -> BoundaryFuture<'_, Option<()>>;
+    /// Awaits the next session event: a Trigger Key activation, a desktop
+    /// revocation, or a portal loss/restart transition. A `Shortcut` boundary
+    /// error signals a stream failure the listener treats as final retirement.
+    fn next_event(&mut self) -> BoundaryFuture<'_, ShortcutEvent>;
 }

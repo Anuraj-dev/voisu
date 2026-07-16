@@ -1383,72 +1383,91 @@ async fn run_replay(
 const SHORTCUT_TOGGLE_REPLY_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Binds the Trigger Key through the Global Shortcuts portal and turns each
-/// activation into a Toggle. Every failure path — an unavailable portal, denied
-/// or revoked permission, a portal restart, or a stream error — retires the
-/// listener quietly, clears the displayed binding, and leaves CLI
-/// start/stop/toggle fully usable. Tests substitute the portal edge by pointing
-/// `DBUS_SESSION_BUS_ADDRESS` at a private bus running a controlled portal
-/// service — the daemon itself always runs this production listener.
+/// activation into a Toggle. An unavailable portal, a denied or revoked
+/// permission, or a stream error retires the listener quietly, clears the
+/// displayed binding, and leaves CLI start/stop/toggle fully usable. A portal
+/// that leaves the bus (crash/restart) clears the binding immediately and the
+/// listener rebinds once a new portal owns the name, so the binding is never
+/// stale and a restarted portal ends up rebound. Tests substitute the portal
+/// edge by pointing `DBUS_SESSION_BUS_ADDRESS` at a private bus running a
+/// controlled portal service — the daemon itself always runs this production
+/// listener.
 async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>) {
     let mut portal: Box<dyn ShortcutPortal> = Box::new(FedoraShortcutPortal::new());
-    let mut session = match portal.bind().await {
-        Ok(session) => session,
-        Err(error) => {
-            eprintln!("Trigger Key binding is unavailable: {}", error.diagnostic());
-            let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
+    'rebind: loop {
+        let mut session = match portal.bind().await {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("Trigger Key binding is unavailable: {}", error.diagnostic());
+                let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
+                return;
+            }
+        };
+        if actor
+            .send(ActorMessage::ShortcutBound(Some(session.binding())))
+            .await
+            .is_err()
+        {
             return;
         }
-    };
-    if actor
-        .send(ActorMessage::ShortcutBound(Some(session.binding())))
-        .await
-        .is_err()
-    {
-        return;
-    }
-    loop {
-        match session.next_activation().await {
-            Ok(Some(())) => {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                if actor
-                    .send(ActorMessage::Command(Command::Toggle, reply_tx))
-                    .await
-                    .is_err()
-                {
+        loop {
+            match session.next_event().await {
+                Ok(voisu_core::ShortcutEvent::Activated) => {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    if actor
+                        .send(ActorMessage::Command(Command::Toggle, reply_tx))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    // Await the reply before reading the next activation: the
+                    // actor already rejects overlapping Toggles, and processing
+                    // them one at a time gives a natural debounce so a burst of
+                    // activations cannot spawn overlapping Recordings or
+                    // duplicate stop processing.
+                    match timeout(SHORTCUT_TOGGLE_REPLY_DEADLINE, reply_rx).await {
+                        Ok(Ok(response)) => {
+                            eprintln!("Trigger Key activation: {}", response.message);
+                        }
+                        Ok(Err(_)) => return,
+                        Err(_) => {
+                            eprintln!("Trigger Key activation timed out awaiting the daemon");
+                        }
+                    }
+                }
+                Ok(voisu_core::ShortcutEvent::Revoked) => {
+                    eprintln!(
+                        "Trigger Key portal ended; start, stop, and toggle remain available"
+                    );
+                    // Clear the displayed binding: a revoked portal must not
+                    // leave `voisu shortcut` claiming a retired Trigger Key.
+                    let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
                     return;
                 }
-                // Await the reply before reading the next activation: the actor
-                // already rejects overlapping Toggles, and processing them one
-                // at a time gives a natural debounce so a burst of activations
-                // cannot spawn overlapping Recordings or duplicate stop
-                // processing.
-                match timeout(SHORTCUT_TOGGLE_REPLY_DEADLINE, reply_rx).await {
-                    Ok(Ok(response)) => {
-                        eprintln!("Trigger Key activation: {}", response.message);
-                    }
-                    Ok(Err(_)) => return,
-                    Err(_) => {
-                        eprintln!("Trigger Key activation timed out awaiting the daemon");
-                    }
+                Ok(voisu_core::ShortcutEvent::PortalLost) => {
+                    eprintln!(
+                        "Trigger Key portal left the bus; binding cleared until it returns"
+                    );
+                    let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
+                    // Keep polling the SAME session: its portal owner watch
+                    // stays live and yields PortalRestarted on a new owner.
                 }
-            }
-            Ok(None) => {
-                eprintln!(
-                    "Trigger Key portal ended; start, stop, and toggle remain available"
-                );
-                // Clear the displayed binding: a revoked or restarted portal
-                // must not leave `voisu shortcut` claiming a retired Trigger Key.
-                let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
-                return;
-            }
-            Err(error) => {
-                eprintln!(
-                    "Trigger Key activation stream failed: {}; start, stop, and toggle \
-                     remain available",
-                    error.diagnostic()
-                );
-                let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
-                return;
+                Ok(voisu_core::ShortcutEvent::PortalRestarted) => {
+                    eprintln!("Trigger Key portal restarted; rebinding the Trigger Key");
+                    // The old binding is stale on the new portal either way.
+                    let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
+                    continue 'rebind;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Trigger Key activation stream failed: {}; start, stop, and toggle \
+                         remain available",
+                        error.diagnostic()
+                    );
+                    let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
+                    return;
+                }
             }
         }
     }

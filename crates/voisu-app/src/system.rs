@@ -137,15 +137,17 @@ fn escaped_sender(connection: &zbus::Connection) -> Result<String, BoundaryError
         .replace('.', "_"))
 }
 
-/// Performs one portal request round trip: subscribes to the expected
-/// `Request.Response` path, invokes `method` on the GlobalShortcuts portal, and
-/// awaits the response under `deadline`. Returns the response's results
+/// Performs one portal request round trip. Before invoking `method` it
+/// subscribes to EVERY `org.freedesktop.portal.Request.Response` signal (a
+/// broad match rule, not one keyed to the predictable handle path) so that a
+/// portal answering on a divergent request handle can never emit its response
+/// into a subscription gap; once the method returns the authoritative handle,
+/// the buffered stream is filtered down to it. Returns the response's results
 /// vardict; a non-zero response code (the user or desktop denied or cancelled
 /// the request) fails closed.
 async fn portal_request<B>(
     connection: &zbus::Connection,
     portal: &zbus::Proxy<'_>,
-    token: &str,
     method: &str,
     body: &B,
     deadline: Duration,
@@ -155,20 +157,13 @@ where
 {
     use zbus::export::ordered_stream::OrderedStreamExt;
 
-    let request_path = format!(
-        "/org/freedesktop/portal/desktop/request/{}/{token}",
-        escaped_sender(connection)?
-    );
-    let request_proxy = zbus::Proxy::new(
-        connection,
-        PORTAL_BUS_NAME,
-        request_path.as_str(),
-        PORTAL_REQUEST_INTERFACE,
-    )
-    .await
-    .map_err(|error| shortcut_error(format!("portal request proxy failed: {error}")))?;
-    let mut responses = request_proxy
-        .receive_signal("Response")
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface(PORTAL_REQUEST_INTERFACE)
+        .and_then(|builder| builder.member("Response"))
+        .map_err(|error| shortcut_error(format!("portal response rule invalid: {error}")))?
+        .build();
+    let mut responses = zbus::MessageStream::for_match_rule(rule, connection, Some(16))
         .await
         .map_err(|error| shortcut_error(format!("portal response subscription failed: {error}")))?;
 
@@ -177,41 +172,34 @@ where
         .await
         .map_err(|error| shortcut_error(format!("portal {method} failed: {error}")))?;
     // Since xdg-desktop-portal 0.9 the returned handle equals the predictable
-    // path subscribed to above; on an older portal the actual handle differs
-    // and the subscription must move to it before the response is awaited.
+    // path; on an older portal it differs — either way the broad subscription
+    // above already buffers its Response, so only the filter changes.
     let handle: zbus::zvariant::OwnedObjectPath = reply
         .body()
         .deserialize()
         .map_err(|error| shortcut_error(format!("portal {method} returned no handle: {error}")))?;
-    if handle.as_str() != request_path {
-        let request_proxy = zbus::Proxy::new(
-            connection,
-            PORTAL_BUS_NAME,
-            handle.as_str().to_owned(),
-            PORTAL_REQUEST_INTERFACE,
-        )
-        .await
-        .map_err(|error| shortcut_error(format!("portal request proxy failed: {error}")))?;
-        responses = request_proxy.receive_signal("Response").await.map_err(|error| {
-            shortcut_error(format!("portal response subscription failed: {error}"))
-        })?;
+    let deadline_at = tokio::time::Instant::now() + deadline;
+    loop {
+        let message = tokio::time::timeout_at(deadline_at, responses.next())
+            .await
+            .map_err(|_| shortcut_error(format!("portal {method} response deadline elapsed")))?
+            .ok_or_else(|| shortcut_error(format!("portal {method} response stream ended")))?
+            .map_err(|error| shortcut_error(format!("portal {method} response failed: {error}")))?;
+        let header = message.header();
+        if header.path().map(|path| path.as_str()) != Some(handle.as_str()) {
+            continue;
+        }
+        let (code, results): (u32, std::collections::HashMap<String, zbus::zvariant::OwnedValue>) =
+            message.body().deserialize().map_err(|error| {
+                shortcut_error(format!("portal {method} response malformed: {error}"))
+            })?;
+        if code != 0 {
+            return Err(shortcut_error(format!(
+                "the desktop denied or cancelled the {method} request (response {code})"
+            )));
+        }
+        return Ok(results);
     }
-
-    let response = tokio::time::timeout(deadline, responses.next())
-        .await
-        .map_err(|_| shortcut_error(format!("portal {method} response deadline elapsed")))?
-        .ok_or_else(|| shortcut_error(format!("portal {method} response stream ended")))?;
-    let (code, results): (u32, std::collections::HashMap<String, zbus::zvariant::OwnedValue>) =
-        response
-            .body()
-            .deserialize()
-            .map_err(|error| shortcut_error(format!("portal {method} response malformed: {error}")))?;
-    if code != 0 {
-        return Err(shortcut_error(format!(
-            "the desktop denied or cancelled the {method} request (response {code})"
-        )));
-    }
-    Ok(results)
 }
 
 /// Extracts the desktop-approved trigger description for `TRIGGER_KEY_ID` from
@@ -275,15 +263,17 @@ impl ShortcutPortal for FedoraShortcutPortal {
                     ("handle_token", Value::from(create_token.as_str())),
                     ("session_handle_token", Value::from(session_token.as_str())),
                 ]);
-            portal_request(
+            let create_results = portal_request(
                 &connection,
                 &portal,
-                &create_token,
                 "CreateSession",
                 &(create_options,),
                 PORTAL_SESSION_DEADLINE,
             )
             .await?;
+            // The session handle returned by the portal is authoritative; the
+            // predictable path is only the fallback for a portal that omits it.
+            let session_path = session_handle_from(&create_results).unwrap_or(session_path);
 
             // Subscribe to this session's signals BEFORE binding so an
             // activation racing the bind response cannot be missed.
@@ -307,6 +297,23 @@ impl ShortcutPortal for FedoraShortcutPortal {
                 .receive_signal("Closed")
                 .await
                 .map_err(|error| shortcut_error(format!("closure subscription failed: {error}")))?;
+            // Watch the portal's bus-name ownership: a crashed or restarted
+            // portal emits no Session.Closed, so owner changes are the only
+            // signal that the binding went stale and a rebind is due.
+            let bus_proxy = zbus::Proxy::new(
+                &connection,
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+            )
+            .await
+            .map_err(|error| shortcut_error(format!("bus proxy failed: {error}")))?;
+            let owner_changes = bus_proxy
+                .receive_signal_with_args("NameOwnerChanged", &[(0, PORTAL_BUS_NAME)])
+                .await
+                .map_err(|error| {
+                    shortcut_error(format!("portal owner subscription failed: {error}"))
+                })?;
 
             let shortcut_properties: std::collections::HashMap<&str, Value<'_>> =
                 std::collections::HashMap::from([(
@@ -316,10 +323,9 @@ impl ShortcutPortal for FedoraShortcutPortal {
             let shortcuts = vec![(TRIGGER_KEY_ID, shortcut_properties)];
             let bind_options: std::collections::HashMap<&str, Value<'_>> =
                 std::collections::HashMap::from([("handle_token", Value::from(bind_token.as_str()))]);
-            let results = portal_request(
+            let results = match portal_request(
                 &connection,
                 &portal,
-                &bind_token,
                 "BindShortcuts",
                 &(
                     session_object_path.clone(),
@@ -330,7 +336,16 @@ impl ShortcutPortal for FedoraShortcutPortal {
                 ),
                 PORTAL_BIND_DEADLINE,
             )
-            .await?;
+            .await
+            {
+                Ok(results) => results,
+                Err(error) => {
+                    // The portal session already exists: a denied or failed
+                    // bind must not leak it on the desktop.
+                    close_portal_session(&connection, session_object_path.as_str()).await;
+                    return Err(error);
+                }
+            };
             let binding = TriggerKeyBinding::new(
                 approved_trigger_description(&results)
                     .unwrap_or_else(|| TRIGGER_KEY_DESCRIPTION.to_owned()),
@@ -342,22 +357,58 @@ impl ShortcutPortal for FedoraShortcutPortal {
                 binding,
                 activations,
                 closures,
+                owner_changes,
                 retired: false,
             }) as Box<dyn ShortcutSession>)
         })
     }
 }
 
+/// Extracts the authoritative session handle from CreateSession results
+/// (`session_handle` is a string per the portal contract; an object path is
+/// tolerated).
+fn session_handle_from(
+    results: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+) -> Option<String> {
+    let value = results.get("session_handle")?;
+    if let Ok(handle) = value.downcast_ref::<zbus::zvariant::Str<'_>>() {
+        return Some(handle.as_str().to_owned());
+    }
+    value
+        .downcast_ref::<zbus::zvariant::ObjectPath<'_>>()
+        .ok()
+        .map(|path| path.as_str().to_owned())
+}
+
+/// Best-effort, bounded `org.freedesktop.portal.Session.Close`.
+async fn close_portal_session(connection: &zbus::Connection, session_path: &str) {
+    let close = async {
+        if let Ok(session) = zbus::Proxy::new(
+            connection,
+            PORTAL_BUS_NAME,
+            session_path.to_owned(),
+            PORTAL_SESSION_INTERFACE,
+        )
+        .await
+        {
+            let _ = session.call_method("Close", &()).await;
+        }
+    };
+    let _ = tokio::time::timeout(PORTAL_CLOSE_DEADLINE, close).await;
+}
+
 /// A live Global Shortcuts session on the daemon's persistent D-Bus connection.
-/// The session owns the connection and both signal subscriptions; retirement
-/// closes the portal session with a bounded best-effort `Session.Close` so the
-/// desktop does not keep a dangling session for a listener that is gone.
+/// The session owns the connection and all three signal subscriptions
+/// (Activated, Session.Closed, portal NameOwnerChanged); retirement closes the
+/// portal session with a bounded best-effort `Session.Close` so the desktop
+/// does not keep a dangling session for a listener that is gone.
 pub struct FedoraShortcutSession {
     connection: zbus::Connection,
     session_path: zbus::zvariant::OwnedObjectPath,
     binding: TriggerKeyBinding,
     activations: zbus::proxy::SignalStream<'static>,
     closures: zbus::proxy::SignalStream<'static>,
+    owner_changes: zbus::proxy::SignalStream<'static>,
     retired: bool,
 }
 
@@ -367,19 +418,7 @@ impl FedoraShortcutSession {
         if std::mem::replace(&mut self.retired, true) {
             return;
         }
-        let close = async {
-            if let Ok(session) = zbus::Proxy::new(
-                &self.connection,
-                PORTAL_BUS_NAME,
-                self.session_path.as_str().to_owned(),
-                PORTAL_SESSION_INTERFACE,
-            )
-            .await
-            {
-                let _ = session.call_method("Close", &()).await;
-            }
-        };
-        let _ = tokio::time::timeout(PORTAL_CLOSE_DEADLINE, close).await;
+        close_portal_session(&self.connection, self.session_path.as_str()).await;
     }
 }
 
@@ -388,8 +427,9 @@ impl ShortcutSession for FedoraShortcutSession {
         self.binding.clone()
     }
 
-    fn next_activation(&mut self) -> BoundaryFuture<'_, Option<()>> {
+    fn next_event(&mut self) -> BoundaryFuture<'_, voisu_core::ShortcutEvent> {
         Box::pin(async move {
+            use voisu_core::ShortcutEvent;
             use zbus::export::ordered_stream::OrderedStreamExt;
             loop {
                 tokio::select! {
@@ -411,20 +451,49 @@ impl ShortcutSession for FedoraShortcutSession {
                                 continue;
                             };
                             if session == self.session_path && shortcut_id == TRIGGER_KEY_ID {
-                                return Ok(Some(()));
+                                return Ok(ShortcutEvent::Activated);
                             }
                         }
                         None => {
+                            // The daemon's own bus connection ended; close what
+                            // can still be closed and treat it as revocation.
                             self.close().await;
-                            return Ok(None);
+                            return Ok(ShortcutEvent::Revoked);
                         }
                     },
                     closed = self.closures.next() => {
-                        // The desktop revoked the session (or the portal
-                        // restarted and dropped it); either ends the stream.
+                        // The desktop closed the session: permission revoked.
+                        // Nothing is left to Close on the portal side.
                         let _ = closed;
                         self.retired = true;
-                        return Ok(None);
+                        return Ok(ShortcutEvent::Revoked);
+                    }
+                    owner_change = self.owner_changes.next() => {
+                        let Some(message) = owner_change else {
+                            self.close().await;
+                            return Ok(ShortcutEvent::Revoked);
+                        };
+                        // NameOwnerChanged(name s, old_owner s, new_owner s):
+                        // an empty new owner means the portal left the bus; a
+                        // non-empty one means a (restarted) portal now owns it
+                        // and this session is stale on the wrong owner.
+                        let Ok((_name, _old_owner, new_owner)) =
+                            message.body().deserialize::<(String, String, String)>()
+                        else {
+                            continue;
+                        };
+                        // No portal process that knows this session exists any
+                        // more, so there is nothing to Close — mark it retired
+                        // either way. On PortalLost the caller keeps polling
+                        // this same session (its owner watch stays live) until
+                        // a new owner yields PortalRestarted; on
+                        // PortalRestarted the caller drops it and rebinds.
+                        self.retired = true;
+                        return Ok(if new_owner.is_empty() {
+                            ShortcutEvent::PortalLost
+                        } else {
+                            ShortcutEvent::PortalRestarted
+                        });
                     }
                 }
             }
@@ -444,19 +513,7 @@ impl Drop for FedoraShortcutSession {
             let connection = self.connection.clone();
             let session_path = self.session_path.clone();
             handle.spawn(async move {
-                let close = async {
-                    if let Ok(session) = zbus::Proxy::new(
-                        &connection,
-                        PORTAL_BUS_NAME,
-                        session_path.as_str().to_owned(),
-                        PORTAL_SESSION_INTERFACE,
-                    )
-                    .await
-                    {
-                        let _ = session.call_method("Close", &()).await;
-                    }
-                };
-                let _ = tokio::time::timeout(PORTAL_CLOSE_DEADLINE, close).await;
+                close_portal_session(&connection, session_path.as_str()).await;
             });
         }
     }
