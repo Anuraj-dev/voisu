@@ -52,8 +52,18 @@ const RECONCILIATION_PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 const PCM_CHUNK_BYTES: usize = 3_200;
 const MIN_RECORDING_BYTES: usize = PCM_CHUNK_BYTES;
 const MAX_RECORDING_BYTES: usize = 16_000 * 2 * 60 * 5;
-const GROQ_CHUNK_BYTES: usize = 16_000 * 2 * 30;
-const GROQ_CHUNK_OVERLAP_BYTES: usize = 16_000;
+/// Recordings at or below this length (120 s of 16 kHz s16le mono) take a
+/// single full-audio Groq request at finalize: no pre-streamed chunks, no
+/// seams, full context for Whisper. Only Recordings that grow past this switch
+/// to pre-streamed chunking.
+const GROQ_FULL_AUDIO_MAX_BYTES: usize = 16_000 * 2 * 120;
+/// Pre-streamed chunk length for Recordings longer than the full-audio limit:
+/// 60 s windows with a 4 s overlap so the word-overlap dedup can stitch seams.
+const GROQ_CHUNK_BYTES: usize = 16_000 * 2 * 60;
+const GROQ_CHUNK_OVERLAP_BYTES: usize = 16_000 * 2 * 4;
+/// Word-overlap window for `merge_chunk_transcripts`, widened from the old 24
+/// to cover the 4 s chunk overlap comfortably.
+const GROQ_MERGE_OVERLAP_WORDS: usize = 48;
 const DEEPGRAM_CHUNK_BYTES: usize = 16_000 * 2;
 const MAX_DEEPGRAM_IN_FLIGHT: usize = 3;
 
@@ -1503,6 +1513,7 @@ impl TranscriptProvider for GroqProvider {
         Ok(Box::new(GroqStream {
             credential,
             endpoint,
+            params: GroqRequestParams::from_config(),
             buffer: Vec::new(),
             streamed_bytes: 0,
             chunks: VecDeque::new(),
@@ -1531,9 +1542,43 @@ fn provider_endpoint_is_secure(endpoint: &str) -> bool {
         || authority.starts_with("[::1]:")
 }
 
+/// The per-Recording Groq/Whisper request tuning built once at stream start:
+/// the model, the transcription language, and the vocabulary prompt. Cloned
+/// into every chunk request so all requests for a Recording share one glossary.
+#[derive(Clone)]
+struct GroqRequestParams {
+    model: String,
+    language: String,
+    prompt: String,
+}
+
+impl GroqRequestParams {
+    /// Resolves the request tuning from config and the shared dictionary:
+    /// model from `VOISU_GROQ_MODEL` (default `whisper-large-v3`), language from
+    /// `VOISU_GROQ_LANGUAGE` (default `en`), and the Whisper vocabulary prompt.
+    fn from_config() -> Self {
+        let model = std::env::var("VOISU_GROQ_MODEL")
+            .unwrap_or_else(|_| "whisper-large-v3".to_owned());
+        let language = std::env::var("VOISU_GROQ_LANGUAGE").unwrap_or_else(|_| "en".to_owned());
+        Self {
+            model,
+            language,
+            prompt: crate::dictionary::whisper_prompt(),
+        }
+    }
+}
+
+/// Whether the Groq stream should pre-stream chunks yet. Recordings at or below
+/// the full-audio limit never pre-stream — they take one full-audio request at
+/// finalize; only once a Recording grows past the limit does chunking begin.
+fn groq_prestream_active(total_received_bytes: usize) -> bool {
+    total_received_bytes > GROQ_FULL_AUDIO_MAX_BYTES
+}
+
 struct GroqStream {
     credential: Credential,
     endpoint: String,
+    params: GroqRequestParams,
     buffer: Vec<u8>,
     streamed_bytes: usize,
     chunks: VecDeque<tokio::task::JoinHandle<Result<String, BoundaryError>>>,
@@ -1682,19 +1727,25 @@ impl ProviderStream for GroqStream {
         Box::pin(async move {
             self.streamed_bytes = self.streamed_bytes.saturating_add(chunk.0.len());
             self.buffer.extend_from_slice(&chunk.0);
-            while self.buffer.len() >= GROQ_CHUNK_BYTES {
-                let pcm = self.buffer[..GROQ_CHUNK_BYTES].to_vec();
-                self.buffer = self.buffer
-                    [GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES..]
-                    .to_vec();
-                let credential = self.credential.clone();
-                let endpoint = self.endpoint.clone();
-                let cancel = Arc::clone(&self.cancel);
-                self.chunks.push_back(tokio::spawn(async move {
-                    ProviderHttpClient
-                        .transcribe_groq_chunk(credential, endpoint, pcm, cancel)
-                        .await
-                }));
+            // A Recording at or below the full-audio limit never pre-streams: it
+            // is transcribed as one full-audio request at finalize. Only once it
+            // grows past the limit do we cut 60 s chunks with a 4 s overlap.
+            if groq_prestream_active(self.streamed_bytes) {
+                while self.buffer.len() >= GROQ_CHUNK_BYTES {
+                    let pcm = self.buffer[..GROQ_CHUNK_BYTES].to_vec();
+                    self.buffer = self.buffer
+                        [GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES..]
+                        .to_vec();
+                    let credential = self.credential.clone();
+                    let endpoint = self.endpoint.clone();
+                    let params = self.params.clone();
+                    let cancel = Arc::clone(&self.cancel);
+                    self.chunks.push_back(tokio::spawn(async move {
+                        ProviderHttpClient
+                            .transcribe_groq_chunk(credential, endpoint, params, pcm, cancel)
+                            .await
+                    }));
+                }
             }
             Ok(())
         })
@@ -1742,6 +1793,7 @@ impl ProviderStream for GroqStream {
                         .transcribe_groq_chunk(
                             self.credential.clone(),
                             self.endpoint.clone(),
+                            self.params.clone(),
                             std::mem::take(&mut self.buffer),
                             Arc::clone(&self.cancel),
                         )
@@ -3498,12 +3550,15 @@ impl ProviderHttpClient {
         &self,
         credential: Credential,
         endpoint: String,
+        params: GroqRequestParams,
         pcm: Vec<u8>,
         cancel: Arc<CancelRegistry>,
     ) -> Result<String, BoundaryError> {
-        tokio::task::spawn_blocking(move || request_groq_chunk(credential, endpoint, pcm, &cancel))
-            .await
-            .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "Groq request task failed"))?
+        tokio::task::spawn_blocking(move || {
+            request_groq_chunk(credential, endpoint, &params, pcm, &cancel)
+        })
+        .await
+        .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "Groq request task failed"))?
     }
 }
 
@@ -3571,9 +3626,47 @@ fn request_deepgram_chunk(
         })
 }
 
+/// Builds the curl `--config` body for a Groq transcription request: the audio
+/// form part plus the accuracy gains — `model`, `language`, `temperature=0`,
+/// `response_format`, and (when non-empty) the vocabulary `prompt`. Rejects a
+/// model or language carrying control characters; a control-character-bearing
+/// prompt is defensively stripped rather than rejected. Kept pure and separate
+/// from the request so the request shape is testable without a network call.
+fn build_groq_curl_config(
+    endpoint: &str,
+    credential: &Credential,
+    file_path: &str,
+    params: &GroqRequestParams,
+) -> Result<String, BoundaryError> {
+    if params.model.is_empty() || params.model.contains(['\n', '\r']) {
+        return Err(BoundaryError::new(BoundaryKind::Provider, "invalid Groq model"));
+    }
+    if params.language.contains(['\n', '\r']) {
+        return Err(BoundaryError::new(BoundaryKind::Provider, "invalid Groq language"));
+    }
+    let endpoint = curl_config_escape(endpoint);
+    let credential = curl_config_escape(credential.expose_to_boundary());
+    let path = curl_config_escape(file_path);
+    let model = curl_config_escape(&params.model);
+    let mut config = format!(
+        "url = \"{endpoint}\"\nheader = \"Authorization: Bearer {credential}\"\nform = \"file=@{path};filename=recording.wav;type=audio/wav\"\nform = \"model={model}\"\nform = \"response_format=json\"\nform = \"temperature=0\"\n"
+    );
+    if !params.language.is_empty() {
+        let language = curl_config_escape(&params.language);
+        config.push_str(&format!("form = \"language={language}\"\n"));
+    }
+    let prompt: String = params.prompt.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+    if !prompt.is_empty() {
+        let prompt = curl_config_escape(&prompt);
+        config.push_str(&format!("form = \"prompt={prompt}\"\n"));
+    }
+    Ok(config)
+}
+
 fn request_groq_chunk(
     credential: Credential,
     endpoint: String,
+    params: &GroqRequestParams,
     pcm: Vec<u8>,
     cancel: &CancelRegistry,
 ) -> Result<String, BoundaryError> {
@@ -3586,18 +3679,7 @@ fn request_groq_chunk(
     file.write_all(&wav)
         .and_then(|()| file.flush())
         .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "temporary audio write failed"))?;
-    let endpoint = curl_config_escape(&endpoint);
-    let credential = curl_config_escape(credential.expose_to_boundary());
-    let path = curl_config_escape(&file.path().to_string_lossy());
-    let model = std::env::var("VOISU_GROQ_MODEL")
-        .unwrap_or_else(|_| "whisper-large-v3-turbo".to_owned());
-    if model.is_empty() || model.contains(['\n', '\r']) {
-        return Err(BoundaryError::new(BoundaryKind::Provider, "invalid Groq model"));
-    }
-    let model = curl_config_escape(&model);
-    let config = format!(
-        "url = \"{endpoint}\"\nheader = \"Authorization: Bearer {credential}\"\nform = \"file=@{path};filename=recording.wav;type=audio/wav\"\nform = \"model={model}\"\nform = \"response_format=json\"\n"
-    );
+    let config = build_groq_curl_config(&endpoint, &credential, &file.path().to_string_lossy(), params)?;
     let outcome = run_restricted_with_deadline(
         "curl",
         &[
@@ -3644,7 +3726,7 @@ fn merge_chunk_transcripts(transcripts: Vec<String>) -> String {
             .split_whitespace()
             .map(str::to_owned)
             .collect();
-        let overlap = (1..=merged.len().min(words.len()).min(24))
+        let overlap = (1..=merged.len().min(words.len()).min(GROQ_MERGE_OVERLAP_WORDS))
             .rev()
             .find(|count| merged[merged.len() - count..] == words[..*count])
             .unwrap_or(0);
@@ -3696,6 +3778,94 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use voisu_core::{ProviderCoordinator, ProviderStreams};
+
+    /// Fixed Groq request tuning for stream constructor tests: deterministic and
+    /// independent of the host's environment and user dictionary.
+    fn test_groq_params() -> GroqRequestParams {
+        GroqRequestParams {
+            model: "whisper-large-v3".to_owned(),
+            language: "en".to_owned(),
+            prompt: "Groq, Tokio".to_owned(),
+        }
+    }
+
+    #[test]
+    fn groq_stays_full_audio_at_or_below_the_limit_and_chunks_above() {
+        // A Recording at exactly the full-audio limit still takes one full-audio
+        // request; only once it grows past the limit does pre-streaming begin.
+        assert!(!groq_prestream_active(GROQ_FULL_AUDIO_MAX_BYTES));
+        assert!(!groq_prestream_active(GROQ_FULL_AUDIO_MAX_BYTES - 1));
+        assert!(groq_prestream_active(GROQ_FULL_AUDIO_MAX_BYTES + 1));
+    }
+
+    #[test]
+    fn groq_chunk_geometry_is_sixty_second_windows_with_a_four_second_overlap() {
+        assert_eq!(GROQ_CHUNK_BYTES, 16_000 * 2 * 60);
+        assert_eq!(GROQ_CHUNK_OVERLAP_BYTES, 16_000 * 2 * 4);
+        assert_eq!(GROQ_FULL_AUDIO_MAX_BYTES, 16_000 * 2 * 120);
+    }
+
+    #[test]
+    fn groq_curl_config_carries_the_accuracy_gains() {
+        let credential = Credential::new("secret-token".to_owned()).unwrap();
+        let params = GroqRequestParams {
+            model: "whisper-large-v3".to_owned(),
+            language: "en".to_owned(),
+            prompt: "Tokio, serde, SELinux".to_owned(),
+        };
+        let config =
+            build_groq_curl_config("https://api.groq.com/v1", &credential, "/tmp/rec.wav", &params)
+                .expect("valid config");
+        assert!(config.contains("form = \"model=whisper-large-v3\""));
+        assert!(config.contains("form = \"language=en\""));
+        assert!(config.contains("form = \"temperature=0\""));
+        assert!(config.contains("form = \"prompt=Tokio, serde, SELinux\""));
+        assert!(config.contains("form = \"response_format=json\""));
+        assert!(config.contains("Authorization: Bearer secret-token"));
+    }
+
+    #[test]
+    fn groq_curl_config_omits_an_empty_prompt_and_language() {
+        let credential = Credential::new("secret-token".to_owned()).unwrap();
+        let params = GroqRequestParams {
+            model: "whisper-large-v3".to_owned(),
+            language: String::new(),
+            prompt: String::new(),
+        };
+        let config =
+            build_groq_curl_config("https://api.groq.com/v1", &credential, "/tmp/rec.wav", &params)
+                .expect("valid config");
+        assert!(!config.contains("prompt="));
+        assert!(!config.contains("language="));
+        // temperature is unconditional.
+        assert!(config.contains("form = \"temperature=0\""));
+    }
+
+    #[test]
+    fn groq_curl_config_rejects_a_control_character_model() {
+        let credential = Credential::new("secret-token".to_owned()).unwrap();
+        let params = GroqRequestParams {
+            model: "bad\nmodel".to_owned(),
+            language: "en".to_owned(),
+            prompt: String::new(),
+        };
+        let error =
+            build_groq_curl_config("https://api.groq.com/v1", &credential, "/tmp/rec.wav", &params)
+                .unwrap_err();
+        assert_eq!(error.diagnostic(), "invalid Groq model");
+    }
+
+    #[test]
+    fn merge_dedupes_an_overlap_wider_than_the_old_window() {
+        // A ~30-word seam overlap — wider than the previous 24-word window —
+        // must be collapsed, not duplicated, at the 4 s chunk boundary.
+        let first: Vec<String> = (0..40).map(|i| format!("w{i}")).collect();
+        let second: Vec<String> = (10..60).map(|i| format!("w{i}")).collect();
+        let merged =
+            merge_chunk_transcripts(vec![first.join(" "), second.join(" ")]);
+        let expected: Vec<String> = (0..60).map(|i| format!("w{i}")).collect();
+        assert_eq!(merged, expected.join(" "), "the 30-word overlap is deduped");
+    }
 
     /// A probe chunk task shaped like a real provider chunk: the outer async
     /// task awaits an inner `spawn_blocking` request. The blocking closure — the
@@ -3773,6 +3943,7 @@ mod tests {
             groq: Box::new(GroqStream {
                 credential,
                 endpoint: "http://localhost/groq".to_owned(),
+                params: test_groq_params(),
                 buffer: Vec::new(),
                 streamed_bytes: 0,
                 chunks: VecDeque::from([groq_chunk]),
@@ -3845,6 +4016,7 @@ mod tests {
         let stream = GroqStream {
             credential: Credential::new("controlled-credential".to_owned()).unwrap(),
             endpoint: "http://localhost/groq".to_owned(),
+            params: test_groq_params(),
             buffer: Vec::new(),
             streamed_bytes: 0,
             chunks: VecDeque::from([chunk]),

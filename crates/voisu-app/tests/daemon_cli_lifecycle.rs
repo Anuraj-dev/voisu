@@ -743,7 +743,11 @@ printf '%s' "$((count + 1))" > "$dir/delivery.count"
 }
 
 #[test]
-fn groq_receives_bounded_overlapping_chunks_and_the_merge_result_is_delivered_once() {
+fn groq_transcribes_a_short_recording_as_one_full_audio_request_at_finalize() {
+    // A Recording at or below the full-audio limit (~120 s) pre-streams nothing
+    // during the Recording — Whisper gets the complete audio in one request at
+    // finalize, eliminating chunk seams. ~31 s of PCM here stays well under the
+    // limit.
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
     write_fake_command(
@@ -765,7 +769,7 @@ cat > "$dir/clipboard"
 "#,
     );
     let (endpoint, requests_rx, live_requests, server) =
-        local_groq_chunk_server(vec!["alpha beta", "beta gamma"]);
+        local_groq_chunk_server(vec!["alpha beta gamma"]);
     let path = format!(
         "{}:{}",
         commands.path().display(),
@@ -781,24 +785,24 @@ cat > "$dir/clipboard"
         ],
     );
     assert!(voisu(runtime.path(), "start").status.success());
-    let live_deadline = Instant::now() + Duration::from_secs(2);
-    while live_requests.load(Ordering::SeqCst) == 0 && Instant::now() < live_deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
+    // Confirm the Recording is actively capturing, then prove no Groq chunk was
+    // pre-streamed: a short Recording issues its one request only at finalize.
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
     assert_eq!(
         live_requests.load(Ordering::SeqCst),
-        1,
-        "the first bounded Groq chunk must be submitted during the Recording"
+        0,
+        "a short Recording must not pre-stream any Groq chunk"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
     let stopped = voisu(runtime.path(), "stop");
     assert!(stopped.status.success(), "{}", stderr(&stopped));
     let requests = requests_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
-    assert_eq!(requests.len(), 2, "one long Recording must be bounded into two Groq requests");
-    for request in requests {
-        assert!(request.windows(4).any(|window| window == b"RIFF"));
-    }
+    assert_eq!(
+        requests.len(),
+        1,
+        "a short Recording is one full-audio Groq request at finalize"
+    );
+    assert!(requests[0].windows(4).any(|window| window == b"RIFF"));
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
         "alpha beta gamma"
@@ -4448,7 +4452,7 @@ fn daemon_interruption_reaps_boundary_processes_and_restarts_in_a_safe_state() {
         r#"#!/bin/sh
 dir=$(dirname "$0")
 printf '%s' "$$" > "$dir/pw-record.pid"
-head -c 1000000 /dev/zero | tr '\000' '\001'
+head -c 4000000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 i=0
 while test "$i" -lt 6000; do sleep 0.01; i=$((i + 1)); done
@@ -4698,13 +4702,15 @@ fn start_during_recovery_is_rejected_retryably_then_succeeds() {
 fn failed_recording_kills_its_in_flight_groq_request_before_the_next_recording() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
-    // Enough PCM for one bounded Groq chunk request during the Recording, then
-    // keep recording until the configured Recording Deadline fails it.
+    // More than the full-audio limit (~120 s) of PCM so the Recording crosses
+    // into pre-streamed chunking and a bounded Groq chunk request goes in
+    // flight during the Recording; then keep recording until the configured
+    // Recording Deadline fails it.
     write_fake_command(
         commands.path(),
         "pw-record",
         r#"#!/bin/sh
-head -c 1000000 /dev/zero | tr '\000' '\001'
+head -c 4000000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 i=0
 while [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
