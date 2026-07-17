@@ -2,20 +2,19 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-17
 
 ## 🚧 In progress / next
-- **Ticket 13 MERGED and the live desktop smoke PASSED (2026-07-17).** PR #21 squash-merged to main
-  (`57eb284`), issue #13 closed; three post-merge live-desktop fixes pushed directly to main; CI green at
-  `73f5727` (two unrelated CI-runner timing flakes each passed on rerun). `VOISU_FEDORA_LIVE_SMOKE=1
-  packaging/fedora-smoke.sh` passed against the exact `73f5727` RPM: all six doctor capabilities PASS, a
-  real Recording reached both real cloud providers, the Transcript was submitted through the compositor
-  and preserved on the clipboard, and cleanup restored the pre-smoke state.
-- Real provider credentials are set and verified (`auth verify` green for groq and deepgram); the entries
-  stored on 2026-07-15 were placeholders.
-- Next: Raja's permanent install (`sudo dnf install dist/rpm/voisu-0.1.0-1.git73f5727….rpm`, optional
-  `voisu-overlay` subpackage) plus his KDE toggle shortcut; then the remaining PENDING release-evidence
-  rows (portal revocation, login start across a real login, upgrade/removal, explicit fallback scenarios).
-- The final Sol/Terra/Luna-vs-Opus benchmark report is written (`docs/model-benchmark.md`, incl. the
-  2026-07-17 live-smoke addendum). Remaining milestones after evidence closure: APT/DEB packaging is
-  explicitly out of scope for this release.
+- **Overlay toolkit LOCKED: keep GTK4 + gtk4-layer-shell; do NOT migrate to Electron** (2026-07-17,
+  evidence-backed — see decisions.md + session log). Electron has no wlr-layer-shell on Wayland
+  (`setAlwaysOnTop` no-op, positioning broken); HyprVox's Electron overlay only works via forced XWayland
+  + Hyprland window rules + a rich React waveform — none of which transfer to Voisu's KWin/layer-shell/
+  disposable-capsule/Rust context.
+- **ACTIVE: the installed Overlay does not appear on `voisu toggle`** on Raja's live Fedora KDE/Wayland
+  desktop. Diagnosing now (drive `voisu toggle`, read journal/stderr, root-cause) to produce a detailed
+  fix-prompt for a separate agent. See session log 2026-07-17.
+- Ticket 13 is MERGED and the live desktop smoke PASSED (`57eb284`; PR #21; issue #13 closed; CI green at
+  `73f5727`). Real provider credentials set and verified (`auth verify` green for groq + deepgram).
+- Then: remaining PENDING release-evidence rows (portal revocation, login start, upgrade/removal, explicit
+  fallback scenarios). Final benchmark report is written (`docs/model-benchmark.md`). APT/DEB packaging is
+  out of scope for this release.
 
 ## Status
 - `voisu` and `voisu-daemon` communicate over bounded, versioned Unix IPC; the actor keeps status
