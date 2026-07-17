@@ -1,5 +1,6 @@
 //! Shared domain, provider coordination, and IPC types for Voisu.
 
+use std::collections::HashSet;
 use std::env;
 use std::future::Future;
 use std::os::unix::fs::MetadataExt;
@@ -159,6 +160,51 @@ pub struct LifecycleEvidence {
 pub struct ProviderTiming {
     pub provider: Provider,
     pub completed_ms: u64,
+}
+
+/// How far a provider progressed before it failed or was found absent. A history
+/// record keeps this so a reader can tell a provider that never began (absent or
+/// disabled) from one that broke mid-stream or missed the Provider Deadline.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailureStage {
+    /// The provider never began for this Recording — absent, disabled, or not
+    /// configured. No Source Transcript was ever attempted.
+    NotStarted,
+    /// The provider began but failed while streaming audio, before finalize.
+    Streaming,
+    /// The provider failed while producing its Source Transcript at finalize.
+    Completion,
+    /// The Provider Deadline elapsed before the provider produced a Source
+    /// Transcript, so its result was abandoned.
+    ProviderDeadline,
+}
+
+/// A recorded provider failure or absence for one Recording: which provider, how
+/// far it reached, and the boundary diagnostic. This is what makes a missing
+/// Source Transcript visible instead of silent — every configured provider that
+/// does not contribute a Source Transcript leaves one of these in the history
+/// record. The diagnostic is a local boundary detail; export scrubs it of secret
+/// values like every other free-form string.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderFailure {
+    pub provider: Provider,
+    pub stage: ProviderFailureStage,
+    pub diagnostic: String,
+}
+
+impl ProviderFailure {
+    pub fn new(
+        provider: Provider,
+        stage: ProviderFailureStage,
+        diagnostic: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider,
+            stage,
+            diagnostic: diagnostic.into(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -598,6 +644,24 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 });
             }
 
+            // Source-quality gate (§3.4): the two Source Transcripts materially
+            // disagreed, but before spending an LLM merge on them, check they
+            // are even comparable. If they are catastrophically divergent — one
+            // a fragment or a runaway, or the two describing different content
+            // (the recording-11 word-salad case) — merging would fold garbage
+            // into a good transcript, so select the better Source Transcript
+            // using the existing clean-source selection semantics instead.
+            if let Some(metric) = source_divergence(&deepgram.text, &groq.text) {
+                return clean_source_fallback(
+                    &sources,
+                    format!(
+                        "Source Transcripts catastrophically divergent ({metric}); selected the better Source Transcript instead of merging"
+                    ),
+                    false,
+                    false,
+                );
+            }
+
             let merge_result = {
                 let cancel = CancelRegistry::new();
                 let request = self.model.request(
@@ -774,6 +838,54 @@ fn clean_source_fallback(
         reconciliation_requested,
         recovery_attempted,
     })
+}
+
+/// A Source Transcript shorter than roughly a third of the other's length is a
+/// fragment or a runaway, not a comparable transcription of the same speech.
+const DIVERGENCE_LENGTH_RATIO_FLOOR: f64 = 0.34;
+/// Once both Source Transcripts are substantial, sharing fewer than a third of
+/// the smaller one's distinct words means they describe different content — the
+/// recording-11 word-salad signature. Real provider disagreement on the same
+/// speech keeps the large majority of content words, well above this floor.
+const DIVERGENCE_TOKEN_OVERLAP_FLOOR: f64 = 0.30;
+/// The token-overlap heuristic only engages once the smaller Source Transcript
+/// has at least this many distinct words: below it, set overlap is statistically
+/// noisy (two short toy phrases can share nothing yet still merge cleanly), so
+/// only the length-ratio guard applies to small inputs.
+const DIVERGENCE_MIN_OVERLAP_WORDS: usize = 12;
+
+/// Judges whether two Source Transcripts are catastrophically divergent — too
+/// incomparable to merge — using a length-ratio guard and a distinct-word
+/// containment (token-overlap) guard. Returns the measured metric string when
+/// divergent so history can explain why the merge was skipped, or `None` when
+/// the sources are comparable enough to reconcile.
+fn source_divergence(left: &str, right: &str) -> Option<String> {
+    let left_words = normalized_words(left);
+    let right_words = normalized_words(right);
+    let fewer = left_words.len().min(right_words.len());
+    let more = left_words.len().max(right_words.len());
+    if more == 0 {
+        return None;
+    }
+    let length_ratio = fewer as f64 / more as f64;
+    if length_ratio < DIVERGENCE_LENGTH_RATIO_FLOOR {
+        return Some(format!(
+            "length ratio {length_ratio:.2} below {DIVERGENCE_LENGTH_RATIO_FLOOR:.2}"
+        ));
+    }
+    let left_set: HashSet<&String> = left_words.iter().collect();
+    let right_set: HashSet<&String> = right_words.iter().collect();
+    let smaller_distinct = left_set.len().min(right_set.len());
+    if smaller_distinct >= DIVERGENCE_MIN_OVERLAP_WORDS {
+        let shared = left_set.intersection(&right_set).count();
+        let overlap = shared as f64 / smaller_distinct as f64;
+        if overlap < DIVERGENCE_TOKEN_OVERLAP_FLOOR {
+            return Some(format!(
+                "token overlap {overlap:.2} below {DIVERGENCE_TOKEN_OVERLAP_FLOOR:.2}"
+            ));
+        }
+    }
+    None
 }
 
 fn source_similarity(left: &str, right: &str) -> f64 {
@@ -996,6 +1108,11 @@ pub struct ProviderCoordinator {
 pub struct ProviderCompletion {
     pub sources: Vec<SourceTranscript>,
     pub timings_ms: Vec<ProviderTiming>,
+    /// Every configured provider that did NOT contribute a Source Transcript for
+    /// this Recording — one that failed producing its transcript or that missed
+    /// the Provider Deadline — with its stage and boundary diagnostic. This is
+    /// what keeps a missing Source Transcript visible instead of silent.
+    pub provider_failures: Vec<ProviderFailure>,
 }
 
 impl ProviderCoordinator {
@@ -1050,7 +1167,7 @@ impl ProviderCoordinator {
         let mut deadline_elapsed = false;
         let mut transcripts = Vec::new();
         let mut timings_ms = Vec::new();
-        let mut diagnostics = Vec::new();
+        let mut provider_failures: Vec<ProviderFailure> = Vec::new();
 
         {
             let deepgram_completion = deepgram.complete(audio.clone());
@@ -1075,7 +1192,11 @@ impl ProviderCoordinator {
                                 });
                                 transcripts.push(source);
                             }
-                            Err(error) => diagnostics.push(error.diagnostic().to_owned()),
+                            Err(error) => provider_failures.push(ProviderFailure::new(
+                                Provider::Deepgram,
+                                ProviderFailureStage::Completion,
+                                error.diagnostic().to_owned(),
+                            )),
                         }
                     }
                     result = &mut groq_completion, if !groq_done => {
@@ -1088,7 +1209,11 @@ impl ProviderCoordinator {
                                 });
                                 transcripts.push(source);
                             }
-                            Err(error) => diagnostics.push(error.diagnostic().to_owned()),
+                            Err(error) => provider_failures.push(ProviderFailure::new(
+                                Provider::Groq,
+                                ProviderFailureStage::Completion,
+                                error.diagnostic().to_owned(),
+                            )),
                         }
                     }
                     _ = &mut deadline => {
@@ -1100,6 +1225,23 @@ impl ProviderCoordinator {
         }
 
         if deadline_elapsed {
+            // A provider that never produced a Source Transcript before the
+            // Provider Deadline is abandoned below — record its absence so it is
+            // visible in history rather than silently missing.
+            if !deepgram_done {
+                provider_failures.push(ProviderFailure::new(
+                    Provider::Deepgram,
+                    ProviderFailureStage::ProviderDeadline,
+                    "Provider Deadline elapsed before completion",
+                ));
+            }
+            if !groq_done {
+                provider_failures.push(ProviderFailure::new(
+                    Provider::Groq,
+                    ProviderFailureStage::ProviderDeadline,
+                    "Provider Deadline elapsed before completion",
+                ));
+            }
             let abort_pending = async move {
                 let deepgram_abort = async move {
                     if deepgram_done {
@@ -1131,17 +1273,23 @@ impl ProviderCoordinator {
 
         transcripts.sort_by_key(|source| source.provider);
         timings_ms.sort_by_key(|timing| timing.provider);
+        provider_failures.sort_by_key(|failure| failure.provider);
         if transcripts.is_empty() {
-            let detail = if diagnostics.is_empty() {
+            let detail = if provider_failures.is_empty() {
                 "Provider Deadline elapsed".to_owned()
             } else {
-                diagnostics.join("; ")
+                provider_failures
+                    .iter()
+                    .map(|failure| failure.diagnostic.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ")
             };
             Err(BoundaryError::new(BoundaryKind::Provider, detail))
         } else {
             Ok(ProviderCompletion {
                 sources: transcripts,
                 timings_ms,
+                provider_failures,
             })
         }
     }

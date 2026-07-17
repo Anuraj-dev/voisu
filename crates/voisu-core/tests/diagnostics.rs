@@ -4,8 +4,9 @@ use tempfile::TempDir;
 use voisu_core::{
     correlation_id, export_record, replay_capture, unix_millis_now, AudioChunk, BoundaryFuture,
     CapturedAudio, DebugAudioRecord, DiagnosticRecord, DiagnosticStore, LifecycleStage, Provider,
-    ProviderCoordinator, ProviderStream, ProviderStreams, RetentionPolicy, SourceTranscript,
-    Transcript, TranscriptDecision, TranscriptSelection, TranscriptValidator, REDACTED,
+    ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream, ProviderStreams,
+    RetentionPolicy, SourceTranscript, Transcript, TranscriptDecision, TranscriptSelection,
+    TranscriptValidator, REDACTED,
 };
 
 fn record_at(id: u64, recorded_at_unix_ms: u64) -> DiagnosticRecord {
@@ -122,6 +123,63 @@ fn export_scrubs_secret_values_from_transcripts_and_reasons() {
         "a known secret value must not survive anywhere in an export: {encoded}"
     );
     assert!(encoded.contains(REDACTED), "the secret is masked, not silently dropped");
+}
+
+#[test]
+fn provider_failures_are_retained_and_surfaced_in_history() {
+    // A provider that failed mid-stream and one that was absent/disabled must
+    // both leave a visible entry in the retained history record — never a silent
+    // missing Source Transcript.
+    let dir = TempDir::new().unwrap();
+    let store = DiagnosticStore::open(dir.path().to_owned(), RetentionPolicy::default()).unwrap();
+    let mut record = DiagnosticRecord::new("corr-visible".to_owned(), 1);
+    record.source_transcripts = vec![voisu_core::SourceTranscriptRecord {
+        provider: Provider::Groq,
+        text: "The async function returns a promise.".to_owned(),
+    }];
+    record.provider_failures = vec![
+        ProviderFailure::new(
+            Provider::Deepgram,
+            ProviderFailureStage::Completion,
+            "chunk 3 POST failed: connection reset",
+        ),
+        ProviderFailure::new(
+            Provider::Deepgram,
+            ProviderFailureStage::NotStarted,
+            "Deepgram disabled for this Recording",
+        ),
+    ];
+    let history = store.record(record).unwrap();
+    assert_eq!(history.len(), 1);
+    let failures = &history[0].provider_failures;
+    assert_eq!(failures.len(), 2);
+    assert_eq!(failures[0].stage, ProviderFailureStage::Completion);
+    assert_eq!(failures[1].stage, ProviderFailureStage::NotStarted);
+    // `voisu history` serializes the record verbatim, so the absence is visible.
+    let encoded = serde_json::to_string(&history).unwrap();
+    assert!(encoded.contains("connection reset"));
+    assert!(encoded.contains("Deepgram disabled for this Recording"));
+    assert!(encoded.contains("not_started"));
+}
+
+#[test]
+fn export_scrubs_secret_values_from_provider_failure_diagnostics() {
+    // A provider's boundary diagnostic can echo a secret (a signed URL, a header
+    // value). Export must scrub it like every other free-form string.
+    let mut record = record_at(1, unix_millis_now());
+    record.provider_failures = vec![ProviderFailure::new(
+        Provider::Deepgram,
+        ProviderFailureStage::Completion,
+        "auth failed with token sk-live-hostile-123".to_owned(),
+    )];
+    let environment = vec![("VOISU_DEEPGRAM_API_KEY".to_owned(), "sk-live-hostile-123".to_owned())];
+    let export = export_record(record, environment);
+    let encoded = serde_json::to_string(&export).unwrap();
+    assert!(
+        !encoded.contains("sk-live-hostile-123"),
+        "a secret in a provider-failure diagnostic must be scrubbed: {encoded}"
+    );
+    assert!(encoded.contains(REDACTED));
 }
 
 #[test]

@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BoundaryError, CapturedAudio, DeliveryMethod, LifecycleStage, Provider, ProviderCoordinator,
-    ProviderTiming, SourceTranscript, TranscriptDecision, TranscriptSelection, TranscriptValidator,
+    ProviderFailure, ProviderTiming, SourceTranscript, TranscriptDecision, TranscriptSelection,
+    TranscriptValidator,
 };
 
 /// A stored transcript text is clamped so a bounded history never grows without
@@ -148,6 +149,12 @@ pub struct DiagnosticRecord {
     pub capture_finalized_ms: Option<u64>,
     #[serde(default)]
     pub provider_timings_ms: Vec<ProviderTiming>,
+    /// Every configured provider that failed or was absent for this Recording,
+    /// with its stage and boundary diagnostic. Empty when both providers
+    /// contributed a Source Transcript. `voisu history` and `voisu export`
+    /// serialize this field, so a missing Source Transcript is never silent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_failures: Vec<ProviderFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_to_text_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,6 +186,7 @@ impl DiagnosticRecord {
             first_chunk_ms: None,
             capture_finalized_ms: None,
             provider_timings_ms: Vec::new(),
+            provider_failures: Vec::new(),
             release_to_text_ms: None,
             error: None,
             debug_audio: None,
@@ -465,6 +473,9 @@ pub fn export_record(
         .fallback_reason
         .map(|text| scrub_secret_values(&text, &secrets));
     record.error = record.error.map(|text| scrub_secret_values(&text, &secrets));
+    for failure in &mut record.provider_failures {
+        failure.diagnostic = scrub_secret_values(&failure.diagnostic, &secrets);
+    }
     DiagnosticExport {
         record,
         environment: redacted_environment(vars),
@@ -770,6 +781,10 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
 pub struct ReplayOutcome {
     pub source_transcripts: Vec<SourceTranscript>,
     pub timings_ms: Vec<ProviderTiming>,
+    /// Providers that failed or were absent while replaying the fixture, carried
+    /// through so a replay surfaces the same failure visibility as a live
+    /// Recording.
+    pub provider_failures: Vec<ProviderFailure>,
     pub decision: TranscriptDecision,
 }
 
@@ -784,10 +799,12 @@ pub async fn replay_capture(
 ) -> Result<ReplayOutcome, BoundaryError> {
     let completion = coordinator.complete_with_timings(audio).await?;
     let source_transcripts = completion.sources.clone();
+    let provider_failures = completion.provider_failures;
     let decision = validator.validate(completion.sources).await?;
     Ok(ReplayOutcome {
         source_transcripts,
         timings_ms: completion.timings_ms,
+        provider_failures,
         decision,
     })
 }

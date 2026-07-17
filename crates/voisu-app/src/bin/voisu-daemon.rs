@@ -24,7 +24,8 @@ use voisu_core::{
     DeliveryOutcome, DiagnosticRecord, DiagnosticStore, LifecycleEvidence, LifecycleStage,
     OverlayEvent, OverlayOutcome,
     MergeResult, PROTOCOL_VERSION, Provider,
-    ProviderCoordinator, ProviderStream, ProviderStreams, ReconciliationKind, ReconciliationModel,
+    ProviderCoordinator, ProviderFailure, ProviderStream, ProviderStreams, ReconciliationKind,
+    ReconciliationModel,
     ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SourceTranscript,
     SourceTranscriptRecord, Transcript, TranscriptDecision, TranscriptDecisionPipeline,
     TranscriptProvider, TranscriptValidator, TriggerKeyBinding, VersionEnvelope, replay_capture,
@@ -1322,6 +1323,7 @@ async fn process_recording(
     // persisted to bounded local history once the Recording completes. Raw audio
     // is captured only when the user explicitly enabled debug capture.
     let mut source_records: Vec<SourceTranscriptRecord> = Vec::new();
+    let mut provider_failures: Vec<ProviderFailure> = Vec::new();
     let mut final_transcript: Option<String> = None;
     let mut debug_audio = None;
 
@@ -1346,8 +1348,9 @@ async fn process_recording(
             }
         }
         let completed = providers.complete_with_timings(audio).await?;
-        let sources = completed.sources;
+        provider_failures = completed.provider_failures;
         evidence.provider_timings_ms = completed.timings_ms;
+        let sources = completed.sources;
         evidence.source_transcript_providers =
             sources.iter().map(|source| source.provider).collect();
         source_records = sources.iter().map(SourceTranscriptRecord::new).collect();
@@ -1386,6 +1389,7 @@ async fn process_recording(
     let record = diagnostic_record(
         &evidence,
         source_records,
+        provider_failures,
         final_transcript,
         debug_audio,
         result.as_ref().err(),
@@ -1421,6 +1425,7 @@ async fn process_recording(
 fn diagnostic_record(
     evidence: &LifecycleEvidence,
     source_transcripts: Vec<SourceTranscriptRecord>,
+    provider_failures: Vec<ProviderFailure>,
     final_transcript: Option<String>,
     debug_audio: Option<voisu_core::DebugAudioRecord>,
     error: Option<&BoundaryError>,
@@ -1429,6 +1434,7 @@ fn diagnostic_record(
     record.stages = evidence.stages.clone();
     record.streamed_chunk_count = evidence.streamed_chunk_count;
     record.source_transcripts = source_transcripts;
+    record.provider_failures = provider_failures;
     if let Some(text) = final_transcript {
         record.set_final_transcript(text);
     }

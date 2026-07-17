@@ -189,6 +189,120 @@ async fn near_identical_source_transcripts_select_groq_without_reconciliation() 
 }
 
 #[tokio::test]
+async fn catastrophically_divergent_sources_select_better_source_without_merging() {
+    // Recording-11 case: Groq transcribed the paragraph well; Deepgram's
+    // context-free 1 s batch slices produced word salad. The sources materially
+    // disagree (edit similarity well below the near-identical threshold), so the
+    // pipeline would normally reconcile — but the source-quality gate must catch
+    // that they share almost no content and select the better Source Transcript
+    // instead of merging garbage. The reconciliation model must NEVER be asked.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+
+    let groq = "The async function returns a promise that resolves to a JSON payload. We deserialize it with serde, match on the enum variant, and propagate errors using the question mark operator.";
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "So yeah um the thing over there and then you know it kind of goes around before after that we were saying about the weather today outside near people.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: groq.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "a divergent pair must not be merged");
+    assert_eq!(decision.selection, TranscriptSelection::SourceGroq);
+    assert_eq!(decision.transcript.0, groq);
+    assert!(!decision.reconciliation_requested);
+    assert!(!decision.recovery_attempted);
+    let reason = decision.fallback_reason.expect("gate records a fallback reason");
+    assert!(
+        reason.contains("catastrophically divergent") && reason.contains("token overlap"),
+        "fallback reason must explain the gate: {reason}"
+    );
+}
+
+#[tokio::test]
+async fn a_fragment_source_is_gated_by_length_ratio_not_merged() {
+    // One provider returned a bare fragment while the other transcribed the full
+    // paragraph: their length ratio is far below the floor, so they are
+    // incomparable and the better Source Transcript is selected without a merge.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+
+    let groq = "The async function returns a promise that resolves to a JSON payload. We deserialize it with serde, match on the enum variant, and propagate errors using the question mark operator.";
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Okay so.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: groq.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(decision.selection, TranscriptSelection::SourceGroq);
+    assert_eq!(decision.transcript.0, groq);
+    let reason = decision.fallback_reason.expect("gate records a fallback reason");
+    assert!(reason.contains("length ratio"), "reason must cite length ratio: {reason}");
+}
+
+#[tokio::test]
+async fn long_reordered_sources_below_the_gate_still_reconcile() {
+    // The two Source Transcripts disagree enough to clear the near-identical
+    // threshold (a whole clause is reordered, so edit similarity is low), yet
+    // they share almost all their content words and are comparable in length.
+    // The gate must NOT fire here: this is exactly the material disagreement
+    // reconciliation exists to resolve, so the merge model IS invoked.
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::clone(&kinds),
+            text: "The async function returns a promise that resolves to a JSON payload, then we deserialize with serde and match the enum variant.".to_owned(),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "We deserialize with serde and match the enum variant after the async function returns a promise that resolves to a JSON payload.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "The async function returns a promise that resolves to a JSON payload, then we deserialize with serde and match the enum variant.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::Reconciled);
+    assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
+    assert!(decision.reconciliation_requested);
+    assert!(decision.fallback_reason.is_none());
+}
+
+#[tokio::test]
 async fn material_disagreement_uses_the_bounded_reconciliation_model() {
     let kinds = Arc::new(Mutex::new(Vec::new()));
     let mut pipeline = TranscriptDecisionPipeline::new(
