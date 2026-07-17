@@ -2,73 +2,64 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-17
 
 ## 🚧 In progress / next
-- **Executing the transcription-accuracy PRD** on branch
-  `feature/transcription-accuracy` (off local `main` `67aa3b6`, NOT pushed).
-  PRD + tickets committed `ee76028`
-  (`docs/specs/2026-07-17-transcription-accuracy.md`, `.scratch/voisu-accuracy/`).
-  Three implementers ran in parallel; state per ticket below.
-- **Ticket 04 — Groq accuracy (Opus): CLOSED, Sol APPROVE** (1 fix round).
-  In worktree `.claude/worktrees/agent-ac07d292893b98ce5`
-  (branch `worktree-agent-ac07d292893b98ce5`), commits `19cd716` + `239ef1a`,
-  base `074da5f` (NOT the feature tip — integration must rebase/merge). Delivered:
-  `crates/voisu-app/src/dictionary.rs` (`merged_terms()`, `whisper_prompt()`,
-  224-token budget), Whisper prompt + `language=en` + `temperature=0`,
-  `VOISU_GROQ_MODEL` override (default `whisper-large-v3`), ≤120 s full-audio
-  finalize else 60 s chunks / 4 s overlap / 48-word dedup. 238 tests green there.
-- **Ticket 05 — Deepgram nova-3 websocket streaming (Fable): FIX ROUND IN PROGRESS.**
-  Worktree `.claude/worktrees/ticket05-deepgram-streaming`
-  (branch `ticket05-deepgram-streaming`, base `ee76028`), commit `132f225`.
-  tokio-tungstenite 0.24 rustls, `TranscriptAccumulator` (is_final only),
-  keyterm seam `DeepgramProvider::with_keyterms(reaper, Vec<String>)` — daemon
-  call sites still `::new`; driver wires `dictionary::merged_terms()` at
-  integration (`voisu-daemon.rs:391` and `:1524`). 229 tests were green. Sol
-  returned 7 findings (1 BLOCKER: reconnect silently drops unfinalized audio;
-  2 HIGH: drain treats truncation as success + `ws://` userinfo token leak;
-  3 MEDIUM, 1 LOW). Agent resumed 2026-07-17 evening.
-- **Ticket 06 — reconciliation divergence gate + provider-failure visibility
-  (Opus): ROUND-2 FIX IN PROGRESS.** Commits `54e29ff` + `d63b8a4` directly on
-  `feature/transcription-accuracy`. Divergence gate in
-  `TranscriptDecisionPipeline::decide`, `ProviderFailure`/`ProviderFailureStage`
-  records, diagnostics scrubbing. 238 tests were green. Sol round-2 returned 6
-  HIGH (Groq bias in `clean_source_fallback`; quality-score gaming by
-  unique-word salad + `is_degenerate` false-positives on jargon; winner
-  transcript erased on loser-cleanup failure `lib.rs:1438`; visibility gaps
-  `voisu-daemon.rs:755/634/1364`; URL-scrub misses uppercase/ws/wss
-  `diagnostics.rs:477`; unscrubbed `delivery_fallback_reason` `diagnostics.rs:525`).
-  Agent resumed.
-- **Next after fix rounds:** Sol re-reviews (medium) to APPROVE per ticket →
-  integrate on the feature branch (merge 04 + 05, resolve `system.rs` /
-  `daemon_cli_lifecycle.rs` overlaps, wire keyterms) → full gates
-  (`cargo test --workspace` + `cargo check -p voisu-app --features overlay`) →
-  local RPM build + Raja's live 4-paragraph Appendix A dictation, WER vs 26.3%
-  baseline, pass bar ≤10% overall + latency ≤~1 s → push/PR/merge ONLY on pass.
-- **Latency effort CHARTED (2026-07-17), queued behind accuracy integration.**
-  Separate map `.scratch/voisu-latency/` + plan
-  `docs/specs/2026-07-17-latency-optimization.md`. Evidence: `voisu history` recs
-  20–39 → tail ~1889 ms reconciled vs ~690 ms Groq-only (~400 ms floor); Deepgram
-  gates the barrier 12/12 and its 282 ms RTT is structural. Locked decisions:
-  (D1) Deepgram → default-off `voisu deepgram on|off` toggle, evaluate live then
-  finalize delete-vs-keep; (D2) keep curl, defer TLS warm-up; (D3) FLAC not Opus;
-  (D4) fix direct-typing delivery, auto-paste as fallback. **Do NOT start
-  implementation until `feature/transcription-accuracy` integrates to main** —
-  tickets 01 & 04 touch the same `system.rs`/`lib.rs`/daemon files. Frontier
-  tickets when unblocked: 01 (toggle), 04 (FLAC), 05 (delivery, own branch).
+- **Transcription-accuracy effort is CODE-COMPLETE and fully integrated** on branch
+  `feature/transcription-accuracy` (branch tip `15c82f9`, docs-only; NOT pushed
+  anywhere). All three tickets closed with Sol APPROVE and merged onto the branch.
+  296 workspace tests passing, 0 failed; overlay check clean.
+  **Blocked only on the live-test gate** (RPM build + live WER dictation).
+- **BLOCKED — RPM + live WER gate (per the orchestration plan):**
+  1. RPM build via `packaging/build-rpm.sh` — failed twice on "Disk quota
+     exceeded" (os error 122) in `%check` temp dirs (NOT code; `service_cli`
+     passes 30/30 locally). Retry in progress after driver freed ~11 GB (removed
+     merged worktrees `agent-ac07d292893b98ce5` + `ticket05-deepgram-streaming`,
+     ran `cargo clean`). An RPM build is running concurrently in this checkout.
+  2. On build success: `sudo dnf install dist/rpm/voisu-0.1.0-1.git15c82f9*.rpm`
+     (also `voisu-overlay`), restart `voisu.service`, verify `voisu doctor`/auth.
+  3. Raja dictates the 4 Appendix A paragraphs
+     (`docs/specs/2026-07-17-transcription-accuracy.md`) live; score WER per
+     source + final (normalized, punctuation-insensitive; baseline 26.3%). Pass:
+     overall ≤10%, no fluent-nonsense substitutions, no silent provider absence,
+     release-to-text ≤~1 s after finalize.
+  4. Only if pass: push branch, open PR, merge on CI green. If fail: report
+     scored evidence and STOP.
+- **Latency effort queued behind this branch** (separate map `.scratch/voisu-latency/`
+  + plan `docs/specs/2026-07-17-latency-optimization.md`; decisions D1–D4 in
+  `decisions.md`). Do NOT start until `feature/transcription-accuracy` integrates
+  to main — tickets 01 & 04 touch the same `system.rs`/`lib.rs`/daemon files.
 - Priority 2 unchanged: Overlay visual redesign/polish (functional v1 is in).
-- Deferred release acceptance still untested: logout/login startup
-  observation, kill-Overlay-mid-Recording, clean uninstall.
+- Deferred release acceptance still untested: logout/login startup observation,
+  kill-Overlay-mid-Recording, clean uninstall.
 
 ## Status
-- Accuracy diagnosis DONE (2026-07-17 blind test, 26.3% WER): root causes =
-  Deepgram 1 s batch-chunk design (word salad / silent absence), Groq without
-  prompt/language (jargon errors), 30 s chunk seams. Reconciliation was NOT the
-  villain (refuted).
+- **Ticket 04 (Groq accuracy): CLOSED, Sol APPROVE.** Merged via `1503d26`.
+  `dictionary.rs` (`merged_terms()`, `whisper_prompt()`, 224-token budget),
+  Whisper prompt + `language=en` + `temperature=0`, `VOISU_GROQ_MODEL` override
+  (default `whisper-large-v3`), ≤120 s full-audio finalize else 60 s chunks.
+- **Ticket 05 (Deepgram nova-3 websocket streaming): CLOSED, Sol APPROVE**, 0
+  findings on fix `abf4fd9` (redial redesigned: `audio_delivered` gate — loss
+  after delivered audio fails visibly, no redial; drain requires terminal
+  Metadata evidence; ws userinfo structurally rejected). Merged via `30ee55e`;
+  driver resolved 3 conflicts (kept 04's full-audio/60 s-chunk Groq constants +
+  `build_groq_curl_config`, deleted retired batch Deepgram path, kept both
+  lifecycle tests) and wired `dictionary::merged_terms()` into
+  `DeepgramProvider::with_keyterms` at both daemon construction sites.
+- **Ticket 06 (divergence gate + §3.5 visibility): CLOSED, Sol APPROVE at
+  `b2b83a0`** after EIGHT review rounds. Accepted design (`4f71124`): single
+  symmetric `phonetic_matching` feeds gate + selection; garbage-asymmetry /
+  fragment / agreement<0.2 tiers; low-confidence §3.5 annotation when intrinsic
+  tiers decide. Final fix `b2b83a0`: hollow floor aligned to
+  `CONTENT_OVERLAP_FLOOR` 0.2. Accepted residuals: sea/see ≤3-char exact rule;
+  4-distinct pure-nonsense loop reconciles.
+- **NEW live bug found & fixed (`b7b01a4`):** every Recording was killed at
+  exactly 60 s (default `VOISU_RECORDING_DEADLINE_MS` fallback,
+  journalctl-proven). Default now 600 s via pure `resolve_recording_deadline`
+  seam. Chunking was dead code without this (PRD assumed >120 s recordings).
+- Accuracy diagnosis (2026-07-17 blind test, 26.3% WER): root causes = Deepgram
+  1 s batch-chunk design, Groq without prompt/language, 30 s chunk seams.
+  Reconciliation was NOT the villain (refuted).
 - Overlay graphical startup merged locally (`67aa3b6`); local `main` ahead of
-  `origin/main`, not pushed. Packaged units installed and verified live.
-- Accuracy PRD bound to research: Deepgram streaming guide (Raja's vault:
-  `AI Created Stuff/Hyprvox Rebuild/Deepgram Streaming Guide for Voisu.md`) +
-  pricing asset (`.scratch/voisu-accuracy/assets/02-groq-deepgram-pricing.md`).
-- `docs/model-benchmark.md` rows 61–67 track this effort's dispatches
-  (uncommitted).
+  `origin/main`, not pushed.
+- `docs/model-benchmark.md` rows 61–83 complete (committed).
 
 ## Architecture map
 - Domain, IPC, Transcript decision, diagnostics -> `crates/voisu-core/src/lib.rs`
@@ -96,18 +87,24 @@
   fluent-nonsense substitutions, no silent provider absence, latency ≤ today.
 - Reconciliation gated on source comparability (divergence gate) so a degenerate
   source cannot poison the final Transcript.
-- Overlay presentation stays observer-only and disposable; keep GTK4 +
-  gtk4-layer-shell for the KWin layer-shell surface.
+- Three-strike subagent escalation rule: 3 failed review rounds → discard the
+  agent, respawn fresh at higher effort with the findings history (proven on
+  ticket 06; full entry in `decisions.md`).
 - Portals are the normal Fedora path; no raw input devices or `uinput`.
 
 ## Gotchas
-- **Target dirs deleted 2026-07-17** (Raja freed disk) — full rebuilds expected;
-  keep disk usage frugal, clean up worktrees after integration.
+- **Disk critically tight (~14 GB free).** `rpmbuild` needs workspace debug +
+  release trees PLUS its own `%check` build tree — `cargo clean` target/ before
+  RPM builds. Build script refuses a dirty status (untracked files count):
+  `.git/info/exclude` now locally ignores `.claude/`, `.scratch/voisu-latency/`,
+  `docs/specs/2026-07-17-latency-optimization.md`.
+- **Keyring:** "secret service lookup denied" seen once in logs (19:06) — verify
+  keyring unlocked + `voisu auth verify` before the live test.
 - **Parallel branch `fix/delivery-keymap-fd`** (keymap fd pread fix) lives in a
-  SEPARATE worktree, NOT part of this branch; accuracy agents must not touch
-  `system.rs` `keyboard_keymap_text`/libei region ~3033–3110.
-- Ticket 04 base is `074da5f` (not the feature tip) — rebase/merge on integration.
-- Session-limit kills recover via SendMessage resume (agents keep context).
+  SEPARATE worktree (`/tmp`), untouched; not part of this branch. Accuracy work
+  must not touch `system.rs` `keyboard_keymap_text`/libei region ~3033–3110.
+- Latency-optimization effort (other session, decisions D1–D4) is sequenced
+  AFTER this branch integrates.
 - Use `CONTEXT.md` terms exactly; ordinary synonyms are intentionally banned.
 - Default workspace builds are GTK-free; Overlay needs `--features overlay`.
 - `packaging/build-rpm.sh` requires a clean COMMITTED checkout (push not
@@ -115,6 +112,6 @@
 - Whisper `prompt` honors only ~224 tokens — dictionary builder budgets it.
 - Groq free-tier limits (7,200 audio-sec/hr, 2,000 req/day) are the rate ceiling.
 - `rustfmt` and `clippy` are unavailable.
-- Delivery still uses `clipboard_fallback` (`xkbcommon` parse errors) — 100% of
-  recordings, so Raja pastes manually. Now tracked as **latency ticket 05**
-  (`fix/delivery-keymap-fd`); still do NOT fold into the accuracy branch.
+- Delivery still uses `clipboard_fallback` (`xkbcommon` parse errors) — Raja
+  pastes manually. Tracked as **latency ticket 05** (`fix/delivery-keymap-fd`);
+  do NOT fold into the accuracy branch.

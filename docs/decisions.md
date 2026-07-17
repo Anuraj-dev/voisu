@@ -289,3 +289,18 @@ synthesis only as 2nd-best if direct-typing is unreliable on the host. Sequenced
 AFTER the accuracy branch integrates (shared `system.rs`/`lib.rs`/daemon files).
 Full plan: `docs/specs/2026-07-17-latency-optimization.md`; map + tickets:
 `.scratch/voisu-latency/`.
+
+## 2026-07-17 — Three-strike subagent escalation rule
+**Why:** Ticket 06 (reconciliation divergence gate) proved that a subagent stuck
+after repeated review rounds keeps patching symptoms rather than fixing the
+design — Opus burned three rounds (`54e29ff`/`d63b8a4`/`d06062a`) accumulating
+complexity without converging. New rule: **3 failed review rounds → discard that
+agent and respawn a FRESH agent at higher effort, handing it the full findings
+history** (and a simplify mandate if the failures were complexity-driven). Proven
+this session: after the discarded Opus, a fresh Fable agent still failed 3 rounds
+(`bd34220`/`bc01840`/`3d2e2c2`), but a second fresh Fable with an explicit
+simplify mandate delivered the accepted design in one shot (`4f71124`, single
+symmetric `phonetic_matching` feeding gate + selection) plus one alignment fix
+(`b2b83a0`), Sol APPROVE. Findings-per-round fell 6→3→2→3→5→1→0. Rejected
+alternative: continuing to patch with the same agent, which the six wasted rounds
+show does not converge — a fresh context beats an entrenched one.
