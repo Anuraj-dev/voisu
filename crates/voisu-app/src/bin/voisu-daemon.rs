@@ -39,6 +39,7 @@ const PROVIDER_DEADLINE: Duration = PROVIDER_COMPLETION_DEADLINE;
 
 #[tokio::main]
 async fn main() {
+    voisu_app::system::install_crypto_provider();
     let systemd_owned = matches!(
         std::env::args().skip(1).collect::<Vec<_>>().as_slice(),
         [argument] if argument == "--systemd"

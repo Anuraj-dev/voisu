@@ -2368,6 +2368,14 @@ async fn deepgram_ws_sessions(
     }
 }
 
+/// Installs the process-level rustls CryptoProvider (ring). The
+/// `rustls-tls-webpki-roots` feature of tokio-tungstenite does not select a
+/// crypto backend, and rustls panics on the first TLS handshake when none is
+/// installed. Idempotent: a second call leaves the installed provider in place.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Dials the streaming endpoint with the `Authorization: Token` header scheme
 /// the batch path already used. The whole handshake is bounded by
 /// `DEEPGRAM_CONNECT_DEADLINE` and observes cancellation on the poll tick, so
@@ -4342,6 +4350,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use voisu_core::{ProviderCoordinator, ProviderStreams};
+
+    #[test]
+    fn crypto_provider_installs_and_is_idempotent() {
+        install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
 
     /// Fixed Groq request tuning for stream constructor tests: deterministic and
     /// independent of the host's environment and user dictionary.
