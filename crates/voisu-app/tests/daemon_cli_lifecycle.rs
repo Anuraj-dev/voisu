@@ -4414,7 +4414,8 @@ fn daemon_interruption_reaps_boundary_processes_and_restarts_in_a_safe_state() {
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-printf '%s' "$$" > "$dir/pw-record.pid"
+printf '%s' "$$" > "$dir/pw-record.pid.$$"
+mv "$dir/pw-record.pid.$$" "$dir/pw-record.pid"
 head -c 4000000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 i=0
@@ -4429,7 +4430,8 @@ dir=$(dirname "$0")
 cat >/dev/null
 exec </dev/null >/dev/null 2>&1
 trap '' EXIT HUP INT TERM PIPE
-printf '%s' "$$" > "$dir/curl.pid"
+printf '%s' "$$" > "$dir/curl.pid.$$"
+mv "$dir/curl.pid.$$" "$dir/curl.pid"
 : > "$dir/curl.started"
 exec setsid sleep infinity
 "#,
