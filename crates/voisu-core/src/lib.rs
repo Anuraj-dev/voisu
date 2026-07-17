@@ -867,7 +867,9 @@ fn clean_source_fallback(
             match select_better_source(
                 &normalized_words(&left.text),
                 &normalized_words(&right.text),
-            ) {
+            )
+            .0
+            {
                 GateWinner::Left => *left,
                 GateWinner::Right => *right,
             },
@@ -979,13 +981,19 @@ const CONTENT_REPETITION_FLOOR: f64 = 0.4;
 /// term ("test test test done") is terse, not degenerate.
 const MIN_REPETITION_CONTENT: usize = 8;
 
+/// A repetition loop needs at least this many distinct content words before
+/// cross-source evidence can judge it. Below it ("start stop reset" three
+/// times) the vocabulary is too small to distinguish a loop from genuinely
+/// repeated command speech, so those shapes go to reconciliation instead.
+const MIN_LOOP_VOCABULARY: usize = 4;
+
 /// True when a Source Transcript is internally degenerate — a filler or
 /// repetition loop with almost no distinct content (context-free 1 s slices, or
 /// a "the/and/to/is" loop). This is a ROBUST garbage signal: it triggers on
 /// near-absent content, NOT on mere repetition, so legitimate jargon-heavy,
 /// naturally repetitive, or short-command dictation ("start stop reset" three
 /// times) is never flagged. Repetition loops that DO carry content words are
-/// judged with cross-source evidence in `is_stolen_word_loop` instead, because
+/// judged with cross-source evidence in `is_garbage_against` instead, because
 /// a single-source view cannot tell them from genuine repeated speech.
 fn is_degenerate(words: &[String]) -> bool {
     let total = words.len();
@@ -999,32 +1007,64 @@ fn is_degenerate(words: &[String]) -> bool {
     content_fraction < 0.25 || distinct_content < 3
 }
 
-/// True when a Source Transcript is a repetition loop built around words the
-/// OTHER source actually contains: a sizable content vocabulary (so there is
-/// real evidence to judge) recycled so relentlessly that the distinct share of
-/// content occurrences collapses, with at least one recycled word stolen from
-/// (confirmed by) the other source. Genuinely repeated command speech ("start
-/// stop reset" three times) is exempt twice over: its vocabulary is too small
-/// to judge, and against an unrelated hallucination nothing it says is
-/// confirmed — that ambiguous shape goes to reconciliation instead of being
-/// discarded.
-fn is_stolen_word_loop(own: &[String], other: &[String]) -> bool {
-    let content_count = own.iter().filter(|word| !is_stopword(word)).count();
-    let own_content = distinct_content_words(own);
-    if content_count < MIN_REPETITION_CONTENT || own_content.len() < MIN_COMPARABLE_CONTENT {
+/// True when a Source Transcript has the SHAPE of a repetition loop: a
+/// judgeable content vocabulary recycled so relentlessly that the distinct
+/// share of content occurrences collapses. Shape alone is not a verdict —
+/// genuine command dictation can repeat itself — so the loop is condemned only
+/// by cross-source evidence in `is_garbage_against`.
+fn is_repetition_loop(words: &[String]) -> bool {
+    let content_count = words.iter().filter(|word| !is_stopword(word)).count();
+    let distinct_content = distinct_content_words(words).len();
+    content_count >= MIN_REPETITION_CONTENT
+        && distinct_content >= MIN_LOOP_VOCABULARY
+        && (distinct_content as f64) < CONTENT_REPETITION_FLOOR * content_count as f64
+}
+
+/// The single garbage verdict for one side of a disagreeing pair, judged by
+/// intrinsic degeneracy plus cross-source evidence (`confirmed` is the set of
+/// this side's distinct content words that the one-to-one phonetic matching
+/// paired with the other side). A transcript is garbage when it is a
+/// near-content-free filler loop, or a repetition loop that either
+/// - steals its material: the majority of its RECYCLED (multi-occurrence)
+///   content words are confirmed by the other source, so the loop is an echo
+///   of the other transcript's content rather than independent speech; or
+/// - is hollow: it has a comparable vocabulary yet NOTHING it says is
+///   confirmed, so its relentless repetition is self-generated noise.
+/// Genuine repeated speech survives both: its recycled commands are its own
+/// (no theft majority), and any real overlap with the other source keeps it
+/// from being hollow. A loop with some overlap but no recycled-word theft is
+/// ambiguous and deliberately NOT garbage — that shape reconciles.
+fn is_garbage_against(own: &[String], confirmed: &HashSet<&str>) -> bool {
+    if is_degenerate(own) {
+        return true;
+    }
+    if !is_repetition_loop(own) {
         return false;
     }
-    if own_content.len() as f64 / content_count as f64 >= CONTENT_REPETITION_FLOOR {
-        return false;
+    let mut occurrences: HashMap<&str, usize> = HashMap::new();
+    for word in own.iter().filter(|word| !is_stopword(word)) {
+        *occurrences.entry(word.as_str()).or_default() += 1;
     }
-    let other_content = distinct_content_words(other);
-    own_content.iter().any(|word| other_content.contains(*word))
+    let recycled: Vec<&str> = occurrences
+        .iter()
+        .filter(|(_, count)| **count >= 2)
+        .map(|(word, _)| *word)
+        .collect();
+    let confirmed_recycled = recycled
+        .iter()
+        .filter(|word| confirmed.contains(**word))
+        .count();
+    let stolen = confirmed_recycled * 2 > recycled.len();
+    let hollow =
+        distinct_content_words(own).len() >= MIN_COMPARABLE_CONTENT && confirmed.is_empty();
+    stolen || hollow
 }
 
 /// Two Source Transcripts of the same audio must agree on a meaningful share of
-/// content words. Below this containment (shared distinct content words over
-/// the smaller distinct-content set) they cannot both be transcriptions of the
-/// same speech: one of them is garbage, and merging would poison the result.
+/// content words. Below this containment (one-to-one matched distinct content
+/// words over the smaller distinct-content set) they cannot both be
+/// transcriptions of the same speech: one of them is garbage, and merging
+/// would poison the result.
 const CONTENT_OVERLAP_FLOOR: f64 = 0.2;
 
 /// Sources with fewer distinct content words than this are too short for the
@@ -1035,40 +1075,31 @@ const MIN_COMPARABLE_CONTENT: usize = 5;
 /// Cross-confirmation differences below this margin are noise, not a decision.
 const CONFIRMATION_MARGIN: f64 = 0.15;
 
-/// Evidence for choosing between two disagreeing Source Transcripts, ordered by
-/// robustness. `confirmation` and `cohesion` are the primary signals because
-/// neither can be inflated by a fluent salad: confirmation requires the OTHER
-/// source to agree, and cohesion requires revisiting a real topic term, which a
-/// stream of unique nonsense words never does.
-struct SourceEvidence {
-    /// Fraction of this source's DISTINCT content words that appear in the
-    /// other source's content vocabulary. Distinct, never occurrences: a salad
-    /// repeating one stolen word gains nothing, because repetition of an
-    /// already-confirmed word is not additional cross-source agreement.
-    confirmation: f64,
-    /// Distinct content words this source returns to at non-adjacent positions.
-    cohesion: usize,
-    /// Intrinsic content-density score — a last-resort tiebreak only, because
-    /// it is the one signal a fluent salad can game.
-    quality: f64,
+/// Which evidence tier decided a selection between two disagreeing sources.
+/// The first two tiers rest on cross-source evidence a salad cannot fake; the
+/// last three are heuristic guesses over intrinsic structure and are surfaced
+/// as low-confidence in the §3.5 diagnostic reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectionEvidence {
+    /// Exactly one side is garbage under `is_garbage_against`.
+    Garbage,
+    /// One side's distinct content is confirmed by the other side beyond the
+    /// noise margin.
+    Confirmation,
+    /// Only topical cohesion (revisited topic terms) separated the sides.
+    Cohesion,
+    /// Only intrinsic content density separated the sides.
+    Quality,
+    /// No evidence at all: the deterministic default (the later source, Groq)
+    /// was applied.
+    Default,
 }
 
-fn source_evidence(own: &[String], other: &[String]) -> SourceEvidence {
-    let other_content = distinct_content_words(other);
-    let own_content = distinct_content_words(own);
-    let confirmation = if own_content.is_empty() {
-        0.0
-    } else {
-        own_content
-            .iter()
-            .filter(|word| other_content.contains(**word))
-            .count() as f64
-            / own_content.len() as f64
-    };
-    SourceEvidence {
-        confirmation,
-        cohesion: topical_cohesion(own),
-        quality: source_quality(own),
+impl SelectionEvidence {
+    /// True when the winner was picked by an intrinsic, gameable signal or by
+    /// the bare deterministic default rather than by cross-source evidence.
+    fn is_low_confidence(self) -> bool {
+        matches!(self, Self::Cohesion | Self::Quality | Self::Default)
     }
 }
 
@@ -1093,48 +1124,53 @@ fn topical_cohesion(words: &[String]) -> usize {
         .count()
 }
 
-/// When exact content overlap is near zero, at least this fraction of the
-/// smaller vocabulary must approximately match the other side before the pair
-/// is treated as "same audio, different spellings" and sent to reconciliation.
-/// Homophone-heavy divergence ("cache writes failed" vs "cash rights sailed")
-/// clears it easily; fluent nonsense and word salads have neither exact nor
-/// phonetic alignment and stay gated.
-const PHONETIC_ALIGNMENT_FLOOR: f64 = 0.5;
-
-/// Fraction of the smaller distinct-content vocabulary with an approximate
-/// (edit-distance) match in the other vocabulary — a cheap stand-in for
-/// phonetic similarity that catches homophones and provider spelling variants.
-/// Matching is ONE-TO-ONE: each word on the larger side is consumable exactly
+/// The single cross-source agreement computation: a one-to-one matching
+/// between the two distinct content vocabularies, where a pair matches when
+/// the words are equal or sound alike (edit-distance homophone tolerance, so
+/// "cache"/"cash" and "failed"/"sailed" count as the same heard word).
+/// Matching is ONE-TO-ONE — each word on either side is consumable exactly
 /// once, so six salad words orbiting the same real word ("bat hat mat rat pat
-/// sat" around "cat") claim at most one match between them instead of a
-/// perfect alignment. Both sides are visited in sorted order (greedy,
-/// closest-first per word) so the result is deterministic.
-fn phonetic_alignment(left: &HashSet<&str>, right: &HashSet<&str>) -> f64 {
-    let (smaller, larger) = if left.len() <= right.len() {
-        (left, right)
-    } else {
-        (right, left)
-    };
-    if smaller.is_empty() {
-        return 0.0;
-    }
-    let mut smaller: Vec<&str> = smaller.iter().copied().collect();
-    smaller.sort_unstable();
-    let mut available: Vec<&str> = larger.iter().copied().collect();
-    available.sort_unstable();
-    let mut matched = 0usize;
-    for word in &smaller {
-        let closest = available
-            .iter()
-            .enumerate()
-            .filter(|(_, other)| words_sound_alike(word, other))
-            .min_by_key(|(_, other)| char_edit_distance(word, other));
-        if let Some((index, _)) = closest {
-            available.remove(index);
-            matched += 1;
+/// sat" around "cat") claim at most one match between them — and SYMMETRIC BY
+/// CONSTRUCTION: candidate pairs are taken greedily in a global order keyed by
+/// (edit distance, unordered word pair), which is invariant under swapping the
+/// arguments, so the matching never depends on which provider held which text.
+fn phonetic_matching<'words>(
+    left: &HashSet<&'words str>,
+    right: &HashSet<&'words str>,
+) -> Vec<(&'words str, &'words str)> {
+    let mut candidates: Vec<(usize, &str, &str)> = left
+        .iter()
+        .flat_map(|left_word| {
+            right
+                .iter()
+                .filter(|right_word| words_sound_alike(left_word, right_word))
+                .map(|right_word| {
+                    (
+                        char_edit_distance(left_word, right_word),
+                        *left_word,
+                        *right_word,
+                    )
+                })
+        })
+        .collect();
+    candidates.sort_unstable_by_key(|(distance, left_word, right_word)| {
+        (
+            *distance,
+            *left_word.min(right_word),
+            *left_word.max(right_word),
+        )
+    });
+    let mut left_used: HashSet<&str> = HashSet::new();
+    let mut right_used: HashSet<&str> = HashSet::new();
+    let mut matching = Vec::new();
+    for (_, left_word, right_word) in candidates {
+        if !left_used.contains(left_word) && !right_used.contains(right_word) {
+            left_used.insert(left_word);
+            right_used.insert(right_word);
+            matching.push((left_word, right_word));
         }
     }
-    matched as f64 / smaller.len() as f64
+    matching
 }
 
 /// Two content words within a third of their length in edit distance are close
@@ -1175,43 +1211,90 @@ fn char_edit_distance(left: &str, right: &str) -> usize {
     previous[right.len()]
 }
 
-/// Chooses between two disagreeing Source Transcripts by ordered cross-source
-/// evidence, never by provider and never by an intrinsic score alone:
-/// cross-confirmation first, topical cohesion second, intrinsic content density
-/// last. On a full tie it keeps the later element — the same rare, low-stakes
-/// exact-tie behavior the fallback has always had.
-fn select_better_source(left: &[String], right: &[String]) -> GateWinner {
-    let left_evidence = source_evidence(left, right);
-    let right_evidence = source_evidence(right, left);
-    if (left_evidence.confirmation - right_evidence.confirmation).abs() > CONFIRMATION_MARGIN {
-        return if left_evidence.confirmation > right_evidence.confirmation {
+/// Chooses between two disagreeing Source Transcripts by ordered evidence,
+/// never by a fixed provider preference. The strong tiers rest on cross-source
+/// evidence: a one-sided garbage verdict (degenerate filler, stolen-word loop,
+/// or hollow loop), then asymmetric distinct-word confirmation. When both are
+/// silent no heuristic truly knows — topical cohesion, then content density,
+/// then the deterministic default (the later source, Groq) still pick a
+/// winner, but the returned `SelectionEvidence` marks those tiers as
+/// low-confidence so the gate can say so in the §3.5 diagnostic record.
+fn select_better_source(left: &[String], right: &[String]) -> (GateWinner, SelectionEvidence) {
+    let left_content = distinct_content_words(left);
+    let right_content = distinct_content_words(right);
+    let matching = phonetic_matching(&left_content, &right_content);
+    let left_confirmed: HashSet<&str> = matching.iter().map(|(word, _)| *word).collect();
+    let right_confirmed: HashSet<&str> = matching.iter().map(|(_, word)| *word).collect();
+
+    let left_garbage = is_garbage_against(left, &left_confirmed);
+    let right_garbage = is_garbage_against(right, &right_confirmed);
+    if left_garbage != right_garbage {
+        let winner = if left_garbage {
+            GateWinner::Right
+        } else {
+            GateWinner::Left
+        };
+        return (winner, SelectionEvidence::Garbage);
+    }
+
+    // Distinct words, never occurrences: a salad repeating one stolen word
+    // gains nothing, because repetition of an already-confirmed word is not
+    // additional cross-source agreement.
+    let confirmation = |confirmed: &HashSet<&str>, content: &HashSet<&str>| {
+        if content.is_empty() {
+            0.0
+        } else {
+            confirmed.len() as f64 / content.len() as f64
+        }
+    };
+    let left_confirmation = confirmation(&left_confirmed, &left_content);
+    let right_confirmation = confirmation(&right_confirmed, &right_content);
+    if (left_confirmation - right_confirmation).abs() > CONFIRMATION_MARGIN {
+        let winner = if left_confirmation > right_confirmation {
             GateWinner::Left
         } else {
             GateWinner::Right
         };
+        return (winner, SelectionEvidence::Confirmation);
     }
-    if left_evidence.cohesion != right_evidence.cohesion {
-        return if left_evidence.cohesion > right_evidence.cohesion {
+
+    let left_cohesion = topical_cohesion(left);
+    let right_cohesion = topical_cohesion(right);
+    if left_cohesion != right_cohesion {
+        let winner = if left_cohesion > right_cohesion {
             GateWinner::Left
         } else {
             GateWinner::Right
         };
+        return (winner, SelectionEvidence::Cohesion);
     }
-    if left_evidence.quality > right_evidence.quality {
-        GateWinner::Left
+
+    let left_quality = source_quality(left);
+    let right_quality = source_quality(right);
+    if left_quality > right_quality {
+        (GateWinner::Left, SelectionEvidence::Quality)
+    } else if right_quality > left_quality {
+        (GateWinner::Right, SelectionEvidence::Quality)
     } else {
-        GateWinner::Right
+        (GateWinner::Right, SelectionEvidence::Default)
     }
 }
 
 /// Decides whether to skip the LLM merge for two materially disagreeing Source
-/// Transcripts and select the better one. It gates on three robust garbage
-/// signals: exactly one source is a degenerate filler/repetition loop, one is a
-/// bare fragment (extreme length ratio), or the two share near-zero content
-/// words despite comparable length — two transcriptions of the same audio
-/// cannot do that, so one is fluent nonsense or a word salad. Sources that
-/// clear all three (real disagreements over shared content) return `None` and
-/// go to the reconciliation model.
+/// Transcripts and select the better one (§3.4). One symmetric computation —
+/// the one-to-one phonetic-tolerant matching of distinct content words —
+/// feeds every decision:
+/// 1. Exactly one source is garbage (degenerate filler loop, a repetition loop
+///    stealing the majority of its recycled words from the other source, or a
+///    hollow loop nothing of which is confirmed): select the other.
+/// 2. One source is a bare fragment (extreme length ratio): select the fuller.
+/// 3. Two comparable vocabularies agree on almost nothing — two transcriptions
+///    of the same audio cannot do that, so one is fluent nonsense or a word
+///    salad no intrinsic check can flag: gate, and select by `select_better_source`,
+///    recording a low-confidence marker when only weak evidence decided.
+/// Pairs that clear all three (real disagreements over shared or
+/// phonetically-aligned content, terse pairs, homophone spellings) return
+/// `None` and go to the reconciliation model.
 fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
     let left_words = normalized_words(left);
     let right_words = normalized_words(right);
@@ -1220,92 +1303,78 @@ fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
     if fewer == 0 {
         return None;
     }
-    let left_degenerate = is_degenerate(&left_words);
-    let right_degenerate = is_degenerate(&right_words);
+    let left_content = distinct_content_words(&left_words);
+    let right_content = distinct_content_words(&right_words);
+    let matching = phonetic_matching(&left_content, &right_content);
+    let left_confirmed: HashSet<&str> = matching.iter().map(|(word, _)| *word).collect();
+    let right_confirmed: HashSet<&str> = matching.iter().map(|(_, word)| *word).collect();
+    let left_garbage = is_garbage_against(&left_words, &left_confirmed);
+    let right_garbage = is_garbage_against(&right_words, &right_confirmed);
 
-    if left_degenerate == right_degenerate {
-        let length_ratio = fewer as f64 / more as f64;
-        if length_ratio < DIVERGENCE_LENGTH_RATIO_FLOOR {
-            // One source is a fragment: the fuller transcription carries the
-            // content, so select it and skip a merge with a stub.
-            let winner = if left_words.len() >= right_words.len() {
-                GateWinner::Left
-            } else {
-                GateWinner::Right
-            };
-            return Some(QualityGate {
-                winner,
-                reason: format!(
-                    "catastrophically divergent (length ratio {length_ratio:.2} below {DIVERGENCE_LENGTH_RATIO_FLOOR:.2}); selected the fuller Source Transcript, the other is a fragment"
-                ),
-            });
-        }
-        // Stolen-word-loop check: exactly one source is a repetition loop
-        // recycling words the other source contains — a salad built by looping
-        // stolen content plus padding. The other source explains the loop's
-        // real content AND carries its own, so select it.
-        if !left_degenerate {
-            let left_loop = is_stolen_word_loop(&left_words, &right_words);
-            let right_loop = is_stolen_word_loop(&right_words, &left_words);
-            if left_loop != right_loop {
-                let winner = if left_loop {
-                    GateWinner::Right
+    if left_garbage != right_garbage {
+        // Exactly one source is garbage: select the coherent one.
+        let winner = if left_garbage {
+            GateWinner::Right
+        } else {
+            GateWinner::Left
+        };
+        return Some(QualityGate {
+            winner,
+            reason:
+                "catastrophically divergent (one Source Transcript is a degenerate filler/repetition loop without independent cross-source support); selected the coherent Source Transcript"
+                    .to_owned(),
+        });
+    }
+
+    let length_ratio = fewer as f64 / more as f64;
+    if length_ratio < DIVERGENCE_LENGTH_RATIO_FLOOR {
+        // One source is a fragment: the fuller transcription carries the
+        // content, so select it and skip a merge with a stub.
+        let winner = if left_words.len() >= right_words.len() {
+            GateWinner::Left
+        } else {
+            GateWinner::Right
+        };
+        return Some(QualityGate {
+            winner,
+            reason: format!(
+                "catastrophically divergent (length ratio {length_ratio:.2} below {DIVERGENCE_LENGTH_RATIO_FLOOR:.2}); selected the fuller Source Transcript, the other is a fragment"
+            ),
+        });
+    }
+
+    // Cross-agreement check: two comparable, individually coherent
+    // transcriptions of the SAME audio must still agree — exactly or
+    // phonetically — on a meaningful share of content words. Near-zero
+    // agreement means one of them is garbage, and an LLM merge would let it
+    // poison the result. Short pairs are exempt: terse commands can honestly
+    // share nothing. Both-garbage pairs are also exempt — with no coherent
+    // side to select, reconciliation is the only honest move.
+    if !left_garbage {
+        let smaller_content = left_content.len().min(right_content.len());
+        if smaller_content >= MIN_COMPARABLE_CONTENT {
+            let agreement = matching.len() as f64 / smaller_content as f64;
+            if agreement < CONTENT_OVERLAP_FLOOR {
+                let (winner, evidence) = select_better_source(&left_words, &right_words);
+                let low_confidence = if evidence.is_low_confidence() {
+                    "; low-confidence selection: cross-source evidence could not distinguish the Source Transcripts"
                 } else {
-                    GateWinner::Left
+                    ""
                 };
                 return Some(QualityGate {
                     winner,
-                    reason:
-                        "catastrophically divergent (one Source Transcript is a repetition loop recycling words stolen from the other); selected the Source Transcript with real content"
-                            .to_owned(),
+                    reason: format!(
+                        "catastrophically divergent (cross-source content agreement {agreement:.2} below {CONTENT_OVERLAP_FLOOR:.2}); selected the Source Transcript better supported by cross-source evidence{low_confidence}"
+                    ),
                 });
             }
         }
-        // Cross-agreement check (§3.4): two comparable-length, individually
-        // coherent transcriptions of the SAME audio must still agree on a
-        // meaningful share of content words. Near-zero agreement means one of
-        // them is garbage — fluent nonsense or a unique-word salad that no
-        // intrinsic check can flag — and an LLM merge would let it poison the
-        // result. Short pairs are exempt: terse commands can honestly share
-        // nothing.
-        if !left_degenerate {
-            let left_content = distinct_content_words(&left_words);
-            let right_content = distinct_content_words(&right_words);
-            let smaller_content = left_content.len().min(right_content.len());
-            if smaller_content >= MIN_COMPARABLE_CONTENT {
-                let shared = left_content.intersection(&right_content).count();
-                let overlap = shared as f64 / smaller_content as f64;
-                if overlap < CONTENT_OVERLAP_FLOOR
-                    && phonetic_alignment(&left_content, &right_content) < PHONETIC_ALIGNMENT_FLOOR
-                {
-                    let winner = select_better_source(&left_words, &right_words);
-                    return Some(QualityGate {
-                        winner,
-                        reason: format!(
-                            "catastrophically divergent (cross-source content-word overlap {overlap:.2} below {CONTENT_OVERLAP_FLOOR:.2}, with no phonetic alignment); selected the Source Transcript better supported by cross-source evidence"
-                        ),
-                    });
-                }
-            }
-        }
-        // Sources agree enough to be transcriptions of the same speech (or are
-        // both garbage, or too short to judge): no confident single winner, so
-        // reconcile rather than guess.
-        return None;
     }
 
-    // Exactly one source is a degenerate garbage loop: select the coherent one.
-    let winner = if left_degenerate {
-        GateWinner::Right
-    } else {
-        GateWinner::Left
-    };
-    Some(QualityGate {
-        winner,
-        reason:
-            "catastrophically divergent (one Source Transcript is a degenerate filler/repetition loop); selected the coherent Source Transcript"
-                .to_owned(),
-    })
+    // Sources agree enough to be transcriptions of the same speech (or are
+    // both garbage, or too short to judge): no confident single winner, so
+    // reconcile rather than guess.
+    None
 }
 
 fn source_similarity(left: &str, right: &str) -> f64 {

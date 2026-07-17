@@ -363,6 +363,51 @@ async fn unique_word_salad_with_no_cross_agreement_is_gated_and_dictation_wins()
         reason.contains("catastrophically divergent"),
         "the gate must ground the selection in cross-source divergence: {reason}"
     );
+    // §3.5: at zero agreement neither side is confirmed by the other, so the
+    // winner is a heuristic guess — the record must say so instead of
+    // pretending the gate knew.
+    assert!(
+        reason.contains("low-confidence"),
+        "a selection decided without cross-source evidence must be marked low-confidence: {reason}"
+    );
+}
+
+#[tokio::test]
+async fn gated_selection_is_stable_under_provider_position_swap() {
+    // The zero-agreement gate must deliver the same text whichever provider
+    // carried it: every selection signal is computed symmetrically over the
+    // pair, so swapping provider positions must not flip the winner.
+    let dictation = "The cache stores the value, then the cache invalidation clears the cache, and the cache reloads the value from the cache after the cache miss occurs repeatedly.";
+    let salad = "Purple mountains dance quietly beneath the whispering violet clouds while seven curious otters juggle glowing lanterns across the frozen meadow tonight forever.";
+
+    for (deepgram, groq) in [(dictation, salad), (salad, dictation)] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = TranscriptDecisionPipeline::new(
+            CountingModel {
+                calls: Arc::clone(&calls),
+            },
+            Duration::from_millis(50),
+        );
+        let decision = pipeline
+            .decide(vec![
+                SourceTranscript {
+                    provider: Provider::Deepgram,
+                    text: deepgram.to_owned(),
+                },
+                SourceTranscript {
+                    provider: Provider::Groq,
+                    text: groq.to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            decision.transcript.0, dictation,
+            "the dictation must win the gated selection from either provider position"
+        );
+    }
 }
 
 #[tokio::test]
@@ -558,6 +603,175 @@ async fn fallback_confirmation_counts_distinct_words_not_occurrences() {
         "occurrence-inflated confirmation must not buy the salad the fallback"
     );
     assert_eq!(decision.transcript.0, dictation);
+}
+
+#[tokio::test]
+async fn genuine_repeated_commands_with_one_shared_word_are_not_discarded_as_stolen() {
+    // Round-6 finding 1: a 13-occurrence transcript of four genuinely repeated
+    // commands plus one singleton the other source happens to share must NOT be
+    // discarded as a "stolen word loop". None of its RECYCLED words is
+    // confirmed by the other source — the only shared words are the singleton
+    // "cluster" and a loose phonetic echo — so there is no theft evidence, and
+    // the honest path is reconciliation.
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::clone(&kinds),
+            text: "Start stop reset pause the cluster.".to_owned(),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Start stop reset pause start stop reset pause start stop reset pause cluster.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "The cluster restarts gracefully when the gentle breeze carries autumn leaves across the quiet village square.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        decision.selection,
+        TranscriptSelection::Reconciled,
+        "repeated genuine commands with no theft evidence must reconcile, not be discarded"
+    );
+    assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
+}
+
+#[tokio::test]
+async fn four_word_stolen_padded_loop_is_gated_not_reconciled() {
+    // Round-6 finding 2: a padded repetition loop with EXACTLY four distinct
+    // content words — every one of them recycled and stolen from the accurate
+    // source — used to slip between the stolen-loop tier (which required five)
+    // and the overlap gate (which exempted fewer than five) and poison the
+    // merge. It must be gated: theft evidence does not expire below an
+    // arbitrary vocabulary size.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+
+    let dictation = "The cache stores the value, then the cache invalidation clears the cache, and the cache reloads the value from the cache after the cache miss occurs repeatedly.";
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: dictation.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "The cache value miss the reloads cache the value miss reloads cache the value miss reloads.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a stolen-word loop must never reach the merge model, whatever its vocabulary size"
+    );
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(decision.transcript.0, dictation);
+    let reason = decision.fallback_reason.expect("gate records a fallback reason");
+    assert!(reason.contains("catastrophically divergent"), "{reason}");
+}
+
+#[tokio::test]
+async fn pure_nonsense_repetition_loop_loses_to_accurate_speech() {
+    // Round-6 finding 3: a relentless loop of five nonsense words, none of them
+    // confirmed by the other source, used to WIN gated selection because its
+    // non-adjacent repetitions faked topical cohesion (scoring 5 against the
+    // accurate transcript's 0). A repetition loop with zero cross-source
+    // support is garbage; the accurate speech must be delivered.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+
+    let accurate = "The migration script renames the billing column, updates the foreign keys, and rewrites the index before the deploy finishes.";
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: accurate.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Flurbo zintak merp quavel dringle flurbo zintak merp quavel dringle flurbo zintak merp quavel dringle.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the pair must be gated, not merged");
+    assert_eq!(
+        decision.selection,
+        TranscriptSelection::SourceDeepgram,
+        "a zero-confirmation repetition loop must never be delivered over accurate speech"
+    );
+    assert_eq!(decision.transcript.0, accurate);
+}
+
+#[tokio::test]
+async fn gate_decision_is_stable_under_provider_position_swap() {
+    // Round-6 finding 4: greedy phonetic alignment traversed the Deepgram
+    // vocabulary first, so this pair scored 0.4 in one provider order and 0.6
+    // in the other — crossing the gate threshold, meaning WHICH provider held
+    // which text decided whether the pair was merged. Matching must be
+    // symmetric by construction: both orders must make the same gate decision
+    // (here: enough phonetic agreement, so both reconcile).
+    let texts = [
+        "The brand jumbo plank swift wizard.",
+        "The blank frond octopus quench shift.",
+    ];
+    let mut outcomes = Vec::new();
+    for (deepgram, groq) in [(texts[0], texts[1]), (texts[1], texts[0])] {
+        let kinds = Arc::new(Mutex::new(Vec::new()));
+        let mut pipeline = TranscriptDecisionPipeline::new(
+            SuccessfulModel {
+                kinds: Arc::clone(&kinds),
+                text: "The blank front octopus quenched shift.".to_owned(),
+            },
+            Duration::from_millis(50),
+        );
+        let decision = pipeline
+            .decide(vec![
+                SourceTranscript {
+                    provider: Provider::Deepgram,
+                    text: deepgram.to_owned(),
+                },
+                SourceTranscript {
+                    provider: Provider::Groq,
+                    text: groq.to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
+        outcomes.push((decision.selection, decision.reconciliation_requested));
+    }
+
+    assert_eq!(
+        outcomes[0], outcomes[1],
+        "swapping which provider carried which text must not change the gate decision"
+    );
+    assert_eq!(
+        outcomes[0],
+        (TranscriptSelection::Reconciled, true),
+        "phonetically aligned vocabularies are the merge's job in BOTH provider orders"
+    );
 }
 
 #[tokio::test]
