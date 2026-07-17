@@ -1,3 +1,4 @@
+pub mod dictionary;
 pub mod feedback;
 mod process;
 pub mod overlay;
