@@ -233,3 +233,18 @@ and exits 1 silently instead of dying by the signal (so a nonzero exit is accept
 the interrupt and stderr is empty; a capture already dead before stop still fails and never delivers). The
 alternative — keeping strict status contracts and wrapping the tools — was rejected because the tools' real shapes
 ARE the boundary contract; realistic test fakes now encode them.
+
+## 2026-07-17 — Keep the Overlay on GTK4 + gtk4-layer-shell; do not migrate to Electron
+**Why:** Evidence review (two parallel research agents: HyprVox's Electron overlay + web research on
+KWin/Wayland). For Voisu's constraints — a click-through, layer-anchored, disposable capsule on KDE/KWin,
+shipped as a lightweight RPM subpackage, driven by the Rust daemon — GTK4 is the only option that can
+request a real `zwlr_layer_shell_v1` surface from KWin (default `keyboard_interactivity=none`, empty input
+region for click-through), adds ~70KB on top of already-present GTK, and stays in one native Rust process
+via gtk4-rs. Electron/Chromium has no layer-shell support on Wayland (`setAlwaysOnTop` is a no-op,
+positioning broken), forcing a non-scriptable WM-rule hack + a 150–400MB Chromium runtime + a cross-process
+JS bridge to the Rust daemon. HyprVox chose Electron, but only via forced XWayland self-positioning +
+Hyprland-specific window rules and a rich React/canvas waveform — context that does not transfer to Voisu.
+Rejected: an Electron migration, which would be a rewrite away from the correct architecture. Full weighted
+comparison in the 2026-07-17 session log. This affirms ADR-0003's daemon/Overlay split rather than reversing
+it; promote to a dedicated ADR only if the toolkit floor (min KWin/Plasma version for layer-shell) needs to
+be pinned as a hard dependency.
