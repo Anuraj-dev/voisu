@@ -1274,12 +1274,8 @@ impl AudioCapture for PipeWireCapture {
         let stderr_reader = thread::spawn(move || {
             read_capped(&mut stderr, MAX_RETAINED_STDERR_BYTES).unwrap_or_default()
         });
-        let deadline = std::env::var("VOISU_RECORDING_DEADLINE_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(Duration::from_millis)
-            .filter(|value| !value.is_zero())
-            .unwrap_or(Duration::from_secs(60));
+        let deadline =
+            resolve_recording_deadline(std::env::var("VOISU_RECORDING_DEADLINE_MS").ok());
         Ok(Box::new(PipeWireActiveCapture {
             child: Some(child),
             state,
@@ -1290,6 +1286,23 @@ impl AudioCapture for PipeWireCapture {
             deadline,
         }))
     }
+}
+
+/// Default ceiling on a single Recording before the Recording Deadline stops
+/// it. Recordings routinely run past two minutes (the provider chunking path
+/// exists for exactly those), so the default must be generous; a stuck or
+/// forgotten Recording is still bounded. `VOISU_RECORDING_DEADLINE_MS`
+/// overrides it, and a zero override falls back to this default.
+const DEFAULT_RECORDING_DEADLINE: Duration = Duration::from_secs(600);
+
+/// Resolve the Recording Deadline from the raw `VOISU_RECORDING_DEADLINE_MS`
+/// value. A parseable, non-zero millisecond count wins; anything else — absent,
+/// unparseable, or zero — uses [`DEFAULT_RECORDING_DEADLINE`].
+fn resolve_recording_deadline(raw: Option<String>) -> Duration {
+    raw.and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .filter(|value| !value.is_zero())
+        .unwrap_or(DEFAULT_RECORDING_DEADLINE)
 }
 
 struct PipeWireActiveCapture {
@@ -4080,6 +4093,27 @@ mod tests {
 
         assert_eq!(us.control, dvorak.control);
         assert_ne!(us.paste, dvorak.paste);
+    }
+
+    #[test]
+    fn recording_deadline_defaults_to_ten_minutes_and_survives_past_sixty_seconds() {
+        // With no override the Recording Deadline must be generous enough that a
+        // routine multi-minute Recording is never killed. Sixty seconds was the
+        // old, wrong default that discarded audio before providers ever saw it.
+        let default = resolve_recording_deadline(None);
+        assert_eq!(default, Duration::from_secs(600));
+        assert!(
+            default > Duration::from_secs(60),
+            "default Recording Deadline must not kill a >60s Recording"
+        );
+
+        // A parseable, non-zero override still wins; junk and zero fall back.
+        assert_eq!(
+            resolve_recording_deadline(Some("5000".to_owned())),
+            Duration::from_millis(5000)
+        );
+        assert_eq!(resolve_recording_deadline(Some("0".to_owned())), default);
+        assert_eq!(resolve_recording_deadline(Some("nonsense".to_owned())), default);
     }
 
     #[test]
