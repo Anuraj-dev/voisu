@@ -163,6 +163,38 @@ fn provider_failures_are_retained_and_surfaced_in_history() {
 }
 
 #[test]
+fn export_structurally_scrubs_url_secrets_not_derived_from_secret_env_keys() {
+    // Finding 5: a failure diagnostic echoes a signed provider URL whose secret
+    // (userinfo + token query) comes from a NON-secret-named env key
+    // (VOISU_DEEPGRAM_TRANSCRIPTION_URL). Name-based value scrubbing never sees
+    // it, so export must strip URL userinfo and query/fragment structurally.
+    let mut record = record_at(1, unix_millis_now());
+    record.provider_failures = vec![ProviderFailure::new(
+        Provider::Deepgram,
+        ProviderFailureStage::Completion,
+        "POST https://user:hunter2@api.deepgram.test/v1/listen?token=abc123 failed".to_owned(),
+    )];
+    // The URL env key is NOT classified secret by name (no API_KEY/TOKEN marker).
+    let environment = vec![(
+        "VOISU_DEEPGRAM_TRANSCRIPTION_URL".to_owned(),
+        "https://api.deepgram.test/v1/listen".to_owned(),
+    )];
+    let export = export_record(record, environment);
+    let encoded = serde_json::to_string(&export).unwrap();
+    assert!(!encoded.contains("hunter2"), "URL userinfo must be stripped: {encoded}");
+    assert!(!encoded.contains("token=abc123"), "URL query secret must be stripped: {encoded}");
+    assert!(
+        encoded.contains("https://api.deepgram.test/v1/listen"),
+        "the non-secret host and path are preserved: {encoded}"
+    );
+    // The standalone scrubber is directly exercised too.
+    assert_eq!(
+        voisu_core::scrub_embedded_urls("see https://a:b@h.test/p?t=1 now"),
+        "see https://h.test/p now"
+    );
+}
+
+#[test]
 fn export_scrubs_secret_values_from_provider_failure_diagnostics() {
     // A provider's boundary diagnostic can echo a secret (a signed URL, a header
     // value). Export must scrub it like every other free-form string.

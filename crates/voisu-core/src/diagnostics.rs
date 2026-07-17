@@ -440,6 +440,68 @@ pub fn scrub_secret_values(text: &str, secrets: &[String]) -> String {
     scrubbed
 }
 
+/// Strips userinfo credentials and the entire query/fragment from a single
+/// `http(s)://` URL token, keeping only scheme, host, and path. A boundary
+/// diagnostic can echo a signed provider URL (`https://user:pw@host/listen?token=abc`)
+/// whose secret does NOT come from any environment variable, so name-based
+/// secret scrubbing never sees it — this removes it structurally instead.
+fn strip_url_secrets(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    // Drop query and fragment wholesale: token-bearing parameters live there.
+    let core = rest.split(['?', '#']).next().unwrap_or("");
+    let (authority, path) = match core.split_once('/') {
+        Some((authority, path)) => (authority, Some(path)),
+        None => (core, None),
+    };
+    // Drop any `user:password@` userinfo prefix.
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    match path {
+        Some(path) => format!("{scheme}://{host}/{path}"),
+        None => format!("{scheme}://{host}"),
+    }
+}
+
+/// Structurally scrubs every `http(s)://` URL embedded in a free-form string of
+/// its userinfo credentials and query/fragment secrets, preserving all
+/// surrounding text. This defends against secrets that reach a diagnostic
+/// through a URL rather than through a secret-named environment variable.
+pub fn scrub_embedded_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let next = rest.find("http").filter(|&index| {
+            rest[index..].starts_with("http://") || rest[index..].starts_with("https://")
+        });
+        match next {
+            Some(index) => {
+                out.push_str(&rest[..index]);
+                let tail = &rest[index..];
+                // A URL token runs until the first whitespace.
+                let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+                out.push_str(&strip_url_secrets(&tail[..end]));
+                rest = &tail[end..];
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Applies both scrubbing passes to a free-form string: known secret VALUES
+/// (from secret-named environment variables) and structural URL secrets
+/// (userinfo, query/fragment) that no name-based rule would catch.
+fn scrub_free_text(text: &str, secrets: &[String]) -> String {
+    scrub_embedded_urls(&scrub_secret_values(text, secrets))
+}
+
 fn secret_values(vars: &[(String, String)]) -> Vec<String> {
     // Every non-empty secret value is scrubbed: credentials have no minimum
     // length, so even a one-character value must never survive an export.
@@ -461,20 +523,20 @@ pub fn export_record(
     let secrets = secret_values(&vars);
     let mut record = record;
     for source in &mut record.source_transcripts {
-        source.text = scrub_secret_values(&source.text, &secrets);
+        source.text = scrub_free_text(&source.text, &secrets);
     }
     record.final_transcript = record
         .final_transcript
-        .map(|text| scrub_secret_values(&text, &secrets));
+        .map(|text| scrub_free_text(&text, &secrets));
     record.validation_reason = record
         .validation_reason
-        .map(|text| scrub_secret_values(&text, &secrets));
+        .map(|text| scrub_free_text(&text, &secrets));
     record.fallback_reason = record
         .fallback_reason
-        .map(|text| scrub_secret_values(&text, &secrets));
-    record.error = record.error.map(|text| scrub_secret_values(&text, &secrets));
+        .map(|text| scrub_free_text(&text, &secrets));
+    record.error = record.error.map(|text| scrub_free_text(&text, &secrets));
     for failure in &mut record.provider_failures {
-        failure.diagnostic = scrub_secret_values(&failure.diagnostic, &secrets);
+        failure.diagnostic = scrub_free_text(&failure.diagnostic, &secrets);
     }
     DiagnosticExport {
         record,

@@ -5571,6 +5571,106 @@ fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
 }
 
 #[test]
+fn partial_provider_completion_failure_is_recorded_in_history() {
+    // Deepgram succeeds and delivers; Groq fails completion. The failure must be
+    // PERSISTED in history (not merely returned in live evidence). Deleting the
+    // daemon's `record.provider_failures = provider_failures` assignment makes
+    // this assertion fail — it discriminates end-to-end persistence.
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_PROVIDER_COMPLETE_FAILURE", "groq"),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Ship the release on Friday."),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "the surviving provider still delivers: {stopped}");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"].as_array().expect("history is a list")[0];
+    let failures = record["provider_failures"]
+        .as_array()
+        .expect("a failed provider must be recorded even when the other succeeds");
+    assert_eq!(failures.len(), 1, "exactly the failed provider is recorded: {record}");
+    assert_eq!(failures[0]["provider"], "groq");
+    assert_eq!(failures[0]["stage"], "completion");
+    assert!(failures[0]["diagnostic"].is_string(), "the boundary diagnostic is retained");
+
+    let _ = daemon.terminate_and_stderr();
+}
+
+#[test]
+fn all_providers_failing_records_every_failure_in_history() {
+    // No provider produces a Source Transcript. The Recording is rejected, but
+    // history must still show BOTH providers' failures rather than a bare,
+    // source-less error (the silent-absence regression this fixes).
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_PROVIDER_COMPLETE_FAILURE", "both")],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], false, "no Source Transcript was produced: {stopped}");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"].as_array().expect("history is a list")[0];
+    let failures = record["provider_failures"]
+        .as_array()
+        .expect("both providers' failures must be recorded even with no source");
+    assert_eq!(failures.len(), 2, "{record}");
+    let providers: Vec<&str> = failures
+        .iter()
+        .map(|failure| failure["provider"].as_str().unwrap())
+        .collect();
+    assert!(providers.contains(&"deepgram") && providers.contains(&"groq"), "{record}");
+    assert!(failures.iter().all(|failure| failure["stage"] == "completion"), "{record}");
+
+    let _ = daemon.terminate_and_stderr();
+}
+
+#[test]
+fn provider_start_failure_records_a_not_started_failure_in_history() {
+    // A provider whose start() fails never began. History must attribute the
+    // absence to that provider as a not_started failure, not just a generic
+    // public error.
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_PROVIDER_START_FAILURE", "1")],
+    );
+
+    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    assert_eq!(started["ok"], false, "{started}");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        let found = history["history"].as_array().unwrap().iter().any(|record| {
+            record["provider_failures"]
+                .as_array()
+                .is_some_and(|failures| {
+                    failures.iter().any(|failure| {
+                        failure["provider"] == "groq" && failure["stage"] == "not_started"
+                    })
+                })
+        });
+        if found {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a provider start failure must record a not_started failure: {history}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn export_of_an_unknown_correlation_id_is_rejected() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start(runtime.path());

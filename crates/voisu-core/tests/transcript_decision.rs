@@ -209,7 +209,9 @@ async fn catastrophically_divergent_sources_select_better_source_without_merging
         .decide(vec![
             SourceTranscript {
                 provider: Provider::Deepgram,
-                text: "So yeah um the thing over there and then you know it kind of goes around before after that we were saying about the weather today outside near people.".to_owned(),
+                // Context-free 1 s slices produce a disfluent, filler- and
+                // function-word-dominated salad with almost no coherent content.
+                text: "So the the it's like you know a a promise the it's kind of um the thing you know so and then the the it and so the you know the.".to_owned(),
             },
             SourceTranscript {
                 provider: Provider::Groq,
@@ -226,8 +228,10 @@ async fn catastrophically_divergent_sources_select_better_source_without_merging
     assert!(!decision.recovery_attempted);
     let reason = decision.fallback_reason.expect("gate records a fallback reason");
     assert!(
-        reason.contains("catastrophically divergent") && reason.contains("token overlap"),
-        "fallback reason must explain the gate: {reason}"
+        reason.contains("catastrophically divergent")
+            && reason.contains("intra-source quality")
+            && reason.contains("Groq"),
+        "fallback reason must ground the selection in a real quality signal: {reason}"
     );
 }
 
@@ -264,6 +268,76 @@ async fn a_fragment_source_is_gated_by_length_ratio_not_merged() {
     assert_eq!(decision.transcript.0, groq);
     let reason = decision.fallback_reason.expect("gate records a fallback reason");
     assert!(reason.contains("length ratio"), "reason must cite length ratio: {reason}");
+}
+
+#[tokio::test]
+async fn common_word_repetition_salad_is_gated_not_merged() {
+    // Adversarial (finding 3): a longer salad that loops common function words
+    // (the/and/to/is) shares them with the good source and carries almost no
+    // content, so a raw-token overlap check would wave it through. The degeneracy
+    // signal (low lexical diversity, near-zero content words) must still catch it
+    // and select the healthy source without merging.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+
+    let groq = "The async function returns a promise that resolves to a JSON payload. We deserialize it with serde, match on the enum variant, and propagate errors using the question mark operator.";
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "the the and to is the and to the is and the to and is the the and to is the and.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: groq.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "a common-word salad must not be merged");
+    assert_eq!(decision.selection, TranscriptSelection::SourceGroq);
+    assert_eq!(decision.transcript.0, groq);
+}
+
+#[tokio::test]
+async fn divergent_but_equally_healthy_sources_degrade_to_the_merge() {
+    // Finding 4: the two sources disagree wildly (near-zero content overlap) but
+    // are BOTH fluent and healthy — one is accurate, the other fluent nonsense.
+    // Cheap heuristics cannot tell which is garbage, so the gate must decline and
+    // let the reconciliation model decide rather than force a fixed provider.
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::clone(&kinds),
+            text: "The async function returns a promise that resolves to a JSON payload.".to_owned(),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "The async function returns a promise that resolves to a JSON payload and we deserialize it with serde before matching the enum variant.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "The synchronous method throws an exception that maps to a binary blob, we serialize it via config, branch on the boolean flag, and swallow failures with a silent guard.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::Reconciled);
+    assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
+    assert!(decision.reconciliation_requested);
+    assert!(decision.fallback_reason.is_none());
 }
 
 #[tokio::test]
