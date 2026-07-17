@@ -5634,10 +5634,10 @@ fn all_providers_failing_records_every_failure_in_history() {
 }
 
 #[test]
-fn provider_start_failure_records_a_not_started_failure_in_history() {
-    // A provider whose start() fails never began. History must attribute the
-    // absence to that provider as a not_started failure, not just a generic
-    // public error.
+fn provider_start_failure_records_both_providers_in_history() {
+    // Finding 4: Groq's start() fails AFTER Deepgram's started. Both providers
+    // must end with an entry — Groq not_started, and the torn-down Deepgram
+    // aborted — never a bare error with a silent absence for either.
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start_with_env(
         runtime.path(),
@@ -5654,9 +5654,13 @@ fn provider_start_failure_records_a_not_started_failure_in_history() {
             record["provider_failures"]
                 .as_array()
                 .is_some_and(|failures| {
-                    failures.iter().any(|failure| {
+                    let groq = failures.iter().any(|failure| {
                         failure["provider"] == "groq" && failure["stage"] == "not_started"
-                    })
+                    });
+                    let deepgram = failures.iter().any(|failure| {
+                        failure["provider"] == "deepgram" && failure["stage"] == "aborted"
+                    });
+                    groq && deepgram
                 })
         });
         if found {
@@ -5664,10 +5668,39 @@ fn provider_start_failure_records_a_not_started_failure_in_history() {
         }
         assert!(
             Instant::now() < deadline,
-            "a provider start failure must record a not_started failure: {history}"
+            "both providers must be recorded on a start failure: {history}"
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn capture_finalization_failure_records_all_providers_in_history() {
+    // Finding 4: when capture finalization fails, no completion runs, yet both
+    // providers were started. History must record each as aborted rather than
+    // leaving an empty provider-failure list on the abort exit path.
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_CAPTURE_FINISH_FAILURE", "1")],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], false, "capture finalization failed: {stopped}");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"].as_array().expect("history is a list")[0];
+    let failures = record["provider_failures"]
+        .as_array()
+        .expect("both providers must be accounted for on a capture abort");
+    let providers: Vec<&str> = failures
+        .iter()
+        .map(|failure| failure["provider"].as_str().unwrap())
+        .collect();
+    assert!(providers.contains(&"deepgram") && providers.contains(&"groq"), "{record}");
+    assert!(failures.iter().all(|failure| failure["stage"] == "aborted"), "{record}");
+
+    let _ = daemon.terminate_and_stderr();
 }
 
 #[test]

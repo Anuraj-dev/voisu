@@ -410,6 +410,51 @@ async fn stream_audio_attributes_a_streaming_failure_to_the_failing_provider() {
     assert_eq!(failures[0].diagnostic, "deepgram websocket dropped");
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_loser_cleanup_failure_does_not_erase_the_winner_transcript() {
+    // Finding 3: Deepgram succeeds; Groq misses the Provider Deadline AND its
+    // abort times out. The cleanup failure of the loser must NOT discard the
+    // winner — the completion returns Deepgram's Source Transcript, with Groq's
+    // deadline absence (annotated with the cleanup failure) recorded.
+    let completion = ProviderCoordinator::start(
+        Duration::from_millis(50),
+        Duration::from_millis(50),
+        ProviderStreams {
+            deepgram: Box::new(ControlledStream {
+                provider: Provider::Deepgram,
+                delay: Duration::from_millis(1),
+                completions: Arc::new(AtomicUsize::new(0)),
+                chunks: Arc::new(AtomicUsize::new(0)),
+                aborts: Arc::new(AtomicUsize::new(0)),
+                abort_delay: Duration::ZERO,
+            }),
+            groq: Box::new(ControlledStream {
+                provider: Provider::Groq,
+                delay: Duration::from_secs(30),
+                completions: Arc::new(AtomicUsize::new(0)),
+                chunks: Arc::new(AtomicUsize::new(0)),
+                aborts: Arc::new(AtomicUsize::new(0)),
+                abort_delay: Duration::from_secs(30),
+            }),
+        },
+    )
+    .complete_with_timings(CapturedAudio::empty())
+    .await
+    .expect("a winner must survive a loser's cleanup failure");
+
+    assert_eq!(completion.sources.len(), 1);
+    assert_eq!(completion.sources[0].provider, Provider::Deepgram);
+    assert_eq!(completion.provider_failures.len(), 1);
+    let failure = &completion.provider_failures[0];
+    assert_eq!(failure.provider, Provider::Groq);
+    assert_eq!(failure.stage, ProviderFailureStage::ProviderDeadline);
+    assert!(
+        failure.diagnostic.contains("cleanup failed"),
+        "the loser's cleanup failure is recorded, not swallowed: {}",
+        failure.diagnostic
+    );
+}
+
 #[tokio::test]
 async fn both_providers_succeeding_records_no_failures() {
     let completion = ProviderCoordinator::start(

@@ -466,28 +466,37 @@ fn strip_url_secrets(url: &str) -> String {
     }
 }
 
-/// Structurally scrubs every `http(s)://` URL embedded in a free-form string of
-/// its userinfo credentials and query/fragment secrets, preserving all
-/// surrounding text. This defends against secrets that reach a diagnostic
-/// through a URL rather than through a secret-named environment variable.
+/// Structurally scrubs every URL embedded in a free-form string of its userinfo
+/// credentials and query/fragment secrets, preserving all surrounding text. This
+/// defends against secrets that reach a diagnostic through a URL rather than
+/// through a secret-named environment variable. It scans EVERY occurrence
+/// case-insensitively (so a non-URL `"httpStatus"` never masks a later signed
+/// URL, and `HTTPS://` is caught) and covers websocket schemes (`ws`/`wss`),
+/// which Deepgram's streaming endpoint uses.
 pub fn scrub_embedded_urls(text: &str) -> String {
+    const SCHEMES: [&str; 4] = ["http://", "https://", "ws://", "wss://"];
+    // A lowercased copy for case-insensitive matching. ASCII lowercasing never
+    // changes byte length, and the schemes are ASCII, so offsets map back to the
+    // original text at char boundaries.
+    let lower = text.to_ascii_lowercase();
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while !rest.is_empty() {
-        let next = rest.find("http").filter(|&index| {
-            rest[index..].starts_with("http://") || rest[index..].starts_with("https://")
-        });
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let next = SCHEMES
+            .iter()
+            .filter_map(|scheme| lower[cursor..].find(scheme).map(|offset| cursor + offset))
+            .min();
         match next {
-            Some(index) => {
-                out.push_str(&rest[..index]);
-                let tail = &rest[index..];
+            Some(start) => {
+                out.push_str(&text[cursor..start]);
+                let tail = &text[start..];
                 // A URL token runs until the first whitespace.
                 let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
-                out.push_str(&strip_url_secrets(&tail[..end]));
-                rest = &tail[end..];
+                out.push_str(&strip_url_secrets(&text[start..start + end]));
+                cursor = start + end;
             }
             None => {
-                out.push_str(rest);
+                out.push_str(&text[cursor..]);
                 break;
             }
         }
@@ -535,6 +544,9 @@ pub fn export_record(
         .fallback_reason
         .map(|text| scrub_free_text(&text, &secrets));
     record.error = record.error.map(|text| scrub_free_text(&text, &secrets));
+    record.delivery_fallback_reason = record
+        .delivery_fallback_reason
+        .map(|text| scrub_free_text(&text, &secrets));
     for failure in &mut record.provider_failures {
         failure.diagnostic = scrub_free_text(&failure.diagnostic, &secrets);
     }

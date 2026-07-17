@@ -195,6 +195,42 @@ fn export_structurally_scrubs_url_secrets_not_derived_from_secret_env_keys() {
 }
 
 #[test]
+fn url_scrubbing_handles_nested_json_uppercase_and_websocket_schemes() {
+    use voisu_core::scrub_embedded_urls;
+    // Finding 5: a non-URL "http" substring earlier in the text must NOT stop
+    // the scan and mask a later signed URL.
+    let nested = scrub_embedded_urls(
+        r#"{"httpStatus":500,"url":"https://user:hunter2@h.test/listen?token=abc"}"#,
+    );
+    assert!(!nested.contains("hunter2"), "later URL must still be scrubbed: {nested}");
+    assert!(!nested.contains("token=abc"), "{nested}");
+    assert!(nested.contains("https://h.test/listen"), "host/path preserved: {nested}");
+    // Uppercase scheme is caught.
+    assert!(!scrub_embedded_urls("HTTPS://user:pw@h.test/x").contains("pw"));
+    // Websocket schemes (Deepgram streaming) are caught.
+    let ws = scrub_embedded_urls("connect wss://user:pw@stream.test/v1?token=xyz then go");
+    assert!(!ws.contains("pw") && !ws.contains("token=xyz"), "{ws}");
+    assert!(ws.contains("wss://stream.test/v1"), "{ws}");
+}
+
+#[test]
+fn export_scrubs_secret_values_from_the_delivery_fallback_reason() {
+    // Finding 6: delivery_fallback_reason is a free-form exported string (a
+    // clipboard/xkbcommon fallback message) and must be scrubbed like the rest.
+    let mut record = record_at(1, unix_millis_now());
+    record.delivery_fallback_reason =
+        Some("clipboard fallback: key sk-live-hostile-123 rejected".to_owned());
+    let environment = vec![("VOISU_GROQ_API_KEY".to_owned(), "sk-live-hostile-123".to_owned())];
+    let export = export_record(record, environment);
+    let encoded = serde_json::to_string(&export).unwrap();
+    assert!(
+        !encoded.contains("sk-live-hostile-123"),
+        "a secret in delivery_fallback_reason must be scrubbed: {encoded}"
+    );
+    assert!(encoded.contains(REDACTED));
+}
+
+#[test]
 fn export_scrubs_secret_values_from_provider_failure_diagnostics() {
     // A provider's boundary diagnostic can echo a secret (a signed URL, a header
     // value). Export must scrub it like every other free-form string.

@@ -52,6 +52,25 @@ struct CandidateThenRepairModel {
     candidate: String,
 }
 
+struct FailingReconcileModel;
+
+impl ReconciliationModel for FailingReconcileModel {
+    fn request(
+        &mut self,
+        _kind: ReconciliationKind,
+        _sources: Vec<SourceTranscript>,
+        _candidate: Option<MergeResult>,
+        _cancel: Arc<CancelRegistry>,
+    ) -> BoundaryFuture<'_, MergeResult> {
+        Box::pin(async {
+            Err(BoundaryError::new(
+                BoundaryKind::Validation,
+                "cloud reconciliation unavailable",
+            ))
+        })
+    }
+}
+
 struct AlwaysUnsafeModel;
 
 impl ReconciliationModel for AlwaysUnsafeModel {
@@ -228,10 +247,8 @@ async fn catastrophically_divergent_sources_select_better_source_without_merging
     assert!(!decision.recovery_attempted);
     let reason = decision.fallback_reason.expect("gate records a fallback reason");
     assert!(
-        reason.contains("catastrophically divergent")
-            && reason.contains("intra-source quality")
-            && reason.contains("Groq"),
-        "fallback reason must ground the selection in a real quality signal: {reason}"
+        reason.contains("catastrophically divergent") && reason.contains("degenerate"),
+        "fallback reason must ground the selection in a real garbage signal: {reason}"
     );
 }
 
@@ -268,6 +285,104 @@ async fn a_fragment_source_is_gated_by_length_ratio_not_merged() {
     assert_eq!(decision.transcript.0, groq);
     let reason = decision.fallback_reason.expect("gate records a fallback reason");
     assert!(reason.contains("length ratio"), "reason must cite length ratio: {reason}");
+}
+
+#[tokio::test]
+async fn clean_source_fallback_selects_by_quality_not_a_fixed_provider() {
+    // Finding 1: two coherent sources disagree (so they reconcile, not gate),
+    // reconciliation then FAILS, and the clean-source fallback must select the
+    // higher-quality source — here the content-rich Deepgram source — NOT Groq
+    // by a fixed max-provider preference.
+    let mut pipeline =
+        TranscriptDecisionPipeline::new(FailingReconcileModel, Duration::from_millis(50));
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Deploy the Kubernetes cluster with twelve worker nodes and sixty four gigabytes of memory per node for the production workload.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "We should probably move the meeting to another day and tell the whole team about the schedule change fairly soon.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        decision.selection,
+        TranscriptSelection::SourceDeepgram,
+        "the higher-quality source must win the fallback, not Groq by provider order"
+    );
+    assert!(decision.reconciliation_requested);
+    assert!(decision.fallback_reason.unwrap().contains("cloud reconciliation failed"));
+}
+
+#[tokio::test]
+async fn unique_word_salad_does_not_beat_repetitive_technical_dictation() {
+    // Finding 2: accurate dictation that repeats a real content word ("cache")
+    // must NOT lose to a grammatical all-unique-word salad. Both are coherent
+    // (neither degenerate), so the gate must decline and reconcile rather than
+    // deliver the salad without a merge (the old type-token-ratio score let the
+    // unique salad win outright).
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::clone(&kinds),
+            text: "The cache stores the value.".to_owned(),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "The cache stores the value, then the cache invalidation clears the cache, and the cache reloads the value from the cache after the cache miss occurs repeatedly.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Purple mountains dance quietly beneath the whispering violet clouds while seven curious otters juggle glowing lanterns across the frozen meadow tonight forever.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::Reconciled);
+    assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
+}
+
+#[tokio::test]
+async fn legitimate_repetitive_jargon_is_not_flagged_degenerate() {
+    // Finding 2: jargon-heavy dictation that repeats real terms ("kubelet",
+    // "pod") must not be mistaken for a degenerate loop and gated away. Paired
+    // with a different coherent source, it must reconcile.
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::clone(&kinds),
+            text: "The kubelet restarts the pod.".to_owned(),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "The kubelet restarts the pod and the scheduler reschedules the pod onto another node when the kubelet probe fails repeatedly.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Redis stores the session token until the gateway validates the request and forwards it to the upstream service pool.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::Reconciled);
+    assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
 }
 
 #[tokio::test]

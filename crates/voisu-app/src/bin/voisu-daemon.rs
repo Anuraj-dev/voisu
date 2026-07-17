@@ -634,6 +634,15 @@ async fn actor_loop(
                             let mut record = DiagnosticRecord::new(correlation.clone(), id);
                             record.error = Some("daemon is shutting down".to_owned());
                             record.recovery_attempted = true;
+                            // Both provider streams started here and are torn down
+                            // without producing a Source Transcript: record each
+                            // as Aborted so shutdown-during-start is never a
+                            // silent absence.
+                            account_for_missing_providers(
+                                &record.source_transcripts,
+                                &mut record.provider_failures,
+                                "daemon shutting down; Recording aborted during startup",
+                            );
                             if let Err(error) = diagnostics.record(record) {
                                 eprintln!(
                                     "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
@@ -750,14 +759,27 @@ async fn actor_loop(
                                 Some(failure.error.public_message().to_owned());
                             record.recovery_attempted = recovering;
                             // A provider whose start() failed never began: record
-                            // its absence as a NotStarted failure so history is
-                            // never a bare error with no attributed provider.
+                            // it NotStarted. Any provider that DID start before
+                            // the failure (e.g. Deepgram when Groq start fails) is
+                            // torn down without a Source Transcript, so record it
+                            // Aborted. Every configured provider ends with an
+                            // entry — no bare error with a silent absence.
                             if let Some(provider) = failure.failed_provider {
-                                record.provider_failures = vec![ProviderFailure::new(
+                                record.provider_failures.push(ProviderFailure::new(
                                     provider,
                                     ProviderFailureStage::NotStarted,
                                     failure.error.diagnostic().to_owned(),
-                                )];
+                                ));
+                                let started = failure.provider_stream.is_some();
+                                account_for_missing_providers(
+                                    &record.source_transcripts,
+                                    &mut record.provider_failures,
+                                    if started {
+                                        "provider stream started but the Recording was aborted during startup"
+                                    } else {
+                                        "provider not reached; startup aborted before it began"
+                                    },
+                                );
                             }
                             if let Err(error) = diagnostics.record(record) {
                                 eprintln!(
@@ -1424,10 +1446,15 @@ async fn process_recording(
     // deadline cleanup failed), the coordinator attached the per-provider
     // failure evidence to the error rather than to a ProviderCompletion. Recover
     // it here so history shows each provider's absence instead of a bare error.
-    if provider_failures.is_empty() {
-        if let Some(error) = result.as_ref().err() {
+    if let Some(error) = result.as_ref().err() {
+        if provider_failures.is_empty() {
             provider_failures = error.provider_failures().to_vec();
         }
+        // Every configured provider must end with EITHER a Source Transcript or
+        // a failure entry. On a capture-abort or a one-sided streaming failure,
+        // the provider(s) that merely got torn down have neither yet, so record
+        // them as Aborted — no silent absence on any exit path.
+        account_for_missing_providers(&source_records, &mut provider_failures, error.diagnostic());
     }
 
     let record = diagnostic_record(
@@ -1461,6 +1488,32 @@ async fn process_recording(
             reply,
         }))
         .await;
+}
+
+/// Enforces the no-silent-absence invariant: every configured provider must end
+/// a Recording with either a Source Transcript or a failure entry. Any provider
+/// with neither (torn down by a capture abort, a shutdown mid-start, or the
+/// other provider's start failure) is recorded as Aborted with the cause.
+fn account_for_missing_providers(
+    source_records: &[SourceTranscriptRecord],
+    provider_failures: &mut Vec<ProviderFailure>,
+    diagnostic: &str,
+) {
+    for provider in [Provider::Deepgram, Provider::Groq] {
+        let has_source = source_records
+            .iter()
+            .any(|source| source.provider == provider);
+        let has_failure = provider_failures
+            .iter()
+            .any(|failure| failure.provider == provider);
+        if !has_source && !has_failure {
+            provider_failures.push(ProviderFailure::new(
+                provider,
+                ProviderFailureStage::Aborted,
+                diagnostic.to_owned(),
+            ));
+        }
+    }
 }
 
 /// Builds the persisted diagnostic record for one completed Recording from its
