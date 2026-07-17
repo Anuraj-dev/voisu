@@ -2,8 +2,9 @@
 
 Voisu is packaged as an RPM for Fedora KDE Plasma on Wayland. The base RPM
 contains `/usr/bin/voisu` and `/usr/bin/voisu-daemon` and is GTK-free. The
-optional `voisu-overlay` subpackage contains `/usr/bin/voisu-overlay` and adds
-GTK4 plus GTK4 Layer Shell runtime dependencies.
+optional `voisu-overlay` subpackage contains `/usr/bin/voisu-overlay`, its
+independent systemd user unit, and GTK4 plus GTK4 Layer Shell runtime
+dependencies.
 
 The base package declares only the boundaries used by the application:
 
@@ -85,11 +86,28 @@ printf '%s\n' "$DEEPGRAM_API_KEY" | voisu auth set deepgram
 voisu auth verify groq
 voisu auth verify deepgram
 voisu service install
-voisu service start                 # immediate start; login start is enabled
+voisu service start                 # immediate daemon start; login start is enabled
 voisu service status
 ```
 
-The packaged user unit is `/usr/lib/systemd/user/voisu.service` and points at
+When the optional subpackage is installed, `voisu service install` also enables
+and immediately starts `/usr/lib/systemd/user/voisu-overlay.service`, after
+confirming systemd's effective fragment and `ExecStart` still resolve to the
+packaged Overlay rather than a user-owned shadow. Run or rerun the command after
+adding `voisu-overlay`; no separate Overlay setup verb is required. Verify the
+independent login-start path with:
+
+```sh
+systemctl --user is-enabled voisu-overlay.service
+systemctl --user is-active voisu-overlay.service
+pgrep -a -x voisu-overlay
+```
+
+The Overlay is hidden at Idle by design. `voisu service start`, `stop`, and
+`restart` continue to manage only the daemon; Overlay management failure is
+reported as a warning and never fails daemon installation or uninstallation.
+
+The packaged daemon user unit is `/usr/lib/systemd/user/voisu.service` and points at
 `/usr/bin/voisu-daemon --systemd`. `voisu service install` asks systemd for the
 unit it would actually run — `systemctl --user show voisu.service -p
 FragmentPath -p ExecStart` — so an administrator override under
@@ -103,10 +121,15 @@ Voisu-managed stale files, reloads systemd, and enables the packaged unit; if th
 effective packaged `ExecStart` binary is missing or untrusted, it clearly falls
 back to the Ticket 09 user-data path instead.
 
+The optional Overlay unit runs `/usr/bin/voisu-overlay --supervise`, is owned by
+`graphical-session.target`, and is ordered after `voisu.service` without
+`Wants=` or `Requires=`. It remains an observer-only process: daemon startup,
+Recording, Transcript production, and Delivery never depend on it.
+
 ## Upgrade and removal
 
-After an RPM upgrade, run the user-owned migration command once if the old
-Ticket 09 installation exists:
+After an RPM upgrade, after adding the optional Overlay subpackage, or when an
+old Ticket 09 installation exists, rerun the user-owned setup command:
 
 ```sh
 sudo dnf upgrade ./dist/rpm/voisu-0.1.0-*.rpm
@@ -126,14 +149,16 @@ unit. User data is preserved:
 
 ```sh
 voisu service uninstall
-sudo dnf remove voisu voisu-overlay
+sudo dnf remove voisu-overlay voisu
 systemctl --user daemon-reload
 ```
 
 `voisu service uninstall` reports that it must run before removing the RPM. It
-disables the packaged service and removes only a stale Ticket 09 shadow. It does
-not remove RPM-owned files. An explicit purge is a separate, destructive user
-action:
+best-effort disables and stops the optional Overlay unit when present, then
+disables the packaged daemon service and removes only a stale Ticket 09 shadow.
+An Overlay failure remains a warning and does not block daemon uninstall. The
+command does not remove RPM-owned files. An explicit purge is a separate,
+destructive user action:
 remove the Voisu state/configuration directories under `XDG_STATE_HOME`,
 `XDG_CONFIG_HOME`, and `XDG_DATA_HOME`, then clear the `voisu-provider` Secret
 Service entries for `groq` and `deepgram` with the user's keyring tool.
