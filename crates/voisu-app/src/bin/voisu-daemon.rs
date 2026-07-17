@@ -393,7 +393,10 @@ async fn actor_loop(
     let mut deepgram: Option<Box<dyn TranscriptProvider>> = Some(if controlled {
         Box::new(ControlledProvider::from_env(Provider::Deepgram))
     } else {
-        Box::new(DeepgramProvider::new(reaper.clone()))
+        Box::new(DeepgramProvider::with_keyterms(
+            reaper.clone(),
+            voisu_app::dictionary::merged_terms(),
+        ))
     });
     let mut groq: Option<Box<dyn TranscriptProvider>> = Some(if controlled {
         Box::new(ControlledProvider::from_env(Provider::Groq))
@@ -1646,7 +1649,10 @@ fn rebuild_replay_adapters(
         )
     } else {
         (
-            Box::new(DeepgramProvider::new(reaper.clone())),
+            Box::new(DeepgramProvider::with_keyterms(
+                reaper.clone(),
+                voisu_app::dictionary::merged_terms(),
+            )),
             Box::new(GroqProvider::new(reaper.clone())),
             Box::new(MergeResultValidator::new()),
         )
