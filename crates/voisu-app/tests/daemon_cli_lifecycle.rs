@@ -374,9 +374,18 @@ fn deepgram_receives_live_audio_during_the_recording_over_the_streaming_websocke
     write_fake_command(
         commands.path(),
         "pw-record",
+        // 64000 bytes of position-derived PCM (a repeating 0..=255 cycle), so
+        // reordering, duplication, or corruption that preserves length still
+        // fails the content assertion below. The full buffer is built FIRST
+        // and emitted with one cat, so the graceful stop can never interrupt
+        // generation mid-way; the ready marker follows the complete emission.
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 64000 /dev/zero | tr '\000' '\001'
+i=0
+while [ "$i" -lt 256 ]; do printf "\\$(printf '%03o' "$i")"; i=$((i + 1)); done > "$dir/pcm-cycle"
+i=0
+while [ "$i" -lt 250 ]; do cat "$dir/pcm-cycle"; i=$((i + 1)); done > "$dir/pcm-full"
+cat "$dir/pcm-full"
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -428,6 +437,9 @@ cat > "$dir/clipboard"
     // Binary PCM frames must reach the websocket DURING the Recording, not
     // only at stop.
     wait_for_marker(commands.path(), "deepgram.ready");
+    // Stop only after the full 64000 bytes were emitted, so the content
+    // assertion below compares against the complete captured Recording.
+    wait_for_marker(commands.path(), "pw-record.ready");
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
 
     let stopped = voisu(runtime.path(), "stop");
@@ -444,12 +456,14 @@ cat > "$dir/clipboard"
     assert!(uri.contains("interim_results=true"), "{uri}");
     assert_eq!(authorization, "Token deepgram-controlled-secret");
     assert!(!handshake.contains("groq-controlled-secret"));
-    // The whole finalized Recording (pw-record emits 64000 PCM bytes) must
-    // arrive as binary frames by CloseStream: live streaming plus the
-    // complete() tail top-up.
+    // The whole finalized Recording (pw-record emits 64000 position-derived
+    // PCM bytes) must arrive as binary frames by CloseStream — byte for byte,
+    // in order: live streaming plus the complete() tail top-up.
+    let expected: Vec<u8> = (0..64000_usize).map(|index| (index % 256) as u8).collect();
     assert_eq!(
-        fs::read_to_string(commands.path().join("deepgram.audio-bytes")).unwrap(),
-        "64000"
+        fs::read(commands.path().join("deepgram.audio")).unwrap(),
+        expected,
+        "the streamed PCM must match the captured Recording byte for byte"
     );
 }
 
@@ -1477,9 +1491,26 @@ fn a_capture_that_dies_silently_before_stop_never_delivers_a_transcript() {
 
     assert!(voisu(runtime.path(), "start").status.success());
     wait_for_marker(commands.path(), "pw-record.ready");
-    let stopped = voisu(runtime.path(), "stop");
-    assert!(!stopped.status.success());
-    let message = stderr(&stopped);
+    // The dead capture's EOF handling races this explicit stop: a single stop
+    // can land while the daemon is mid-Processing of the already-failed
+    // Recording (a legitimate transient — the streaming provider's abort runs
+    // inside it), so retry until the race resolves. The contract under test
+    // is unchanged and fully asserted below: the Recording FAILS, nothing is
+    // ever delivered, and the daemon recovers.
+    let settle_deadline = Instant::now() + Duration::from_secs(5);
+    let message = loop {
+        let stopped = voisu(runtime.path(), "stop");
+        assert!(!stopped.status.success());
+        let message = stderr(&stopped);
+        if message != "Recording is being processed\n" {
+            break message;
+        }
+        assert!(
+            Instant::now() < settle_deadline,
+            "processing a silently dead capture must settle"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
     assert!(
         message == "Recording capture failed\n" || message == "No Recording active\n",
         "a silently dead capture must fail the Recording, got: {message}"
@@ -1864,6 +1895,7 @@ enum MockDeepgramBehavior {
 /// - `deepgram.handshake` — request URI + Authorization header, one per line;
 /// - `deepgram.ready` — written when the first binary audio frame arrives;
 /// - `deepgram.audio-bytes` — running total of binary PCM bytes received;
+/// - `deepgram.audio` — the received binary PCM itself, in arrival order;
 /// - `deepgram.closed` — written when a connection ends.
 fn spawn_mock_deepgram(markers: &Path, behavior: MockDeepgramBehavior) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1909,12 +1941,15 @@ fn serve_mock_deepgram_connection(
     let Ok(mut socket) = accepted else { return };
     fs::write(markers.join("deepgram.handshake"), handshake).unwrap();
     let mut audio_bytes = 0_usize;
+    let mut audio: Vec<u8> = Vec::new();
     let mut error_sent = false;
     loop {
         match socket.read() {
             Ok(Message::Binary(bytes)) => {
                 audio_bytes += bytes.len();
+                audio.extend_from_slice(&bytes);
                 fs::write(markers.join("deepgram.audio-bytes"), audio_bytes.to_string()).unwrap();
+                fs::write(markers.join("deepgram.audio"), &audio).unwrap();
                 fs::write(markers.join("deepgram.ready"), "").unwrap();
                 if matches!(behavior, MockDeepgramBehavior::StreamingError) && !error_sent {
                     error_sent = true;
@@ -1931,6 +1966,11 @@ fn serve_mock_deepgram_connection(
                             r#"{{"type":"Results","is_final":true,"speech_final":true,"channel":{{"alternatives":[{{"transcript":"{transcript}"}}]}}}}"#
                         );
                         let _ = socket.send(Message::Text(results));
+                        // The terminal summary Metadata confirms CloseStream
+                        // was processed; the client requires it before close.
+                        let _ = socket.send(Message::Text(
+                            r#"{"type":"Metadata","request_id":"mock-request"}"#.to_owned(),
+                        ));
                         let _ = socket.send(Message::Close(None));
                         break;
                     }
@@ -2002,6 +2042,22 @@ printf '%s' "$((count + 1))" > "$dir/delivery.count"
             ),
         ],
     )
+}
+
+/// Asserts a marker appears within a tight `bound`, unlike `wait_for_marker`'s
+/// open-ended poll. Used where the marker's cause must ALREADY have happened
+/// (e.g. a websocket close initiated before Idle was published) and only the
+/// cross-thread/loopback observation lag is tolerable — an implementation
+/// that leaves the work running would need the full open-ended wait instead.
+fn assert_marker_appears_within(directory: &Path, name: &str, bound: Duration) {
+    let deadline = Instant::now() + bound;
+    while !directory.join(name).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{name} must appear within {bound:?} — was the websocket still live at Idle?"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 fn wait_for_portal_capture(commands: &Path) {
@@ -3247,9 +3303,11 @@ printf '{"text":"Groq wins"}'
         serde_json::json!(["groq"])
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
-    // The late Deepgram websocket was closed by the gated abort — the
-    // connection must not be left streaming into the next Recording.
-    wait_for_marker(commands.path(), "deepgram.closed");
+    // The gated abort closes the websocket BEFORE the daemon acknowledges and
+    // Idle becomes observable, so at this point the close is already on the
+    // wire: only the mock's cross-thread observation lag is granted, not an
+    // open-ended wait that would also pass over a still-live connection.
+    assert_marker_appears_within(commands.path(), "deepgram.closed", Duration::from_millis(250));
 }
 
 #[test]
@@ -3311,8 +3369,9 @@ printf '{"text":"Groq wins"}'
         serde_json::json!(["groq"])
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
-    // The failed stream's websocket is torn down, not left dangling.
-    wait_for_marker(commands.path(), "deepgram.closed");
+    // The failed stream's websocket is torn down before Idle is observable,
+    // not left dangling; only observation lag is granted.
+    assert_marker_appears_within(commands.path(), "deepgram.closed", Duration::from_millis(250));
 }
 
 #[test]

@@ -54,10 +54,12 @@ const MIN_RECORDING_BYTES: usize = PCM_CHUNK_BYTES;
 const MAX_RECORDING_BYTES: usize = 16_000 * 2 * 60 * 5;
 const GROQ_CHUNK_BYTES: usize = 16_000 * 2 * 30;
 const GROQ_CHUNK_OVERLAP_BYTES: usize = 16_000;
-/// Bounded app-level reconnects for the Deepgram streaming websocket: Deepgram
-/// has no server-side resume, so a dropped connection is redialed at most this
-/// many times before the provider fails visibly and the parallel Groq stream
-/// carries the Recording.
+/// Bounded app-level redials for the Deepgram streaming websocket, covering
+/// ONLY failed dials and connections that dropped before any audio was
+/// delivered on them. Once audio has been accepted by a socket a drop is
+/// unrecoverable (Deepgram has no server-side resume, and unfinalized audio
+/// cannot be replayed), so it fails the provider visibly and the parallel
+/// Groq stream carries the Recording.
 const DEEPGRAM_RECONNECT_ATTEMPTS: usize = 2;
 const DEEPGRAM_RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
 /// Whole-handshake bound (DNS + TCP + TLS + websocket upgrade) for one dial
@@ -72,8 +74,9 @@ const DEEPGRAM_CANCEL_POLL: Duration = Duration::from_millis(100);
 /// long, well under that window.
 const DEEPGRAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// After `CloseStream` is sent, bounded wait for Deepgram to flush the final
-/// `Results` messages and close; the accumulated Transcript is returned even
-/// if the server never closes cleanly.
+/// `Results`, send the terminal summary `Metadata`, and close. A server that
+/// never confirms within this grace fails the provider visibly — returning
+/// the accumulated prefix would deliver a plausible but truncated Transcript.
 const DEEPGRAM_CLOSE_GRACE: Duration = Duration::from_secs(10);
 
 pub struct FedoraReadiness;
@@ -1813,6 +1816,7 @@ impl TranscriptProvider for DeepgramProvider {
             url,
             credential,
             DEEPGRAM_KEEPALIVE_INTERVAL,
+            DEEPGRAM_CLOSE_GRACE,
             self.reaper.clone(),
         )))
     }
@@ -1852,11 +1856,29 @@ fn deepgram_streaming_url(base: &str, keyterms: &[String]) -> Result<String, Bou
     } else {
         base.to_owned()
     };
-    let secure = normalized.starts_with("wss://")
-        || normalized
-            .strip_prefix("ws://")
-            .is_some_and(|rest| authority_is_loopback(rest.split('/').next().unwrap_or_default()));
-    if !secure {
+    let (plaintext, remainder) = if let Some(rest) = normalized.strip_prefix("wss://") {
+        (false, rest)
+    } else if let Some(rest) = normalized.strip_prefix("ws://") {
+        (true, rest)
+    } else {
+        return Err(BoundaryError::new(
+            BoundaryKind::Provider,
+            "Deepgram streaming endpoint must use WSS except on loopback",
+        ));
+    };
+    let authority = remainder.split('/').next().unwrap_or_default();
+    // Reject userinfo outright: `ws://127.0.0.1:80@attacker.example/…` has a
+    // loopback-LOOKING authority prefix but its HOST is attacker.example, and
+    // loopback-checking the raw authority string would send the Token header
+    // there over plaintext. Deepgram auth travels in the Authorization header,
+    // so no legitimate endpoint carries userinfo.
+    if authority.is_empty() || authority.contains('@') {
+        return Err(BoundaryError::new(
+            BoundaryKind::Provider,
+            "Deepgram streaming endpoint authority is invalid",
+        ));
+    }
+    if plaintext && !authority_is_loopback(authority) {
         return Err(BoundaryError::new(
             BoundaryKind::Provider,
             "Deepgram streaming endpoint must use WSS except on loopback",
@@ -1977,6 +1999,7 @@ impl DeepgramStream {
         url: String,
         credential: Credential,
         keepalive: Duration,
+        close_grace: Duration,
         reaper: ProviderReaper,
     ) -> Self {
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1991,6 +2014,7 @@ impl DeepgramStream {
             Arc::clone(&cancel),
             Arc::clone(&shutdown),
             keepalive,
+            close_grace,
         ));
         Self {
             outbound: Some(outbound_tx),
@@ -2042,14 +2066,25 @@ impl ProviderStream for DeepgramStream {
             // notification (the flag backstops a pre-poll race), closes the
             // websocket, and returns. Await it — never abort — through the
             // same front/pop discipline as the chunk tasks, so a drop
-            // mid-await leaves the handle for the reaper.
+            // mid-await leaves the handle for the reaper. If the task had
+            // ALREADY stored a provider failure (server Error, exhausted
+            // dials) before this Recording was aborted for an unrelated
+            // reason, surface it through abort's error channel rather than
+            // discarding it — send_audio deliberately hides the closed
+            // channel, so this is the failure's only remaining exit.
+            // (Limitation: without voisu-core changes this reaches the
+            // recovery-abort diagnostics, not the per-provider history.)
             self.cancel.cancel();
             self.shutdown.notify_waiters();
+            let mut stored_failure = Ok(());
             while let Some(io_task) = self.io_tasks.front_mut() {
-                let _ = io_task.await;
+                let joined = io_task.await;
                 self.io_tasks.pop_front();
+                if let Ok(Err(error)) = joined {
+                    stored_failure = Err(error);
+                }
             }
-            Ok(())
+            stored_failure
         })
     }
 
@@ -2123,6 +2158,7 @@ async fn deepgram_ws_task(
     cancel: Arc<CancelRegistry>,
     shutdown: Arc<tokio::sync::Notify>,
     keepalive: Duration,
+    close_grace: Duration,
 ) -> Result<(), BoundaryError> {
     // Arm the shutdown wakeup before any other await so an abort lands
     // immediately at whichever await point the session loop is parked on —
@@ -2139,6 +2175,7 @@ async fn deepgram_ws_task(
         transcript,
         Arc::clone(&cancel),
         keepalive,
+        close_grace,
     );
     tokio::pin!(sessions);
     if cancel.is_cancelled() {
@@ -2158,9 +2195,13 @@ async fn deepgram_ws_sessions(
     transcript: Arc<Mutex<TranscriptAccumulator>>,
     cancel: Arc<CancelRegistry>,
     keepalive: Duration,
+    close_grace: Duration,
 ) -> Result<(), BoundaryError> {
     let mut reconnects_left = DEEPGRAM_RECONNECT_ATTEMPTS;
     let mut pending: Option<DeepgramOutbound> = None;
+    // Set once any audio frame has been accepted by any socket: from then on
+    // a lost connection is unrecoverable (see DEEPGRAM_RECONNECT_ATTEMPTS).
+    let mut audio_delivered = false;
     loop {
         if cancel.is_cancelled() {
             return Ok(());
@@ -2185,14 +2226,27 @@ async fn deepgram_ws_sessions(
             socket,
             &mut outbound,
             &mut pending,
+            &mut audio_delivered,
             &transcript,
             &cancel,
             keepalive,
+            close_grace,
         )
         .await?
         {
             DeepgramConnectionEnd::Finished => return Ok(()),
             DeepgramConnectionEnd::Lost => {
+                if audio_delivered {
+                    // Audio accepted by the dropped socket but not yet
+                    // finalized cannot be replayed: redialing and continuing
+                    // would return a plausible Transcript with a silent gap.
+                    // Fail visibly; the parallel Groq stream carries the
+                    // Recording (PRD §3.3).
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Provider,
+                        "Deepgram streaming connection lost",
+                    ));
+                }
                 if reconnects_left == 0 {
                     return Err(BoundaryError::new(
                         BoundaryKind::Provider,
@@ -2265,16 +2319,24 @@ async fn deepgram_ws_connect(
 
 /// Drives one websocket connection: forwards outbound audio/control frames,
 /// ingests inbound `Results` into the accumulator, sends `KeepAlive` during
-/// outbound gaps, and observes cancellation on a bounded tick. Returns `Err`
-/// only for fatal server-reported errors; transport drops return
-/// `DeepgramConnectionEnd::Lost` so the caller can redial.
+/// outbound gaps, and observes cancellation on a bounded tick. Marks
+/// `audio_delivered` once any audio frame is accepted by the socket. Returns
+/// `Err` for fatal failures (server-reported errors, malformed frames, an
+/// unconfirmed CloseStream); transport drops return
+/// `DeepgramConnectionEnd::Lost` and the caller decides whether a redial is
+/// safe. A drain only Finishes when the server confirmed CloseStream with its
+/// terminal summary `Metadata` before closing — Deepgram's contract is to
+/// process remaining audio, return final results plus summary metadata, then
+/// terminate; anything less may be a truncated Transcript.
 async fn drive_deepgram_connection(
     socket: DeepgramSocket,
     outbound: &mut tokio::sync::mpsc::UnboundedReceiver<DeepgramOutbound>,
     pending: &mut Option<DeepgramOutbound>,
+    audio_delivered: &mut bool,
     transcript: &Arc<Mutex<TranscriptAccumulator>>,
     cancel: &CancelRegistry,
     keepalive: Duration,
+    close_grace: Duration,
 ) -> Result<DeepgramConnectionEnd, BoundaryError> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -2284,19 +2346,25 @@ async fn drive_deepgram_connection(
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_sent = tokio::time::Instant::now();
     // Once `CloseStream` is out, stop consuming outbound frames and only
-    // drain inbound until the server flushes final `Results` and closes,
-    // bounded by the close grace.
+    // drain inbound until the server flushes final `Results`, confirms with
+    // its terminal `Metadata`, and closes — bounded by the close grace.
     let mut draining_deadline: Option<tokio::time::Instant> = None;
-    // A frame that failed to send on the previous connection is retried first.
+    let mut terminal_metadata_seen = false;
+    // A frame that failed to send on the previous connection is retried first
+    // (only reachable before any audio was delivered — see the caller).
     if let Some(frame) = pending.take() {
+        let is_audio = matches!(frame, DeepgramOutbound::Audio(_));
         let draining = matches!(frame, DeepgramOutbound::CloseStream);
         if sink.send(deepgram_ws_frame(&frame)).await.is_err() {
             *pending = Some(frame);
             return Ok(DeepgramConnectionEnd::Lost);
         }
+        if is_audio {
+            *audio_delivered = true;
+        }
         last_sent = tokio::time::Instant::now();
         if draining {
-            draining_deadline = Some(last_sent + DEEPGRAM_CLOSE_GRACE);
+            draining_deadline = Some(last_sent + close_grace);
         }
     }
     loop {
@@ -2308,26 +2376,43 @@ async fn drive_deepgram_connection(
                     let _ = sink.send(Message::Close(None)).await;
                     return Ok(DeepgramConnectionEnd::Finished);
                 };
+                let is_audio = matches!(frame, DeepgramOutbound::Audio(_));
                 let draining = matches!(frame, DeepgramOutbound::CloseStream);
                 if sink.send(deepgram_ws_frame(&frame)).await.is_err() {
                     *pending = Some(frame);
                     return Ok(DeepgramConnectionEnd::Lost);
                 }
+                if is_audio {
+                    *audio_delivered = true;
+                }
                 last_sent = tokio::time::Instant::now();
                 if draining {
-                    draining_deadline = Some(last_sent + DEEPGRAM_CLOSE_GRACE);
+                    draining_deadline = Some(last_sent + close_grace);
                 }
             }
             incoming = stream.next() => match incoming {
                 Some(Ok(Message::Text(text))) => {
-                    ingest_deepgram_message(transcript, &text)?;
+                    let kind = ingest_deepgram_message(transcript, &text)?;
+                    if draining_deadline.is_some()
+                        && matches!(kind, DeepgramMessageKind::Metadata)
+                    {
+                        terminal_metadata_seen = true;
+                    }
                 }
                 Some(Ok(Message::Close(_))) | None => {
-                    return Ok(if draining_deadline.is_some() {
-                        DeepgramConnectionEnd::Finished
-                    } else {
-                        DeepgramConnectionEnd::Lost
-                    });
+                    if draining_deadline.is_none() {
+                        return Ok(DeepgramConnectionEnd::Lost);
+                    }
+                    if terminal_metadata_seen {
+                        return Ok(DeepgramConnectionEnd::Finished);
+                    }
+                    // Closed after CloseStream but WITHOUT the terminal
+                    // summary Metadata: the server-side flush is unconfirmed
+                    // and the accumulated Transcript may be truncated.
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Provider,
+                        "Deepgram closed without confirming CloseStream",
+                    ));
                 }
                 Some(Err(_)) => {
                     if draining_deadline.is_some() {
@@ -2352,10 +2437,15 @@ async fn drive_deepgram_connection(
                 }
                 if let Some(deadline) = draining_deadline {
                     if tokio::time::Instant::now() >= deadline {
-                        // Deepgram never closed after CloseStream; return what
-                        // accumulated rather than hanging the Recording.
+                        // Deepgram never confirmed CloseStream within the
+                        // grace: the accumulated prefix would be a plausible
+                        // but truncated Transcript, well inside the Provider
+                        // Deadline — fail visibly instead.
                         let _ = sink.send(Message::Close(None)).await;
-                        return Ok(DeepgramConnectionEnd::Finished);
+                        return Err(BoundaryError::new(
+                            BoundaryKind::Provider,
+                            "Deepgram did not confirm CloseStream within the close grace",
+                        ));
                     }
                 } else if last_sent.elapsed() >= keepalive {
                     if sink
@@ -2382,28 +2472,64 @@ fn deepgram_ws_frame(frame: &DeepgramOutbound) -> tokio_tungstenite::tungstenite
     }
 }
 
+/// What one inbound text frame turned out to be, for the caller's
+/// drain-confirmation tracking.
+enum DeepgramMessageKind {
+    /// The summary `Metadata` message — terminal when it follows CloseStream.
+    Metadata,
+    Other,
+}
+
 /// Parses one inbound text frame. `Results` feed the accumulator; a server
-/// `Error` message is fatal and fails the provider visibly; anything
-/// unrecognized (including malformed JSON) is ignored so server-side schema
-/// additions never break the Recording.
+/// `Error` message, a frame that is not JSON, and a `Results` frame missing
+/// its `is_final` marker or (when finalized) its transcript text are all
+/// fatal — silently skipping them would truncate the Transcript without a
+/// trace. Unknown-but-well-formed message types stay tolerated so server-side
+/// schema ADDITIONS never break the Recording; interim shape drift is UI-only
+/// and equally tolerated.
 fn ingest_deepgram_message(
     transcript: &Arc<Mutex<TranscriptAccumulator>>,
     text: &str,
-) -> Result<(), BoundaryError> {
+) -> Result<DeepgramMessageKind, BoundaryError> {
     let Ok(message) = serde_json::from_str::<serde_json::Value>(text) else {
-        return Ok(());
-    };
-    if message.get("type").and_then(serde_json::Value::as_str) == Some("Error") {
         return Err(BoundaryError::new(
             BoundaryKind::Provider,
-            "Deepgram reported a streaming error",
+            "Deepgram sent a malformed streaming message",
         ));
+    };
+    match message.get("type").and_then(serde_json::Value::as_str) {
+        Some("Error") => Err(BoundaryError::new(
+            BoundaryKind::Provider,
+            "Deepgram reported a streaming error",
+        )),
+        Some("Results") => {
+            let Some(is_final) = message.get("is_final").and_then(serde_json::Value::as_bool)
+            else {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Provider,
+                    "Deepgram sent a malformed streaming message",
+                ));
+            };
+            if is_final
+                && message
+                    .pointer("/channel/alternatives/0/transcript")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+            {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Provider,
+                    "Deepgram sent a malformed streaming message",
+                ));
+            }
+            transcript
+                .lock()
+                .expect("Deepgram transcript accumulator mutex poisoned")
+                .ingest(&message);
+            Ok(DeepgramMessageKind::Other)
+        }
+        Some("Metadata") => Ok(DeepgramMessageKind::Metadata),
+        _ => Ok(DeepgramMessageKind::Other),
     }
-    transcript
-        .lock()
-        .expect("Deepgram transcript accumulator mutex poisoned")
-        .ingest(&message);
-    Ok(())
 }
 
 pub struct MergeResultValidator {
@@ -4429,12 +4555,28 @@ mod tests {
         keepalive: Duration,
         reaper: &ProviderReaper,
     ) -> DeepgramStream {
+        test_deepgram_stream_with_grace(base, keepalive, DEEPGRAM_CLOSE_GRACE, reaper)
+    }
+
+    fn test_deepgram_stream_with_grace(
+        base: &str,
+        keepalive: Duration,
+        close_grace: Duration,
+        reaper: &ProviderReaper,
+    ) -> DeepgramStream {
         DeepgramStream::connect(
             deepgram_streaming_url(base, &[]).unwrap(),
             Credential::new("controlled-credential".to_owned()).unwrap(),
             keepalive,
+            close_grace,
             reaper.clone(),
         )
+    }
+
+    /// The terminal summary message Deepgram sends after `CloseStream`, before
+    /// closing the connection.
+    fn deepgram_metadata_frame() -> String {
+        serde_json::json!({"type": "Metadata", "request_id": "mock-request"}).to_string()
     }
 
     fn deepgram_results_frame(transcript: &str, is_final: bool) -> String {
@@ -4507,6 +4649,10 @@ mod tests {
                                     "Second segment.",
                                     true,
                                 )))
+                                .await
+                                .unwrap();
+                            socket
+                                .send(Message::Text(deepgram_metadata_frame()))
                                 .await
                                 .unwrap();
                             let _ = socket.send(Message::Close(None)).await;
@@ -4621,23 +4767,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deepgram_redials_after_a_drop_and_keeps_finalized_segments() {
+    async fn deepgram_drop_after_delivered_audio_fails_visibly_without_redialing() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let redialed = Arc::new(AtomicBool::new(false));
+        let redialed_flag = Arc::clone(&redialed);
+        let server = tokio::spawn(async move {
+            // Finalize one segment for delivered audio, then drop abruptly.
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _ = socket.next().await;
+            socket
+                .send(Message::Text(deepgram_results_frame("schedule the", true)))
+                .await
+                .unwrap();
+            drop(socket);
+            // Keep listening: a redial WOULD succeed here, so a pass proves the
+            // client refused to redial rather than that it couldn't.
+            if tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .is_ok()
+            {
+                redialed_flag.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = test_deepgram_stream(&base, Duration::from_secs(5), &reaper);
+        stream.send_audio(AudioChunk(vec![7u8; 32])).await.unwrap();
+        // Wait until the finalized segment was ingested, then give a
+        // redial-and-continue implementation time to observe the drop and
+        // redial BEFORE the Recording completes — the exact window where a
+        // silent audio gap would hide.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stream.transcript.lock().unwrap().text() != "schedule the" {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the finalized segment must be ingested");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        // Audio already accepted by the dropped socket cannot be replayed, so a
+        // redial-and-continue would return a plausible Transcript with a silent
+        // gap. The provider must fail visibly instead; Groq carries.
+        let error = stream
+            .complete(CapturedAudio::new(vec![7u8; 32]))
+            .await
+            .unwrap_err();
+        assert!(
+            error.diagnostic().contains("Deepgram"),
+            "got {:?}",
+            error.diagnostic()
+        );
+        let _ = server.await;
+        assert!(
+            !redialed.load(Ordering::SeqCst),
+            "a drop after delivered audio must not be redialed"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepgram_redials_a_failed_dial_before_any_audio_within_the_budget() {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
 
         let (listener, base) = mock_deepgram_listener().await;
         let (second_up_tx, second_up_rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
-            // First connection: finalize one segment, then drop abruptly.
+            // First connection dies before any audio was delivered on it.
             let (tcp, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
-            let _ = socket.next().await;
-            socket
-                .send(Message::Text(deepgram_results_frame("first half", true)))
-                .await
-                .unwrap();
+            let socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
             drop(socket);
-            // Second connection: the bounded redial.
+            // Second connection: the bounded redial carries the Recording.
             let (tcp, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
             let _ = second_up_tx.send(());
@@ -4645,7 +4848,11 @@ mod tests {
                 if let Message::Text(text) = message {
                     if text.contains("CloseStream") {
                         socket
-                            .send(Message::Text(deepgram_results_frame("second half", true)))
+                            .send(Message::Text(deepgram_results_frame("after redial", true)))
+                            .await
+                            .unwrap();
+                        socket
+                            .send(Message::Text(deepgram_metadata_frame()))
                             .await
                             .unwrap();
                         let _ = socket.send(Message::Close(None)).await;
@@ -4657,16 +4864,233 @@ mod tests {
 
         let reaper = ProviderReaper::new();
         let mut stream = test_deepgram_stream(&base, Duration::from_secs(5), &reaper);
-        stream.send_audio(AudioChunk(vec![7u8; 32])).await.unwrap();
-        // Wait until the redialed connection is established so the Recording's
-        // completion frames deterministically reach the second connection.
+        // No audio has been handed to the first connection, so nothing can be
+        // lost: the dial phase stays covered by the bounded reconnect budget.
         second_up_rx.await.unwrap();
+        stream.send_audio(AudioChunk(vec![7u8; 32])).await.unwrap();
         let transcript = stream
             .complete(CapturedAudio::new(vec![7u8; 32]))
             .await
             .unwrap();
-        assert_eq!(transcript.text, "first half second half");
+        assert_eq!(transcript.text, "after redial");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deepgram_close_without_terminal_metadata_fails_visibly() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                if let Message::Text(text) = message {
+                    if text.contains("CloseStream") {
+                        // A final Results but NO terminal Metadata before the
+                        // close: the server-side flush is unconfirmed, so the
+                        // Transcript may be truncated.
+                        socket
+                            .send(Message::Text(deepgram_results_frame("truncated", true)))
+                            .await
+                            .unwrap();
+                        let _ = socket.send(Message::Close(None)).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = test_deepgram_stream(&base, Duration::from_secs(5), &reaper);
+        stream.send_audio(AudioChunk(vec![5u8; 32])).await.unwrap();
+        let error = stream
+            .complete(CapturedAudio::new(vec![5u8; 32]))
+            .await
+            .unwrap_err();
+        assert!(
+            error.diagnostic().contains("Deepgram"),
+            "a close without the terminal Metadata must fail visibly, got {:?}",
+            error.diagnostic()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deepgram_unanswered_closestream_fails_visibly_at_the_close_grace() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            // Read everything, never answer CloseStream.
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = test_deepgram_stream_with_grace(
+            &base,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+            &reaper,
+        );
+        stream.send_audio(AudioChunk(vec![4u8; 32])).await.unwrap();
+        // Returning the partial accumulator here would deliver a plausible but
+        // truncated Source Transcript inside the 14s Provider Deadline.
+        let error = stream
+            .complete(CapturedAudio::new(vec![4u8; 32]))
+            .await
+            .unwrap_err();
+        assert!(
+            error.diagnostic().contains("Deepgram"),
+            "an unanswered CloseStream must fail visibly at the close grace, got {:?}",
+            error.diagnostic()
+        );
+        drop(stream);
+        let _ = reaper.drain(Duration::from_secs(2)).await;
+        let _ = server.await;
+    }
+
+    #[test]
+    fn deepgram_streaming_url_rejects_userinfo_in_the_authority() {
+        // ws://127.0.0.1:80@attacker.example/… — the raw authority starts with
+        // a loopback-looking userinfo but the HOST is attacker.example; the
+        // Token header must never travel over that connection (let alone in
+        // plaintext).
+        assert!(
+            deepgram_streaming_url("ws://127.0.0.1:80@attacker.example/listen", &[]).is_err()
+        );
+        assert!(
+            deepgram_streaming_url("http://localhost@attacker.example/listen", &[]).is_err()
+        );
+        assert!(deepgram_streaming_url("wss://user@api.deepgram.com/v1/listen", &[]).is_err());
+        assert!(deepgram_streaming_url("ws:///listen", &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn deepgram_abort_surfaces_a_stored_streaming_failure() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _ = socket.next().await;
+            socket
+                .send(Message::Text(
+                    r#"{"type":"Error","description":"rejected"}"#.to_owned(),
+                ))
+                .await
+                .unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = test_deepgram_stream(&base, Duration::from_secs(5), &reaper);
+        stream.send_audio(AudioChunk(vec![3u8; 32])).await.unwrap();
+        // Wait until the I/O task stored the failure, mirroring a Recording
+        // whose capture fails (or whose Recording Deadline fires) after
+        // Deepgram already failed: abort(), not complete(), is what runs.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !stream.io_tasks.front().unwrap().is_finished() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the streaming task must settle its failure");
+        let error = Box::new(stream).abort().await.unwrap_err();
+        assert_eq!(
+            error.diagnostic(),
+            "Deepgram reported a streaming error",
+            "abort must surface the stored provider failure, not discard it"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn malformed_deepgram_text_frames_fail_visibly() {
+        let transcript = Arc::new(Mutex::new(TranscriptAccumulator::default()));
+        // Not JSON at all.
+        assert!(ingest_deepgram_message(&transcript, "not-json").is_err());
+        // A Results frame with no is_final marker.
+        assert!(ingest_deepgram_message(&transcript, r#"{"type":"Results"}"#).is_err());
+        // A finalized Results frame whose transcript text is missing: skipping
+        // it would silently truncate the Transcript.
+        assert!(ingest_deepgram_message(
+            &transcript,
+            r#"{"type":"Results","is_final":true,"speech_final":true}"#
+        )
+        .is_err());
+        // Unknown message types stay tolerated (server-side schema additions),
+        // and interim shape drift is UI-only.
+        assert!(ingest_deepgram_message(&transcript, r#"{"type":"SpeechStarted"}"#).is_ok());
+        assert!(
+            ingest_deepgram_message(&transcript, r#"{"type":"Results","is_final":false}"#)
+                .is_ok()
+        );
+        assert_eq!(
+            transcript.lock().unwrap().text(),
+            "",
+            "no rejected frame may leak text into the Transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepgram_malformed_final_results_fail_the_provider_visibly() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _ = socket.next().await;
+            // A malformed finalized Results frame, followed by a perfectly
+            // clean drain: only frame-level strictness can catch this.
+            socket
+                .send(Message::Text(
+                    r#"{"type":"Results","is_final":true}"#.to_owned(),
+                ))
+                .await
+                .unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                match message {
+                    Message::Text(text) if text.contains("CloseStream") => {
+                        let _ = socket.send(Message::Text(deepgram_metadata_frame())).await;
+                        let _ = socket.send(Message::Close(None)).await;
+                        break;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = test_deepgram_stream(&base, Duration::from_secs(5), &reaper);
+        stream.send_audio(AudioChunk(vec![2u8; 32])).await.unwrap();
+        let error = stream
+            .complete(CapturedAudio::new(vec![2u8; 32]))
+            .await
+            .unwrap_err();
+        assert!(
+            error.diagnostic().contains("Deepgram"),
+            "a malformed finalized Results frame must fail visibly, got {:?}",
+            error.diagnostic()
+        );
+        let _ = server.await;
     }
 
     #[tokio::test]
