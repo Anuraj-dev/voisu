@@ -1575,6 +1575,29 @@ fn groq_prestream_active(total_received_bytes: usize) -> bool {
     total_received_bytes > GROQ_FULL_AUDIO_MAX_BYTES
 }
 
+/// Plans the finalize Groq request(s) over a `len`-byte finalized buffer. A
+/// buffer at or below the full-audio limit is one full-audio request; a buffer
+/// past the limit (for example when a capture backlog appended at Stop pushes it
+/// over) is split into 60 s windows with a 4 s overlap so no single request is
+/// oversized and the word-overlap dedup can stitch the seams.
+fn plan_finalize_chunks(len: usize) -> Vec<std::ops::Range<usize>> {
+    if len <= GROQ_FULL_AUDIO_MAX_BYTES {
+        return vec![0..len];
+    }
+    let step = GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES;
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < len {
+        let end = (start + GROQ_CHUNK_BYTES).min(len);
+        ranges.push(start..end);
+        if end == len {
+            break;
+        }
+        start += step;
+    }
+    ranges
+}
+
 struct GroqStream {
     credential: Credential,
     endpoint: String,
@@ -1777,28 +1800,48 @@ impl ProviderStream for GroqStream {
                 ));
             }
             self.buffer.extend_from_slice(&pcm[self.streamed_bytes..]);
+            // A finalize request needs issuing when nothing was pre-streamed, or
+            // when the retained overlap tail carries fresh audio past the last
+            // pre-streamed chunk. Its handle MUST live in `self.chunks` so a
+            // Provider Deadline that drops this future still leaves `abort` /
+            // `Drop` / the `ProviderReaper` owning — and killing — its curl
+            // child, exactly as pre-streamed chunks are owned. Awaiting the
+            // request inline here would detach that curl on cancellation.
+            let needs_finalize =
+                self.chunks.is_empty() || self.buffer.len() > GROQ_CHUNK_OVERLAP_BYTES;
+            if needs_finalize {
+                let buffer = std::mem::take(&mut self.buffer);
+                // Re-evaluate the full-audio gate against the FINALIZED length:
+                // a capture backlog appended at Stop can push a Recording past
+                // the 120 s limit even when nothing crossed it during streaming,
+                // in which case it must be chunked, not sent as one request.
+                for range in plan_finalize_chunks(buffer.len()) {
+                    let pcm = buffer[range].to_vec();
+                    let credential = self.credential.clone();
+                    let endpoint = self.endpoint.clone();
+                    let params = self.params.clone();
+                    let cancel = Arc::clone(&self.cancel);
+                    self.chunks.push_back(tokio::spawn(async move {
+                        ProviderHttpClient
+                            .transcribe_groq_chunk(credential, endpoint, params, pcm, cancel)
+                            .await
+                    }));
+                }
+            }
             let mut transcripts = Vec::new();
             while let Some(chunk) = self.chunks.front_mut() {
-                let transcript = chunk.await.map_err(|_| {
+                // Keep the handle in `self.chunks` for the await so a Provider
+                // Deadline that drops this future still leaves `Drop` an owned
+                // task to adopt. Once the await resolves, pop it BEFORE the `?`
+                // error propagation: a completed handle left behind would be
+                // polled a second time by the reaper's adopt closure and panic
+                // ("JoinHandle polled after completion").
+                let joined = chunk.await;
+                self.chunks.pop_front();
+                let transcript = joined.map_err(|_| {
                     BoundaryError::new(BoundaryKind::Provider, "Groq chunk task failed")
                 })??;
-                self.chunks.pop_front();
                 transcripts.push(transcript);
-            }
-            let needs_final_chunk = transcripts.is_empty()
-                || self.buffer.len() > GROQ_CHUNK_OVERLAP_BYTES;
-            if needs_final_chunk {
-                transcripts.push(
-                    ProviderHttpClient
-                        .transcribe_groq_chunk(
-                            self.credential.clone(),
-                            self.endpoint.clone(),
-                            self.params.clone(),
-                            std::mem::take(&mut self.buffer),
-                            Arc::clone(&self.cancel),
-                        )
-                        .await?,
-                );
             }
             let text = merge_chunk_transcripts(transcripts);
             Ok(SourceTranscript {
@@ -3799,6 +3842,31 @@ mod tests {
     }
 
     #[test]
+    fn finalize_is_one_full_audio_request_at_or_below_the_limit() {
+        assert_eq!(plan_finalize_chunks(1_000), vec![0..1_000]);
+        assert_eq!(
+            plan_finalize_chunks(GROQ_FULL_AUDIO_MAX_BYTES),
+            vec![0..GROQ_FULL_AUDIO_MAX_BYTES]
+        );
+    }
+
+    #[test]
+    fn finalize_chunks_a_backlog_inflated_recording_past_the_limit() {
+        // 130 s finalized (e.g. a large capture backlog appended at Stop pushed a
+        // Recording that streamed under 120 s past the limit): it must be chunked
+        // into 60 s windows with a 4 s overlap, not one oversized request.
+        let len = GROQ_FULL_AUDIO_MAX_BYTES + 16_000 * 2 * 10;
+        let ranges = plan_finalize_chunks(len);
+        assert!(ranges.len() >= 2, "past the limit finalize is chunked, not one request");
+        assert_eq!(ranges[0], 0..GROQ_CHUNK_BYTES);
+        assert_eq!(ranges[1].start, GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES);
+        assert_eq!(ranges.last().unwrap().end, len, "the last window ends at the recording end");
+        for range in &ranges[..ranges.len() - 1] {
+            assert_eq!(range.end - range.start, GROQ_CHUNK_BYTES, "non-final windows are full chunks");
+        }
+    }
+
+    #[test]
     fn groq_chunk_geometry_is_sixty_second_windows_with_a_four_second_overlap() {
         assert_eq!(GROQ_CHUNK_BYTES, 16_000 * 2 * 60);
         assert_eq!(GROQ_CHUNK_OVERLAP_BYTES, 16_000 * 2 * 4);
@@ -3865,6 +3933,61 @@ mod tests {
             merge_chunk_transcripts(vec![first.join(" "), second.join(" ")]);
         let expected: Vec<String> = (0..60).map(|i| format!("w{i}")).collect();
         assert_eq!(merged, expected.join(" "), "the 30-word overlap is deduped");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_finalize_request_is_owned_by_the_reaper_not_detached() {
+        // The single full-audio request of a short Recording is issued at
+        // finalize. If the Provider Deadline drops complete() while that request
+        // is in flight, its curl child must be OWNED — handed to the
+        // ProviderReaper by Drop — never detached. A local server that accepts
+        // and never answers keeps the finalize request in flight.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(connection) => held.push(connection),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = GroqStream {
+            credential: Credential::new("controlled-credential".to_owned()).unwrap(),
+            endpoint: format!("http://{address}/audio/transcriptions"),
+            params: test_groq_params(),
+            buffer: Vec::new(),
+            streamed_bytes: 0,
+            chunks: VecDeque::new(),
+            cancel: CancelRegistry::new(),
+            reaper: reaper.clone(),
+        };
+
+        // Drive complete() far enough to issue the finalize request, then drop it
+        // exactly as the Provider Deadline would.
+        {
+            let completion = stream.complete(CapturedAudio::empty());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(750), completion)
+                    .await
+                    .is_err(),
+                "the hanging finalize request must not complete on its own"
+            );
+        }
+        // Dropping the stream must adopt the still-live finalize task into the
+        // reaper (cancel-first, then adopt), not detach its curl child. With the
+        // finalize request awaited inline this count is zero.
+        drop(stream);
+        assert_eq!(
+            reaper.pending(),
+            1,
+            "the finalize request handle must be owned by the reaper, not detached"
+        );
+        // Draining cancels the request and reaps its curl child.
+        reaper.drain_to_completion(Duration::from_secs(5)).await;
     }
 
     /// A probe chunk task shaped like a real provider chunk: the outer async

@@ -803,6 +803,13 @@ cat > "$dir/clipboard"
         "a short Recording is one full-audio Groq request at finalize"
     );
     assert!(requests[0].windows(4).any(|window| window == b"RIFF"));
+    // The one request must carry the FULL captured PCM, not a stripped or empty
+    // 44-byte WAV header: ~1,000,000 bytes of audio were captured.
+    assert!(
+        requests[0].len() >= 1_000_000,
+        "the finalize request carries the full audio, not an empty WAV (got {} bytes)",
+        requests[0].len()
+    );
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
         "alpha beta gamma"
@@ -4776,6 +4783,95 @@ while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
     }
 
     // Only after the stale request is provably dead does the next Recording begin.
+    assert!(voisu(runtime.path(), "start").status.success());
+}
+
+#[test]
+fn finalize_groq_request_is_killed_when_the_provider_deadline_fires() {
+    // The single full-audio request of a short (<=120 s) Recording is issued at
+    // finalize. Its subprocess must be owned like a pre-streamed chunk: when the
+    // Provider Deadline fires while it is in flight, the abort must KILL the
+    // curl child, not leave it detached to run for up to 14 s and overlap the
+    // next Recording. This exercises the finalize path specifically, not the
+    // pre-stream deque.
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    // ~2 s of PCM: far below the 120 s full-audio limit, so nothing pre-streams
+    // and the only Groq request is the one issued at finalize.
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+head -c 64000 /dev/zero | tr '\000' '\001'
+: > "$dir/pw-record.ready"
+trap 'exit 0' INT TERM
+i=0
+while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
+"#,
+    );
+    // The Groq finalize request hangs so the Provider Deadline fires while it is
+    // in flight; only a kill from the aborted Recording ends it early.
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$$" >> "$dir/curl.pids"
+: > "$dir/curl.start"
+i=0
+while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
+"#,
+    );
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_TEST_MODE", "system-boundaries"),
+            ("VOISU_TEST_PROVIDER_DEADLINE_MS", "2000"),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "pw-record.ready");
+    // Graceful Stop drives finalize; the single full-audio request goes in
+    // flight and hangs, so Stop returns a failure once the Provider Deadline
+    // elapses. What matters is what happens to the request's subprocess.
+    let _ = voisu(runtime.path(), "stop");
+    wait_for_marker(commands.path(), "curl.start");
+    let curl_pid: u32 = fs::read_to_string(commands.path().join("curl.pids"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let kill_deadline = Instant::now() + Duration::from_secs(4);
+    while Path::new(&format!("/proc/{curl_pid}")).exists() {
+        assert!(
+            Instant::now() < kill_deadline,
+            "the finalize Groq request's subprocess must be killed on the Provider Deadline, not detached"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // Only after the stale finalize request is provably dead does the daemon
+    // return to idle and accept the next Recording.
+    let idle_deadline = Instant::now() + Duration::from_secs(8);
+    while stdout(&voisu(runtime.path(), "status")) != "idle\n" {
+        assert!(Instant::now() < idle_deadline, "failed Recording must recover to idle");
+        thread::sleep(Duration::from_millis(20));
+    }
     assert!(voisu(runtime.path(), "start").status.success());
 }
 

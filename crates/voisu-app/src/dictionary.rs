@@ -14,6 +14,7 @@
 //! comment, blank lines are ignored, and a missing file means built-ins only.
 
 use std::collections::HashSet;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 /// Whisper honours only ~224 tokens of prompt. The prompt builder appends terms
@@ -146,14 +147,33 @@ fn user_dictionary_path() -> PathBuf {
     base.join("voisu").join("dictionary.txt")
 }
 
-/// Parses a user dictionary file into terms. One term per line; `#` starts a
-/// comment (whole-line or trailing); blank lines are ignored. A missing or
-/// unreadable file yields no terms (built-ins only).
+/// Loads user dictionary terms, logging a local diagnostic on a genuine read
+/// failure. A missing file is not an error (built-ins only); a permission
+/// denial or invalid UTF-8 is surfaced to stderr rather than silently dropping
+/// all user vocabulary.
 fn load_user_terms(path: &Path) -> Vec<String> {
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    parse_user_terms(&contents)
+    match read_user_terms(path) {
+        Ok(terms) => terms,
+        Err(diagnostic) => {
+            eprintln!("{diagnostic}");
+            Vec::new()
+        }
+    }
+}
+
+/// Reads and parses a user dictionary file. A missing file yields `Ok(empty)`;
+/// any other read failure (permission, invalid UTF-8) yields `Err(diagnostic)`
+/// so the caller can surface it instead of masquerading it as a missing file.
+/// Separated from logging so it is testable directly.
+fn read_user_terms(path: &Path) -> Result<Vec<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(parse_user_terms(&contents)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!(
+            "voisu: ignoring unreadable user dictionary at {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 /// Parses user dictionary text into terms, applying the comment and blank-line
@@ -162,11 +182,7 @@ fn parse_user_terms(contents: &str) -> Vec<String> {
     contents
         .lines()
         .filter_map(|line| {
-            let term = match line.split_once('#') {
-                Some((before, _comment)) => before,
-                None => line,
-            }
-            .trim();
+            let term = strip_comment(line).trim();
             if term.is_empty() {
                 None
             } else {
@@ -174,6 +190,20 @@ fn parse_user_terms(contents: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Returns `line` with any trailing comment removed. A `#` begins a comment only
+/// at line start or when preceded by whitespace, so terms like `C#` and `F#`
+/// (where `#` follows a non-space character) are preserved intact.
+fn strip_comment(line: &str) -> &str {
+    let mut preceded_by_whitespace = true;
+    for (index, character) in line.char_indices() {
+        if character == '#' && preceded_by_whitespace {
+            return &line[..index];
+        }
+        preceded_by_whitespace = character.is_whitespace();
+    }
+    line
 }
 
 /// Merges `user` terms ahead of the built-in dictionary, de-duplicating
@@ -190,16 +220,18 @@ fn merged_terms_with(user: Vec<String>) -> Vec<String> {
 }
 
 /// Builds a comma-separated glossary from `terms`, appending terms in order
-/// until adding the next one would exceed [`WHISPER_PROMPT_TOKEN_BUDGET`].
+/// until adding the next one would cross [`WHISPER_PROMPT_TOKEN_BUDGET`] real
+/// tokens. Truncation uses the conservative [`token_upper_bound`] so the result
+/// provably never exceeds the budget.
 fn whisper_prompt_from_terms(terms: &[String]) -> String {
     let mut prompt = String::new();
     for term in terms {
         let candidate_len = if prompt.is_empty() {
-            term.chars().count()
+            term.len()
         } else {
-            prompt.chars().count() + 2 + term.chars().count()
+            prompt.len() + ", ".len() + term.len()
         };
-        if estimate_tokens(candidate_len) > WHISPER_PROMPT_TOKEN_BUDGET {
+        if token_upper_bound(candidate_len) > WHISPER_PROMPT_TOKEN_BUDGET {
             break;
         }
         if !prompt.is_empty() {
@@ -210,10 +242,15 @@ fn whisper_prompt_from_terms(terms: &[String]) -> String {
     prompt
 }
 
-/// Approximates the Whisper token count of a glossary `char_len` characters
-/// long using the standard ~4-characters-per-token heuristic.
-fn estimate_tokens(char_len: usize) -> usize {
-    char_len.div_ceil(4)
+/// A provable upper bound on the real Whisper token count of a glossary that is
+/// `byte_len` UTF-8 bytes long. Whisper's byte-level BPE (like GPT-2) starts
+/// from one token per input byte and only ever merges adjacent tokens, so the
+/// emitted token count never exceeds the byte count. Char/4-style heuristics
+/// under-count multibyte terms (emoji, punctuation, CJK); the byte length never
+/// does, so truncating against it can only over-count, never over-run the
+/// ~224-token prompt window Whisper honours.
+fn token_upper_bound(byte_len: usize) -> usize {
+    byte_len
 }
 
 #[cfg(test)]
@@ -278,7 +315,7 @@ Tokio   # inline comment
         // known late term must be dropped while an early one survives.
         let user: Vec<String> = (0..2000).map(|i| format!("term{i:04}")).collect();
         let prompt = whisper_prompt_from_terms(&merged_terms_with(user));
-        assert!(estimate_tokens(prompt.chars().count()) <= WHISPER_PROMPT_TOKEN_BUDGET);
+        assert!(token_upper_bound(prompt.len()) <= WHISPER_PROMPT_TOKEN_BUDGET);
         assert!(prompt.contains("term0000"), "early user terms survive");
         assert!(!prompt.contains("term1999"), "late terms are truncated away");
         // Truncation dropped the built-ins entirely (they sort after the user terms).
@@ -289,5 +326,60 @@ Tokio   # inline comment
     fn whisper_prompt_from_terms_never_starts_with_a_separator() {
         let prompt = whisper_prompt_from_terms(&["Rust".to_owned(), "cargo".to_owned()]);
         assert_eq!(prompt, "Rust, cargo");
+    }
+
+    #[test]
+    fn whisper_prompt_stays_within_the_real_token_budget_for_multibyte_terms() {
+        // Byte-level BPE (Whisper/GPT-2) never emits more tokens than the input
+        // has UTF-8 bytes, so the byte length is a provable upper bound on the
+        // real token count. Emoji and other multibyte terms tokenize far above a
+        // char/4 estimate; the built prompt must still be provably under budget.
+        let user: Vec<String> = (0..2000).map(|i| format!("😀ζterm{i}")).collect();
+        let prompt = whisper_prompt_from_terms(&user);
+        // The provable upper bound on real tokens is the UTF-8 byte length.
+        assert!(
+            prompt.len() <= WHISPER_PROMPT_TOKEN_BUDGET,
+            "prompt is {} bytes, over the {}-token provable bound",
+            prompt.len(),
+            WHISPER_PROMPT_TOKEN_BUDGET
+        );
+        assert!(!prompt.is_empty(), "some multibyte terms still fit");
+    }
+
+    #[test]
+    fn reading_a_present_user_dictionary_returns_its_terms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dictionary.txt");
+        std::fs::write(&path, "serde\nTokio\n").unwrap();
+        assert_eq!(read_user_terms(&path), Ok(vec!["serde".to_owned(), "Tokio".to_owned()]));
+    }
+
+    #[test]
+    fn a_missing_user_dictionary_is_not_an_error() {
+        let terms = read_user_terms(Path::new("/nonexistent/voisu/dictionary.txt"));
+        assert_eq!(terms, Ok(Vec::new()));
+    }
+
+    #[test]
+    fn an_unreadable_user_dictionary_surfaces_a_diagnostic_not_silent_emptiness() {
+        // Invalid UTF-8 must not masquerade as a missing file: it silently drops
+        // all user vocabulary. It has to surface as a diagnostic instead.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dictionary.txt");
+        std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        let result = read_user_terms(&path);
+        assert!(result.is_err(), "an unreadable dictionary is a diagnostic, not empty terms");
+        assert!(
+            result.unwrap_err().contains("dictionary"),
+            "the diagnostic names the dictionary"
+        );
+    }
+
+    #[test]
+    fn a_hash_only_starts_a_comment_at_a_boundary_so_c_sharp_survives() {
+        // "C#" is a real term: the '#' is not preceded by whitespace. A '#' only
+        // begins a comment at line start or after whitespace.
+        let terms = parse_user_terms("C#\nF#\nTokio # trailing comment\n# whole-line\n");
+        assert_eq!(terms, vec!["C#", "F#", "Tokio"]);
     }
 }
