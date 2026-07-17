@@ -1028,12 +1028,16 @@ fn is_repetition_loop(words: &[String]) -> bool {
 /// - steals its material: the majority of its RECYCLED (multi-occurrence)
 ///   content words are confirmed by the other source, so the loop is an echo
 ///   of the other transcript's content rather than independent speech; or
-/// - is hollow: it has a comparable vocabulary yet NOTHING it says is
-///   confirmed, so its relentless repetition is self-generated noise.
+/// - is hollow: it has a comparable vocabulary yet the other source confirms
+///   less than the agreement floor of it, so its relentless repetition is
+///   self-generated noise around at most an accidental shared word or two.
+///   The floor is the SAME `CONTENT_OVERLAP_FLOOR` the agreement gate uses, so
+///   no confirmed-fraction band opens between "hollow" and "agrees enough to
+///   reconcile" for a loop whose vocabulary is the smaller of the pair.
 /// Genuine repeated speech survives both: its recycled commands are its own
 /// (no theft majority), and any real overlap with the other source keeps it
-/// from being hollow. A loop with some overlap but no recycled-word theft is
-/// ambiguous and deliberately NOT garbage — that shape reconciles.
+/// from being hollow. A loop with meaningful overlap but no recycled-word
+/// theft is ambiguous and deliberately NOT garbage — that shape reconciles.
 fn is_garbage_against(own: &[String], confirmed: &HashSet<&str>) -> bool {
     if is_degenerate(own) {
         return true;
@@ -1055,8 +1059,9 @@ fn is_garbage_against(own: &[String], confirmed: &HashSet<&str>) -> bool {
         .filter(|word| confirmed.contains(**word))
         .count();
     let stolen = confirmed_recycled * 2 > recycled.len();
-    let hollow =
-        distinct_content_words(own).len() >= MIN_COMPARABLE_CONTENT && confirmed.is_empty();
+    let distinct_content = distinct_content_words(own).len();
+    let hollow = distinct_content >= MIN_COMPARABLE_CONTENT
+        && (confirmed.len() as f64) < CONTENT_OVERLAP_FLOOR * distinct_content as f64;
     stolen || hollow
 }
 

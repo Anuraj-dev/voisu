@@ -726,6 +726,47 @@ async fn pure_nonsense_repetition_loop_loses_to_accurate_speech() {
 }
 
 #[tokio::test]
+async fn nonsense_loop_with_one_accidental_match_still_loses_to_accurate_speech() {
+    // Sol review of the redesign: a six-word repetition loop that happens to
+    // share ONE word with the accurate source ("column") is neither hollow
+    // (zero confirmed was a knife edge) nor stolen (no recycled-word
+    // majority), so it slipped to the cohesion tier and its repeated nonsense
+    // out-scored the accurate non-repetitive speech. A loop whose confirmed
+    // vocabulary sits below the agreement floor is hollow all the same: the
+    // accurate speech must be delivered.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+
+    let accurate = "The migration script renames the billing column, updates the foreign keys, and rewrites the index before the deploy finishes.";
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: accurate.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Flurbo zintak merp quavel dringle column flurbo zintak merp quavel dringle column flurbo zintak merp quavel dringle column.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the pair must be gated, not merged");
+    assert_eq!(
+        decision.selection,
+        TranscriptSelection::SourceDeepgram,
+        "one accidentally shared word must not let a repetition loop beat accurate speech"
+    );
+    assert_eq!(decision.transcript.0, accurate);
+}
+
+#[tokio::test]
 async fn gate_decision_is_stable_under_provider_position_swap() {
     // Round-6 finding 4: greedy phonetic alignment traversed the Deepgram
     // vocabulary first, so this pair scored 0.4 in one provider order and 0.6
