@@ -22,6 +22,15 @@
      release-to-text ≤~1 s after finalize.
   4. Only if pass: push branch, open PR, merge on CI green. If fail: report
      scored evidence and STOP.
+- **PRIORITY ORDER after this branch integrates to main (decided 2026-07-18):**
+  land the TWO CRITICAL audit fixes FIRST, before any latency ticket — (1)
+  supervise `process_recording`/remove `pump.await.expect` (voisu-daemon.rs:1396,
+  bare spawn at :577 — panic wedges daemon in Processing forever; mirror
+  `supervise_replay`), (2) wrap blocking `stop_child` in `spawn_blocking`
+  (system.rs:1476/1488 — up to ~2 s worker-thread stall per stop). Both touch the
+  same files as latency tickets 01 & 04; criticals land first so latency rebases
+  over small diffs. Full audit backlog is being charted in the hardening
+  wayfinder map (rest of it waits BEHIND latency).
 - **Latency effort queued behind this branch** (separate map `.scratch/voisu-latency/`
   + plan `docs/specs/2026-07-17-latency-optimization.md`; decisions D1–D4 in
   `decisions.md`). Do NOT start until `feature/transcription-accuracy` integrates
