@@ -1,6 +1,6 @@
 //! Shared domain, provider coordination, and IPC types for Voisu.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::future::Future;
 use std::os::unix::fs::MetadataExt;
@@ -666,14 +666,15 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             }
 
             // Source-quality gate (§3.4): the two Source Transcripts materially
-            // disagreed. Before spending an LLM merge, check whether one side is
+            // disagreed. Before spending an LLM merge, check whether the pair is
             // catastrophically divergent by a ROBUST garbage signal — a
             // degenerate filler/repetition loop (the recording-11 word-salad
-            // case), or a bare fragment. If so, skip the merge and select the
-            // coherent/fuller Source Transcript. When both sources are coherent
-            // (fluent nonsense vs an accurate source, or a genuine hard
-            // disagreement), we deliberately do NOT gate: cheap heuristics cannot
-            // rank them, so fall through to reconciliation rather than guess.
+            // case), a bare fragment, or near-zero cross-source content
+            // agreement between comparable sources (fluent nonsense / a
+            // unique-word salad, which no intrinsic check can flag). If so, skip
+            // the merge and select the Source Transcript the evidence supports.
+            // Real disagreements over shared content still fall through to
+            // reconciliation.
             if let Some(gate) = source_quality_gate(&deepgram.text, &groq.text) {
                 // The caller passes (deepgram.text, groq.text) in that order, so
                 // Left maps to Deepgram and Right to Groq. The gate itself holds
@@ -849,19 +850,30 @@ fn clean_source_fallback(
     reconciliation_requested: bool,
     recovery_attempted: bool,
 ) -> Result<TranscriptDecision, BoundaryError> {
-    // Select the clean source with the higher content-quality score, NOT a
-    // fixed provider preference: an accurate Deepgram source must win over
-    // fluent Groq nonsense here just as it would at the gate. `max_by` keeps the
-    // later element (Groq, since sources are provider-sorted) only on an exact
-    // score tie, which is rare and low-stakes at this post-reconciliation stage.
-    let source = sources
+    // Select among the quality-safe sources by the SAME cross-source-evidence
+    // comparator the divergence gate uses — never a fixed provider preference,
+    // and never an intrinsic score alone, which a fluent unique-word salad can
+    // inflate past accurate repetitive dictation.
+    let safe: Vec<&SourceTranscript> = sources
         .iter()
-        .filter(|source| quality_failure_reason(&source.text, std::slice::from_ref(*source)).is_none())
-        .max_by(|left, right| {
-            source_quality(&normalized_words(&left.text))
-                .partial_cmp(&source_quality(&normalized_words(&right.text)))
-                .unwrap_or(std::cmp::Ordering::Equal)
+        .filter(|source| {
+            quality_failure_reason(&source.text, std::slice::from_ref(*source)).is_none()
         })
+        .collect();
+    let source = match safe.as_slice() {
+        [] => None,
+        [only] => Some(*only),
+        [left, right, ..] => Some(
+            match select_better_source(
+                &normalized_words(&left.text),
+                &normalized_words(&right.text),
+            ) {
+                GateWinner::Left => *left,
+                GateWinner::Right => *right,
+            },
+        ),
+    };
+    let source = source
         .ok_or_else(|| {
             let validation_reason = format!("{reason}; neither Source Transcript is safe");
             BoundaryError::new(
@@ -923,8 +935,12 @@ fn is_stopword(word: &str) -> bool {
     STOPWORDS.contains(&word)
 }
 
-fn distinct_content_words(words: &[String]) -> HashSet<&String> {
-    words.iter().filter(|word| !is_stopword(word)).collect()
+fn distinct_content_words(words: &[String]) -> HashSet<&str> {
+    words
+        .iter()
+        .filter(|word| !is_stopword(word))
+        .map(String::as_str)
+        .collect()
 }
 
 /// A content-density quality score in [0, 1], used ONLY to break a
@@ -968,14 +984,117 @@ fn is_degenerate(words: &[String]) -> bool {
     content_fraction < 0.25 || distinct_content < 3
 }
 
+/// Two Source Transcripts of the same audio must agree on a meaningful share of
+/// content words. Below this containment (shared distinct content words over
+/// the smaller distinct-content set) they cannot both be transcriptions of the
+/// same speech: one of them is garbage, and merging would poison the result.
+const CONTENT_OVERLAP_FLOOR: f64 = 0.2;
+
+/// Sources with fewer distinct content words than this are too short for the
+/// cross-agreement gate to judge — two terse commands ("book the room" vs
+/// "schedule the review") can honestly share nothing, so they reconcile.
+const MIN_COMPARABLE_CONTENT: usize = 5;
+
+/// Cross-confirmation differences below this margin are noise, not a decision.
+const CONFIRMATION_MARGIN: f64 = 0.15;
+
+/// Evidence for choosing between two disagreeing Source Transcripts, ordered by
+/// robustness. `confirmation` and `cohesion` are the primary signals because
+/// neither can be inflated by a fluent salad: confirmation requires the OTHER
+/// source to agree, and cohesion requires revisiting a real topic term, which a
+/// stream of unique nonsense words never does.
+struct SourceEvidence {
+    /// Fraction of this source's content-word occurrences that appear in the
+    /// other source's distinct content vocabulary.
+    confirmation: f64,
+    /// Distinct content words this source returns to at non-adjacent positions.
+    cohesion: usize,
+    /// Intrinsic content-density score — a last-resort tiebreak only, because
+    /// it is the one signal a fluent salad can game.
+    quality: f64,
+}
+
+fn source_evidence(own: &[String], other: &[String]) -> SourceEvidence {
+    let other_content = distinct_content_words(other);
+    let content: Vec<&str> = own
+        .iter()
+        .filter(|word| !is_stopword(word))
+        .map(String::as_str)
+        .collect();
+    let confirmation = if content.is_empty() {
+        0.0
+    } else {
+        content
+            .iter()
+            .filter(|word| other_content.contains(**word))
+            .count() as f64
+            / content.len() as f64
+    };
+    SourceEvidence {
+        confirmation,
+        cohesion: topical_cohesion(own),
+        quality: source_quality(own),
+    }
+}
+
+/// Counts distinct content words a transcript returns to at separated
+/// positions. Real dictation revisits its topic terms ("cache ... cache
+/// invalidation"); a salad of unique words never does. Adjacent repeats are
+/// stutter, not cohesion, so they deliberately do not count.
+fn topical_cohesion(words: &[String]) -> usize {
+    let mut positions: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, word) in words.iter().enumerate() {
+        if !is_stopword(word) {
+            positions.entry(word.as_str()).or_default().push(index);
+        }
+    }
+    positions
+        .values()
+        .filter(|occurrences| {
+            occurrences
+                .windows(2)
+                .any(|pair| pair[1] - pair[0] > 1)
+        })
+        .count()
+}
+
+/// Chooses between two disagreeing Source Transcripts by ordered cross-source
+/// evidence, never by provider and never by an intrinsic score alone:
+/// cross-confirmation first, topical cohesion second, intrinsic content density
+/// last. On a full tie it keeps the later element — the same rare, low-stakes
+/// exact-tie behavior the fallback has always had.
+fn select_better_source(left: &[String], right: &[String]) -> GateWinner {
+    let left_evidence = source_evidence(left, right);
+    let right_evidence = source_evidence(right, left);
+    if (left_evidence.confirmation - right_evidence.confirmation).abs() > CONFIRMATION_MARGIN {
+        return if left_evidence.confirmation > right_evidence.confirmation {
+            GateWinner::Left
+        } else {
+            GateWinner::Right
+        };
+    }
+    if left_evidence.cohesion != right_evidence.cohesion {
+        return if left_evidence.cohesion > right_evidence.cohesion {
+            GateWinner::Left
+        } else {
+            GateWinner::Right
+        };
+    }
+    if left_evidence.quality > right_evidence.quality {
+        GateWinner::Left
+    } else {
+        GateWinner::Right
+    }
+}
+
 /// Decides whether to skip the LLM merge for two materially disagreeing Source
-/// Transcripts and select the better one. It gates ONLY on robust garbage
-/// signals — exactly one source is a degenerate filler/repetition loop, or one
-/// is a bare fragment (extreme length ratio) — never on a fine-grained quality
-/// ranking, which cannot reliably tell fluent nonsense from accurate text. When
-/// both sources are coherent (even if they disagree wildly, or one is fluent
-/// nonsense), it returns `None`: we cannot confidently rank them, so the honest
-/// choice is to let the reconciliation model decide.
+/// Transcripts and select the better one. It gates on three robust garbage
+/// signals: exactly one source is a degenerate filler/repetition loop, one is a
+/// bare fragment (extreme length ratio), or the two share near-zero content
+/// words despite comparable length — two transcriptions of the same audio
+/// cannot do that, so one is fluent nonsense or a word salad. Sources that
+/// clear all three (real disagreements over shared content) return `None` and
+/// go to the reconciliation model.
 fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
     let left_words = normalized_words(left);
     let right_words = normalized_words(right);
@@ -987,8 +1106,6 @@ fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
     let left_degenerate = is_degenerate(&left_words);
     let right_degenerate = is_degenerate(&right_words);
 
-    // Both coherent, or both garbage: no confident single winner to select, so
-    // reconcile rather than guess.
     if left_degenerate == right_degenerate {
         let length_ratio = fewer as f64 / more as f64;
         if length_ratio < DIVERGENCE_LENGTH_RATIO_FLOOR {
@@ -1006,6 +1123,34 @@ fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
                 ),
             });
         }
+        // Cross-agreement check (§3.4): two comparable-length, individually
+        // coherent transcriptions of the SAME audio must still agree on a
+        // meaningful share of content words. Near-zero agreement means one of
+        // them is garbage — fluent nonsense or a unique-word salad that no
+        // intrinsic check can flag — and an LLM merge would let it poison the
+        // result. Short pairs are exempt: terse commands can honestly share
+        // nothing.
+        if !left_degenerate {
+            let left_content = distinct_content_words(&left_words);
+            let right_content = distinct_content_words(&right_words);
+            let smaller_content = left_content.len().min(right_content.len());
+            if smaller_content >= MIN_COMPARABLE_CONTENT {
+                let shared = left_content.intersection(&right_content).count();
+                let overlap = shared as f64 / smaller_content as f64;
+                if overlap < CONTENT_OVERLAP_FLOOR {
+                    let winner = select_better_source(&left_words, &right_words);
+                    return Some(QualityGate {
+                        winner,
+                        reason: format!(
+                            "catastrophically divergent (cross-source content-word overlap {overlap:.2} below {CONTENT_OVERLAP_FLOOR:.2}); selected the Source Transcript better supported by cross-source evidence"
+                        ),
+                    });
+                }
+            }
+        }
+        // Sources agree enough to be transcriptions of the same speech (or are
+        // both garbage, or too short to judge): no confident single winner, so
+        // reconcile rather than guess.
         return None;
     }
 

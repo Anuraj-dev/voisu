@@ -758,28 +758,48 @@ async fn actor_loop(
                             record.error =
                                 Some(failure.error.public_message().to_owned());
                             record.recovery_attempted = recovering;
-                            // A provider whose start() failed never began: record
-                            // it NotStarted. Any provider that DID start before
-                            // the failure (e.g. Deepgram when Groq start fails) is
-                            // torn down without a Source Transcript, so record it
-                            // Aborted. Every configured provider ends with an
-                            // entry — no bare error with a silent absence.
+                            // Every configured provider ends this record with an
+                            // entry matching how far it actually reached — no
+                            // bare error with a silent absence, even when
+                            // capture itself failed before any provider began.
+                            // The provider whose start() failed and any provider
+                            // never reached are NotStarted; a provider whose
+                            // stream DID start before the failure (e.g. Deepgram
+                            // when Groq start fails) is torn down without a
+                            // Source Transcript, so it is Aborted.
                             if let Some(provider) = failure.failed_provider {
                                 record.provider_failures.push(ProviderFailure::new(
                                     provider,
                                     ProviderFailureStage::NotStarted,
                                     failure.error.diagnostic().to_owned(),
                                 ));
-                                let started = failure.provider_stream.is_some();
-                                account_for_missing_providers(
-                                    &record.source_transcripts,
-                                    &mut record.provider_failures,
-                                    if started {
-                                        "provider stream started but the Recording was aborted during startup"
-                                    } else {
-                                        "provider not reached; startup aborted before it began"
-                                    },
-                                );
+                            }
+                            let started_provider = failure
+                                .provider_stream
+                                .as_ref()
+                                .map(|stream| stream.provider());
+                            for provider in [Provider::Deepgram, Provider::Groq] {
+                                if record
+                                    .provider_failures
+                                    .iter()
+                                    .any(|failure| failure.provider == provider)
+                                {
+                                    continue;
+                                }
+                                let (stage, diagnostic) = if started_provider == Some(provider) {
+                                    (
+                                        ProviderFailureStage::Aborted,
+                                        "provider stream started but the Recording was aborted during startup",
+                                    )
+                                } else {
+                                    (
+                                        ProviderFailureStage::NotStarted,
+                                        "provider not reached; startup aborted before it began",
+                                    )
+                                };
+                                record.provider_failures.push(ProviderFailure::new(
+                                    provider, stage, diagnostic,
+                                ));
                             }
                             if let Err(error) = diagnostics.record(record) {
                                 eprintln!(
@@ -1492,8 +1512,10 @@ async fn process_recording(
 
 /// Enforces the no-silent-absence invariant: every configured provider must end
 /// a Recording with either a Source Transcript or a failure entry. Any provider
-/// with neither (torn down by a capture abort, a shutdown mid-start, or the
-/// other provider's start failure) is recorded as Aborted with the cause.
+/// with neither (torn down by a capture abort or a shutdown mid-start — its
+/// stream HAD started) is recorded as Aborted with the cause. Start-sequence
+/// failures do their own accounting, because a provider never reached there is
+/// NotStarted, not Aborted.
 fn account_for_missing_providers(
     source_records: &[SourceTranscriptRecord],
     provider_failures: &mut Vec<ProviderFailure>,
@@ -1942,6 +1964,7 @@ async fn serve(stream: UnixStream, actor: mpsc::Sender<ActorMessage>) -> Result<
 }
 
 struct ControlledCapture {
+    fail_begin_once: bool,
     finish_failures_remaining: u32,
     recording_outcome_once: Option<String>,
     fail_abort: bool,
@@ -1967,6 +1990,7 @@ impl ControlledCapture {
             .unwrap_or(1);
         let chunk_delay = env_millis("VOISU_TEST_CHUNK_DELAY_MS");
         Self {
+            fail_begin_once: std::env::var_os("VOISU_TEST_CAPTURE_BEGIN_FAILURE").is_some(),
             finish_failures_remaining: std::env::var("VOISU_TEST_CAPTURE_FINISH_FAILURES")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -1987,6 +2011,12 @@ impl ControlledCapture {
 
 impl AudioCapture for ControlledCapture {
     fn begin(&mut self, _recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError> {
+        if std::mem::take(&mut self.fail_begin_once) {
+            return Err(BoundaryError::new(
+                BoundaryKind::Capture,
+                "controlled-capture-begin-detail",
+            ));
+        }
         let fail_finish = self.finish_failures_remaining > 0;
         self.finish_failures_remaining = self.finish_failures_remaining.saturating_sub(1);
         let recording_outcome = self.recording_outcome_once.take();
@@ -2110,10 +2140,15 @@ impl ControlledProvider {
             env_millis("VOISU_TEST_PROVIDER_DELAY_MS")
         };
         let send_stall = env_millis("VOISU_TEST_PROVIDER_SEND_STALL_MS");
-        // Only Groq fails its start, so capture and Deepgram are already started
-        // when the partial-start-failure abort path is exercised.
-        let fail_start_once = provider == Provider::Groq
-            && std::env::var_os("VOISU_TEST_PROVIDER_START_FAILURE").is_some();
+        // "deepgram" fails the FIRST provider start (nothing but capture is
+        // running yet); any other value fails Groq, so capture and Deepgram are
+        // already started when the partial-start-failure abort path is
+        // exercised.
+        let fail_start_once = match std::env::var("VOISU_TEST_PROVIDER_START_FAILURE") {
+            Ok(target) if target == "deepgram" => provider == Provider::Deepgram,
+            Ok(_) => provider == Provider::Groq,
+            Err(_) => false,
+        };
         let fail_abort = std::env::var_os("VOISU_TEST_PROVIDER_ABORT_FAILURE").is_some();
         let targets = |name: &str| {
             std::env::var(name).ok().is_some_and(|value| {

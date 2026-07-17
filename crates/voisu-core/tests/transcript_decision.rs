@@ -289,9 +289,9 @@ async fn a_fragment_source_is_gated_by_length_ratio_not_merged() {
 
 #[tokio::test]
 async fn clean_source_fallback_selects_by_quality_not_a_fixed_provider() {
-    // Finding 1: two coherent sources disagree (so they reconcile, not gate),
-    // reconciliation then FAILS, and the clean-source fallback must select the
-    // higher-quality source — here the content-rich Deepgram source — NOT Groq
+    // Two overlapping sources disagree (one is riddled with stutter, so they
+    // reconcile rather than gate), reconciliation then FAILS, and the
+    // clean-source fallback must select the cleaner Deepgram source — NOT Groq
     // by a fixed max-provider preference.
     let mut pipeline =
         TranscriptDecisionPipeline::new(FailingReconcileModel, Duration::from_millis(50));
@@ -304,7 +304,7 @@ async fn clean_source_fallback_selects_by_quality_not_a_fixed_provider() {
             },
             SourceTranscript {
                 provider: Provider::Groq,
-                text: "We should probably move the meeting to another day and tell the whole team about the schedule change fairly soon.".to_owned(),
+                text: "Deploy the the Kubernetes cluster with with twelve worker nodes nodes and sixty four gigabytes of memory per node node for the the production workload.".to_owned(),
             },
         ])
         .await
@@ -320,26 +320,28 @@ async fn clean_source_fallback_selects_by_quality_not_a_fixed_provider() {
 }
 
 #[tokio::test]
-async fn unique_word_salad_does_not_beat_repetitive_technical_dictation() {
-    // Finding 2: accurate dictation that repeats a real content word ("cache")
-    // must NOT lose to a grammatical all-unique-word salad. Both are coherent
-    // (neither degenerate), so the gate must decline and reconcile rather than
-    // deliver the salad without a merge (the old type-token-ratio score let the
-    // unique salad win outright).
-    let kinds = Arc::new(Mutex::new(Vec::new()));
+async fn unique_word_salad_with_no_cross_agreement_is_gated_and_dictation_wins() {
+    // §3.4: a fluent all-unique-word salad shares NO content words with the
+    // other source — two transcriptions of the same audio cannot diverge that
+    // far, so one of them is garbage and the pair must NOT be LLM-merged (the
+    // salad would poison the Merge Result). The winner must be the repetitive
+    // technical dictation: its revisited topic terms ("cache ... cache
+    // invalidation") are cohesion evidence a salad of unique words cannot fake,
+    // while an intrinsic uniqueness-rewarding score would pick the salad.
+    let calls = Arc::new(AtomicUsize::new(0));
     let mut pipeline = TranscriptDecisionPipeline::new(
-        SuccessfulModel {
-            kinds: Arc::clone(&kinds),
-            text: "The cache stores the value.".to_owned(),
+        CountingModel {
+            calls: Arc::clone(&calls),
         },
         Duration::from_millis(50),
     );
 
+    let dictation = "The cache stores the value, then the cache invalidation clears the cache, and the cache reloads the value from the cache after the cache miss occurs repeatedly.";
     let decision = pipeline
         .decide(vec![
             SourceTranscript {
                 provider: Provider::Deepgram,
-                text: "The cache stores the value, then the cache invalidation clears the cache, and the cache reloads the value from the cache after the cache miss occurs repeatedly.".to_owned(),
+                text: dictation.to_owned(),
             },
             SourceTranscript {
                 provider: Provider::Groq,
@@ -349,15 +351,62 @@ async fn unique_word_salad_does_not_beat_repetitive_technical_dictation() {
         .await
         .unwrap();
 
-    assert_eq!(decision.selection, TranscriptSelection::Reconciled);
-    assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a zero-agreement pair must never reach the merge model"
+    );
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(decision.transcript.0, dictation);
+    let reason = decision.fallback_reason.expect("gate records a fallback reason");
+    assert!(
+        reason.contains("catastrophically divergent"),
+        "the gate must ground the selection in cross-source divergence: {reason}"
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_failure_fallback_is_not_gamed_by_a_partially_overlapping_salad() {
+    // §3.4 fallback path: the salad shares just enough content words ("cache",
+    // "value") with the dictation to slip past the divergence gate, the pair
+    // reconciles, and reconciliation FAILS. The clean-source fallback must not
+    // rank by an intrinsic score a unique-word salad inflates — it must select
+    // the source whose content the OTHER source confirms: the dictation's words
+    // are heavily confirmed by the salad's stolen terms, while the salad's
+    // remaining vocabulary is confirmed by nothing.
+    let mut pipeline =
+        TranscriptDecisionPipeline::new(FailingReconcileModel, Duration::from_millis(50));
+
+    let dictation = "The cache stores the value, then the cache invalidation clears the cache, and the cache reloads the value from the cache after the cache miss occurs repeatedly.";
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: dictation.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Purple mountains dance quietly beneath the whispering violet cache clouds while seven curious otters juggle the glowing value lanterns across the frozen meadow tonight.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert!(decision.reconciliation_requested, "the pair must reach reconciliation first");
+    assert_eq!(
+        decision.selection,
+        TranscriptSelection::SourceDeepgram,
+        "the fallback must deliver the cross-confirmed dictation, never the salad"
+    );
+    assert_eq!(decision.transcript.0, dictation);
+    assert!(decision.fallback_reason.unwrap().contains("cloud reconciliation failed"));
 }
 
 #[tokio::test]
 async fn legitimate_repetitive_jargon_is_not_flagged_degenerate() {
-    // Finding 2: jargon-heavy dictation that repeats real terms ("kubelet",
-    // "pod") must not be mistaken for a degenerate loop and gated away. Paired
-    // with a different coherent source, it must reconcile.
+    // Jargon-heavy dictation that repeats real terms ("kubelet", "pod") must
+    // not be mistaken for a degenerate loop and gated away. Paired with a
+    // coherent source that shares part of its content, it must reconcile.
     let kinds = Arc::new(Mutex::new(Vec::new()));
     let mut pipeline = TranscriptDecisionPipeline::new(
         SuccessfulModel {
@@ -375,7 +424,7 @@ async fn legitimate_repetitive_jargon_is_not_flagged_degenerate() {
             },
             SourceTranscript {
                 provider: Provider::Groq,
-                text: "Redis stores the session token until the gateway validates the request and forwards it to the upstream service pool.".to_owned(),
+                text: "Redis stores the session token until the scheduler gateway validates the pod request and forwards it to the upstream node pool.".to_owned(),
             },
         ])
         .await
@@ -421,25 +470,26 @@ async fn common_word_repetition_salad_is_gated_not_merged() {
 }
 
 #[tokio::test]
-async fn divergent_but_equally_healthy_sources_degrade_to_the_merge() {
-    // Finding 4: the two sources disagree wildly (near-zero content overlap) but
-    // are BOTH fluent and healthy — one is accurate, the other fluent nonsense.
-    // Cheap heuristics cannot tell which is garbage, so the gate must decline and
-    // let the reconciliation model decide rather than force a fixed provider.
-    let kinds = Arc::new(Mutex::new(Vec::new()));
+async fn fluent_nonsense_with_no_cross_agreement_is_gated_not_merged() {
+    // §3.4: one provider hallucinated a FLUENT, grammatical paragraph that
+    // shares no content words with the accurate source. Merging would let the
+    // nonsense poison the Merge Result, so the pair must be gated without ever
+    // asking the model, and the source the evidence supports — the one that
+    // revisits its own topic terms — must be selected.
+    let calls = Arc::new(AtomicUsize::new(0));
     let mut pipeline = TranscriptDecisionPipeline::new(
-        SuccessfulModel {
-            kinds: Arc::clone(&kinds),
-            text: "The async function returns a promise that resolves to a JSON payload.".to_owned(),
+        CountingModel {
+            calls: Arc::clone(&calls),
         },
         Duration::from_millis(50),
     );
 
+    let accurate = "The async function returns a promise that resolves to a JSON payload, and the promise rejects when serde fails, so we deserialize with serde and match the enum variant.";
     let decision = pipeline
         .decide(vec![
             SourceTranscript {
                 provider: Provider::Deepgram,
-                text: "The async function returns a promise that resolves to a JSON payload and we deserialize it with serde before matching the enum variant.".to_owned(),
+                text: accurate.to_owned(),
             },
             SourceTranscript {
                 provider: Provider::Groq,
@@ -449,10 +499,16 @@ async fn divergent_but_equally_healthy_sources_degrade_to_the_merge() {
         .await
         .unwrap();
 
-    assert_eq!(decision.selection, TranscriptSelection::Reconciled);
-    assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
-    assert!(decision.reconciliation_requested);
-    assert!(decision.fallback_reason.is_none());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "fluent nonsense must not reach the merge model"
+    );
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(decision.transcript.0, accurate);
+    assert!(!decision.reconciliation_requested);
+    let reason = decision.fallback_reason.expect("gate records a fallback reason");
+    assert!(reason.contains("catastrophically divergent"), "{reason}");
 }
 
 #[tokio::test]

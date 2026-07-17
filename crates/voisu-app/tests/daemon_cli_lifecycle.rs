@@ -5675,6 +5675,89 @@ fn provider_start_failure_records_both_providers_in_history() {
 }
 
 #[test]
+fn capture_begin_failure_records_every_provider_as_not_started() {
+    // §3.5: capture's begin() fails before ANY provider was reached. The
+    // persisted record must still carry an entry per configured provider —
+    // both not_started — never a bare capture error with silent provider
+    // absence.
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_CAPTURE_BEGIN_FAILURE", "1")],
+    );
+
+    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    assert_eq!(started["ok"], false, "{started}");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        let found = history["history"].as_array().unwrap().iter().any(|record| {
+            record["provider_failures"]
+                .as_array()
+                .is_some_and(|failures| {
+                    failures.len() == 2
+                        && ["deepgram", "groq"].iter().all(|provider| {
+                            failures.iter().any(|failure| {
+                                failure["provider"] == *provider
+                                    && failure["stage"] == "not_started"
+                            })
+                        })
+                })
+        });
+        if found {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a capture begin failure must record every provider as not_started: {history}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn deepgram_start_failure_records_unreached_groq_as_not_started() {
+    // §3.5: Deepgram's start() fails FIRST, so Groq is never reached — it must
+    // be recorded not_started (it never began), not aborted (nothing of it
+    // existed to abort).
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_PROVIDER_START_FAILURE", "deepgram")],
+    );
+
+    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    assert_eq!(started["ok"], false, "{started}");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        let found = history["history"].as_array().unwrap().iter().any(|record| {
+            record["provider_failures"]
+                .as_array()
+                .is_some_and(|failures| {
+                    let deepgram = failures.iter().any(|failure| {
+                        failure["provider"] == "deepgram" && failure["stage"] == "not_started"
+                    });
+                    let groq = failures.iter().any(|failure| {
+                        failure["provider"] == "groq" && failure["stage"] == "not_started"
+                    });
+                    deepgram && groq
+                })
+        });
+        if found {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "an unreached provider must be recorded not_started, never aborted: {history}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn capture_finalization_failure_records_all_providers_in_history() {
     // Finding 4: when capture finalization fails, no completion runs, yet both
     // providers were started. History must record each as aborted rather than
