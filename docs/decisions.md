@@ -271,3 +271,21 @@ as real nova-3 websocket streaming (batch-on-finalize rejected: doubles
 release latency; dropping it rejected: Raja keeps the second opinion and will
 rotate credit accounts) and must stay disableable (only non-free component).
 Full spec: docs/specs/2026-07-17-transcription-accuracy.md
+
+## 2026-07-17 — Latency optimization effort: Deepgram toggle, FLAC, keep curl, fix delivery
+**Why:** `voisu history` recs 20–39 showed the release-to-text tail is ~1889 ms
+with Deepgram vs ~690 ms Groq-only (~400 ms floor). Deepgram gates the
+wait-for-both barrier 12/12 times and its 282 ms RTT from India is structural,
+not code-fixable; reconciliation also strips proper nouns. Four decisions
+(grilling with Raja): **(D1)** Deepgram becomes a default-off runtime toggle
+(`voisu deepgram on|off`, persisted) — evaluate Groq-only live, then finalize
+delete-vs-keep, rather than a blind deletion; harmonizes with the accuracy map
+which already required Deepgram be disableable. **(D2)** Keep `curl`; defer TLS
+warm-up + pooled reqwest client to future ambition (the ~70 ms win isn't worth
+ripping out the curl security sandbox + a security re-review now). **(D3)** FLAC
+lossless upload, not Opus — zero WER risk against the ≤10% bar. **(D4)** Fix
+direct-typing delivery (`fix/delivery-keymap-fd`) first; auto-paste keystroke
+synthesis only as 2nd-best if direct-typing is unreliable on the host. Sequenced
+AFTER the accuracy branch integrates (shared `system.rs`/`lib.rs`/daemon files).
+Full plan: `docs/specs/2026-07-17-latency-optimization.md`; map + tickets:
+`.scratch/voisu-latency/`.

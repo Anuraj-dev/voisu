@@ -20,3 +20,5 @@
 | ../CONTEXT.md | Ubiquitous domain language with banned synonyms |
 | ../.scratch/voisu-spec/ | Approved product specification |
 | ../.scratch/voisu-implementation/issues/ | Ten ordered implementation tickets |
+| specs/2026-07-17-latency-optimization.md | Latency effort plan (Deepgram toggle, FLAC, delivery fix) |
+| ../.scratch/voisu-latency/ | Latency wayfinder map + tickets 01–05 |
