@@ -80,7 +80,7 @@ impl ServiceFixture {
     }
 
     fn run(&self, arguments: &[&str]) -> Output {
-        self.command(arguments).output().unwrap()
+        output_retrying(&mut self.command(arguments))
     }
 
     fn unit_path(&self) -> PathBuf {
@@ -310,6 +310,21 @@ sys.exit(0)
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+/// Retries exec on ETXTBSY: a concurrent test's fork can inherit this
+/// fixture's freshly copied binary while it is still open for write, making
+/// the exec fail with "Text file busy" until that child completes its own exec.
+fn output_retrying(command: &mut Command) -> Output {
+    for _ in 0..100 {
+        match command.output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            result => return result.unwrap(),
+        }
+    }
+    command.output().unwrap()
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -454,11 +469,9 @@ fn overlay_enable_failure_does_not_fail_daemon_service_install() {
     fixture.install_packaged_unit();
     fixture.install_packaged_overlay_unit();
 
-    let installed = fixture
-        .command(&["service", "install"])
-        .env("FAKE_SYSTEMCTL_FAIL_UNIT", "voisu-overlay.service")
-        .output()
-        .unwrap();
+    let mut install = fixture.command(&["service", "install"]);
+    install.env("FAKE_SYSTEMCTL_FAIL_UNIT", "voisu-overlay.service");
+    let installed = output_retrying(&mut install);
 
     assert!(installed.status.success(), "{}", stderr(&installed));
     assert!(
@@ -968,11 +981,9 @@ fn overlay_disable_failure_does_not_fail_daemon_service_uninstall() {
     fixture.install_packaged_unit();
     fixture.install_packaged_overlay_unit();
 
-    let removed = fixture
-        .command(&["service", "uninstall"])
-        .env("FAKE_SYSTEMCTL_FAIL_UNIT", "voisu-overlay.service")
-        .output()
-        .unwrap();
+    let mut uninstall = fixture.command(&["service", "uninstall"]);
+    uninstall.env("FAKE_SYSTEMCTL_FAIL_UNIT", "voisu-overlay.service");
+    let removed = output_retrying(&mut uninstall);
 
     assert!(removed.status.success(), "{}", stderr(&removed));
     assert!(
