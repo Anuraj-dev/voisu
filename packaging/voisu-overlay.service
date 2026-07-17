@@ -1,0 +1,12 @@
+[Unit]
+Description=Voisu overlay observer
+PartOf=graphical-session.target
+After=voisu.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/voisu-overlay --supervise
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

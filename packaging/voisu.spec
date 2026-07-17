@@ -57,6 +57,7 @@ Summary:        Optional GTK4 Voisu Overlay
 Requires:       %{name}%{?_isa} = %{version}-%{release}
 Requires:       gtk4%{?_isa}
 Requires:       gtk4-layer-shell%{?_isa}
+%{?systemd_requires}
 
 %description overlay
 Optional observer-only GTK4 Overlay feedback for Voisu. The base package is
@@ -87,6 +88,7 @@ install -D -m 0755 target/release/voisu %{buildroot}%{_bindir}/voisu
 install -D -m 0755 target/release/voisu-daemon %{buildroot}%{_bindir}/voisu-daemon
 install -D -m 0755 target/release/voisu-overlay %{buildroot}%{_bindir}/voisu-overlay
 install -D -m 0644 packaging/voisu.service %{buildroot}%{_userunitdir}/voisu.service
+install -D -m 0644 packaging/voisu-overlay.service %{buildroot}%{_userunitdir}/voisu-overlay.service
 
 %post
 %systemd_user_post voisu.service
@@ -97,6 +99,15 @@ install -D -m 0644 packaging/voisu.service %{buildroot}%{_userunitdir}/voisu.ser
 %postun
 %systemd_user_postun voisu.service
 
+%post overlay
+%systemd_user_post voisu-overlay.service
+
+%preun overlay
+%systemd_user_preun voisu-overlay.service
+
+%postun overlay
+%systemd_user_postun voisu-overlay.service
+
 %files
 %license LICENSE
 %doc README.md
@@ -106,6 +117,7 @@ install -D -m 0644 packaging/voisu.service %{buildroot}%{_userunitdir}/voisu.ser
 
 %files overlay
 %{_bindir}/voisu-overlay
+%{_userunitdir}/voisu-overlay.service
 
 %changelog
 * Thu Jul 16 2026 Voisu maintainers <voisu@example.invalid> - 0.1.0-1

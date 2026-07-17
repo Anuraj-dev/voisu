@@ -2,86 +2,43 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-17
 
 ## 🚧 In progress / next
-- **Overlay toolkit LOCKED: keep GTK4 + gtk4-layer-shell; do NOT migrate to Electron** (2026-07-17,
-  evidence-backed — see decisions.md + session log). Electron has no wlr-layer-shell on Wayland
-  (`setAlwaysOnTop` no-op, positioning broken); HyprVox's Electron overlay only works via forced XWayland
-  + Hyprland window rules + a rich React waveform — none of which transfer to Voisu's KWin/layer-shell/
-  disposable-capsule/Rust context.
-- **ACTIVE: the installed Overlay does not appear on `voisu toggle`** on Raja's live Fedora KDE/Wayland
-  desktop. Diagnosing now (drive `voisu toggle`, read journal/stderr, root-cause) to produce a detailed
-  fix-prompt for a separate agent. See session log 2026-07-17.
-- Ticket 13 is MERGED and the live desktop smoke PASSED (`57eb284`; PR #21; issue #13 closed; CI green at
-  `73f5727`). Real provider credentials set and verified (`auth verify` green for groq + deepgram).
-- Then: remaining PENDING release-evidence rows (portal revocation, login start, upgrade/removal, explicit
-  fallback scenarios). Final benchmark report is written (`docs/model-benchmark.md`). APT/DEB packaging is
-  out of scope for this release.
+- **Overlay login-start fix is implemented and review-clean but uncommitted.** Next: commit the tested tree when Raja approves, rebuild the exact RPM, install base + optional Overlay RPMs, rerun `voisu service install`, then observe a real logout/login and capsule rendering on KWin.
+- Host acceptance still required: `voisu-overlay --supervise` active after login; Recording → Processing → Success/Failure → hidden Idle; kill the Overlay mid-Recording and prove daemon/Transcript/Delivery independence; clean uninstall/removal.
+- Remaining release evidence after that: portal revocation, upgrade/removal, and explicit fallback scenarios. APT/DEB remains out of scope.
 
 ## Status
-- `voisu` and `voisu-daemon` communicate over bounded, versioned Unix IPC; the actor keeps status
-  responsive while capture, provider completion, reconciliation, validation, and Delivery run behind
-  owned boundaries.
-- PipeWire capture streams one-second Deepgram chunks and bounded overlapping Groq WAV chunks
-  concurrently under one Provider Deadline; cancellation owns, kills, reaps, and awaits every child.
-- The Transcript pipeline selects near agreement, reconciles material disagreement, applies guardrails,
-  permits one bounded repair, and otherwise falls back to a clean Source Transcript or reports a Quality
-  Failure. Only the final Transcript reaches Delivery.
-- Packaged-unit detection asks systemd for the EFFECTIVE unit and handles the Ticket 09 XDG stale-shadow
-  case with strict conservative ExecStart parsing (see `docs/packaging-fedora.md`).
-- The Fedora RPM (base GTK-free + optional overlay subpackage) is fully proven: reproducible exact-commit
-  vendored build, `%check` release suite in rpmbuild, rpmlint clean, smoke-harness artifact binding, and
-  the live desktop Recording→Delivery smoke (see `docs/release-evidence.md`).
-- **Live-desktop fixes (2026-07-17, all RED-proven then verified on real hardware):**
-  - `f876425` — `wl-copy` forks a clipboard-serving child that inherits the parent's pipes; draining
-    stderr misread the healthy case as a timeout. wl-copy now runs via `run_restricted_serving`
-    (discards output, trusts the parent's exit status).
-  - `73f5727` — real `pw-record` catches SIGINT and exits 1 silently instead of dying by the signal, so
-    every live graceful stop failed. A nonzero exit is accepted only when the child was still alive at
-    the interrupt AND stderr is empty; a capture already dead before stop still fails and never delivers.
-    Realistic test fakes now `exit 1` on INT (clearing the wrapper's EXIT trap so the status survives).
-  - `fedora-smoke.sh` — `rpm -q` prints "package … is not installed" to stdout; the harness captured it
-    as a NEVRA and tripped the clobber guard on fresh hosts. Queries now branch on rpm's exit code.
-- Current gates: `cargo test --workspace` — 216 passed, 2 ignored, 0 failed (3 consecutive clean full
-  runs); host rpmbuild + rpmlint + live smoke all PROVEN at `73f5727`.
+- The optional Overlay RPM now owns `/usr/bin/voisu-overlay` and `/usr/lib/systemd/user/voisu-overlay.service`; the unit runs `--supervise`, belongs independently to `graphical-session.target`, and has ordering but no dependency on `voisu.service`.
+- `voisu service install|uninstall` best-effort enables/starts or disables/stops the Overlay only when systemd's effective fragment remains packaged and `ExecStart` runs only `/usr/bin/voisu-overlay`. Overlay failures are warnings; required daemon results remain authoritative. `service start|stop|restart` remain daemon-only.
+- The Fedora smoke harness now snapshots and restores optional Overlay enablement/active state when `voisu-overlay` was already installed.
+- Review: Fable 5 was unavailable after retries (`502 unknown provider`). Raja approved GPT-5.6 Sol fallback; the first high-effort review found two medium issues (user-unit shadow trust and smoke state leakage), both fixed test-first; medium re-review returned `NO FINDINGS`.
+- Automated gates: `cargo test --workspace` — 221 passed, 2 live tests ignored, 0 failed; GTK-free workspace check and `cargo check -p voisu-app --features overlay` pass; `bash -n`, `rpmspec -P`, `systemd-analyze verify`, and `git diff --check` pass.
+- Existing daemon path remains reliable: bounded versioned IPC, dual-provider Recording pipeline, validated Transcript decision, portal-mediated Delivery with clipboard preservation, and graphical-session-owned `voisu.service`.
 
 ## Architecture map
-- Domain, IPC, lifecycle/Delivery evidence, provider coordination, decision pipeline -> `crates/voisu-core/src/lib.rs`
-- Fedora adapters: PipeWire, providers, clipboard, zbus portals, native libei -> `crates/voisu-app/src/system.rs`
-- systemd user-service installation, lifecycle, ownership/IPC reporting -> `crates/voisu-app/src/service.rs`
-- Fedora RPM spec, exact-commit build, and smoke harness -> `packaging/`; install/upgrade/removal
-  procedure -> `docs/packaging-fedora.md`
-- Release evidence matrix and host checklist -> `docs/release-evidence.md`
-- Headless Overlay backend selection and restart policy -> `crates/voisu-app/src/feedback.rs`
-- Overlay presentation controller -> `crates/voisu-app/src/overlay.rs`
-- GTK Overlay runtime adapter and observer-only status polling -> `crates/voisu-app/src/bin/voisu-overlay.rs`
-- Lifecycle actor -> `crates/voisu-app/src/bin/voisu-daemon.rs`
+- Domain, IPC, Transcript decision, diagnostics -> `crates/voisu-core/src/lib.rs`
+- Fedora capture/provider/clipboard/portal/libei adapters -> `crates/voisu-app/src/system.rs`
+- Daemon + optional Overlay user-service lifecycle -> `crates/voisu-app/src/service.rs`
 - Public CLI -> `crates/voisu-app/src/bin/voisu.rs`
-- Ordered implementation tickets -> `.scratch/voisu-implementation/issues/`
+- GTK Overlay observer/runtime -> `crates/voisu-app/src/bin/voisu-overlay.rs`
+- Overlay presentation + restart policy -> `crates/voisu-app/src/overlay.rs`, `crates/voisu-app/src/feedback.rs`
+- RPM units/spec/build/smoke -> `packaging/`
+- Approved design/plan -> `docs/superpowers/specs/2026-07-17-overlay-login-start-design.md`, `docs/superpowers/plans/2026-07-17-overlay-login-start.md`
+- Fedora procedure/evidence -> `docs/packaging-fedora.md`, `docs/release-evidence.md`
 
 ## Stack & run
-- Stack: Rust 2024 + Tokio + serde + zbus 5 + GTK4 (opt-in) + runtime libei · Run:
-  `cargo run -p voisu-app --bin voisu-daemon` · Test: `cargo test --workspace`
+- Stack: Rust 2024 + Tokio + serde + zbus 5 + GTK4 (opt-in) + runtime libei · Run: `cargo run -p voisu-app --bin voisu-daemon` · Test: `cargo test --workspace`
 
 ## Key decisions (top 3–5)
-- Portals are the only normal Fedora path for global shortcuts and input emulation; no raw devices or `uinput`.
-- Only a validated final Transcript crosses the Delivery boundary, and clipboard preservation gates
-  compositor submission.
-- External tools are judged by their REAL behavior, not their documented one: `wl-copy` serves via a
-  pipe-holding fork (never capture its output), and `pw-record` exits 1 silently on SIGINT (accepted
-  only as a live interrupt with empty stderr).
-- Overlay presentation is observer-only and may disappear; the daemon lifecycle never depends on it.
-- The Fedora release uses one GTK-free base RPM plus an optional Overlay subpackage; `Cargo.lock`, an
-  exact-commit vendor archive, and `--offline` bind the tested source to a reproducible RPM build.
-- RPM removal follows desktop-user `voisu service uninstall` before `dnf remove`, because per-user
-  systemd scriptlets cannot reliably clear a running unit or enablement under `~/.config`.
+- Overlay presentation is observer-only and disposable; daemon lifecycle, Recording, Transcript production, and Delivery never depend on it.
+- Keep GTK4 + gtk4-layer-shell for the real KWin layer-shell surface; do not migrate to Electron/XWayland hacks.
+- Start the optional Overlay through its own graphical-session user unit; integrate setup into existing `voisu service install|uninstall` as non-fatal best-effort behavior.
+- Trust effective systemd state, not only an on-disk packaged filename; user-owned Overlay shadows or command overrides are not managed automatically.
+- Portals are the normal Fedora path for Trigger Key and direct Delivery; no raw input devices or `uinput`.
 
 ## Gotchas
-- Use `CONTEXT.md` terms exactly; several ordinary synonyms are banned.
-- Default workspace builds are GTK-free; compile the optional Overlay with
-  `cargo check -p voisu-app --features overlay`.
-- This managed sandbox denies Unix-domain and private D-Bus socket binds with `EPERM`; run socket-heavy
-  acceptance on the host/orchestrator.
-- `rustfmt` and `clippy` are unavailable (`cargo fmt` is not installed).
-- CI shared runners flake on timing-bound tests (~600ms kill bounds, service-readiness polls) under
-  load; rerun before diagnosing.
-- The `claude` sandbox shells have no TTY: interactive `sudo` is impossible — Raja runs sudo-needing
-  commands himself in Konsole (`|& tee /tmp/…log` so the orchestrator can read the result).
+- Use `CONTEXT.md` terms exactly; ordinary synonyms are intentionally banned.
+- Default workspace builds are GTK-free; compile the optional Overlay with `cargo check -p voisu-app --features overlay`.
+- `packaging/build-rpm.sh` refuses a dirty checkout and binds artifacts to the checked-out commit; no exact RPM rebuild until the tested changes are committed.
+- This sandbox denies Unix-domain/private D-Bus binds and cannot perform interactive sudo or a real graphical-login observation. Raja runs host commands in Konsole with `|& tee /tmp/...log`.
+- `--report-backend` proves backend selection, not KWin acceptance; only a visible capsule proves the mapped layer-shell surface.
+- `rustfmt` and `clippy` are unavailable.

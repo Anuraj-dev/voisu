@@ -14,6 +14,8 @@ use voisu_core::{
 use crate::process::guard_external_child;
 
 const UNIT_NAME: &str = "voisu.service";
+const OVERLAY_UNIT_NAME: &str = "voisu-overlay.service";
+const OVERLAY_EXECUTABLE: &str = "/usr/bin/voisu-overlay";
 const SYSTEMCTL_DEADLINE: Duration = Duration::from_secs(5);
 const SERVICE_TRANSITION_DEADLINE: Duration = Duration::from_secs(3);
 const IPC_DEADLINE: Duration = Duration::from_millis(300);
@@ -69,15 +71,131 @@ enum DaemonIpc {
     Unavailable,
 }
 
+#[derive(Clone, Copy)]
+enum OptionalOverlayAction {
+    Enable,
+    Disable,
+}
+
 pub fn manage_user_service(action: UserServiceAction) -> Result<UserServiceReport, String> {
     match action {
-        UserServiceAction::Install => install(),
+        UserServiceAction::Install => {
+            let report = install()?;
+            Ok(append_optional_overlay_report(
+                report,
+                manage_optional_overlay(OptionalOverlayAction::Enable),
+            ))
+        }
         UserServiceAction::Start => start(),
         UserServiceAction::Stop => stop(),
         UserServiceAction::Restart => restart(),
         UserServiceAction::Status => status(),
-        UserServiceAction::Uninstall => uninstall(),
+        UserServiceAction::Uninstall => {
+            let overlay_message = manage_optional_overlay(OptionalOverlayAction::Disable);
+            let report = uninstall()?;
+            Ok(append_optional_overlay_report(report, overlay_message))
+        }
     }
+}
+
+fn manage_optional_overlay(action: OptionalOverlayAction) -> Option<String> {
+    if !packaged_overlay_unit_exists() {
+        return None;
+    }
+    if let Err(reason) = validate_effective_overlay_unit() {
+        return Some(format!(
+            "warning: optional Overlay service was not managed: {reason}"
+        ));
+    }
+
+    let (arguments, success_message, failure_prefix): (&[&str], &str, &str) = match action {
+        OptionalOverlayAction::Enable => (
+            &["enable", "--now", OVERLAY_UNIT_NAME],
+            "optional Overlay service enabled and started",
+            "optional Overlay service was not enabled",
+        ),
+        OptionalOverlayAction::Disable => (
+            &["disable", "--now", OVERLAY_UNIT_NAME],
+            "optional Overlay service disabled and stopped",
+            "optional Overlay service was not disabled",
+        ),
+    };
+
+    Some(match systemctl_required(arguments) {
+        Ok(()) => success_message.to_owned(),
+        Err(error) => format!("warning: {failure_prefix}: {error}"),
+    })
+}
+
+fn packaged_overlay_unit_exists() -> bool {
+    packaged_unit_dirs().into_iter().any(|directory| {
+        let path = directory.join(OVERLAY_UNIT_NAME);
+        fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+    })
+}
+
+fn validate_effective_overlay_unit() -> Result<(), String> {
+    let output = systemctl(&[
+        "show",
+        OVERLAY_UNIT_NAME,
+        "-p",
+        "LoadState",
+        "-p",
+        "FragmentPath",
+        "-p",
+        "ExecStart",
+    ])?;
+    if !output.success {
+        return Err("systemd could not resolve the effective unit".to_owned());
+    }
+
+    let mut load_state = None;
+    let mut fragment = None;
+    let mut exec_lines = Vec::new();
+    for line in output.stdout.lines() {
+        if let Some(value) = line.strip_prefix("LoadState=") {
+            load_state.get_or_insert_with(|| value.trim().to_owned());
+        } else if let Some(value) = line.strip_prefix("FragmentPath=") {
+            fragment.get_or_insert_with(|| value.trim().to_owned());
+        } else if let Some(value) = line.strip_prefix("ExecStart=") {
+            exec_lines.push(value.to_owned());
+        }
+    }
+
+    if load_state.as_deref() != Some("loaded") {
+        return Err(format!(
+            "effective unit is not cleanly loaded (LoadState={})",
+            load_state.as_deref().unwrap_or("unknown")
+        ));
+    }
+    let fragment = fragment
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| "effective unit has no fragment".to_owned())?;
+    if !is_packaged_fragment(&fragment) {
+        return Err(format!(
+            "effective unit {} is not packaged",
+            fragment.display()
+        ));
+    }
+
+    let execs = parse_show_execstart_binaries(&exec_lines);
+    if execs.as_slice() != [PathBuf::from(OVERLAY_EXECUTABLE)] {
+        return Err("effective unit does not run only /usr/bin/voisu-overlay".to_owned());
+    }
+    Ok(())
+}
+
+fn append_optional_overlay_report(
+    mut report: UserServiceReport,
+    overlay_message: Option<String>,
+) -> UserServiceReport {
+    if let Some(message) = overlay_message {
+        report.message.push_str("; ");
+        report.message.push_str(&message);
+    }
+    report
 }
 
 fn install() -> Result<UserServiceReport, String> {

@@ -248,3 +248,13 @@ Rejected: an Electron migration, which would be a rewrite away from the correct 
 comparison in the 2026-07-17 session log. This affirms ADR-0003's daemon/Overlay split rather than reversing
 it; promote to a dedicated ADR only if the toolkit floor (min KWin/Plasma version for layer-shell) needs to
 be pinned as a hard dependency.
+
+## 2026-07-17 — Start the optional Overlay through its own graphical-session user unit
+**Why:** The Overlay RPM previously shipped only the healthy binary, so no login path launched
+`voisu-overlay --supervise`. The optional subpackage now owns an independent `graphical-session.target`
+user unit, while `voisu service install|uninstall` manages it only when its effective fragment and
+`ExecStart` still resolve to the packaged Overlay and treats every Overlay failure as non-fatal.
+`After=voisu.service` provides ordering without `Wants=` or `Requires=`; daemon start,
+Recording, Transcript production, and Delivery never depend on presentation. A separate CLI verb was
+rejected as unnecessary setup friction, and XDG autostart was rejected because it diverges from the
+existing observable systemd-user lifecycle.
