@@ -967,11 +967,25 @@ fn source_quality(words: &[String]) -> f64 {
     (0.6 * content_fraction + 0.4 * richness) * (1.0 - duplication)
 }
 
+/// A transcript whose content words are revisited so relentlessly that fewer
+/// than this fraction of content-word occurrences are distinct is a repetition
+/// loop, not dictation. Legitimate repetitive technical dictation sits well
+/// above it (the "cache … cache invalidation … cache" fixture is ~0.64); a
+/// loop cycling a couple of words through filler collapses far below.
+const CONTENT_REPETITION_FLOOR: f64 = 0.4;
+
+/// The repetition-loop check needs at least this many content-word occurrences
+/// before a low distinct ratio means anything — a short utterance repeating one
+/// term ("test test test done") is terse, not degenerate.
+const MIN_REPETITION_CONTENT: usize = 8;
+
 /// True when a Source Transcript is internally degenerate — a filler or
-/// repetition loop with almost no distinct content (context-free 1 s slices, or
-/// a "the/and/to/is" loop). This is a ROBUST garbage signal: it triggers on
-/// near-absent content, NOT on mere repetition, so legitimate jargon-heavy or
-/// naturally repetitive dictation ("the cache … the cache") is never flagged.
+/// repetition loop rather than speech. Two ROBUST signals, neither of which
+/// legitimate jargon-heavy or naturally repetitive dictation ("the cache … the
+/// cache") can trip: near-absent content (context-free 1 s slices, a
+/// "the/and/to/is" loop), or a content vocabulary so relentlessly recycled that
+/// the distinct share of content occurrences collapses (a "cache value cache
+/// value …" loop padded with stray words).
 fn is_degenerate(words: &[String]) -> bool {
     let total = words.len();
     if total < 6 {
@@ -981,7 +995,11 @@ fn is_degenerate(words: &[String]) -> bool {
     let content_count = words.iter().filter(|word| !is_stopword(word)).count();
     let distinct_content = distinct_content_words(words).len();
     let content_fraction = content_count as f64 / total as f64;
-    content_fraction < 0.25 || distinct_content < 3
+    if content_fraction < 0.25 || distinct_content < 3 {
+        return true;
+    }
+    content_count >= MIN_REPETITION_CONTENT
+        && (distinct_content as f64 / content_count as f64) < CONTENT_REPETITION_FLOOR
 }
 
 /// Two Source Transcripts of the same audio must agree on a meaningful share of
@@ -1004,8 +1022,10 @@ const CONFIRMATION_MARGIN: f64 = 0.15;
 /// source to agree, and cohesion requires revisiting a real topic term, which a
 /// stream of unique nonsense words never does.
 struct SourceEvidence {
-    /// Fraction of this source's content-word occurrences that appear in the
-    /// other source's distinct content vocabulary.
+    /// Fraction of this source's DISTINCT content words that appear in the
+    /// other source's content vocabulary. Distinct, never occurrences: a salad
+    /// repeating one stolen word gains nothing, because repetition of an
+    /// already-confirmed word is not additional cross-source agreement.
     confirmation: f64,
     /// Distinct content words this source returns to at non-adjacent positions.
     cohesion: usize,
@@ -1016,19 +1036,15 @@ struct SourceEvidence {
 
 fn source_evidence(own: &[String], other: &[String]) -> SourceEvidence {
     let other_content = distinct_content_words(other);
-    let content: Vec<&str> = own
-        .iter()
-        .filter(|word| !is_stopword(word))
-        .map(String::as_str)
-        .collect();
-    let confirmation = if content.is_empty() {
+    let own_content = distinct_content_words(own);
+    let confirmation = if own_content.is_empty() {
         0.0
     } else {
-        content
+        own_content
             .iter()
             .filter(|word| other_content.contains(**word))
             .count() as f64
-            / content.len() as f64
+            / own_content.len() as f64
     };
     SourceEvidence {
         confirmation,
@@ -1056,6 +1072,67 @@ fn topical_cohesion(words: &[String]) -> usize {
                 .any(|pair| pair[1] - pair[0] > 1)
         })
         .count()
+}
+
+/// When exact content overlap is near zero, at least this fraction of the
+/// smaller vocabulary must approximately match the other side before the pair
+/// is treated as "same audio, different spellings" and sent to reconciliation.
+/// Homophone-heavy divergence ("cache writes failed" vs "cash rights sailed")
+/// clears it easily; fluent nonsense and word salads have neither exact nor
+/// phonetic alignment and stay gated.
+const PHONETIC_ALIGNMENT_FLOOR: f64 = 0.5;
+
+/// Fraction of the smaller distinct-content vocabulary with an approximate
+/// (edit-distance) match in the other vocabulary — a cheap stand-in for
+/// phonetic similarity that catches homophones and provider spelling variants.
+fn phonetic_alignment(left: &HashSet<&str>, right: &HashSet<&str>) -> f64 {
+    let (smaller, larger) = if left.len() <= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    if smaller.is_empty() {
+        return 0.0;
+    }
+    smaller
+        .iter()
+        .filter(|word| larger.iter().any(|other| words_sound_alike(word, other)))
+        .count() as f64
+        / smaller.len() as f64
+}
+
+/// Two content words within a third of their length in edit distance are close
+/// enough to be alternate spellings or homophones of the same heard word
+/// ("failed"/"sailed", "cache"/"cash", "during"/"touring"), while unrelated
+/// vocabulary — even topically adjacent nonsense — almost never lands inside
+/// the bound.
+fn words_sound_alike(left: &str, right: &str) -> bool {
+    let longer = left.chars().count().max(right.chars().count());
+    if longer == 0 {
+        return false;
+    }
+    char_edit_distance(left, right) <= longer.div_ceil(3)
+}
+
+fn char_edit_distance(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_char) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right.iter().enumerate() {
+            current[right_index + 1] = if left_char == right_char {
+                previous[right_index]
+            } else {
+                1 + previous[right_index]
+                    .min(current[right_index])
+                    .min(previous[right_index + 1])
+            };
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 /// Chooses between two disagreeing Source Transcripts by ordered cross-source
@@ -1137,12 +1214,14 @@ fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
             if smaller_content >= MIN_COMPARABLE_CONTENT {
                 let shared = left_content.intersection(&right_content).count();
                 let overlap = shared as f64 / smaller_content as f64;
-                if overlap < CONTENT_OVERLAP_FLOOR {
+                if overlap < CONTENT_OVERLAP_FLOOR
+                    && phonetic_alignment(&left_content, &right_content) < PHONETIC_ALIGNMENT_FLOOR
+                {
                     let winner = select_better_source(&left_words, &right_words);
                     return Some(QualityGate {
                         winner,
                         reason: format!(
-                            "catastrophically divergent (cross-source content-word overlap {overlap:.2} below {CONTENT_OVERLAP_FLOOR:.2}); selected the Source Transcript better supported by cross-source evidence"
+                            "catastrophically divergent (cross-source content-word overlap {overlap:.2} below {CONTENT_OVERLAP_FLOOR:.2}, with no phonetic alignment); selected the Source Transcript better supported by cross-source evidence"
                         ),
                     });
                 }

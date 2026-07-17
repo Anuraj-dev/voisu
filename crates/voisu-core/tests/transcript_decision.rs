@@ -403,6 +403,83 @@ async fn reconciliation_failure_fallback_is_not_gamed_by_a_partially_overlapping
 }
 
 #[tokio::test]
+async fn occurrence_inflated_stolen_word_salad_cannot_beat_the_accurate_source() {
+    // Sol F1: a salad that repeatedly copies one or two words from the accurate
+    // source ("cache", "value") padded with nonsense could inflate an
+    // occurrence-counted confirmation score arbitrarily and win the
+    // reconciliation-failure fallback. Confirmation must count each distinct
+    // word once — repetition of a stolen word is not additional cross-source
+    // agreement — and a vocabulary revisited so relentlessly that its content
+    // type-token ratio collapses is a repetition loop, not dictation. The
+    // accurate dictation must be delivered.
+    let mut pipeline =
+        TranscriptDecisionPipeline::new(FailingReconcileModel, Duration::from_millis(50));
+
+    let dictation = "The cache stores the value, then the cache invalidation clears the cache, and the cache reloads the value from the cache after the cache miss occurs repeatedly.";
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: dictation.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                // cache x8 and value x7, never adjacent, plus five nonsense
+                // words: 15 of 20 content-word occurrences are "confirmed" by
+                // the dictation under occurrence counting, but only 2 of its 7
+                // distinct content words really are.
+                text: "The cache value cache the value cache mountains value cache otters value cache lanterns value cache the cache value meadow cache value tonight.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        decision.selection,
+        TranscriptSelection::SourceDeepgram,
+        "repeating stolen words must not buy the salad the win"
+    );
+    assert_eq!(decision.transcript.0, dictation);
+}
+
+#[tokio::test]
+async fn homophone_heavy_disagreement_reconciles_instead_of_gating() {
+    // Sol F2: the two providers heard the SAME audio but spelled it apart —
+    // "cache writes failed during queue drain" vs "cash rights sailed touring
+    // cue train". Exact content-word overlap is zero, but the vocabularies
+    // align phonetically, which is exactly the disagreement the LLM merge
+    // exists to arbitrate. The gate must NOT fire and silently pick a side; the
+    // pair must reconcile.
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::clone(&kinds),
+            text: "The cache writes failed during queue drain.".to_owned(),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "The cache writes failed during queue drain.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "The cash rights sailed touring cue train.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::Reconciled);
+    assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
+    assert!(decision.reconciliation_requested);
+    assert!(decision.fallback_reason.is_none());
+}
+
+#[tokio::test]
 async fn legitimate_repetitive_jargon_is_not_flagged_degenerate() {
     // Jargon-heavy dictation that repeats real terms ("kubelet", "pod") must
     // not be mistaken for a degenerate loop and gated away. Paired with a
