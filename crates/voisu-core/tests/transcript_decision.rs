@@ -443,6 +443,124 @@ async fn occurrence_inflated_stolen_word_salad_cannot_beat_the_accurate_source()
 }
 
 #[tokio::test]
+async fn repeated_command_dictation_is_not_discarded_as_degenerate() {
+    // Sol F1: genuinely repeated short-command speech ("start stop reset" three
+    // times) collapses the content type-token ratio, but it is real dictation,
+    // not a loop of stolen words. Against an unrelated fluent hallucination it
+    // must NOT be discarded for the hallucination: nothing the commands say is
+    // confirmed by the other source, and the vocabulary is too small to judge,
+    // so the honest path is reconciliation.
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::clone(&kinds),
+            text: "Start stop reset start stop reset start stop reset.".to_owned(),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Start stop reset start stop reset start stop reset.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "The gentle breeze carried autumn leaves across the quiet village square before sunrise.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        decision.selection,
+        TranscriptSelection::Reconciled,
+        "repeated command speech must never be silently discarded for a hallucination"
+    );
+    assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
+}
+
+#[tokio::test]
+async fn short_word_salad_cannot_phonetically_impersonate_real_speech() {
+    // Sol F2: every word of a short-word salad sits one edit away from the SAME
+    // word of the real transcript ("bat hat mat rat pat sat" all orbit "cat").
+    // Many-to-one matching would call that phonetic alignment and wave the
+    // salad through to poison the merge. Matching must be one-to-one with
+    // short words requiring exactness, so the salad stays gated and the real
+    // speech is selected.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+
+    let real = "The cat chased the ball across the garden, and the cat watched the children from the porch.";
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: real.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Bat hat mat rat pat sat night.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a short-word salad must not phonetically impersonate real speech into a merge"
+    );
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(decision.transcript.0, real);
+}
+
+#[tokio::test]
+async fn fallback_confirmation_counts_distinct_words_not_occurrences() {
+    // Sol F3: this fixture slips EVERY degeneracy tier (its content type-token
+    // ratio sits exactly at the 0.4 floor) and reaches source_evidence through
+    // a failed reconciliation. Under occurrence counting its adjacent-run
+    // stolen words ("cache" x6, "value" x5) score 0.73 confirmation vs the
+    // dictation's 0.57 — past the decision margin — so the salad wins iff
+    // confirmation counts occurrences. Distinct counting ties the confirmations
+    // and the salad's adjacent runs earn no cohesion, so the dictation wins.
+    let mut pipeline =
+        TranscriptDecisionPipeline::new(FailingReconcileModel, Duration::from_millis(50));
+
+    let dictation = "The cache stores the value, then the cache invalidation clears the cache, and the cache reloads the value from the cache after the cache miss occurs repeatedly.";
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: dictation.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "The cache cache cache cache cache cache value value value value value mountains otters lanterns meadow.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert!(
+        decision.reconciliation_requested,
+        "the fixture must reach the reconciliation-failure fallback"
+    );
+    assert_eq!(
+        decision.selection,
+        TranscriptSelection::SourceDeepgram,
+        "occurrence-inflated confirmation must not buy the salad the fallback"
+    );
+    assert_eq!(decision.transcript.0, dictation);
+}
+
+#[tokio::test]
 async fn homophone_heavy_disagreement_reconciles_instead_of_gating() {
     // Sol F2: the two providers heard the SAME audio but spelled it apart —
     // "cache writes failed during queue drain" vs "cash rights sailed touring

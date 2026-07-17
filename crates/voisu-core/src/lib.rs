@@ -980,12 +980,13 @@ const CONTENT_REPETITION_FLOOR: f64 = 0.4;
 const MIN_REPETITION_CONTENT: usize = 8;
 
 /// True when a Source Transcript is internally degenerate — a filler or
-/// repetition loop rather than speech. Two ROBUST signals, neither of which
-/// legitimate jargon-heavy or naturally repetitive dictation ("the cache … the
-/// cache") can trip: near-absent content (context-free 1 s slices, a
-/// "the/and/to/is" loop), or a content vocabulary so relentlessly recycled that
-/// the distinct share of content occurrences collapses (a "cache value cache
-/// value …" loop padded with stray words).
+/// repetition loop with almost no distinct content (context-free 1 s slices, or
+/// a "the/and/to/is" loop). This is a ROBUST garbage signal: it triggers on
+/// near-absent content, NOT on mere repetition, so legitimate jargon-heavy,
+/// naturally repetitive, or short-command dictation ("start stop reset" three
+/// times) is never flagged. Repetition loops that DO carry content words are
+/// judged with cross-source evidence in `is_stolen_word_loop` instead, because
+/// a single-source view cannot tell them from genuine repeated speech.
 fn is_degenerate(words: &[String]) -> bool {
     let total = words.len();
     if total < 6 {
@@ -995,11 +996,29 @@ fn is_degenerate(words: &[String]) -> bool {
     let content_count = words.iter().filter(|word| !is_stopword(word)).count();
     let distinct_content = distinct_content_words(words).len();
     let content_fraction = content_count as f64 / total as f64;
-    if content_fraction < 0.25 || distinct_content < 3 {
-        return true;
+    content_fraction < 0.25 || distinct_content < 3
+}
+
+/// True when a Source Transcript is a repetition loop built around words the
+/// OTHER source actually contains: a sizable content vocabulary (so there is
+/// real evidence to judge) recycled so relentlessly that the distinct share of
+/// content occurrences collapses, with at least one recycled word stolen from
+/// (confirmed by) the other source. Genuinely repeated command speech ("start
+/// stop reset" three times) is exempt twice over: its vocabulary is too small
+/// to judge, and against an unrelated hallucination nothing it says is
+/// confirmed — that ambiguous shape goes to reconciliation instead of being
+/// discarded.
+fn is_stolen_word_loop(own: &[String], other: &[String]) -> bool {
+    let content_count = own.iter().filter(|word| !is_stopword(word)).count();
+    let own_content = distinct_content_words(own);
+    if content_count < MIN_REPETITION_CONTENT || own_content.len() < MIN_COMPARABLE_CONTENT {
+        return false;
     }
-    content_count >= MIN_REPETITION_CONTENT
-        && (distinct_content as f64 / content_count as f64) < CONTENT_REPETITION_FLOOR
+    if own_content.len() as f64 / content_count as f64 >= CONTENT_REPETITION_FLOOR {
+        return false;
+    }
+    let other_content = distinct_content_words(other);
+    own_content.iter().any(|word| other_content.contains(*word))
 }
 
 /// Two Source Transcripts of the same audio must agree on a meaningful share of
@@ -1085,6 +1104,11 @@ const PHONETIC_ALIGNMENT_FLOOR: f64 = 0.5;
 /// Fraction of the smaller distinct-content vocabulary with an approximate
 /// (edit-distance) match in the other vocabulary — a cheap stand-in for
 /// phonetic similarity that catches homophones and provider spelling variants.
+/// Matching is ONE-TO-ONE: each word on the larger side is consumable exactly
+/// once, so six salad words orbiting the same real word ("bat hat mat rat pat
+/// sat" around "cat") claim at most one match between them instead of a
+/// perfect alignment. Both sides are visited in sorted order (greedy,
+/// closest-first per word) so the result is deterministic.
 fn phonetic_alignment(left: &HashSet<&str>, right: &HashSet<&str>) -> f64 {
     let (smaller, larger) = if left.len() <= right.len() {
         (left, right)
@@ -1094,22 +1118,38 @@ fn phonetic_alignment(left: &HashSet<&str>, right: &HashSet<&str>) -> f64 {
     if smaller.is_empty() {
         return 0.0;
     }
-    smaller
-        .iter()
-        .filter(|word| larger.iter().any(|other| words_sound_alike(word, other)))
-        .count() as f64
-        / smaller.len() as f64
+    let mut smaller: Vec<&str> = smaller.iter().copied().collect();
+    smaller.sort_unstable();
+    let mut available: Vec<&str> = larger.iter().copied().collect();
+    available.sort_unstable();
+    let mut matched = 0usize;
+    for word in &smaller {
+        let closest = available
+            .iter()
+            .enumerate()
+            .filter(|(_, other)| words_sound_alike(word, other))
+            .min_by_key(|(_, other)| char_edit_distance(word, other));
+        if let Some((index, _)) = closest {
+            available.remove(index);
+            matched += 1;
+        }
+    }
+    matched as f64 / smaller.len() as f64
 }
 
 /// Two content words within a third of their length in edit distance are close
 /// enough to be alternate spellings or homophones of the same heard word
 /// ("failed"/"sailed", "cache"/"cash", "during"/"touring"), while unrelated
 /// vocabulary — even topically adjacent nonsense — almost never lands inside
-/// the bound.
+/// the bound. Words of three letters or fewer are one flip away from unrelated
+/// vocabulary ("cat"/"bat"), so they must match exactly.
 fn words_sound_alike(left: &str, right: &str) -> bool {
     let longer = left.chars().count().max(right.chars().count());
     if longer == 0 {
         return false;
+    }
+    if longer <= 3 {
+        return left == right;
     }
     char_edit_distance(left, right) <= longer.div_ceil(3)
 }
@@ -1199,6 +1239,27 @@ fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
                     "catastrophically divergent (length ratio {length_ratio:.2} below {DIVERGENCE_LENGTH_RATIO_FLOOR:.2}); selected the fuller Source Transcript, the other is a fragment"
                 ),
             });
+        }
+        // Stolen-word-loop check: exactly one source is a repetition loop
+        // recycling words the other source contains — a salad built by looping
+        // stolen content plus padding. The other source explains the loop's
+        // real content AND carries its own, so select it.
+        if !left_degenerate {
+            let left_loop = is_stolen_word_loop(&left_words, &right_words);
+            let right_loop = is_stolen_word_loop(&right_words, &left_words);
+            if left_loop != right_loop {
+                let winner = if left_loop {
+                    GateWinner::Right
+                } else {
+                    GateWinner::Left
+                };
+                return Some(QualityGate {
+                    winner,
+                    reason:
+                        "catastrophically divergent (one Source Transcript is a repetition loop recycling words stolen from the other); selected the Source Transcript with real content"
+                            .to_owned(),
+                });
+            }
         }
         // Cross-agreement check (§3.4): two comparable-length, individually
         // coherent transcriptions of the SAME audio must still agree on a
