@@ -2,43 +2,83 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-17
 
 ## 🚧 In progress / next
-- **Overlay login-start fix is implemented and review-clean but uncommitted.** Next: commit the tested tree when Raja approves, rebuild the exact RPM, install base + optional Overlay RPMs, rerun `voisu service install`, then observe a real logout/login and capsule rendering on KWin.
-- Host acceptance still required: `voisu-overlay --supervise` active after login; Recording → Processing → Success/Failure → hidden Idle; kill the Overlay mid-Recording and prove daemon/Transcript/Delivery independence; clean uninstall/removal.
-- Remaining release evidence after that: portal revocation, upgrade/removal, and explicit fallback scenarios. APT/DEB remains out of scope.
+- **Execute the approved transcription-accuracy PRD** —
+  `docs/specs/2026-07-17-transcription-accuracy.md` (READY FOR APPROVAL;
+  Raja approved verbally in-session 2026-07-17, execution greenlit). Map:
+  `.scratch/voisu-accuracy/map.md` (tickets 01–02 closed, 03 PRD written,
+  04–07 open). Next concrete step: create `feature/transcription-accuracy`
+  branch, then spawn 3 parallel implementers — ticket 04 Groq accuracy
+  (Opus), ticket 05 Deepgram nova-3 websocket (Fable 5 medium —
+  architectural), ticket 06 reconciliation gating + provider-failure
+  visibility (Opus). Driver is purely orchestrator; Sol reviews (first high,
+  re-reviews medium). Local RPM install + live 4-paragraph suite BEFORE any
+  PR; PR + merge on CI green only if accuracy AND latency win.
+- **Accuracy diagnosis is DONE** (2026-07-17 blind test, 26.3% WER):
+  root causes = Deepgram 1 s batch-chunk design (word salad / silent
+  absence), Groq without prompt/language (jargon errors), 30 s chunk seams.
+  Reconciliation was NOT the villain — the old STATE hypothesis is refuted;
+  it slightly improved Groq in the one reconciled recording.
+- Priority 2 unchanged: Overlay visual redesign/polish (functional v1 is in).
+- Deferred release acceptance still untested: logout/login startup
+  observation, kill-Overlay-mid-Recording, clean uninstall.
 
 ## Status
-- The optional Overlay RPM now owns `/usr/bin/voisu-overlay` and `/usr/lib/systemd/user/voisu-overlay.service`; the unit runs `--supervise`, belongs independently to `graphical-session.target`, and has ordering but no dependency on `voisu.service`.
-- `voisu service install|uninstall` best-effort enables/starts or disables/stops the Overlay only when systemd's effective fragment remains packaged and `ExecStart` runs only `/usr/bin/voisu-overlay`. Overlay failures are warnings; required daemon results remain authoritative. `service start|stop|restart` remain daemon-only.
-- The Fedora smoke harness now snapshots and restores optional Overlay enablement/active state when `voisu-overlay` was already installed.
-- Review: Fable 5 was unavailable after retries (`502 unknown provider`). Raja approved GPT-5.6 Sol fallback; the first high-effort review found two medium issues (user-unit shadow trust and smoke state leakage), both fixed test-first; medium re-review returned `NO FINDINGS`.
-- Automated gates: `cargo test --workspace` — 221 passed, 2 live tests ignored, 0 failed; GTK-free workspace check and `cargo check -p voisu-app --features overlay` pass; `bash -n`, `rpmspec -P`, `systemd-analyze verify`, and `git diff --check` pass.
-- Existing daemon path remains reliable: bounded versioned IPC, dual-provider Recording pipeline, validated Transcript decision, portal-mediated Delivery with clipboard preservation, and graphical-session-owned `voisu.service`.
+- Overlay graphical startup merged locally (`67aa3b6`); local `main` ahead of
+  `origin/main`, not pushed. Packaged units installed and verified live.
+- Accuracy PRD written and bound to research: Deepgram streaming guide (in
+  Raja's vault: `AI Created Stuff/Hyprvox Rebuild/Deepgram Streaming Guide
+  for Voisu.md`) + pricing asset
+  (`.scratch/voisu-accuracy/assets/02-groq-deepgram-pricing.md`).
+- Key PRD decisions: Groq full-audio-at-finalize ≤120 s (evidence: tail
+  request already ~400–500 ms, so no latency cost) + `whisper-large-v3`
+  default (Groq free tier covers 2 h/day for both models — accuracy decides);
+  vocabulary prompt = built-in dev dictionary + `~/.config/voisu/dictionary.txt`
+  (224-token budget, user terms first), same list feeds Deepgram `keyterm`;
+  Deepgram rebuilt as nova-3 websocket streaming (tokio-tungstenite rustls,
+  is_final-only assembly, visible failure, disableable); reconciliation on
+  `llama-3.1-8b-instant`; gate reconciliation on source comparability.
+- Deepgram stays past the $200 credit (Raja rotates accounts); future
+  (post-acceptance, not now): single-provider benchmark.
+- Automated gates green as of last session: 221 passed, 2 live ignored, 0
+  failed.
 
 ## Architecture map
 - Domain, IPC, Transcript decision, diagnostics -> `crates/voisu-core/src/lib.rs`
 - Fedora capture/provider/clipboard/portal/libei adapters -> `crates/voisu-app/src/system.rs`
-- Daemon + optional Overlay user-service lifecycle -> `crates/voisu-app/src/service.rs`
+  (GroqStream ~1534, request_groq_chunk ~3574, DeepgramStream ~1799,
+  merge_chunk_transcripts ~3640, Groq reconciliation ~1966–2100)
+- Daemon + Overlay user-service lifecycle -> `crates/voisu-app/src/service.rs`
 - Public CLI -> `crates/voisu-app/src/bin/voisu.rs`
-- GTK Overlay observer/runtime -> `crates/voisu-app/src/bin/voisu-overlay.rs`
-- Overlay presentation + restart policy -> `crates/voisu-app/src/overlay.rs`, `crates/voisu-app/src/feedback.rs`
+- GTK Overlay -> `crates/voisu-app/src/bin/voisu-overlay.rs`, `overlay.rs`, `feedback.rs`
 - RPM units/spec/build/smoke -> `packaging/`
-- Approved design/plan -> `docs/superpowers/specs/2026-07-17-overlay-login-start-design.md`, `docs/superpowers/plans/2026-07-17-overlay-login-start.md`
+- Accuracy effort -> `docs/specs/2026-07-17-transcription-accuracy.md` (PRD),
+  `.scratch/voisu-accuracy/` (map + tickets + pricing asset)
 - Fedora procedure/evidence -> `docs/packaging-fedora.md`, `docs/release-evidence.md`
 
 ## Stack & run
 - Stack: Rust 2024 + Tokio + serde + zbus 5 + GTK4 (opt-in) + runtime libei · Run: `cargo run -p voisu-app --bin voisu-daemon` · Test: `cargo test --workspace`
 
 ## Key decisions (top 3–5)
-- Overlay presentation is observer-only and disposable; daemon lifecycle, Recording, Transcript production, and Delivery never depend on it.
-- Keep GTK4 + gtk4-layer-shell for the real KWin layer-shell surface; do not migrate to Electron/XWayland hacks.
-- Start the optional Overlay through its own graphical-session user unit; integrate setup into existing `voisu service install|uninstall` as non-fatal best-effort behavior.
-- Trust effective systemd state, not only an on-disk packaged filename; user-owned Overlay shadows or command overrides are not managed automatically.
-- Portals are the normal Fedora path for Trigger Key and direct Delivery; no raw input devices or `uinput`.
+- Transcription accuracy overhaul per PRD: Groq single-request + vocabulary
+  prompt is the primary accuracy lever; Deepgram = real streaming second
+  opinion, cleanly disableable (only non-free component).
+- Acceptance bar: ≤10% WER on the live 4-paragraph technical suite, no
+  fluent-nonsense substitutions, no silent provider absence, latency ≤ today.
+- Overlay presentation stays observer-only and disposable; daemon never
+  depends on it.
+- Keep GTK4 + gtk4-layer-shell for the KWin layer-shell surface.
+- Portals are the normal Fedora path; no raw input devices or `uinput`.
 
 ## Gotchas
 - Use `CONTEXT.md` terms exactly; ordinary synonyms are intentionally banned.
-- Default workspace builds are GTK-free; compile the optional Overlay with `cargo check -p voisu-app --features overlay`.
-- `packaging/build-rpm.sh` refuses a dirty checkout and binds artifacts to the checked-out commit; no exact RPM rebuild until the tested changes are committed.
-- This sandbox denies Unix-domain/private D-Bus binds and cannot perform interactive sudo or a real graphical-login observation. Raja runs host commands in Konsole with `|& tee /tmp/...log`.
-- `--report-backend` proves backend selection, not KWin acceptance; only a visible capsule proves the mapped layer-shell surface.
+- Default workspace builds are GTK-free; Overlay needs `--features overlay`.
+- `packaging/build-rpm.sh` requires a clean COMMITTED checkout (push not
+  required — fine for feature-branch local testing) and embeds the commit.
+- Whisper `prompt` honors only ~224 tokens — dictionary builder must budget.
+- Deepgram history absence was silent by design flaw; until ticket 06 lands,
+  a missing source Transcript says nothing about why.
+- Groq free-tier limits (7,200 audio-sec/hr, 2,000 req/day) are the real
+  rate ceiling — full-audio single requests help stay under the req/day cap.
 - `rustfmt` and `clippy` are unavailable.
+- Delivery still uses `clipboard_fallback` (`xkbcommon` parse errors) —
+  separate effort, do not fold into the accuracy branch.

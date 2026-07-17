@@ -258,3 +258,16 @@ user unit, while `voisu service install|uninstall` manages it only when its effe
 Recording, Transcript production, and Delivery never depend on presentation. A separate CLI verb was
 rejected as unnecessary setup friction, and XDG autostart was rejected because it diverges from the
 existing observable systemd-user lifecycle.
+
+## 2026-07-17 — Transcription accuracy overhaul design (PRD)
+**Why:** Blind test measured 26.3% WER; evidence (recordings 11–14) showed the
+real causes were Deepgram's context-free 1 s batch chunks and an unprompted
+Groq call — not reconciliation, refuting the prior hypothesis. Chose Groq
+full-audio-at-finalize ≤120 s (tail request already costs ~0.5 s, so no
+latency penalty) + `whisper-large-v3` default (Groq free tier covers both
+models at 2 h/day; accuracy decides) + shared built-in/user vocabulary
+dictionary feeding Whisper `prompt` and Deepgram `keyterm`; Deepgram rebuilt
+as real nova-3 websocket streaming (batch-on-finalize rejected: doubles
+release latency; dropping it rejected: Raja keeps the second opinion and will
+rotate credit accounts) and must stay disableable (only non-free component).
+Full spec: docs/specs/2026-07-17-transcription-accuracy.md
