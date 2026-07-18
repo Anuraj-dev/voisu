@@ -365,3 +365,10 @@ reached the decision log. Scout 126 alone paid for the fleet by finding a latent
 (uncapped keyterms → Deepgram 400 → dead stream) that no test covers.
 
 | 134 | GNOME-specific overlay deep dive (follow-up requested by Raja mid-grilling) | Sonnet 5 | Found a real path: companion GNOME Shell extension (St widget + D-Bus listener, GSConnect/Custom-OSD precedent) = true always-on-top overlay on GNOME; plain-window keep-above is a no-op on Wayland BY DESIGN; XWayland override-redirect works but is an unsupported side-effect; recommends tiny extension (tier 1) + plain window (tier 2 default), auto-detect | 137 s | 58.6k | 15 |
+
+## Session 2026-07-18 (night) — fix batch + friends map
+
+| # | Ticket | Task | Model (effort) | Result | Review findings vs its work | Fix rounds | Notes |
+|---|---|---|---|---|---|---|---|
+| 135 | fix-a | Deepgram default OFF→ON flip (config.rs + daemon/CLI comments + tests, TDD) | Opus 4.8 | Clean first pass: 4 files, RED shown, 346/0 local; PR #48 | 1 nit (stale parser doc comment) — driver fixed inline | 0 | 240 s, 51.9k tok, 22 tools; CI test-gate failure was an unrelated service-readiness flake (passed on rerun) |
+| 136 | fix-a | First review of PR #48 | gpt-5.6-sol (high, cladex) | 1 nit, no correctness findings; confirmed no residual OFF assumptions | — | — | 130.9k in/6.2k out; tried to invoke Skill+codex exec (denied), then reviewed directly |
