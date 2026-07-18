@@ -21,7 +21,10 @@ use std::path::{Path, PathBuf};
 /// until adding the next one would cross this budget, then stops.
 pub const WHISPER_PROMPT_TOKEN_BUDGET: usize = 224;
 
-/// AI tooling vocabulary.
+/// AI tooling vocabulary. Ordinary English words (token, prompt, inference…)
+/// are deliberately absent: Whisper and nova-3 already transcribe them, and
+/// every byte spent on a common word pushes a distinctive CLI term past the
+/// Whisper prompt budget.
 const AI_TOOLING: &[&str] = &[
     "Claude",
     "Claude Code",
@@ -33,32 +36,36 @@ const AI_TOOLING: &[&str] = &[
     "Groq",
     "Deepgram",
     "Whisper",
-    "token",
-    "inference",
-    "embedding",
-    "prompt",
-    "transcription",
 ];
 
-/// Linux and system vocabulary.
+/// Linux and system vocabulary, most-distinctive terms first: the live WER
+/// suite showed misses exactly on the CLI compounds ("rpmbuild" -> "RPM
+/// build", "changelog" -> "channel log", "dist tag" -> "disk tag",
+/// "daemon-reload" -> "--daemon"), so those must survive prompt truncation
+/// ahead of words the models already know.
 const LINUX_SYSTEM: &[&str] = &[
-    "systemd",
     "systemctl",
+    "daemon-reload",
     "journalctl",
+    "rpmbuild",
+    "audit2allow",
+    "xkbcommon",
     "SELinux",
+    "changelog",
+    "dist tag",
+    "voisu",
+    "voisu-daemon",
+    "dnf",
+    "grep",
+    "systemd",
     "Wayland",
     "KDE",
     "Plasma",
     "PipeWire",
-    "xkbcommon",
     "RPM",
-    "dnf",
-    "grep",
+    "Fedora",
     "chmod",
     "kernel",
-    "Fedora",
-    "audit2allow",
-    "rpmbuild",
     "daemon",
 ];
 
@@ -320,6 +327,17 @@ Tokio   # inline comment
         assert!(!prompt.contains("term1999"), "late terms are truncated away");
         // Truncation dropped the built-ins entirely (they sort after the user terms).
         assert!(!prompt.contains("Kubernetes"));
+    }
+
+    #[test]
+    fn cli_compound_terms_survive_prompt_truncation() {
+        // The 2026-07-18 live WER suite missed exactly these CLI compounds;
+        // they must fit inside the truncated Whisper prompt with builtins
+        // only, not merely exist somewhere in the merged list.
+        let prompt = whisper_prompt_from_terms(&merged_terms_with(Vec::new()));
+        for term in ["daemon-reload", "rpmbuild", "changelog", "dist tag", "voisu-daemon"] {
+            assert!(prompt.contains(term), "{term:?} truncated out of: {prompt}");
+        }
     }
 
     #[test]
