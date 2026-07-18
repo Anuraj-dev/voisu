@@ -1,7 +1,7 @@
 # Dictionary CLI (add/remove/list) + per-session hot-reload
 
 **Label:** `wayfinder:task` (AFK, implementation)
-**Status:** open
+**Status:** resolved (2026-07-19, PR #57 merged)
 **Blocked by:** EXTERNAL — fix batch merging first (keyterm cap fix touches the
 same dictionary→keyterm seam)
 **Blocks:** 09-packaging-accounts-setup (phase gate)
@@ -22,3 +22,20 @@ same dictionary→keyterm seam)
 
 RED→GREEN; tests for CLI file edits and that a term added between sessions
 reaches the next session's keyterms. Routing: Terra high, Sol review.
+
+## Resolution (2026-07-19)
+
+Implemented by gpt-5.6-terra (high, last Terra dispatch before the Codex-reviews-only
+routing), fix round by Opus 4.8 (high), reviewed by Sol (1 round). Merged as PR #57.
+
+- `voisu dictionary add|remove|list [--json]`: atomic writes, flock(2)-serialized
+  read-modify-write (concurrent edits can't lose updates), idempotent case-insensitive
+  add, case-insensitive remove (missing -> exit 4), comments/ordering preserved; add
+  rejects terms the comment grammar would mangle (C#/F# still fine).
+- Per-Recording hot-reload: one dictionary snapshot at each Recording start feeds both
+  Deepgram keyterms and the Groq whisper prompt (GroqProvider::with_prompt); the
+  supervised replay tail keeps the captured snapshot — no fs I/O invariant preserved.
+- Keyterm cap (user-first, 500-token/100-term) holds on the re-read path.
+- Declined: Unicode full case folding (documented as to_lowercase semantics);
+  Deepgram reconnect-without-keyterms (out of scope, cap prevents the 400).
+- Suites: 375/0 both feature sets; CI green (one #58 flake rerun).

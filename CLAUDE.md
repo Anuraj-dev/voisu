@@ -16,14 +16,16 @@ next agent (or you tomorrow) starts cheap.
 
 ## Model & effort routing (pinned for this repo)
 
+Updated by Raja 2026-07-19: Codex quota is nearly exhausted — Codex/GPT models are for REVIEWS ONLY.
+All implementation goes to Claude models.
+
 | Work | Model | Effort |
 |---|---|---|
 | Code review — FIRST review of a ticket | gpt-5.6-sol | high (Sol never goes above high) |
 | Code review — re-reviews after the first, until merge | gpt-5.6-sol | medium |
-| Tough / architectural tickets (concurrency, IPC, provider streaming, reconciliation) | gpt-5.6-sol | medium |
-| Regular feature work | gpt-5.6-terra | high |
-| Light work (glue, config, packaging, small fixes) | gpt-5.6-luna | medium |
-| Very small quick changes (avoid a codex roundtrip) | claude-opus-4-8 | high |
+| ALL implementation (features, fixes, glue, config, packaging) | claude-opus-4-8 subagent | high |
+| Genuinely complex / architectural tickets (concurrency, IPC, provider streaming, reconciliation) | claude-fable-5 subagent | medium |
+| Review of code a Claude model wrote is still Sol; review of Fable-written code may go to Opus if Sol quota is critical | — | — |
 | ALL bulk reading, exploration, test/log triage, lookups | claude-sonnet-5 | high |
 
 ## Source of truth

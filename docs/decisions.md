@@ -427,3 +427,34 @@ evidence digest `.scratch/voisu-research/2026-07-18-distribution-decisions.md`).
   dictionary CLI + per-session hot-reload; replacements tier deferred.
 - **Process:** fixes → features → packaging; implementer failing 2 review rounds
   is discarded (Fable inline or higher-effort respawn) — tightened from 3.
+
+## 2026-07-19 — Codex/GPT models are reviews-only; Claude implements everything
+**Why:** Raja's Codex Plus quota is nearly exhausted while Claude Max headroom is ample. All
+implementation → Opus 4.8 subagents (Fable 5 subagent for genuinely architectural work; the driver
+never implements — it orchestrates). Sol keeps all reviews (first high, re-reviews medium). Rejected:
+continuing Terra/Luna feature dispatches (would burn the remaining review budget).
+
+## 2026-07-19 — Guarded delivery: strict stable_id guard, all-string KWin wire, bounded staleness
+**Why:** (1) Comparison key is stable_id ONLY — same-app-different-window is a mismatch; the guard's
+promise is "the surface you started in", and app-level matching would type into the wrong window.
+(2) KWin callDBus marshals JS Numbers as INT32, which zbus rejects against u32 — silently defeating
+every push; the D-Bus surface is all-strings with Rust-side parsing (Opus review catch). Pushes are
+sender-authenticated against KWin's unique owner. (3) The 10-min staleness deadline stays: it bounds
+the fail-open window if the push-only script dies while KWin lives; the long-dwell clipboard fallback
+is the accepted, recoverable cost. Rejected: trusting owner-check alone (unbounded fail-open) and a
+script-side timer (KWin sandbox has no reliable timer).
+
+## 2026-07-19 — Dictionary edits flock-serialized; hot-reload is one snapshot per Recording
+**Why:** Concurrent CLI edits raced (read-modify-write, last rename wins) — flock(2) on a sibling
+lock file serializes writers while readers stay lock-free on atomic rename. Hot-reload re-reads the
+dictionary once at each Recording start and threads that snapshot into BOTH providers; the supervised
+replay tail keeps its captured snapshot (no fs I/O invariant preserved). Rejected: full Unicode case
+folding (disproportionate dependency) and Deepgram reconnect-without-keyterms (cap already prevents
+the 400).
+
+## 2026-07-19 — GNOME fallback: re-present on visible transitions; notify from observed daemon states
+**Why:** Wayland forbids keep-above for regular toplevels, so the fallback window re-present()s once
+per rendered transition into a visible phase. The Recording notification derives from OBSERVED daemon
+states (RecordingNotifyLatch): an unreachable blip mid-Recording must not re-notify — rendered-phase
+edges alone refire across the unavailable capsule. Clipboard keeps the wl-copy shell-out (speaks
+wl_data_device, works on GNOME); Flatpak-proofing deferred to phase-B packaging.
