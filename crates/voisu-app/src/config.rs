@@ -201,10 +201,12 @@ fn parse_delivery_mode(contents: &str) -> Option<DeliveryMode> {
         if key.trim() != DELIVERY_MODE_KEY {
             continue;
         }
+        // Both TOML string forms are accepted so a hand-edited single-quoted
+        // literal string is honored rather than silently defaulting.
         return match value.trim() {
-            "\"type\"" => Some(DeliveryMode::Type),
-            "\"clipboard\"" => Some(DeliveryMode::Clipboard),
-            "\"guarded\"" => Some(DeliveryMode::Guarded),
+            "\"type\"" | "'type'" => Some(DeliveryMode::Type),
+            "\"clipboard\"" | "'clipboard'" => Some(DeliveryMode::Clipboard),
+            "\"guarded\"" | "'guarded'" => Some(DeliveryMode::Guarded),
             _ => None,
         };
     }
@@ -223,6 +225,14 @@ const MANAGED_LINES: [&str; 3] = [
     "# Voisu daemon configuration.",
     "# Recording Provider and Delivery settings; read once at daemon start.",
     "# Managed by the `voisu deepgram` and `voisu delivery` commands.",
+];
+
+/// Managed header lines emitted by earlier releases. Stripped alongside
+/// [`MANAGED_LINES`] so upgrading an existing config never strands stale
+/// headers above the rewritten block.
+const LEGACY_MANAGED_LINES: [&str; 2] = [
+    "# Whether the Deepgram Provider participates in a Recording.",
+    "# Managed by `voisu deepgram on|off`; read once at daemon start.",
 ];
 
 /// Persists the toggle, creating the parent `voisu` directory if needed and
@@ -304,7 +314,8 @@ fn merge_content(
         if trimmed.starts_with('[') {
             in_root = false;
         }
-        let is_managed_comment = MANAGED_LINES.contains(&line.trim());
+        let is_managed_comment = MANAGED_LINES.contains(&line.trim())
+            || LEGACY_MANAGED_LINES.contains(&line.trim());
         let is_root_deepgram_enabled = deepgram_enabled.is_some()
             && in_root
             && trimmed
@@ -449,6 +460,39 @@ other_key = 5
         );
         assert_eq!(parse_delivery_mode("other_key = true\n"), None);
         assert_eq!(resolve_delivery_mode(None), DeliveryMode::Type);
+    }
+
+    #[test]
+    fn single_quoted_delivery_modes_are_honored() {
+        assert_eq!(
+            parse_delivery_mode("delivery_mode = 'clipboard'\n"),
+            Some(DeliveryMode::Clipboard)
+        );
+        assert_eq!(
+            parse_delivery_mode("delivery_mode = 'guarded'\n"),
+            Some(DeliveryMode::Guarded)
+        );
+    }
+
+    #[test]
+    fn rewriting_a_config_from_an_earlier_release_drops_its_stale_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voisu").join("config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = "# Voisu daemon configuration.\n\
+            # Whether the Deepgram Provider participates in a Recording.\n\
+            # Managed by `voisu deepgram on|off`; read once at daemon start.\n\
+            deepgram_enabled = false\n";
+        std::fs::write(&path, legacy).unwrap();
+
+        write_delivery_mode(&path, DeliveryMode::Clipboard).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        for line in LEGACY_MANAGED_LINES {
+            assert!(!contents.contains(line), "{contents}");
+        }
+        assert_eq!(read_setting(&path), Some(false));
+        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Clipboard));
     }
 
     #[test]
