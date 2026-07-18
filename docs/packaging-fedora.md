@@ -126,6 +126,25 @@ The optional Overlay unit runs `/usr/bin/voisu-overlay --supervise`, is owned by
 `Wants=` or `Requires=`. It remains an observer-only process: daemon startup,
 Recording, Transcript production, and Delivery never depend on it.
 
+### Unit sandboxing
+
+Both user units carry systemd hardening directives (`NoNewPrivileges`,
+`ProtectSystem=strict`, `PrivateTmp`, `RestrictAddressFamilies`, kernel/cgroup
+protections, `SystemCallArchitectures=native`) so a compromised dependency gets
+a confined process. The deliberate exceptions:
+
+- Daemon `ReadWritePaths=%t %h/.config/voisu %h/.local/state/voisu` — control
+  socket and capture scratch, config/dictionary, history/diagnostics.
+- Daemon keeps `AF_INET`/`AF_INET6` (provider HTTPS/WSS via curl) and
+  `AF_NETLINK` (glibc `getaddrinfo` interface enumeration); the overlay is
+  `AF_UNIX`-only (daemon socket, Wayland, D-Bus).
+- `MemoryDenyWriteExecute=yes` is set on the daemon (no JIT anywhere in its
+  process tree) but omitted on the overlay: GTK/GL shader pipelines and libei
+  may map writable+executable pages.
+
+Every directive must be re-validated against a real install (`voisu doctor`, a
+live Recording, overlay startup) whenever the dependency surface changes.
+
 ## Upgrade and removal
 
 After an RPM upgrade, after adding the optional Overlay subpackage, or when an
