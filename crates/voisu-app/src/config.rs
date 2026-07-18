@@ -5,8 +5,10 @@
 //! `$XDG_CONFIG_HOME/voisu/config.toml` (default `~/.config/voisu/config.toml`),
 //! read once at daemon start.
 //!
-//! The default is **OFF**: a fresh install runs the fast Groq-only path, and the
-//! user opts into the dual-Provider path with `voisu deepgram on`. The file is
+//! The default is **ON**: a fresh install runs the reconciled dual-Provider path
+//! for the best jargon accuracy, and the user opts into the fast Groq-only path
+//! with `voisu deepgram off` (or the `VOISU_DISABLE_DEEPGRAM` env override). The
+//! file is
 //! deliberately hand-parsed — one boolean key does not justify a full TOML
 //! dependency, and the parser tolerates comments, blank lines, surrounding
 //! whitespace, and unrelated keys so a hand-edited file degrades to the default
@@ -22,16 +24,17 @@ const DEEPGRAM_ENABLED_KEY: &str = "deepgram_enabled";
 /// mirroring `VOISU_DISABLE_DIRECT_DELIVERY`/`VOISU_DISABLE_SHORTCUTS`.
 const DISABLE_DEEPGRAM_ENV: &str = "VOISU_DISABLE_DEEPGRAM";
 
-/// Deepgram is OFF by default, so a fresh install lives on the fast Groq-only
-/// path until the user runs `voisu deepgram on`.
-pub const DEFAULT_DEEPGRAM_ENABLED: bool = false;
+/// Deepgram is ON by default, so a fresh install runs the reconciled
+/// dual-Provider path for the best jargon accuracy until the user runs
+/// `voisu deepgram off`.
+pub const DEFAULT_DEEPGRAM_ENABLED: bool = true;
 
 /// Whether the Deepgram Provider is enabled for Recordings.
 ///
 /// The env override [`DISABLE_DEEPGRAM_ENV`] wins over the persisted file: when
 /// it is set, Deepgram is disabled regardless of the file. Otherwise the
 /// persisted `config.toml` decides, defaulting to [`DEFAULT_DEEPGRAM_ENABLED`]
-/// (OFF) when the file is absent, unreadable, or does not carry the key.
+/// (ON) when the file is absent, unreadable, or does not carry the key.
 pub fn deepgram_enabled() -> bool {
     resolve(
         std::env::var_os(DISABLE_DEEPGRAM_ENV).is_some(),
@@ -224,8 +227,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_default_is_off_when_nothing_is_persisted() {
-        assert!(!resolve(false, None));
+    fn the_default_is_on_when_nothing_is_persisted() {
+        assert!(resolve(false, None));
     }
 
     #[test]
@@ -294,8 +297,8 @@ other_key = 5
 
     #[test]
     fn a_toggle_under_a_table_is_not_read_as_the_root_setting() {
-        // Real TOML scopes this key to `[other]`, so it must NOT enable the
-        // Provider against the default-off policy.
+        // Real TOML scopes this key to `[other]`, so it must NOT be read as the
+        // root toggle: a table-scoped key never decides the Provider.
         assert_eq!(
             parse_deepgram_enabled("[other]\ndeepgram_enabled = true\n"),
             None
