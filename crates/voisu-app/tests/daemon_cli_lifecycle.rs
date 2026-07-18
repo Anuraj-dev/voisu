@@ -368,15 +368,24 @@ exit 0
 }
 
 #[test]
-fn deepgram_receives_live_audio_during_the_recording_through_a_hardened_boundary() {
+fn deepgram_receives_live_audio_during_the_recording_over_the_streaming_websocket() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
     write_fake_command(
         commands.path(),
         "pw-record",
+        // 64000 bytes of position-derived PCM (a repeating 0..=255 cycle), so
+        // reordering, duplication, or corruption that preserves length still
+        // fails the content assertion below. The full buffer is built FIRST
+        // and emitted with one cat, so the graceful stop can never interrupt
+        // generation mid-way; the ready marker follows the complete emission.
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 64000 /dev/zero | tr '\000' '\001'
+i=0
+while [ "$i" -lt 256 ]; do printf "\\$(printf '%03o' "$i")"; i=$((i + 1)); done > "$dir/pcm-cycle"
+i=0
+while [ "$i" -lt 250 ]; do cat "$dir/pcm-cycle"; i=$((i + 1)); done > "$dir/pcm-full"
+cat "$dir/pcm-full"
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -387,19 +396,8 @@ while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
         commands.path(),
         "curl",
         r#"#!/bin/sh
-dir=$(dirname "$0")
-config=$(mktemp "$dir/curl-config.XXXXXX")
-cat > "$config"
-if grep -q 'deepgram.test' "$config"; then
-  printf '%s\n' "$@" > "$dir/deepgram.args"
-  env | sort > "$dir/deepgram.env"
-  cp "$config" "$dir/deepgram.stdin"
-  : > "$dir/deepgram.ready"
-  printf '{"results":{"channels":[{"alternatives":[{"transcript":"hello from Deepgram"}]}]}}'
-else
-  printf '{"text":"hello from Groq"}'
-fi
-rm -f "$config"
+cat > /dev/null
+printf '{"text":"hello from Groq"}'
 "#,
     );
     write_fake_command(
@@ -410,6 +408,10 @@ dir=$(dirname "$0")
 cat > "$dir/clipboard"
 "#,
     );
+    let deepgram_endpoint = spawn_mock_deepgram(
+        commands.path(),
+        MockDeepgramBehavior::Finalize("hello from Deepgram"),
+    );
     let path = format!(
         "{}:{}",
         commands.path().display(),
@@ -421,10 +423,7 @@ cat > "$dir/clipboard"
             ("PATH", &path),
             ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
             ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
-            (
-                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
-                "https://deepgram.test/v1/listen",
-            ),
+            ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
             (
                 "VOISU_GROQ_TRANSCRIPTION_URL",
                 "https://groq.test/audio/transcriptions",
@@ -435,7 +434,12 @@ cat > "$dir/clipboard"
 
     let started = voisu(runtime.path(), "start");
     assert!(started.status.success(), "{}", stderr(&started));
+    // Binary PCM frames must reach the websocket DURING the Recording, not
+    // only at stop.
     wait_for_marker(commands.path(), "deepgram.ready");
+    // Stop only after the full 64000 bytes were emitted, so the content
+    // assertion below compares against the complete captured Recording.
+    wait_for_marker(commands.path(), "pw-record.ready");
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
 
     let stopped = voisu(runtime.path(), "stop");
@@ -444,126 +448,23 @@ cat > "$dir/clipboard"
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
         "hello from Groq"
     );
+    let handshake = fs::read_to_string(commands.path().join("deepgram.handshake")).unwrap();
+    let (uri, authorization) = handshake.split_once('\n').unwrap();
+    assert!(uri.contains("model=nova-3"), "{uri}");
+    assert!(uri.contains("encoding=linear16"), "{uri}");
+    assert!(uri.contains("sample_rate=16000"), "{uri}");
+    assert!(uri.contains("interim_results=true"), "{uri}");
+    assert_eq!(authorization, "Token deepgram-controlled-secret");
+    assert!(!handshake.contains("groq-controlled-secret"));
+    // The whole finalized Recording (pw-record emits 64000 position-derived
+    // PCM bytes) must arrive as binary frames by CloseStream — byte for byte,
+    // in order: live streaming plus the complete() tail top-up.
+    let expected: Vec<u8> = (0..64000_usize).map(|index| (index % 256) as u8).collect();
     assert_eq!(
-        fs::read_to_string(commands.path().join("deepgram.args"))
-            .unwrap()
-            .lines()
-            .next(),
-        Some("-q")
+        fs::read(commands.path().join("deepgram.audio")).unwrap(),
+        expected,
+        "the streamed PCM must match the captured Recording byte for byte"
     );
-    let environment = fs::read_to_string(commands.path().join("deepgram.env")).unwrap();
-    assert!(!environment.contains("VOISU_DEEPGRAM_API_KEY="));
-    assert!(!environment.contains("VOISU_GROQ_API_KEY="));
-    let config = fs::read_to_string(commands.path().join("deepgram.stdin")).unwrap();
-    assert!(config.contains("Authorization: Token deepgram-controlled-secret"));
-    assert!(!config.contains("groq-controlled-secret"));
-}
-
-#[test]
-fn deepgram_queues_chunks_after_three_in_flight_requests() {
-    let runtime = TempDir::new().unwrap();
-    let commands = TempDir::new().unwrap();
-    write_fake_command(
-        commands.path(),
-        "pw-record",
-        r#"#!/bin/sh
-dir=$(dirname "$0")
-head -c 160000 /dev/zero | tr '\000' '\001'
-trap 'exit 0' INT TERM
-: > "$dir/pw-record.ready"
-i=0
-while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
-"#,
-    );
-    write_fake_command(
-        commands.path(),
-        "curl",
-        r#"#!/bin/sh
-dir=$(dirname "$0")
-config=$(mktemp "$dir/curl-config.XXXXXX")
-cat > "$config"
-if ! grep -q 'deepgram.test' "$config"; then
-  rm -f "$config"
-  printf '{"text":"Groq Source Transcript"}'
-  exit 0
-fi
-rm -f "$config"
-i=0
-while ! mkdir "$dir/deepgram.lock" 2>/dev/null && [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
-sequence=$(cat "$dir/deepgram.next" 2>/dev/null || printf '0')
-sequence=$((sequence + 1))
-printf '%s' "$sequence" > "$dir/deepgram.next"
-active=$(cat "$dir/deepgram.active" 2>/dev/null || printf '0')
-active=$((active + 1))
-printf '%s' "$active" > "$dir/deepgram.active"
-maximum=$(cat "$dir/deepgram.maximum" 2>/dev/null || printf '0')
-if [ "$active" -gt "$maximum" ]; then
-  printf '%s' "$active" > "$dir/deepgram.maximum"
-fi
-rmdir "$dir/deepgram.lock"
-: > "$dir/deepgram.started.$sequence"
-i=0
-while [ ! -e "$dir/deepgram.release.$sequence" ] && [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
-i=0
-while ! mkdir "$dir/deepgram.lock" 2>/dev/null && [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
-active=$(cat "$dir/deepgram.active")
-printf '%s' $((active - 1)) > "$dir/deepgram.active"
-rmdir "$dir/deepgram.lock"
-printf '{"results":{"channels":[{"alternatives":[{"transcript":"chunk"}]}]}}'
-"#,
-    );
-    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
-    let path = format!(
-        "{}:{}",
-        commands.path().display(),
-        std::env::var("PATH").unwrap()
-    );
-    let _daemon = Daemon::start_production_with_env(
-        runtime.path(),
-        &[
-            ("PATH", &path),
-            ("VOISU_TEST_MODE", "system-boundaries"),
-            ("VOISU_TEST_PROVIDER_DEADLINE_MS", "2000"),
-            ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
-            ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
-            (
-                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
-                "https://deepgram.test/v1/listen",
-            ),
-            (
-                "VOISU_GROQ_TRANSCRIPTION_URL",
-                "https://groq.test/audio/transcriptions",
-            ),
-        ],
-    );
-
-    assert!(voisu(runtime.path(), "start").status.success());
-    wait_for_marker(commands.path(), "pw-record.ready");
-    for sequence in 1..=3 {
-        wait_for_marker(commands.path(), &format!("deepgram.started.{sequence}"));
-    }
-    for sequence in 1..=3 {
-        fs::write(
-            commands.path().join(format!("deepgram.release.{sequence}")),
-            "",
-        )
-        .unwrap();
-    }
-    wait_for_marker(commands.path(), "deepgram.started.4");
-    wait_for_marker(commands.path(), "deepgram.started.5");
-    assert_eq!(
-        fs::read_to_string(commands.path().join("deepgram.maximum")).unwrap(),
-        "3"
-    );
-    for sequence in 4..=5 {
-        fs::write(
-            commands.path().join(format!("deepgram.release.{sequence}")),
-            "",
-        )
-        .unwrap();
-    }
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
-    assert_eq!(stopped["ok"], true, "{stopped}");
 }
 
 #[test]
@@ -586,17 +487,14 @@ while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
         commands.path(),
         "curl",
         r#"#!/bin/sh
-config=$(mktemp)
-cat > "$config"
-if grep -q 'deepgram.test' "$config"; then
-  rm -f "$config"
-  printf '{"results":{"channels":[{"alternatives":[{"transcript":"Deepgram fallback"}]}]}}'
-else
-  rm -f "$config"
-  trap - EXIT
-  exit 22
-fi
+cat > /dev/null
+trap - EXIT
+exit 22
 "#,
+    );
+    let deepgram_endpoint = spawn_mock_deepgram(
+        commands.path(),
+        MockDeepgramBehavior::Finalize("Deepgram fallback"),
     );
     write_fake_command(
         commands.path(),
@@ -617,10 +515,7 @@ cat > "$dir/clipboard"
             ("PATH", &path),
             ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
             ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
-            (
-                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
-                "https://deepgram.test/v1/listen",
-            ),
+            ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
             (
                 "VOISU_GROQ_TRANSCRIPTION_URL",
                 "https://groq.test/audio/transcriptions",
@@ -666,14 +561,7 @@ while test "$i" -lt 6000; do sleep 0.01; i=$((i + 1)); done
             commands.path(),
             "curl",
             r#"#!/bin/sh
-config=$(mktemp)
-cat > "$config"
-if grep -q 'deepgram.test' "$config"; then
-  rm -f "$config"
-  printf '{"results":{"channels":[{"alternatives":[{"transcript":"Provider fallback"}]}]}}'
-  exit 0
-fi
-rm -f "$config"
+cat > /dev/null
 case "${VOISU_TEST_PROVIDER_FAILURE_MODE:?}" in
   disconnect) exit 56 ;;
   malformed) printf '{'; exit 0 ;;
@@ -696,6 +584,10 @@ printf '%s' "$((count + 1))" > "$dir/delivery.count"
             commands.path().display(),
             std::env::var("PATH").unwrap()
         );
+        let deepgram_endpoint = spawn_mock_deepgram(
+            commands.path(),
+            MockDeepgramBehavior::Finalize("Provider fallback"),
+        );
         let daemon = Daemon::start_production_with_env(
             runtime.path(),
             &[
@@ -703,10 +595,7 @@ printf '%s' "$((count + 1))" > "$dir/delivery.count"
                 ("VOISU_TEST_PROVIDER_FAILURE_MODE", failure),
                 ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
                 ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
-                (
-                    "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
-                    "https://deepgram.test/v1/listen",
-                ),
+                ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
                 (
                     "VOISU_GROQ_TRANSCRIPTION_URL",
                     "https://groq.test/audio/transcriptions",
@@ -743,7 +632,11 @@ printf '%s' "$((count + 1))" > "$dir/delivery.count"
 }
 
 #[test]
-fn groq_receives_bounded_overlapping_chunks_and_the_merge_result_is_delivered_once() {
+fn groq_transcribes_a_short_recording_as_one_full_audio_request_at_finalize() {
+    // A Recording at or below the full-audio limit (~120 s) pre-streams nothing
+    // during the Recording — Whisper gets the complete audio in one request at
+    // finalize, eliminating chunk seams. ~31 s of PCM here stays well under the
+    // limit.
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
     write_fake_command(
@@ -765,7 +658,7 @@ cat > "$dir/clipboard"
 "#,
     );
     let (endpoint, requests_rx, live_requests, server) =
-        local_groq_chunk_server(vec!["alpha beta", "beta gamma"]);
+        local_groq_chunk_server(vec!["alpha beta gamma"]);
     let path = format!(
         "{}:{}",
         commands.path().display(),
@@ -781,24 +674,31 @@ cat > "$dir/clipboard"
         ],
     );
     assert!(voisu(runtime.path(), "start").status.success());
-    let live_deadline = Instant::now() + Duration::from_secs(2);
-    while live_requests.load(Ordering::SeqCst) == 0 && Instant::now() < live_deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
+    // Confirm the Recording is actively capturing, then prove no Groq chunk was
+    // pre-streamed: a short Recording issues its one request only at finalize.
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
     assert_eq!(
         live_requests.load(Ordering::SeqCst),
-        1,
-        "the first bounded Groq chunk must be submitted during the Recording"
+        0,
+        "a short Recording must not pre-stream any Groq chunk"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
     let stopped = voisu(runtime.path(), "stop");
     assert!(stopped.status.success(), "{}", stderr(&stopped));
     let requests = requests_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
-    assert_eq!(requests.len(), 2, "one long Recording must be bounded into two Groq requests");
-    for request in requests {
-        assert!(request.windows(4).any(|window| window == b"RIFF"));
-    }
+    assert_eq!(
+        requests.len(),
+        1,
+        "a short Recording is one full-audio Groq request at finalize"
+    );
+    assert!(requests[0].windows(4).any(|window| window == b"RIFF"));
+    // The one request must carry the FULL captured PCM, not a stripped or empty
+    // 44-byte WAV header: ~1,000,000 bytes of audio were captured.
+    assert!(
+        requests[0].len() >= 1_000_000,
+        "the finalize request carries the full audio, not an empty WAV (got {} bytes)",
+        requests[0].len()
+    );
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
         "alpha beta gamma"
@@ -1154,15 +1054,13 @@ while test "$i" -lt 6000; do sleep 0.01; i=$((i + 1)); done
         commands.path(),
         "curl",
         r#"#!/bin/sh
-config=$(mktemp)
-cat > "$config"
-if grep -q 'deepgram.test' "$config"; then
-  printf '{"results":{"channels":[{"alternatives":[{"transcript":"Recovered microphone"}]}]}}'
-else
-  printf '{"text":"Recovered microphone"}'
-fi
-rm -f "$config"
+cat > /dev/null
+printf '{"text":"Recovered microphone"}'
 "#,
+    );
+    let deepgram_endpoint = spawn_mock_deepgram(
+        commands.path(),
+        MockDeepgramBehavior::Finalize("Recovered microphone"),
     );
     write_fake_command(
         commands.path(),
@@ -1183,10 +1081,7 @@ cat > "$dir/clipboard"
             ("PATH", &path),
             ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
             ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
-            (
-                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
-                "https://deepgram.test/v1/listen",
-            ),
+            ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
             (
                 "VOISU_GROQ_TRANSCRIPTION_URL",
                 "https://groq.test/audio/transcriptions",
@@ -1607,9 +1502,26 @@ fn a_capture_that_dies_silently_before_stop_never_delivers_a_transcript() {
 
     assert!(voisu(runtime.path(), "start").status.success());
     wait_for_marker(commands.path(), "pw-record.ready");
-    let stopped = voisu(runtime.path(), "stop");
-    assert!(!stopped.status.success());
-    let message = stderr(&stopped);
+    // The dead capture's EOF handling races this explicit stop: a single stop
+    // can land while the daemon is mid-Processing of the already-failed
+    // Recording (a legitimate transient — the streaming provider's abort runs
+    // inside it), so retry until the race resolves. The contract under test
+    // is unchanged and fully asserted below: the Recording FAILS, nothing is
+    // ever delivered, and the daemon recovers.
+    let settle_deadline = Instant::now() + Duration::from_secs(5);
+    let message = loop {
+        let stopped = voisu(runtime.path(), "stop");
+        assert!(!stopped.status.success());
+        let message = stderr(&stopped);
+        if message != "Recording is being processed\n" {
+            break message;
+        }
+        assert!(
+            Instant::now() < settle_deadline,
+            "processing a silently dead capture must settle"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
     assert!(
         message == "Recording capture failed\n" || message == "No Recording active\n",
         "a silently dead capture must fail the Recording, got: {message}"
@@ -1973,6 +1885,115 @@ fn write_fake_command(directory: &Path, name: &str, script: &str) {
         .expect("fake command should be executable");
 }
 
+/// How a mock Deepgram streaming connection behaves once audio arrives.
+#[derive(Clone, Copy)]
+enum MockDeepgramBehavior {
+    /// Answer `CloseStream` with one finalized `Results` transcript, then
+    /// close — the healthy streaming path.
+    Finalize(&'static str),
+    /// Never answer `CloseStream`: the daemon's Provider Deadline / abort
+    /// paths must close the connection themselves.
+    NeverFinalize,
+    /// Send a streaming `Error` message after the first audio frame — the
+    /// visible mid-Recording provider failure.
+    StreamingError,
+}
+
+/// Serves a loopback Deepgram streaming endpoint for acceptance daemons and
+/// returns the endpoint URL to inject via `VOISU_DEEPGRAM_TRANSCRIPTION_URL`.
+/// Every connection is served the same way, and observability mirrors the
+/// fake-command marker convention in `markers`:
+/// - `deepgram.handshake` — request URI + Authorization header, one per line;
+/// - `deepgram.ready` — written when the first binary audio frame arrives;
+/// - `deepgram.audio-bytes` — running total of binary PCM bytes received;
+/// - `deepgram.audio` — the received binary PCM itself, in arrival order;
+/// - `deepgram.closed` — written when a connection ends.
+fn spawn_mock_deepgram(markers: &Path, behavior: MockDeepgramBehavior) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://127.0.0.1:{}/v1/listen",
+        listener.local_addr().unwrap().port()
+    );
+    let markers = markers.to_path_buf();
+    thread::spawn(move || {
+        for connection in listener.incoming() {
+            let Ok(connection) = connection else { break };
+            let markers = markers.clone();
+            thread::spawn(move || serve_mock_deepgram_connection(connection, &markers, behavior));
+        }
+    });
+    endpoint
+}
+
+fn serve_mock_deepgram_connection(
+    connection: std::net::TcpStream,
+    markers: &Path,
+    behavior: MockDeepgramBehavior,
+) {
+    use tungstenite::handshake::server::{Request as WsRequest, Response as WsResponse};
+    use tungstenite::Message;
+
+    let mut handshake = String::new();
+    let accepted = tungstenite::accept_hdr(
+        connection,
+        |request: &WsRequest, response: WsResponse| {
+            handshake = format!(
+                "{}\n{}",
+                request.uri(),
+                request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+            );
+            Ok(response)
+        },
+    );
+    let Ok(mut socket) = accepted else { return };
+    fs::write(markers.join("deepgram.handshake"), handshake).unwrap();
+    let mut audio_bytes = 0_usize;
+    let mut audio: Vec<u8> = Vec::new();
+    let mut error_sent = false;
+    loop {
+        match socket.read() {
+            Ok(Message::Binary(bytes)) => {
+                audio_bytes += bytes.len();
+                audio.extend_from_slice(&bytes);
+                fs::write(markers.join("deepgram.audio-bytes"), audio_bytes.to_string()).unwrap();
+                fs::write(markers.join("deepgram.audio"), &audio).unwrap();
+                fs::write(markers.join("deepgram.ready"), "").unwrap();
+                if matches!(behavior, MockDeepgramBehavior::StreamingError) && !error_sent {
+                    error_sent = true;
+                    let _ = socket.send(Message::Text(
+                        r#"{"type":"Error","description":"controlled streaming failure"}"#
+                            .to_owned(),
+                    ));
+                }
+            }
+            Ok(Message::Text(text)) => {
+                if text.contains("CloseStream") {
+                    if let MockDeepgramBehavior::Finalize(transcript) = behavior {
+                        let results = format!(
+                            r#"{{"type":"Results","is_final":true,"speech_final":true,"channel":{{"alternatives":[{{"transcript":"{transcript}"}}]}}}}"#
+                        );
+                        let _ = socket.send(Message::Text(results));
+                        // The terminal summary Metadata confirms CloseStream
+                        // was processed; the client requires it before close.
+                        let _ = socket.send(Message::Text(
+                            r#"{"type":"Metadata","request_id":"mock-request"}"#.to_owned(),
+                        ));
+                        let _ = socket.send(Message::Close(None));
+                        break;
+                    }
+                }
+            }
+            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    fs::write(markers.join("deepgram.closed"), "").unwrap();
+}
+
 fn start_portal_clipboard_daemon(
     runtime: &Path,
     commands: &Path,
@@ -1993,15 +2014,13 @@ while :; do sleep 0.01; done
         commands,
         "curl",
         r#"#!/bin/sh
-config=$(mktemp)
-cat > "$config"
-if grep -q 'deepgram.test' "$config"; then
-  printf '{"results":{"channels":[{"alternatives":[{"transcript":"Portal recovery Transcript"}]}]}}'
-else
-  printf '{"text":"Portal recovery Transcript"}'
-fi
-rm -f "$config"
+cat > /dev/null
+printf '{"text":"Portal recovery Transcript"}'
 "#,
+    );
+    let deepgram_endpoint = spawn_mock_deepgram(
+        commands,
+        MockDeepgramBehavior::Finalize("Portal recovery Transcript"),
     );
     write_fake_command(
         commands,
@@ -2027,16 +2046,29 @@ printf '%s' "$((count + 1))" > "$dir/delivery.count"
             ("VOISU_DISABLE_DIRECT_DELIVERY", "1"),
             ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
             ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
-            (
-                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
-                "https://deepgram.test/v1/listen",
-            ),
+            ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
             (
                 "VOISU_GROQ_TRANSCRIPTION_URL",
                 "https://groq.test/audio/transcriptions",
             ),
         ],
     )
+}
+
+/// Asserts a marker appears within a tight `bound`, unlike `wait_for_marker`'s
+/// open-ended poll. Used where the marker's cause must ALREADY have happened
+/// (e.g. a websocket close initiated before Idle was published) and only the
+/// cross-thread/loopback observation lag is tolerable — an implementation
+/// that leaves the work running would need the full open-ended wait instead.
+fn assert_marker_appears_within(directory: &Path, name: &str, bound: Duration) {
+    let deadline = Instant::now() + bound;
+    while !directory.join(name).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{name} must appear within {bound:?} — was the websocket still live at Idle?"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 fn wait_for_portal_capture(commands: &Path) {
@@ -3035,9 +3067,7 @@ while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
 dir=$(dirname "$0")
 config=$(mktemp "$dir/curl-config.XXXXXX")
 cat > "$config"
-if grep -q 'deepgram.test' "$config"; then
-  printf '{"results":{"channels":[{"alternatives":[{"transcript":"Book the room Tuesday afternoon."}]}]}}'
-elif grep -q 'reconciliation.test' "$config"; then
+if grep -q 'reconciliation.test' "$config"; then
   cp "$config" "$dir/reconciliation.config"
   printf '{"choices":[{"message":{"content":"Book the review for Wednesday morning."}}]}'
 else
@@ -3045,6 +3075,10 @@ else
 fi
 rm -f "$config"
 "#,
+    );
+    let deepgram_endpoint = spawn_mock_deepgram(
+        commands.path(),
+        MockDeepgramBehavior::Finalize("Book the room Tuesday afternoon."),
     );
     write_fake_command(
         commands.path(),
@@ -3063,10 +3097,7 @@ rm -f "$config"
             ("VOISU_TEST_MODE", "system-boundaries"),
             ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
             ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
-            (
-                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
-                "https://deepgram.test/v1/listen",
-            ),
+            ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
             (
                 "VOISU_GROQ_TRANSCRIPTION_URL",
                 "https://groq.test/audio/transcriptions",
@@ -3137,10 +3168,7 @@ fi
 dir=$(dirname "$0")
 config=$(mktemp "$dir/curl-config.XXXXXX")
 cat > "$config"
-if grep -q 'deepgram.test' "$config"; then
-  rm -f "$config"
-  printf '{"results":{"channels":[{"alternatives":[{"transcript":"Book the room Tuesday afternoon."}]}]}}'
-elif grep -q 'reconciliation.test' "$config"; then
+if grep -q 'reconciliation.test' "$config"; then
   printf '%s\n' "$$" > "$dir/reconciliation.pid"
   : > "$dir/reconciliation.started"
   rm -f "$config"
@@ -3151,6 +3179,10 @@ else
   printf '{"text":"Schedule the review Wednesday morning."}'
 fi
 "#,
+    );
+    let deepgram_endpoint = spawn_mock_deepgram(
+        commands.path(),
+        MockDeepgramBehavior::Finalize("Book the room Tuesday afternoon."),
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
     let path = format!(
@@ -3164,10 +3196,7 @@ fi
             ("PATH", &path),
             ("VOISU_TEST_MODE", "system-boundaries"),
             ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
-            (
-                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
-                "https://deepgram.test/v1/listen",
-            ),
+            ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
             (
                 "VOISU_GROQ_TRANSCRIPTION_URL",
                 "https://groq.test/audio/transcriptions",
@@ -3227,7 +3256,7 @@ fn provider_deadline_releases_the_valid_source_without_waiting_for_the_slow_prov
 }
 
 #[test]
-fn provider_deadline_kills_and_reaps_late_deepgram_curl_before_idle() {
+fn provider_deadline_closes_the_late_deepgram_stream_before_the_daemon_reports_idle() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
     write_fake_command(
@@ -3246,23 +3275,15 @@ while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
         commands.path(),
         "curl",
         r#"#!/bin/sh
-dir=$(dirname "$0")
-config=$(mktemp "$dir/curl-config.XXXXXX")
-cat > "$config"
-if grep -q 'deepgram.test' "$config"; then
-  printf '%s\n' "$$" > "$dir/deepgram.pid"
-  : > "$dir/deepgram.started"
-  rm -f "$config"
-  i=0
-  while [ ! -e "$dir/deepgram.release" ] && [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
-  printf '{"results":{"channels":[{"alternatives":[{"transcript":"late"}]}]}}'
-else
-  rm -f "$config"
-  printf '{"text":"Groq wins"}'
-fi
+cat > /dev/null
+printf '{"text":"Groq wins"}'
 "#,
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
+    // The mock never answers CloseStream: Deepgram's completion outlasts the
+    // Provider Deadline and the gated abort must close the websocket.
+    let deepgram_endpoint =
+        spawn_mock_deepgram(commands.path(), MockDeepgramBehavior::NeverFinalize);
     let path = format!(
         "{}:{}",
         commands.path().display(),
@@ -3276,10 +3297,7 @@ fi
             ("VOISU_TEST_PROVIDER_DEADLINE_MS", "2000"),
             ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
             ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
-            (
-                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
-                "https://deepgram.test/v1/listen",
-            ),
+            ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
             (
                 "VOISU_GROQ_TRANSCRIPTION_URL",
                 "https://groq.test/audio/transcriptions",
@@ -3288,7 +3306,7 @@ fi
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    wait_for_marker(commands.path(), "deepgram.started");
+    wait_for_marker(commands.path(), "deepgram.ready");
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(
@@ -3296,16 +3314,15 @@ fi
         serde_json::json!(["groq"])
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
-    let pid = fs::read_to_string(commands.path().join("deepgram.pid")).unwrap();
-    assert!(
-        !Path::new(&format!("/proc/{}", pid.trim())).exists(),
-        "the late Deepgram curl must be reaped before Idle is observable"
-    );
-    assert!(!commands.path().join("deepgram.release").exists());
+    // The gated abort closes the websocket BEFORE the daemon acknowledges and
+    // Idle becomes observable, so at this point the close is already on the
+    // wire: only the mock's cross-thread observation lag is granted, not an
+    // open-ended wait that would also pass over a still-live connection.
+    assert_marker_appears_within(commands.path(), "deepgram.closed", Duration::from_millis(250));
 }
 
 #[test]
-fn deepgram_chunk_failure_reaps_later_curls_before_idle() {
+fn deepgram_streaming_error_fails_the_provider_and_groq_still_delivers() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
     write_fake_command(
@@ -3314,8 +3331,7 @@ fn deepgram_chunk_failure_reaps_later_curls_before_idle() {
         r#"#!/bin/sh
 dir=$(dirname "$0")
 head -c 32000 /dev/zero | tr '\000' '\001'
-head -c 32000 /dev/zero | tr '\000' '\002'
-head -c 32000 /dev/zero | tr '\000' '\003'
+trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
 i=0
 while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
@@ -3325,37 +3341,15 @@ while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
         commands.path(),
         "curl",
         r#"#!/bin/sh
-dir=$(dirname "$0")
-config=$(mktemp "$dir/curl-config.XXXXXX")
-cat > "$config"
-if grep -q 'deepgram.test' "$config"; then
-  audio=$(sed -n 's/^data-binary = "@\(.*\)"$/\1/p' "$config")
-  byte=$(od -An -tu1 -N1 "$audio" | tr -d ' ')
-  printf '%s\n' "$$" >> "$dir/deepgram.pids"
-  : > "$dir/deepgram.started.$byte"
-  rm -f "$config"
-  if [ "$byte" = "1" ]; then
-    trap - EXIT
-    exit 22
-  fi
-  # A pipe-holding descendant inherits stdout and outlives this stub past the
-  # 2000ms Provider Deadline: the daemon's bounded stdout drain (and thus the
-  # chunk JoinHandle) cannot finish before ~3.5s, forcing the Deepgram
-  # completion future to be dropped at the deadline DURING the failed-chunk
-  # cleanup. Only a gated abort() that still owns the retained handles keeps
-  # Idle unobservable until this holder exits.
-  sleep 3.5 &
-  printf '%s\n' "$!" >> "$dir/deepgram.holders"
-  i=0
-  while [ ! -e "$dir/deepgram.release" ] && [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
-  printf '{"results":{"channels":[{"alternatives":[{"transcript":"late"}]}]}}'
-else
-  rm -f "$config"
-  printf '{"text":"Groq wins"}'
-fi
+cat > /dev/null
+printf '{"text":"Groq wins"}'
 "#,
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
+    // The mock reports a streaming Error mid-Recording: the Deepgram provider
+    // must fail visibly while the parallel Groq stream carries the Recording.
+    let deepgram_endpoint =
+        spawn_mock_deepgram(commands.path(), MockDeepgramBehavior::StreamingError);
     let path = format!(
         "{}:{}",
         commands.path().display(),
@@ -3369,10 +3363,7 @@ fi
             ("VOISU_TEST_PROVIDER_DEADLINE_MS", "2000"),
             ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
             ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
-            (
-                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
-                "https://deepgram.test/v1/listen",
-            ),
+            ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
             (
                 "VOISU_GROQ_TRANSCRIPTION_URL",
                 "https://groq.test/audio/transcriptions",
@@ -3381,10 +3372,7 @@ fi
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    wait_for_marker(commands.path(), "deepgram.started.1");
-    wait_for_marker(commands.path(), "deepgram.started.2");
-    wait_for_marker(commands.path(), "deepgram.started.3");
-
+    wait_for_marker(commands.path(), "deepgram.ready");
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(
@@ -3392,30 +3380,9 @@ fi
         serde_json::json!(["groq"])
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
-    for pid in fs::read_to_string(commands.path().join("deepgram.pids"))
-        .unwrap()
-        .lines()
-    {
-        assert!(
-            !Path::new(&format!("/proc/{pid}")).exists(),
-            "a later Deepgram curl must be reaped before Idle is observable"
-        );
-    }
-    // The pipe-holders prove the deadline fired DURING the failed-chunk
-    // cleanup and that abort() still owned the retained sibling handles: if
-    // the cleanup had detached them (e.g. by draining the deque before
-    // awaiting), Idle would be observable at the 2s deadline while these
-    // descendants are still alive at ~3.5s.
-    for pid in fs::read_to_string(commands.path().join("deepgram.holders"))
-        .expect("later Deepgram curls must have spawned their pipe-holders")
-        .lines()
-    {
-        assert!(
-            !Path::new(&format!("/proc/{pid}")).exists(),
-            "a late Deepgram pipe-holder must be gone before Idle is observable"
-        );
-    }
-    assert!(!commands.path().join("deepgram.release").exists());
+    // The failed stream's websocket is torn down before Idle is observable,
+    // not left dangling; only observation lag is granted.
+    assert_marker_appears_within(commands.path(), "deepgram.closed", Duration::from_millis(250));
 }
 
 #[test]
@@ -4447,8 +4414,9 @@ fn daemon_interruption_reaps_boundary_processes_and_restarts_in_a_safe_state() {
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-printf '%s' "$$" > "$dir/pw-record.pid"
-head -c 1000000 /dev/zero | tr '\000' '\001'
+printf '%s' "$$" > "$dir/pw-record.pid.$$"
+mv "$dir/pw-record.pid.$$" "$dir/pw-record.pid"
+head -c 4000000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 i=0
 while test "$i" -lt 6000; do sleep 0.01; i=$((i + 1)); done
@@ -4462,7 +4430,8 @@ dir=$(dirname "$0")
 cat >/dev/null
 exec </dev/null >/dev/null 2>&1
 trap '' EXIT HUP INT TERM PIPE
-printf '%s' "$$" > "$dir/curl.pid"
+printf '%s' "$$" > "$dir/curl.pid.$$"
+mv "$dir/curl.pid.$$" "$dir/curl.pid"
 : > "$dir/curl.started"
 exec setsid sleep infinity
 "#,
@@ -4516,6 +4485,79 @@ exec setsid sleep infinity
     assert!(voisu(runtime.path(), "start").status.success());
     assert!(voisu(runtime.path(), "stop").status.success());
     replacement.terminate();
+}
+
+#[test]
+// PR_SET_PDEATHSIG is armed against the forking THREAD, not the process: a
+// pw-record spawned directly on a transient Tokio blocking-pool thread is
+// SIGKILLed when that idle thread is reaped (~10 s in production), killing
+// every longer Recording. The shrunken keep-alive makes an unfixed spawn path
+// fail within ~1 s; the capture must survive the pool-thread reap.
+fn recording_survives_blocking_pool_thread_reap() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s' "$$" > "$dir/pw-record.pid.$$"
+mv "$dir/pw-record.pid.$$" "$dir/pw-record.pid"
+trap 'exit 0' INT TERM
+i=0
+while test "$i" -lt 600; do
+  head -c 3200 /dev/zero | tr '\000' '\001'
+  sleep 0.01
+  i=$((i + 1))
+done
+"#,
+    );
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
+            ("VOISU_TEST_BLOCKING_KEEP_ALIVE_MS", "50"),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "pw-record.pid");
+    let pid = fs::read_to_string(commands.path().join("pw-record.pid"))
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    let started = proc_state_and_start(pid)
+        .expect("pw-record must be inspectable right after its pid marker");
+    thread::sleep(Duration::from_millis(1500));
+    // A bare /proc existence check would also pass for an unreaped zombie or a
+    // reused pid; require the SAME process (starttime) still running.
+    let (state, start_time) = proc_state_and_start(pid)
+        .expect("pw-record was killed by the blocking-pool thread reap");
+    assert_eq!(start_time, started.1, "pw-record pid was reused by another process");
+    assert_ne!(state, 'Z', "pw-record is a zombie: it was killed by the thread reap");
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    daemon.terminate();
+}
+
+/// Reads (state, starttime) for a pid from /proc/<pid>/stat, parsing after the
+/// last ')' so a comm containing spaces or parentheses cannot shift fields.
+fn proc_state_and_start(pid: u32) -> Option<(char, u64)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit_once(')')?.1;
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    // starttime is field 22 of stat; the first field after ')' is field 3.
+    let start_time = fields.nth(18)?.parse::<u64>().ok()?;
+    Some((state, start_time))
 }
 
 #[test]
@@ -4698,13 +4740,15 @@ fn start_during_recovery_is_rejected_retryably_then_succeeds() {
 fn failed_recording_kills_its_in_flight_groq_request_before_the_next_recording() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
-    // Enough PCM for one bounded Groq chunk request during the Recording, then
-    // keep recording until the configured Recording Deadline fails it.
+    // More than the full-audio limit (~120 s) of PCM so the Recording crosses
+    // into pre-streamed chunking and a bounded Groq chunk request goes in
+    // flight during the Recording; then keep recording until the configured
+    // Recording Deadline fails it.
     write_fake_command(
         commands.path(),
         "pw-record",
         r#"#!/bin/sh
-head -c 1000000 /dev/zero | tr '\000' '\001'
+head -c 4000000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 i=0
 while [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
@@ -4774,7 +4818,96 @@ while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
 }
 
 #[test]
-fn failed_recording_kills_its_in_flight_deepgram_requests_before_the_next_recording() {
+fn finalize_groq_request_is_killed_when_the_provider_deadline_fires() {
+    // The single full-audio request of a short (<=120 s) Recording is issued at
+    // finalize. Its subprocess must be owned like a pre-streamed chunk: when the
+    // Provider Deadline fires while it is in flight, the abort must KILL the
+    // curl child, not leave it detached to run for up to 14 s and overlap the
+    // next Recording. This exercises the finalize path specifically, not the
+    // pre-stream deque.
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    // ~2 s of PCM: far below the 120 s full-audio limit, so nothing pre-streams
+    // and the only Groq request is the one issued at finalize.
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+head -c 64000 /dev/zero | tr '\000' '\001'
+: > "$dir/pw-record.ready"
+trap 'exit 0' INT TERM
+i=0
+while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
+"#,
+    );
+    // The Groq finalize request hangs so the Provider Deadline fires while it is
+    // in flight; only a kill from the aborted Recording ends it early.
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$$" >> "$dir/curl.pids"
+: > "$dir/curl.start"
+i=0
+while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
+"#,
+    );
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_TEST_MODE", "system-boundaries"),
+            ("VOISU_TEST_PROVIDER_DEADLINE_MS", "2000"),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "pw-record.ready");
+    // Graceful Stop drives finalize; the single full-audio request goes in
+    // flight and hangs, so Stop returns a failure once the Provider Deadline
+    // elapses. What matters is what happens to the request's subprocess.
+    let _ = voisu(runtime.path(), "stop");
+    wait_for_marker(commands.path(), "curl.start");
+    let curl_pid: u32 = fs::read_to_string(commands.path().join("curl.pids"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let kill_deadline = Instant::now() + Duration::from_secs(4);
+    while Path::new(&format!("/proc/{curl_pid}")).exists() {
+        assert!(
+            Instant::now() < kill_deadline,
+            "the finalize Groq request's subprocess must be killed on the Provider Deadline, not detached"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // Only after the stale finalize request is provably dead does the daemon
+    // return to idle and accept the next Recording.
+    let idle_deadline = Instant::now() + Duration::from_secs(8);
+    while stdout(&voisu(runtime.path(), "status")) != "idle\n" {
+        assert!(Instant::now() < idle_deadline, "failed Recording must recover to idle");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(voisu(runtime.path(), "start").status.success());
+}
+
+#[test]
+fn failed_recording_closes_its_deepgram_stream_before_the_next_recording() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
     write_fake_command(
@@ -4791,20 +4924,14 @@ while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
         commands.path(),
         "curl",
         r#"#!/bin/sh
-dir=$(dirname "$0")
-config=$(mktemp "$dir/curl-config.XXXXXX")
-cat > "$config"
-if grep -q 'deepgram.test' "$config"; then
-  printf '%s\n' "$$" >> "$dir/deepgram.pids"
-  : > "$dir/deepgram.start"
-  rm -f "$config"
-  i=0
-  while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
-fi
-rm -f "$config"
+cat > /dev/null
 printf '{"text":"unused Groq Source Transcript"}'
 "#,
     );
+    // The mock never finalizes: the failed Recording's abort must close the
+    // in-flight Deepgram websocket rather than leave it streaming.
+    let deepgram_endpoint =
+        spawn_mock_deepgram(commands.path(), MockDeepgramBehavior::NeverFinalize);
     let path = format!(
         "{}:{}",
         commands.path().display(),
@@ -4816,10 +4943,7 @@ printf '{"text":"unused Groq Source Transcript"}'
             ("PATH", &path),
             ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
             ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
-            (
-                "VOISU_DEEPGRAM_TRANSCRIPTION_URL",
-                "https://deepgram.test/v1/listen",
-            ),
+            ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
             (
                 "VOISU_GROQ_TRANSCRIPTION_URL",
                 "https://groq.test/audio/transcriptions",
@@ -4829,7 +4953,7 @@ printf '{"text":"unused Groq Source Transcript"}'
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    wait_for_marker(commands.path(), "deepgram.start");
+    wait_for_marker(commands.path(), "deepgram.ready");
     let idle_deadline = Instant::now() + Duration::from_secs(5);
     while stdout(&voisu(runtime.path(), "status")) != "idle\n" {
         assert!(
@@ -4838,15 +4962,9 @@ printf '{"text":"unused Groq Source Transcript"}'
         );
         thread::sleep(Duration::from_millis(20));
     }
-    for pid in fs::read_to_string(commands.path().join("deepgram.pids"))
-        .unwrap()
-        .lines()
-    {
-        assert!(
-            !Path::new(&format!("/proc/{pid}")).exists(),
-            "the failed Recording's Deepgram request {pid} must be terminated before idle"
-        );
-    }
+    // The failed Recording's Deepgram websocket must be closed before the
+    // next Recording starts.
+    wait_for_marker(commands.path(), "deepgram.closed");
     assert!(voisu(runtime.path(), "start").status.success());
 }
 
@@ -5568,6 +5686,222 @@ fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn partial_provider_completion_failure_is_recorded_in_history() {
+    // Deepgram succeeds and delivers; Groq fails completion. The failure must be
+    // PERSISTED in history (not merely returned in live evidence). Deleting the
+    // daemon's `record.provider_failures = provider_failures` assignment makes
+    // this assertion fail — it discriminates end-to-end persistence.
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_PROVIDER_COMPLETE_FAILURE", "groq"),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Ship the release on Friday."),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "the surviving provider still delivers: {stopped}");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"].as_array().expect("history is a list")[0];
+    let failures = record["provider_failures"]
+        .as_array()
+        .expect("a failed provider must be recorded even when the other succeeds");
+    assert_eq!(failures.len(), 1, "exactly the failed provider is recorded: {record}");
+    assert_eq!(failures[0]["provider"], "groq");
+    assert_eq!(failures[0]["stage"], "completion");
+    assert!(failures[0]["diagnostic"].is_string(), "the boundary diagnostic is retained");
+
+    let _ = daemon.terminate_and_stderr();
+}
+
+#[test]
+fn all_providers_failing_records_every_failure_in_history() {
+    // No provider produces a Source Transcript. The Recording is rejected, but
+    // history must still show BOTH providers' failures rather than a bare,
+    // source-less error (the silent-absence regression this fixes).
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_PROVIDER_COMPLETE_FAILURE", "both")],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], false, "no Source Transcript was produced: {stopped}");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"].as_array().expect("history is a list")[0];
+    let failures = record["provider_failures"]
+        .as_array()
+        .expect("both providers' failures must be recorded even with no source");
+    assert_eq!(failures.len(), 2, "{record}");
+    let providers: Vec<&str> = failures
+        .iter()
+        .map(|failure| failure["provider"].as_str().unwrap())
+        .collect();
+    assert!(providers.contains(&"deepgram") && providers.contains(&"groq"), "{record}");
+    assert!(failures.iter().all(|failure| failure["stage"] == "completion"), "{record}");
+
+    let _ = daemon.terminate_and_stderr();
+}
+
+#[test]
+fn provider_start_failure_records_both_providers_in_history() {
+    // Finding 4: Groq's start() fails AFTER Deepgram's started. Both providers
+    // must end with an entry — Groq not_started, and the torn-down Deepgram
+    // aborted — never a bare error with a silent absence for either.
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_PROVIDER_START_FAILURE", "1")],
+    );
+
+    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    assert_eq!(started["ok"], false, "{started}");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        let found = history["history"].as_array().unwrap().iter().any(|record| {
+            record["provider_failures"]
+                .as_array()
+                .is_some_and(|failures| {
+                    let groq = failures.iter().any(|failure| {
+                        failure["provider"] == "groq" && failure["stage"] == "not_started"
+                    });
+                    let deepgram = failures.iter().any(|failure| {
+                        failure["provider"] == "deepgram" && failure["stage"] == "aborted"
+                    });
+                    groq && deepgram
+                })
+        });
+        if found {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both providers must be recorded on a start failure: {history}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn capture_begin_failure_records_every_provider_as_not_started() {
+    // §3.5: capture's begin() fails before ANY provider was reached. The
+    // persisted record must still carry an entry per configured provider —
+    // both not_started — never a bare capture error with silent provider
+    // absence.
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_CAPTURE_BEGIN_FAILURE", "1")],
+    );
+
+    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    assert_eq!(started["ok"], false, "{started}");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        let found = history["history"].as_array().unwrap().iter().any(|record| {
+            record["provider_failures"]
+                .as_array()
+                .is_some_and(|failures| {
+                    failures.len() == 2
+                        && ["deepgram", "groq"].iter().all(|provider| {
+                            failures.iter().any(|failure| {
+                                failure["provider"] == *provider
+                                    && failure["stage"] == "not_started"
+                            })
+                        })
+                })
+        });
+        if found {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a capture begin failure must record every provider as not_started: {history}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn deepgram_start_failure_records_unreached_groq_as_not_started() {
+    // §3.5: Deepgram's start() fails FIRST, so Groq is never reached — it must
+    // be recorded not_started (it never began), not aborted (nothing of it
+    // existed to abort).
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_PROVIDER_START_FAILURE", "deepgram")],
+    );
+
+    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    assert_eq!(started["ok"], false, "{started}");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        let found = history["history"].as_array().unwrap().iter().any(|record| {
+            record["provider_failures"]
+                .as_array()
+                .is_some_and(|failures| {
+                    let deepgram = failures.iter().any(|failure| {
+                        failure["provider"] == "deepgram" && failure["stage"] == "not_started"
+                    });
+                    let groq = failures.iter().any(|failure| {
+                        failure["provider"] == "groq" && failure["stage"] == "not_started"
+                    });
+                    deepgram && groq
+                })
+        });
+        if found {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "an unreached provider must be recorded not_started, never aborted: {history}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn capture_finalization_failure_records_all_providers_in_history() {
+    // Finding 4: when capture finalization fails, no completion runs, yet both
+    // providers were started. History must record each as aborted rather than
+    // leaving an empty provider-failure list on the abort exit path.
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_CAPTURE_FINISH_FAILURE", "1")],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], false, "capture finalization failed: {stopped}");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"].as_array().expect("history is a list")[0];
+    let failures = record["provider_failures"]
+        .as_array()
+        .expect("both providers must be accounted for on a capture abort");
+    let providers: Vec<&str> = failures
+        .iter()
+        .map(|failure| failure["provider"].as_str().unwrap())
+        .collect();
+    assert!(providers.contains(&"deepgram") && providers.contains(&"groq"), "{record}");
+    assert!(failures.iter().all(|failure| failure["stage"] == "aborted"), "{record}");
+
+    let _ = daemon.terminate_and_stderr();
 }
 
 #[test]

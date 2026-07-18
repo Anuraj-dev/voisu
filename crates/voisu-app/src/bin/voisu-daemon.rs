@@ -24,7 +24,8 @@ use voisu_core::{
     DeliveryOutcome, DiagnosticRecord, DiagnosticStore, LifecycleEvidence, LifecycleStage,
     OverlayEvent, OverlayOutcome,
     MergeResult, PROTOCOL_VERSION, Provider,
-    ProviderCoordinator, ProviderStream, ProviderStreams, ReconciliationKind, ReconciliationModel,
+    ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream, ProviderStreams,
+    ReconciliationKind, ReconciliationModel,
     ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SourceTranscript,
     SourceTranscriptRecord, Transcript, TranscriptDecision, TranscriptDecisionPipeline,
     TranscriptProvider, TranscriptValidator, TriggerKeyBinding, VersionEnvelope, replay_capture,
@@ -36,8 +37,26 @@ const IO_DEADLINE: Duration = CAPTURE_FINALIZE_DEADLINE;
 const MAX_CONNECTIONS: usize = 32;
 const PROVIDER_DEADLINE: Duration = PROVIDER_COMPLETION_DEADLINE;
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    voisu_app::system::install_crypto_provider();
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    // Test-only seam (VOISU_TEST_* namespace, never set by the packaged unit):
+    // shrinks the blocking-pool idle keep-alive so the acceptance test for the
+    // PR_SET_PDEATHSIG parent-THREAD contract can observe a pool-thread reap
+    // in milliseconds instead of Tokio's production ~10 s.
+    if let Some(keep_alive) = std::env::var("VOISU_TEST_BLOCKING_KEEP_ALIVE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    {
+        builder.thread_keep_alive(Duration::from_millis(keep_alive));
+    }
+    let runtime = builder.build().expect("Tokio runtime construction failed");
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     let systemd_owned = matches!(
         std::env::args().skip(1).collect::<Vec<_>>().as_slice(),
         [argument] if argument == "--systemd"
@@ -313,6 +332,10 @@ struct StartFailure {
     error: BoundaryError,
     capture: Option<Box<dyn ActiveCapture>>,
     provider_stream: Option<Box<dyn ProviderStream>>,
+    /// The provider whose `start()` failed, if the failure was a provider (not a
+    /// capture) start. Recorded as a NotStarted ProviderFailure so a provider
+    /// that never began is visible in history rather than a bare generic error.
+    failed_provider: Option<Provider>,
 }
 
 struct ActiveRecording {
@@ -388,7 +411,10 @@ async fn actor_loop(
     let mut deepgram: Option<Box<dyn TranscriptProvider>> = Some(if controlled {
         Box::new(ControlledProvider::from_env(Provider::Deepgram))
     } else {
-        Box::new(DeepgramProvider::new(reaper.clone()))
+        Box::new(DeepgramProvider::with_keyterms(
+            reaper.clone(),
+            voisu_app::dictionary::merged_terms(),
+        ))
     });
     let mut groq: Option<Box<dyn TranscriptProvider>> = Some(if controlled {
         Box::new(ControlledProvider::from_env(Provider::Groq))
@@ -629,6 +655,15 @@ async fn actor_loop(
                             let mut record = DiagnosticRecord::new(correlation.clone(), id);
                             record.error = Some("daemon is shutting down".to_owned());
                             record.recovery_attempted = true;
+                            // Both provider streams started here and are torn down
+                            // without producing a Source Transcript: record each
+                            // as Aborted so shutdown-during-start is never a
+                            // silent absence.
+                            account_for_missing_providers(
+                                &record.source_transcripts,
+                                &mut record.provider_failures,
+                                "daemon shutting down; Recording aborted during startup",
+                            );
                             if let Err(error) = diagnostics.record(record) {
                                 eprintln!(
                                     "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
@@ -744,6 +779,49 @@ async fn actor_loop(
                             record.error =
                                 Some(failure.error.public_message().to_owned());
                             record.recovery_attempted = recovering;
+                            // Every configured provider ends this record with an
+                            // entry matching how far it actually reached — no
+                            // bare error with a silent absence, even when
+                            // capture itself failed before any provider began.
+                            // The provider whose start() failed and any provider
+                            // never reached are NotStarted; a provider whose
+                            // stream DID start before the failure (e.g. Deepgram
+                            // when Groq start fails) is torn down without a
+                            // Source Transcript, so it is Aborted.
+                            if let Some(provider) = failure.failed_provider {
+                                record.provider_failures.push(ProviderFailure::new(
+                                    provider,
+                                    ProviderFailureStage::NotStarted,
+                                    failure.error.diagnostic().to_owned(),
+                                ));
+                            }
+                            let started_provider = failure
+                                .provider_stream
+                                .as_ref()
+                                .map(|stream| stream.provider());
+                            for provider in [Provider::Deepgram, Provider::Groq] {
+                                if record
+                                    .provider_failures
+                                    .iter()
+                                    .any(|failure| failure.provider == provider)
+                                {
+                                    continue;
+                                }
+                                let (stage, diagnostic) = if started_provider == Some(provider) {
+                                    (
+                                        ProviderFailureStage::Aborted,
+                                        "provider stream started but the Recording was aborted during startup",
+                                    )
+                                } else {
+                                    (
+                                        ProviderFailureStage::NotStarted,
+                                        "provider not reached; startup aborted before it began",
+                                    )
+                                };
+                                record.provider_failures.push(ProviderFailure::new(
+                                    provider, stage, diagnostic,
+                                ));
+                            }
                             if let Err(error) = diagnostics.record(record) {
                                 eprintln!(
                                     "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
@@ -1086,6 +1164,7 @@ fn begin_recording(
                 error,
                 capture: None,
                 provider_stream: None,
+                failed_provider: None,
             });
         }
     };
@@ -1096,6 +1175,7 @@ fn begin_recording(
                 error,
                 capture: Some(active_capture),
                 provider_stream: None,
+                failed_provider: Some(Provider::Deepgram),
             });
         }
     };
@@ -1106,6 +1186,7 @@ fn begin_recording(
                 error,
                 capture: Some(active_capture),
                 provider_stream: Some(deepgram_stream),
+                failed_provider: Some(Provider::Groq),
             });
         }
     };
@@ -1182,10 +1263,16 @@ async fn bounded_abort(capture: Box<dyn ActiveCapture>, cause: BoundaryError) ->
     match timeout(RECOVERY_ABORT_DEADLINE, capture.abort()).await {
         Ok(Ok(())) => cause,
         Ok(Err(abort_error)) => combine_capture_abort(cause, abort_error),
-        Err(_) => BoundaryError::new(
-            cause.kind(),
-            format!("{}; capture abort timed out", cause.diagnostic()),
-        ),
+        Err(_) => {
+            // Preserve any provider-failure evidence the cause carried (e.g. a
+            // Streaming failure that aborted the Recording) into the new error.
+            let failures = cause.provider_failures().to_vec();
+            BoundaryError::new(
+                cause.kind(),
+                format!("{}; capture abort timed out", cause.diagnostic()),
+            )
+            .with_provider_failures(failures)
+        }
     }
 }
 
@@ -1204,22 +1291,31 @@ async fn abort_recording_work(
     );
     match provider_result {
         Ok(Ok(())) => cause,
-        Ok(Err(error)) => BoundaryError::new(
-            cause.kind(),
-            format!(
-                "{}; provider abort failed: {}",
-                cause.diagnostic(),
-                error.diagnostic()
-            ),
-        ),
-        Err(_) => BoundaryError::new(
-            cause.kind(),
-            format!("{}; provider abort timed out", cause.diagnostic()),
-        ),
+        Ok(Err(error)) => {
+            let failures = cause.provider_failures().to_vec();
+            BoundaryError::new(
+                cause.kind(),
+                format!(
+                    "{}; provider abort failed: {}",
+                    cause.diagnostic(),
+                    error.diagnostic()
+                ),
+            )
+            .with_provider_failures(failures)
+        }
+        Err(_) => {
+            let failures = cause.provider_failures().to_vec();
+            BoundaryError::new(
+                cause.kind(),
+                format!("{}; provider abort timed out", cause.diagnostic()),
+            )
+            .with_provider_failures(failures)
+        }
     }
 }
 
 fn combine_capture_abort(cause: BoundaryError, abort_error: BoundaryError) -> BoundaryError {
+    let failures = cause.provider_failures().to_vec();
     BoundaryError::new(
         cause.kind(),
         format!(
@@ -1228,6 +1324,7 @@ fn combine_capture_abort(cause: BoundaryError, abort_error: BoundaryError) -> Bo
             abort_error.diagnostic()
         ),
     )
+    .with_provider_failures(failures)
 }
 
 /// Owns the live capture and provider coordinator during a Recording, feeding
@@ -1322,6 +1419,7 @@ async fn process_recording(
     // persisted to bounded local history once the Recording completes. Raw audio
     // is captured only when the user explicitly enabled debug capture.
     let mut source_records: Vec<SourceTranscriptRecord> = Vec::new();
+    let mut provider_failures: Vec<ProviderFailure> = Vec::new();
     let mut final_transcript: Option<String> = None;
     let mut debug_audio = None;
 
@@ -1346,8 +1444,9 @@ async fn process_recording(
             }
         }
         let completed = providers.complete_with_timings(audio).await?;
-        let sources = completed.sources;
+        provider_failures = completed.provider_failures;
         evidence.provider_timings_ms = completed.timings_ms;
+        let sources = completed.sources;
         evidence.source_transcript_providers =
             sources.iter().map(|source| source.provider).collect();
         source_records = sources.iter().map(SourceTranscriptRecord::new).collect();
@@ -1383,9 +1482,26 @@ async fn process_recording(
     }
     .await;
 
+    // On a failure that produced no usable Source Transcript (both providers
+    // failed completion, a streaming failure aborted the Recording, or a
+    // deadline cleanup failed), the coordinator attached the per-provider
+    // failure evidence to the error rather than to a ProviderCompletion. Recover
+    // it here so history shows each provider's absence instead of a bare error.
+    if let Some(error) = result.as_ref().err() {
+        if provider_failures.is_empty() {
+            provider_failures = error.provider_failures().to_vec();
+        }
+        // Every configured provider must end with EITHER a Source Transcript or
+        // a failure entry. On a capture-abort or a one-sided streaming failure,
+        // the provider(s) that merely got torn down have neither yet, so record
+        // them as Aborted — no silent absence on any exit path.
+        account_for_missing_providers(&source_records, &mut provider_failures, error.diagnostic());
+    }
+
     let record = diagnostic_record(
         &evidence,
         source_records,
+        provider_failures,
         final_transcript,
         debug_audio,
         result.as_ref().err(),
@@ -1415,12 +1531,41 @@ async fn process_recording(
         .await;
 }
 
+/// Enforces the no-silent-absence invariant: every configured provider must end
+/// a Recording with either a Source Transcript or a failure entry. Any provider
+/// with neither (torn down by a capture abort or a shutdown mid-start — its
+/// stream HAD started) is recorded as Aborted with the cause. Start-sequence
+/// failures do their own accounting, because a provider never reached there is
+/// NotStarted, not Aborted.
+fn account_for_missing_providers(
+    source_records: &[SourceTranscriptRecord],
+    provider_failures: &mut Vec<ProviderFailure>,
+    diagnostic: &str,
+) {
+    for provider in [Provider::Deepgram, Provider::Groq] {
+        let has_source = source_records
+            .iter()
+            .any(|source| source.provider == provider);
+        let has_failure = provider_failures
+            .iter()
+            .any(|failure| failure.provider == provider);
+        if !has_source && !has_failure {
+            provider_failures.push(ProviderFailure::new(
+                provider,
+                ProviderFailureStage::Aborted,
+                diagnostic.to_owned(),
+            ));
+        }
+    }
+}
+
 /// Builds the persisted diagnostic record for one completed Recording from its
 /// lifecycle evidence and the collected transcripts. The public error message
 /// (never the internal diagnostic) is recorded so history never leaks a secret.
 fn diagnostic_record(
     evidence: &LifecycleEvidence,
     source_transcripts: Vec<SourceTranscriptRecord>,
+    provider_failures: Vec<ProviderFailure>,
     final_transcript: Option<String>,
     debug_audio: Option<voisu_core::DebugAudioRecord>,
     error: Option<&BoundaryError>,
@@ -1429,6 +1574,7 @@ fn diagnostic_record(
     record.stages = evidence.stages.clone();
     record.streamed_chunk_count = evidence.streamed_chunk_count;
     record.source_transcripts = source_transcripts;
+    record.provider_failures = provider_failures;
     if let Some(text) = final_transcript {
         record.set_final_transcript(text);
     }
@@ -1521,7 +1667,10 @@ fn rebuild_replay_adapters(
         )
     } else {
         (
-            Box::new(DeepgramProvider::new(reaper.clone())),
+            Box::new(DeepgramProvider::with_keyterms(
+                reaper.clone(),
+                voisu_app::dictionary::merged_terms(),
+            )),
             Box::new(GroqProvider::new(reaper.clone())),
             Box::new(MergeResultValidator::new()),
         )
@@ -1839,6 +1988,7 @@ async fn serve(stream: UnixStream, actor: mpsc::Sender<ActorMessage>) -> Result<
 }
 
 struct ControlledCapture {
+    fail_begin_once: bool,
     finish_failures_remaining: u32,
     recording_outcome_once: Option<String>,
     fail_abort: bool,
@@ -1864,6 +2014,7 @@ impl ControlledCapture {
             .unwrap_or(1);
         let chunk_delay = env_millis("VOISU_TEST_CHUNK_DELAY_MS");
         Self {
+            fail_begin_once: std::env::var_os("VOISU_TEST_CAPTURE_BEGIN_FAILURE").is_some(),
             finish_failures_remaining: std::env::var("VOISU_TEST_CAPTURE_FINISH_FAILURES")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -1884,6 +2035,12 @@ impl ControlledCapture {
 
 impl AudioCapture for ControlledCapture {
     fn begin(&mut self, _recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError> {
+        if std::mem::take(&mut self.fail_begin_once) {
+            return Err(BoundaryError::new(
+                BoundaryKind::Capture,
+                "controlled-capture-begin-detail",
+            ));
+        }
         let fail_finish = self.finish_failures_remaining > 0;
         self.finish_failures_remaining = self.finish_failures_remaining.saturating_sub(1);
         let recording_outcome = self.recording_outcome_once.take();
@@ -1992,6 +2149,7 @@ struct ControlledProvider {
     fail_start_once: bool,
     fail_abort: bool,
     fail_complete: bool,
+    fail_send: bool,
 }
 
 impl ControlledProvider {
@@ -2006,14 +2164,23 @@ impl ControlledProvider {
             env_millis("VOISU_TEST_PROVIDER_DELAY_MS")
         };
         let send_stall = env_millis("VOISU_TEST_PROVIDER_SEND_STALL_MS");
-        // Only Groq fails its start, so capture and Deepgram are already started
-        // when the partial-start-failure abort path is exercised.
-        let fail_start_once = provider == Provider::Groq
-            && std::env::var_os("VOISU_TEST_PROVIDER_START_FAILURE").is_some();
+        // "deepgram" fails the FIRST provider start (nothing but capture is
+        // running yet); any other value fails Groq, so capture and Deepgram are
+        // already started when the partial-start-failure abort path is
+        // exercised.
+        let fail_start_once = match std::env::var("VOISU_TEST_PROVIDER_START_FAILURE") {
+            Ok(target) if target == "deepgram" => provider == Provider::Deepgram,
+            Ok(_) => provider == Provider::Groq,
+            Err(_) => false,
+        };
         let fail_abort = std::env::var_os("VOISU_TEST_PROVIDER_ABORT_FAILURE").is_some();
-        let fail_complete = std::env::var("VOISU_TEST_PROVIDER_COMPLETE_FAILURE")
-            .ok()
-            .is_some_and(|value| value == provider.secret_service_value());
+        let targets = |name: &str| {
+            std::env::var(name).ok().is_some_and(|value| {
+                value == provider.secret_service_value() || value == "both"
+            })
+        };
+        let fail_complete = targets("VOISU_TEST_PROVIDER_COMPLETE_FAILURE");
+        let fail_send = targets("VOISU_TEST_PROVIDER_SEND_FAILURE");
         let transcript_name = match provider {
             Provider::Deepgram => "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
             Provider::Groq => "VOISU_TEST_GROQ_TRANSCRIPT",
@@ -2029,6 +2196,7 @@ impl ControlledProvider {
             fail_start_once,
             fail_abort,
             fail_complete,
+            fail_send,
         }
     }
 }
@@ -2053,6 +2221,7 @@ impl TranscriptProvider for ControlledProvider {
             send_stall: self.send_stall,
             fail_abort: self.fail_abort,
             fail_complete: self.fail_complete,
+            fail_send: self.fail_send,
         }))
     }
 }
@@ -2064,6 +2233,7 @@ struct ControlledProviderStream {
     send_stall: Duration,
     fail_abort: bool,
     fail_complete: bool,
+    fail_send: bool,
 }
 
 impl ProviderStream for ControlledProviderStream {
@@ -2073,9 +2243,16 @@ impl ProviderStream for ControlledProviderStream {
 
     fn send_audio(&mut self, _chunk: AudioChunk) -> BoundaryFuture<'_, ()> {
         let send_stall = self.send_stall;
+        let fail_send = self.fail_send;
         Box::pin(async move {
             if !send_stall.is_zero() {
                 tokio::time::sleep(send_stall).await;
+            }
+            if fail_send {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Provider,
+                    "controlled-provider-send-detail",
+                ));
             }
             Ok(())
         })

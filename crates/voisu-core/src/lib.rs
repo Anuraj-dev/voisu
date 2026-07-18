@@ -1,5 +1,6 @@
 //! Shared domain, provider coordination, and IPC types for Voisu.
 
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::future::Future;
 use std::os::unix::fs::MetadataExt;
@@ -14,7 +15,8 @@ use serde::{Deserialize, Serialize};
 mod diagnostics;
 pub use diagnostics::{
     correlation_id, export_record, is_secret_env_key, redacted_environment, replay_capture,
-    sanitize_url, scrub_secret_values, unix_millis_now, DebugAudioRecord, DiagnosticExport,
+    sanitize_url, scrub_embedded_urls, scrub_secret_values, unix_millis_now, DebugAudioRecord,
+    DiagnosticExport,
     DiagnosticRecord, DiagnosticStore, PruneOutcome, ReplayOutcome, RetentionPolicy,
     SourceTranscriptRecord, DEFAULT_DEBUG_AUDIO_TTL, DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS,
     EXPORT_ENV_ALLOWLIST, MAX_STORED_TEXT, REDACTED,
@@ -161,6 +163,56 @@ pub struct ProviderTiming {
     pub completed_ms: u64,
 }
 
+/// How far a provider progressed before it failed or was found absent. A history
+/// record keeps this so a reader can tell a provider that never began (absent or
+/// disabled) from one that broke mid-stream or missed the Provider Deadline.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailureStage {
+    /// The provider never began for this Recording — absent, disabled, or not
+    /// configured. No Source Transcript was ever attempted.
+    NotStarted,
+    /// The provider began but failed while streaming audio, before finalize.
+    Streaming,
+    /// The provider failed while producing its Source Transcript at finalize.
+    Completion,
+    /// The Provider Deadline elapsed before the provider produced a Source
+    /// Transcript, so its result was abandoned.
+    ProviderDeadline,
+    /// The provider began but the Recording was torn down before it could
+    /// produce a Source Transcript — a startup failure of the OTHER provider, a
+    /// capture failure, or a shutdown mid-start. It never failed on its own, but
+    /// it produced no Source Transcript, so its absence is recorded, not silent.
+    Aborted,
+}
+
+/// A recorded provider failure or absence for one Recording: which provider, how
+/// far it reached, and the boundary diagnostic. This is what makes a missing
+/// Source Transcript visible instead of silent — every configured provider that
+/// does not contribute a Source Transcript leaves one of these in the history
+/// record. The diagnostic is a local boundary detail; export scrubs it of secret
+/// values like every other free-form string.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderFailure {
+    pub provider: Provider,
+    pub stage: ProviderFailureStage,
+    pub diagnostic: String,
+}
+
+impl ProviderFailure {
+    pub fn new(
+        provider: Provider,
+        stage: ProviderFailureStage,
+        diagnostic: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider,
+            stage,
+            diagnostic: diagnostic.into(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Response {
     pub version: u32,
@@ -271,6 +323,7 @@ pub struct BoundaryError {
     kind: BoundaryKind,
     diagnostic: String,
     transcript_failure: Option<TranscriptFailureEvidence>,
+    provider_failures: Vec<ProviderFailure>,
 }
 
 #[derive(Clone, Debug)]
@@ -287,6 +340,7 @@ impl BoundaryError {
             kind,
             diagnostic: diagnostic.into(),
             transcript_failure: None,
+            provider_failures: Vec::new(),
         }
     }
 
@@ -297,6 +351,19 @@ impl BoundaryError {
 
     pub fn transcript_failure(&self) -> Option<&TranscriptFailureEvidence> {
         self.transcript_failure.as_ref()
+    }
+
+    /// Attaches provider-failure evidence to an error so a failure on a path
+    /// that produces NO usable Source Transcript (both providers failed, or a
+    /// deadline-cleanup failed) still reaches the history record instead of
+    /// being discarded with the error.
+    pub fn with_provider_failures(mut self, failures: Vec<ProviderFailure>) -> Self {
+        self.provider_failures = failures;
+        self
+    }
+
+    pub fn provider_failures(&self) -> &[ProviderFailure] {
+        &self.provider_failures
     }
 
     pub fn kind(&self) -> BoundaryKind {
@@ -598,6 +665,43 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 });
             }
 
+            // Source-quality gate (§3.4): the two Source Transcripts materially
+            // disagreed. Before spending an LLM merge, check whether the pair is
+            // catastrophically divergent by a ROBUST garbage signal — a
+            // degenerate filler/repetition loop (the recording-11 word-salad
+            // case), a bare fragment, or near-zero cross-source content
+            // agreement between comparable sources (fluent nonsense / a
+            // unique-word salad, which no intrinsic check can flag). If so, skip
+            // the merge and select the Source Transcript the evidence supports.
+            // Real disagreements over shared content still fall through to
+            // reconciliation.
+            if let Some(gate) = source_quality_gate(&deepgram.text, &groq.text) {
+                // The caller passes (deepgram.text, groq.text) in that order, so
+                // Left maps to Deepgram and Right to Groq. The gate itself holds
+                // no provider preference.
+                let winner = match gate.winner {
+                    GateWinner::Left => deepgram,
+                    GateWinner::Right => groq,
+                };
+                if quality_failure_reason(&winner.text, &sources).is_none() {
+                    return Ok(TranscriptDecision {
+                        transcript: Transcript(winner.text.trim().to_owned()),
+                        selection: match winner.provider {
+                            Provider::Deepgram => TranscriptSelection::SourceDeepgram,
+                            Provider::Groq => TranscriptSelection::SourceGroq,
+                        },
+                        validation_reason:
+                            "catastrophically divergent Source Transcripts; selected the better source without merging"
+                                .to_owned(),
+                        fallback_reason: Some(gate.reason),
+                        reconciliation_requested: false,
+                        recovery_attempted: false,
+                    });
+                }
+                // The better source itself failed a quality guardrail: fall
+                // through and let reconciliation/repair handle it.
+            }
+
             let merge_result = {
                 let cancel = CancelRegistry::new();
                 let request = self.model.request(
@@ -746,10 +850,32 @@ fn clean_source_fallback(
     reconciliation_requested: bool,
     recovery_attempted: bool,
 ) -> Result<TranscriptDecision, BoundaryError> {
-    let source = sources
+    // Select among the quality-safe sources by the SAME cross-source-evidence
+    // comparator the divergence gate uses — never a fixed provider preference,
+    // and never an intrinsic score alone, which a fluent unique-word salad can
+    // inflate past accurate repetitive dictation.
+    let safe: Vec<&SourceTranscript> = sources
         .iter()
-        .filter(|source| quality_failure_reason(&source.text, std::slice::from_ref(*source)).is_none())
-        .max_by_key(|source| source.provider)
+        .filter(|source| {
+            quality_failure_reason(&source.text, std::slice::from_ref(*source)).is_none()
+        })
+        .collect();
+    let source = match safe.as_slice() {
+        [] => None,
+        [only] => Some(*only),
+        [left, right, ..] => Some(
+            match select_better_source(
+                &normalized_words(&left.text),
+                &normalized_words(&right.text),
+            )
+            .0
+            {
+                GateWinner::Left => *left,
+                GateWinner::Right => *right,
+            },
+        ),
+    };
+    let source = source
         .ok_or_else(|| {
             let validation_reason = format!("{reason}; neither Source Transcript is safe");
             BoundaryError::new(
@@ -774,6 +900,486 @@ fn clean_source_fallback(
         reconciliation_requested,
         recovery_attempted,
     })
+}
+
+/// A Source Transcript shorter than roughly a third of the other's length is a
+/// fragment, not a comparable transcription of the same speech.
+const DIVERGENCE_LENGTH_RATIO_FLOOR: f64 = 0.34;
+
+/// The side of the compared pair a gate selected. The caller maps this back to
+/// the concrete Provider, so the gate itself carries no provider preference.
+enum GateWinner {
+    Left,
+    Right,
+}
+
+/// The decision to skip the LLM merge and select a better Source Transcript.
+struct QualityGate {
+    winner: GateWinner,
+    reason: String,
+}
+
+/// English function words plus common spoken fillers, excluded from content
+/// density and content-count measurement. A word salad from context-free slices
+/// is dominated by these; a real technical dictation is not.
+const STOPWORDS: [&str; 94] = [
+    "a", "an", "and", "or", "but", "of", "to", "in", "on", "at", "for", "with", "is", "are", "was",
+    "were", "be", "been", "being", "am", "the", "this", "that", "these", "those", "it", "its", "as",
+    "by", "from", "into", "onto", "over", "under", "out", "up", "down", "off", "so", "then", "than",
+    "we", "you", "i", "he", "she", "they", "them", "our", "your", "my", "me", "his", "her", "their",
+    "do", "does", "did", "not", "no", "yes", "if", "when", "while", "about", "before", "after",
+    "near", "would", "could", "should", "will", "can", "um", "uh", "uhh", "yeah", "like", "just",
+    "kind", "sort", "mean", "know", "well", "okay", "ok", "there", "here", "gonna", "wanna", "sorta",
+    "kinda", "really", "actually",
+];
+
+fn is_stopword(word: &str) -> bool {
+    STOPWORDS.contains(&word)
+}
+
+fn distinct_content_words(words: &[String]) -> HashSet<&str> {
+    words
+        .iter()
+        .filter(|word| !is_stopword(word))
+        .map(String::as_str)
+        .collect()
+}
+
+/// A content-density quality score in [0, 1], used ONLY to break a
+/// clean-source fallback tie (never to decide gating). It deliberately does NOT
+/// reward lexical uniqueness — an earlier type-token-ratio term let a salad of
+/// all-unique words outscore accurate dictation that repeats real content words
+/// (e.g. "cache … cache invalidation … cache"). It rewards content-word density
+/// and the count of distinct content words, penalizing only adjacent-word
+/// stutter, so repeating real content is never scored below word salad.
+fn source_quality(words: &[String]) -> f64 {
+    let total = words.len();
+    if total == 0 {
+        return 0.0;
+    }
+    let content_count = words.iter().filter(|word| !is_stopword(word)).count();
+    let distinct_content = distinct_content_words(words).len();
+    let content_fraction = content_count as f64 / total as f64;
+    let richness = (distinct_content as f64 / 8.0).min(1.0);
+    let duplication = words
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .count() as f64
+        / total as f64;
+    (0.6 * content_fraction + 0.4 * richness) * (1.0 - duplication)
+}
+
+/// A transcript whose content words are revisited so relentlessly that fewer
+/// than this fraction of content-word occurrences are distinct is a repetition
+/// loop, not dictation. Legitimate repetitive technical dictation sits well
+/// above it (the "cache … cache invalidation … cache" fixture is ~0.64); a
+/// loop cycling a couple of words through filler collapses far below.
+const CONTENT_REPETITION_FLOOR: f64 = 0.4;
+
+/// The repetition-loop check needs at least this many content-word occurrences
+/// before a low distinct ratio means anything — a short utterance repeating one
+/// term ("test test test done") is terse, not degenerate.
+const MIN_REPETITION_CONTENT: usize = 8;
+
+/// A repetition loop needs at least this many distinct content words before
+/// cross-source evidence can judge it. Below it ("start stop reset" three
+/// times) the vocabulary is too small to distinguish a loop from genuinely
+/// repeated command speech, so those shapes go to reconciliation instead.
+const MIN_LOOP_VOCABULARY: usize = 4;
+
+/// True when a Source Transcript is internally degenerate — a filler or
+/// repetition loop with almost no distinct content (context-free 1 s slices, or
+/// a "the/and/to/is" loop). This is a ROBUST garbage signal: it triggers on
+/// near-absent content, NOT on mere repetition, so legitimate jargon-heavy,
+/// naturally repetitive, or short-command dictation ("start stop reset" three
+/// times) is never flagged. Repetition loops that DO carry content words are
+/// judged with cross-source evidence in `is_garbage_against` instead, because
+/// a single-source view cannot tell them from genuine repeated speech.
+fn is_degenerate(words: &[String]) -> bool {
+    let total = words.len();
+    if total < 6 {
+        // Too short to distinguish degeneracy from a terse-but-valid utterance.
+        return false;
+    }
+    let content_count = words.iter().filter(|word| !is_stopword(word)).count();
+    let distinct_content = distinct_content_words(words).len();
+    let content_fraction = content_count as f64 / total as f64;
+    content_fraction < 0.25 || distinct_content < 3
+}
+
+/// True when a Source Transcript has the SHAPE of a repetition loop: a
+/// judgeable content vocabulary recycled so relentlessly that the distinct
+/// share of content occurrences collapses. Shape alone is not a verdict —
+/// genuine command dictation can repeat itself — so the loop is condemned only
+/// by cross-source evidence in `is_garbage_against`.
+fn is_repetition_loop(words: &[String]) -> bool {
+    let content_count = words.iter().filter(|word| !is_stopword(word)).count();
+    let distinct_content = distinct_content_words(words).len();
+    content_count >= MIN_REPETITION_CONTENT
+        && distinct_content >= MIN_LOOP_VOCABULARY
+        && (distinct_content as f64) < CONTENT_REPETITION_FLOOR * content_count as f64
+}
+
+/// The single garbage verdict for one side of a disagreeing pair, judged by
+/// intrinsic degeneracy plus cross-source evidence (`confirmed` is the set of
+/// this side's distinct content words that the one-to-one phonetic matching
+/// paired with the other side). A transcript is garbage when it is a
+/// near-content-free filler loop, or a repetition loop that either
+/// - steals its material: the majority of its RECYCLED (multi-occurrence)
+///   content words are confirmed by the other source, so the loop is an echo
+///   of the other transcript's content rather than independent speech; or
+/// - is hollow: it has a comparable vocabulary yet the other source confirms
+///   less than the agreement floor of it, so its relentless repetition is
+///   self-generated noise around at most an accidental shared word or two.
+///   The floor is the SAME `CONTENT_OVERLAP_FLOOR` the agreement gate uses, so
+///   no confirmed-fraction band opens between "hollow" and "agrees enough to
+///   reconcile" for a loop whose vocabulary is the smaller of the pair.
+/// Genuine repeated speech survives both: its recycled commands are its own
+/// (no theft majority), and any real overlap with the other source keeps it
+/// from being hollow. A loop with meaningful overlap but no recycled-word
+/// theft is ambiguous and deliberately NOT garbage — that shape reconciles.
+fn is_garbage_against(own: &[String], confirmed: &HashSet<&str>) -> bool {
+    if is_degenerate(own) {
+        return true;
+    }
+    if !is_repetition_loop(own) {
+        return false;
+    }
+    let mut occurrences: HashMap<&str, usize> = HashMap::new();
+    for word in own.iter().filter(|word| !is_stopword(word)) {
+        *occurrences.entry(word.as_str()).or_default() += 1;
+    }
+    let recycled: Vec<&str> = occurrences
+        .iter()
+        .filter(|(_, count)| **count >= 2)
+        .map(|(word, _)| *word)
+        .collect();
+    let confirmed_recycled = recycled
+        .iter()
+        .filter(|word| confirmed.contains(**word))
+        .count();
+    let stolen = confirmed_recycled * 2 > recycled.len();
+    let distinct_content = distinct_content_words(own).len();
+    let hollow = distinct_content >= MIN_COMPARABLE_CONTENT
+        && (confirmed.len() as f64) < CONTENT_OVERLAP_FLOOR * distinct_content as f64;
+    stolen || hollow
+}
+
+/// Two Source Transcripts of the same audio must agree on a meaningful share of
+/// content words. Below this containment (one-to-one matched distinct content
+/// words over the smaller distinct-content set) they cannot both be
+/// transcriptions of the same speech: one of them is garbage, and merging
+/// would poison the result.
+const CONTENT_OVERLAP_FLOOR: f64 = 0.2;
+
+/// Sources with fewer distinct content words than this are too short for the
+/// cross-agreement gate to judge — two terse commands ("book the room" vs
+/// "schedule the review") can honestly share nothing, so they reconcile.
+const MIN_COMPARABLE_CONTENT: usize = 5;
+
+/// Cross-confirmation differences below this margin are noise, not a decision.
+const CONFIRMATION_MARGIN: f64 = 0.15;
+
+/// Which evidence tier decided a selection between two disagreeing sources.
+/// The first two tiers rest on cross-source evidence a salad cannot fake; the
+/// last three are heuristic guesses over intrinsic structure and are surfaced
+/// as low-confidence in the §3.5 diagnostic reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectionEvidence {
+    /// Exactly one side is garbage under `is_garbage_against`.
+    Garbage,
+    /// One side's distinct content is confirmed by the other side beyond the
+    /// noise margin.
+    Confirmation,
+    /// Only topical cohesion (revisited topic terms) separated the sides.
+    Cohesion,
+    /// Only intrinsic content density separated the sides.
+    Quality,
+    /// No evidence at all: the deterministic default (the later source, Groq)
+    /// was applied.
+    Default,
+}
+
+impl SelectionEvidence {
+    /// True when the winner was picked by an intrinsic, gameable signal or by
+    /// the bare deterministic default rather than by cross-source evidence.
+    fn is_low_confidence(self) -> bool {
+        matches!(self, Self::Cohesion | Self::Quality | Self::Default)
+    }
+}
+
+/// Counts distinct content words a transcript returns to at separated
+/// positions. Real dictation revisits its topic terms ("cache ... cache
+/// invalidation"); a salad of unique words never does. Adjacent repeats are
+/// stutter, not cohesion, so they deliberately do not count.
+fn topical_cohesion(words: &[String]) -> usize {
+    let mut positions: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, word) in words.iter().enumerate() {
+        if !is_stopword(word) {
+            positions.entry(word.as_str()).or_default().push(index);
+        }
+    }
+    positions
+        .values()
+        .filter(|occurrences| {
+            occurrences
+                .windows(2)
+                .any(|pair| pair[1] - pair[0] > 1)
+        })
+        .count()
+}
+
+/// The single cross-source agreement computation: a one-to-one matching
+/// between the two distinct content vocabularies, where a pair matches when
+/// the words are equal or sound alike (edit-distance homophone tolerance, so
+/// "cache"/"cash" and "failed"/"sailed" count as the same heard word).
+/// Matching is ONE-TO-ONE — each word on either side is consumable exactly
+/// once, so six salad words orbiting the same real word ("bat hat mat rat pat
+/// sat" around "cat") claim at most one match between them — and SYMMETRIC BY
+/// CONSTRUCTION: candidate pairs are taken greedily in a global order keyed by
+/// (edit distance, unordered word pair), which is invariant under swapping the
+/// arguments, so the matching never depends on which provider held which text.
+fn phonetic_matching<'words>(
+    left: &HashSet<&'words str>,
+    right: &HashSet<&'words str>,
+) -> Vec<(&'words str, &'words str)> {
+    let mut candidates: Vec<(usize, &str, &str)> = left
+        .iter()
+        .flat_map(|left_word| {
+            right
+                .iter()
+                .filter(|right_word| words_sound_alike(left_word, right_word))
+                .map(|right_word| {
+                    (
+                        char_edit_distance(left_word, right_word),
+                        *left_word,
+                        *right_word,
+                    )
+                })
+        })
+        .collect();
+    candidates.sort_unstable_by_key(|(distance, left_word, right_word)| {
+        (
+            *distance,
+            *left_word.min(right_word),
+            *left_word.max(right_word),
+        )
+    });
+    let mut left_used: HashSet<&str> = HashSet::new();
+    let mut right_used: HashSet<&str> = HashSet::new();
+    let mut matching = Vec::new();
+    for (_, left_word, right_word) in candidates {
+        if !left_used.contains(left_word) && !right_used.contains(right_word) {
+            left_used.insert(left_word);
+            right_used.insert(right_word);
+            matching.push((left_word, right_word));
+        }
+    }
+    matching
+}
+
+/// Two content words within a third of their length in edit distance are close
+/// enough to be alternate spellings or homophones of the same heard word
+/// ("failed"/"sailed", "cache"/"cash", "during"/"touring"), while unrelated
+/// vocabulary — even topically adjacent nonsense — almost never lands inside
+/// the bound. Words of three letters or fewer are one flip away from unrelated
+/// vocabulary ("cat"/"bat"), so they must match exactly.
+fn words_sound_alike(left: &str, right: &str) -> bool {
+    let longer = left.chars().count().max(right.chars().count());
+    if longer == 0 {
+        return false;
+    }
+    if longer <= 3 {
+        return left == right;
+    }
+    char_edit_distance(left, right) <= longer.div_ceil(3)
+}
+
+fn char_edit_distance(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_char) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right.iter().enumerate() {
+            current[right_index + 1] = if left_char == right_char {
+                previous[right_index]
+            } else {
+                1 + previous[right_index]
+                    .min(current[right_index])
+                    .min(previous[right_index + 1])
+            };
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
+/// Chooses between two disagreeing Source Transcripts by ordered evidence,
+/// never by a fixed provider preference. The strong tiers rest on cross-source
+/// evidence: a one-sided garbage verdict (degenerate filler, stolen-word loop,
+/// or hollow loop), then asymmetric distinct-word confirmation. When both are
+/// silent no heuristic truly knows — topical cohesion, then content density,
+/// then the deterministic default (the later source, Groq) still pick a
+/// winner, but the returned `SelectionEvidence` marks those tiers as
+/// low-confidence so the gate can say so in the §3.5 diagnostic record.
+fn select_better_source(left: &[String], right: &[String]) -> (GateWinner, SelectionEvidence) {
+    let left_content = distinct_content_words(left);
+    let right_content = distinct_content_words(right);
+    let matching = phonetic_matching(&left_content, &right_content);
+    let left_confirmed: HashSet<&str> = matching.iter().map(|(word, _)| *word).collect();
+    let right_confirmed: HashSet<&str> = matching.iter().map(|(_, word)| *word).collect();
+
+    let left_garbage = is_garbage_against(left, &left_confirmed);
+    let right_garbage = is_garbage_against(right, &right_confirmed);
+    if left_garbage != right_garbage {
+        let winner = if left_garbage {
+            GateWinner::Right
+        } else {
+            GateWinner::Left
+        };
+        return (winner, SelectionEvidence::Garbage);
+    }
+
+    // Distinct words, never occurrences: a salad repeating one stolen word
+    // gains nothing, because repetition of an already-confirmed word is not
+    // additional cross-source agreement.
+    let confirmation = |confirmed: &HashSet<&str>, content: &HashSet<&str>| {
+        if content.is_empty() {
+            0.0
+        } else {
+            confirmed.len() as f64 / content.len() as f64
+        }
+    };
+    let left_confirmation = confirmation(&left_confirmed, &left_content);
+    let right_confirmation = confirmation(&right_confirmed, &right_content);
+    if (left_confirmation - right_confirmation).abs() > CONFIRMATION_MARGIN {
+        let winner = if left_confirmation > right_confirmation {
+            GateWinner::Left
+        } else {
+            GateWinner::Right
+        };
+        return (winner, SelectionEvidence::Confirmation);
+    }
+
+    let left_cohesion = topical_cohesion(left);
+    let right_cohesion = topical_cohesion(right);
+    if left_cohesion != right_cohesion {
+        let winner = if left_cohesion > right_cohesion {
+            GateWinner::Left
+        } else {
+            GateWinner::Right
+        };
+        return (winner, SelectionEvidence::Cohesion);
+    }
+
+    let left_quality = source_quality(left);
+    let right_quality = source_quality(right);
+    if left_quality > right_quality {
+        (GateWinner::Left, SelectionEvidence::Quality)
+    } else if right_quality > left_quality {
+        (GateWinner::Right, SelectionEvidence::Quality)
+    } else {
+        (GateWinner::Right, SelectionEvidence::Default)
+    }
+}
+
+/// Decides whether to skip the LLM merge for two materially disagreeing Source
+/// Transcripts and select the better one (§3.4). One symmetric computation —
+/// the one-to-one phonetic-tolerant matching of distinct content words —
+/// feeds every decision:
+/// 1. Exactly one source is garbage (degenerate filler loop, a repetition loop
+///    stealing the majority of its recycled words from the other source, or a
+///    hollow loop nothing of which is confirmed): select the other.
+/// 2. One source is a bare fragment (extreme length ratio): select the fuller.
+/// 3. Two comparable vocabularies agree on almost nothing — two transcriptions
+///    of the same audio cannot do that, so one is fluent nonsense or a word
+///    salad no intrinsic check can flag: gate, and select by `select_better_source`,
+///    recording a low-confidence marker when only weak evidence decided.
+/// Pairs that clear all three (real disagreements over shared or
+/// phonetically-aligned content, terse pairs, homophone spellings) return
+/// `None` and go to the reconciliation model.
+fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
+    let left_words = normalized_words(left);
+    let right_words = normalized_words(right);
+    let fewer = left_words.len().min(right_words.len());
+    let more = left_words.len().max(right_words.len());
+    if fewer == 0 {
+        return None;
+    }
+    let left_content = distinct_content_words(&left_words);
+    let right_content = distinct_content_words(&right_words);
+    let matching = phonetic_matching(&left_content, &right_content);
+    let left_confirmed: HashSet<&str> = matching.iter().map(|(word, _)| *word).collect();
+    let right_confirmed: HashSet<&str> = matching.iter().map(|(_, word)| *word).collect();
+    let left_garbage = is_garbage_against(&left_words, &left_confirmed);
+    let right_garbage = is_garbage_against(&right_words, &right_confirmed);
+
+    if left_garbage != right_garbage {
+        // Exactly one source is garbage: select the coherent one.
+        let winner = if left_garbage {
+            GateWinner::Right
+        } else {
+            GateWinner::Left
+        };
+        return Some(QualityGate {
+            winner,
+            reason:
+                "catastrophically divergent (one Source Transcript is a degenerate filler/repetition loop without independent cross-source support); selected the coherent Source Transcript"
+                    .to_owned(),
+        });
+    }
+
+    let length_ratio = fewer as f64 / more as f64;
+    if length_ratio < DIVERGENCE_LENGTH_RATIO_FLOOR {
+        // One source is a fragment: the fuller transcription carries the
+        // content, so select it and skip a merge with a stub.
+        let winner = if left_words.len() >= right_words.len() {
+            GateWinner::Left
+        } else {
+            GateWinner::Right
+        };
+        return Some(QualityGate {
+            winner,
+            reason: format!(
+                "catastrophically divergent (length ratio {length_ratio:.2} below {DIVERGENCE_LENGTH_RATIO_FLOOR:.2}); selected the fuller Source Transcript, the other is a fragment"
+            ),
+        });
+    }
+
+    // Cross-agreement check: two comparable, individually coherent
+    // transcriptions of the SAME audio must still agree — exactly or
+    // phonetically — on a meaningful share of content words. Near-zero
+    // agreement means one of them is garbage, and an LLM merge would let it
+    // poison the result. Short pairs are exempt: terse commands can honestly
+    // share nothing. Both-garbage pairs are also exempt — with no coherent
+    // side to select, reconciliation is the only honest move.
+    if !left_garbage {
+        let smaller_content = left_content.len().min(right_content.len());
+        if smaller_content >= MIN_COMPARABLE_CONTENT {
+            let agreement = matching.len() as f64 / smaller_content as f64;
+            if agreement < CONTENT_OVERLAP_FLOOR {
+                let (winner, evidence) = select_better_source(&left_words, &right_words);
+                let low_confidence = if evidence.is_low_confidence() {
+                    "; low-confidence selection: cross-source evidence could not distinguish the Source Transcripts"
+                } else {
+                    ""
+                };
+                return Some(QualityGate {
+                    winner,
+                    reason: format!(
+                        "catastrophically divergent (cross-source content agreement {agreement:.2} below {CONTENT_OVERLAP_FLOOR:.2}); selected the Source Transcript better supported by cross-source evidence{low_confidence}"
+                    ),
+                });
+            }
+        }
+    }
+
+    // Sources agree enough to be transcriptions of the same speech (or are
+    // both garbage, or too short to judge): no confident single winner, so
+    // reconcile rather than guess.
+    None
 }
 
 fn source_similarity(left: &str, right: &str) -> f64 {
@@ -993,9 +1599,15 @@ pub struct ProviderCoordinator {
     streams: ProviderStreams,
 }
 
+#[derive(Debug)]
 pub struct ProviderCompletion {
     pub sources: Vec<SourceTranscript>,
     pub timings_ms: Vec<ProviderTiming>,
+    /// Every configured provider that did NOT contribute a Source Transcript for
+    /// this Recording — one that failed producing its transcript or that missed
+    /// the Provider Deadline — with its stage and boundary diagnostic. This is
+    /// what keeps a missing Source Transcript visible instead of silent.
+    pub provider_failures: Vec<ProviderFailure>,
 }
 
 impl ProviderCoordinator {
@@ -1011,8 +1623,28 @@ impl ProviderCoordinator {
         let deepgram = self.streams.deepgram.send_audio(chunk.clone());
         let groq = self.streams.groq.send_audio(chunk);
         let (deepgram, groq) = tokio::join!(deepgram, groq);
-        deepgram?;
-        groq
+        // A live streaming failure aborts the Recording. Attribute it to the
+        // failing provider(s) as a Streaming-stage ProviderFailure so the
+        // abort path can carry it into history instead of losing which provider
+        // broke and where.
+        let mut failures = Vec::new();
+        let mut first_error: Option<BoundaryError> = None;
+        for (provider, result) in [(Provider::Deepgram, deepgram), (Provider::Groq, groq)] {
+            if let Err(error) = result {
+                failures.push(ProviderFailure::new(
+                    provider,
+                    ProviderFailureStage::Streaming,
+                    error.diagnostic().to_owned(),
+                ));
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error.with_provider_failures(failures)),
+            None => Ok(()),
+        }
     }
 
     pub async fn abort(self) -> Result<(), BoundaryError> {
@@ -1050,7 +1682,11 @@ impl ProviderCoordinator {
         let mut deadline_elapsed = false;
         let mut transcripts = Vec::new();
         let mut timings_ms = Vec::new();
-        let mut diagnostics = Vec::new();
+        let mut provider_failures: Vec<ProviderFailure> = Vec::new();
+        // A failure aborting the losing (deadline) stream. It becomes the error
+        // ONLY when no provider succeeded; when a winner exists it must never
+        // erase that winner, so it is instead annotated onto the loser's entry.
+        let mut cleanup_error: Option<BoundaryError> = None;
 
         {
             let deepgram_completion = deepgram.complete(audio.clone());
@@ -1075,7 +1711,11 @@ impl ProviderCoordinator {
                                 });
                                 transcripts.push(source);
                             }
-                            Err(error) => diagnostics.push(error.diagnostic().to_owned()),
+                            Err(error) => provider_failures.push(ProviderFailure::new(
+                                Provider::Deepgram,
+                                ProviderFailureStage::Completion,
+                                error.diagnostic().to_owned(),
+                            )),
                         }
                     }
                     result = &mut groq_completion, if !groq_done => {
@@ -1088,7 +1728,11 @@ impl ProviderCoordinator {
                                 });
                                 transcripts.push(source);
                             }
-                            Err(error) => diagnostics.push(error.diagnostic().to_owned()),
+                            Err(error) => provider_failures.push(ProviderFailure::new(
+                                Provider::Groq,
+                                ProviderFailureStage::Completion,
+                                error.diagnostic().to_owned(),
+                            )),
                         }
                     }
                     _ = &mut deadline => {
@@ -1100,6 +1744,23 @@ impl ProviderCoordinator {
         }
 
         if deadline_elapsed {
+            // A provider that never produced a Source Transcript before the
+            // Provider Deadline is abandoned below — record its absence so it is
+            // visible in history rather than silently missing.
+            if !deepgram_done {
+                provider_failures.push(ProviderFailure::new(
+                    Provider::Deepgram,
+                    ProviderFailureStage::ProviderDeadline,
+                    "Provider Deadline elapsed before completion",
+                ));
+            }
+            if !groq_done {
+                provider_failures.push(ProviderFailure::new(
+                    Provider::Groq,
+                    ProviderFailureStage::ProviderDeadline,
+                    "Provider Deadline elapsed before completion",
+                ));
+            }
             let abort_pending = async move {
                 let deepgram_abort = async move {
                     if deepgram_done {
@@ -1119,29 +1780,59 @@ impl ProviderCoordinator {
                 deepgram_result?;
                 groq_result
             };
-            tokio::time::timeout(self.abort_deadline, abort_pending)
-                .await
-                .map_err(|_| {
-                    BoundaryError::new(
-                        BoundaryKind::Provider,
-                        "provider deadline cleanup timed out",
-                    )
-                })??;
+            cleanup_error = match tokio::time::timeout(self.abort_deadline, abort_pending).await {
+                Ok(inner) => inner.err(),
+                Err(_) => Some(BoundaryError::new(
+                    BoundaryKind::Provider,
+                    "provider deadline cleanup timed out",
+                )),
+            };
         }
 
         transcripts.sort_by_key(|source| source.provider);
         timings_ms.sort_by_key(|timing| timing.provider);
+        provider_failures.sort_by_key(|failure| failure.provider);
         if transcripts.is_empty() {
-            let detail = if diagnostics.is_empty() {
-                "Provider Deadline elapsed".to_owned()
-            } else {
-                diagnostics.join("; ")
+            // No provider produced a Source Transcript. A cleanup failure keeps
+            // its exact message here; otherwise build the detail from the
+            // collected failures. Either way, carry every failure into the error
+            // so history shows each provider's absence, not a bare error.
+            let error = match cleanup_error {
+                Some(error) => error,
+                None => {
+                    let detail = if provider_failures.is_empty() {
+                        "Provider Deadline elapsed".to_owned()
+                    } else {
+                        provider_failures
+                            .iter()
+                            .map(|failure| failure.diagnostic.clone())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    };
+                    BoundaryError::new(BoundaryKind::Provider, detail)
+                }
             };
-            Err(BoundaryError::new(BoundaryKind::Provider, detail))
+            Err(error.with_provider_failures(provider_failures))
         } else {
+            // A winner survived. If aborting the loser failed, annotate the
+            // loser's deadline entry so the cleanup failure stays visible — but
+            // NEVER discard the winner's Source Transcript for it.
+            if let Some(cleanup_error) = cleanup_error {
+                for failure in provider_failures
+                    .iter_mut()
+                    .filter(|failure| failure.stage == ProviderFailureStage::ProviderDeadline)
+                {
+                    failure.diagnostic = format!(
+                        "{}; cleanup failed: {}",
+                        failure.diagnostic,
+                        cleanup_error.diagnostic()
+                    );
+                }
+            }
             Ok(ProviderCompletion {
                 sources: transcripts,
                 timings_ms,
+                provider_failures,
             })
         }
     }

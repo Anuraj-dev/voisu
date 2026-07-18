@@ -36,6 +36,7 @@ tar -tzf "$archive" > "$topdir/source-archive.list"
 grep -qx "voisu-${version}/Cargo.lock" "$topdir/source-archive.list"
 grep -qx "voisu-${version}/LICENSE" "$topdir/source-archive.list"
 grep -qx "voisu-${version}/packaging/voisu.service" "$topdir/source-archive.list"
+grep -qx "voisu-${version}/packaging/voisu-overlay.service" "$topdir/source-archive.list"
 
 # Reproducibility: vendor from an extraction of the exact-commit git archive
 # (never the working tree), and archive deterministically. --sort fixes entry

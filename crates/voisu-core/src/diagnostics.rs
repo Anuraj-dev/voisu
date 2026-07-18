@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BoundaryError, CapturedAudio, DeliveryMethod, LifecycleStage, Provider, ProviderCoordinator,
-    ProviderTiming, SourceTranscript, TranscriptDecision, TranscriptSelection, TranscriptValidator,
+    ProviderFailure, ProviderTiming, SourceTranscript, TranscriptDecision, TranscriptSelection,
+    TranscriptValidator,
 };
 
 /// A stored transcript text is clamped so a bounded history never grows without
@@ -148,6 +149,12 @@ pub struct DiagnosticRecord {
     pub capture_finalized_ms: Option<u64>,
     #[serde(default)]
     pub provider_timings_ms: Vec<ProviderTiming>,
+    /// Every configured provider that failed or was absent for this Recording,
+    /// with its stage and boundary diagnostic. Empty when both providers
+    /// contributed a Source Transcript. `voisu history` and `voisu export`
+    /// serialize this field, so a missing Source Transcript is never silent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_failures: Vec<ProviderFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_to_text_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,6 +186,7 @@ impl DiagnosticRecord {
             first_chunk_ms: None,
             capture_finalized_ms: None,
             provider_timings_ms: Vec::new(),
+            provider_failures: Vec::new(),
             release_to_text_ms: None,
             error: None,
             debug_audio: None,
@@ -432,6 +440,77 @@ pub fn scrub_secret_values(text: &str, secrets: &[String]) -> String {
     scrubbed
 }
 
+/// Strips userinfo credentials and the entire query/fragment from a single
+/// `http(s)://` URL token, keeping only scheme, host, and path. A boundary
+/// diagnostic can echo a signed provider URL (`https://user:pw@host/listen?token=abc`)
+/// whose secret does NOT come from any environment variable, so name-based
+/// secret scrubbing never sees it — this removes it structurally instead.
+fn strip_url_secrets(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    // Drop query and fragment wholesale: token-bearing parameters live there.
+    let core = rest.split(['?', '#']).next().unwrap_or("");
+    let (authority, path) = match core.split_once('/') {
+        Some((authority, path)) => (authority, Some(path)),
+        None => (core, None),
+    };
+    // Drop any `user:password@` userinfo prefix.
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    match path {
+        Some(path) => format!("{scheme}://{host}/{path}"),
+        None => format!("{scheme}://{host}"),
+    }
+}
+
+/// Structurally scrubs every URL embedded in a free-form string of its userinfo
+/// credentials and query/fragment secrets, preserving all surrounding text. This
+/// defends against secrets that reach a diagnostic through a URL rather than
+/// through a secret-named environment variable. It scans EVERY occurrence
+/// case-insensitively (so a non-URL `"httpStatus"` never masks a later signed
+/// URL, and `HTTPS://` is caught) and covers websocket schemes (`ws`/`wss`),
+/// which Deepgram's streaming endpoint uses.
+pub fn scrub_embedded_urls(text: &str) -> String {
+    const SCHEMES: [&str; 4] = ["http://", "https://", "ws://", "wss://"];
+    // A lowercased copy for case-insensitive matching. ASCII lowercasing never
+    // changes byte length, and the schemes are ASCII, so offsets map back to the
+    // original text at char boundaries.
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let next = SCHEMES
+            .iter()
+            .filter_map(|scheme| lower[cursor..].find(scheme).map(|offset| cursor + offset))
+            .min();
+        match next {
+            Some(start) => {
+                out.push_str(&text[cursor..start]);
+                let tail = &text[start..];
+                // A URL token runs until the first whitespace.
+                let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+                out.push_str(&strip_url_secrets(&text[start..start + end]));
+                cursor = start + end;
+            }
+            None => {
+                out.push_str(&text[cursor..]);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Applies both scrubbing passes to a free-form string: known secret VALUES
+/// (from secret-named environment variables) and structural URL secrets
+/// (userinfo, query/fragment) that no name-based rule would catch.
+fn scrub_free_text(text: &str, secrets: &[String]) -> String {
+    scrub_embedded_urls(&scrub_secret_values(text, secrets))
+}
+
 fn secret_values(vars: &[(String, String)]) -> Vec<String> {
     // Every non-empty secret value is scrubbed: credentials have no minimum
     // length, so even a one-character value must never survive an export.
@@ -453,18 +532,24 @@ pub fn export_record(
     let secrets = secret_values(&vars);
     let mut record = record;
     for source in &mut record.source_transcripts {
-        source.text = scrub_secret_values(&source.text, &secrets);
+        source.text = scrub_free_text(&source.text, &secrets);
     }
     record.final_transcript = record
         .final_transcript
-        .map(|text| scrub_secret_values(&text, &secrets));
+        .map(|text| scrub_free_text(&text, &secrets));
     record.validation_reason = record
         .validation_reason
-        .map(|text| scrub_secret_values(&text, &secrets));
+        .map(|text| scrub_free_text(&text, &secrets));
     record.fallback_reason = record
         .fallback_reason
-        .map(|text| scrub_secret_values(&text, &secrets));
-    record.error = record.error.map(|text| scrub_secret_values(&text, &secrets));
+        .map(|text| scrub_free_text(&text, &secrets));
+    record.error = record.error.map(|text| scrub_free_text(&text, &secrets));
+    record.delivery_fallback_reason = record
+        .delivery_fallback_reason
+        .map(|text| scrub_free_text(&text, &secrets));
+    for failure in &mut record.provider_failures {
+        failure.diagnostic = scrub_free_text(&failure.diagnostic, &secrets);
+    }
     DiagnosticExport {
         record,
         environment: redacted_environment(vars),
@@ -770,6 +855,10 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
 pub struct ReplayOutcome {
     pub source_transcripts: Vec<SourceTranscript>,
     pub timings_ms: Vec<ProviderTiming>,
+    /// Providers that failed or were absent while replaying the fixture, carried
+    /// through so a replay surfaces the same failure visibility as a live
+    /// Recording.
+    pub provider_failures: Vec<ProviderFailure>,
     pub decision: TranscriptDecision,
 }
 
@@ -784,10 +873,12 @@ pub async fn replay_capture(
 ) -> Result<ReplayOutcome, BoundaryError> {
     let completion = coordinator.complete_with_timings(audio).await?;
     let source_transcripts = completion.sources.clone();
+    let provider_failures = completion.provider_failures;
     let decision = validator.validate(completion.sources).await?;
     Ok(ReplayOutcome {
         source_transcripts,
         timings_ms: completion.timings_ms,
+        provider_failures,
         decision,
     })
 }

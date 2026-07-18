@@ -4,8 +4,63 @@ use std::time::Duration;
 
 use voisu_core::{
     AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind, CapturedAudio, Provider,
-    ProviderCoordinator, ProviderStream, ProviderStreams, SourceTranscript,
+    ProviderCoordinator, ProviderFailureStage, ProviderStream, ProviderStreams, SourceTranscript,
 };
+
+/// A provider stream that fails while producing its Source Transcript at
+/// finalize — the realistic silent-absence case from the 2026-07-17 blind test,
+/// where a mid-stream chunk failure abandoned the whole provider. Its
+/// completion returns a boundary diagnostic instead of a transcript.
+struct FailingStream {
+    provider: Provider,
+    diagnostic: &'static str,
+    aborts: Arc<AtomicUsize>,
+}
+
+impl ProviderStream for FailingStream {
+    fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    fn send_audio(&mut self, _chunk: AudioChunk) -> BoundaryFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()> {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn complete(&mut self, _audio: CapturedAudio) -> BoundaryFuture<'_, SourceTranscript> {
+        let diagnostic = self.diagnostic;
+        Box::pin(async move { Err(BoundaryError::new(BoundaryKind::Provider, diagnostic)) })
+    }
+}
+
+/// A provider stream that fails while streaming live audio, before finalize.
+struct SendFailingStream {
+    provider: Provider,
+    diagnostic: &'static str,
+}
+
+impl ProviderStream for SendFailingStream {
+    fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    fn send_audio(&mut self, _chunk: AudioChunk) -> BoundaryFuture<'_, ()> {
+        let diagnostic = self.diagnostic;
+        Box::pin(async move { Err(BoundaryError::new(BoundaryKind::Provider, diagnostic)) })
+    }
+
+    fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn complete(&mut self, _audio: CapturedAudio) -> BoundaryFuture<'_, SourceTranscript> {
+        Box::pin(async { Err(BoundaryError::new(BoundaryKind::Provider, "unreached")) })
+    }
+}
 
 struct ControlledStream {
     provider: Provider,
@@ -250,6 +305,219 @@ async fn ready_sources_at_the_deadline_instant_are_not_discarded() {
         sources.iter().map(|source| source.provider).collect::<Vec<_>>(),
         vec![Provider::Deepgram, Provider::Groq]
     );
+}
+
+#[tokio::test]
+async fn a_failed_provider_is_recorded_while_the_other_succeeds() {
+    // The silent-absence bug: one provider fails at completion while the other
+    // succeeds. The failure must be recorded (provider, stage, diagnostic), not
+    // dropped just because a usable Source Transcript is available.
+    let groq = Arc::new(AtomicUsize::new(0));
+    let completion = ProviderCoordinator::start(
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        ProviderStreams {
+            deepgram: Box::new(FailingStream {
+                provider: Provider::Deepgram,
+                diagnostic: "chunk 3 POST failed: connection reset",
+                aborts: Arc::new(AtomicUsize::new(0)),
+            }),
+            groq: stream(
+                Provider::Groq,
+                Duration::from_millis(1),
+                Arc::clone(&groq),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        },
+    )
+    .complete_with_timings(CapturedAudio::empty())
+    .await
+    .unwrap();
+
+    assert_eq!(completion.sources.len(), 1);
+    assert_eq!(completion.sources[0].provider, Provider::Groq);
+    assert_eq!(completion.provider_failures.len(), 1);
+    let failure = &completion.provider_failures[0];
+    assert_eq!(failure.provider, Provider::Deepgram);
+    assert_eq!(failure.stage, ProviderFailureStage::Completion);
+    assert_eq!(failure.diagnostic, "chunk 3 POST failed: connection reset");
+}
+
+#[tokio::test]
+async fn all_providers_failing_attaches_failures_to_the_error() {
+    // When NO provider produces a Source Transcript, the coordinator returns an
+    // error — but the per-provider failure evidence must ride ON that error so
+    // history shows each provider's absence instead of a bare, source-less error.
+    let error = ProviderCoordinator::start(
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        ProviderStreams {
+            deepgram: Box::new(FailingStream {
+                provider: Provider::Deepgram,
+                diagnostic: "deepgram completion failed",
+                aborts: Arc::new(AtomicUsize::new(0)),
+            }),
+            groq: Box::new(FailingStream {
+                provider: Provider::Groq,
+                diagnostic: "groq completion failed",
+                aborts: Arc::new(AtomicUsize::new(0)),
+            }),
+        },
+    )
+    .complete_with_timings(CapturedAudio::empty())
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.kind(), BoundaryKind::Provider);
+    let failures = error.provider_failures();
+    assert_eq!(failures.len(), 2, "both providers' failures must ride on the error");
+    assert!(failures.iter().any(|failure| failure.provider == Provider::Deepgram
+        && failure.stage == ProviderFailureStage::Completion));
+    assert!(failures.iter().any(|failure| failure.provider == Provider::Groq
+        && failure.stage == ProviderFailureStage::Completion));
+}
+
+#[tokio::test]
+async fn stream_audio_attributes_a_streaming_failure_to_the_failing_provider() {
+    // A live send_audio failure aborts the Recording. The returned error must
+    // carry a Streaming-stage ProviderFailure attributed to the provider that
+    // broke, so the daemon's abort path can persist which provider failed where.
+    let mut coordinator = ProviderCoordinator::start(
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        ProviderStreams {
+            deepgram: Box::new(SendFailingStream {
+                provider: Provider::Deepgram,
+                diagnostic: "deepgram websocket dropped",
+            }),
+            groq: stream(
+                Provider::Groq,
+                Duration::from_millis(1),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        },
+    );
+
+    let error = coordinator
+        .stream_audio(AudioChunk(vec![0_u8; 4]))
+        .await
+        .unwrap_err();
+    let failures = error.provider_failures();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].provider, Provider::Deepgram);
+    assert_eq!(failures[0].stage, ProviderFailureStage::Streaming);
+    assert_eq!(failures[0].diagnostic, "deepgram websocket dropped");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_loser_cleanup_failure_does_not_erase_the_winner_transcript() {
+    // Finding 3: Deepgram succeeds; Groq misses the Provider Deadline AND its
+    // abort times out. The cleanup failure of the loser must NOT discard the
+    // winner — the completion returns Deepgram's Source Transcript, with Groq's
+    // deadline absence (annotated with the cleanup failure) recorded.
+    let completion = ProviderCoordinator::start(
+        Duration::from_millis(50),
+        Duration::from_millis(50),
+        ProviderStreams {
+            deepgram: Box::new(ControlledStream {
+                provider: Provider::Deepgram,
+                delay: Duration::from_millis(1),
+                completions: Arc::new(AtomicUsize::new(0)),
+                chunks: Arc::new(AtomicUsize::new(0)),
+                aborts: Arc::new(AtomicUsize::new(0)),
+                abort_delay: Duration::ZERO,
+            }),
+            groq: Box::new(ControlledStream {
+                provider: Provider::Groq,
+                delay: Duration::from_secs(30),
+                completions: Arc::new(AtomicUsize::new(0)),
+                chunks: Arc::new(AtomicUsize::new(0)),
+                aborts: Arc::new(AtomicUsize::new(0)),
+                abort_delay: Duration::from_secs(30),
+            }),
+        },
+    )
+    .complete_with_timings(CapturedAudio::empty())
+    .await
+    .expect("a winner must survive a loser's cleanup failure");
+
+    assert_eq!(completion.sources.len(), 1);
+    assert_eq!(completion.sources[0].provider, Provider::Deepgram);
+    assert_eq!(completion.provider_failures.len(), 1);
+    let failure = &completion.provider_failures[0];
+    assert_eq!(failure.provider, Provider::Groq);
+    assert_eq!(failure.stage, ProviderFailureStage::ProviderDeadline);
+    assert!(
+        failure.diagnostic.contains("cleanup failed"),
+        "the loser's cleanup failure is recorded, not swallowed: {}",
+        failure.diagnostic
+    );
+}
+
+#[tokio::test]
+async fn both_providers_succeeding_records_no_failures() {
+    let completion = ProviderCoordinator::start(
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        ProviderStreams {
+            deepgram: stream(
+                Provider::Deepgram,
+                Duration::from_millis(1),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            groq: stream(
+                Provider::Groq,
+                Duration::from_millis(1),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        },
+    )
+    .complete_with_timings(CapturedAudio::empty())
+    .await
+    .unwrap();
+
+    assert_eq!(completion.sources.len(), 2);
+    assert!(
+        completion.provider_failures.is_empty(),
+        "no failures when both providers contribute a Source Transcript"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_provider_missing_the_deadline_is_recorded_as_absent() {
+    // Groq never finishes before the Provider Deadline. Deepgram carries the
+    // Recording, but Groq's absence must be visible, attributed to the deadline.
+    let completion = ProviderCoordinator::start(
+        Duration::from_millis(50),
+        Duration::from_secs(1),
+        ProviderStreams {
+            deepgram: stream(
+                Provider::Deepgram,
+                Duration::from_millis(1),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            groq: stream(
+                Provider::Groq,
+                Duration::from_secs(30),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        },
+    )
+    .complete_with_timings(CapturedAudio::empty())
+    .await
+    .unwrap();
+
+    assert_eq!(completion.sources.len(), 1);
+    assert_eq!(completion.sources[0].provider, Provider::Deepgram);
+    assert_eq!(completion.provider_failures.len(), 1);
+    let failure = &completion.provider_failures[0];
+    assert_eq!(failure.provider, Provider::Groq);
+    assert_eq!(failure.stage, ProviderFailureStage::ProviderDeadline);
 }
 
 #[test]

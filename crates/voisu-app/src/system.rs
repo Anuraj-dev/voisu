@@ -52,10 +52,42 @@ const RECONCILIATION_PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 const PCM_CHUNK_BYTES: usize = 3_200;
 const MIN_RECORDING_BYTES: usize = PCM_CHUNK_BYTES;
 const MAX_RECORDING_BYTES: usize = 16_000 * 2 * 60 * 5;
-const GROQ_CHUNK_BYTES: usize = 16_000 * 2 * 30;
-const GROQ_CHUNK_OVERLAP_BYTES: usize = 16_000;
-const DEEPGRAM_CHUNK_BYTES: usize = 16_000 * 2;
-const MAX_DEEPGRAM_IN_FLIGHT: usize = 3;
+/// Recordings at or below this length (120 s of 16 kHz s16le mono) take a
+/// single full-audio Groq request at finalize: no pre-streamed chunks, no
+/// seams, full context for Whisper. Only Recordings that grow past this switch
+/// to pre-streamed chunking.
+const GROQ_FULL_AUDIO_MAX_BYTES: usize = 16_000 * 2 * 120;
+/// Pre-streamed chunk length for Recordings longer than the full-audio limit:
+/// 60 s windows with a 4 s overlap so the word-overlap dedup can stitch seams.
+const GROQ_CHUNK_BYTES: usize = 16_000 * 2 * 60;
+const GROQ_CHUNK_OVERLAP_BYTES: usize = 16_000 * 2 * 4;
+/// Word-overlap window for `merge_chunk_transcripts`, widened from the old 24
+/// to cover the 4 s chunk overlap comfortably.
+const GROQ_MERGE_OVERLAP_WORDS: usize = 48;
+/// Bounded app-level redials for the Deepgram streaming websocket, covering
+/// ONLY failed dials and connections that dropped before any audio was
+/// delivered on them. Once audio has been accepted by a socket a drop is
+/// unrecoverable (Deepgram has no server-side resume, and unfinalized audio
+/// cannot be replayed), so it fails the provider visibly and the parallel
+/// Groq stream carries the Recording.
+const DEEPGRAM_RECONNECT_ATTEMPTS: usize = 2;
+const DEEPGRAM_RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
+/// Whole-handshake bound (DNS + TCP + TLS + websocket upgrade) for one dial
+/// of the streaming endpoint, so a black-holing network cannot pin the I/O
+/// task past the Provider Deadline.
+const DEEPGRAM_CONNECT_DEADLINE: Duration = Duration::from_secs(5);
+/// Poll cadence at which the streaming I/O task observes `CancelRegistry`
+/// (a poll-style flag, matching the subprocess poll-bound discipline).
+const DEEPGRAM_CANCEL_POLL: Duration = Duration::from_millis(100);
+/// Deepgram closes idle streaming sockets after ~10-12s without data; a JSON
+/// `KeepAlive` text frame is sent whenever nothing else has gone out for this
+/// long, well under that window.
+const DEEPGRAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// After `CloseStream` is sent, bounded wait for Deepgram to flush the final
+/// `Results`, send the terminal summary `Metadata`, and close. A server that
+/// never confirms within this grace fails the provider visibly — returning
+/// the accumulated prefix would deliver a plausible but truncated Transcript.
+const DEEPGRAM_CLOSE_GRACE: Duration = Duration::from_secs(10);
 
 pub struct FedoraReadiness;
 
@@ -1228,15 +1260,6 @@ impl AudioCapture for PipeWireCapture {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(|_| {
-            BoundaryError::new(BoundaryKind::Capture, "pw-record unavailable")
-        })?;
-        let mut stdout = child.stdout.take().ok_or_else(|| {
-            BoundaryError::new(BoundaryKind::Capture, "pw-record stdout unavailable")
-        })?;
-        let mut stderr = child.stderr.take().ok_or_else(|| {
-            BoundaryError::new(BoundaryKind::Capture, "pw-record stderr unavailable")
-        })?;
         let state = Arc::new(Mutex::new(CaptureReaderState {
             chunks: VecDeque::new(),
             received_bytes: 0,
@@ -1244,7 +1267,40 @@ impl AudioCapture for PipeWireCapture {
             error: None,
         }));
         let reader_state = Arc::clone(&state);
+        // pw-record MUST be spawned from the reader thread, never from the
+        // caller: `guard_external_child` arms PR_SET_PDEATHSIG, and the kernel
+        // delivers that signal when the FORKING THREAD exits, not the process.
+        // The caller runs on a transient Tokio blocking-pool thread that is
+        // reaped after ~10 s idle, which SIGKILLed every Recording longer than
+        // that. The reader thread lives until the capture ends, so parent-death
+        // delivery degrades to exactly the daemon-death contract intended.
+        let (handoff_tx, handoff_rx) =
+            std::sync::mpsc::channel::<Result<(Child, std::process::ChildStderr), &'static str>>();
         let reader = thread::spawn(move || {
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(_) => {
+                    let _ = handoff_tx.send(Err("pw-record unavailable"));
+                    return;
+                }
+            };
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let (Some(mut stdout), Some(stderr)) = (stdout, stderr) else {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = handoff_tx.send(Err("pw-record stdout unavailable"));
+                return;
+            };
+            if let Err(returned) = handoff_tx.send(Ok((child, stderr))) {
+                // begin() is blocked on recv, so this only happens if it
+                // panicked; reclaim the child rather than leaking it.
+                if let Ok((mut child, _)) = returned.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return;
+            }
             let mut buffer = vec![0_u8; PCM_CHUNK_BYTES];
             loop {
                 match stdout.read(&mut buffer) {
@@ -1271,15 +1327,15 @@ impl AudioCapture for PipeWireCapture {
                 }
             }
         });
+        let (child, mut stderr) = handoff_rx
+            .recv()
+            .map_err(|_| BoundaryError::new(BoundaryKind::Capture, "pw-record unavailable"))?
+            .map_err(|message| BoundaryError::new(BoundaryKind::Capture, message))?;
         let stderr_reader = thread::spawn(move || {
             read_capped(&mut stderr, MAX_RETAINED_STDERR_BYTES).unwrap_or_default()
         });
-        let deadline = std::env::var("VOISU_RECORDING_DEADLINE_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(Duration::from_millis)
-            .filter(|value| !value.is_zero())
-            .unwrap_or(Duration::from_secs(60));
+        let deadline =
+            resolve_recording_deadline(std::env::var("VOISU_RECORDING_DEADLINE_MS").ok());
         Ok(Box::new(PipeWireActiveCapture {
             child: Some(child),
             state,
@@ -1290,6 +1346,23 @@ impl AudioCapture for PipeWireCapture {
             deadline,
         }))
     }
+}
+
+/// Default ceiling on a single Recording before the Recording Deadline stops
+/// it. Recordings routinely run past two minutes (the provider chunking path
+/// exists for exactly those), so the default must be generous; a stuck or
+/// forgotten Recording is still bounded. `VOISU_RECORDING_DEADLINE_MS`
+/// overrides it, and a zero override falls back to this default.
+const DEFAULT_RECORDING_DEADLINE: Duration = Duration::from_secs(600);
+
+/// Resolve the Recording Deadline from the raw `VOISU_RECORDING_DEADLINE_MS`
+/// value. A parseable, non-zero millisecond count wins; anything else — absent,
+/// unparseable, or zero — uses [`DEFAULT_RECORDING_DEADLINE`].
+fn resolve_recording_deadline(raw: Option<String>) -> Duration {
+    raw.and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .filter(|value| !value.is_zero())
+        .unwrap_or(DEFAULT_RECORDING_DEADLINE)
 }
 
 struct PipeWireActiveCapture {
@@ -1503,6 +1576,7 @@ impl TranscriptProvider for GroqProvider {
         Ok(Box::new(GroqStream {
             credential,
             endpoint,
+            params: GroqRequestParams::from_config(),
             buffer: Vec::new(),
             streamed_bytes: 0,
             chunks: VecDeque::new(),
@@ -1522,7 +1596,11 @@ fn provider_endpoint_is_secure(endpoint: &str) -> bool {
     let Some(remainder) = endpoint.strip_prefix("http://") else {
         return false;
     };
-    let authority = remainder.split('/').next().unwrap_or_default().to_ascii_lowercase();
+    authority_is_loopback(remainder.split('/').next().unwrap_or_default())
+}
+
+fn authority_is_loopback(authority: &str) -> bool {
+    let authority = authority.to_ascii_lowercase();
     authority == "localhost"
         || authority.starts_with("localhost:")
         || authority == "127.0.0.1"
@@ -1531,9 +1609,66 @@ fn provider_endpoint_is_secure(endpoint: &str) -> bool {
         || authority.starts_with("[::1]:")
 }
 
+/// The per-Recording Groq/Whisper request tuning built once at stream start:
+/// the model, the transcription language, and the vocabulary prompt. Cloned
+/// into every chunk request so all requests for a Recording share one glossary.
+#[derive(Clone)]
+struct GroqRequestParams {
+    model: String,
+    language: String,
+    prompt: String,
+}
+
+impl GroqRequestParams {
+    /// Resolves the request tuning from config and the shared dictionary:
+    /// model from `VOISU_GROQ_MODEL` (default `whisper-large-v3`), language from
+    /// `VOISU_GROQ_LANGUAGE` (default `en`), and the Whisper vocabulary prompt.
+    fn from_config() -> Self {
+        let model = std::env::var("VOISU_GROQ_MODEL")
+            .unwrap_or_else(|_| "whisper-large-v3".to_owned());
+        let language = std::env::var("VOISU_GROQ_LANGUAGE").unwrap_or_else(|_| "en".to_owned());
+        Self {
+            model,
+            language,
+            prompt: crate::dictionary::whisper_prompt(),
+        }
+    }
+}
+
+/// Whether the Groq stream should pre-stream chunks yet. Recordings at or below
+/// the full-audio limit never pre-stream — they take one full-audio request at
+/// finalize; only once a Recording grows past the limit does chunking begin.
+fn groq_prestream_active(total_received_bytes: usize) -> bool {
+    total_received_bytes > GROQ_FULL_AUDIO_MAX_BYTES
+}
+
+/// Plans the finalize Groq request(s) over a `len`-byte finalized buffer. A
+/// buffer at or below the full-audio limit is one full-audio request; a buffer
+/// past the limit (for example when a capture backlog appended at Stop pushes it
+/// over) is split into 60 s windows with a 4 s overlap so no single request is
+/// oversized and the word-overlap dedup can stitch the seams.
+fn plan_finalize_chunks(len: usize) -> Vec<std::ops::Range<usize>> {
+    if len <= GROQ_FULL_AUDIO_MAX_BYTES {
+        return vec![0..len];
+    }
+    let step = GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES;
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < len {
+        let end = (start + GROQ_CHUNK_BYTES).min(len);
+        ranges.push(start..end);
+        if end == len {
+            break;
+        }
+        start += step;
+    }
+    ranges
+}
+
 struct GroqStream {
     credential: Credential,
     endpoint: String,
+    params: GroqRequestParams,
     buffer: Vec<u8>,
     streamed_bytes: usize,
     chunks: VecDeque<tokio::task::JoinHandle<Result<String, BoundaryError>>>,
@@ -1682,19 +1817,25 @@ impl ProviderStream for GroqStream {
         Box::pin(async move {
             self.streamed_bytes = self.streamed_bytes.saturating_add(chunk.0.len());
             self.buffer.extend_from_slice(&chunk.0);
-            while self.buffer.len() >= GROQ_CHUNK_BYTES {
-                let pcm = self.buffer[..GROQ_CHUNK_BYTES].to_vec();
-                self.buffer = self.buffer
-                    [GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES..]
-                    .to_vec();
-                let credential = self.credential.clone();
-                let endpoint = self.endpoint.clone();
-                let cancel = Arc::clone(&self.cancel);
-                self.chunks.push_back(tokio::spawn(async move {
-                    ProviderHttpClient
-                        .transcribe_groq_chunk(credential, endpoint, pcm, cancel)
-                        .await
-                }));
+            // A Recording at or below the full-audio limit never pre-streams: it
+            // is transcribed as one full-audio request at finalize. Only once it
+            // grows past the limit do we cut 60 s chunks with a 4 s overlap.
+            if groq_prestream_active(self.streamed_bytes) {
+                while self.buffer.len() >= GROQ_CHUNK_BYTES {
+                    let pcm = self.buffer[..GROQ_CHUNK_BYTES].to_vec();
+                    self.buffer = self.buffer
+                        [GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES..]
+                        .to_vec();
+                    let credential = self.credential.clone();
+                    let endpoint = self.endpoint.clone();
+                    let params = self.params.clone();
+                    let cancel = Arc::clone(&self.cancel);
+                    self.chunks.push_back(tokio::spawn(async move {
+                        ProviderHttpClient
+                            .transcribe_groq_chunk(credential, endpoint, params, pcm, cancel)
+                            .await
+                    }));
+                }
             }
             Ok(())
         })
@@ -1726,27 +1867,48 @@ impl ProviderStream for GroqStream {
                 ));
             }
             self.buffer.extend_from_slice(&pcm[self.streamed_bytes..]);
+            // A finalize request needs issuing when nothing was pre-streamed, or
+            // when the retained overlap tail carries fresh audio past the last
+            // pre-streamed chunk. Its handle MUST live in `self.chunks` so a
+            // Provider Deadline that drops this future still leaves `abort` /
+            // `Drop` / the `ProviderReaper` owning — and killing — its curl
+            // child, exactly as pre-streamed chunks are owned. Awaiting the
+            // request inline here would detach that curl on cancellation.
+            let needs_finalize =
+                self.chunks.is_empty() || self.buffer.len() > GROQ_CHUNK_OVERLAP_BYTES;
+            if needs_finalize {
+                let buffer = std::mem::take(&mut self.buffer);
+                // Re-evaluate the full-audio gate against the FINALIZED length:
+                // a capture backlog appended at Stop can push a Recording past
+                // the 120 s limit even when nothing crossed it during streaming,
+                // in which case it must be chunked, not sent as one request.
+                for range in plan_finalize_chunks(buffer.len()) {
+                    let pcm = buffer[range].to_vec();
+                    let credential = self.credential.clone();
+                    let endpoint = self.endpoint.clone();
+                    let params = self.params.clone();
+                    let cancel = Arc::clone(&self.cancel);
+                    self.chunks.push_back(tokio::spawn(async move {
+                        ProviderHttpClient
+                            .transcribe_groq_chunk(credential, endpoint, params, pcm, cancel)
+                            .await
+                    }));
+                }
+            }
             let mut transcripts = Vec::new();
             while let Some(chunk) = self.chunks.front_mut() {
-                let transcript = chunk.await.map_err(|_| {
+                // Keep the handle in `self.chunks` for the await so a Provider
+                // Deadline that drops this future still leaves `Drop` an owned
+                // task to adopt. Once the await resolves, pop it BEFORE the `?`
+                // error propagation: a completed handle left behind would be
+                // polled a second time by the reaper's adopt closure and panic
+                // ("JoinHandle polled after completion").
+                let joined = chunk.await;
+                self.chunks.pop_front();
+                let transcript = joined.map_err(|_| {
                     BoundaryError::new(BoundaryKind::Provider, "Groq chunk task failed")
                 })??;
-                self.chunks.pop_front();
                 transcripts.push(transcript);
-            }
-            let needs_final_chunk = transcripts.is_empty()
-                || self.buffer.len() > GROQ_CHUNK_OVERLAP_BYTES;
-            if needs_final_chunk {
-                transcripts.push(
-                    ProviderHttpClient
-                        .transcribe_groq_chunk(
-                            self.credential.clone(),
-                            self.endpoint.clone(),
-                            std::mem::take(&mut self.buffer),
-                            Arc::clone(&self.cancel),
-                        )
-                        .await?,
-                );
             }
             let text = merge_chunk_transcripts(transcripts);
             Ok(SourceTranscript {
@@ -1759,64 +1921,257 @@ impl ProviderStream for GroqStream {
 
 pub struct DeepgramProvider {
     reaper: ProviderReaper,
+    /// nova-3 `keyterm` boosting terms, repeated as query params on the
+    /// streaming URL. Ticket 04's shared dictionary is wired in here by the
+    /// driver at merge; until then the list defaults to empty.
+    keyterms: Vec<String>,
 }
 
 impl DeepgramProvider {
     /// Builds a Deepgram provider whose streams share the actor-owned `reaper`,
-    /// so a stream dropped mid-abort hands its curl reap to the supervisor the
-    /// actor drains before Idle.
+    /// so a stream dropped mid-abort hands its websocket I/O task to the
+    /// supervisor the actor drains before Idle. No keyterm boosting.
     pub fn new(reaper: ProviderReaper) -> Self {
-        Self { reaper }
+        Self::with_keyterms(reaper, Vec::new())
+    }
+
+    /// Same as [`DeepgramProvider::new`] but with nova-3 `keyterm` boosting
+    /// terms appended to every streaming connection URL.
+    pub fn with_keyterms(reaper: ProviderReaper, keyterms: Vec<String>) -> Self {
+        Self { reaper, keyterms }
     }
 }
 
 impl TranscriptProvider for DeepgramProvider {
     fn start(&mut self, _recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError> {
         let credential = SecretStore::load(&mut SecretToolStore, Provider::Deepgram)?;
-        let endpoint = std::env::var("VOISU_DEEPGRAM_TRANSCRIPTION_URL").unwrap_or_else(|_| {
-            "https://api.deepgram.com/v1/listen?model=nova-3&encoding=linear16&sample_rate=16000&channels=1"
-                .to_owned()
-        });
-        if !provider_endpoint_is_secure(&endpoint) {
-            return Err(BoundaryError::new(
-                BoundaryKind::Provider,
-                "Deepgram transcription endpoint must use HTTPS except on loopback",
-            ));
-        }
-        Ok(Box::new(DeepgramStream {
+        let base = std::env::var("VOISU_DEEPGRAM_TRANSCRIPTION_URL")
+            .unwrap_or_else(|_| "wss://api.deepgram.com/v1/listen".to_owned());
+        let url = deepgram_streaming_url(&base, &self.keyterms)?;
+        Ok(Box::new(DeepgramStream::connect(
+            url,
             credential,
-            endpoint,
-            buffer: Vec::new(),
-            streamed_bytes: 0,
-            chunks: VecDeque::new(),
-            permits: Arc::new(tokio::sync::Semaphore::new(MAX_DEEPGRAM_IN_FLIGHT)),
-            cancel: CancelRegistry::new(),
-            reaper: self.reaper.clone(),
-        }))
+            DEEPGRAM_KEEPALIVE_INTERVAL,
+            DEEPGRAM_CLOSE_GRACE,
+            self.reaper.clone(),
+        )))
     }
 }
 
+/// Fixed query params for the Deepgram nova-3 real-time streaming connection:
+/// raw s16le/16kHz/mono PCM in, interim results on (finals are filtered by the
+/// accumulator), smart formatting, and explicit endpointing/utterance-end
+/// tuning for dictation pauses.
+const DEEPGRAM_STREAMING_PARAMS: &[(&str, &str)] = &[
+    ("model", "nova-3"),
+    ("encoding", "linear16"),
+    ("sample_rate", "16000"),
+    ("channels", "1"),
+    ("interim_results", "true"),
+    ("smart_format", "true"),
+    ("punctuate", "true"),
+    ("endpointing", "300"),
+    ("utterance_end_ms", "1000"),
+];
+
+/// Builds the streaming websocket URL from a base endpoint. `https`/`http`
+/// bases are rewritten to `wss`/`ws` so the existing endpoint override env var
+/// keeps working; plaintext `ws` is allowed only on loopback, mirroring the
+/// HTTPS policy of the batch endpoints.
+fn deepgram_streaming_url(base: &str, keyterms: &[String]) -> Result<String, BoundaryError> {
+    if base.contains(['\n', '\r']) {
+        return Err(BoundaryError::new(
+            BoundaryKind::Provider,
+            "Deepgram streaming endpoint must use WSS except on loopback",
+        ));
+    }
+    let normalized = if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        base.to_owned()
+    };
+    let (plaintext, remainder) = if let Some(rest) = normalized.strip_prefix("wss://") {
+        (false, rest)
+    } else if let Some(rest) = normalized.strip_prefix("ws://") {
+        (true, rest)
+    } else {
+        return Err(BoundaryError::new(
+            BoundaryKind::Provider,
+            "Deepgram streaming endpoint must use WSS except on loopback",
+        ));
+    };
+    let authority = remainder.split('/').next().unwrap_or_default();
+    // Reject userinfo outright: `ws://127.0.0.1:80@attacker.example/…` has a
+    // loopback-LOOKING authority prefix but its HOST is attacker.example, and
+    // loopback-checking the raw authority string would send the Token header
+    // there over plaintext. Deepgram auth travels in the Authorization header,
+    // so no legitimate endpoint carries userinfo.
+    if authority.is_empty() || authority.contains('@') {
+        return Err(BoundaryError::new(
+            BoundaryKind::Provider,
+            "Deepgram streaming endpoint authority is invalid",
+        ));
+    }
+    if plaintext && !authority_is_loopback(authority) {
+        return Err(BoundaryError::new(
+            BoundaryKind::Provider,
+            "Deepgram streaming endpoint must use WSS except on loopback",
+        ));
+    }
+    let mut url = normalized;
+    let mut separator = if url.contains('?') { '&' } else { '?' };
+    for (name, value) in DEEPGRAM_STREAMING_PARAMS {
+        url.push(separator);
+        url.push_str(name);
+        url.push('=');
+        url.push_str(value);
+        separator = '&';
+    }
+    for keyterm in keyterms {
+        let keyterm = keyterm.trim();
+        if keyterm.is_empty() {
+            continue;
+        }
+        url.push(separator);
+        url.push_str("keyterm=");
+        url.push_str(&percent_encode_query(keyterm));
+        separator = '&';
+    }
+    Ok(url)
+}
+
+/// Percent-encodes a query component: RFC 3986 unreserved characters pass
+/// through, everything else (including spaces) becomes `%XX`.
+fn percent_encode_query(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+/// Assembles the Recording's Transcript from Deepgram streaming `Results`
+/// messages. ONLY `is_final: true` segments are accumulated — interim results
+/// for a time window are superseded by later messages and must never reach the
+/// Transcript — so this can never blindly concatenate revisions of the same
+/// audio the way the removed per-chunk batch path did.
+#[derive(Default)]
+struct TranscriptAccumulator {
+    segments: Vec<String>,
+}
+
+impl TranscriptAccumulator {
+    fn ingest(&mut self, message: &serde_json::Value) {
+        if message.get("type").and_then(serde_json::Value::as_str) != Some("Results") {
+            return;
+        }
+        if message.get("is_final").and_then(serde_json::Value::as_bool) != Some(true) {
+            return;
+        }
+        let Some(text) = message
+            .pointer("/channel/alternatives/0/transcript")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let text = text.trim();
+        if !text.is_empty() {
+            self.segments.push(text.to_owned());
+        }
+    }
+
+    fn text(&self) -> String {
+        self.segments.join(" ")
+    }
+}
+
+/// Frames the stream owner hands to the websocket I/O task: raw PCM goes out
+/// as binary frames, `Finalize`/`CloseStream` as JSON text frames.
+enum DeepgramOutbound {
+    Audio(Vec<u8>),
+    Finalize,
+    CloseStream,
+}
+
+type DeepgramSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
 struct DeepgramStream {
-    credential: Credential,
-    endpoint: String,
-    buffer: Vec<u8>,
+    /// `None` once `complete()` has taken the sender; dropping it lets the I/O
+    /// task observe end-of-outbound and settle.
+    outbound: Option<tokio::sync::mpsc::UnboundedSender<DeepgramOutbound>>,
     streamed_bytes: usize,
-    chunks: VecDeque<tokio::task::JoinHandle<Result<String, BoundaryError>>>,
-    permits: Arc<tokio::sync::Semaphore>,
+    /// The single long-lived websocket I/O task, kept in a deque so `Drop`
+    /// hands it to the actor-owned `ProviderReaper` through the same adoption
+    /// contract the curl chunk tasks used (await, never abort).
+    io_tasks: VecDeque<tokio::task::JoinHandle<Result<(), BoundaryError>>>,
+    /// Filled by the I/O task as finalized `Results` arrive.
+    transcript: Arc<Mutex<TranscriptAccumulator>>,
+    /// Per-Recording cancellation flag polled by the I/O task on a bounded
+    /// tick, mirroring the poll-bound discipline of the subprocess waits.
     cancel: Arc<CancelRegistry>,
-    /// Actor-owned supervisor that adopts this stream's chunk tasks if the
-    /// stream is dropped mid-abort, so their curl reap is retained and awaited
+    /// Awaitable companion to `cancel`: `abort()`/`Drop` notify it so the I/O
+    /// task wakes immediately instead of waiting out a backoff sleep or poll
+    /// tick — the abort path must not stretch the Processing window.
+    shutdown: Arc<tokio::sync::Notify>,
+    /// Actor-owned supervisor that adopts the I/O task if the stream is
+    /// dropped mid-abort, so the websocket teardown is retained and awaited
     /// rather than detached.
     reaper: ProviderReaper,
+}
+
+impl DeepgramStream {
+    /// Spawns the websocket I/O task for one Recording. Must be called on the
+    /// runtime; connect failures surface later, through `send_audio` (closed
+    /// channel) or `complete()`/`abort()` (the task's stored error).
+    fn connect(
+        url: String,
+        credential: Credential,
+        keepalive: Duration,
+        close_grace: Duration,
+        reaper: ProviderReaper,
+    ) -> Self {
+        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel();
+        let transcript = Arc::new(Mutex::new(TranscriptAccumulator::default()));
+        let cancel = CancelRegistry::new();
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let io_task = tokio::spawn(deepgram_ws_task(
+            url,
+            credential,
+            outbound_rx,
+            Arc::clone(&transcript),
+            Arc::clone(&cancel),
+            Arc::clone(&shutdown),
+            keepalive,
+            close_grace,
+        ));
+        Self {
+            outbound: Some(outbound_tx),
+            streamed_bytes: 0,
+            io_tasks: VecDeque::from([io_task]),
+            transcript,
+            cancel,
+            shutdown,
+            reaper,
+        }
+    }
 }
 
 impl Drop for DeepgramStream {
     fn drop(&mut self) {
         // See `Drop for GroqStream`: cancel first, then adopt (await, never
-        // abort) so the nested `spawn_blocking` curl is reaped before the
+        // abort) so the websocket I/O task finishes its teardown before the
         // reaper task completes and Idle becomes observable.
         self.cancel.cancel();
-        self.reaper.adopt(std::mem::take(&mut self.chunks));
+        self.shutdown.notify_waiters();
+        self.reaper.adopt(std::mem::take(&mut self.io_tasks));
     }
 }
 
@@ -1828,34 +2183,44 @@ impl ProviderStream for DeepgramStream {
     fn send_audio(&mut self, chunk: AudioChunk) -> BoundaryFuture<'_, ()> {
         Box::pin(async move {
             self.streamed_bytes = self.streamed_bytes.saturating_add(chunk.0.len());
-            self.buffer.extend_from_slice(&chunk.0);
-            while self.buffer.len() >= DEEPGRAM_CHUNK_BYTES {
-                let pcm = self.buffer.drain(..DEEPGRAM_CHUNK_BYTES).collect();
-                let credential = self.credential.clone();
-                let endpoint = self.endpoint.clone();
-                let cancel = Arc::clone(&self.cancel);
-                let permits = Arc::clone(&self.permits);
-                self.chunks.push_back(tokio::spawn(async move {
-                    let _permit = permits.acquire_owned().await.map_err(|_| {
-                        BoundaryError::new(BoundaryKind::Provider, "Deepgram request queue closed")
-                    })?;
-                    ProviderHttpClient
-                        .transcribe_deepgram_chunk(credential, endpoint, pcm, cancel)
-                        .await
-                }));
-            }
+            let outbound = self.outbound.as_ref().ok_or_else(|| {
+                BoundaryError::new(BoundaryKind::Provider, "Deepgram stream already completed")
+            })?;
+            // A closed channel means the I/O task already failed. Do NOT fail
+            // here: `ProviderCoordinator::stream_audio` propagates send errors
+            // and would fail the whole Recording, while the bound decision is
+            // that the parallel Groq stream carries it. The stored I/O-task
+            // error surfaces visibly through `complete()` instead.
+            let _ = outbound.send(DeepgramOutbound::Audio(chunk.0));
             Ok(())
         })
     }
 
     fn abort(mut self: Box<Self>) -> BoundaryFuture<'static, ()> {
         Box::pin(async move {
+            // Signal cancellation first: the I/O task wakes on the shutdown
+            // notification (the flag backstops a pre-poll race), closes the
+            // websocket, and returns. Await it — never abort — through the
+            // same front/pop discipline as the chunk tasks, so a drop
+            // mid-await leaves the handle for the reaper. If the task had
+            // ALREADY stored a provider failure (server Error, exhausted
+            // dials) before this Recording was aborted for an unrelated
+            // reason, surface it through abort's error channel rather than
+            // discarding it — send_audio deliberately hides the closed
+            // channel, so this is the failure's only remaining exit.
+            // (Limitation: without voisu-core changes this reaches the
+            // recovery-abort diagnostics, not the per-provider history.)
             self.cancel.cancel();
-            while let Some(chunk) = self.chunks.front_mut() {
-                let _ = chunk.await;
-                self.chunks.pop_front();
+            self.shutdown.notify_waiters();
+            let mut stored_failure = Ok(());
+            while let Some(io_task) = self.io_tasks.front_mut() {
+                let joined = io_task.await;
+                self.io_tasks.pop_front();
+                if let Ok(Err(error)) = joined {
+                    stored_failure = Err(error);
+                }
             }
-            Ok(())
+            stored_failure
         })
     }
 
@@ -1868,69 +2233,447 @@ impl ProviderStream for DeepgramStream {
                     "Deepgram stream exceeded the finalized Recording",
                 ));
             }
-            self.buffer.extend_from_slice(&pcm[self.streamed_bytes..]);
-            if !self.buffer.is_empty() || self.chunks.is_empty() {
-                let credential = self.credential.clone();
-                let endpoint = self.endpoint.clone();
-                let tail = std::mem::take(&mut self.buffer);
-                let cancel = Arc::clone(&self.cancel);
-                let permits = Arc::clone(&self.permits);
-                self.chunks.push_back(tokio::spawn(async move {
-                    let _permit = permits.acquire_owned().await.map_err(|_| {
-                        BoundaryError::new(BoundaryKind::Provider, "Deepgram request queue closed")
-                    })?;
-                    ProviderHttpClient
-                        .transcribe_deepgram_chunk(credential, endpoint, tail, cancel)
-                        .await
-                }));
-            }
-            let mut transcripts = Vec::new();
-            // Await the in-flight chunk WITHOUT removing it from `self.chunks`.
-            // If this completion future is dropped mid-await (e.g. the Provider
-            // Deadline elapses and the coordinator moves to `abort()`), the
-            // chunk must still be in the deque so the gated `abort()` awaits and
-            // reaps its curl child before Idle is observable. Popping it here
-            // would detach that reap and race the Idle transition.
-            while let Some(chunk) = self.chunks.front_mut() {
-                match await_deepgram_chunk(chunk).await {
-                    Ok(transcript) => {
-                        self.chunks.pop_front();
-                        transcripts.push(transcript);
-                    }
-                    Err(error) => {
-                        // Cancel the siblings so their curl children are killed,
-                        // then drop the already-awaited front handle (re-awaiting
-                        // a completed JoinHandle panics) and await the rest so
-                        // their reaps complete before this error surfaces. Each
-                        // sibling is awaited through `front_mut()` and popped only
-                        // AFTER its await completes: if the Provider Deadline drops
-                        // this future mid-cleanup, the unfinished handles are still
-                        // in the deque for the gated `abort()` to own and reap —
-                        // draining first would detach them on drop.
-                        self.cancel.cancel();
-                        self.chunks.pop_front();
-                        while let Some(chunk) = self.chunks.front_mut() {
-                            let _ = chunk.await;
-                            self.chunks.pop_front();
-                        }
-                        return Err(error);
-                    }
+            if let Some(outbound) = self.outbound.take() {
+                // Top up with any un-streamed tail, flush server-side buffers,
+                // and end the stream gracefully. A closed channel here means
+                // the I/O task already ended; its stored result carries the
+                // error, so failed sends are deliberately ignored.
+                let tail = &pcm[self.streamed_bytes..];
+                if !tail.is_empty() {
+                    let _ = outbound.send(DeepgramOutbound::Audio(tail.to_vec()));
                 }
+                let _ = outbound.send(DeepgramOutbound::Finalize);
+                let _ = outbound.send(DeepgramOutbound::CloseStream);
             }
+            // Await the I/O task WITHOUT removing it from `self.io_tasks`. If
+            // this completion future is dropped mid-await (e.g. the Provider
+            // Deadline elapses and the coordinator moves to `abort()`), the
+            // handle must still be in the deque so the gated `abort()` awaits
+            // the websocket teardown before Idle is observable.
+            while let Some(io_task) = self.io_tasks.front_mut() {
+                let joined = io_task.await;
+                self.io_tasks.pop_front();
+                joined.map_err(|_| {
+                    BoundaryError::new(BoundaryKind::Provider, "Deepgram streaming task failed")
+                })??;
+            }
+            let text = self
+                .transcript
+                .lock()
+                .expect("Deepgram transcript accumulator mutex poisoned")
+                .text();
             Ok(SourceTranscript {
                 provider: Provider::Deepgram,
-                text: concatenate_chunk_transcripts(transcripts),
+                text,
             })
         })
     }
 }
 
-async fn await_deepgram_chunk(
-    chunk: &mut tokio::task::JoinHandle<Result<String, BoundaryError>>,
-) -> Result<String, BoundaryError> {
-    chunk.await.map_err(|_| {
-        BoundaryError::new(BoundaryKind::Provider, "Deepgram chunk task failed")
-    })?
+/// How one websocket connection ended, as seen by the per-connection driver.
+enum DeepgramConnectionEnd {
+    /// The stream ended on purpose: `CloseStream` acknowledged, outbound side
+    /// dropped, or cancellation observed. The I/O task is done.
+    Finished,
+    /// The connection dropped mid-Recording; the I/O task may redial within
+    /// the bounded reconnect budget.
+    Lost,
+}
+
+/// The long-lived websocket I/O task: one per Recording, owning the Deepgram
+/// connection end to end. Slots into the existing `ProviderReaper` adoption
+/// contract as a single `JoinHandle`. A connection lost mid-Recording is
+/// redialed at most `DEEPGRAM_RECONNECT_ATTEMPTS` times (audio already in
+/// flight during the drop is lost — the parallel Groq stream covers the gap);
+/// past the budget the error is stored here and surfaces through `complete()`.
+async fn deepgram_ws_task(
+    url: String,
+    credential: Credential,
+    outbound: tokio::sync::mpsc::UnboundedReceiver<DeepgramOutbound>,
+    transcript: Arc<Mutex<TranscriptAccumulator>>,
+    cancel: Arc<CancelRegistry>,
+    shutdown: Arc<tokio::sync::Notify>,
+    keepalive: Duration,
+    close_grace: Duration,
+) -> Result<(), BoundaryError> {
+    // Arm the shutdown wakeup before any other await so an abort lands
+    // immediately at whichever await point the session loop is parked on —
+    // a backoff sleep or in-flight dial must not stretch the abort. The
+    // cancellation flag backstops a notify that fires before this task's
+    // first poll. Dropping the session future mid-await only drops an
+    // in-process socket — nothing external is left to reap.
+    let shutdown_notified = shutdown.notified();
+    tokio::pin!(shutdown_notified);
+    let sessions = deepgram_ws_sessions(
+        url,
+        credential,
+        outbound,
+        transcript,
+        Arc::clone(&cancel),
+        keepalive,
+        close_grace,
+    );
+    tokio::pin!(sessions);
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
+    tokio::select! {
+        result = &mut sessions => result,
+        _ = &mut shutdown_notified => Ok(()),
+    }
+}
+
+/// The reconnect-bounded connection loop driven by [`deepgram_ws_task`].
+async fn deepgram_ws_sessions(
+    url: String,
+    credential: Credential,
+    mut outbound: tokio::sync::mpsc::UnboundedReceiver<DeepgramOutbound>,
+    transcript: Arc<Mutex<TranscriptAccumulator>>,
+    cancel: Arc<CancelRegistry>,
+    keepalive: Duration,
+    close_grace: Duration,
+) -> Result<(), BoundaryError> {
+    let mut reconnects_left = DEEPGRAM_RECONNECT_ATTEMPTS;
+    let mut pending: Option<DeepgramOutbound> = None;
+    // Set once any audio frame has been accepted by any socket: from then on
+    // a lost connection is unrecoverable (see DEEPGRAM_RECONNECT_ATTEMPTS).
+    let mut audio_delivered = false;
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        let socket = match deepgram_ws_connect(&url, &credential, &cancel).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                if cancel.is_cancelled() {
+                    // Aborted while dialing: nothing was connected, nothing to
+                    // reap — finish instead of burning the reconnect budget.
+                    return Ok(());
+                }
+                if reconnects_left == 0 {
+                    return Err(error);
+                }
+                reconnects_left -= 1;
+                tokio::time::sleep(DEEPGRAM_RECONNECT_BACKOFF).await;
+                continue;
+            }
+        };
+        match drive_deepgram_connection(
+            socket,
+            &mut outbound,
+            &mut pending,
+            &mut audio_delivered,
+            &transcript,
+            &cancel,
+            keepalive,
+            close_grace,
+        )
+        .await?
+        {
+            DeepgramConnectionEnd::Finished => return Ok(()),
+            DeepgramConnectionEnd::Lost => {
+                if audio_delivered {
+                    // Audio accepted by the dropped socket but not yet
+                    // finalized cannot be replayed: redialing and continuing
+                    // would return a plausible Transcript with a silent gap.
+                    // Fail visibly; the parallel Groq stream carries the
+                    // Recording (PRD §3.3).
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Provider,
+                        "Deepgram streaming connection lost",
+                    ));
+                }
+                if reconnects_left == 0 {
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Provider,
+                        "Deepgram streaming connection lost",
+                    ));
+                }
+                reconnects_left -= 1;
+                tokio::time::sleep(DEEPGRAM_RECONNECT_BACKOFF).await;
+            }
+        }
+    }
+}
+
+/// Installs the process-level rustls CryptoProvider (ring). The
+/// `rustls-tls-webpki-roots` feature of tokio-tungstenite does not select a
+/// crypto backend, and rustls panics on the first TLS handshake when none is
+/// installed. Idempotent: a second call leaves the installed provider in place.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// Dials the streaming endpoint with the `Authorization: Token` header scheme
+/// the batch path already used. The whole handshake is bounded by
+/// `DEEPGRAM_CONNECT_DEADLINE` and observes cancellation on the poll tick, so
+/// an abort never waits on a slow DNS/TLS dial: dropping the in-process
+/// connect future cancels it without leaving anything to reap.
+async fn deepgram_ws_connect(
+    url: &str,
+    credential: &Credential,
+    cancel: &CancelRegistry,
+) -> Result<DeepgramSocket, BoundaryError> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let mut request = url.into_client_request().map_err(|_| {
+        BoundaryError::new(BoundaryKind::Provider, "Deepgram streaming URL is invalid")
+    })?;
+    let token = format!("Token {}", credential.expose_to_boundary());
+    request.headers_mut().insert(
+        tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+        token.parse().map_err(|_| {
+            BoundaryError::new(BoundaryKind::Provider, "Deepgram credential is not header-safe")
+        })?,
+    );
+    let connect = tokio_tungstenite::connect_async(request);
+    tokio::pin!(connect);
+    let deadline = tokio::time::sleep(DEEPGRAM_CONNECT_DEADLINE);
+    tokio::pin!(deadline);
+    let mut ticks = tokio::time::interval(DEEPGRAM_CANCEL_POLL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            result = &mut connect => {
+                let (socket, _response) = result.map_err(|_| {
+                    BoundaryError::new(
+                        BoundaryKind::Provider,
+                        "Deepgram websocket connect failed",
+                    )
+                })?;
+                return Ok(socket);
+            }
+            _ = &mut deadline => {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Provider,
+                    "Deepgram websocket connect deadline elapsed",
+                ));
+            }
+            _ = ticks.tick() => {
+                if cancel.is_cancelled() {
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Provider,
+                        "Deepgram websocket connect cancelled",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Drives one websocket connection: forwards outbound audio/control frames,
+/// ingests inbound `Results` into the accumulator, sends `KeepAlive` during
+/// outbound gaps, and observes cancellation on a bounded tick. Marks
+/// `audio_delivered` once any audio frame is accepted by the socket. Returns
+/// `Err` for fatal failures (server-reported errors, malformed frames, an
+/// unconfirmed CloseStream); transport drops return
+/// `DeepgramConnectionEnd::Lost` and the caller decides whether a redial is
+/// safe. A drain only Finishes when the server confirmed CloseStream with its
+/// terminal summary `Metadata` before closing — Deepgram's contract is to
+/// process remaining audio, return final results plus summary metadata, then
+/// terminate; anything less may be a truncated Transcript.
+async fn drive_deepgram_connection(
+    socket: DeepgramSocket,
+    outbound: &mut tokio::sync::mpsc::UnboundedReceiver<DeepgramOutbound>,
+    pending: &mut Option<DeepgramOutbound>,
+    audio_delivered: &mut bool,
+    transcript: &Arc<Mutex<TranscriptAccumulator>>,
+    cancel: &CancelRegistry,
+    keepalive: Duration,
+    close_grace: Duration,
+) -> Result<DeepgramConnectionEnd, BoundaryError> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (mut sink, mut stream) = socket.split();
+    let mut ticks = tokio::time::interval(DEEPGRAM_CANCEL_POLL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_sent = tokio::time::Instant::now();
+    // Once `CloseStream` is out, stop consuming outbound frames and only
+    // drain inbound until the server flushes final `Results`, confirms with
+    // its terminal `Metadata`, and closes — bounded by the close grace.
+    let mut draining_deadline: Option<tokio::time::Instant> = None;
+    let mut terminal_metadata_seen = false;
+    // A frame that failed to send on the previous connection is retried first
+    // (only reachable before any audio was delivered — see the caller).
+    if let Some(frame) = pending.take() {
+        let is_audio = matches!(frame, DeepgramOutbound::Audio(_));
+        let draining = matches!(frame, DeepgramOutbound::CloseStream);
+        if sink.send(deepgram_ws_frame(&frame)).await.is_err() {
+            *pending = Some(frame);
+            return Ok(DeepgramConnectionEnd::Lost);
+        }
+        if is_audio {
+            *audio_delivered = true;
+        }
+        last_sent = tokio::time::Instant::now();
+        if draining {
+            draining_deadline = Some(last_sent + close_grace);
+        }
+    }
+    loop {
+        tokio::select! {
+            frame = outbound.recv(), if draining_deadline.is_none() => {
+                let Some(frame) = frame else {
+                    // Stream owner dropped without `complete()` (abort/Drop
+                    // path): close this connection out and finish.
+                    let _ = sink.send(Message::Close(None)).await;
+                    return Ok(DeepgramConnectionEnd::Finished);
+                };
+                let is_audio = matches!(frame, DeepgramOutbound::Audio(_));
+                let draining = matches!(frame, DeepgramOutbound::CloseStream);
+                if sink.send(deepgram_ws_frame(&frame)).await.is_err() {
+                    *pending = Some(frame);
+                    return Ok(DeepgramConnectionEnd::Lost);
+                }
+                if is_audio {
+                    *audio_delivered = true;
+                }
+                last_sent = tokio::time::Instant::now();
+                if draining {
+                    draining_deadline = Some(last_sent + close_grace);
+                }
+            }
+            incoming = stream.next() => match incoming {
+                Some(Ok(Message::Text(text))) => {
+                    let kind = ingest_deepgram_message(transcript, &text)?;
+                    if draining_deadline.is_some()
+                        && matches!(kind, DeepgramMessageKind::Metadata)
+                    {
+                        terminal_metadata_seen = true;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => {
+                    if draining_deadline.is_none() {
+                        return Ok(DeepgramConnectionEnd::Lost);
+                    }
+                    if terminal_metadata_seen {
+                        return Ok(DeepgramConnectionEnd::Finished);
+                    }
+                    // Closed after CloseStream but WITHOUT the terminal
+                    // summary Metadata: the server-side flush is unconfirmed
+                    // and the accumulated Transcript may be truncated.
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Provider,
+                        "Deepgram closed without confirming CloseStream",
+                    ));
+                }
+                Some(Err(_)) => {
+                    if draining_deadline.is_some() {
+                        // The transport died between CloseStream and the
+                        // server's flush: the final Results may be missing.
+                        // Returning the partial accumulator here would
+                        // silently truncate the Transcript — fail visibly and
+                        // let the parallel Groq stream carry the Recording.
+                        return Err(BoundaryError::new(
+                            BoundaryKind::Provider,
+                            "Deepgram streaming connection lost",
+                        ));
+                    }
+                    return Ok(DeepgramConnectionEnd::Lost);
+                }
+                Some(Ok(_)) => {}
+            },
+            _ = ticks.tick() => {
+                if cancel.is_cancelled() {
+                    let _ = sink.send(Message::Close(None)).await;
+                    return Ok(DeepgramConnectionEnd::Finished);
+                }
+                if let Some(deadline) = draining_deadline {
+                    if tokio::time::Instant::now() >= deadline {
+                        // Deepgram never confirmed CloseStream within the
+                        // grace: the accumulated prefix would be a plausible
+                        // but truncated Transcript, well inside the Provider
+                        // Deadline — fail visibly instead.
+                        let _ = sink.send(Message::Close(None)).await;
+                        return Err(BoundaryError::new(
+                            BoundaryKind::Provider,
+                            "Deepgram did not confirm CloseStream within the close grace",
+                        ));
+                    }
+                } else if last_sent.elapsed() >= keepalive {
+                    if sink
+                        .send(Message::Text(r#"{"type":"KeepAlive"}"#.to_owned()))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(DeepgramConnectionEnd::Lost);
+                    }
+                    last_sent = tokio::time::Instant::now();
+                }
+            }
+        }
+    }
+}
+
+fn deepgram_ws_frame(frame: &DeepgramOutbound) -> tokio_tungstenite::tungstenite::Message {
+    use tokio_tungstenite::tungstenite::Message;
+
+    match frame {
+        DeepgramOutbound::Audio(bytes) => Message::Binary(bytes.clone()),
+        DeepgramOutbound::Finalize => Message::Text(r#"{"type":"Finalize"}"#.to_owned()),
+        DeepgramOutbound::CloseStream => Message::Text(r#"{"type":"CloseStream"}"#.to_owned()),
+    }
+}
+
+/// What one inbound text frame turned out to be, for the caller's
+/// drain-confirmation tracking.
+enum DeepgramMessageKind {
+    /// The summary `Metadata` message — terminal when it follows CloseStream.
+    Metadata,
+    Other,
+}
+
+/// Parses one inbound text frame. `Results` feed the accumulator; a server
+/// `Error` message, a frame that is not JSON, and a `Results` frame missing
+/// its `is_final` marker or (when finalized) its transcript text are all
+/// fatal — silently skipping them would truncate the Transcript without a
+/// trace. Unknown-but-well-formed message types stay tolerated so server-side
+/// schema ADDITIONS never break the Recording; interim shape drift is UI-only
+/// and equally tolerated.
+fn ingest_deepgram_message(
+    transcript: &Arc<Mutex<TranscriptAccumulator>>,
+    text: &str,
+) -> Result<DeepgramMessageKind, BoundaryError> {
+    let Ok(message) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Err(BoundaryError::new(
+            BoundaryKind::Provider,
+            "Deepgram sent a malformed streaming message",
+        ));
+    };
+    match message.get("type").and_then(serde_json::Value::as_str) {
+        Some("Error") => Err(BoundaryError::new(
+            BoundaryKind::Provider,
+            "Deepgram reported a streaming error",
+        )),
+        Some("Results") => {
+            let Some(is_final) = message.get("is_final").and_then(serde_json::Value::as_bool)
+            else {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Provider,
+                    "Deepgram sent a malformed streaming message",
+                ));
+            };
+            if is_final
+                && message
+                    .pointer("/channel/alternatives/0/transcript")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+            {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Provider,
+                    "Deepgram sent a malformed streaming message",
+                ));
+            }
+            transcript
+                .lock()
+                .expect("Deepgram transcript accumulator mutex poisoned")
+                .ingest(&message);
+            Ok(DeepgramMessageKind::Other)
+        }
+        Some("Metadata") => Ok(DeepgramMessageKind::Metadata),
+        _ => Ok(DeepgramMessageKind::Other),
+    }
 }
 
 pub struct MergeResultValidator {
@@ -3480,100 +4223,63 @@ fn spawn_remote_desktop_setup(
 }
 
 impl ProviderHttpClient {
-    async fn transcribe_deepgram_chunk(
-        &self,
-        credential: Credential,
-        endpoint: String,
-        pcm: Vec<u8>,
-        cancel: Arc<CancelRegistry>,
-    ) -> Result<String, BoundaryError> {
-        tokio::task::spawn_blocking(move || {
-            request_deepgram_chunk(credential, endpoint, pcm, &cancel)
-        })
-        .await
-        .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "Deepgram request task failed"))?
-    }
-
     async fn transcribe_groq_chunk(
         &self,
         credential: Credential,
         endpoint: String,
+        params: GroqRequestParams,
         pcm: Vec<u8>,
         cancel: Arc<CancelRegistry>,
     ) -> Result<String, BoundaryError> {
-        tokio::task::spawn_blocking(move || request_groq_chunk(credential, endpoint, pcm, &cancel))
-            .await
-            .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "Groq request task failed"))?
+        tokio::task::spawn_blocking(move || {
+            request_groq_chunk(credential, endpoint, &params, pcm, &cancel)
+        })
+        .await
+        .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "Groq request task failed"))?
     }
 }
 
-fn request_deepgram_chunk(
-    credential: Credential,
-    endpoint: String,
-    pcm: Vec<u8>,
-    cancel: &CancelRegistry,
+/// Builds the curl `--config` body for a Groq transcription request: the audio
+/// form part plus the accuracy gains — `model`, `language`, `temperature=0`,
+/// `response_format`, and (when non-empty) the vocabulary `prompt`. Rejects a
+/// model or language carrying control characters; a control-character-bearing
+/// prompt is defensively stripped rather than rejected. Kept pure and separate
+/// from the request so the request shape is testable without a network call.
+fn build_groq_curl_config(
+    endpoint: &str,
+    credential: &Credential,
+    file_path: &str,
+    params: &GroqRequestParams,
 ) -> Result<String, BoundaryError> {
-    let mut file = tempfile::Builder::new()
-        .prefix("voisu-deepgram-")
-        .suffix(".pcm")
-        .tempfile()
-        .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "temporary audio file unavailable"))?;
-    file.write_all(&pcm)
-        .and_then(|()| file.flush())
-        .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "temporary audio write failed"))?;
-    let endpoint = curl_config_escape(&endpoint);
-    let credential = curl_config_escape(credential.expose_to_boundary());
-    let path = curl_config_escape(&file.path().to_string_lossy());
-    let config = format!(
-        "url = \"{endpoint}\"\nheader = \"Authorization: Token {credential}\"\nheader = \"Content-Type: audio/raw\"\ndata-binary = \"@{path}\"\n"
-    );
-    let outcome = run_restricted_with_deadline(
-        "curl",
-        &[
-            "-q",
-            "--config",
-            "-",
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--max-time",
-            "15",
-        ],
-        Some(config.as_bytes()),
-        true,
-        PROVIDER_PROCESS_DEADLINE,
-        Some(cancel),
-    )
-    .map_err(|error| match error {
-        ProcessError::TimedOut => {
-            BoundaryError::new(BoundaryKind::Provider, "Deepgram Provider Deadline elapsed")
-        }
-        _ => BoundaryError::new(
-            BoundaryKind::Provider,
-            "Deepgram request unavailable or failed",
-        ),
-    })?;
-    if !outcome.success {
-        return Err(BoundaryError::new(
-            BoundaryKind::Provider,
-            "Deepgram rejected the audio request",
-        ));
+    if params.model.is_empty() || params.model.contains(['\n', '\r']) {
+        return Err(BoundaryError::new(BoundaryKind::Provider, "invalid Groq model"));
     }
-    let response: serde_json::Value = serde_json::from_slice(&outcome.stdout).map_err(|_| {
-        BoundaryError::new(BoundaryKind::Provider, "Deepgram returned malformed JSON")
-    })?;
-    response
-        .pointer("/results/channels/0/alternatives/0/transcript")
-        .and_then(|text| text.as_str())
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            BoundaryError::new(BoundaryKind::Provider, "Deepgram response omitted text")
-        })
+    if params.language.contains(['\n', '\r']) {
+        return Err(BoundaryError::new(BoundaryKind::Provider, "invalid Groq language"));
+    }
+    let endpoint = curl_config_escape(endpoint);
+    let credential = curl_config_escape(credential.expose_to_boundary());
+    let path = curl_config_escape(file_path);
+    let model = curl_config_escape(&params.model);
+    let mut config = format!(
+        "url = \"{endpoint}\"\nheader = \"Authorization: Bearer {credential}\"\nform = \"file=@{path};filename=recording.wav;type=audio/wav\"\nform = \"model={model}\"\nform = \"response_format=json\"\nform = \"temperature=0\"\n"
+    );
+    if !params.language.is_empty() {
+        let language = curl_config_escape(&params.language);
+        config.push_str(&format!("form = \"language={language}\"\n"));
+    }
+    let prompt: String = params.prompt.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+    if !prompt.is_empty() {
+        let prompt = curl_config_escape(&prompt);
+        config.push_str(&format!("form = \"prompt={prompt}\"\n"));
+    }
+    Ok(config)
 }
 
 fn request_groq_chunk(
     credential: Credential,
     endpoint: String,
+    params: &GroqRequestParams,
     pcm: Vec<u8>,
     cancel: &CancelRegistry,
 ) -> Result<String, BoundaryError> {
@@ -3586,18 +4292,7 @@ fn request_groq_chunk(
     file.write_all(&wav)
         .and_then(|()| file.flush())
         .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "temporary audio write failed"))?;
-    let endpoint = curl_config_escape(&endpoint);
-    let credential = curl_config_escape(credential.expose_to_boundary());
-    let path = curl_config_escape(&file.path().to_string_lossy());
-    let model = std::env::var("VOISU_GROQ_MODEL")
-        .unwrap_or_else(|_| "whisper-large-v3-turbo".to_owned());
-    if model.is_empty() || model.contains(['\n', '\r']) {
-        return Err(BoundaryError::new(BoundaryKind::Provider, "invalid Groq model"));
-    }
-    let model = curl_config_escape(&model);
-    let config = format!(
-        "url = \"{endpoint}\"\nheader = \"Authorization: Bearer {credential}\"\nform = \"file=@{path};filename=recording.wav;type=audio/wav\"\nform = \"model={model}\"\nform = \"response_format=json\"\n"
-    );
+    let config = build_groq_curl_config(&endpoint, &credential, &file.path().to_string_lossy(), params)?;
     let outcome = run_restricted_with_deadline(
         "curl",
         &[
@@ -3644,26 +4339,13 @@ fn merge_chunk_transcripts(transcripts: Vec<String>) -> String {
             .split_whitespace()
             .map(str::to_owned)
             .collect();
-        let overlap = (1..=merged.len().min(words.len()).min(24))
+        let overlap = (1..=merged.len().min(words.len()).min(GROQ_MERGE_OVERLAP_WORDS))
             .rev()
             .find(|count| merged[merged.len() - count..] == words[..*count])
             .unwrap_or(0);
         merged.extend(words.into_iter().skip(overlap));
     }
     merged.join(" ")
-}
-
-fn concatenate_chunk_transcripts(transcripts: Vec<String>) -> String {
-    transcripts
-        .into_iter()
-        .flat_map(|transcript| {
-            transcript
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn wav_from_pcm(pcm: &[u8]) -> Result<Vec<u8>, BoundaryError> {
@@ -3696,6 +4378,182 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use voisu_core::{ProviderCoordinator, ProviderStreams};
+
+    #[test]
+    fn crypto_provider_installs_and_is_idempotent() {
+        install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    /// Fixed Groq request tuning for stream constructor tests: deterministic and
+    /// independent of the host's environment and user dictionary.
+    fn test_groq_params() -> GroqRequestParams {
+        GroqRequestParams {
+            model: "whisper-large-v3".to_owned(),
+            language: "en".to_owned(),
+            prompt: "Groq, Tokio".to_owned(),
+        }
+    }
+
+    #[test]
+    fn groq_stays_full_audio_at_or_below_the_limit_and_chunks_above() {
+        // A Recording at exactly the full-audio limit still takes one full-audio
+        // request; only once it grows past the limit does pre-streaming begin.
+        assert!(!groq_prestream_active(GROQ_FULL_AUDIO_MAX_BYTES));
+        assert!(!groq_prestream_active(GROQ_FULL_AUDIO_MAX_BYTES - 1));
+        assert!(groq_prestream_active(GROQ_FULL_AUDIO_MAX_BYTES + 1));
+    }
+
+    #[test]
+    fn finalize_is_one_full_audio_request_at_or_below_the_limit() {
+        assert_eq!(plan_finalize_chunks(1_000), vec![0..1_000]);
+        assert_eq!(
+            plan_finalize_chunks(GROQ_FULL_AUDIO_MAX_BYTES),
+            vec![0..GROQ_FULL_AUDIO_MAX_BYTES]
+        );
+    }
+
+    #[test]
+    fn finalize_chunks_a_backlog_inflated_recording_past_the_limit() {
+        // 130 s finalized (e.g. a large capture backlog appended at Stop pushed a
+        // Recording that streamed under 120 s past the limit): it must be chunked
+        // into 60 s windows with a 4 s overlap, not one oversized request.
+        let len = GROQ_FULL_AUDIO_MAX_BYTES + 16_000 * 2 * 10;
+        let ranges = plan_finalize_chunks(len);
+        assert!(ranges.len() >= 2, "past the limit finalize is chunked, not one request");
+        assert_eq!(ranges[0], 0..GROQ_CHUNK_BYTES);
+        assert_eq!(ranges[1].start, GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES);
+        assert_eq!(ranges.last().unwrap().end, len, "the last window ends at the recording end");
+        for range in &ranges[..ranges.len() - 1] {
+            assert_eq!(range.end - range.start, GROQ_CHUNK_BYTES, "non-final windows are full chunks");
+        }
+    }
+
+    #[test]
+    fn groq_chunk_geometry_is_sixty_second_windows_with_a_four_second_overlap() {
+        assert_eq!(GROQ_CHUNK_BYTES, 16_000 * 2 * 60);
+        assert_eq!(GROQ_CHUNK_OVERLAP_BYTES, 16_000 * 2 * 4);
+        assert_eq!(GROQ_FULL_AUDIO_MAX_BYTES, 16_000 * 2 * 120);
+    }
+
+    #[test]
+    fn groq_curl_config_carries_the_accuracy_gains() {
+        let credential = Credential::new("secret-token".to_owned()).unwrap();
+        let params = GroqRequestParams {
+            model: "whisper-large-v3".to_owned(),
+            language: "en".to_owned(),
+            prompt: "Tokio, serde, SELinux".to_owned(),
+        };
+        let config =
+            build_groq_curl_config("https://api.groq.com/v1", &credential, "/tmp/rec.wav", &params)
+                .expect("valid config");
+        assert!(config.contains("form = \"model=whisper-large-v3\""));
+        assert!(config.contains("form = \"language=en\""));
+        assert!(config.contains("form = \"temperature=0\""));
+        assert!(config.contains("form = \"prompt=Tokio, serde, SELinux\""));
+        assert!(config.contains("form = \"response_format=json\""));
+        assert!(config.contains("Authorization: Bearer secret-token"));
+    }
+
+    #[test]
+    fn groq_curl_config_omits_an_empty_prompt_and_language() {
+        let credential = Credential::new("secret-token".to_owned()).unwrap();
+        let params = GroqRequestParams {
+            model: "whisper-large-v3".to_owned(),
+            language: String::new(),
+            prompt: String::new(),
+        };
+        let config =
+            build_groq_curl_config("https://api.groq.com/v1", &credential, "/tmp/rec.wav", &params)
+                .expect("valid config");
+        assert!(!config.contains("prompt="));
+        assert!(!config.contains("language="));
+        // temperature is unconditional.
+        assert!(config.contains("form = \"temperature=0\""));
+    }
+
+    #[test]
+    fn groq_curl_config_rejects_a_control_character_model() {
+        let credential = Credential::new("secret-token".to_owned()).unwrap();
+        let params = GroqRequestParams {
+            model: "bad\nmodel".to_owned(),
+            language: "en".to_owned(),
+            prompt: String::new(),
+        };
+        let error =
+            build_groq_curl_config("https://api.groq.com/v1", &credential, "/tmp/rec.wav", &params)
+                .unwrap_err();
+        assert_eq!(error.diagnostic(), "invalid Groq model");
+    }
+
+    #[test]
+    fn merge_dedupes_an_overlap_wider_than_the_old_window() {
+        // A ~30-word seam overlap — wider than the previous 24-word window —
+        // must be collapsed, not duplicated, at the 4 s chunk boundary.
+        let first: Vec<String> = (0..40).map(|i| format!("w{i}")).collect();
+        let second: Vec<String> = (10..60).map(|i| format!("w{i}")).collect();
+        let merged =
+            merge_chunk_transcripts(vec![first.join(" "), second.join(" ")]);
+        let expected: Vec<String> = (0..60).map(|i| format!("w{i}")).collect();
+        assert_eq!(merged, expected.join(" "), "the 30-word overlap is deduped");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_finalize_request_is_owned_by_the_reaper_not_detached() {
+        // The single full-audio request of a short Recording is issued at
+        // finalize. If the Provider Deadline drops complete() while that request
+        // is in flight, its curl child must be OWNED — handed to the
+        // ProviderReaper by Drop — never detached. A local server that accepts
+        // and never answers keeps the finalize request in flight.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(connection) => held.push(connection),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = GroqStream {
+            credential: Credential::new("controlled-credential".to_owned()).unwrap(),
+            endpoint: format!("http://{address}/audio/transcriptions"),
+            params: test_groq_params(),
+            buffer: Vec::new(),
+            streamed_bytes: 0,
+            chunks: VecDeque::new(),
+            cancel: CancelRegistry::new(),
+            reaper: reaper.clone(),
+        };
+
+        // Drive complete() far enough to issue the finalize request, then drop it
+        // exactly as the Provider Deadline would.
+        {
+            let completion = stream.complete(CapturedAudio::empty());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(750), completion)
+                    .await
+                    .is_err(),
+                "the hanging finalize request must not complete on its own"
+            );
+        }
+        // Dropping the stream must adopt the still-live finalize task into the
+        // reaper (cancel-first, then adopt), not detach its curl child. With the
+        // finalize request awaited inline this count is zero.
+        drop(stream);
+        assert_eq!(
+            reaper.pending(),
+            1,
+            "the finalize request handle must be owned by the reaper, not detached"
+        );
+        // Draining cancels the request and reaps its curl child.
+        reaper.drain_to_completion(Duration::from_secs(5)).await;
+    }
 
     /// A probe chunk task shaped like a real provider chunk: the outer async
     /// task awaits an inner `spawn_blocking` request. The blocking closure — the
@@ -3759,20 +4617,31 @@ mod tests {
         let (deepgram_chunk, deepgram_probe) =
             spawn_blocking_backed_chunk(Arc::clone(&deepgram_cancel));
         let (groq_chunk, groq_probe) = spawn_blocking_backed_chunk(Arc::clone(&groq_cancel));
+        // Shape the Deepgram websocket I/O task like a real one whose teardown
+        // still owns nested blocking work when cancellation fires.
+        let deepgram_io_task = tokio::spawn(async move {
+            deepgram_chunk
+                .await
+                .map_err(|_| {
+                    BoundaryError::new(BoundaryKind::Provider, "Deepgram streaming task failed")
+                })?
+                .map(|_| ())
+        });
+        let (deepgram_outbound, _deepgram_outbound_rx) = tokio::sync::mpsc::unbounded_channel();
         let streams = ProviderStreams {
             deepgram: Box::new(DeepgramStream {
-                credential: credential.clone(),
-                endpoint: "http://localhost/deepgram".to_owned(),
-                buffer: Vec::new(),
+                outbound: Some(deepgram_outbound),
                 streamed_bytes: 0,
-                chunks: VecDeque::from([deepgram_chunk]),
-                permits: Arc::new(tokio::sync::Semaphore::new(MAX_DEEPGRAM_IN_FLIGHT)),
+                io_tasks: VecDeque::from([deepgram_io_task]),
+                transcript: Arc::new(Mutex::new(TranscriptAccumulator::default())),
                 cancel: deepgram_cancel,
+                shutdown: Arc::new(tokio::sync::Notify::new()),
                 reaper: reaper.clone(),
             }),
             groq: Box::new(GroqStream {
                 credential,
                 endpoint: "http://localhost/groq".to_owned(),
+                params: test_groq_params(),
                 buffer: Vec::new(),
                 streamed_bytes: 0,
                 chunks: VecDeque::from([groq_chunk]),
@@ -3845,6 +4714,7 @@ mod tests {
         let stream = GroqStream {
             credential: Credential::new("controlled-credential".to_owned()).unwrap(),
             endpoint: "http://localhost/groq".to_owned(),
+            params: test_groq_params(),
             buffer: Vec::new(),
             streamed_bytes: 0,
             chunks: VecDeque::from([chunk]),
@@ -3960,6 +4830,719 @@ mod tests {
     }
 
     #[test]
+    fn transcript_accumulator_assembles_only_finalized_results_in_order() {
+        let mut accumulator = TranscriptAccumulator::default();
+        // Interim revision of a window that a later final supersedes.
+        accumulator.ingest(&serde_json::json!({
+            "type": "Results", "is_final": false,
+            "channel": {"alternatives": [{"transcript": "the quick brown"}]}
+        }));
+        accumulator.ingest(&serde_json::json!({
+            "type": "Results", "is_final": true,
+            "channel": {"alternatives": [{"transcript": "the quick brown fox"}]}
+        }));
+        // Non-Results, whitespace-only finals, and shape drift are ignored.
+        accumulator.ingest(&serde_json::json!({"type": "Metadata"}));
+        accumulator.ingest(&serde_json::json!({
+            "type": "Results", "is_final": true,
+            "channel": {"alternatives": [{"transcript": "   "}]}
+        }));
+        accumulator.ingest(&serde_json::json!({"type": "Results", "is_final": true}));
+        accumulator.ingest(&serde_json::json!({
+            "type": "Results", "is_final": true, "speech_final": true,
+            "channel": {"alternatives": [{"transcript": "jumps over."}]}
+        }));
+        assert_eq!(accumulator.text(), "the quick brown fox jumps over.");
+    }
+
+    #[test]
+    fn deepgram_streaming_url_carries_nova3_params_and_repeated_encoded_keyterms() {
+        let url = deepgram_streaming_url(
+            "wss://api.deepgram.com/v1/listen",
+            &["Voisu".to_owned(), "smart format".to_owned(), "  ".to_owned()],
+        )
+        .unwrap();
+        assert!(url.starts_with("wss://api.deepgram.com/v1/listen?"), "{url}");
+        for expected in [
+            "model=nova-3",
+            "encoding=linear16",
+            "sample_rate=16000",
+            "channels=1",
+            "interim_results=true",
+            "smart_format=true",
+            "punctuate=true",
+            "endpointing=300",
+            "utterance_end_ms=1000",
+        ] {
+            assert!(url.contains(expected), "{url} is missing {expected}");
+        }
+        assert!(url.contains("keyterm=Voisu"), "{url}");
+        assert!(url.contains("keyterm=smart%20format"), "{url}");
+        assert_eq!(url.matches("keyterm=").count(), 2, "blank keyterms must be dropped: {url}");
+    }
+
+    #[test]
+    fn deepgram_streaming_url_rewrites_http_schemes_and_requires_wss_off_loopback() {
+        assert!(deepgram_streaming_url("https://api.deepgram.com/v1/listen", &[])
+            .unwrap()
+            .starts_with("wss://api.deepgram.com/v1/listen?"));
+        assert!(deepgram_streaming_url("http://127.0.0.1:9999/v1/listen", &[])
+            .unwrap()
+            .starts_with("ws://127.0.0.1:9999/v1/listen?"));
+        assert!(deepgram_streaming_url("ws://deepgram.test/v1/listen", &[]).is_err());
+        assert!(deepgram_streaming_url("http://deepgram.test/v1/listen", &[]).is_err());
+        // A base that already carries a query keeps it and appends with '&'.
+        let url = deepgram_streaming_url("wss://host/listen?tier=custom", &[]).unwrap();
+        assert!(url.contains("?tier=custom&model=nova-3"), "{url}");
+    }
+
+    async fn mock_deepgram_listener() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("ws://{}/v1/listen", listener.local_addr().unwrap());
+        (listener, base)
+    }
+
+    fn test_deepgram_stream(
+        base: &str,
+        keepalive: Duration,
+        reaper: &ProviderReaper,
+    ) -> DeepgramStream {
+        test_deepgram_stream_with_grace(base, keepalive, DEEPGRAM_CLOSE_GRACE, reaper)
+    }
+
+    fn test_deepgram_stream_with_grace(
+        base: &str,
+        keepalive: Duration,
+        close_grace: Duration,
+        reaper: &ProviderReaper,
+    ) -> DeepgramStream {
+        DeepgramStream::connect(
+            deepgram_streaming_url(base, &[]).unwrap(),
+            Credential::new("controlled-credential".to_owned()).unwrap(),
+            keepalive,
+            close_grace,
+            reaper.clone(),
+        )
+    }
+
+    /// The terminal summary message Deepgram sends after `CloseStream`, before
+    /// closing the connection.
+    fn deepgram_metadata_frame() -> String {
+        serde_json::json!({"type": "Metadata", "request_id": "mock-request"}).to_string()
+    }
+
+    fn deepgram_results_frame(transcript: &str, is_final: bool) -> String {
+        serde_json::json!({
+            "type": "Results",
+            "is_final": is_final,
+            "speech_final": is_final,
+            "channel": {"alternatives": [{"transcript": transcript}]}
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn deepgram_streams_binary_audio_and_returns_only_finalized_segments() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::handshake::server::{
+            Request as WsRequest, Response as WsResponse,
+        };
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let handshake: Arc<Mutex<Option<(String, String)>>> = Arc::default();
+            let capture = Arc::clone(&handshake);
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                tcp,
+                move |request: &WsRequest, response: WsResponse| {
+                    let authorization = request
+                        .headers()
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned();
+                    *capture.lock().unwrap() =
+                        Some((request.uri().to_string(), authorization));
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let mut audio: Vec<u8> = Vec::new();
+            let mut control: Vec<String> = Vec::new();
+            let mut interim_sent = false;
+            while let Some(message) = socket.next().await {
+                match message.unwrap() {
+                    Message::Binary(bytes) => {
+                        audio.extend_from_slice(&bytes);
+                        if !interim_sent {
+                            interim_sent = true;
+                            socket
+                                .send(Message::Text(deepgram_results_frame(
+                                    "this interim revision must never reach the Transcript",
+                                    false,
+                                )))
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    Message::Text(text) => {
+                        let closing = text.contains("CloseStream");
+                        control.push(text);
+                        if closing {
+                            socket
+                                .send(Message::Text(deepgram_results_frame("Hello world.", true)))
+                                .await
+                                .unwrap();
+                            socket
+                                .send(Message::Text(deepgram_results_frame(
+                                    "Second segment.",
+                                    true,
+                                )))
+                                .await
+                                .unwrap();
+                            socket
+                                .send(Message::Text(deepgram_metadata_frame()))
+                                .await
+                                .unwrap();
+                            let _ = socket.send(Message::Close(None)).await;
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+            let captured = handshake.lock().unwrap().clone();
+            (captured, audio, control)
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = test_deepgram_stream(&base, Duration::from_secs(5), &reaper);
+        let mut pcm = Vec::new();
+        for chunk in [vec![1u8; 64], vec![2u8; 64]] {
+            pcm.extend_from_slice(&chunk);
+            stream.send_audio(AudioChunk(chunk)).await.unwrap();
+        }
+        // An un-streamed tail that complete() must top up before Finalize.
+        pcm.extend_from_slice(&[3u8; 32]);
+        let transcript = stream
+            .complete(CapturedAudio::new(pcm.clone()))
+            .await
+            .unwrap();
+        assert_eq!(transcript.provider, Provider::Deepgram);
+        assert_eq!(transcript.text, "Hello world. Second segment.");
+
+        let (captured, audio, control) = server.await.unwrap();
+        let (uri, authorization) = captured.expect("handshake must be captured");
+        assert_eq!(authorization, "Token controlled-credential");
+        assert!(uri.contains("model=nova-3"), "{uri}");
+        assert!(uri.contains("interim_results=true"), "{uri}");
+        assert_eq!(audio, pcm, "every PCM byte must arrive as binary frames");
+        assert!(
+            control.iter().any(|text| text.contains("\"Finalize\"")),
+            "{control:?}"
+        );
+        assert!(
+            control.iter().any(|text| text.contains("\"CloseStream\"")),
+            "{control:?}"
+        );
+        assert_eq!(reaper.pending(), 0);
+    }
+
+    #[tokio::test]
+    async fn deepgram_connection_lost_mid_recording_fails_the_provider_visibly() {
+        use futures_util::StreamExt;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            // Take the first frame, then drop both the connection and the
+            // listener so every redial within the bounded budget is refused.
+            let _ = socket.next().await;
+            drop(socket);
+            drop(listener);
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = test_deepgram_stream(&base, Duration::from_secs(5), &reaper);
+        stream.send_audio(AudioChunk(vec![0u8; 32])).await.unwrap();
+        server.await.unwrap();
+        let error = stream
+            .complete(CapturedAudio::new(vec![0u8; 32]))
+            .await
+            .unwrap_err();
+        assert!(
+            error.diagnostic().contains("Deepgram"),
+            "a mid-Recording drop must surface a visible provider error, got {:?}",
+            error.diagnostic()
+        );
+    }
+
+    #[tokio::test]
+    async fn deepgram_server_error_message_fails_the_provider_visibly() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _ = socket.next().await;
+            socket
+                .send(Message::Text(
+                    r#"{"type":"Error","description":"rejected"}"#.to_owned(),
+                ))
+                .await
+                .unwrap();
+            // Hold the connection open; the client must fail on the Error
+            // message itself, not on a transport drop.
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = test_deepgram_stream(&base, Duration::from_secs(5), &reaper);
+        stream.send_audio(AudioChunk(vec![0u8; 32])).await.unwrap();
+        let error = stream
+            .complete(CapturedAudio::new(vec![0u8; 32]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.diagnostic(), "Deepgram reported a streaming error");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn deepgram_drop_after_delivered_audio_fails_visibly_without_redialing() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let redialed = Arc::new(AtomicBool::new(false));
+        let redialed_flag = Arc::clone(&redialed);
+        let server = tokio::spawn(async move {
+            // Finalize one segment for delivered audio, then drop abruptly.
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _ = socket.next().await;
+            socket
+                .send(Message::Text(deepgram_results_frame("schedule the", true)))
+                .await
+                .unwrap();
+            drop(socket);
+            // Keep listening: a redial WOULD succeed here, so a pass proves the
+            // client refused to redial rather than that it couldn't.
+            if tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .is_ok()
+            {
+                redialed_flag.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = test_deepgram_stream(&base, Duration::from_secs(5), &reaper);
+        stream.send_audio(AudioChunk(vec![7u8; 32])).await.unwrap();
+        // Wait until the finalized segment was ingested, then give a
+        // redial-and-continue implementation time to observe the drop and
+        // redial BEFORE the Recording completes — the exact window where a
+        // silent audio gap would hide.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stream.transcript.lock().unwrap().text() != "schedule the" {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the finalized segment must be ingested");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        // Audio already accepted by the dropped socket cannot be replayed, so a
+        // redial-and-continue would return a plausible Transcript with a silent
+        // gap. The provider must fail visibly instead; Groq carries.
+        let error = stream
+            .complete(CapturedAudio::new(vec![7u8; 32]))
+            .await
+            .unwrap_err();
+        assert!(
+            error.diagnostic().contains("Deepgram"),
+            "got {:?}",
+            error.diagnostic()
+        );
+        let _ = server.await;
+        assert!(
+            !redialed.load(Ordering::SeqCst),
+            "a drop after delivered audio must not be redialed"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepgram_redials_a_failed_dial_before_any_audio_within_the_budget() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let (second_up_tx, second_up_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            // First connection dies before any audio was delivered on it.
+            let (tcp, _) = listener.accept().await.unwrap();
+            let socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            drop(socket);
+            // Second connection: the bounded redial carries the Recording.
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _ = second_up_tx.send(());
+            while let Some(Ok(message)) = socket.next().await {
+                if let Message::Text(text) = message {
+                    if text.contains("CloseStream") {
+                        socket
+                            .send(Message::Text(deepgram_results_frame("after redial", true)))
+                            .await
+                            .unwrap();
+                        socket
+                            .send(Message::Text(deepgram_metadata_frame()))
+                            .await
+                            .unwrap();
+                        let _ = socket.send(Message::Close(None)).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = test_deepgram_stream(&base, Duration::from_secs(5), &reaper);
+        // No audio has been handed to the first connection, so nothing can be
+        // lost: the dial phase stays covered by the bounded reconnect budget.
+        second_up_rx.await.unwrap();
+        stream.send_audio(AudioChunk(vec![7u8; 32])).await.unwrap();
+        let transcript = stream
+            .complete(CapturedAudio::new(vec![7u8; 32]))
+            .await
+            .unwrap();
+        assert_eq!(transcript.text, "after redial");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deepgram_close_without_terminal_metadata_fails_visibly() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                if let Message::Text(text) = message {
+                    if text.contains("CloseStream") {
+                        // A final Results but NO terminal Metadata before the
+                        // close: the server-side flush is unconfirmed, so the
+                        // Transcript may be truncated.
+                        socket
+                            .send(Message::Text(deepgram_results_frame("truncated", true)))
+                            .await
+                            .unwrap();
+                        let _ = socket.send(Message::Close(None)).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = test_deepgram_stream(&base, Duration::from_secs(5), &reaper);
+        stream.send_audio(AudioChunk(vec![5u8; 32])).await.unwrap();
+        let error = stream
+            .complete(CapturedAudio::new(vec![5u8; 32]))
+            .await
+            .unwrap_err();
+        assert!(
+            error.diagnostic().contains("Deepgram"),
+            "a close without the terminal Metadata must fail visibly, got {:?}",
+            error.diagnostic()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deepgram_unanswered_closestream_fails_visibly_at_the_close_grace() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            // Read everything, never answer CloseStream.
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = test_deepgram_stream_with_grace(
+            &base,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+            &reaper,
+        );
+        stream.send_audio(AudioChunk(vec![4u8; 32])).await.unwrap();
+        // Returning the partial accumulator here would deliver a plausible but
+        // truncated Source Transcript inside the 14s Provider Deadline.
+        let error = stream
+            .complete(CapturedAudio::new(vec![4u8; 32]))
+            .await
+            .unwrap_err();
+        assert!(
+            error.diagnostic().contains("Deepgram"),
+            "an unanswered CloseStream must fail visibly at the close grace, got {:?}",
+            error.diagnostic()
+        );
+        drop(stream);
+        let _ = reaper.drain(Duration::from_secs(2)).await;
+        let _ = server.await;
+    }
+
+    #[test]
+    fn deepgram_streaming_url_rejects_userinfo_in_the_authority() {
+        // ws://127.0.0.1:80@attacker.example/… — the raw authority starts with
+        // a loopback-looking userinfo but the HOST is attacker.example; the
+        // Token header must never travel over that connection (let alone in
+        // plaintext).
+        assert!(
+            deepgram_streaming_url("ws://127.0.0.1:80@attacker.example/listen", &[]).is_err()
+        );
+        assert!(
+            deepgram_streaming_url("http://localhost@attacker.example/listen", &[]).is_err()
+        );
+        assert!(deepgram_streaming_url("wss://user@api.deepgram.com/v1/listen", &[]).is_err());
+        assert!(deepgram_streaming_url("ws:///listen", &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn deepgram_abort_surfaces_a_stored_streaming_failure() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _ = socket.next().await;
+            socket
+                .send(Message::Text(
+                    r#"{"type":"Error","description":"rejected"}"#.to_owned(),
+                ))
+                .await
+                .unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = test_deepgram_stream(&base, Duration::from_secs(5), &reaper);
+        stream.send_audio(AudioChunk(vec![3u8; 32])).await.unwrap();
+        // Wait until the I/O task stored the failure, mirroring a Recording
+        // whose capture fails (or whose Recording Deadline fires) after
+        // Deepgram already failed: abort(), not complete(), is what runs.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !stream.io_tasks.front().unwrap().is_finished() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the streaming task must settle its failure");
+        let error = Box::new(stream).abort().await.unwrap_err();
+        assert_eq!(
+            error.diagnostic(),
+            "Deepgram reported a streaming error",
+            "abort must surface the stored provider failure, not discard it"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn malformed_deepgram_text_frames_fail_visibly() {
+        let transcript = Arc::new(Mutex::new(TranscriptAccumulator::default()));
+        // Not JSON at all.
+        assert!(ingest_deepgram_message(&transcript, "not-json").is_err());
+        // A Results frame with no is_final marker.
+        assert!(ingest_deepgram_message(&transcript, r#"{"type":"Results"}"#).is_err());
+        // A finalized Results frame whose transcript text is missing: skipping
+        // it would silently truncate the Transcript.
+        assert!(ingest_deepgram_message(
+            &transcript,
+            r#"{"type":"Results","is_final":true,"speech_final":true}"#
+        )
+        .is_err());
+        // Unknown message types stay tolerated (server-side schema additions),
+        // and interim shape drift is UI-only.
+        assert!(ingest_deepgram_message(&transcript, r#"{"type":"SpeechStarted"}"#).is_ok());
+        assert!(
+            ingest_deepgram_message(&transcript, r#"{"type":"Results","is_final":false}"#)
+                .is_ok()
+        );
+        assert_eq!(
+            transcript.lock().unwrap().text(),
+            "",
+            "no rejected frame may leak text into the Transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepgram_malformed_final_results_fail_the_provider_visibly() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _ = socket.next().await;
+            // A malformed finalized Results frame, followed by a perfectly
+            // clean drain: only frame-level strictness can catch this.
+            socket
+                .send(Message::Text(
+                    r#"{"type":"Results","is_final":true}"#.to_owned(),
+                ))
+                .await
+                .unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                match message {
+                    Message::Text(text) if text.contains("CloseStream") => {
+                        let _ = socket.send(Message::Text(deepgram_metadata_frame())).await;
+                        let _ = socket.send(Message::Close(None)).await;
+                        break;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = test_deepgram_stream(&base, Duration::from_secs(5), &reaper);
+        stream.send_audio(AudioChunk(vec![2u8; 32])).await.unwrap();
+        let error = stream
+            .complete(CapturedAudio::new(vec![2u8; 32]))
+            .await
+            .unwrap_err();
+        assert!(
+            error.diagnostic().contains("Deepgram"),
+            "a malformed finalized Results frame must fail visibly, got {:?}",
+            error.diagnostic()
+        );
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn deepgram_sends_keepalive_text_frames_during_outbound_gaps() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Text(text))) if text.contains("KeepAlive") => return true,
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return false,
+                    _ => {}
+                }
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let stream = test_deepgram_stream(&base, Duration::from_millis(50), &reaper);
+        let keepalive_seen = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("the mock server must observe a frame within the bound")
+            .unwrap();
+        assert!(keepalive_seen, "an idle outbound side must emit KeepAlive");
+        Box::new(stream).abort().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deepgram_stream_dropped_mid_abort_hands_the_streaming_task_to_the_reaper() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _ = connected_tx.send(());
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let stream = test_deepgram_stream(&base, Duration::from_secs(5), &reaper);
+        // Cancellation before the connection exists would end the I/O task
+        // pre-connect; the drop under test must land on a live websocket.
+        connected_rx.await.unwrap();
+        drop(stream);
+        assert_eq!(
+            reaper.pending(),
+            1,
+            "a dropped stream must hand its websocket I/O task to the supervisor"
+        );
+        assert!(
+            reaper.drain(Duration::from_secs(2)).await,
+            "the retained I/O task must observe cancellation and drain"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deepgram_abort_awaits_the_streaming_task_and_leaves_nothing_retained() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, base) = mock_deepgram_listener().await;
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _ = connected_tx.send(());
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+        });
+
+        let reaper = ProviderReaper::new();
+        let mut stream = test_deepgram_stream(&base, Duration::from_secs(5), &reaper);
+        stream.send_audio(AudioChunk(vec![9u8; 32])).await.unwrap();
+        // The abort under test must land on a live websocket, not on an I/O
+        // task that observed cancellation before it ever connected.
+        connected_rx.await.unwrap();
+        Box::new(stream).abort().await.unwrap();
+        assert_eq!(
+            reaper.pending(),
+            0,
+            "abort must await the I/O task itself, leaving nothing for the supervisor"
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
     fn every_restricted_external_child_receives_the_parent_death_contract() {
         let mut child = restricted_command("python3");
         child.args([
@@ -4018,14 +5601,6 @@ mod tests {
     }
 
     #[test]
-    fn non_overlapping_deepgram_chunks_keep_a_repeated_boundary_word() {
-        assert_eq!(
-            concatenate_chunk_transcripts(vec!["that was very".to_owned(), "very good".to_owned()]),
-            "that was very very good"
-        );
-    }
-
-    #[test]
     fn libei_device_must_resume_and_stays_failed_after_removal() {
         let mut link = EiDeviceLink::default();
         assert_eq!(
@@ -4080,6 +5655,27 @@ mod tests {
 
         assert_eq!(us.control, dvorak.control);
         assert_ne!(us.paste, dvorak.paste);
+    }
+
+    #[test]
+    fn recording_deadline_defaults_to_ten_minutes_and_survives_past_sixty_seconds() {
+        // With no override the Recording Deadline must be generous enough that a
+        // routine multi-minute Recording is never killed. Sixty seconds was the
+        // old, wrong default that discarded audio before providers ever saw it.
+        let default = resolve_recording_deadline(None);
+        assert_eq!(default, Duration::from_secs(600));
+        assert!(
+            default > Duration::from_secs(60),
+            "default Recording Deadline must not kill a >60s Recording"
+        );
+
+        // A parseable, non-zero override still wins; junk and zero fall back.
+        assert_eq!(
+            resolve_recording_deadline(Some("5000".to_owned())),
+            Duration::from_millis(5000)
+        );
+        assert_eq!(resolve_recording_deadline(Some("0".to_owned())), default);
+        assert_eq!(resolve_recording_deadline(Some("nonsense".to_owned())), default);
     }
 
     #[test]

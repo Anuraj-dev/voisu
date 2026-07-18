@@ -248,3 +248,91 @@ Rejected: an Electron migration, which would be a rewrite away from the correct 
 comparison in the 2026-07-17 session log. This affirms ADR-0003's daemon/Overlay split rather than reversing
 it; promote to a dedicated ADR only if the toolkit floor (min KWin/Plasma version for layer-shell) needs to
 be pinned as a hard dependency.
+
+## 2026-07-17 — Start the optional Overlay through its own graphical-session user unit
+**Why:** The Overlay RPM previously shipped only the healthy binary, so no login path launched
+`voisu-overlay --supervise`. The optional subpackage now owns an independent `graphical-session.target`
+user unit, while `voisu service install|uninstall` manages it only when its effective fragment and
+`ExecStart` still resolve to the packaged Overlay and treats every Overlay failure as non-fatal.
+`After=voisu.service` provides ordering without `Wants=` or `Requires=`; daemon start,
+Recording, Transcript production, and Delivery never depend on presentation. A separate CLI verb was
+rejected as unnecessary setup friction, and XDG autostart was rejected because it diverges from the
+existing observable systemd-user lifecycle.
+
+## 2026-07-17 — Transcription accuracy overhaul design (PRD)
+**Why:** Blind test measured 26.3% WER; evidence (recordings 11–14) showed the
+real causes were Deepgram's context-free 1 s batch chunks and an unprompted
+Groq call — not reconciliation, refuting the prior hypothesis. Chose Groq
+full-audio-at-finalize ≤120 s (tail request already costs ~0.5 s, so no
+latency penalty) + `whisper-large-v3` default (Groq free tier covers both
+models at 2 h/day; accuracy decides) + shared built-in/user vocabulary
+dictionary feeding Whisper `prompt` and Deepgram `keyterm`; Deepgram rebuilt
+as real nova-3 websocket streaming (batch-on-finalize rejected: doubles
+release latency; dropping it rejected: Raja keeps the second opinion and will
+rotate credit accounts) and must stay disableable (only non-free component).
+Full spec: docs/specs/2026-07-17-transcription-accuracy.md
+
+## 2026-07-17 — Latency optimization effort: Deepgram toggle, FLAC, keep curl, fix delivery
+**Why:** `voisu history` recs 20–39 showed the release-to-text tail is ~1889 ms
+with Deepgram vs ~690 ms Groq-only (~400 ms floor). Deepgram gates the
+wait-for-both barrier 12/12 times and its 282 ms RTT from India is structural,
+not code-fixable; reconciliation also strips proper nouns. Four decisions
+(grilling with Raja): **(D1)** Deepgram becomes a default-off runtime toggle
+(`voisu deepgram on|off`, persisted) — evaluate Groq-only live, then finalize
+delete-vs-keep, rather than a blind deletion; harmonizes with the accuracy map
+which already required Deepgram be disableable. **(D2)** Keep `curl`; defer TLS
+warm-up + pooled reqwest client to future ambition (the ~70 ms win isn't worth
+ripping out the curl security sandbox + a security re-review now). **(D3)** FLAC
+lossless upload, not Opus — zero WER risk against the ≤10% bar. **(D4)** Fix
+direct-typing delivery (`fix/delivery-keymap-fd`) first; auto-paste keystroke
+synthesis only as 2nd-best if direct-typing is unreliable on the host. Sequenced
+AFTER the accuracy branch integrates (shared `system.rs`/`lib.rs`/daemon files).
+Full plan: `docs/specs/2026-07-17-latency-optimization.md`; map + tickets:
+`.scratch/voisu-latency/`.
+
+## 2026-07-17 — Three-strike subagent escalation rule
+**Why:** Ticket 06 (reconciliation divergence gate) proved that a subagent stuck
+after repeated review rounds keeps patching symptoms rather than fixing the
+design — Opus burned three rounds (`54e29ff`/`d63b8a4`/`d06062a`) accumulating
+complexity without converging. New rule: **3 failed review rounds → discard that
+agent and respawn a FRESH agent at higher effort, handing it the full findings
+history** (and a simplify mandate if the failures were complexity-driven). Proven
+this session: after the discarded Opus, a fresh Fable agent still failed 3 rounds
+(`bd34220`/`bc01840`/`3d2e2c2`), but a second fresh Fable with an explicit
+simplify mandate delivered the accepted design in one shot (`4f71124`, single
+symmetric `phonetic_matching` feeding gate + selection) plus one alignment fix
+(`b2b83a0`), Sol APPROVE. Findings-per-round fell 6→3→2→3→5→1→0. Rejected
+alternative: continuing to patch with the same agent, which the six wasted rounds
+show does not converge — a fresh context beats an entrenched one.
+
+## 2026-07-18 — Post-audit hardening sequencing + trigger-ruled refactors
+**Why:** Full audit found 2 criticals (daemon wedge via unsupervised
+capture_pump panic; blocking stop_child on Tokio workers) living in the same
+files latency tickets 01/04 touch. Decided: criticals land right after the
+accuracy branch integrates and BEFORE latency (small diffs rebase cheap;
+rejected "everything waits" as it delays live correctness fixes). systemd
+hardening + CI cargo-audit/clippy are parallel-safe anytime (packaging/CI only).
+Minors bundled into one hygiene ticket behind latency (rejected per-ticket
+tracking overhead). Big refactors get TRIGGER RULES, not queue slots —
+system.rs split before overlay/desktop-target work, provider collectionization
+before a 3rd provider, nested-compositor e2e with the overlay milestone and
+CI-ONLY (Raja: local e2e eats his machine) — rejected firm scheduling to avoid
+churning files twice. Map: `.scratch/voisu-hardening/`.
+
+## 2026-07-18 — Spawn external children from long-lived threads (pdeathsig rule)
+**Why:** PR_SET_PDEATHSIG delivers on the death of the forking THREAD, not the
+process. pw-record was spawned inside `spawn_blocking`; Tokio reaps idle
+blocking-pool threads after ~10 s, so every recording longer than that was
+SIGKILLed. Fix: the capture reader thread (which lives as long as the child)
+spawns pw-record itself and hands the Child back over an mpsc channel. Rejected
+alternatives: dropping pdeathsig (loses orphan cleanup) and raising the pool
+keep-alive (fragile, global). Regression test pins /proc starttime + non-zombie
++ daemon status; a `VOISU_TEST_BLOCKING_KEEP_ALIVE_MS` seam shrinks keep-alive.
+
+## 2026-07-18 — rustls crypto backend = ring, installed explicitly at startup
+**Why:** tokio-tungstenite's `rustls-tls-webpki-roots` selects no crypto
+backend; rustls 0.23 then panics at first TLS use ("no process-level
+CryptoProvider"). Chose ring (pregenerated asm, no cmake) over aws-lc-rs
+(cmake would break the vendored offline RPM build); `install_crypto_provider()`
+is idempotent and runs first in daemon main. Ring's static link adds
+`Apache-2.0 AND ISC` to the RPM License tag and its texts ship via %license.

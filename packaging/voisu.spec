@@ -3,7 +3,9 @@ Version:        0.1.0
 %{!?voisu_commit:%global voisu_commit unknown}
 Release:        1.git%{?voisu_commit}%{?dist}
 Summary:        Cloud-first Linux dictation for Fedora Wayland
-License:        MIT
+# Voisu is MIT; the statically linked ring crate adds ISC (new code) and
+# Apache-2.0 (BoringSSL-derived code). Ring's license texts ship in %%license.
+License:        MIT AND Apache-2.0 AND ISC
 URL:            https://github.com/Anuraj-Dev/voisu
 Source0:        %{name}-%{version}.tar.gz
 Source1:        voisu-vendor-%{version}.tar.gz
@@ -57,6 +59,7 @@ Summary:        Optional GTK4 Voisu Overlay
 Requires:       %{name}%{?_isa} = %{version}-%{release}
 Requires:       gtk4%{?_isa}
 Requires:       gtk4-layer-shell%{?_isa}
+%{?systemd_requires}
 
 %description overlay
 Optional observer-only GTK4 Overlay feedback for Voisu. The base package is
@@ -65,6 +68,10 @@ GTK-free; installing this package adds the separate Overlay process.
 %prep
 %autosetup -n %{name}-%{version}
 tar -xzf %{SOURCE1} -C ..
+# Statically linked ring is ISC AND Apache-2.0; its texts must ship with the RPM.
+cp ../voisu-vendor-%{version}/ring/LICENSE LICENSE.ring
+cp ../voisu-vendor-%{version}/ring/LICENSE-BoringSSL LICENSE.ring-BoringSSL
+cp ../voisu-vendor-%{version}/ring/LICENSE-other-bits LICENSE.ring-other-bits
 mkdir -p .cargo
 cat > .cargo/config.toml <<'EOF'
 [source.crates-io]
@@ -87,6 +94,7 @@ install -D -m 0755 target/release/voisu %{buildroot}%{_bindir}/voisu
 install -D -m 0755 target/release/voisu-daemon %{buildroot}%{_bindir}/voisu-daemon
 install -D -m 0755 target/release/voisu-overlay %{buildroot}%{_bindir}/voisu-overlay
 install -D -m 0644 packaging/voisu.service %{buildroot}%{_userunitdir}/voisu.service
+install -D -m 0644 packaging/voisu-overlay.service %{buildroot}%{_userunitdir}/voisu-overlay.service
 
 %post
 %systemd_user_post voisu.service
@@ -97,8 +105,17 @@ install -D -m 0644 packaging/voisu.service %{buildroot}%{_userunitdir}/voisu.ser
 %postun
 %systemd_user_postun voisu.service
 
+%post overlay
+%systemd_user_post voisu-overlay.service
+
+%preun overlay
+%systemd_user_preun voisu-overlay.service
+
+%postun overlay
+%systemd_user_postun voisu-overlay.service
+
 %files
-%license LICENSE
+%license LICENSE LICENSE.ring LICENSE.ring-BoringSSL LICENSE.ring-other-bits
 %doc README.md
 %{_bindir}/voisu
 %{_bindir}/voisu-daemon
@@ -106,6 +123,7 @@ install -D -m 0644 packaging/voisu.service %{buildroot}%{_userunitdir}/voisu.ser
 
 %files overlay
 %{_bindir}/voisu-overlay
+%{_userunitdir}/voisu-overlay.service
 
 %changelog
 * Thu Jul 16 2026 Voisu maintainers <voisu@example.invalid> - 0.1.0-1

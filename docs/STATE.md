@@ -1,87 +1,109 @@
 # Voisu — State
-> Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-17
+> Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-18
 
 ## 🚧 In progress / next
-- **Overlay toolkit LOCKED: keep GTK4 + gtk4-layer-shell; do NOT migrate to Electron** (2026-07-17,
-  evidence-backed — see decisions.md + session log). Electron has no wlr-layer-shell on Wayland
-  (`setAlwaysOnTop` no-op, positioning broken); HyprVox's Electron overlay only works via forced XWayland
-  + Hyprland window rules + a rich React waveform — none of which transfer to Voisu's KWin/layer-shell/
-  disposable-capsule/Rust context.
-- **ACTIVE: the installed Overlay does not appear on `voisu toggle`** on Raja's live Fedora KDE/Wayland
-  desktop. Diagnosing now (drive `voisu toggle`, read journal/stderr, root-cause) to produce a detailed
-  fix-prompt for a separate agent. See session log 2026-07-17.
-- Ticket 13 is MERGED and the live desktop smoke PASSED (`57eb284`; PR #21; issue #13 closed; CI green at
-  `73f5727`). Real provider credentials set and verified (`auth verify` green for groq + deepgram).
-- Then: remaining PENDING release-evidence rows (portal revocation, login start, upgrade/removal, explicit
-  fallback scenarios). Final benchmark report is written (`docs/model-benchmark.md`). APT/DEB packaging is
-  out of scope for this release.
+- **Accuracy branch LIVE-TESTED — awaiting Raja's ship/hold decision.** Branch
+  `feature/transcription-accuracy` tip `2f90a10` (NOT pushed). RPM
+  `git2f90a10` built, installed, and live-verified on this machine.
+  Live WER (4-paragraph Appendix A suite, baseline 26.3%): **final overall
+  10.8% raw / 10.0% formatting-adjusted** — P1 6.1%, P2 (CLI vocab) 19.3%,
+  P3 6.0%, P4 12.9%. Both providers present on every recording; post-finalize
+  latency 1.0–1.5 s (bar ~1 s); stress test **118 s continuous recording PASS**.
+  Residual fluent-nonsense on rare CLI/domain terms ("rpmbuild"→"RPM build",
+  "changelog"→"channel log", "reconciler"→"Reconcealer"). Gate is MARGINAL,
+  not a clean pass → per rules, NOT pushed/PR'd.
+  **Next: Raja decides — (a) ship as-is (26.3%→~10% stands), then push branch,
+  PR to main, merge on CI green (no AI credits); or (b) one more accuracy pass
+  wiring CLI jargon into dictionary keyterms before shipping.**
+- **PRIORITY ORDER after this branch integrates to main (decided 2026-07-18):**
+  land the TWO CRITICAL audit fixes FIRST, before any latency ticket — (1)
+  supervise `process_recording`/remove `pump.await.expect` (voisu-daemon.rs,
+  panic wedges daemon in Processing forever; mirror `supervise_replay`), (2)
+  wrap blocking `stop_child` in `spawn_blocking`. Backlog charted in
+  `.scratch/voisu-hardening/` (03 systemd-hardening + 04 CI-audit/clippy are
+  parallel-safe anytime; 05 hygiene waits behind latency).
+- **Latency effort queued behind this branch** (`.scratch/voisu-latency/` +
+  `docs/specs/2026-07-17-latency-optimization.md`). Do NOT start until this
+  branch integrates — tickets 01 & 04 touch the same files.
+- Priority 2 unchanged: Overlay visual redesign/polish (functional v1 is in).
+- Deferred release acceptance still untested: logout/login startup observation,
+  kill-Overlay-mid-Recording, clean uninstall.
 
 ## Status
-- `voisu` and `voisu-daemon` communicate over bounded, versioned Unix IPC; the actor keeps status
-  responsive while capture, provider completion, reconciliation, validation, and Delivery run behind
-  owned boundaries.
-- PipeWire capture streams one-second Deepgram chunks and bounded overlapping Groq WAV chunks
-  concurrently under one Provider Deadline; cancellation owns, kills, reaps, and awaits every child.
-- The Transcript pipeline selects near agreement, reconciles material disagreement, applies guardrails,
-  permits one bounded repair, and otherwise falls back to a clean Source Transcript or reports a Quality
-  Failure. Only the final Transcript reaches Delivery.
-- Packaged-unit detection asks systemd for the EFFECTIVE unit and handles the Ticket 09 XDG stale-shadow
-  case with strict conservative ExecStart parsing (see `docs/packaging-fedora.md`).
-- The Fedora RPM (base GTK-free + optional overlay subpackage) is fully proven: reproducible exact-commit
-  vendored build, `%check` release suite in rpmbuild, rpmlint clean, smoke-harness artifact binding, and
-  the live desktop Recording→Delivery smoke (see `docs/release-evidence.md`).
-- **Live-desktop fixes (2026-07-17, all RED-proven then verified on real hardware):**
-  - `f876425` — `wl-copy` forks a clipboard-serving child that inherits the parent's pipes; draining
-    stderr misread the healthy case as a timeout. wl-copy now runs via `run_restricted_serving`
-    (discards output, trusts the parent's exit status).
-  - `73f5727` — real `pw-record` catches SIGINT and exits 1 silently instead of dying by the signal, so
-    every live graceful stop failed. A nonzero exit is accepted only when the child was still alive at
-    the interrupt AND stderr is empty; a capture already dead before stop still fails and never delivers.
-    Realistic test fakes now `exit 1` on INT (clearing the wrapper's EXIT trap so the status survives).
-  - `fedora-smoke.sh` — `rpm -q` prints "package … is not installed" to stdout; the harness captured it
-    as a NEVRA and tripped the clobber guard on fresh hosts. Queries now branch on rpm's exit code.
-- Current gates: `cargo test --workspace` — 216 passed, 2 ignored, 0 failed (3 consecutive clean full
-  runs); host rpmbuild + rpmlint + live smoke all PROVEN at `73f5727`.
+- **Two live-blocking daemon bugs found & fixed this session (2026-07-18):**
+  1. `a0899b3` — rustls 0.23 had no process-level CryptoProvider (tungstenite
+     `rustls-tls-webpki-roots` picks no backend) → every Deepgram connect
+     panicked. Fixed: explicit `rustls/ring` dep + `install_crypto_provider()`
+     at daemon startup (ring not aws-lc-rs: no cmake, vendored RPM builds).
+  2. `f04dbbe` — **recordings died at exactly ~10 s**: PR_SET_PDEATHSIG fires
+     when the forking THREAD exits; pw-record was spawned from a Tokio
+     blocking-pool thread reaped after its 10 s idle keep-alive → SIGKILL
+     mid-recording. Fixed: spawn pw-record FROM the capture reader thread
+     (mpsc handoff). Regression test proven RED→GREEN
+     (`recording_survives_blocking_pool_thread_reap`, pins /proc starttime +
+     non-zombie + status Recording).
+  Plus `99d0f9e`/`1a63b72` (%check test races: atomic pid writes, ETXTBSY
+  retry) and `0615736` (Sol findings: RPM license `MIT AND Apache-2.0 AND ISC`
+  + ring license texts shipped; regression-test false-green hardened).
+  298 tests green ×3. Sol high review → 2 findings → fixed → Sol medium APPROVE.
+- Live pipeline verified end-to-end: all 6 stages complete, reconciliation
+  beats both sources (P1–P3), delivery via clipboard_fallback (keymap fd bug,
+  separate branch). Stress: 118.2 s, 1,846 chunks, both providers.
+- Tickets 04/05/06 all CLOSED with Sol APPROVE (details in decisions.md +
+  session logs; merges `1503d26`, `30ee55e`, `b2b83a0`).
+- Full codebase audit done 2026-07-18; 2 criticals queued (see above); report
+  in `.scratch/voisu-hardening/`.
+- Overlay graphical startup merged locally (`67aa3b6`); local `main` ahead of
+  `origin/main`, not pushed.
+- `docs/model-benchmark.md` rows 61–86 complete (committed).
 
 ## Architecture map
-- Domain, IPC, lifecycle/Delivery evidence, provider coordination, decision pipeline -> `crates/voisu-core/src/lib.rs`
-- Fedora adapters: PipeWire, providers, clipboard, zbus portals, native libei -> `crates/voisu-app/src/system.rs`
-- systemd user-service installation, lifecycle, ownership/IPC reporting -> `crates/voisu-app/src/service.rs`
-- Fedora RPM spec, exact-commit build, and smoke harness -> `packaging/`; install/upgrade/removal
-  procedure -> `docs/packaging-fedora.md`
-- Release evidence matrix and host checklist -> `docs/release-evidence.md`
-- Headless Overlay backend selection and restart policy -> `crates/voisu-app/src/feedback.rs`
-- Overlay presentation controller -> `crates/voisu-app/src/overlay.rs`
-- GTK Overlay runtime adapter and observer-only status polling -> `crates/voisu-app/src/bin/voisu-overlay.rs`
-- Lifecycle actor -> `crates/voisu-app/src/bin/voisu-daemon.rs`
+- Domain, IPC, Transcript decision, diagnostics -> `crates/voisu-core/src/lib.rs`
+- Fedora capture/provider/clipboard/portal/libei adapters -> `crates/voisu-app/src/system.rs`
+- Dictionary / Whisper prompt builder -> `crates/voisu-app/src/dictionary.rs`
+- Daemon + Overlay user-service lifecycle -> `crates/voisu-app/src/service.rs`
 - Public CLI -> `crates/voisu-app/src/bin/voisu.rs`
-- Ordered implementation tickets -> `.scratch/voisu-implementation/issues/`
+- GTK Overlay -> `crates/voisu-app/src/bin/voisu-overlay.rs`, `overlay.rs`, `feedback.rs`
+- RPM units/spec/build/smoke -> `packaging/`
+- Deepgram real-time diagnostic probe -> `crates/voisu-app/examples/deepgram_probe.rs`
+- Accuracy effort -> `docs/specs/2026-07-17-transcription-accuracy.md` (PRD + Appendix A refs),
+  `.scratch/voisu-accuracy/`
+- Latency effort -> `docs/specs/2026-07-17-latency-optimization.md`, `.scratch/voisu-latency/`
+- Fedora procedure/evidence -> `docs/packaging-fedora.md`, `docs/release-evidence.md`
 
 ## Stack & run
-- Stack: Rust 2024 + Tokio + serde + zbus 5 + GTK4 (opt-in) + runtime libei · Run:
-  `cargo run -p voisu-app --bin voisu-daemon` · Test: `cargo test --workspace`
+- Stack: Rust 2024 + Tokio + serde + zbus 5 + GTK4 (opt-in) + runtime libei · Run: `cargo run -p voisu-app --bin voisu-daemon` · Test: `cargo test --workspace`
+- Robust test count: `cargo test --workspace 2>&1 | grep -oE "[0-9]+ passed; [0-9]+ failed" | awk '{p+=$1; f+=$3} END {print p, f}'`
 
 ## Key decisions (top 3–5)
-- Portals are the only normal Fedora path for global shortcuts and input emulation; no raw devices or `uinput`.
-- Only a validated final Transcript crosses the Delivery boundary, and clipboard preservation gates
-  compositor submission.
-- External tools are judged by their REAL behavior, not their documented one: `wl-copy` serves via a
-  pipe-holding fork (never capture its output), and `pw-record` exits 1 silently on SIGINT (accepted
-  only as a live interrupt with empty stderr).
-- Overlay presentation is observer-only and may disappear; the daemon lifecycle never depends on it.
-- The Fedora release uses one GTK-free base RPM plus an optional Overlay subpackage; `Cargo.lock`, an
-  exact-commit vendor archive, and `--offline` bind the tested source to a reproducible RPM build.
-- RPM removal follows desktop-user `voisu service uninstall` before `dnf remove`, because per-user
-  systemd scriptlets cannot reliably clear a running unit or enablement under `~/.config`.
+- Never arm PR_SET_PDEATHSIG from a transient thread: pdeathsig fires on the
+  forking THREAD's exit — external children must be spawned from a thread that
+  outlives them (capture reader thread), never the Tokio blocking pool.
+- rustls crypto backend = ring (explicit install at startup); aws-lc-rs
+  rejected (cmake dep breaks vendored RPM builds).
+- Acceptance bar: ≤10% WER on the live 4-paragraph suite, no fluent-nonsense,
+  no silent provider absence, latency ≤ today. Live result is marginal — ship
+  decision is Raja's, not auto-merge.
+- Transcription accuracy overhaul per PRD: Groq single-request + vocabulary
+  prompt primary; Deepgram nova-3 streaming second opinion, disableable.
+- Portals are the normal Fedora path; no raw input devices or `uinput`.
 
 ## Gotchas
-- Use `CONTEXT.md` terms exactly; several ordinary synonyms are banned.
-- Default workspace builds are GTK-free; compile the optional Overlay with
-  `cargo check -p voisu-app --features overlay`.
-- This managed sandbox denies Unix-domain and private D-Bus socket binds with `EPERM`; run socket-heavy
-  acceptance on the host/orchestrator.
-- `rustfmt` and `clippy` are unavailable (`cargo fmt` is not installed).
-- CI shared runners flake on timing-bound tests (~600ms kill bounds, service-readiness polls) under
-  load; rerun before diagnosing.
-- The `claude` sandbox shells have no TTY: interactive `sudo` is impossible — Raja runs sudo-needing
-  commands himself in Konsole (`|& tee /tmp/…log` so the orchestrator can read the result).
+- **Disk critically tight (~14 GB).** `cargo clean` before RPM builds; build
+  needs `TMPDIR=/var/tmp RUST_TEST_THREADS=4`; script refuses a dirty tree
+  (untracked count; `.git/info/exclude` locally ignores `.claude/`,
+  `.scratch/voisu-latency/`, latency spec).
+- **Parallel branch `fix/delivery-keymap-fd`** in a separate worktree —
+  untouched; don't touch `system.rs` keymap/libei region ~3033–3110.
+- Delivery still `clipboard_fallback` (xkbcommon parse errors) — Raja pastes
+  manually; fix lives on that separate branch, NOT here.
+- Regression test uses `VOISU_TEST_BLOCKING_KEEP_ALIVE_MS` seam to shrink the
+  blocking-pool keep-alive; don't remove the env hook from voisu-daemon main.
+- `packaging/build-rpm.sh` requires a clean COMMITTED checkout; embeds commit.
+- Whisper `prompt` honors only ~224 tokens; Groq free tier: 7,200 audio-sec/hr,
+  2,000 req/day.
+- Use `CONTEXT.md` terms exactly; default builds GTK-free (`--features overlay`
+  for Overlay). `rustfmt`/`clippy` unavailable.
+- Leftover diagnostics (optional cleanup): `/var/tmp/pwtest.raw`,
+  `/var/tmp/pwpipe.err`, fixture `pwtest.raw` under
+  `/run/user/1000/voisu/v1/diagnostics/fixtures/`.

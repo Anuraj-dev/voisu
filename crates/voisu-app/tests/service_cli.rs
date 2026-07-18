@@ -80,7 +80,7 @@ impl ServiceFixture {
     }
 
     fn run(&self, arguments: &[&str]) -> Output {
-        self.command(arguments).output().unwrap()
+        output_retrying(&mut self.command(arguments))
     }
 
     fn unit_path(&self) -> PathBuf {
@@ -93,6 +93,24 @@ impl ServiceFixture {
 
     fn packaged_unit_file(&self) -> PathBuf {
         self.packaged_unit_dir.join("voisu.service")
+    }
+
+    fn packaged_overlay_unit_file(&self) -> PathBuf {
+        self.packaged_unit_dir.join("voisu-overlay.service")
+    }
+
+    fn install_packaged_overlay_unit(&self) {
+        fs::write(
+            self.packaged_overlay_unit_file(),
+            "[Service]\nExecStart=/usr/bin/voisu-overlay --supervise\n",
+        )
+        .unwrap();
+    }
+
+    fn install_user_overlay_shadow(&self) {
+        let path = self.config.join("systemd/user/voisu-overlay.service");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "[Service]\nExecStart=/tmp/user-overlay --supervise\n").unwrap();
     }
 
     fn set_show_state(&self, key: &str, value: &str) {
@@ -178,6 +196,12 @@ set -eu
 log=${FAKE_SYSTEMCTL_LOG:?}
 state=${FAKE_SYSTEMCTL_STATE:?}
 printf '%s\n' "$*" >> "$log"
+fail_unit=${FAKE_SYSTEMCTL_FAIL_UNIT:-}
+last=
+for argument in "$@"; do last=$argument; done
+if test -n "$fail_unit" && test "$last" = "$fail_unit"; then
+  exit 1
+fi
 command=${2:-}
 pid_file="${state}.pid"
 daemon=$(sed -n 's/^daemon=//p' "$state" 2>/dev/null || true)
@@ -188,8 +212,9 @@ case "$command" in
   show)
     # Model systemd precedence honestly: a user unit under XDG config shadows
     # any packaged unit. Report whichever unit systemd would actually run.
-    xdg_unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/voisu.service"
-    pkg_unit="${VOISU_PACKAGED_UNIT_DIR:-}/voisu.service"
+    unit=${3:-voisu.service}
+    xdg_unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$unit"
+    pkg_unit="${VOISU_PACKAGED_UNIT_DIR:-}/$unit"
     loadstate=$(sed -n 's/^loadstate=//p' "$state" 2>/dev/null || true)
     execs=$(sed -n 's/^execs=//p' "$state" 2>/dev/null || true)
     if test -f "$xdg_unit"; then
@@ -209,7 +234,7 @@ case "$command" in
     # ExecStart binaries: an explicit "execs=" override (pipe-separated for
     # multiple commands, e.g. an /etc drop-in) else parse the unit file.
     if test -z "$execs"; then
-      execs=$(sed -n 's/^ExecStart=\(.*\) --systemd$/\1/p' "$unit_file" | head -1)
+      execs=$(sed -n 's/^ExecStart=\([^[:space:]]*\).*$/\1/p' "$unit_file" | head -1)
     fi
     argv_extra=$(sed -n 's/^argv_extra=//p' "$state" 2>/dev/null || true)
     old_ifs=$IFS
@@ -285,6 +310,21 @@ sys.exit(0)
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+/// Retries exec on ETXTBSY: a concurrent test's fork can inherit this
+/// fixture's freshly copied binary while it is still open for write, making
+/// the exec fail with "Text file busy" until that child completes its own exec.
+fn output_retrying(command: &mut Command) -> Output {
+    for _ in 0..100 {
+        match command.output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            result => return result.unwrap(),
+        }
+    }
+    command.output().unwrap()
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -303,6 +343,25 @@ fn wait_for_socket(runtime: &Path, present: bool) {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("daemon socket did not reach present={present}: {}", socket.display());
+}
+
+/// Waits until `status` reports the manually spawned daemon as reachable over
+/// IPC. The socket file appears at bind time, before the daemon serves IPC, so
+/// a bare [`wait_for_socket`] leaves a window where `service start` classifies
+/// the daemon as absent and takes the systemd path — a loaded CI runner hit
+/// exactly that window.
+fn wait_for_manual_daemon(fixture: &ServiceFixture) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let status = fixture.run(&["service", "status"]);
+        last = stdout(&status);
+        if last.contains("daemon running outside systemd") {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("manual daemon never became IPC-reachable; last status: {last}");
 }
 
 #[test]
@@ -387,6 +446,59 @@ fn packaged_install_migrates_a_stale_user_service_without_shadowing_the_package(
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
     assert!(calls.contains("--user daemon-reload"));
     assert!(calls.contains("--user enable voisu.service"));
+}
+
+#[test]
+fn packaged_overlay_is_not_managed_when_a_user_unit_shadows_it() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    fixture.install_packaged_unit();
+    fixture.install_packaged_overlay_unit();
+    fixture.install_user_overlay_shadow();
+
+    let installed = fixture.run(&["service", "install"]);
+
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    assert!(stdout(&installed).contains("warning: optional Overlay service was not managed"));
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    assert!(calls.contains("--user enable voisu.service"));
+    assert!(calls.contains("--user show voisu-overlay.service"));
+    assert!(!calls.contains("--user enable --now voisu-overlay.service"));
+}
+
+#[test]
+fn packaged_install_enables_and_starts_the_optional_overlay_service() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    fixture.install_packaged_unit();
+    fixture.install_packaged_overlay_unit();
+
+    let installed = fixture.run(&["service", "install"]);
+
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    assert!(
+        stdout(&installed).contains("optional Overlay service enabled and started")
+    );
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    assert!(calls.contains("--user enable voisu.service"));
+    assert!(calls.contains("--user enable --now voisu-overlay.service"));
+}
+
+#[test]
+fn overlay_enable_failure_does_not_fail_daemon_service_install() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    fixture.install_packaged_unit();
+    fixture.install_packaged_overlay_unit();
+
+    let mut install = fixture.command(&["service", "install"]);
+    install.env("FAKE_SYSTEMCTL_FAIL_UNIT", "voisu-overlay.service");
+    let installed = output_retrying(&mut install);
+
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    assert!(
+        stdout(&installed).contains("warning: optional Overlay service was not enabled")
+    );
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    assert!(calls.contains("--user enable voisu.service"));
+    assert!(calls.contains("--user enable --now voisu-overlay.service"));
 }
 
 #[test]
@@ -806,6 +918,7 @@ fn a_manual_daemon_is_reported_and_service_start_does_not_create_a_crash_loop() 
         .env("VOISU_TEST_MODE", "controlled");
     let mut manual = manual.spawn().unwrap();
     wait_for_socket(&fixture.runtime, true);
+    wait_for_manual_daemon(&fixture);
 
     let started = fixture.run(&["service", "start"]);
     assert!(started.status.success(), "{}", stderr(&started));
@@ -830,6 +943,7 @@ fn a_systemd_launched_duplicate_exits_cleanly_while_the_manual_daemon_remains_re
         .env("VOISU_TEST_MODE", "controlled");
     let mut manual = manual.spawn().unwrap();
     wait_for_socket(&fixture.runtime, true);
+    wait_for_manual_daemon(&fixture);
 
     let duplicate = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"))
         .arg("--systemd")
@@ -863,6 +977,42 @@ fn uninstall_disables_service_removes_installed_files_and_leaves_no_runtime_sock
     assert!(calls.contains("--user disable --now voisu.service"));
     assert!(calls.contains("--user daemon-reload"));
     assert!(calls.contains("--user reset-failed voisu.service"));
+}
+
+#[test]
+fn packaged_uninstall_disables_and_stops_the_optional_overlay_service() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    fixture.install_packaged_unit();
+    fixture.install_packaged_overlay_unit();
+
+    let removed = fixture.run(&["service", "uninstall"]);
+
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    assert!(
+        stdout(&removed).contains("optional Overlay service disabled and stopped")
+    );
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    assert!(calls.contains("--user disable --now voisu-overlay.service"));
+    assert!(calls.contains("--user disable --now voisu.service"));
+}
+
+#[test]
+fn overlay_disable_failure_does_not_fail_daemon_service_uninstall() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    fixture.install_packaged_unit();
+    fixture.install_packaged_overlay_unit();
+
+    let mut uninstall = fixture.command(&["service", "uninstall"]);
+    uninstall.env("FAKE_SYSTEMCTL_FAIL_UNIT", "voisu-overlay.service");
+    let removed = output_retrying(&mut uninstall);
+
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    assert!(
+        stdout(&removed).contains("warning: optional Overlay service was not disabled")
+    );
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    assert!(calls.contains("--user disable --now voisu-overlay.service"));
+    assert!(calls.contains("--user disable --now voisu.service"));
 }
 
 #[test]

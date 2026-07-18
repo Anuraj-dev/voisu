@@ -16,8 +16,10 @@ set -euo pipefail
 # reinstalling.
 #
 # User-service state: `voisu service install` (and, in the live smoke,
-# `voisu service start`) enable the user unit, may restart it, and migrate away
-# any Ticket 09 XDG user-data shadow. The cleanup trap runs on success and on
+# `voisu service start`) enable the daemon unit, may restart it, and migrate away
+# any Ticket 09 XDG user-data shadow. When the optional Overlay RPM is already
+# installed, service install also enables and starts its independent user unit.
+# The cleanup trap runs on success and on
 # failure and restores the mutated user-service state: it restores any Ticket 09
 # XDG shadow unit/daemon it backed up before mutating, and — whenever a unit
 # exists again after restoration (the package was already installed before the
@@ -54,6 +56,10 @@ if installed_nevra=$(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' voisu 2
         exit 1
     fi
 fi
+overlay_installed_before=0
+if rpm -q voisu-overlay >/dev/null 2>&1; then
+    overlay_installed_before=1
+fi
 for path in /usr/bin/voisu /usr/bin/voisu-daemon /usr/lib/systemd/user/voisu.service; do
     if test -e "$path" || test -L "$path"; then
         if test "$installed_before" -ne 1; then
@@ -87,6 +93,10 @@ restore_user_service() {
     # Best-effort quiesce whatever the smoke enabled before restoring.
     systemctl --user stop voisu.service >/dev/null 2>&1 || true
     systemctl --user disable voisu.service >/dev/null 2>&1 || true
+    if test "$overlay_installed_before" -eq 1; then
+        systemctl --user stop voisu-overlay.service >/dev/null 2>&1 || true
+        systemctl --user disable voisu-overlay.service >/dev/null 2>&1 || true
+    fi
     # Restore any Ticket 09 XDG shadow the smoke migrated away (user data,
     # independent of the RPM).
     if test -f "$snapshot_dir/voisu.service"; then
@@ -149,6 +159,48 @@ restore_user_service() {
         if test "${pre_active:-}" != active && test "$final_active" = active; then
             printf 'restore: voisu.service left active but was "%s" before the smoke\n' \
                 "${pre_active:-inactive}" >&2
+            failed=1
+        fi
+    fi
+    if test "$overlay_installed_before" -eq 1; then
+        expected_overlay_enabled=${pre_overlay_enabled:-disabled}
+        case "$expected_overlay_enabled" in
+            enabled)
+                systemctl --user enable voisu-overlay.service >/dev/null 2>&1 || true
+                ;;
+            enabled-runtime)
+                systemctl --user enable --runtime voisu-overlay.service >/dev/null 2>&1 || true
+                ;;
+            disabled)
+                :
+                ;;
+            *)
+                printf 'restore: cannot faithfully restore Overlay enablement state "%s"; left disabled\n' \
+                    "$pre_overlay_enabled" >&2
+                failed=1
+                expected_overlay_enabled=
+                ;;
+        esac
+        if test "${pre_overlay_active:-}" = active; then
+            systemctl --user start voisu-overlay.service >/dev/null 2>&1 || true
+        fi
+        final_overlay_enabled=$(systemctl --user is-enabled voisu-overlay.service 2>/dev/null || true)
+        final_overlay_enabled=${final_overlay_enabled:-disabled}
+        if test -n "$expected_overlay_enabled" \
+            && test "$final_overlay_enabled" != "$expected_overlay_enabled"; then
+            printf 'restore: voisu-overlay.service enablement is "%s" but was "%s" before the smoke\n' \
+                "$final_overlay_enabled" "$expected_overlay_enabled" >&2
+            failed=1
+        fi
+        final_overlay_active=$(systemctl --user is-active voisu-overlay.service 2>/dev/null || true)
+        if test "${pre_overlay_active:-}" = active && test "$final_overlay_active" != active; then
+            printf 'restore: voisu-overlay.service is "%s" but was active before the smoke\n' \
+                "$final_overlay_active" >&2
+            failed=1
+        fi
+        if test "${pre_overlay_active:-}" != active && test "$final_overlay_active" = active; then
+            printf 'restore: voisu-overlay.service left active but was "%s" before the smoke\n' \
+                "${pre_overlay_active:-inactive}" >&2
             failed=1
         fi
     fi
@@ -247,11 +299,15 @@ grep -qx 'ExecStart=/usr/bin/voisu-daemon --systemd' /usr/lib/systemd/user/voisu
 /usr/bin/voisu --help >/dev/null
 systemctl --user daemon-reload
 
-# Snapshot the user-service state that `voisu service install`/`start` mutate so
-# the cleanup trap can restore it on both success and failure.
+# Snapshot every user-service state that `voisu service install`/`start` can
+# mutate so the cleanup trap can restore it on both success and failure.
 snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/voisu-smoke-snapshot.XXXXXX")
 pre_enabled=$(systemctl --user is-enabled voisu.service 2>/dev/null || true)
 pre_active=$(systemctl --user is-active voisu.service 2>/dev/null || true)
+if test "$overlay_installed_before" -eq 1; then
+    pre_overlay_enabled=$(systemctl --user is-enabled voisu-overlay.service 2>/dev/null || true)
+    pre_overlay_active=$(systemctl --user is-active voisu-overlay.service 2>/dev/null || true)
+fi
 if test -f "$shadow_unit"; then
     cp -p "$shadow_unit" "$snapshot_dir/voisu.service"
 fi
