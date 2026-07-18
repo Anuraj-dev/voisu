@@ -1,7 +1,7 @@
 # ADR: GTK4 locked in, Electron rejected
 
 **Label:** `wayfinder:task` (AFK, small)
-**Status:** open
+**Status:** resolved (2026-07-18) — ADR 0007, PR #53
 **Blocked by:** —
 **Blocks:** —
 

@@ -1,7 +1,7 @@
 # Research: focused-window identity tracking on KDE + Hyprland Wayland
 
 **Label:** `wayfinder:research` (AFK)
-**Status:** open
+**Status:** resolved (2026-07-18) — asset: assets/03-focus-tracking-research.md
 **Blocked by:** —
 **Blocks:** 04-guarded-delivery-mode
 

@@ -51,6 +51,8 @@ with the friend-facing features shipped first: `delivery_mode`
 ## Decisions so far
 
 <!-- one line per closed ticket -->
+- **01 (2026-07-18):** ADR 0007 records GTK4+layer-shell locked, Electron rejected, Tauri sole web-tech fallback (PR #53).
+- **03 (2026-07-18):** Focus tracking: KDE via KWin scripting (internalId identity; script+D-Bus, no portal path), Hyprland via bounded `hyprctl activewindow -j` (address identity); FocusProbe trait seam with runtime-detected Kwin/Hyprland/Null adapters, Null fails closed. Asset: assets/03-focus-tracking-research.md. Sub-decisions left to 04: KWin script→daemon channel, script packaging, same-app-different-window policy.
 
 ## Not yet specified
 
