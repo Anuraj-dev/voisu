@@ -20,6 +20,7 @@ use voisu_app::system::{
     PROVIDER_COMPLETION_DEADLINE, PipeWireCapture, PortalClipboardDelivery, ProviderReaper,
     RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
+use voisu_app::config::DeliveryMode;
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
     CancelRegistry, CapturedAudio, Command, DaemonState, DeliveryAdapter, DeliveryMethod,
@@ -435,6 +436,9 @@ async fn actor_loop(
     // adapter is a no-network stand-in so `begin_recording` never opens a Deepgram
     // stream and the completion barrier waits on Groq alone.
     let deepgram_enabled = voisu_app::config::deepgram_enabled();
+    // Delivery mode is resolved once at daemon start, like the Deepgram
+    // toggle. A running daemon keeps that choice until its next restart.
+    let delivery_mode = voisu_app::config::delivery_mode();
     // The Deepgram keyterm snapshot, resolved once at startup. Threaded into
     // every adapter rebuild so the supervised replay tail never re-reads the
     // dictionary file (no filesystem I/O or fallible logging in that path).
@@ -461,13 +465,8 @@ async fn actor_loop(
     } else {
         Some(Box::new(MergeResultValidator::new()))
     };
-    let mut delivery: Option<Box<dyn DeliveryAdapter>> = if controlled {
-        Some(Box::new(ControlledDelivery))
-    } else if std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_some() {
-        Some(Box::new(PortalClipboardDelivery::clipboard_only()))
-    } else {
-        Some(Box::new(PortalClipboardDelivery::default()))
-    };
+    let mut delivery: Option<Box<dyn DeliveryAdapter>> =
+        Some(build_delivery_adapter(controlled, delivery_mode));
     // The desktop-approved Trigger Key binding, once the portal listener reports
     // it. `None` means no Trigger Key is bound (portal unavailable or denied),
     // which never prevents CLI Recording control.
@@ -625,6 +624,7 @@ async fn actor_loop(
                                 debug_capture,
                                 controlled,
                                 deepgram_enabled,
+                                delivery_mode,
                                 configured_providers.clone(),
                                 Some(reply),
                                 tx.clone(),
@@ -948,6 +948,7 @@ async fn actor_loop(
                             debug_capture,
                             controlled,
                             deepgram_enabled,
+                            delivery_mode,
                             configured_providers.clone(),
                             None,
                             tx.clone(),
@@ -1029,6 +1030,7 @@ async fn actor_loop(
                             debug_capture,
                             controlled,
                             deepgram_enabled,
+                            delivery_mode,
                             configured_providers.clone(),
                             None,
                             tx.clone(),
@@ -1074,6 +1076,7 @@ fn spawn_recording_processing(
     debug_capture: bool,
     controlled: bool,
     deepgram_enabled: bool,
+    delivery_mode: DeliveryMode,
     configured_providers: Vec<Provider>,
     reply: Option<oneshot::Sender<Response>>,
     actor: mpsc::Sender<ActorMessage>,
@@ -1111,6 +1114,7 @@ fn spawn_recording_processing(
         processing,
         controlled,
         deepgram_enabled,
+        delivery_mode,
         configured_providers,
         panic_evidence,
         reply,
@@ -1696,6 +1700,7 @@ async fn supervise_recording(
     processing: JoinHandle<RecordingResult>,
     controlled: bool,
     deepgram_enabled: bool,
+    delivery_mode: DeliveryMode,
     configured_providers: Vec<Provider>,
     panic_evidence: LifecycleEvidence,
     reply: Option<oneshot::Sender<Response>>,
@@ -1743,7 +1748,7 @@ async fn supervise_recording(
                     "Recording {id}: writing diagnostics failed: {record_error}"
                 ));
             }
-            let (validator, delivery) = rebuild_recording_adapters(controlled);
+            let (validator, delivery) = rebuild_recording_adapters(controlled, delivery_mode);
             RecordingResult {
                 result: Err(error),
                 evidence: panic_evidence,
@@ -1779,6 +1784,7 @@ fn log_best_effort(message: std::fmt::Arguments<'_>) {
 
 fn rebuild_recording_adapters(
     controlled: bool,
+    delivery_mode: DeliveryMode,
 ) -> (Box<dyn TranscriptValidator>, Box<dyn DeliveryAdapter>) {
     if controlled {
         (
@@ -1786,13 +1792,28 @@ fn rebuild_recording_adapters(
             Box::new(ControlledDelivery),
         )
     } else {
-        let delivery: Box<dyn DeliveryAdapter> =
-            if std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_some() {
-                Box::new(PortalClipboardDelivery::clipboard_only())
-            } else {
-                Box::new(PortalClipboardDelivery::default())
-            };
-        (Box::new(MergeResultValidator::new()), delivery)
+        (
+            Box::new(MergeResultValidator::new()),
+            build_delivery_adapter(false, delivery_mode),
+        )
+    }
+}
+
+/// Builds the Delivery adapter from the daemon-start mode. The environment
+/// override is an emergency opt-out and deliberately wins over persisted
+/// configuration, matching the Deepgram toggle's precedence shape.
+fn build_delivery_adapter(controlled: bool, delivery_mode: DeliveryMode) -> Box<dyn DeliveryAdapter> {
+    if controlled {
+        Box::new(ControlledDelivery)
+    } else if std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_some() {
+        Box::new(PortalClipboardDelivery::clipboard_only())
+    } else {
+        match delivery_mode {
+            DeliveryMode::Type => Box::new(PortalClipboardDelivery::default()),
+            DeliveryMode::Clipboard => Box::new(PortalClipboardDelivery::clipboard_only()),
+            // Ticket 04 replaces this safe degradation with the focus guard.
+            DeliveryMode::Guarded => Box::new(PortalClipboardDelivery::clipboard_only()),
+        }
     }
 }
 
@@ -2782,6 +2803,7 @@ mod tests {
             processing,
             true,
             true,
+            DeliveryMode::Type,
             vec![Provider::Groq],
             evidence,
             None,

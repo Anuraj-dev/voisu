@@ -12,6 +12,7 @@ use voisu_app::service::{UserServiceAction, manage_user_service};
 use voisu_app::system::{
     FedoraReadiness, PROCESSING_RESPONSE_DEADLINE, ProviderHttpClient, SecretToolStore,
 };
+use voisu_app::config::DeliveryMode;
 
 // History and export responses carry bounded local diagnostics, so the CLI
 // accepts a larger response frame than the tiny command replies. The bound
@@ -27,6 +28,7 @@ enum CliAction {
     AuthSet(Provider),
     AuthVerify(Provider),
     SetDeepgram(bool),
+    Delivery(Option<DeliveryMode>),
     Service(UserServiceAction),
     Help,
 }
@@ -42,6 +44,7 @@ fn main() -> ExitCode {
         },
         Ok(CliAction::AuthVerify(provider)) => auth_verify(provider),
         Ok(CliAction::SetDeepgram(enabled)) => set_deepgram(enabled),
+        Ok(CliAction::Delivery(mode)) => delivery(mode),
         Ok(CliAction::Service(action)) => match manage_user_service(action) {
             Ok(report) => {
                 println!("{}", report.message);
@@ -271,6 +274,33 @@ fn set_deepgram(enabled: bool) -> ExitCode {
     }
 }
 
+/// Reads or persists the Delivery mode. A running daemon resolves configuration
+/// only at start, so writes apply after the next restart.
+fn delivery(mode: Option<DeliveryMode>) -> ExitCode {
+    let Some(mode) = mode else {
+        println!("delivery mode: {}", voisu_app::config::delivery_mode().as_str());
+        return ExitCode::SUCCESS;
+    };
+    match voisu_app::config::set_delivery_mode(mode) {
+        Ok(_) if mode == DeliveryMode::Guarded => {
+            println!(
+                "guarded delivery is not yet available; persisted for when it ships; \
+                 restart the daemon to apply (voisu service restart)"
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(_) => {
+            println!(
+                "Delivery mode set to {} for new Recordings; restart the daemon to apply \
+                 (voisu service restart)",
+                mode.as_str()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(message) => fail(4, &message),
+    }
+}
+
 fn credential_from_stdin() -> Result<Credential, BoundaryError> {
     let mut credential = String::new();
     std::io::stdin()
@@ -379,6 +409,10 @@ fn parse_command() -> Result<CliAction, String> {
         [command, state] if command == "deepgram" => {
             Ok(CliAction::SetDeepgram(parse_toggle(state)?))
         }
+        [command] if command == "delivery" => Ok(CliAction::Delivery(None)),
+        [command, mode] if command == "delivery" => {
+            Ok(CliAction::Delivery(Some(parse_delivery_mode(mode)?)))
+        }
         [service, action] if service == "service" => {
             Ok(CliAction::Service(parse_service_action(action)?))
         }
@@ -408,6 +442,15 @@ fn parse_toggle(value: &str) -> Result<bool, String> {
     }
 }
 
+fn parse_delivery_mode(value: &str) -> Result<DeliveryMode, String> {
+    match value {
+        "type" => Ok(DeliveryMode::Type),
+        "clipboard" => Ok(DeliveryMode::Clipboard),
+        "guarded" => Ok(DeliveryMode::Guarded),
+        _ => Err("delivery mode must be type, clipboard, or guarded".to_owned()),
+    }
+}
+
 fn parse_provider(value: &str) -> Result<Provider, String> {
     match value {
         "groq" => Ok(Provider::Groq),
@@ -417,7 +460,7 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: voisu <start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|service>\n\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu service <install|start|stop|restart|status|uninstall>"
+    "usage: voisu <start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|delivery|service>\n\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu delivery <type|clipboard|guarded>  # choose Transcript Delivery (default type)\n  voisu service <install|start|stop|restart|status|uninstall>"
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {
