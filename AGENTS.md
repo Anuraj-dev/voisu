@@ -14,27 +14,6 @@ next agent (or you tomorrow) starts cheap.
 - Full decision log (why we chose things): `docs/decisions.md`
 - Complex features are planned in `docs/specs/` (see `/spec`).
 
-## Delegation to Claude (MANDATORY for codex/GPT agents)
-
-You have a cheap, disposable worker pool: the `claude` CLI. Spend YOUR context and
-reasoning ONLY on architecture, diagnosis, and final code. Everything token-heavy
-goes to Claude:
-
-- **Bulk reading / repo exploration / log & test-output triage / one-fact lookups**
-  — do NOT read many files yourself. Run:
-  `claude -p "Read <paths/area>, report <exactly what you need> as a bullet summary" --model claude-sonnet-5 --effort high`
-  and consume the summary. Sonnet at high effort is the worker for ALL of this,
-  including trivial lookups (a path, a signature, one grep).
-- **Independent light side-tasks** (a small util + tests, doc updates) you don't want
-  to context-switch into:
-  `claude -p "<task with file paths and acceptance criteria>. Return a unified diff summary." --model claude-opus-4-8 --effort high`
-  — then verify the diff yourself.
-
-Rules: always state the expected output format in the `-p` prompt ("return a bullet
-summary", "return a table of file → purpose"); never paste large file contents into
-your own reasoning when a Claude summary suffices; treat `claude -p` calls as free
-relative to your own context. Always pass `--effort high` on these calls.
-
 ## Model & effort routing (pinned for this repo)
 
 | Work | Model | Effort |
