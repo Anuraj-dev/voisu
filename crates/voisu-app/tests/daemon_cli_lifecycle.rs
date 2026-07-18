@@ -851,6 +851,84 @@ printf 'controlled-secret'
 }
 
 #[test]
+fn status_stays_responsive_while_pw_record_stop_is_slow() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+head -c 6400 /dev/zero | tr '\000' '\100'
+trap ': > "$dir/pw-record.stopping"; i=0; while [ ! -e "$dir/pw-record.release" ] && [ "$i" -lt 3000 ]; do sleep 0.02; i=$((i + 1)); done; exit 0' INT TERM
+: > "$dir/pw-record.ready"
+i=0
+while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+cat > /dev/null
+printf '{"text":"responsive stop"}'
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        r#"#!/bin/sh
+cat > /dev/null
+"#,
+    );
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("TOKIO_WORKER_THREADS", "1"),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "pw-record.ready");
+    let runtime_dir = runtime.path().to_owned();
+    let stop = thread::spawn(move || voisu(&runtime_dir, "stop"));
+    wait_for_marker(commands.path(), "pw-record.stopping");
+
+    let runtime_dir = runtime.path().to_owned();
+    let (status_tx, status_rx) = mpsc::channel();
+    let status_thread = thread::spawn(move || {
+        status_tx.send(voisu(&runtime_dir, "status")).unwrap();
+    });
+    let prompt_status = status_rx.recv_timeout(Duration::from_millis(250));
+    fs::write(commands.path().join("pw-record.release"), "").unwrap();
+    let status = match prompt_status {
+        Ok(status) => status,
+        Err(error) => {
+            status_thread.join().unwrap();
+            stop.join().unwrap();
+            panic!("status must not wait for slow pw-record cleanup: {error}");
+        }
+    };
+    status_thread.join().unwrap();
+    assert!(status.status.success(), "{}", stderr(&status));
+    assert_eq!(stdout(&status), "processing\n");
+
+    let stopped = stop.join().unwrap();
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+}
+
+#[test]
 fn non_loopback_plaintext_groq_endpoint_is_rejected_without_disclosing_secrets() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();

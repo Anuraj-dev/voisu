@@ -1383,65 +1383,19 @@ impl PipeWireActiveCapture {
         }
     }
 
-    fn stop_child(&mut self, graceful: bool) -> Result<Vec<u8>, BoundaryError> {
-        let mut child = self.child.take().ok_or_else(|| {
+    async fn stop_child(&mut self, graceful: bool) -> Result<Vec<u8>, BoundaryError> {
+        let child = self.child.take().ok_or_else(|| {
             BoundaryError::new(BoundaryKind::Capture, "pw-record already finalized")
         })?;
-        // A tool that already exited before the stop failed on its own; only a
-        // process that was still capturing when interrupted may exit nonzero.
-        let exited_before_stop = matches!(child.try_wait(), Ok(Some(_)));
-        if graceful {
-            if let Some(pid) = child.id().try_into().ok() {
-                unsafe {
-                    libc::kill(pid, libc::SIGINT);
-                }
-            }
-        } else {
-            let _ = child.kill();
-        }
-        let stopped = Instant::now();
-        let status = wait_for_child(&mut child, stopped, PROCESS_DEADLINE, None);
-        let reader = self
-            .reader
-            .take()
-            .map(|handle| bounded_join(handle, stopped, &mut child, PROCESS_DEADLINE));
-        let stderr = self
-            .stderr_reader
-            .take()
-            .map(|handle| bounded_join(handle, stopped, &mut child, PROCESS_DEADLINE));
-        if !matches!(reader, None | Some(Ok(()))) {
-            return Err(BoundaryError::new(
-                BoundaryKind::Capture,
-                "pw-record audio drain failed",
-            ));
-        }
-        let stderr = match stderr {
-            Some(Ok(bytes)) => bytes,
-            None => Vec::new(),
-            Some(Err(_)) => {
-                return Err(BoundaryError::new(
-                    BoundaryKind::Capture,
-                    "pw-record diagnostic drain failed",
-                ));
-            }
-        };
-        let status = status.map_err(|error| capture_process_error(error, &stderr))?;
-        let expected_signal = if graceful { libc::SIGINT } else { libc::SIGKILL };
-        // Real pw-record catches SIGINT and exits nonzero with no diagnostics
-        // rather than dying by the signal; that silent nonzero exit is its
-        // normal interrupted shape, not a failure. Anything with diagnostics,
-        // or that had already died before the interrupt, stays rejected.
-        let interrupted_cleanly = graceful && !exited_before_stop && stderr.is_empty();
-        if !status.success()
-            && status.signal() != Some(expected_signal)
-            && !interrupted_cleanly
-        {
-            return Err(BoundaryError::new(
-                BoundaryKind::Capture,
-                process_diagnostic("pw-record failed", &stderr),
-            ));
-        }
-        Ok(stderr)
+        let reader = self.reader.take();
+        let stderr_reader = self.stderr_reader.take();
+        tokio::task::spawn_blocking(move || {
+            stop_child_blocking(child, reader, stderr_reader, graceful)
+        })
+        .await
+        .map_err(|_| {
+            BoundaryError::new(BoundaryKind::Capture, "pw-record cleanup task failed")
+        })?
     }
 
     fn validate_audio(&self) -> Result<(), BoundaryError> {
@@ -1468,6 +1422,64 @@ impl PipeWireActiveCapture {
         }
         Ok(())
     }
+}
+
+fn stop_child_blocking(
+    mut child: Child,
+    reader: Option<thread::JoinHandle<()>>,
+    stderr_reader: Option<thread::JoinHandle<Vec<u8>>>,
+    graceful: bool,
+) -> Result<Vec<u8>, BoundaryError> {
+    // A tool that already exited before the stop failed on its own; only a
+    // process that was still capturing when interrupted may exit nonzero.
+    let exited_before_stop = matches!(child.try_wait(), Ok(Some(_)));
+    if graceful {
+        if let Some(pid) = child.id().try_into().ok() {
+            unsafe {
+                libc::kill(pid, libc::SIGINT);
+            }
+        }
+    } else {
+        let _ = child.kill();
+    }
+    let stopped = Instant::now();
+    let status = wait_for_child(&mut child, stopped, PROCESS_DEADLINE, None);
+    let reader = reader.map(|handle| bounded_join(handle, stopped, &mut child, PROCESS_DEADLINE));
+    let stderr = stderr_reader
+        .map(|handle| bounded_join(handle, stopped, &mut child, PROCESS_DEADLINE));
+    if !matches!(reader, None | Some(Ok(()))) {
+        return Err(BoundaryError::new(
+            BoundaryKind::Capture,
+            "pw-record audio drain failed",
+        ));
+    }
+    let stderr = match stderr {
+        Some(Ok(bytes)) => bytes,
+        None => Vec::new(),
+        Some(Err(_)) => {
+            return Err(BoundaryError::new(
+                BoundaryKind::Capture,
+                "pw-record diagnostic drain failed",
+            ));
+        }
+    };
+    let status = status.map_err(|error| capture_process_error(error, &stderr))?;
+    let expected_signal = if graceful { libc::SIGINT } else { libc::SIGKILL };
+    // Real pw-record catches SIGINT and exits nonzero with no diagnostics
+    // rather than dying by the signal; that silent nonzero exit is its
+    // normal interrupted shape, not a failure. Anything with diagnostics,
+    // or that had already died before the interrupt, stays rejected.
+    let interrupted_cleanly = graceful && !exited_before_stop && stderr.is_empty();
+    if !status.success()
+        && status.signal() != Some(expected_signal)
+        && !interrupted_cleanly
+    {
+        return Err(BoundaryError::new(
+            BoundaryKind::Capture,
+            process_diagnostic("pw-record failed", &stderr),
+        ));
+    }
+    Ok(stderr)
 }
 
 impl ActiveCapture for PipeWireActiveCapture {
@@ -1501,7 +1513,7 @@ impl ActiveCapture for PipeWireActiveCapture {
 
     fn finish(&mut self) -> BoundaryFuture<'_, CapturedAudio> {
         Box::pin(async move {
-            self.stop_child(true)?;
+            self.stop_child(true).await?;
             self.drain_chunks();
             if let Some(error) = self.state.lock().unwrap().error.clone() {
                 return Err(BoundaryError::new(BoundaryKind::Capture, error));
@@ -1513,7 +1525,7 @@ impl ActiveCapture for PipeWireActiveCapture {
 
     fn abort(mut self: Box<Self>) -> BoundaryFuture<'static, ()> {
         Box::pin(async move {
-            self.stop_child(false)?;
+            self.stop_child(false).await?;
             Ok(())
         })
     }
