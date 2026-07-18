@@ -150,9 +150,11 @@ fn run_journal_feedback(selection: FeedbackSelection) -> i32 {
     let mut controller = PresentationController::default();
     let mut previous = OverlayView::HIDDEN;
     loop {
-        let view = read_status()
-            .map(|response| controller.observe(&response, Instant::now()))
-            .unwrap_or_else(daemon_unavailable_view);
+        let now = Instant::now();
+        let view = match read_status() {
+            Some(response) => controller.observe(&response, now),
+            None => controller.observe_unreachable(now),
+        };
         if view != previous {
             eprintln!("{} phase={}", selection.report_line(), overlay_phase_label(view.phase));
             previous = view;
@@ -285,8 +287,11 @@ fn install_surface_feedback(
             // notification backend; stop driving the retired window.
             return gtk::glib::ControlFlow::Break;
         }
-        let view = read_status().map(|response| controller.borrow_mut().observe(&response, Instant::now()))
-            .unwrap_or_else(daemon_unavailable_view);
+        let now = Instant::now();
+        let view = match read_status() {
+            Some(response) => controller.borrow_mut().observe(&response, now),
+            None => controller.borrow_mut().observe_unreachable(now),
+        };
         render_surface(&window, &label, &meter, &capsule, view, reduced_motion);
         gtk::glib::ControlFlow::Continue
     });
@@ -301,8 +306,11 @@ fn install_notification_feedback(application: &gtk::Application) {
     let application = application.clone();
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
         let _hold = &hold;
-        let view = read_status().map(|response| controller.borrow_mut().observe(&response, Instant::now()))
-            .unwrap_or_else(daemon_unavailable_view);
+        let now = Instant::now();
+        let view = match read_status() {
+            Some(response) => controller.borrow_mut().observe(&response, now),
+            None => controller.borrow_mut().observe_unreachable(now),
+        };
         if view.is_visible() && *previous.borrow() != view {
             let notification = gtk::gio::Notification::new("Voisu");
             notification.set_body(Some(view.visible_label));
@@ -311,15 +319,6 @@ fn install_notification_feedback(application: &gtk::Application) {
         *previous.borrow_mut() = view;
         gtk::glib::ControlFlow::Continue
     });
-}
-
-fn daemon_unavailable_view() -> OverlayView {
-    OverlayView {
-        phase: OverlayPhase::Failure,
-        activity: 0,
-        visible_label: "Daemon unavailable",
-        accessible_label: "Daemon unavailable; the optional Overlay cannot reach voisu-daemon",
-    }
 }
 
 fn render_surface(

@@ -72,6 +72,18 @@ impl OverlayView {
             visible_label: "Quality Failure", accessible_label: "Quality Failure" }
     }
 
+    /// The Failure view shown when the optional Overlay cannot reach the
+    /// daemon. Owned here so the label strings live in one place; the label
+    /// text is load-bearing for tests and users and must stay unchanged.
+    pub const fn daemon_unavailable() -> Self {
+        Self {
+            phase: OverlayPhase::Failure,
+            activity: 0,
+            visible_label: "Daemon unavailable",
+            accessible_label: "Daemon unavailable; the optional Overlay cannot reach voisu-daemon",
+        }
+    }
+
     pub const fn is_visible(self) -> bool { !matches!(self.phase, OverlayPhase::Hidden) }
 
     pub const fn animation_interval(self, reduced_motion: bool) -> Option<Duration> {
@@ -89,10 +101,17 @@ pub struct PresentationController {
     /// mistaking it for the already-displayed event and suppressing the flash.
     displayed_event: Option<(u64, u64)>,
     terminal_until: Option<Instant>,
+    /// Whether the last poll observed the daemon as unreachable. Edge-triggering
+    /// the daemon-unavailable flash off this flag keeps a persistently-down
+    /// daemon from re-arming the capsule on every level-triggered poll.
+    unreachable: bool,
 }
 
 impl PresentationController {
     pub fn observe(&mut self, response: &Response, now: Instant) -> OverlayView {
+        // A successful reachable observation clears the unreachable edge so a
+        // LATER reachable->unreachable transition flashes the capsule again.
+        self.unreachable = false;
         // Any live in-progress state (Recording or Processing) is driven straight
         // from status and supersedes the previous terminal feedback window. The
         // retained observer event stays attached to every OverlayStatus response,
@@ -114,6 +133,25 @@ impl PresentationController {
         if self.terminal_until.is_some_and(|until| now < until) {
             return response.overlay_event.as_ref()
                 .map(OverlayView::from_terminal_event).unwrap_or(OverlayView::HIDDEN);
+        }
+        self.terminal_until = None;
+        OverlayView::HIDDEN
+    }
+
+    /// Routes an unreachable daemon through the same terminal-cap mechanism as
+    /// every other terminal event. The reachable->unreachable transition (edge)
+    /// flashes the daemon-unavailable capsule for `TERMINAL_DISPLAY`, then hides
+    /// while the daemon stays down. The overlay coming up against an
+    /// already-down daemon is itself a transition, so it flashes once. A
+    /// successful `observe` re-arms the edge for a later drop.
+    pub fn observe_unreachable(&mut self, now: Instant) -> OverlayView {
+        if !self.unreachable {
+            self.unreachable = true;
+            self.terminal_until = Some(now + TERMINAL_DISPLAY);
+            return OverlayView::daemon_unavailable();
+        }
+        if self.terminal_until.is_some_and(|until| now < until) {
+            return OverlayView::daemon_unavailable();
         }
         self.terminal_until = None;
         OverlayView::HIDDEN
@@ -260,6 +298,93 @@ mod tests {
                 .phase,
             OverlayPhase::Failure,
         );
+    }
+
+    #[test]
+    fn a_daemon_unreachable_transition_flashes_the_daemon_unavailable_capsule() {
+        // Edge-triggered: the reachable->unreachable transition shows the
+        // daemon-unavailable Failure view, with the exact label strings users
+        // and tests rely on.
+        let mut controller = PresentationController::default();
+        let now = Instant::now();
+        let view = controller.observe_unreachable(now);
+        assert_eq!(view.phase, OverlayPhase::Failure);
+        assert!(view.is_visible());
+        assert_eq!(view.visible_label, "Daemon unavailable");
+        assert_eq!(
+            view.accessible_label,
+            "Daemon unavailable; the optional Overlay cannot reach voisu-daemon",
+        );
+    }
+
+    #[test]
+    fn a_persistent_unreachable_daemon_hides_after_the_terminal_cap() {
+        // The daemon-unavailable capsule obeys the same TERMINAL_DISPLAY cap as
+        // every other terminal event: it flashes, then hides while the daemon
+        // stays down instead of pinning on screen forever.
+        let mut controller = PresentationController::default();
+        let now = Instant::now();
+        assert_eq!(controller.observe_unreachable(now).phase, OverlayPhase::Failure);
+        // Still within the window: the capsule remains up.
+        assert_eq!(
+            controller.observe_unreachable(now + Duration::from_millis(500)).phase,
+            OverlayPhase::Failure,
+        );
+        // The window elapses while the daemon is still unreachable: hidden.
+        assert_eq!(
+            controller.observe_unreachable(now + TERMINAL_DISPLAY).phase,
+            OverlayPhase::Hidden,
+        );
+        // It stays hidden as unreachability persists.
+        assert_eq!(
+            controller
+                .observe_unreachable(now + TERMINAL_DISPLAY + Duration::from_secs(30))
+                .phase,
+            OverlayPhase::Hidden,
+        );
+    }
+
+    #[test]
+    fn a_reachable_observation_rearms_a_later_unreachable_flash() {
+        // A successful observe resets the edge: after the daemon comes back and
+        // then drops again, the fresh transition flashes once more.
+        let mut controller = PresentationController::default();
+        let now = Instant::now();
+        assert_eq!(controller.observe_unreachable(now).phase, OverlayPhase::Failure);
+        let expired = now + TERMINAL_DISPLAY;
+        assert_eq!(controller.observe_unreachable(expired).phase, OverlayPhase::Hidden);
+        // Daemon reachable again (idle) clears the unreachable edge.
+        assert_eq!(
+            controller.observe(&overlay_status(DaemonState::Idle, None), expired).phase,
+            OverlayPhase::Hidden,
+        );
+        // A later reachable->unreachable transition flashes again.
+        assert_eq!(
+            controller.observe_unreachable(expired + Duration::from_secs(1)).phase,
+            OverlayPhase::Failure,
+        );
+    }
+
+    #[test]
+    fn continuous_unreachability_does_not_reflash_after_the_cap() {
+        // Level-triggered ticks (every 200 ms) while the daemon stays down must
+        // not re-arm the flash; only a reachable->unreachable edge does.
+        let mut controller = PresentationController::default();
+        let now = Instant::now();
+        assert_eq!(controller.observe_unreachable(now).phase, OverlayPhase::Failure);
+        assert_eq!(
+            controller.observe_unreachable(now + TERMINAL_DISPLAY).phase,
+            OverlayPhase::Hidden,
+        );
+        for tick in 1..20 {
+            assert_eq!(
+                controller
+                    .observe_unreachable(now + TERMINAL_DISPLAY + Duration::from_millis(200 * tick))
+                    .phase,
+                OverlayPhase::Hidden,
+                "unreachable tick {tick} must not re-flash",
+            );
+        }
     }
 
     #[test]
