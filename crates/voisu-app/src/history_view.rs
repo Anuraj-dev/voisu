@@ -12,6 +12,13 @@
 //! records, truncation, and the non-interactive path all directly testable
 //! without a daemon. The daemon IPC protocol and stored records are unchanged;
 //! this is presentation only.
+//!
+//! Every externally sourced string (delivered Transcript, Provider diagnostics,
+//! decision reasons) originates from a network STT provider and is therefore
+//! untrusted. All such text is routed through [`truncate_inline`], which strips
+//! terminal control bytes (ESC/BEL/backspace/DEL and other C0/C1 controls) so a
+//! hostile transcript cannot smuggle CSI screen-clears or OSC clipboard-hijack
+//! sequences into the user's terminal — even piped with color off.
 
 use serde_json::Value;
 
@@ -146,8 +153,11 @@ fn render_record(index: usize, record: &Value, style: &RenderStyle) -> String {
 
     let capture_finalized = u64_field(record, "capture_finalized_ms");
     let release = u64_field(record, "release_to_text_ms");
+    // Tail = release_to_text_ms − capture_finalized_ms. A reversed pair
+    // (release earlier than capture) is an invalid record; `checked_sub`
+    // renders it as `—` rather than fabricating a plausible "tail 0ms".
     let tail = match (capture_finalized, release) {
-        (Some(capture), Some(release)) => Some(release.saturating_sub(capture)),
+        (Some(capture), Some(release)) => release.checked_sub(capture),
         _ => None,
     };
 
@@ -400,9 +410,15 @@ fn relative_time(now_ms: u64, then_ms: u64) -> String {
     format!("{days}d ago")
 }
 
-/// Collapses whitespace to single spaces and truncates to `width` characters,
-/// appending an ellipsis when it had to cut. Measured in characters so multibyte
-/// text is never split mid-codepoint.
+/// Sanitizes an untrusted, network-sourced string for safe single-line terminal
+/// display and truncates it to `width` characters.
+///
+/// Ordinary whitespace (including tab/newline/CR) collapses to a single space so
+/// the value stays on one line. Every other control character — ESC, BEL,
+/// backspace, DEL, and the rest of the C0/C1 ranges — is dropped, so a hostile
+/// transcript cannot inject CSI or OSC escape sequences into the terminal.
+/// Truncation is measured in characters so multibyte text is never split
+/// mid-codepoint.
 fn truncate_inline(text: &str, width: usize) -> String {
     let collapsed: String = {
         let mut out = String::with_capacity(text.len());
@@ -413,6 +429,10 @@ fn truncate_inline(text: &str, width: usize) -> String {
                     out.push(' ');
                     last_space = true;
                 }
+            } else if ch.is_control() {
+                // Drop ESC/BEL/backspace/DEL and other C0/C1 controls entirely;
+                // never let them reach the terminal.
+                last_space = false;
             } else {
                 out.push(ch);
                 last_space = false;
@@ -684,5 +704,63 @@ mod tests {
         assert_eq!(out.shown, 0);
         assert_eq!(out.remaining, 0);
     }
-}
 
+    #[test]
+    fn terminal_control_sequences_never_survive_in_a_transcript() {
+        // A hostile Source Transcript from a network STT provider carries a CSI
+        // screen-clear and an OSC 52 clipboard-hijack payload. Rendered with
+        // color off (the piped path), none of the raw control bytes may reach
+        // the terminal: stripping the ESC/BEL introducers renders the sequence
+        // inert (any residual ASCII like "]52;c" is then harmless plain text).
+        let hostile = "hi\u{1b}[2J\u{1b}[3Jthere\u{1b}]52;c;SGVsbG8=\u{7}\u{8}\u{7f}end";
+        let out = render_one(json!({
+            "recorded_at_unix_ms": NOW,
+            "final_transcript": hostile,
+            "selection": "source_groq",
+            "capture_finalized_ms": 1,
+            "release_to_text_ms": 2
+        }));
+        assert!(!out.contains('\u{1b}'), "ESC survived: {out:?}");
+        assert!(!out.contains('\u{7}'), "BEL survived: {out:?}");
+        assert!(!out.contains('\u{8}'), "BS survived: {out:?}");
+        assert!(!out.contains('\u{7f}'), "DEL survived: {out:?}");
+        // No C0/C1 control byte survives anywhere in the rendered record.
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'), "control byte survived: {out:?}");
+        // Ordinary letters are preserved.
+        assert!(out.contains("there"), "{out}");
+    }
+
+    #[test]
+    fn terminal_control_sequences_never_survive_in_a_diagnostic_or_reason() {
+        let out = render_one(json!({
+            "recorded_at_unix_ms": NOW,
+            "final_transcript": null,
+            "validation_reason": "bad\u{1b}]52;c;cHduZWQ=\u{7} reason",
+            "provider_failures": [
+                {"provider": "groq", "stage": "completion",
+                 "diagnostic": "upstream\u{1b}[2J failed\u{7}"}
+            ]
+        }));
+        assert!(!out.contains('\u{1b}'), "ESC survived in diagnostic path: {out:?}");
+        assert!(!out.contains('\u{7}'), "BEL survived in diagnostic path: {out:?}");
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'), "control byte survived: {out:?}");
+        assert!(out.contains("failed"), "{out}");
+    }
+
+    #[test]
+    fn reversed_tail_ordering_renders_a_dash_not_a_false_zero() {
+        // release_to_text_ms < capture_finalized_ms is an invalid record; it
+        // must not read as a plausible "tail 0ms".
+        let out = render_one(json!({
+            "recorded_at_unix_ms": NOW,
+            "final_transcript": "reversed timings",
+            "selection": "source_groq",
+            "capture_finalized_ms": 1832,
+            "release_to_text_ms": 1620
+        }));
+        assert!(out.contains("tail —"), "{out}");
+        assert!(!out.contains("tail 0ms"), "{out}");
+        // The release value is still surfaced as recorded.
+        assert!(out.contains("release 1620ms"), "{out}");
+    }
+}
