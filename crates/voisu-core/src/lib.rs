@@ -1931,7 +1931,29 @@ impl DeliveryOutcome {
 }
 
 pub trait DeliveryAdapter: Send {
+    /// Captures any per-Recording Delivery precondition at the moment Recording
+    /// starts. Most adapters have no precondition and keep the no-op default.
+    fn recording_started(&mut self) -> BoundaryFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn deliver(&mut self, transcript: Transcript) -> BoundaryFuture<'_, DeliveryOutcome>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowIdentity {
+    /// Opaque compositor-defined stable token: KWin internalId UUID or
+    /// Hyprland window address. Never a title or caption.
+    pub stable_id: String,
+    /// Corroborating fields for diagnostics only — never the comparison key.
+    pub process_id: Option<u32>,
+    pub app_id: Option<String>,
+}
+
+pub trait FocusProbe: Send {
+    /// `None` means focus cannot be determined. Callers must fail closed rather
+    /// than treating an unavailable focus observation as unchanged.
+    fn current(&mut self) -> BoundaryFuture<'_, Option<WindowIdentity>>;
 }
 
 /// The desktop-approved Trigger Key binding, surfaced to the user during setup.

@@ -2465,13 +2465,35 @@ fn doctor_reports_each_fedora_capability_through_the_public_cli() {
         .arg("doctor")
         .env("XDG_RUNTIME_DIR", runtime.path())
         .env("VOISU_TEST_READINESS", "pass")
+        .env("VOISU_TEST_FOCUS_BACKEND", "hyprland")
         .output()
         .expect("doctor should run");
 
     assert!(doctor.status.success(), "{}", stderr(&doctor));
     assert_eq!(
         stdout(&doctor),
-        "PipeWire: PASS (PipeWire core responds)\nMicrophone: PASS (default source available)\nPortals: PASS (desktop portal responds)\nClipboard: PASS (clipboard roundtrip succeeds)\nSecret storage: PASS (Secret Service responds)\nDaemon: PASS (status handshake succeeds)\n"
+        "PipeWire: PASS (PipeWire core responds)\nMicrophone: PASS (default source available)\nPortals: PASS (desktop portal responds)\nClipboard: PASS (clipboard roundtrip succeeds)\nSecret storage: PASS (Secret Service responds)\nDaemon: PASS (status handshake succeeds)\nFocus guard: hyprland\n"
+    );
+}
+
+#[test]
+fn doctor_explains_that_guarded_delivery_fails_closed_without_a_focus_backend() {
+    let runtime = TempDir::new().unwrap();
+    let doctor = voisu_with_env(
+        runtime.path(),
+        &["doctor"],
+        &[
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "none"),
+        ],
+    );
+
+    assert!(
+        stdout(&doctor).contains(
+            "Focus guard: none (guarded Delivery fails closed to the clipboard)\n"
+        ),
+        "{}",
+        stdout(&doctor)
     );
 }
 
@@ -6622,10 +6644,9 @@ fn delivery_cli_sets_gets_and_persists_guarded_while_rejecting_invalid_modes() {
 
     let guarded = run(&["delivery", "guarded"]);
     assert!(guarded.status.success(), "{}", stderr(&guarded));
-    assert!(
-        stdout(&guarded).contains("guarded delivery is not yet available; persisted for when it ships"),
-        "{}",
-        stdout(&guarded)
+    assert_eq!(
+        stdout(&guarded),
+        "Delivery mode set to guarded for new Recordings; restart the daemon to apply (voisu service restart)\n"
     );
     assert_eq!(stdout(&run(&["delivery"])), "delivery mode: guarded\n");
 
