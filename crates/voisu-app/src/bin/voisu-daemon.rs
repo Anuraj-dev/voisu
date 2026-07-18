@@ -438,7 +438,9 @@ async fn actor_loop(
     // The Deepgram keyterm snapshot, resolved once at startup. Threaded into
     // every adapter rebuild so the supervised replay tail never re-reads the
     // dictionary file (no filesystem I/O or fallible logging in that path).
-    let keyterms = Arc::new(voisu_app::dictionary::merged_terms());
+    let keyterms = Arc::new(voisu_app::dictionary::deepgram_keyterms(
+        &voisu_app::dictionary::merged_terms(),
+    ));
     let mut deepgram: Option<Box<dyn TranscriptProvider>> = Some(build_deepgram_provider(
         deepgram_enabled,
         controlled,
