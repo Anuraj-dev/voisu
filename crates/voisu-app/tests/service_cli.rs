@@ -345,6 +345,25 @@ fn wait_for_socket(runtime: &Path, present: bool) {
     panic!("daemon socket did not reach present={present}: {}", socket.display());
 }
 
+/// Waits until `status` reports the manually spawned daemon as reachable over
+/// IPC. The socket file appears at bind time, before the daemon serves IPC, so
+/// a bare [`wait_for_socket`] leaves a window where `service start` classifies
+/// the daemon as absent and takes the systemd path — a loaded CI runner hit
+/// exactly that window.
+fn wait_for_manual_daemon(fixture: &ServiceFixture) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let status = fixture.run(&["service", "status"]);
+        last = stdout(&status);
+        if last.contains("daemon running outside systemd") {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("manual daemon never became IPC-reachable; last status: {last}");
+}
+
 #[test]
 fn service_manager_guards_its_systemctl_child_with_parent_death_signal() {
     let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
@@ -899,6 +918,7 @@ fn a_manual_daemon_is_reported_and_service_start_does_not_create_a_crash_loop() 
         .env("VOISU_TEST_MODE", "controlled");
     let mut manual = manual.spawn().unwrap();
     wait_for_socket(&fixture.runtime, true);
+    wait_for_manual_daemon(&fixture);
 
     let started = fixture.run(&["service", "start"]);
     assert!(started.status.success(), "{}", stderr(&started));
@@ -923,6 +943,7 @@ fn a_systemd_launched_duplicate_exits_cleanly_while_the_manual_daemon_remains_re
         .env("VOISU_TEST_MODE", "controlled");
     let mut manual = manual.spawn().unwrap();
     wait_for_socket(&fixture.runtime, true);
+    wait_for_manual_daemon(&fixture);
 
     let duplicate = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"))
         .arg("--systemd")
