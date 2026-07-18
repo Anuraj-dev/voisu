@@ -1654,6 +1654,40 @@ fn capture_finalization_failure_is_redacted_and_the_next_recording_succeeds() {
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 }
 
+#[test]
+fn capture_pump_panic_fails_the_recording_and_the_next_recording_succeeds() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_CAPTURE_PUMP_PANIC", "1")],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    thread::sleep(Duration::from_millis(50));
+
+    let failed = voisu(runtime.path(), "stop");
+    assert!(!failed.status.success());
+
+    let restarted = voisu(runtime.path(), "start");
+    assert!(
+        restarted.status.success(),
+        "capture pump panic wedged the daemon: {}",
+        stderr(&restarted)
+    );
+    assert_eq!(failed.status.code(), Some(4));
+    assert_eq!(stderr(&failed), "Recording capture failed\n");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let failures = history["history"][0]["provider_failures"]
+        .as_array()
+        .expect("pump panic must account for both providers");
+    assert_eq!(failures.len(), 2, "{history}");
+    assert!(failures.iter().all(|failure| failure["stage"] == "aborted"));
+
+    let recovered = voisu(runtime.path(), "stop");
+    assert!(recovered.status.success(), "{}", stderr(&recovered));
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+}
+
 impl Drop for Daemon {
     fn drop(&mut self) {
         let process_group = -(self.child.id() as i32);
