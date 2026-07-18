@@ -18,6 +18,12 @@ const OVERLAY_UNIT_NAME: &str = "voisu-overlay.service";
 const OVERLAY_EXECUTABLE: &str = "/usr/bin/voisu-overlay";
 const SYSTEMCTL_DEADLINE: Duration = Duration::from_secs(5);
 const SERVICE_TRANSITION_DEADLINE: Duration = Duration::from_secs(3);
+// Startup readiness gets a longer bound than stop: 3 s proved too tight on
+// loaded machines (CI's parallel flake gate timed out twice in one day on the
+// restart path). Readiness normally lands in well under a second, so the
+// longer bound only delays reporting genuine failures, while stop keeps the
+// short deadline the stuck-stop path (and its test) relies on.
+const SERVICE_READY_DEADLINE: Duration = Duration::from_secs(15);
 const IPC_DEADLINE: Duration = Duration::from_millis(300);
 const MAX_SYSTEMCTL_OUTPUT: u64 = 16 * 1024;
 // systemd precedence among packaged locations: an administrator unit under /etc
@@ -948,7 +954,7 @@ fn systemd_state() -> Result<String, String> {
 }
 
 fn wait_for_managed_daemon() -> Result<(), String> {
-    let deadline = Instant::now() + SERVICE_TRANSITION_DEADLINE;
+    let deadline = Instant::now() + SERVICE_READY_DEADLINE;
     while Instant::now() < deadline {
         if systemd_is_active()? && matches!(probe_daemon(), DaemonIpc::Available(_)) {
             return Ok(());
