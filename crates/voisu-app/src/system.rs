@@ -1231,7 +1231,15 @@ fn wait_for_child(
     }
 }
 
-pub struct PipeWireCapture;
+pub struct PipeWireCapture {
+    reaper: ProviderReaper,
+}
+
+impl PipeWireCapture {
+    pub fn new(reaper: ProviderReaper) -> Self {
+        Self { reaper }
+    }
+}
 
 struct CaptureReaderState {
     chunks: VecDeque<AudioChunk>,
@@ -1341,6 +1349,8 @@ impl AudioCapture for PipeWireCapture {
             state,
             reader: Some(reader),
             stderr_reader: Some(stderr_reader),
+            cleanup: None,
+            reaper: self.reaper.clone(),
             pcm: Vec::new(),
             started: Instant::now(),
             deadline,
@@ -1370,6 +1380,8 @@ struct PipeWireActiveCapture {
     state: Arc<Mutex<CaptureReaderState>>,
     reader: Option<thread::JoinHandle<()>>,
     stderr_reader: Option<thread::JoinHandle<Vec<u8>>>,
+    cleanup: Option<tokio::task::JoinHandle<Result<Vec<u8>, BoundaryError>>>,
+    reaper: ProviderReaper,
     pcm: Vec<u8>,
     started: Instant,
     deadline: Duration,
@@ -1383,65 +1395,23 @@ impl PipeWireActiveCapture {
         }
     }
 
-    fn stop_child(&mut self, graceful: bool) -> Result<Vec<u8>, BoundaryError> {
-        let mut child = self.child.take().ok_or_else(|| {
-            BoundaryError::new(BoundaryKind::Capture, "pw-record already finalized")
-        })?;
-        // A tool that already exited before the stop failed on its own; only a
-        // process that was still capturing when interrupted may exit nonzero.
-        let exited_before_stop = matches!(child.try_wait(), Ok(Some(_)));
-        if graceful {
-            if let Some(pid) = child.id().try_into().ok() {
-                unsafe {
-                    libc::kill(pid, libc::SIGINT);
-                }
-            }
-        } else {
-            let _ = child.kill();
+    async fn stop_child(&mut self, graceful: bool) -> Result<Vec<u8>, BoundaryError> {
+        if self.cleanup.is_none() {
+            let child = self.child.take().ok_or_else(|| {
+                BoundaryError::new(BoundaryKind::Capture, "pw-record already finalized")
+            })?;
+            let reader = self.reader.take();
+            let stderr_reader = self.stderr_reader.take();
+            self.cleanup = Some(tokio::task::spawn_blocking(move || {
+                stop_child_blocking(child, reader, stderr_reader, graceful)
+            }));
         }
-        let stopped = Instant::now();
-        let status = wait_for_child(&mut child, stopped, PROCESS_DEADLINE, None);
-        let reader = self
-            .reader
-            .take()
-            .map(|handle| bounded_join(handle, stopped, &mut child, PROCESS_DEADLINE));
-        let stderr = self
-            .stderr_reader
-            .take()
-            .map(|handle| bounded_join(handle, stopped, &mut child, PROCESS_DEADLINE));
-        if !matches!(reader, None | Some(Ok(()))) {
-            return Err(BoundaryError::new(
-                BoundaryKind::Capture,
-                "pw-record audio drain failed",
-            ));
-        }
-        let stderr = match stderr {
-            Some(Ok(bytes)) => bytes,
-            None => Vec::new(),
-            Some(Err(_)) => {
-                return Err(BoundaryError::new(
-                    BoundaryKind::Capture,
-                    "pw-record diagnostic drain failed",
-                ));
-            }
-        };
-        let status = status.map_err(|error| capture_process_error(error, &stderr))?;
-        let expected_signal = if graceful { libc::SIGINT } else { libc::SIGKILL };
-        // Real pw-record catches SIGINT and exits nonzero with no diagnostics
-        // rather than dying by the signal; that silent nonzero exit is its
-        // normal interrupted shape, not a failure. Anything with diagnostics,
-        // or that had already died before the interrupt, stays rejected.
-        let interrupted_cleanly = graceful && !exited_before_stop && stderr.is_empty();
-        if !status.success()
-            && status.signal() != Some(expected_signal)
-            && !interrupted_cleanly
-        {
-            return Err(BoundaryError::new(
-                BoundaryKind::Capture,
-                process_diagnostic("pw-record failed", &stderr),
-            ));
-        }
-        Ok(stderr)
+        let result = self.cleanup.as_mut().expect("capture cleanup is present").await;
+        self.cleanup.take();
+        result
+            .map_err(|_| {
+                BoundaryError::new(BoundaryKind::Capture, "pw-record cleanup task failed")
+            })?
     }
 
     fn validate_audio(&self) -> Result<(), BoundaryError> {
@@ -1468,6 +1438,64 @@ impl PipeWireActiveCapture {
         }
         Ok(())
     }
+}
+
+fn stop_child_blocking(
+    mut child: Child,
+    reader: Option<thread::JoinHandle<()>>,
+    stderr_reader: Option<thread::JoinHandle<Vec<u8>>>,
+    graceful: bool,
+) -> Result<Vec<u8>, BoundaryError> {
+    // A tool that already exited before the stop failed on its own; only a
+    // process that was still capturing when interrupted may exit nonzero.
+    let exited_before_stop = matches!(child.try_wait(), Ok(Some(_)));
+    if graceful {
+        if let Some(pid) = child.id().try_into().ok() {
+            unsafe {
+                libc::kill(pid, libc::SIGINT);
+            }
+        }
+    } else {
+        let _ = child.kill();
+    }
+    let stopped = Instant::now();
+    let status = wait_for_child(&mut child, stopped, PROCESS_DEADLINE, None);
+    let reader = reader.map(|handle| bounded_join(handle, stopped, &mut child, PROCESS_DEADLINE));
+    let stderr = stderr_reader
+        .map(|handle| bounded_join(handle, stopped, &mut child, PROCESS_DEADLINE));
+    if !matches!(reader, None | Some(Ok(()))) {
+        return Err(BoundaryError::new(
+            BoundaryKind::Capture,
+            "pw-record audio drain failed",
+        ));
+    }
+    let stderr = match stderr {
+        Some(Ok(bytes)) => bytes,
+        None => Vec::new(),
+        Some(Err(_)) => {
+            return Err(BoundaryError::new(
+                BoundaryKind::Capture,
+                "pw-record diagnostic drain failed",
+            ));
+        }
+    };
+    let status = status.map_err(|error| capture_process_error(error, &stderr))?;
+    let expected_signal = if graceful { libc::SIGINT } else { libc::SIGKILL };
+    // Real pw-record catches SIGINT and exits nonzero with no diagnostics
+    // rather than dying by the signal; that silent nonzero exit is its
+    // normal interrupted shape, not a failure. Anything with diagnostics,
+    // or that had already died before the interrupt, stays rejected.
+    let interrupted_cleanly = graceful && !exited_before_stop && stderr.is_empty();
+    if !status.success()
+        && status.signal() != Some(expected_signal)
+        && !interrupted_cleanly
+    {
+        return Err(BoundaryError::new(
+            BoundaryKind::Capture,
+            process_diagnostic("pw-record failed", &stderr),
+        ));
+    }
+    Ok(stderr)
 }
 
 impl ActiveCapture for PipeWireActiveCapture {
@@ -1501,7 +1529,7 @@ impl ActiveCapture for PipeWireActiveCapture {
 
     fn finish(&mut self) -> BoundaryFuture<'_, CapturedAudio> {
         Box::pin(async move {
-            self.stop_child(true)?;
+            self.stop_child(true).await?;
             self.drain_chunks();
             if let Some(error) = self.state.lock().unwrap().error.clone() {
                 return Err(BoundaryError::new(BoundaryKind::Capture, error));
@@ -1513,7 +1541,7 @@ impl ActiveCapture for PipeWireActiveCapture {
 
     fn abort(mut self: Box<Self>) -> BoundaryFuture<'static, ()> {
         Box::pin(async move {
-            self.stop_child(false)?;
+            self.stop_child(false).await?;
             Ok(())
         })
     }
@@ -1521,9 +1549,26 @@ impl ActiveCapture for PipeWireActiveCapture {
 
 impl Drop for PipeWireActiveCapture {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            reap_briefly(&mut child);
+        if let Some(cleanup) = self.cleanup.take() {
+            // An outer abort deadline may drop stop_child after it transferred
+            // pw-record and both reader handles to spawn_blocking. Retain that
+            // task in the actor-owned supervisor; every workflow drains it before
+            // its acknowledgement permits the next Recording.
+            self.reaper.adopt_capture(cleanup);
+        } else if let Some(child) = self.child.take() {
+            // stop_child never ran: capture_pump panicked or was cancelled while
+            // still owning a live pw-record. Killing under reap_briefly's 250 ms
+            // and then dropping the child and both reader handles would let a
+            // slow-exiting child — or a descendant holding the pipe — outlive
+            // Drop while the reaper looks empty, so supervise_recording could
+            // permit Idle mid-cleanup. Hand the raw child and reader handles to
+            // the reaper's bounded kill/reap instead; every Idle-permitting path
+            // drains it before its acknowledgement releases the next Recording.
+            self.reaper.adopt_capture_blocking(
+                child,
+                self.reader.take(),
+                self.stderr_reader.take(),
+            );
         }
     }
 }
@@ -1688,16 +1733,16 @@ struct GroqStream {
 /// `spawn_blocking` curl reap those tasks own — has completed.
 type ReapTask = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
-/// Actor-owned supervisor that keeps every provider-stream cleanup alive and
-/// awaitable. When a provider stream is dropped mid-abort — for example the
-/// abort deadline elapsed and Tokio dropped the abort future that owned the
-/// boxed stream — the stream signals cancellation and hands its still-live chunk
-/// tasks here. Adoption is SYNCHRONOUS: it retains the raw handles inside a
+/// Actor-owned supervisor that keeps capture and provider-stream cleanup alive
+/// and awaitable. When an adapter is dropped mid-abort — for example the abort
+/// deadline elapsed and Tokio dropped the future that owned it — the adapter
+/// hands its still-live cleanup task here. Adoption is SYNCHRONOUS: it retains
+/// the raw handles inside a
 /// future without spawning and without touching `Handle::try_current()`, so a
 /// stream dropped from any thread — including during runtime teardown — always
-/// lands its cleanup in this supervisor. The retained cleanup AWAITS each chunk
-/// task (never `abort()`, which would drop the task's nested `spawn_blocking`
-/// handle and detach the still-running curl before the child is reaped).
+/// lands its cleanup in this supervisor. The retained cleanup AWAITS each task
+/// (never `abort()`, which would drop a nested `spawn_blocking` handle and
+/// detach the still-running process cleanup before the child is reaped).
 /// Drains are serialized: a concurrent drain waits for the in-flight one and
 /// then re-checks, so it can never observe an empty supervisor while another
 /// drain still holds unfinished cleanup. Each workflow task drains this
@@ -1725,18 +1770,63 @@ impl ProviderReaper {
     /// runtime-free: the handles are wrapped in a future and retained; only a
     /// later `drain` polls them, so adopting from a non-runtime thread or a
     /// shutting-down runtime can never detach or abort the cleanup.
+    /// Retains one cleanup future. Called from `Drop` (capture and
+    /// provider-stream adoption), so it must never unwind: a poisoned lock is
+    /// recovered rather than `expect`ed. The lock is only ever held for a
+    /// push/take/len, so its guarded state stays consistent under recovery.
+    fn retain(&self, task: ReapTask) {
+        let mut guard = match self.tasks.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.push(task);
+    }
+
     fn adopt<T: Send + 'static>(&self, mut chunks: VecDeque<tokio::task::JoinHandle<T>>) {
         if chunks.is_empty() {
             return;
         }
-        self.tasks
-            .lock()
-            .expect("provider reaper mutex poisoned")
-            .push(Box::pin(async move {
-                while let Some(chunk) = chunks.pop_front() {
-                    let _ = chunk.await;
-                }
-            }));
+        self.retain(Box::pin(async move {
+            while let Some(chunk) = chunks.pop_front() {
+                let _ = chunk.await;
+            }
+        }));
+    }
+
+    fn adopt_capture(
+        &self,
+        cleanup: tokio::task::JoinHandle<Result<Vec<u8>, BoundaryError>>,
+    ) {
+        self.adopt(VecDeque::from([cleanup]));
+    }
+
+    /// Adopts a pre-stop capture whose `stop_child` never ran: the raw pw-record
+    /// child and reader threads are still live. A dedicated OS thread performs
+    /// `stop_child_blocking`'s bounded kill/reap/join off any async worker, and
+    /// the retained future awaits its completion signal, so a drain blocks the
+    /// Idle transition until the child and both reader threads are actually gone
+    /// — not merely `reap_briefly`'s 250 ms. Runtime-free and non-panicking: no
+    /// `spawn_blocking` and no `Handle::try_current`, so this still lands its
+    /// cleanup when `Drop` runs on a non-runtime teardown thread. The thread's
+    /// own bounds (`wait_for_child` and the two `bounded_join`s under
+    /// `PROCESS_DEADLINE`) guarantee it signals, so the drain terminates.
+    fn adopt_capture_blocking(
+        &self,
+        child: Child,
+        reader: Option<thread::JoinHandle<()>>,
+        stderr_reader: Option<thread::JoinHandle<Vec<u8>>>,
+    ) {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        thread::spawn(move || {
+            // Abandoned Recording: SIGKILL (graceful = false), mirroring the
+            // prior `child.kill()`. The classification result is irrelevant to a
+            // dropped capture and is discarded; only the reap matters.
+            let _ = stop_child_blocking(child, reader, stderr_reader, false);
+            let _ = done_tx.send(());
+        });
+        self.retain(Box::pin(async move {
+            let _ = done_rx.await;
+        }));
     }
 
     /// Number of cleanup futures currently retained and not being drained.
@@ -1761,12 +1851,14 @@ impl ProviderReaper {
     /// unfinished cleanup — but a caller about to tear down the runtime would
     /// then drop the supervisor and detach that cleanup after all, so teardown
     /// paths must use this instead and keep draining. Each retained cleanup is
-    /// internally bounded (a cancelled curl wait kills and reaps its child
-    /// within its own poll bound), so this terminates; the service unit's
+    /// internally bounded (capture and provider waits kill and reap their child
+    /// within their own poll bounds), so this terminates; the service unit's
     /// explicit TimeoutStopSec is the external last-resort backstop.
     pub async fn drain_to_completion(&self, pass: Duration) {
         while !self.drain(pass).await {
-            eprintln!("provider cleanup still draining");
+            // Guaranteed-completion callers gate the Idle transition on this
+            // drain; a failed stderr write must not panic it (`eprintln!` does).
+            let _ = writeln!(std::io::stderr(), "provider cleanup still draining");
         }
     }
 
@@ -4537,6 +4629,118 @@ mod tests {
             merge_chunk_transcripts(vec![first.join(" "), second.join(" ")]);
         let expected: Vec<String> = (0..60).map(|i| format!("w{i}")).collect();
         assert_eq!(merged, expected.join(" "), "the 30-word overlap is deduped");
+    }
+
+    #[tokio::test]
+    async fn dropped_capture_retains_blocking_cleanup_until_reaper_drain() {
+        let reaper = ProviderReaper::new();
+        let entered = Arc::new(AtomicBool::new(false));
+        let cleanup_done = Arc::new(AtomicBool::new(false));
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let entered_task = Arc::clone(&entered);
+        let cleanup_done_task = Arc::clone(&cleanup_done);
+        let cleanup = tokio::task::spawn_blocking(move || {
+            entered_task.store(true, Ordering::SeqCst);
+            let _ = release_rx.recv();
+            cleanup_done_task.store(true, Ordering::SeqCst);
+            Ok(Vec::new())
+        });
+        wait_for(&entered).await;
+
+        let capture = PipeWireActiveCapture {
+            child: None,
+            state: Arc::new(Mutex::new(CaptureReaderState {
+                chunks: VecDeque::new(),
+                received_bytes: 0,
+                eof: true,
+                error: None,
+            })),
+            reader: None,
+            stderr_reader: None,
+            cleanup: Some(cleanup),
+            reaper: reaper.clone(),
+            pcm: Vec::new(),
+            started: Instant::now(),
+            deadline: DEFAULT_RECORDING_DEADLINE,
+        };
+
+        // This is the state produced when an outer abort deadline drops
+        // stop_child while its spawn_blocking cleanup still owns pw-record.
+        drop(capture);
+        assert_eq!(
+            reaper.pending(),
+            1,
+            "capture cleanup must be retained instead of detached"
+        );
+        assert!(
+            !cleanup_done.load(Ordering::SeqCst),
+            "cleanup must still be live before the actor drains the reaper"
+        );
+
+        let _ = release.send(());
+        assert!(
+            reaper.drain(Duration::from_secs(2)).await,
+            "the retained capture cleanup must drain before Idle"
+        );
+        assert!(
+            cleanup_done.load(Ordering::SeqCst),
+            "draining must await the blocking capture cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_capture_before_stop_retains_child_cleanup_until_reaper_drain() {
+        // capture_pump can panic or be cancelled while still owning a live
+        // pw-record before stop_child ever runs: child is Some, cleanup is None.
+        // Drop must not merely kill-and-forget under reap_briefly's 250 ms — a
+        // slow-exiting child would then outlive Drop while the reaper looks empty
+        // and Idle is permitted mid-cleanup. It must hand a bounded kill/reap to
+        // the reaper so the workflow drains it before acknowledging completion.
+        let reaper = ProviderReaper::new();
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a killable stand-in child");
+        let pid: i32 = child.id().try_into().expect("child pid fits in pid_t");
+
+        let capture = PipeWireActiveCapture {
+            child: Some(child),
+            state: Arc::new(Mutex::new(CaptureReaderState {
+                chunks: VecDeque::new(),
+                received_bytes: 0,
+                eof: true,
+                error: None,
+            })),
+            reader: None,
+            stderr_reader: None,
+            cleanup: None,
+            reaper: reaper.clone(),
+            pcm: Vec::new(),
+            started: Instant::now(),
+            deadline: DEFAULT_RECORDING_DEADLINE,
+        };
+
+        drop(capture);
+        assert_eq!(
+            reaper.pending(),
+            1,
+            "a pre-stop capture drop must retain its child cleanup in the reaper"
+        );
+
+        assert!(
+            reaper.drain(Duration::from_secs(4)).await,
+            "the retained pre-stop capture cleanup must drain before Idle"
+        );
+        // Draining awaited the bounded kill/reap, so the child is gone (reaped,
+        // not a lingering zombie) — kill(pid, 0) can no longer find it.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(
+            !alive,
+            "draining must have killed and reaped the abandoned pw-record child"
+        );
     }
 
     #[tokio::test]

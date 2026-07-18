@@ -111,9 +111,9 @@ async fn run() -> Result<(), String> {
     }
 
     let (actor_tx, actor_rx) = mpsc::channel(64);
-    // The actor-owned provider reaper supervises every provider-stream cleanup.
+    // The actor-owned reaper supervises capture and provider-stream cleanup.
     // A clone stays here so shutdown, after the actor has joined, drains any
-    // curl reap still retained before the Tokio runtime is torn down.
+    // process reap still retained before the Tokio runtime is torn down.
     let reaper = ProviderReaper::new();
     let actor = tokio::spawn(actor_loop(
         actor_rx,
@@ -417,7 +417,7 @@ async fn actor_loop(
     let mut capture: Option<Box<dyn AudioCapture>> = Some(if controlled {
         Box::new(ControlledCapture::from_env())
     } else {
-        Box::new(PipeWireCapture)
+        Box::new(PipeWireCapture::new(reaper.clone()))
     });
     let mut deepgram: Option<Box<dyn TranscriptProvider>> = Some(if controlled {
         Box::new(ControlledProvider::from_env(Provider::Deepgram))
@@ -732,7 +732,9 @@ async fn actor_loop(
                                         ),
                                     }
                                 }
-                                shutdown_reaper.drain(RECOVERY_ABORT_DEADLINE).await;
+                                shutdown_reaper
+                                    .drain_to_completion(RECOVERY_ABORT_DEADLINE)
+                                    .await;
                                 let _ = actor.send(ActorMessage::Recovered(id)).await;
                             });
                         }
@@ -1286,12 +1288,12 @@ async fn recover_failed_start(
         }
     };
     tokio::join!(capture_abort, provider_abort);
-    // A timed-out provider abort dropped its stream above, adopting the still-
-    // live cleanup into the reaper. Drain it before acknowledging: Recovered
-    // alone permits the Idle transition.
-    if !reaper.drain(RECOVERY_ABORT_DEADLINE).await {
-        eprintln!("Recording {id} [{correlation}]: provider cleanup did not drain in bound");
-    }
+    // A timed-out capture/provider abort dropped its adapter above, adopting
+    // still-live cleanup into the reaper. Drain to completion before
+    // acknowledging: Recovered alone permits the Idle transition.
+    reaper
+        .drain_to_completion(RECOVERY_ABORT_DEADLINE)
+        .await;
     let _ = actor.send(ActorMessage::Recovered(id)).await;
 }
 
@@ -1644,14 +1646,12 @@ async fn supervise_recording(
             }
         }
     };
-    // Every provider stream has been consumed or dropped now, including streams
-    // dropped by a panic and adopted into the reaper. Drain before acknowledging:
-    // Completed alone permits the Idle transition.
-    if !reaper.drain(RECOVERY_ABORT_DEADLINE).await {
-        log_best_effort(format_args!(
-            "Recording {id}: provider cleanup did not drain within the abort bound"
-        ));
-    }
+    // Every capture/provider adapter has completed or dropped now, including
+    // cleanup dropped by a panic and adopted into the reaper. Drain to
+    // completion before acknowledging: Completed alone permits the Idle
+    // transition, so a new Recording cannot overlap this Recording's blocking
+    // cleanup even when one bounded drain pass expires.
+    reaper.drain_to_completion(RECOVERY_ABORT_DEADLINE).await;
     let _ = actor
         .send(ActorMessage::Completed(Completion {
             id,
@@ -1801,14 +1801,11 @@ async fn supervise_replay(
             }
         }
     };
-    // A replay whose provider abort timed out dropped its streams above,
-    // adopting their cleanup into the reaper. Drain it before acknowledging:
-    // ReplayCompleted alone permits the Idle transition.
-    if !reaper.drain(RECOVERY_ABORT_DEADLINE).await {
-        log_best_effort(format_args!(
-            "Replay {id}: provider cleanup did not drain within the abort bound"
-        ));
-    }
+    // A replay whose capture/provider abort timed out dropped its adapters
+    // above, adopting their cleanup into the reaper. Drain to completion before
+    // acknowledging: ReplayCompleted alone permits the Idle transition, so the
+    // next Recording cannot overlap this replay's blocking cleanup.
+    reaper.drain_to_completion(RECOVERY_ABORT_DEADLINE).await;
     let _ = actor.send(ActorMessage::ReplayCompleted(completion)).await;
 }
 
