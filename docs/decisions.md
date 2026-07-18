@@ -390,3 +390,17 @@ payload formats. Rejected: duration gate proposed in the ticket.
 adopts the capture into the reaper rather than guaranteeing further reads), so
 asserting them is a race — it broke CI once (PR #28). Rejected: retrying/
 sleeping the assertion, which would mask genuine drain regressions.
+
+## 2026-07-18 — CI clippy gate ships with justified crate-root allows
+**Why:** `result_large_err`/`large_enum_variant`/`too_many_arguments` reflect
+deliberate rich-diagnostic and supervisor shapes; boxing/shrinking them is a
+cross-cutting change owned by the hardening-05 hygiene sweep. The alternative —
+blocking the gate on that refactor — would leave main unprotected meanwhile.
+Each allow carries a comment naming the debt.
+
+## 2026-07-18 — systemd sandbox directives merge only after real-install validation
+**Why:** unit-file linting can't prove PipeWire/portal/Secret-Service/libei
+still work under `ProtectSystem=strict` + address-family restrictions, and
+merging before the live latency eval could confound its measurements. PR #31
+stays open until Raja's install validates every directive. Alternative rejected:
+merging on `systemd-analyze verify` alone.
