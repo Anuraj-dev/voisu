@@ -8,6 +8,8 @@
 //!   seam: ticket 05 consumes it read-only to feed Deepgram keyterm boosting.
 //! * [`whisper_prompt`] — a natural comma-separated glossary truncated to the
 //!   ~224-token Whisper prompt budget, fed to the Groq/Whisper `prompt` field.
+//! * [`deepgram_keyterms`] — the merged terms truncated to Deepgram's streaming
+//!   keyterm token and count budgets, preserving user-term priority.
 //!
 //! The user dictionary is plain text at `$XDG_CONFIG_HOME/voisu/dictionary.txt`
 //! (default `~/.config/voisu/dictionary.txt`): one term per line, `#` starts a
@@ -20,6 +22,14 @@ use std::path::{Path, PathBuf};
 /// Whisper honours only ~224 tokens of prompt. The prompt builder appends terms
 /// until adding the next one would cross this budget, then stops.
 pub const WHISPER_PROMPT_TOKEN_BUDGET: usize = 224;
+
+/// Deepgram rejects streaming connections whose keyterms exceed this provable
+/// token bound. The daemon must stay within it because a 400 response kills
+/// the entire streaming connection.
+pub const DEEPGRAM_KEYTERM_TOKEN_BUDGET: usize = 500;
+
+/// Keep Deepgram keyterm boosting well below its recommended term count.
+pub const DEEPGRAM_KEYTERM_COUNT_LIMIT: usize = 100;
 
 /// AI tooling vocabulary. Ordinary English words (token, prompt, inference…)
 /// are deliberately absent: Whisper and nova-3 already transcribe them, and
@@ -133,6 +143,32 @@ fn builtin_terms() -> Vec<String> {
 /// builder and, in ticket 05, Deepgram keyterm boosting.
 pub fn merged_terms() -> Vec<String> {
     merged_terms_with(load_user_terms(&user_dictionary_path()))
+}
+
+/// The Deepgram keyterm vocabulary: `terms` truncated in order to the
+/// [`DEEPGRAM_KEYTERM_TOKEN_BUDGET`] and [`DEEPGRAM_KEYTERM_COUNT_LIMIT`].
+/// Deepgram returns a 400 response when its keyterm token cap is exceeded,
+/// which kills the whole streaming connection. [`token_upper_bound`] assumes
+/// token count never exceeds UTF-8 byte count when tokens consume at least one
+/// input byte and normalization does not expand it. Deepgram does not document
+/// its tokenizer, so this is a conservative engineering assumption for typical
+/// short ASCII technical terms, not a proof.
+pub fn deepgram_keyterms(terms: &[String]) -> Vec<String> {
+    let mut keyterms = Vec::new();
+    let mut token_count = 0;
+
+    for term in terms {
+        let candidate_token_count = token_count + token_upper_bound(term.len());
+        if keyterms.len() == DEEPGRAM_KEYTERM_COUNT_LIMIT
+            || candidate_token_count > DEEPGRAM_KEYTERM_TOKEN_BUDGET
+        {
+            break;
+        }
+        keyterms.push(term.clone());
+        token_count = candidate_token_count;
+    }
+
+    keyterms
 }
 
 /// The Whisper vocabulary prompt: a natural comma-separated glossary of the
@@ -249,13 +285,12 @@ fn whisper_prompt_from_terms(terms: &[String]) -> String {
     prompt
 }
 
-/// A provable upper bound on the real Whisper token count of a glossary that is
-/// `byte_len` UTF-8 bytes long. Whisper's byte-level BPE (like GPT-2) starts
-/// from one token per input byte and only ever merges adjacent tokens, so the
-/// emitted token count never exceeds the byte count. Char/4-style heuristics
-/// under-count multibyte terms (emoji, punctuation, CJK); the byte length never
-/// does, so truncating against it can only over-count, never over-run the
-/// ~224-token prompt window Whisper honours.
+/// A provable upper bound on the real BPE token count of text that is
+/// `byte_len` UTF-8 bytes long. Byte-level BPE starts from one token per input
+/// byte and only ever merges adjacent tokens, so the emitted token count never
+/// exceeds the byte count. Char/4-style heuristics under-count multibyte terms
+/// (emoji, punctuation, CJK); the byte length never does, so truncating against
+/// it can only over-count, never over-run a provider's token budget.
 fn token_upper_bound(byte_len: usize) -> usize {
     byte_len
 }
@@ -399,5 +434,86 @@ Tokio   # inline comment
         // begins a comment at line start or after whitespace.
         let terms = parse_user_terms("C#\nF#\nTokio # trailing comment\n# whole-line\n");
         assert_eq!(terms, vec!["C#", "F#", "Tokio"]);
+    }
+
+    #[test]
+    fn deepgram_keyterms_truncate_oversized_lists_within_both_budgets() {
+        let terms: Vec<String> = (0..600).map(|index| format!("term{index:03}")).collect();
+
+        let keyterms = deepgram_keyterms(&terms);
+
+        assert!(keyterms.len() <= DEEPGRAM_KEYTERM_COUNT_LIMIT);
+        assert!(
+            keyterms
+                .iter()
+                .map(|term| token_upper_bound(term.len()))
+                .sum::<usize>()
+                <= DEEPGRAM_KEYTERM_TOKEN_BUDGET
+        );
+        assert_eq!(keyterms, terms[..keyterms.len()]);
+        assert!(keyterms.len() < terms.len(), "late terms are truncated");
+    }
+
+    #[test]
+    fn deepgram_keyterms_keep_user_terms_ahead_of_builtins_when_truncated() {
+        let user: Vec<String> = (0..DEEPGRAM_KEYTERM_COUNT_LIMIT)
+            .map(|index| format!("user{index:03}"))
+            .collect();
+        let merged = merged_terms_with(user.clone());
+
+        let keyterms = deepgram_keyterms(&merged);
+
+        assert_eq!(keyterms, user[..keyterms.len()]);
+        assert!(keyterms.len() < user.len(), "late user terms are truncated");
+        assert!(!keyterms.iter().any(|term| term == "Claude"));
+    }
+
+    #[test]
+    fn deepgram_keyterms_leave_lists_within_both_budgets_unchanged() {
+        let terms = vec!["Voisu".to_owned(), "Deepgram".to_owned(), "systemctl".to_owned()];
+
+        assert_eq!(deepgram_keyterms(&terms), terms);
+    }
+
+    #[test]
+    fn deepgram_keyterms_exclude_the_first_term_that_crosses_the_token_budget() {
+        let terms = vec!["a".repeat(499), "bc".to_owned(), "later".to_owned()];
+
+        assert_eq!(deepgram_keyterms(&terms), vec!["a".repeat(499)]);
+    }
+
+    #[test]
+    fn deepgram_keyterms_accept_exactly_the_token_budget_and_drop_the_next_byte() {
+        let exactly_at_budget = vec!["a".repeat(499), "b".to_owned()];
+        let one_byte_over_budget = vec!["a".repeat(500), "b".to_owned()];
+
+        assert_eq!(deepgram_keyterms(&exactly_at_budget), exactly_at_budget);
+        assert_eq!(
+            deepgram_keyterms(&one_byte_over_budget),
+            vec!["a".repeat(500)]
+        );
+    }
+
+    #[test]
+    fn deepgram_keyterms_accept_exactly_the_count_limit_and_drop_the_next_term() {
+        let terms: Vec<String> = (0..=DEEPGRAM_KEYTERM_COUNT_LIMIT)
+            .map(|index| format!("t{index:03}"))
+            .collect();
+
+        assert_eq!(
+            deepgram_keyterms(&terms[..DEEPGRAM_KEYTERM_COUNT_LIMIT]),
+            terms[..DEEPGRAM_KEYTERM_COUNT_LIMIT]
+        );
+        assert_eq!(
+            deepgram_keyterms(&terms),
+            terms[..DEEPGRAM_KEYTERM_COUNT_LIMIT]
+        );
+    }
+
+    #[test]
+    fn deepgram_keyterms_stop_when_the_first_term_exceeds_the_token_budget() {
+        let terms = vec!["a".repeat(DEEPGRAM_KEYTERM_TOKEN_BUDGET + 1), "later".to_owned()];
+
+        assert_eq!(deepgram_keyterms(&terms), Vec::<String>::new());
     }
 }
