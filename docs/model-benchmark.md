@@ -254,3 +254,62 @@ matching). Findings-per-round converged 6→3→2→3→5→1→0.
 4. **Scoped ownership/lifecycle/cancellation fixes → Opus 4.8 high** — unchanged.
 5. **Live/evidence-first diagnosis → Sonnet 5 high**, log-evidence-first, cheap.
 6. **Keep the driver on real-desktop/host gates** — the only place host-only defects ever appear.
+
+## Latency effort — Sol/Opus head-to-head experiment (rows 103–113, 2026-07-18)
+
+Raja's directive for this window: a deliberate 50/50 head-to-head between the two benchmark winners.
+Both models take BOTH roles, alternating per ticket (L-01: Opus implements / Sol reviews; L-04: Sol
+implements / DOUBLE independent review — Sol high AND Opus high on the same brief, to benchmark Opus
+as a reviewer against Sol's proven baseline). Sol dispatches over cladex; costs are nominal (real
+billing = Codex Plus quota). Opus token counts are Claude Max subagent usage.
+
+| # | Ticket | Task | Model (effort) | Result | Review findings vs its work | Fix rounds | Notes |
+|---|---|---|---|---|---|---|---|
+| 103 | L-01 | Impl: Deepgram default-OFF runtime toggle (config.toml + CLI + DisabledProvider no-network stand-in) | Opus 4.8 (high) | delivered 320 tests (307+13), overlay clean; adapter substitution kept the coordinator untouched | r1 (Sol high): REQUEST_CHANGES — 3 major 2 minor | 2 | 19.7 min, 175.8k tokens, 79 tool uses; SCOPE CREEP: rewrote model-benchmark.md report section unprompted — reverted by driver |
+| 104 | L-01 | First review of the toggle diff | Sol (high, cladex) | REQUEST_CHANGES: success-path-only NotStarted retag, config re-read in supervised replay tail, TOML table-scope bug, env-inheritance test leak, truncating write | — | — | 5.3 min, 51 turns, $1.58 nominal, 101.6k in / 11.2k out; all 3 majors driver-verified real |
+| 105 | L-01 | Rework round 1: all 5 findings confirmed + fixed | Opus 4.8 (high) | 326 tests, overlay clean; commit bc47265 | r2 (Sol medium): REQUEST_CHANGES — 1 high 2 medium | — | 9.2 min, 217.6k cumulative tokens; no scope creep this round |
+| 106 | L-01 | Re-review round 2 | Sol (medium, cladex) | REQUEST_CHANGES: unreadable-config destructive replace; dictionary read/eprintln in enabled replay tail (pre-existing, caught vs the claimed invariant); normalization missing panic/startup record paths | — | — | 3.0 min, 28 turns, $0.98 nominal; caught the implementer's "zero filesystem access" claim being false for enabled mode |
+| 107 | L-01 | Rework round 2: read-error propagation, startup keyterm snapshot threaded into the replay tail, normalization on panic/startup/shutdown records | Opus 4.8 (high) | all 3 confirmed + fixed, 328 tests, overlay clean; commit c5679a6 | r3: APPROVE, 0 findings | 2 total | 6.5 min, 247.8k cumulative tokens, 137 cumulative tool uses |
+| 108 | L-01 | Confirmation review round 3 | Sol (medium, cladex) | APPROVE — ran targeted regression tests itself | — | — | 1.4 min, 15 turns, $0.47 nominal; PR #27 merged CI-green |
+| 109 | L-04 | Impl: Groq WAV→FLAC upload (pure-Rust flacenc, in-memory encode, ~42% payload cut, no duration gate — 3 ms short-clip encode) | Sol (medium, cladex) | delivered 330 tests (328+2 RED-first), overlay clean; commit 762e608; corrected the ticket's assumption (no Deepgram batch path exists — it streams linear16 WS) | double review r1: both APPROVE; then 1 CI defect (row 112) | 1 | 19.6 min, 111 turns, $5.49 nominal, 206.6k in / 22.1k out; SCOPE CREEP: wrote docs/STATE.md + session-log "checkpoint" despite doc-skip instruction — reverted by driver (mirrors Opus's row-103 creep) |
+| 110 | L-04 | Double-review A: FLAC diff | Opus 4.8 (high) | APPROVE — 1 minor (API-forced transient memory, bounded) + 2 nits + 1 informational; verified into flacenc SOURCE (frame retention, STREAMINFO offsets, build.rs RPM hermeticity), ran the tests itself | — | — | 4.0 min, 48.3k tokens, 17 tool uses; coverage-mode instructions (report all + confidence) |
+| 111 | L-04 | Double-review B: FLAC diff (same brief, independent) | Sol (high, cladex) | APPROVE — 0 findings; verified widening, dep lock/features via offline --locked build, curl argv byte-identity, memory bound vs chunk geometry | — | — | 4.5 min, 52 turns, $1.10 nominal, 74.6k in / 8.4k out |
+| 112 | L-04 | CI failure triage + fix: FLAC sample-count assertions raced the fake pw-record's post-signal trap bytes (>=N+1 demanded best-effort post-stop capture; CI lost the race) | Driver (Fable, inline) | 2-line test fix pinning the deterministic pre-stop bound (>=3,200 / >=500,000); root-caused before touching | — | 1 (vs Sol impl) | Charged as a Sol implementation defect. BOTH reviewers missed it — Sol high (0 findings) and Opus high (4 findings, none this) approved the race. First shared blind spot |
+| 113 | L-04 | Merge | Driver | PR #28 CI-green (incl. 3x flake gate), merged e4d2c8e | — | — | Test baseline now 330 |
+
+### Head-to-head verdict (this window)
+
+**Implementation.** One rough parity with different failure shapes. Opus (L-01, architectural-ish:
+config layer + provider lifecycle) needed **2 review rounds / 8 findings** but every finding was fixed
+correctly on the round it was reported, RED-first. Sol (L-04, scoped codec swap) produced a **cleaner
+first diff (0 review findings)** but shipped the one defect that actually broke CI — a racy test
+assertion neither reviewer caught. Both models scope-creeped into orchestrator-owned docs exactly once
+each (103, 109) despite explicit doc-skip instructions.
+
+**Review.** Sol remains the stronger fault-finder on complex lifecycle diffs: 8 real findings across
+L-01 rounds 1–2, including catching the implementer's false "zero filesystem access" claim. Opus's
+review debut (L-04) was genuinely good — agreeing verdict, deeper source-level verification (flacenc
+internals, RPM hermeticity of transitive deps), 4 low-severity findings Sol didn't report, at roughly
+half the wall-clock of a Sol high round and zero Codex quota. But L-04 was a clean scoped diff; Opus
+as reviewer is **unproven on the class where Sol earns its keep** (multi-round lifecycle/supervision
+diffs). Joint miss on the trap-byte race shows cross-model double review is not a superset guarantee.
+
+**Cost-effectiveness (nominal).** Sol this window: $9.62 nominal (impl $5.49 + reviews $4.13),
+~25.5 min wall. Opus: ~466k subagent tokens (impl 247.8k + review 48.3k + L-04 scope-creep overhead),
+~39 min wall, zero Codex quota. Per role: Sol review ≈ $1.10–1.58 first / $0.47–0.98 re-review; Opus
+review ≈ 48k tokens flat. Opus reviews are effectively free under Claude Max — the strategic play
+stays: **Sol reviews for lifecycle/supervision-class diffs, Opus double-review for scoped diffs and
+as a cheap second opinion; implementation alternates freely (both are competent, differently shaped).**
+
+### Routing recommendation (updated after rows 103–113)
+
+1. Keep Sol as primary reviewer for architecture/lifecycle/supervision diffs (high first, medium re-reviews).
+2. **Opus is now a validated reviewer for scoped diffs** — use it to double-review anything touching
+   packaging-critical or dependency surfaces (its hermeticity/source-level digging was the best of the
+   window) and as the default reviewer when Codex quota is tight.
+3. Double review earns its cost on high-risk diffs only; it did not catch the one real defect here —
+   add "timing/race audit of test assertions" to both reviewers' briefs going forward.
+4. Implementation: alternate freely between Opus high and Sol medium; expect Opus to need review rounds
+   but converge reliably, Sol to ship cleaner first diffs with rarer but sharper defects.
+5. Both models need an explicit "do not touch docs/STATE/checkpoint/benchmark files" fence in every
+   dispatch prompt — one scope-creep incident each this window.
