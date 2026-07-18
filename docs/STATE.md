@@ -2,20 +2,20 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-18
 
 ## 🚧 In progress / next
-- **Accuracy branch LIVE-TESTED — awaiting Raja's ship/hold decision.** Branch
-  `feature/transcription-accuracy` tip `2f90a10` (NOT pushed). RPM
-  `git2f90a10` built, installed, and live-verified on this machine.
-  Live WER (4-paragraph Appendix A suite, baseline 26.3%): **final overall
-  10.8% raw / 10.0% formatting-adjusted** — P1 6.1%, P2 (CLI vocab) 19.3%,
-  P3 6.0%, P4 12.9%. Both providers present on every recording; post-finalize
-  latency 1.0–1.5 s (bar ~1 s); stress test **118 s continuous recording PASS**.
-  Residual fluent-nonsense on rare CLI/domain terms ("rpmbuild"→"RPM build",
-  "changelog"→"channel log", "reconciler"→"Reconcealer"). Gate is MARGINAL,
-  not a clean pass → per rules, NOT pushed/PR'd.
-  **Next: Raja decides — (a) ship as-is (26.3%→~10% stands), then push branch,
-  PR to main, merge on CI green (no AI credits); or (b) one more accuracy pass
-  wiring CLI jargon into dictionary keyterms before shipping.**
-- **PRIORITY ORDER after this branch integrates to main (decided 2026-07-18):**
+- **ACCURACY BRANCH MERGED to main (PR #23, merge `524deda`, CI green).**
+  Final live WER 10.8% raw / **9.2% formatting-adjusted** (baseline 26.3%)
+  after the CLI-keyterm pass `f027a2b` (prompt-budget truncation was the root
+  cause — all CLI compounds now correct; P2 19.3%→10.5%). Deepgram KEPT:
+  worst alone (21.8% avg) but reconciliation cuts Groq-alone 15.1%→10.9% avg
+  across 8 scored recordings. Local machine runs RPM `git44810d1`.
+- **NEXT (Raja's call, overrides the audit-first order): the delivery bug** —
+  delivery always `clipboard_fallback` ("active keyboard layout unavailable",
+  xkbcommon parse errors in the libei keymap path, `system.rs`
+  `keyboard_keymap_text` ~3033–3110). Check the parallel worktree branch
+  `fix/delivery-keymap-fd` (under /tmp) for adoptable work BEFORE coding.
+  Handoff prompt already given to Raja (orchestrator-style, session
+  2026-07-18 09:42+ log).
+- **PRIORITY ORDER after the delivery bug (decided 2026-07-18):**
   land the TWO CRITICAL audit fixes FIRST, before any latency ticket — (1)
   supervise `process_recording`/remove `pump.await.expect` (voisu-daemon.rs,
   panic wedges daemon in Processing forever; mirror `supervise_replay`), (2)
