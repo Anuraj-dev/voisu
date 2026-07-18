@@ -148,9 +148,11 @@ pub fn merged_terms() -> Vec<String> {
 /// The Deepgram keyterm vocabulary: `terms` truncated in order to the
 /// [`DEEPGRAM_KEYTERM_TOKEN_BUDGET`] and [`DEEPGRAM_KEYTERM_COUNT_LIMIT`].
 /// Deepgram returns a 400 response when its keyterm token cap is exceeded,
-/// which kills the whole streaming connection. [`token_upper_bound`] therefore
-/// uses UTF-8 byte length as a provable upper bound, so this cap can only
-/// over-count tokens and never over-run Deepgram's limit.
+/// which kills the whole streaming connection. [`token_upper_bound`] assumes
+/// token count never exceeds UTF-8 byte count when tokens consume at least one
+/// input byte and normalization does not expand it. Deepgram does not document
+/// its tokenizer, so this is a conservative engineering assumption for typical
+/// short ASCII technical terms, not a proof.
 pub fn deepgram_keyterms(terms: &[String]) -> Vec<String> {
     let mut keyterms = Vec::new();
     let mut token_count = 0;
@@ -478,5 +480,40 @@ Tokio   # inline comment
         let terms = vec!["a".repeat(499), "bc".to_owned(), "later".to_owned()];
 
         assert_eq!(deepgram_keyterms(&terms), vec!["a".repeat(499)]);
+    }
+
+    #[test]
+    fn deepgram_keyterms_accept_exactly_the_token_budget_and_drop_the_next_byte() {
+        let exactly_at_budget = vec!["a".repeat(499), "b".to_owned()];
+        let one_byte_over_budget = vec!["a".repeat(500), "b".to_owned()];
+
+        assert_eq!(deepgram_keyterms(&exactly_at_budget), exactly_at_budget);
+        assert_eq!(
+            deepgram_keyterms(&one_byte_over_budget),
+            vec!["a".repeat(500)]
+        );
+    }
+
+    #[test]
+    fn deepgram_keyterms_accept_exactly_the_count_limit_and_drop_the_next_term() {
+        let terms: Vec<String> = (0..=DEEPGRAM_KEYTERM_COUNT_LIMIT)
+            .map(|index| format!("t{index:03}"))
+            .collect();
+
+        assert_eq!(
+            deepgram_keyterms(&terms[..DEEPGRAM_KEYTERM_COUNT_LIMIT]),
+            terms[..DEEPGRAM_KEYTERM_COUNT_LIMIT]
+        );
+        assert_eq!(
+            deepgram_keyterms(&terms),
+            terms[..DEEPGRAM_KEYTERM_COUNT_LIMIT]
+        );
+    }
+
+    #[test]
+    fn deepgram_keyterms_stop_when_the_first_term_exceeds_the_token_budget() {
+        let terms = vec!["a".repeat(DEEPGRAM_KEYTERM_TOKEN_BUDGET + 1), "later".to_owned()];
+
+        assert_eq!(deepgram_keyterms(&terms), Vec::<String>::new());
     }
 }
