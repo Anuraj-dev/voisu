@@ -372,3 +372,21 @@ full harness tooling, JSON usage capture, and native `--effort` passthrough
 budget directive: split work ~50/50 — Sol keeps architecture-grade implementation
 and all reviews; Claude (driver/Opus) takes scoped lifecycle fixes, point work,
 reconciliation, and docs. Codex CLI remains the fallback if the proxy misbehaves.
+
+## 2026-07-18 — Disabled Deepgram is an adapter stand-in, not coordinator surgery
+**Why:** `DisabledProvider` completes the barrier instantly with the canonical
+"Deepgram disabled for this Recording" diagnostic, so `ProviderCoordinator`,
+supervision, and the reaper stay untouched — smallest blast radius, ON-path
+byte-for-byte identical. Rejected: threading an enabled-flag through the
+completion barrier (touches hardened guaranteed-completion code).
+
+## 2026-07-18 — FLAC upload ships ungated by duration
+**Why:** measured short-clip encode cost ~3 ms (2 s clip) for a 42% payload
+cut, so a WAV fallback branch for short Recordings buys nothing and keeps two
+payload formats. Rejected: duration gate proposed in the ticket.
+
+## 2026-07-18 — Test assertions pin only the deterministic pre-stop capture
+**Why:** post-signal bytes from a capture child are best-effort by design (stop
+adopts the capture into the reaper rather than guaranteeing further reads), so
+asserting them is a race — it broke CI once (PR #28). Rejected: retrying/
+sleeping the assertion, which would mask genuine drain regressions.
