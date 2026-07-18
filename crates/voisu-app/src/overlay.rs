@@ -166,42 +166,74 @@ impl PresentationController {
     }
 }
 
-/// The pure "WHEN to re-present" and "WHEN to notify" decision for the fallback
-/// (non-layer-shell) window, kept out of the GTK adapter so it is unit-testable.
+/// The pure "WHEN to re-present" decision for the fallback (non-layer-shell)
+/// window, kept out of the GTK adapter so it is unit-testable.
 ///
 /// A layer-shell surface is kept above by the compositor, but Wayland gives a
 /// plain regular toplevel neither keep-above nor a programmatic raise. The
 /// overlay therefore re-`present()`s the window on each transition INTO a new
 /// visible phase so it resurfaces above whatever occluded it — and *only* on
 /// that edge, never on every 200 ms level-triggered redisplay (e.g. Recording
-/// activity ticks), which would fight the user's focus.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ResurfaceDecision {
-    /// The view entered a new visible phase: re-present the fallback window.
-    pub resurface: bool,
-    /// The view entered the Recording phase specifically: the fallback path
-    /// fires a single desktop notification as a secondary "buried window" cue.
-    pub entered_recording: bool,
-}
-
-/// Edge-tracker over the phase sequence rendered by the observer. Pure and
-/// adapter-free so the resurface and notify edges are tested without GTK.
+/// activity ticks), which would fight the user's focus. Resurfacing is keyed on
+/// the RENDERED phase because a re-present is exactly what a newly-visible
+/// capsule needs, unreachable-blip capsule included.
 #[derive(Debug, Default)]
 pub struct PresentationTracker {
     last_phase: OverlayPhase,
 }
 
 impl PresentationTracker {
-    /// Reports the resurface/notify edges implied by rendering `view` after the
-    /// previously observed view. A repeat of the same phase yields no edges.
-    pub fn observe(&mut self, view: OverlayView) -> ResurfaceDecision {
-        let entered = view.phase != self.last_phase;
-        let decision = ResurfaceDecision {
-            resurface: entered && view.is_visible(),
-            entered_recording: entered && matches!(view.phase, OverlayPhase::Recording),
-        };
+    /// Returns true exactly once per transition INTO a visible rendered phase.
+    /// A repeat of the same phase, or any transition to Hidden, yields false.
+    pub fn observe(&mut self, view: OverlayView) -> bool {
+        let resurface = view.phase != self.last_phase && view.is_visible();
         self.last_phase = view.phase;
-        decision
+        resurface
+    }
+}
+
+/// The successfully-observed daemon signal that drives the Recording-start
+/// notification latch. Deliberately DISTINCT from the rendered phase: a failed
+/// status read renders a "Daemon unavailable" capsule, but that is not a
+/// reachable observation of the daemon's state, so it must leave the latch
+/// untouched. Deriving the notify edge from rendered phases instead would let a
+/// transient read failure mid-Recording refire the notification when Recording
+/// resumes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservedSignal {
+    /// `read_status` failed this tick — the daemon's state was not observed.
+    Unreachable,
+    /// The daemon was reached and rendered to this phase (Recording, Processing,
+    /// Idle→Hidden, or a terminal Success/Failure event).
+    Reachable(OverlayPhase),
+}
+
+/// Edge-latch for the fallback path's secondary "Recording started" desktop
+/// notification. Pure and adapter-free, mirroring `PresentationTracker`.
+///
+/// Fires once when a REACHABLE Recording observation begins and stays silent
+/// until a reachable non-Recording observation (Idle, Processing, or a terminal
+/// event) re-arms it. An `Unreachable` signal leaves the latch untouched, so a
+/// transient blip mid-Recording never produces a duplicate notification.
+#[derive(Debug, Default)]
+pub struct RecordingNotifyLatch {
+    latched: bool,
+}
+
+impl RecordingNotifyLatch {
+    pub fn observe(&mut self, signal: ObservedSignal) -> bool {
+        match signal {
+            ObservedSignal::Unreachable => false,
+            ObservedSignal::Reachable(OverlayPhase::Recording) => {
+                let fire = !self.latched;
+                self.latched = true;
+                fire
+            }
+            ObservedSignal::Reachable(_) => {
+                self.latched = false;
+                false
+            }
+        }
     }
 }
 
@@ -570,37 +602,62 @@ mod tests {
         let processing = OverlayView::from_response(&overlay_status(DaemonState::Processing, None));
         let mut tracker = PresentationTracker::default();
         // hidden -> Recording: a new visible phase, so resurface once.
-        assert!(tracker.observe(recording).resurface);
+        assert!(tracker.observe(recording));
         // Recording -> Recording (a level-triggered redisplay) must NOT re-present.
-        assert!(!tracker.observe(recording).resurface);
+        assert!(!tracker.observe(recording));
         // Recording -> Processing: a new visible phase, resurface again.
-        assert!(tracker.observe(processing).resurface);
+        assert!(tracker.observe(processing));
         // Processing -> Hidden is not a visible phase: never resurface.
-        assert!(!tracker.observe(OverlayView::HIDDEN).resurface);
+        assert!(!tracker.observe(OverlayView::HIDDEN));
         // Hidden -> Hidden never resurfaces.
-        assert!(!tracker.observe(OverlayView::HIDDEN).resurface);
+        assert!(!tracker.observe(OverlayView::HIDDEN));
         // Hidden -> Recording again is a fresh transition: resurface once more.
-        assert!(tracker.observe(recording).resurface);
+        assert!(tracker.observe(recording));
     }
 
     #[test]
-    fn red_recording_start_edge_triggers_a_notification_once() {
-        // RED proof: the fallback (non-layer-shell) path fires a desktop
-        // notification only when Recording STARTS, never on every activity tick
-        // and never on other phases. The edge is the same pure tracker; the
-        // adapter gates it on the fallback backend.
-        let recording = OverlayView::from_response(&overlay_status(DaemonState::Recording, None));
-        let processing = OverlayView::from_response(&overlay_status(DaemonState::Processing, None));
-        let mut tracker = PresentationTracker::default();
-        // Entering Recording is the notify edge.
-        assert!(tracker.observe(recording).entered_recording);
-        // Staying in Recording (activity redisplay) does not re-notify.
-        assert!(!tracker.observe(recording).entered_recording);
-        // Moving to Processing is not a Recording start.
-        assert!(!tracker.observe(processing).entered_recording);
-        // Hidden then Recording is a fresh start: notify again.
-        assert!(!tracker.observe(OverlayView::HIDDEN).entered_recording);
-        assert!(tracker.observe(recording).entered_recording);
+    fn red_recording_start_notifies_once_until_a_reachable_reset() {
+        // RED proof: the fallback path fires the Recording notification only when
+        // a REACHABLE Recording observation begins, and not again while Recording
+        // persists across activity ticks.
+        let mut latch = RecordingNotifyLatch::default();
+        assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)));
+        assert!(!latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)));
+    }
+
+    #[test]
+    fn red_a_transient_unreachable_blip_does_not_refire_the_recording_notification() {
+        // Sol finding 1: the notify edge must come from OBSERVED daemon signals,
+        // not rendered phases. A single failed status read renders the
+        // "Daemon unavailable" capsule mid-Recording, but it is not a reachable
+        // observation, so it must NOT reset the latch — otherwise the next
+        // reachable Recording tick would refire the notification.
+        let mut latch = RecordingNotifyLatch::default();
+        assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)));
+        assert!(!latch.observe(ObservedSignal::Unreachable));
+        // Recording resumes after the blip: still latched, so no second notice.
+        assert!(!latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)));
+    }
+
+    #[test]
+    fn red_a_reachable_non_recording_state_rearms_the_recording_notification() {
+        // Sol finding 1, second half: a genuine reachable non-Recording state
+        // (Idle→Hidden, Processing, or a terminal event) DOES reset the latch, so
+        // the next distinct Recording session notifies again.
+        for reset in [
+            OverlayPhase::Hidden,
+            OverlayPhase::Processing,
+            OverlayPhase::Success,
+            OverlayPhase::Failure,
+        ] {
+            let mut latch = RecordingNotifyLatch::default();
+            assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)));
+            assert!(!latch.observe(ObservedSignal::Reachable(reset)));
+            assert!(
+                latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)),
+                "a reachable {reset:?} must re-arm the Recording notification",
+            );
+        }
     }
 
     #[test]

@@ -15,7 +15,10 @@ use voisu_app::feedback::{
     after_surface_creation, select_feedback_backend, FeedbackBackend, FeedbackCapabilities,
     FeedbackDegradation, FeedbackSelection, OverlayRestartPolicy, SessionKind,
 };
-use voisu_app::overlay::{OverlayPhase, OverlayView, PresentationController, PresentationTracker};
+use voisu_app::overlay::{
+    ObservedSignal, OverlayPhase, OverlayView, PresentationController, PresentationTracker,
+    RecordingNotifyLatch,
+};
 use voisu_core::{Command, PROTOCOL_VERSION, Request, Response, socket_path};
 
 fn main() {
@@ -294,6 +297,7 @@ fn install_surface_feedback(
     // has no "buried window" problem, so its behavior is left untouched.
     let is_fallback = selection.backend == FeedbackBackend::RegularSurface;
     let tracker = Rc::new(RefCell::new(PresentationTracker::default()));
+    let notify_latch = Rc::new(RefCell::new(RecordingNotifyLatch::default()));
     let reduced_motion = gtk::Settings::default()
         .map(|settings| !settings.is_gtk_enable_animations())
         .unwrap_or(true);
@@ -304,23 +308,39 @@ fn install_surface_feedback(
             return gtk::glib::ControlFlow::Break;
         }
         let now = Instant::now();
-        let view = match read_status() {
-            Some(response) => controller.borrow_mut().observe(&response, now),
-            None => controller.borrow_mut().observe_unreachable(now),
+        // The notify edge is driven by the OBSERVED daemon signal, kept separate
+        // from the rendered phase: a failed status read renders an unavailable
+        // capsule but is not a reachable observation, so it must not disturb the
+        // Recording notification latch.
+        let (view, signal) = match read_status() {
+            Some(response) => {
+                let view = controller.borrow_mut().observe(&response, now);
+                (view, ObservedSignal::Reachable(view.phase))
+            }
+            None => (
+                controller.borrow_mut().observe_unreachable(now),
+                ObservedSignal::Unreachable,
+            ),
         };
         render_surface(&window, &label, &meter, &capsule, view, reduced_motion);
+        // render_surface realizes the window on its first real show; the realize
+        // callback may have found no surface and handed feedback to the
+        // notification backend. Re-check before touching the now-retired window
+        // so this same tick cannot present() it or send a duplicate notification.
+        if switched.get() {
+            return gtk::glib::ControlFlow::Break;
+        }
         if is_fallback {
-            let decision = tracker.borrow_mut().observe(view);
             // Wayland denies a plain toplevel keep-above; re-present it on each
             // transition into a visible phase so it resurfaces above occluders.
-            if decision.resurface {
+            if tracker.borrow_mut().observe(view) {
                 window.present();
             }
             // A buried fallback window may be missed on GNOME, so signal
             // Recording start with a bounded desktop notification. Failure here
             // never breaks the overlay — send_notification cannot panic and its
             // delivery is the compositor's concern.
-            if decision.entered_recording {
+            if notify_latch.borrow_mut().observe(signal) {
                 let notification = gtk::gio::Notification::new("Voisu");
                 notification.set_body(Some(view.visible_label));
                 application.send_notification(Some("overlay-recording"), &notification);
