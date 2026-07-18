@@ -1,0 +1,81 @@
+# Map — Voisu to friends (three distros)
+
+**Label:** `wayfinder:map`
+**GitHub mirror:** [map #32](https://github.com/Anuraj-dev/voisu/issues/32) —
+tickets #33–#47 map to `issues/01…15` in order (blocking graph in the map
+issue's index comment). Local files are canonical; close/comment both when
+resolving.
+
+## Destination
+
+Voisu installed and reliably dictating on the three friends' desktops — Omarchy
+(Arch + Hyprland), KDE Plasma, and Ubuntu GNOME — delivered through real update
+channels (AUR, COPR, self-hosted apt repo) from one on-tag release workflow,
+with the friend-facing features shipped first: `delivery_mode`
+(type/clipboard/guarded), `voisu dictionary` CLI + hot-reload, and the
+`voisu setup` wizard with keyring storage.
+
+## Notes
+
+- **Execution is carried into the map** (Raja's standing override, same as the
+  accuracy/latency/hardening maps): tickets run decision→implementation→review→
+  merge. Routing per repo CLAUDE.md pinned table; cross-model review
+  (implementer's model never reviews itself; first review Sol high, re-reviews
+  Sol medium; Sol via cladex). Every dispatch prompt carries the doc fence
+  (no docs/STATE, sessions, model-benchmark). Log dispatches as benchmark rows
+  continuing from row 134.
+- **Evidence base:** all decisions here were researched by a 13-scout Sonnet
+  fleet, adversarially fact-checked — digest at
+  [.scratch/voisu-research/2026-07-18-distribution-decisions.md](../voisu-research/2026-07-18-distribution-decisions.md).
+  Zoom there before re-litigating anything.
+- **Sequencing (Raja, 2026-07-18):** fix batch (Deepgram default flip,
+  hardening-05, keyterm cap fix) runs OUTSIDE this map, first. Then phase A
+  (features), then phase B (packaging) — packaging tickets are blocked behind
+  the phase-A implementation tickets.
+- **CI vs live testing split (Raja's question, answered):** container
+  install-smoke in CI (fedora/ubuntu/arch containers: install package, run
+  binaries, systemd-analyze verify, lintian/namcap) catches packaging bugs;
+  anything needing a live Wayland session (mic, portals, overlay, auto-type)
+  needs a VM or real desktop — friends test last, on packages that already
+  passed the container gate.
+- **Escalation rule (Raja, 2026-07-18):** if an implementer fails 2 review
+  rounds on the same ticket, discard that agent and either (a) the Fable 5
+  driver takes the ticket inline, or (b) respawn at higher model/effort —
+  consistent with the standing three-strike memory, tightened to two for this
+  effort. Workhorses: Opus 4.8 high and Terra high (Luna medium for
+  packaging/config); reviews: always Sol (first high, re-reviews medium, via
+  cladex) — except where Sol implemented (ticket 04), where Opus high reviews.
+- Branch per ticket, PR to main, merge only on CI green (all three gates), no
+  AI credits in commits/PRs.
+
+## Decisions so far
+
+<!-- one line per closed ticket -->
+
+## Not yet specified
+
+- **Friend-facing onboarding docs** — README quickstart per distro (install
+  command, `voisu setup`, free-tier key signup walkthrough). Sharpens once the
+  channels exist and the wizard's final UX is known.
+- **Release/versioning scheme** — tag format, changelog discipline, when to cut
+  the first tagged release. Sharpens once the release workflow ticket lands.
+- **Supported-version claims for Ubuntu** — exact minimum (24.04 degraded vs
+  24.10 full) needs empirical confirmation during packaging validation before
+  it's written into docs.
+- **GNOME auto-type first-run UX** — GNOME needs the manual Settings → Remote
+  Desktop enable; how Voisu detects and surfaces that (doctor check? wizard
+  step?) sharpens once the GNOME fallback ticket resolves.
+
+## Out of scope
+
+- **GNOME Shell extension overlay** — decided "later polish"; plain-window
+  fallback suffices for this destination. Fresh effort if/when earned.
+- **Replacements tier + spoken\written dictionary syntax** — deferred by the
+  vocab-scope decision; separate feature effort later.
+- **Deepgram-only third STT mode** — rejected; two modes stay
+  (reconciled default + Groq-only fast path).
+- **Flatpak / AppImage** — Flatpak later (blocked on flatpak#2787 systemd-user
+  gap), AppImage never.
+- **AI cleanup layer, context awareness, auto-learned vocabulary, local STT
+  fallback** — top roadmap signals from the landscape research, but beyond this
+  map's destination; future efforts.

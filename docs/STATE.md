@@ -1,99 +1,73 @@
 # Voisu — State
-> Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-18
+> Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-18 (evening)
 
 ## 🚧 In progress / next
-- **LATENCY EFFORT COMPLETE. All hardening criticals + 03/04 CLOSED.** Queued next:
-  1. **Flip Deepgram default to ON** (Raja, 2026-07-18: keep the jargon accuracy
-     as the everyday default; the toggle stays for the fast path). First code
-     change of the next session — do NOT do standalone.
-  2. **Hardening 05 hygiene sweep** — BoundaryError boxing + the justified
-     lint-allow debts the CI gate documented; also bump the 3 s `wait_for_marker`
-     bound (flaked once under RPM-build contention).
-  3. On the **next RPM build/install**: packaged units now carry the sandbox
-     directives; then DELETE the validation drop-ins at
-     `~/.config/systemd/user/voisu{,-overlay}.service.d/sandbox-validation.conf`
-     (they duplicate the merged unit and keep the live install sandboxed until then).
-- Priority 2 unchanged: Overlay visual polish. Future idea: packaging beyond RPM.
+- **NEW EFFORT CHARTED: "Voisu to friends" (three distros).** Wayfinder map at
+  `.scratch/voisu-friends/map.md`, mirrored as GitHub issue #32 (tickets
+  #33–#47; local files canonical). Handoff prompt for the next orchestrator
+  session ready at `.scratch/voisu-friends/handoff-prompt.md`.
+- Next session works, in order:
+  1. **Fix batch (outside the map):** Deepgram default OFF→ON flip;
+     hardening-05 sweep (`.scratch/voisu-hardening/issues/05` + BoundaryError
+     boxing + wait_for_marker 3 s→15 s); **keyterm cap fix** (NEW BUG: uncapped
+     keyterms → Deepgram 400 past 500 tokens kills the stream — digest §6).
+  2. **Map phase A (features):** ADR GTK4/Electron, delivery_mode enum incl.
+     guarded (focus-guard, in scope now), dictionary CLI + hot-reload, keyring
+     probe → setup wizard, GNOME plain-window fallback.
+  3. **Map phase B (packaging):** accounts HITL → cargo-deb, AUR, COPR, apt
+     repo, on-tag release CI + container smoke, live desktop validation.
+- On the **next RPM build/install**: DELETE the validation drop-ins at
+  `~/.config/systemd/user/voisu{,-overlay}.service.d/sandbox-validation.conf`.
 
 ## Status
-- **Latency effort CLOSED (all 5 tickets).** L-01 toggle (PR #27), L-04 FLAC
-  (PR #28), L-05 already-shipped (PR #24). L-02 live eval done on RPM
-  `git58a607f`: Groq-only tails 474–1075 ms vs reconciled 727–1670 ms (−25–36%),
-  but Groq-only mangled 8/9 jargon probes that reconciliation repaired —
-  evidence in `.scratch/voisu-latency/assets/02-groq-only-evidence.md`.
-  L-03 DECISION: Deepgram KEPT (default flips to ON next session).
-- **Hardening 03 VALIDATED + merged (PR #31):** sandboxed units proven on the
-  live install via drop-ins — doctor 6/6 PASS, full reconciled Recording
-  delivered, overlay layer-shell with zero degradation, `MemoryDenyWriteExecute`
-  fine on the daemon.
-- **History-pretty (PR #30):** `voisu history` renders a human-first paged view
-  (transcript + tail latency headline, top-20 newest, Enter-to-page on TTY);
-  `voisu history --json` keeps the old byte-identical JSON. Terminal-escape
-  injection from network strings sanitized at the `truncate_inline` choke point.
-- **Hardening 04 (PR #29):** CI now has parallel `clippy -D warnings` (all
-  targets) and `cargo audit --deny warnings` gates. Took 8 CI rounds: lib.rs
-  `#![allow]`s do NOT reach bin/test crate roots; real fixes included explicit
-  `truncate(false)` on the flock lock file.
-- **Hardening 03 (PR #31, OPEN/HELD):** sandboxing for both user units
-  (`ProtectSystem=strict` + explicit ReadWritePaths, address-family restrictions,
-  `MemoryDenyWriteExecute` daemon-only); `systemd-analyze verify` clean.
-- Test baseline: **346** (330 + 16 history_view/CLI).
-- `docs/model-benchmark.md` rows 103–121: Sol/Opus head-to-head verdict +
-  post-latency ride-alongs + routing recommendation.
+- **2026-07-18 evening: 13-scout research fleet + grilling session** produced
+  all distribution/roadmap decisions (benchmark rows 122–134; digest with
+  decisions at `.scratch/voisu-research/2026-07-18-distribution-decisions.md`).
+  Fact-checked adversarially: 6/8 claims confirmed, 2 softened, 0 wrong.
+- **Latency effort CLOSED (all 5 tickets).** Groq-only tails 474–1075 ms vs
+  reconciled 727–1670 ms; reconciliation repaired 8/9 jargon probes Groq-only
+  mangled. Deepgram KEPT; default flips ON in the fix batch.
+- **Hardening 01–04 CLOSED** (03 validated+merged PR #31; 04 CI gates PR #29).
+  CI: tests + clippy -D warnings + cargo-audit on every PR.
+- Installed RPM: git58a607f. Test baseline: **346** (330 + 16 history/CLI).
+- `docs/model-benchmark.md` rows 103–134 (Sol/Opus verdict + research fleet).
 
 ## Architecture map
 - Domain, IPC, Transcript decision, diagnostics -> `crates/voisu-core/src/lib.rs`, `diagnostics.rs`
-- Fedora capture/provider/clipboard/portal/libei adapters + ProviderReaper + FLAC encode -> `crates/voisu-app/src/system.rs`
+- Fedora capture/provider/clipboard/portal/libei adapters + ProviderReaper + FLAC + Deepgram keyterm URL -> `crates/voisu-app/src/system.rs`
 - Recording/replay supervision + DisabledProvider -> `crates/voisu-app/src/bin/voisu-daemon.rs`
-- Persisted config (deepgram toggle) -> `crates/voisu-app/src/config.rs`
-- History pretty-rendering (pure) -> `crates/voisu-app/src/history_view.rs`
+- Persisted config (deepgram toggle; delivery_mode lands here) -> `crates/voisu-app/src/config.rs`
+- History pretty-rendering -> `crates/voisu-app/src/history_view.rs`
 - Dictionary / Whisper prompt builder -> `crates/voisu-app/src/dictionary.rs`
 - Daemon + Overlay user-service lifecycle -> `crates/voisu-app/src/service.rs`
-- Public CLI (`voisu deepgram`, `voisu history [--json]`) -> `crates/voisu-app/src/bin/voisu.rs`
+- Public CLI (`voisu deepgram|history`; dictionary/delivery/setup land here) -> `crates/voisu-app/src/bin/voisu.rs`
 - GTK Overlay -> `crates/voisu-app/src/bin/voisu-overlay.rs`, `overlay.rs`, `feedback.rs`
-- RPM units/spec/build/smoke (now sandboxed units on PR #31) -> `packaging/`
-- CI gates (test/clippy/audit) -> `.github/workflows/ci.yml`
-- Latency effort -> `docs/specs/2026-07-17-latency-optimization.md`, `.scratch/voisu-latency/`
-- Accuracy effort -> `docs/specs/2026-07-17-transcription-accuracy.md`, `.scratch/voisu-accuracy/`
-- Hardening map + audit -> `.scratch/voisu-hardening/` (01, 02, 04 CLOSED; 03 drafted/held)
-- Fedora procedure/evidence -> `docs/packaging-fedora.md`, `docs/release-evidence.md`
+- RPM units/spec/build/smoke -> `packaging/` · CI gates -> `.github/workflows/ci.yml`
+- Friends-distribution map -> `.scratch/voisu-friends/` (map.md, issues/01–15, handoff-prompt.md; GH #32–47)
+- Research digest (all 2026-07-18 decisions + evidence) -> `.scratch/voisu-research/2026-07-18-distribution-decisions.md`
+- Hardening map -> `.scratch/voisu-hardening/` (05 open, queued in fix batch)
 
 ## Stack & run
 - Stack: Rust 2024 + Tokio + serde + zbus 5 + GTK4 (opt-in) + runtime libei + flacenc · Run: `cargo run -p voisu-app --bin voisu-daemon` · Test: `cargo test --workspace`
 - Robust test count: `cargo test --workspace 2>&1 | grep -oE "[0-9]+ passed; [0-9]+ failed" | awk '{p+=$1; f+=$3} END {print p, f}'`
-- Test baseline: **346**.
 
-## Key decisions (top 3–5)
-- Deepgram = default-OFF runtime toggle (delete-or-keep finalized by ticket 03
-  after live eval); disabled Provider is an adapter stand-in, not coordinator
-  surgery — supervision/reaper/barrier untouched.
-- FLAC (lossless) upload, no duration gate; Opus codec rejected for WER risk.
-- CI clippy gate ships with justified `#![allow]`s (result_large_err,
-  large_enum_variant, too_many_arguments) — shrinking those types is the
-  hardening-05 sweep, not the gate's job.
-- Network-sourced strings are sanitized (all C0/C1 controls) at ONE choke point
-  before terminal rendering; `--json` stays byte-identical for scripts.
-- Test assertions pin only deterministic pre-stop capture — post-signal bytes
-  are best-effort by design.
+## Key decisions (top; full log in decisions.md)
+- **GTK4 locked, Electron rejected** (no layer-shell path in Chromium; ADR = map ticket 01; Tauri only web-tech fallback).
+- **delivery_mode enum type|clipboard|guarded — guarded IN scope** (focus-guard; no competitor ships it).
+- **STT stays two-mode** (reconciled default + Groq-only); no Deepgram-only third mode.
+- **Packaging: cargo-deb + AUR(-bin) + COPR + self-hosted apt repo, one on-tag workflow; Flatpak later, AppImage never; GNOME ships plain-window fallback (Shell extension = later polish).**
+- **Pure BYOK + `voisu setup` wizard + keyring** (free tiers cover friends: Groq 8 h/day, Deepgram $200 ≈ 1 yr).
+- Sequencing: fixes → features → packaging; **2 failed review rounds → discard agent, Fable inline or higher effort**.
 
 ## Gotchas
-- **Disk critically tight (~11–14 GB).** `cargo clean` before RPM builds;
-  `TMPDIR=/var/tmp RUST_TEST_THREADS=4`; build script refuses a dirty tree.
-- **No local clippy/rustfmt on this machine (no rustup)** — the CI lint gate is
-  the only clippy run; expect CI-iteration for new lint errors, and remember
-  clippy stops at the first failing target (errors surface serially).
-- **Pin cwd (`git -C …`) in every compound git command when a worktree is
-  active** — a cwd slip pushed a (benign) lint-allow commit directly to main
-  this session.
-- cladex gotchas: prompt via **stdin** when combining `-p` with other flags;
-  headless needs `--permission-mode acceptEdits` + explicit `--allowedTools`;
-  costs in JSON are nominal (real billing = Codex Plus quota).
-- **Subagent doc fence:** every dispatch prompt needs an explicit "do not touch
-  docs/STATE/checkpoint/benchmark" line (held perfectly once adopted).
-- The accuracy WER suite assumes Deepgram ON — run it with `voisu deepgram on`.
-- `packaging/build-rpm.sh` requires a clean COMMITTED checkout; embeds commit.
-- Whisper `prompt` ~224 tokens; Groq free tier: 7,200 audio-sec/hr, 2,000 req/day.
+- **Disk critically tight (~11–14 GB).** `cargo clean` before RPM builds; `TMPDIR=/var/tmp RUST_TEST_THREADS=4`.
+- **No local clippy/rustfmt (no rustup)** — CI is the only clippy run; errors surface serially.
+- **Pin cwd (`git -C …`) in compound git commands when a worktree is active.**
+- cladex: prompt via stdin with `-p`+flags; `--permission-mode acceptEdits` + explicit `--allowedTools`.
+- **Subagent doc fence** in every dispatch prompt (docs/STATE, sessions, benchmark) — held 13/13 this session.
+- The accuracy WER suite assumes Deepgram ON (default will match after the flip).
+- `packaging/build-rpm.sh` needs a clean COMMITTED checkout; embeds commit.
+- Whisper prompt ~224 tokens (last-224 honored); Groq free tier: 7,200 audio-sec/hr, 2,000 req/day.
+- **Deepgram keyterms: 500-token/100-term hard cap, 400 error past it — cap fix queued, don't grow the built-in glossary before it lands.**
+- COPR builders have NO network (vendor crates); Hyprland RemoteDesktop/EIS needs a live smoke test before promising auto-type on Omarchy.
 - Use `CONTEXT.md` terms exactly; default builds GTK-free (`--features overlay`).
-- Leftover diagnostics (optional cleanup): `/var/tmp/pwtest.raw`,
-  `/var/tmp/pwpipe.err`, fixture `pwtest.raw` under
-  `/run/user/1000/voisu/v1/diagnostics/fixtures/`.

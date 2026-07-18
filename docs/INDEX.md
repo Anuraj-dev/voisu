@@ -23,3 +23,5 @@
 | specs/2026-07-17-latency-optimization.md | Latency effort plan (Deepgram toggle, FLAC; delivery fix shipped in PR #24) |
 | ../.scratch/voisu-latency/ | Latency wayfinder map + tickets 01–05 |
 | ../.scratch/voisu-hardening/ | Post-audit hardening wayfinder map + tickets 01–05 + full audit report (assets/audit-2026-07-18.md) |
+| ../.scratch/voisu-friends/ | "Voisu to friends" wayfinder map + tickets 01–15 + next-session handoff prompt (GitHub mirror: issue #32, tickets #33–47) |
+| ../.scratch/voisu-research/2026-07-18-distribution-decisions.md | Research digest + all 2026-07-18 distribution/roadmap decisions (13-scout fleet, fact-checked) |

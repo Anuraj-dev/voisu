@@ -404,3 +404,26 @@ still work under `ProtectSystem=strict` + address-family restrictions, and
 merging before the live latency eval could confound its measurements. PR #31
 stays open until Raja's install validates every directive. Alternative rejected:
 merging on `systemd-analyze verify` alone.
+
+## 2026-07-18 — Friends-distribution decisions (research-backed, grilling session)
+**Why:** 13-scout Sonnet fleet + adversarial fact-check (benchmark rows 122–134;
+evidence digest `.scratch/voisu-research/2026-07-18-distribution-decisions.md`).
+- **GTK4 locked, Electron rejected** — Chromium/Ozone has no layer-shell path
+  (overlay impossible natively); 150–250 MB + CVE treadmill; alternative
+  rejected: Electron; Tauri is the only acceptable web-tech fallback. ADR queued.
+- **delivery_mode enum type|clipboard|guarded, default type; guarded built now**
+  — focus-guard (auto-type only if focus unchanged) ships as differentiator;
+  alternative rejected: bool flag (blocks guarded without migration).
+- **STT stays two-mode** — no Deepgram-only third mode (est. 300–500 ms, not
+  clearly faster than Groq's 474 ms floor; extra config surface not worth it).
+- **Packaging:** cargo-deb + AUR source/-bin + COPR (vendored crates) +
+  self-hosted GPG apt repo, one on-tag GH Actions workflow with container
+  install-smoke gates; Launchpad PPA rejected (offline builders); Flatpak later
+  (flatpak#2787), AppImage never. GNOME gets plain-window fallback now, Shell
+  extension later; Ubuntu floor 24.10+ (Kubuntu 24.04 = Plasma 5.27).
+- **Onboarding: pure BYOK** (free tiers cover friends), `voisu setup` wizard w/
+  live key validation, keyring + loud 0600 fallback; shared relay rejected.
+- **Vocab scope:** keyterm cap fix (bug: uncapped → Deepgram 400 kills stream) +
+  dictionary CLI + per-session hot-reload; replacements tier deferred.
+- **Process:** fixes → features → packaging; implementer failing 2 review rounds
+  is discarded (Fable inline or higher-effort respawn) — tightened from 3.

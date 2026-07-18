@@ -335,3 +335,33 @@ The H-04 clippy convergence cost (7 CI rounds) was a driver/tooling problem, not
 no local clippy on this machine forced CI-iteration, and clippy's stop-at-first-failing-target
 behavior serialized the discovery. One real bug-class fix fell out of the gate: the flock lock file
 now states `truncate(false)` intent explicitly.
+
+## Research fleet: distribution/roadmap decision support (Sonnet 5 scouts) — rows 122–133
+
+All twelve dispatches were Sonnet 5 read-only web-research scouts (driver-orchestrated, doc fence in
+every prompt, held 12/12). Row 133 was an adversarial fact-check pass over the fleet's load-bearing
+claims — 6/8 CONFIRMED, 2 PARTLY TRUE, 0 WRONG — so the fleet's findings are validated, not vibes.
+
+| # | Task | Model (effort) | Result | Duration | Tokens | Tools |
+|---|---|---|---|---|---|---|
+| 122 | Electron vs GTK for Wayland overlay + cross-distro | Sonnet 5 | GTK4 wins hard: Chromium/Ozone has no layer-shell path; all comparable tools (Handy, whisper-overlay, hyprwhspr) use GTK+layer-shell; Tauri (not Electron) is the only sane web-tech fallback | 92 s | 46.8k | 11 |
+| 123 | Native deb/pacman/rpm packaging for Rust daemon+user units | Sonnet 5 | cargo-deb (.deb, units as assets + custom postinst), AUR source + cargo-aur -bin, keep RPM; nfpm only if config sprawl hurts; exact Ubuntu/Arch dep names delivered | 136 s | 49.0k | 12 |
+| 124 | Flatpak/AppImage viability | Sonnet 5 | Flatpak LATER (portal/libei architecture already sandbox-shaped, but no systemd user-unit mechanism — open flatpak#2787); AppImage NEVER | 106 s | 49.8k | 13 |
+| 125 | STT latency landscape validation | Sonnet 5 | Voisu measurements consistent with public data; "Deepgram fast" = streaming/interim latency, dictation cares about time-to-final where Groq short-clip round trip wins; Deepgram-only w/ client Finalize ≈300–500 ms plausible, not clearly faster | 101 s | 46.4k | 10 |
+| 126 | Deepgram keyterm + custom-vocab best practices | Sonnet 5 | FOUND REAL BUG: merged_terms() sent uncapped; Deepgram 400-errors past 500 tokens/100 keyterms (whole stream dies). Best practice 20–50 curated terms; recommends dictionary CLI + hot-reload + replacements tier | 120 s | 61.0k | 20 |
+| 127 | Delivery-mode UX (auto-type vs clipboard) | Sonnet 5 | Market default = auto-insert ON, clipboard opt-out; recommends delivery_mode enum (type/clipboard, reserve guarded); focus-guard = unshipped-anywhere differentiator | 104 s | 48.4k | 12 |
+| 128 | Compositor compatibility matrix | Sonnet 5 | Hyprland+KDE Tier 1 (Hyprland EIS needs live smoke test); GNOME Tier 2 — no layer-shell ever (mutter#973), no wlr-data-control (mutter#524), manual Remote Desktop toggle; ship daemon+CLI sans overlay on GNOME; Ubuntu 24.10+ floor | 141 s | 53.6k | 17 |
+| 129 | Dictation product landscape 2025–26 | Sonnet 5 | "Wispr Flow for Linux" gap is real+validated; top missing features by evidence: (1) AI cleanup layer, (2) context awareness, (3) auto-learned vocab; cloud-first defensible, local fallback = medium-priority hedge | 111 s | 58.0k | 16 |
+| 130 | BYOK onboarding + secrets | Sonnet 5 | Pure BYOK viable on free tiers (Groq 8 h audio/day free; Deepgram $200 ≈ a year at 1–2 h/day); keyring crate + loud 0600 fallback; voisu setup wizard w/ live validation; error classification in doctor | 114 s | 48.8k | 12 |
+| 131 | Distribution/update channels | Sonnet 5 | Ranked: AUR -bin (cargo-aur + deploy action) → COPR (webhook, vendored crates — builders offline) → self-hosted apt (Pages/Cloudsmith); skip Launchpad PPA; single on-tag GH Actions workflow | 132 s | 55.1k | 16 |
+| 132 | Dual-provider precedent + economics | Sonnet 5 | Cost non-issue ($0–17.56/mo worst case; free tiers cover friends); ROVER literature supports diverse-pair fusion (~9–12% rel WER), but NO shipped product runs dual-vendor STT — industry pairs single STT + LLM cleanup | 107 s | 49.5k | 12 |
+| 133 | Adversarial fact-check of rows 122–132 claims | Sonnet 5 | 6/8 CONFIRMED (keyterm 400-cap, GNOME refusals, Plasma 6.1 InputCapture, Finalize semantics, Groq limits/non-streaming, Whisper 224 tokens); 2 PARTLY TRUE (Electron "impossible"→"no native path, XWayland hacks exist"; Flatpak live issue is #2787 not #3178); 0 WRONG | 140 s | 58.3k | 24 |
+
+**Fleet notes.** Twelve scouts, ~101 min of wall-clock work compressed into ~25 min of parallel
+elapsed time, ~625k subagent tokens total, zero doc-fence violations, zero repo writes. The
+adversarial verification pass (row 133) is worth keeping as a standing pattern for
+decision-support research: it cost one extra dispatch and caught two overstatements before they
+reached the decision log. Scout 126 alone paid for the fleet by finding a latent production bug
+(uncapped keyterms → Deepgram 400 → dead stream) that no test covers.
+
+| 134 | GNOME-specific overlay deep dive (follow-up requested by Raja mid-grilling) | Sonnet 5 | Found a real path: companion GNOME Shell extension (St widget + D-Bus listener, GSConnect/Custom-OSD precedent) = true always-on-top overlay on GNOME; plain-window keep-above is a no-op on Wayland BY DESIGN; XWayland override-redirect works but is an unsupported side-effect; recommends tiny extension (tier 1) + plain window (tier 2 default), auto-detect | 137 s | 58.6k | 15 |
