@@ -1555,9 +1555,20 @@ impl Drop for PipeWireActiveCapture {
             // task in the actor-owned supervisor; every workflow drains it before
             // its acknowledgement permits the next Recording.
             self.reaper.adopt_capture(cleanup);
-        } else if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            reap_briefly(&mut child);
+        } else if let Some(child) = self.child.take() {
+            // stop_child never ran: capture_pump panicked or was cancelled while
+            // still owning a live pw-record. Killing under reap_briefly's 250 ms
+            // and then dropping the child and both reader handles would let a
+            // slow-exiting child — or a descendant holding the pipe — outlive
+            // Drop while the reaper looks empty, so supervise_recording could
+            // permit Idle mid-cleanup. Hand the raw child and reader handles to
+            // the reaper's bounded kill/reap instead; every Idle-permitting path
+            // drains it before its acknowledgement releases the next Recording.
+            self.reaper.adopt_capture_blocking(
+                child,
+                self.reader.take(),
+                self.stderr_reader.take(),
+            );
         }
     }
 }
@@ -1759,18 +1770,27 @@ impl ProviderReaper {
     /// runtime-free: the handles are wrapped in a future and retained; only a
     /// later `drain` polls them, so adopting from a non-runtime thread or a
     /// shutting-down runtime can never detach or abort the cleanup.
+    /// Retains one cleanup future. Called from `Drop` (capture and
+    /// provider-stream adoption), so it must never unwind: a poisoned lock is
+    /// recovered rather than `expect`ed. The lock is only ever held for a
+    /// push/take/len, so its guarded state stays consistent under recovery.
+    fn retain(&self, task: ReapTask) {
+        let mut guard = match self.tasks.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.push(task);
+    }
+
     fn adopt<T: Send + 'static>(&self, mut chunks: VecDeque<tokio::task::JoinHandle<T>>) {
         if chunks.is_empty() {
             return;
         }
-        self.tasks
-            .lock()
-            .expect("provider reaper mutex poisoned")
-            .push(Box::pin(async move {
-                while let Some(chunk) = chunks.pop_front() {
-                    let _ = chunk.await;
-                }
-            }));
+        self.retain(Box::pin(async move {
+            while let Some(chunk) = chunks.pop_front() {
+                let _ = chunk.await;
+            }
+        }));
     }
 
     fn adopt_capture(
@@ -1778,6 +1798,35 @@ impl ProviderReaper {
         cleanup: tokio::task::JoinHandle<Result<Vec<u8>, BoundaryError>>,
     ) {
         self.adopt(VecDeque::from([cleanup]));
+    }
+
+    /// Adopts a pre-stop capture whose `stop_child` never ran: the raw pw-record
+    /// child and reader threads are still live. A dedicated OS thread performs
+    /// `stop_child_blocking`'s bounded kill/reap/join off any async worker, and
+    /// the retained future awaits its completion signal, so a drain blocks the
+    /// Idle transition until the child and both reader threads are actually gone
+    /// — not merely `reap_briefly`'s 250 ms. Runtime-free and non-panicking: no
+    /// `spawn_blocking` and no `Handle::try_current`, so this still lands its
+    /// cleanup when `Drop` runs on a non-runtime teardown thread. The thread's
+    /// own bounds (`wait_for_child` and the two `bounded_join`s under
+    /// `PROCESS_DEADLINE`) guarantee it signals, so the drain terminates.
+    fn adopt_capture_blocking(
+        &self,
+        child: Child,
+        reader: Option<thread::JoinHandle<()>>,
+        stderr_reader: Option<thread::JoinHandle<Vec<u8>>>,
+    ) {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        thread::spawn(move || {
+            // Abandoned Recording: SIGKILL (graceful = false), mirroring the
+            // prior `child.kill()`. The classification result is irrelevant to a
+            // dropped capture and is discarded; only the reap matters.
+            let _ = stop_child_blocking(child, reader, stderr_reader, false);
+            let _ = done_tx.send(());
+        });
+        self.retain(Box::pin(async move {
+            let _ = done_rx.await;
+        }));
     }
 
     /// Number of cleanup futures currently retained and not being drained.
@@ -4636,6 +4685,61 @@ mod tests {
         assert!(
             cleanup_done.load(Ordering::SeqCst),
             "draining must await the blocking capture cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_capture_before_stop_retains_child_cleanup_until_reaper_drain() {
+        // capture_pump can panic or be cancelled while still owning a live
+        // pw-record before stop_child ever runs: child is Some, cleanup is None.
+        // Drop must not merely kill-and-forget under reap_briefly's 250 ms — a
+        // slow-exiting child would then outlive Drop while the reaper looks empty
+        // and Idle is permitted mid-cleanup. It must hand a bounded kill/reap to
+        // the reaper so the workflow drains it before acknowledging completion.
+        let reaper = ProviderReaper::new();
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a killable stand-in child");
+        let pid: i32 = child.id().try_into().expect("child pid fits in pid_t");
+
+        let capture = PipeWireActiveCapture {
+            child: Some(child),
+            state: Arc::new(Mutex::new(CaptureReaderState {
+                chunks: VecDeque::new(),
+                received_bytes: 0,
+                eof: true,
+                error: None,
+            })),
+            reader: None,
+            stderr_reader: None,
+            cleanup: None,
+            reaper: reaper.clone(),
+            pcm: Vec::new(),
+            started: Instant::now(),
+            deadline: DEFAULT_RECORDING_DEADLINE,
+        };
+
+        drop(capture);
+        assert_eq!(
+            reaper.pending(),
+            1,
+            "a pre-stop capture drop must retain its child cleanup in the reaper"
+        );
+
+        assert!(
+            reaper.drain(Duration::from_secs(4)).await,
+            "the retained pre-stop capture cleanup must drain before Idle"
+        );
+        // Draining awaited the bounded kill/reap, so the child is gone (reaped,
+        // not a lingering zombie) — kill(pid, 0) can no longer find it.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(
+            !alive,
+            "draining must have killed and reaped the abandoned pw-record child"
         );
     }
 

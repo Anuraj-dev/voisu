@@ -910,7 +910,12 @@ cat > /dev/null
     let status_thread = thread::spawn(move || {
         status_tx.send(voisu(&runtime_dir, "status")).unwrap();
     });
-    let prompt_status = status_rx.recv_timeout(Duration::from_millis(250));
+    // A responsive status must return long before the blocking pw-record stop
+    // could ever have completed. This window includes CLI subprocess launch and
+    // thread scheduling, so it is kept generously above scheduler noise yet well
+    // under the PROCESS_DEADLINE (2 s) a serialized blocking cleanup would cost:
+    // anything under a second still proves status did not wait on the stop.
+    let prompt_status = status_rx.recv_timeout(Duration::from_millis(1000));
     fs::write(commands.path().join("pw-record.release"), "").unwrap();
     let status = match prompt_status {
         Ok(status) => status,
