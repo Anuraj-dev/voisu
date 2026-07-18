@@ -3,7 +3,7 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,7 @@ const MAX_FRAME_BYTES: u64 = 16 * 1024;
 const IO_DEADLINE: Duration = CAPTURE_FINALIZE_DEADLINE;
 const MAX_CONNECTIONS: usize = 32;
 const PROVIDER_DEADLINE: Duration = PROVIDER_COMPLETION_DEADLINE;
+static CONTROLLED_DELIVERY_PANICKED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     voisu_app::system::install_crypto_provider();
@@ -431,6 +432,10 @@ async fn actor_loop(
     } else {
         Box::new(GroqProvider::new(reaper.clone()))
     });
+    // The processing supervisor cannot inspect task-local provider state after a
+    // panic, so retain the providers configured for this Recording beside the
+    // actor-owned adapters and pass that list into every supervised stop path.
+    let configured_providers = vec![Provider::Deepgram, Provider::Groq];
     let mut validator: Option<Box<dyn TranscriptValidator>> = if controlled {
         Some(Box::new(ControlledValidator::from_env()))
     } else {
@@ -611,6 +616,7 @@ async fn actor_loop(
                     tokio::spawn(supervise_recording(
                         processing,
                         controlled,
+                        configured_providers.clone(),
                         panic_evidence,
                         Some(reply),
                         tx.clone(),
@@ -934,6 +940,7 @@ async fn actor_loop(
                     tokio::spawn(supervise_recording(
                         processing,
                         controlled,
+                        configured_providers.clone(),
                         panic_evidence,
                         None,
                         tx.clone(),
@@ -1030,6 +1037,7 @@ async fn actor_loop(
                     tokio::spawn(supervise_recording(
                         processing,
                         controlled,
+                        configured_providers.clone(),
                         panic_evidence,
                         None,
                         tx.clone(),
@@ -1585,7 +1593,8 @@ async fn process_recording(
 async fn supervise_recording(
     processing: JoinHandle<RecordingResult>,
     controlled: bool,
-    mut panic_evidence: LifecycleEvidence,
+    configured_providers: Vec<Provider>,
+    panic_evidence: LifecycleEvidence,
     reply: Option<oneshot::Sender<Response>>,
     actor: mpsc::Sender<ActorMessage>,
     diagnostics: Arc<DiagnosticStore>,
@@ -1595,18 +1604,24 @@ async fn supervise_recording(
     let recording = match processing.await {
         Ok(result) => result,
         Err(join_error) => {
-            eprintln!("Recording {id}: processing task failed: {join_error}");
-            panic_evidence.stages.push(LifecycleStage::CaptureAborted);
+            log_best_effort(format_args!(
+                "Recording {id}: processing task failed: {join_error}"
+            ));
             let error = BoundaryError::new(
-                BoundaryKind::Capture,
-                format!("Recording processing task failed: {join_error}"),
-            );
-            let mut provider_failures = Vec::new();
-            account_for_missing_providers(
-                &[],
-                &mut provider_failures,
-                error.diagnostic(),
-            );
+                BoundaryKind::Validation,
+                format!("Recording processing task failed at an unknown point: {join_error}"),
+            )
+            .with_public_message("Recording processing failed at an unknown point");
+            let provider_failures = configured_providers
+                .into_iter()
+                .map(|provider| {
+                    ProviderFailure::new(
+                        provider,
+                        ProviderFailureStage::Aborted,
+                        "provider outcome is unknown: the Recording processing task failed",
+                    )
+                })
+                .collect();
             let record = diagnostic_record(
                 &panic_evidence,
                 Vec::new(),
@@ -1616,7 +1631,9 @@ async fn supervise_recording(
                 Some(&error),
             );
             if let Err(record_error) = diagnostics.record(record) {
-                eprintln!("Recording {id}: writing diagnostics failed: {record_error}");
+                log_best_effort(format_args!(
+                    "Recording {id}: writing diagnostics failed: {record_error}"
+                ));
             }
             let (validator, delivery) = rebuild_recording_adapters(controlled);
             RecordingResult {
@@ -1631,7 +1648,9 @@ async fn supervise_recording(
     // dropped by a panic and adopted into the reaper. Drain before acknowledging:
     // Completed alone permits the Idle transition.
     if !reaper.drain(RECOVERY_ABORT_DEADLINE).await {
-        eprintln!("Recording {id}: provider cleanup did not drain within the abort bound");
+        log_best_effort(format_args!(
+            "Recording {id}: provider cleanup did not drain within the abort bound"
+        ));
     }
     let _ = actor
         .send(ActorMessage::Completed(Completion {
@@ -1643,6 +1662,13 @@ async fn supervise_recording(
             reply,
         }))
         .await;
+}
+
+/// Writes a diagnostic line to stderr, swallowing any write failure: a stderr
+/// write failure must not panic on the guaranteed-completion supervisor path.
+fn log_best_effort(message: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{message}");
 }
 
 fn rebuild_recording_adapters(
@@ -1761,7 +1787,9 @@ async fn supervise_replay(
             response: result.response,
         },
         Err(join_error) => {
-            eprintln!("Replay {id}: replay task failed: {join_error}");
+            log_best_effort(format_args!(
+                "Replay {id}: replay task failed: {join_error}"
+            ));
             let (deepgram, groq, validator) = rebuild_replay_adapters(controlled, &reaper);
             ReplayCompletion {
                 id,
@@ -1777,7 +1805,9 @@ async fn supervise_replay(
     // adopting their cleanup into the reaper. Drain it before acknowledging:
     // ReplayCompleted alone permits the Idle transition.
     if !reaper.drain(RECOVERY_ABORT_DEADLINE).await {
-        eprintln!("Replay {id}: provider cleanup did not drain within the abort bound");
+        log_best_effort(format_args!(
+            "Replay {id}: provider cleanup did not drain within the abort bound"
+        ));
     }
     let _ = actor.send(ActorMessage::ReplayCompleted(completion)).await;
 }
@@ -2533,6 +2563,11 @@ struct ControlledDelivery;
 
 impl DeliveryAdapter for ControlledDelivery {
     fn deliver(&mut self, _transcript: Transcript) -> BoundaryFuture<'_, DeliveryOutcome> {
+        if std::env::var_os("VOISU_TEST_DELIVERY_PANIC").is_some()
+            && !CONTROLLED_DELIVERY_PANICKED.swap(true, Ordering::SeqCst)
+        {
+            panic!("controlled Delivery panic");
+        }
         Box::pin(async {
             Ok(match std::env::var("VOISU_TEST_DELIVERY_FALLBACK") {
                 Ok(reason) => DeliveryOutcome::clipboard_fallback(reason),
@@ -2545,6 +2580,49 @@ impl DeliveryAdapter for ControlledDelivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn processing_panic_records_only_the_configured_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let diagnostics = Arc::new(
+            DiagnosticStore::open(
+                dir.path().join("diagnostics"),
+                RetentionPolicy::default(),
+            )
+            .unwrap(),
+        );
+        let evidence = base_evidence(7, "configured-provider-panic".to_owned(), Vec::new());
+        let processing: JoinHandle<RecordingResult> = tokio::spawn(async {
+            panic!("controlled processing panic");
+        });
+        let (actor, mut messages) = mpsc::channel(1);
+
+        supervise_recording(
+            processing,
+            true,
+            vec![Provider::Groq],
+            evidence,
+            None,
+            actor,
+            Arc::clone(&diagnostics),
+            ProviderReaper::new(),
+        )
+        .await;
+
+        assert!(matches!(messages.recv().await, Some(ActorMessage::Completed(_))));
+        let history = diagnostics.history().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].provider_failures.len(), 1);
+        assert_eq!(history[0].provider_failures[0].provider, Provider::Groq);
+        assert_eq!(
+            history[0].provider_failures[0].stage,
+            ProviderFailureStage::Aborted
+        );
+        assert_eq!(
+            history[0].provider_failures[0].diagnostic,
+            "provider outcome is unknown: the Recording processing task failed"
+        );
+    }
 
     /// The graceful shutdown must JOIN the actor, never abandon the join on a
     /// deadline: an abandoned actor keeps running detached while it still owns

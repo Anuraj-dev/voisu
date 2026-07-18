@@ -181,8 +181,9 @@ pub enum ProviderFailureStage {
     ProviderDeadline,
     /// The provider began but the Recording was torn down before it could
     /// produce a Source Transcript — a startup failure of the OTHER provider, a
-    /// capture failure, or a shutdown mid-start. It never failed on its own, but
-    /// it produced no Source Transcript, so its absence is recorded, not silent.
+    /// capture failure, a shutdown mid-start, or a processing panic that lost the
+    /// task-local provider outcome. It never failed on its own, but it produced no
+    /// Source Transcript, so its absence is recorded, not silent.
     Aborted,
 }
 
@@ -322,6 +323,7 @@ pub enum BoundaryKind {
 pub struct BoundaryError {
     kind: BoundaryKind,
     diagnostic: String,
+    public_message: Option<&'static str>,
     transcript_failure: Option<TranscriptFailureEvidence>,
     provider_failures: Vec<ProviderFailure>,
 }
@@ -339,9 +341,15 @@ impl BoundaryError {
         Self {
             kind,
             diagnostic: diagnostic.into(),
+            public_message: None,
             transcript_failure: None,
             provider_failures: Vec::new(),
         }
+    }
+
+    pub fn with_public_message(mut self, message: &'static str) -> Self {
+        self.public_message = Some(message);
+        self
     }
 
     pub fn with_transcript_failure(mut self, evidence: TranscriptFailureEvidence) -> Self {
@@ -371,7 +379,7 @@ impl BoundaryError {
     }
 
     pub fn public_message(&self) -> &'static str {
-        match self.kind {
+        self.public_message.unwrap_or(match self.kind {
             BoundaryKind::Capture => "Recording capture failed",
             BoundaryKind::EmptyRecording => "No audio was captured",
             BoundaryKind::TooShortRecording => "Recording is too short",
@@ -385,7 +393,7 @@ impl BoundaryError {
             }
             BoundaryKind::ProviderAuthentication => "Provider authentication failed",
             BoundaryKind::Shortcut => "Trigger Key binding is unavailable",
-        }
+        })
     }
 
     pub fn diagnostic(&self) -> &str {
