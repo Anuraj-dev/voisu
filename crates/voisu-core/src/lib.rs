@@ -1,5 +1,10 @@
 //! Shared domain, provider coordination, and IPC types for Voisu.
 
+// BoundaryError carries rich failure diagnostics by design, and several public
+// seams return it in Err position. Boxing/shrinking it is a cross-cutting
+// change owned by the hardening-05 hygiene sweep, not this CI gate.
+#![allow(clippy::result_large_err)]
+
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::future::Future;
@@ -1042,6 +1047,7 @@ fn is_repetition_loop(words: &[String]) -> bool {
 ///   The floor is the SAME `CONTENT_OVERLAP_FLOOR` the agreement gate uses, so
 ///   no confirmed-fraction band opens between "hollow" and "agrees enough to
 ///   reconcile" for a loop whose vocabulary is the smaller of the pair.
+///
 /// Genuine repeated speech survives both: its recycled commands are its own
 /// (no theft majority), and any real overlap with the other source keeps it
 /// from being hollow. A loop with meaningful overlap but no recycled-word
@@ -1305,6 +1311,7 @@ fn select_better_source(left: &[String], right: &[String]) -> (GateWinner, Selec
 ///    of the same audio cannot do that, so one is fluent nonsense or a word
 ///    salad no intrinsic check can flag: gate, and select by `select_better_source`,
 ///    recording a low-confidence marker when only weak evidence decided.
+///
 /// Pairs that clear all three (real disagreements over shared or
 /// phonetically-aligned content, terse pairs, homophone spellings) return
 /// `None` and go to the reconciliation model.

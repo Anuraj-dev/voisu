@@ -1,3 +1,11 @@
+// This bin is its own crate root, so lib.rs allows do not reach it. Rich
+// BoundaryError values in Err position, the wide ActorMessage enum, and the
+// supervisor argument lists are deliberate; shrinking them belongs to the
+// hardening-05 hygiene sweep, not this CI gate.
+#![allow(clippy::result_large_err)]
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::too_many_arguments)]
+
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -240,6 +248,7 @@ impl SingleInstance {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .mode(0o600)
             .open(path)
             .map_err(|error| format!("cannot open daemon lock: {error}"))?;
