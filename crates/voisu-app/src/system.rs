@@ -23,6 +23,7 @@ use voisu_core::{
     TriggerKeyBinding, VersionEnvelope, PROTOCOL_VERSION,
 };
 
+use crate::focus::SharedFocusProbe;
 use crate::process::guard_external_child;
 
 const PROCESS_DEADLINE: Duration = Duration::from_secs(2);
@@ -1009,6 +1010,7 @@ fn restricted_command(program: &str) -> Command {
         "DBUS_SESSION_BUS_ADDRESS",
         "WAYLAND_DISPLAY",
         "XDG_SESSION_TYPE",
+        "HYPRLAND_INSTANCE_SIGNATURE",
     ] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
@@ -1024,6 +1026,13 @@ fn run_restricted(
     capture_stdout: bool,
 ) -> Result<ProcessOutcome, ProcessError> {
     run_restricted_with_deadline(program, arguments, input, capture_stdout, PROCESS_DEADLINE, None)
+}
+
+pub(crate) fn run_restricted_stdout(program: &str, arguments: &[&str]) -> Option<Vec<u8>> {
+    run_restricted(program, arguments, None, true)
+        .ok()
+        .filter(|outcome| outcome.success)
+        .map(|outcome| outcome.stdout)
 }
 
 /// Runs a helper whose SUCCESS mode is to fork a descendant that keeps
@@ -2969,6 +2978,129 @@ pub trait DirectDeliverySession: Send {
 
 pub trait RemoteDesktopPortal: Send {
     fn connect(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>>;
+}
+
+pub trait NotificationBoundary: Send {
+    fn notify(&mut self, body: &str) -> BoundaryFuture<'_, ()>;
+}
+
+pub struct DesktopNotifier;
+
+impl NotificationBoundary for DesktopNotifier {
+    fn notify(&mut self, body: &str) -> BoundaryFuture<'_, ()> {
+        let body = body.to_owned();
+        Box::pin(async move {
+            let notification = async {
+                let connection = zbus::Connection::session().await.map_err(|_| {
+                    BoundaryError::new(BoundaryKind::Delivery, "desktop notifications unavailable")
+                })?;
+                let proxy = zbus::Proxy::new(
+                    &connection,
+                    "org.freedesktop.Notifications",
+                    "/org/freedesktop/Notifications",
+                    "org.freedesktop.Notifications",
+                )
+                .await
+                .map_err(|_| {
+                    BoundaryError::new(BoundaryKind::Delivery, "desktop notifications unavailable")
+                })?;
+                let actions: Vec<String> = Vec::new();
+                let hints: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
+                    std::collections::HashMap::new();
+                proxy
+                    .call::<_, _, u32>(
+                        "Notify",
+                        &(
+                            "Voisu",
+                            0_u32,
+                            "",
+                            "Voisu",
+                            body,
+                            actions,
+                            hints,
+                            5_000_i32,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        BoundaryError::new(
+                            BoundaryKind::Delivery,
+                            "desktop notification failed",
+                        )
+                    })?;
+                Ok(())
+            };
+            tokio::time::timeout(PROCESS_DEADLINE, notification)
+                .await
+                .map_err(|_| {
+                    BoundaryError::new(
+                        BoundaryKind::Delivery,
+                        "desktop notification deadline elapsed",
+                    )
+                })?
+        })
+    }
+}
+
+pub const FOCUS_GUARD_FALLBACK_REASON: &str = "focus changed during Recording";
+pub const FOCUS_GUARD_NOTIFICATION: &str =
+    "focus changed — transcript preserved on the clipboard";
+
+pub struct GuardedDelivery {
+    focus: SharedFocusProbe,
+    start_identity: Option<voisu_core::WindowIdentity>,
+    direct: Box<dyn DeliveryAdapter>,
+    clipboard: Box<dyn DeliveryAdapter>,
+    notifier: Box<dyn NotificationBoundary>,
+}
+
+impl GuardedDelivery {
+    pub fn with_boundaries(
+        focus: SharedFocusProbe,
+        direct: Box<dyn DeliveryAdapter>,
+        clipboard: Box<dyn DeliveryAdapter>,
+        notifier: Box<dyn NotificationBoundary>,
+    ) -> Self {
+        Self {
+            focus,
+            start_identity: None,
+            direct,
+            clipboard,
+            notifier,
+        }
+    }
+}
+
+impl DeliveryAdapter for GuardedDelivery {
+    fn recording_started(&mut self) -> BoundaryFuture<'_, ()> {
+        Box::pin(async move {
+            self.start_identity = self.focus.lock().await.current().await.unwrap_or(None);
+            Ok(())
+        })
+    }
+
+    fn deliver(&mut self, transcript: Transcript) -> BoundaryFuture<'_, DeliveryOutcome> {
+        Box::pin(async move {
+            let current = self.focus.lock().await.current().await.unwrap_or(None);
+            let unchanged = self
+                .start_identity
+                .as_ref()
+                .zip(current.as_ref())
+                .is_some_and(|(start, end)| start.stable_id == end.stable_id);
+            self.start_identity = None;
+            if unchanged {
+                self.direct.deliver(transcript).await
+            } else {
+                eprintln!("focus guard: {FOCUS_GUARD_FALLBACK_REASON}; preserving Transcript on clipboard");
+                let mut outcome = self.clipboard.deliver(transcript).await?;
+                outcome.fallback_reason = Some(FOCUS_GUARD_FALLBACK_REASON.to_owned());
+                if let Err(error) = self.notifier.notify(FOCUS_GUARD_NOTIFICATION).await {
+                    eprintln!("focus guard notification failed: {}", error.diagnostic());
+                }
+                Ok(outcome)
+            }
+        })
+    }
 }
 
 pub struct PortalClipboardDelivery {

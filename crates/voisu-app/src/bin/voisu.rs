@@ -246,6 +246,17 @@ fn doctor() -> ExitCode {
             finding.detail
         );
     }
+    let focus_backend = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map(|runtime| runtime.block_on(voisu_app::focus::detect_focus_backend()))
+        .unwrap_or(voisu_app::focus::FocusBackendKind::None);
+    if focus_backend == voisu_app::focus::FocusBackendKind::None {
+        println!("Focus guard: none (guarded Delivery fails closed to the clipboard)");
+    } else {
+        println!("Focus guard: {}", focus_backend.as_str());
+    }
     if has_failure {
         ExitCode::from(4)
     } else {
@@ -288,13 +299,6 @@ fn delivery(mode: Option<DeliveryMode>) -> ExitCode {
         return ExitCode::SUCCESS;
     };
     match voisu_app::config::set_delivery_mode(mode) {
-        Ok(_) if mode == DeliveryMode::Guarded => {
-            println!(
-                "guarded delivery is not yet available; persisted for when it ships; \
-                 restart the daemon to apply (voisu service restart)"
-            );
-            ExitCode::SUCCESS
-        }
         Ok(_) => {
             println!(
                 "Delivery mode set to {} for new Recordings; restart the daemon to apply \

@@ -11,12 +11,14 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
+use voisu_app::focus::SharedFocusProbe;
 use voisu_app::system::{
-    ClipboardBoundary, DirectDeliverySession, FedoraRemoteDesktopPortal, PortalClipboardDelivery,
-    RemoteDesktopPortal,
+    ClipboardBoundary, DirectDeliverySession, FedoraRemoteDesktopPortal, GuardedDelivery,
+    NotificationBoundary, PortalClipboardDelivery, RemoteDesktopPortal,
 };
 use voisu_core::{
-    BoundaryError, BoundaryFuture, BoundaryKind, DeliveryAdapter, DeliveryMethod, Transcript,
+    BoundaryError, BoundaryFuture, BoundaryKind, DeliveryAdapter, DeliveryMethod, DeliveryOutcome,
+    FocusProbe, Transcript, WindowIdentity,
 };
 
 struct RecordingClipboard(Arc<Mutex<Vec<String>>>);
@@ -96,6 +98,153 @@ impl DirectDeliverySession for FailingSession {
         let reason = self.0;
         Box::pin(async move { Err(BoundaryError::new(BoundaryKind::Delivery, reason)) })
     }
+}
+
+struct SequenceFocusProbe(std::collections::VecDeque<Option<WindowIdentity>>);
+
+impl FocusProbe for SequenceFocusProbe {
+    fn current(&mut self) -> BoundaryFuture<'_, Option<WindowIdentity>> {
+        let identity = self.0.pop_front().flatten();
+        Box::pin(async move { Ok(identity) })
+    }
+}
+
+struct RecordingDelivery {
+    label: &'static str,
+    events: Arc<Mutex<Vec<String>>>,
+    outcome: DeliveryOutcome,
+}
+
+impl DeliveryAdapter for RecordingDelivery {
+    fn deliver(&mut self, transcript: Transcript) -> BoundaryFuture<'_, DeliveryOutcome> {
+        let event = format!("{}:{}", self.label, transcript.0);
+        let events = Arc::clone(&self.events);
+        let outcome = self.outcome.clone();
+        Box::pin(async move {
+            events.lock().unwrap().push(event);
+            Ok(outcome)
+        })
+    }
+}
+
+struct RecordingNotifier(Arc<Mutex<Vec<String>>>);
+
+impl NotificationBoundary for RecordingNotifier {
+    fn notify(&mut self, body: &str) -> BoundaryFuture<'_, ()> {
+        let body = body.to_owned();
+        let events = Arc::clone(&self.0);
+        Box::pin(async move {
+            events.lock().unwrap().push(format!("notify:{body}"));
+            Ok(())
+        })
+    }
+}
+
+fn identity(stable_id: &str) -> WindowIdentity {
+    WindowIdentity {
+        stable_id: stable_id.to_owned(),
+        process_id: Some(4242),
+        app_id: Some("org.example.Editor".to_owned()),
+    }
+}
+
+fn guarded_delivery(
+    focus: Vec<Option<WindowIdentity>>,
+    events: Arc<Mutex<Vec<String>>>,
+) -> GuardedDelivery {
+    let probe: SharedFocusProbe = Arc::new(tokio::sync::Mutex::new(Box::new(
+        SequenceFocusProbe(focus.into()),
+    )));
+    GuardedDelivery::with_boundaries(
+        probe,
+        Box::new(RecordingDelivery {
+            label: "direct",
+            events: Arc::clone(&events),
+            outcome: DeliveryOutcome::compositor_submitted(),
+        }),
+        Box::new(RecordingDelivery {
+            label: "clipboard",
+            events: Arc::clone(&events),
+            outcome: DeliveryOutcome::clipboard_fallback("clipboard-only"),
+        }),
+        Box::new(RecordingNotifier(events)),
+    )
+}
+
+#[tokio::test]
+async fn guarded_delivery_auto_types_when_the_same_stable_window_remains_focused() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut delivery = guarded_delivery(
+        vec![Some(identity("window-a")), Some(identity("window-a"))],
+        Arc::clone(&events),
+    );
+
+    delivery.recording_started().await.unwrap();
+    let outcome = delivery
+        .deliver(Transcript("guarded text".to_owned()))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.method, DeliveryMethod::CompositorSubmitted);
+    assert_eq!(*events.lock().unwrap(), vec!["direct:guarded text"]);
+}
+
+#[tokio::test]
+async fn guarded_delivery_falls_back_when_either_focus_snapshot_is_unavailable() {
+    for focus in [
+        vec![None, Some(identity("window-a"))],
+        vec![Some(identity("window-a")), None],
+    ] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut delivery = guarded_delivery(focus, Arc::clone(&events));
+
+        delivery.recording_started().await.unwrap();
+        let outcome = delivery
+            .deliver(Transcript("fail closed".to_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
+        assert_eq!(
+            outcome.fallback_reason.as_deref(),
+            Some("focus changed during Recording")
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "clipboard:fail closed",
+                "notify:focus changed — transcript preserved on the clipboard",
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn guarded_delivery_falls_back_and_notifies_when_the_stable_window_changes() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut delivery = guarded_delivery(
+        vec![Some(identity("window-a")), Some(identity("window-b"))],
+        Arc::clone(&events),
+    );
+
+    delivery.recording_started().await.unwrap();
+    let outcome = delivery
+        .deliver(Transcript("preserve me".to_owned()))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
+    assert_eq!(
+        outcome.fallback_reason.as_deref(),
+        Some("focus changed during Recording")
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "clipboard:preserve me",
+            "notify:focus changed — transcript preserved on the clipboard",
+        ]
+    );
 }
 
 struct SessionPortal(Option<Box<dyn DirectDeliverySession>>);
