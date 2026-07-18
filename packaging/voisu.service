@@ -13,5 +13,33 @@ Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=60s
 
+# Sandboxing (defense-in-depth for a compromised dependency). Every exception
+# below exists for a reason — see docs/packaging-fedora.md before tightening.
+NoNewPrivileges=yes
+# Read-only filesystem except the daemon's real write surfaces: the runtime
+# dir (control socket, pw-record scratch), config (config.toml, dictionary),
+# and state (history/diagnostics).
+ProtectSystem=strict
+ReadWritePaths=%t %h/.config/voisu %h/.local/state/voisu
+PrivateTmp=yes
+# AF_UNIX: control socket, D-Bus (Secret Service, portals), PipeWire.
+# AF_INET/AF_INET6: provider HTTPS/WSS via curl.
+# AF_NETLINK: glibc getaddrinfo enumerates interfaces over netlink.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+# The daemon and its subprocesses (pw-record, curl, wl-copy, secret-tool) do
+# no JIT; validate against a real install before assuming this holds.
+MemoryDenyWriteExecute=yes
+
 [Install]
 WantedBy=graphical-session.target
