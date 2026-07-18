@@ -157,3 +157,6 @@ on SIGINT so every live graceful stop failed (the fakes had modeled `exit 0` —
 the stored provider credentials turned out to be placeholders, caught only by `auth verify` against the
 real APIs. This quadruples the evidence for recommendation 5: the sandbox proves contracts, only the
 host proves the tools.
+| 84 | live-gate | Live-blocker diagnosis + fixes (rustls provider, PDEATHSIG thread reap, 2 test races) | Fable 5 driver (inline) | root-caused two live blockers with evidence chain (probe example, replay, /proc timing); delivered a0899b3, 99d0f9e, 1a63b72, f04dbbe; RED-proven regression test | Sol high r1: 2 release findings (ring licenses, test false-green) | fixed in 0615736 | driver did the work inline — systematic-debugging discipline; ~10 s Tokio blocking-pool keep-alive vs per-THREAD PR_SET_PDEATHSIG was the key insight |
+| 85 | live-gate | Review r1 of live-blocker fixes | Sol (high) | VERDICT: FINDINGS (2): ring license compliance in RPM, zombie/PID-reuse false-green in reap test | — | — | ~161k tokens; both findings valid and release-relevant; confirmed handoff ownership + runtime-builder equivalence |
+| 86 | live-gate | Re-review of 0615736 | Sol (medium) | VERDICT: APPROVE | — | — | ~63k tokens; verified /proc stat field arithmetic and vendor %prep paths |
