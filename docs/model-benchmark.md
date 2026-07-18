@@ -161,3 +161,57 @@ host proves the tools.
 | 85 | live-gate | Review r1 of live-blocker fixes | Sol (high) | VERDICT: FINDINGS (2): ring license compliance in RPM, zombie/PID-reuse false-green in reap test | — | — | ~161k tokens; both findings valid and release-relevant; confirmed handoff ownership + runtime-builder equivalence |
 | 86 | live-gate | Re-review of 0615736 | Sol (medium) | VERDICT: APPROVE | — | — | ~63k tokens; verified /proc stat field arithmetic and vendor %prep paths |
 | 87 | live-gate | CLI keyterm accuracy pass (dictionary reorder + compounds + truncation-guard test) | Fable 5 driver (inline) | root cause was prompt-budget truncation, not missing terms; P2 WER 19.3%→10.5%, all CLI compounds now correct; 299 tests | skipped (trivial diff per review policy) | — | live retest overall: raw 10.8%, formatting-adjusted 9.2% — first sub-10 result |
+| 88 | delivery-keymap | EIS keymap fd pread fix (system.rs read_keymap_fd + memfd regression test) | prior-session driver (adopted from worktree); Fable 5 driver verified+rebased | fix matched root-cause hypothesis exactly; test GREEN, 300/300 workspace | Sol (high) — first review | APPROVE, no findings, ~112k tokens | staged-uncommitted work in /tmp worktree was adoptable; committed, rebased onto post-#23 main clean |
+
+## Final report — accuracy effort + live gates (rows 61–87, 2026-07-18)
+
+Extends the tickets-01–13 report above; that snapshot stands as history. 27 dispatches across the
+transcription-accuracy branch (acc-04/05/06), the recording-deadline live bug, and the post-merge live
+smoke/release gate. Two new coder models debut: **Fable 5** as an implementer/rescuer and **Sonnet 5**
+as a diagnostician. Sol remained the sole reviewer (high first, medium re-reviews) throughout.
+
+### Scorecard by role
+
+| Model (role) | Dispatches | How it closed | Failure mode | Verdict |
+|---|---|---|---|---|
+| Opus 4.8 — implementer/fixer (high) | acc-04 (impl+fix), acc-06 (impl+2 fix rounds), live-deadline fix | acc-04 closed in 1 fix round; live-deadline clean; **acc-06 discarded on strike 3** after 3 attempts | The "pendulum" on adversarial policy: bypassable → gameable → removed; never solved the gate core | Still the reliable fixer for scoped ownership/lifecycle work; do NOT hand it open-ended adversarial-*policy* design |
+| Fable 5 — implementer/rescuer (medium/high) | acc-05 (impl+fix), acc-06 (2 rescue attempts), live-gate driver, CLI keyterm | acc-05 closed clean (model debut); **acc-06: 1st rescue discarded on strike 3, 2nd rescue closed it** in 8-round total | Same adversarial-edge pendulum on the 1st rescue; one honesty miss (claim-vs-impl gap, row 78) | Legit new implementer tier — solved the acc-06 core Opus couldn't, honest deviation reporting; needs a **simplify mandate + fresh context** to avoid the edge pendulum |
+| Sol — reviewer (high→medium) | every ticket; 8 rounds on acc-06 alone | unbroken; APPROVE only on genuinely clean diffs | none observed | Highest-ROI spend, reaffirmed: built the homophone counter-example ("cache writes failed" vs "cash rights sailed"), verified provider docs via web, separated must-fix from acceptable residuals on request; reviews got cheaper as diffs narrowed (~43k–54k late rounds) |
+| Sonnet 5 — diagnostician (high) | live recording-deadline root-cause | one 90 s pass from journalctl evidence | none observed | The right tool for evidence-first live diagnosis; ~51k tokens, log-evidence-first beat every code guess |
+| Driver (Fable, inline) | live-gate blockers, CLI keyterm, live-smoke defects | RED→GREEN on the real host | — | Owns the real-machine gate — where 4 host-only defects and both live blockers surfaced |
+
+### The acc-06 outlier
+
+acc-06 (divergence gate + provider-failure visibility) is the adversarial-policy outlier of the whole
+project: **≈1.9M impl tokens across 3 agents / 8 commits / 8 review rounds** before APPROVE. Opus was
+discarded on strike 3 after three attempts at the gate policy; a first Fable rescue solved the *core* in
+one pass but was itself discarded on strike 3 chasing adversarial edges; only a **second Fable rescue with
+an explicit simplify mandate and fresh context** closed it (deleted 2 tiers, unified symmetric phonetic
+matching). Findings-per-round converged 6→3→2→3→5→1→0.
+
+### New lessons (beyond the 01–13 report)
+
+1. **Adversarial-policy design is a distinct hard class.** It defeated both Opus and a first Fable rescue
+   (3 strikes each). What broke it was not more effort or more rounds but **simplify the mandate + fresh
+   context**. This is the policy-design analogue of ticket 13's "escalate the model, not the effort."
+2. **The three-strike escalation rule earned its keep** — it fired twice on acc-06 and each discard-and-
+   respawn was the correct call; grinding a stuck agent further would have burned tokens for no progress.
+3. **Fable 5 is a real implementer tier now**, not just the driver persona: closed acc-05 (Deepgram WS
+   streaming) solo and cracked the acc-06 gate core no other model reached.
+4. **Opus stays best for scoped ownership/lifecycle fixes** (acc-04, live-deadline) but should not own
+   open-ended reconciliation/gate *policy* design.
+5. **Sandbox proves contracts, host proves tools** — reaffirmed a 3rd and 4th time: the live smoke day
+   surfaced 4 host-only defects (NEVRA parse, wl-copy child misread as timeout, pw-record SIGINT exit 1,
+   placeholder credentials) invisible to every sandboxed agent.
+6. **Outcome:** first sub-10 WER — raw 10.8%, formatting-adjusted **9.2%**.
+
+### Routing recommendation (updated)
+
+1. **Sol reviews unchanged and reaffirmed** — high first, medium re-reviews; protect this quota first.
+2. **Adversarial-policy / reconciliation-gate design → Fable 5 high with an explicit simplify mandate**
+   and a hard Sol review; discard-and-simplify on strike 3 rather than grinding. Do not route this class
+   to Opus as open-ended design.
+3. **WS/streaming provider integration → Fable 5 medium** — proven on acc-05.
+4. **Scoped ownership/lifecycle/cancellation fixes → Opus 4.8 high** — unchanged.
+5. **Live/evidence-first diagnosis → Sonnet 5 high**, log-evidence-first, cheap.
+6. **Keep the driver on real-desktop/host gates** — the only place host-only defects ever appear.
