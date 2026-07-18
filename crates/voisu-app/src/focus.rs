@@ -19,13 +19,16 @@ const KWIN_SCRIPT_PLUGIN: &str = "voisu-focus-guard";
 
 /// KWin pushes on activation rather than polling. Ten minutes exceeds Voisu's
 /// five-minute Recording cap, while still making a silent script failure fail
-/// closed instead of trusting an indefinitely old identity. A KWin restart is
-/// detected separately by comparing its unique D-Bus owner on every read.
+/// closed instead of trusting an indefinitely old identity. A single-window
+/// dwell past the deadline therefore falls back safely to clipboard; the bound
+/// limits the fail-open window if the push-only script dies without a freshness
+/// signal while KWin keeps running. A KWin restart is detected separately by
+/// comparing its unique D-Bus owner on every read.
 pub const KWIN_FOCUS_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
 
 pub const KWIN_FOCUS_SCRIPT: &str = r#"function reportActiveWindow(window) {
     if (!window) {
-        callDBus("org.voisu.Focus1", "/org/voisu/Focus1", "org.voisu.Focus1", "Update", "", 0, "");
+        callDBus("org.voisu.Focus1", "/org/voisu/Focus1", "org.voisu.Focus1", "Update", "", "", "");
         return;
     }
     callDBus(
@@ -34,7 +37,7 @@ pub const KWIN_FOCUS_SCRIPT: &str = r#"function reportActiveWindow(window) {
         "org.voisu.Focus1",
         "Update",
         String(window.internalId),
-        Number(window.pid || 0),
+        String(window.pid || ""),
         String(window.resourceClass || "")
     );
 }
@@ -68,12 +71,12 @@ struct KwinFocusStore {
 }
 
 impl KwinFocusStore {
-    fn push(&mut self, stable_id: &str, process_id: u32, app_id: &str) {
+    fn push(&mut self, stable_id: &str, process_id: &str, app_id: &str) {
         self.last_push = (!stable_id.is_empty()).then(|| {
             (
                 WindowIdentity {
                     stable_id: stable_id.to_owned(),
-                    process_id: (process_id != 0).then_some(process_id),
+                    process_id: process_id.parse::<u32>().ok().filter(|pid| *pid != 0),
                     app_id: (!app_id.is_empty()).then(|| app_id.to_owned()),
                 },
                 Instant::now(),
@@ -91,14 +94,41 @@ impl KwinFocusStore {
 
 struct KwinFocusUpdates {
     store: Arc<Mutex<KwinFocusStore>>,
+    expected_owner: String,
+}
+
+impl KwinFocusUpdates {
+    fn apply_update(
+        &self,
+        sender: Option<&str>,
+        stable_id: &str,
+        process_id: &str,
+        app_id: &str,
+    ) {
+        if sender != Some(self.expected_owner.as_str()) {
+            return;
+        }
+        if let Ok(mut store) = self.store.lock() {
+            store.push(stable_id, process_id, app_id);
+        }
+    }
 }
 
 #[zbus::interface(name = "org.voisu.Focus1")]
 impl KwinFocusUpdates {
-    fn update(&self, stable_id: String, process_id: u32, app_id: String) {
-        if let Ok(mut store) = self.store.lock() {
-            store.push(&stable_id, process_id, &app_id);
-        }
+    fn update(
+        &self,
+        stable_id: String,
+        process_id: String,
+        app_id: String,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+    ) {
+        self.apply_update(
+            hdr.sender().map(|sender| sender.as_str()),
+            &stable_id,
+            &process_id,
+            &app_id,
+        );
     }
 }
 
@@ -222,19 +252,23 @@ async fn initialize_kwin_probe(runtime_dir: &Path) -> Option<KwinFocusProbe> {
     let store = Arc::new(Mutex::new(KwinFocusStore::default()));
     let builder = zbus::connection::Builder::session().ok()?;
     let builder = builder.name(VOISU_FOCUS_BUS_NAME).ok()?;
-    let builder = builder
-        .serve_at(
-            VOISU_FOCUS_PATH,
-            KwinFocusUpdates {
-                store: Arc::clone(&store),
-            },
-        )
-        .ok()?;
     let connection = timeout(FOCUS_DBUS_DEADLINE, builder.build())
         .await
         .ok()?
         .ok()?;
     let owner = kwin_owner(&connection).await?;
+    connection
+        .object_server()
+        .at(
+            VOISU_FOCUS_PATH,
+            KwinFocusUpdates {
+                store: Arc::clone(&store),
+                expected_owner: owner.clone(),
+            },
+        )
+        .await
+        .ok()?;
+
     let script_path = runtime_dir.join(format!("kwin-focus-{}.js", std::process::id()));
     let mut script = OpenOptions::new()
         .write(true)
@@ -242,42 +276,47 @@ async fn initialize_kwin_probe(runtime_dir: &Path) -> Option<KwinFocusProbe> {
         .mode(0o600)
         .open(&script_path)
         .ok()?;
-    std::io::Write::write_all(&mut script, KWIN_FOCUS_SCRIPT.as_bytes()).ok()?;
-    drop(script);
+    let result = async {
+        std::io::Write::write_all(&mut script, KWIN_FOCUS_SCRIPT.as_bytes()).ok()?;
+        drop(script);
 
-    let scripting = zbus::Proxy::new(
-        &connection,
-        KWIN_BUS_NAME,
-        KWIN_SCRIPTING_PATH,
-        KWIN_SCRIPTING_INTERFACE,
-    )
-    .await
-    .ok()?;
-    let path = script_path.to_string_lossy().into_owned();
-    let loaded = timeout(
-        FOCUS_DBUS_DEADLINE,
-        scripting.call_method("loadScript", &(path, KWIN_SCRIPT_PLUGIN)),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    let script_id: i32 = loaded.body().deserialize().ok()?;
-    if script_id < 0 {
-        return None;
+        let scripting = zbus::Proxy::new(
+            &connection,
+            KWIN_BUS_NAME,
+            KWIN_SCRIPTING_PATH,
+            KWIN_SCRIPTING_INTERFACE,
+        )
+        .await
+        .ok()?;
+        let path = script_path.to_string_lossy().into_owned();
+        let loaded = timeout(
+            FOCUS_DBUS_DEADLINE,
+            scripting.call_method("loadScript", &(path, KWIN_SCRIPT_PLUGIN)),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let script_id: i32 = loaded.body().deserialize().ok()?;
+        if script_id < 0 {
+            return None;
+        }
+        timeout(
+            FOCUS_DBUS_DEADLINE,
+            scripting.call_method("start", &()),
+        )
+        .await
+        .ok()?
+        .ok()?;
+
+        Some(KwinFocusProbe {
+            connection,
+            owner,
+            store,
+        })
     }
-    timeout(
-        FOCUS_DBUS_DEADLINE,
-        scripting.call_method("start", &()),
-    )
-    .await
-    .ok()?
-    .ok()?;
-
-    Some(KwinFocusProbe {
-        connection,
-        owner,
-        store,
-    })
+    .await;
+    let _ = std::fs::remove_file(script_path);
+    result
 }
 
 async fn kwin_owner(connection: &zbus::Connection) -> Option<String> {
@@ -323,7 +362,7 @@ mod tests {
     fn kwin_push_uses_internal_id_and_normalizes_optional_diagnostics() {
         let mut store = KwinFocusStore::default();
 
-        store.push("{ae0b-42}", 4242, "org.kde.kate");
+        store.push("{ae0b-42}", "4242", "org.kde.kate");
 
         assert_eq!(
             store.current_at(Instant::now()),
@@ -333,12 +372,45 @@ mod tests {
                 app_id: Some("org.kde.kate".to_owned()),
             })
         );
+
+        store.push("{ae0b-43}", "not-a-pid", "");
+        assert_eq!(
+            store.current_at(Instant::now()),
+            Some(WindowIdentity {
+                stable_id: "{ae0b-43}".to_owned(),
+                process_id: None,
+                app_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn kwin_updates_ignore_missing_or_mismatched_senders() {
+        let store = Arc::new(Mutex::new(KwinFocusStore::default()));
+        let updates = KwinFocusUpdates {
+            store: Arc::clone(&store),
+            expected_owner: ":1.42".to_owned(),
+        };
+
+        updates.apply_update(Some(":1.99"), "{wrong}", "99", "wrong.app");
+        updates.apply_update(None, "{missing}", "98", "missing.app");
+        assert_eq!(store.lock().unwrap().current_at(Instant::now()), None);
+
+        updates.apply_update(Some(":1.42"), "{right}", "4242", "org.kde.kate");
+        assert_eq!(
+            store.lock().unwrap().current_at(Instant::now()),
+            Some(WindowIdentity {
+                stable_id: "{right}".to_owned(),
+                process_id: Some(4242),
+                app_id: Some("org.kde.kate".to_owned()),
+            })
+        );
     }
 
     #[test]
     fn kwin_empty_internal_id_clears_focus_and_stale_pushes_fail_closed() {
         let mut store = KwinFocusStore::default();
-        store.push("{ae0b-42}", 0, "");
+        store.push("{ae0b-42}", "0", "");
         store.last_push = store
             .last_push
             .take()
@@ -346,7 +418,7 @@ mod tests {
 
         assert_eq!(store.current_at(Instant::now()), None);
 
-        store.push("", 0, "");
+        store.push("", "0", "");
         assert_eq!(store.current_at(Instant::now()), None);
     }
 }
