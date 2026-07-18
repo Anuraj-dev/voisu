@@ -5867,10 +5867,13 @@ fn cli_history_renders_the_complete_bounded_records() {
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
 
-    let output = voisu(runtime.path(), "history");
+    // `--json` is the byte-compatible raw-records escape hatch; the default
+    // `voisu history` now renders a human-first pretty view (see the pretty
+    // render unit tests in voisu_app::history_view).
+    let output = voisu_with_env(runtime.path(), &["history", "--json"], &[]);
     assert!(output.status.success());
     let records: Value = serde_json::from_str(&stdout(&output))
-        .expect("voisu history prints structured JSON");
+        .expect("voisu history --json prints structured JSON");
     let record = &records[0];
     assert!(record["correlation_id"].as_str().unwrap().starts_with("rec-"));
     assert_eq!(record["final_transcript"], "Render the full record");
