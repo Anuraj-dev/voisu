@@ -1595,6 +1595,7 @@ fn process_diagnostic(prefix: &str, stderr: &[u8]) -> String {
 
 pub struct GroqProvider {
     reaper: ProviderReaper,
+    prompt: Option<String>,
 }
 
 impl GroqProvider {
@@ -1602,7 +1603,17 @@ impl GroqProvider {
     /// stream dropped mid-abort hands its curl reap to the supervisor the actor
     /// drains before Idle.
     pub fn new(reaper: ProviderReaper) -> Self {
-        Self { reaper }
+        Self { reaper, prompt: None }
+    }
+
+    /// Builds a provider with a Recording-start dictionary snapshot. Supplying
+    /// the prompt keeps every Groq request for that Recording on the same
+    /// glossary as its Deepgram stream.
+    pub fn with_prompt(reaper: ProviderReaper, prompt: String) -> Self {
+        Self {
+            reaper,
+            prompt: Some(prompt),
+        }
     }
 }
 
@@ -1620,7 +1631,11 @@ impl TranscriptProvider for GroqProvider {
         Ok(Box::new(GroqStream {
             credential,
             endpoint,
-            params: GroqRequestParams::from_config(),
+            params: GroqRequestParams::from_config(
+                self.prompt
+                    .clone()
+                    .unwrap_or_else(crate::dictionary::whisper_prompt),
+            ),
             buffer: Vec::new(),
             streamed_bytes: 0,
             chunks: VecDeque::new(),
@@ -1664,17 +1679,17 @@ struct GroqRequestParams {
 }
 
 impl GroqRequestParams {
-    /// Resolves the request tuning from config and the shared dictionary:
+    /// Resolves the request tuning from config and a resolved dictionary prompt:
     /// model from `VOISU_GROQ_MODEL` (default `whisper-large-v3`), language from
     /// `VOISU_GROQ_LANGUAGE` (default `en`), and the Whisper vocabulary prompt.
-    fn from_config() -> Self {
+    fn from_config(prompt: String) -> Self {
         let model = std::env::var("VOISU_GROQ_MODEL")
             .unwrap_or_else(|_| "whisper-large-v3".to_owned());
         let language = std::env::var("VOISU_GROQ_LANGUAGE").unwrap_or_else(|_| "en".to_owned());
         Self {
             model,
             language,
-            prompt: crate::dictionary::whisper_prompt(),
+            prompt,
         }
     }
 }

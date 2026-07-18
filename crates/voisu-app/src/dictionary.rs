@@ -16,7 +16,7 @@
 //! comment, blank lines are ignored, and a missing file means built-ins only.
 
 use std::collections::HashSet;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 /// Whisper honours only ~224 tokens of prompt. The prompt builder appends terms
@@ -145,6 +145,63 @@ pub fn merged_terms() -> Vec<String> {
     merged_terms_with(load_user_terms(&user_dictionary_path()))
 }
 
+/// Adds a user term to the end of the personal dictionary. Existing terms are
+/// compared case-insensitively, so the user's first spelling and ordering win.
+pub fn add_user_term(term: &str) -> Result<bool, String> {
+    let term = validated_term(term)?;
+    let path = user_dictionary_path();
+    let existing = read_dictionary_contents(&path)?;
+    if parse_user_terms(&existing)
+        .iter()
+        .any(|existing_term| existing_term.to_lowercase() == term.to_lowercase())
+    {
+        return Ok(false);
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(term);
+    updated.push('\n');
+    write_user_dictionary(&path, &updated)?;
+    Ok(true)
+}
+
+/// Removes every case-insensitive occurrence of a user term while leaving
+/// comments, blank lines, and the order of all other lines byte-for-byte intact.
+pub fn remove_user_term(term: &str) -> Result<bool, String> {
+    let term = validated_term(term)?;
+    let path = user_dictionary_path();
+    let existing = read_dictionary_contents(&path)?;
+    let mut removed = false;
+    let mut updated = String::with_capacity(existing.len());
+    for line in existing.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line).trim_end_matches('\r');
+        let matches = strip_comment(content)
+            .trim()
+            .to_lowercase()
+            == term.to_lowercase();
+        if matches {
+            removed = true;
+        } else {
+            updated.push_str(line);
+        }
+    }
+    if !removed {
+        return Ok(false);
+    }
+    write_user_dictionary(&path, &updated)?;
+    Ok(true)
+}
+
+/// Reads only the personal dictionary terms, in their stored order. Built-in
+/// vocabulary is deliberately excluded so the CLI manages exactly what users
+/// have written.
+pub fn user_terms() -> Result<Vec<String>, String> {
+    read_user_terms(&user_dictionary_path())
+}
+
 /// The Deepgram keyterm vocabulary: `terms` truncated in order to the
 /// [`DEEPGRAM_KEYTERM_TOKEN_BUDGET`] and [`DEEPGRAM_KEYTERM_COUNT_LIMIT`].
 /// Deepgram returns a 400 response when its keyterm token cap is exceeded,
@@ -176,7 +233,14 @@ pub fn deepgram_keyterms(terms: &[String]) -> Vec<String> {
 /// instructions — Whisper biases toward prompt vocabulary, it is not an
 /// instruction channel.
 pub fn whisper_prompt() -> String {
-    whisper_prompt_from_terms(&merged_terms())
+    whisper_prompt_for_terms(&merged_terms())
+}
+
+/// Builds a Whisper vocabulary prompt from an already-resolved dictionary
+/// snapshot. The daemon uses this with the same terms used for Deepgram so one
+/// Recording cannot mix vocabulary versions across Providers.
+pub fn whisper_prompt_for_terms(terms: &[String]) -> String {
+    whisper_prompt_from_terms(terms)
 }
 
 /// The resolved user dictionary path: `$XDG_CONFIG_HOME/voisu/dictionary.txt`,
@@ -188,6 +252,46 @@ fn user_dictionary_path() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .unwrap_or_else(|| PathBuf::from(".config"));
     base.join("voisu").join("dictionary.txt")
+}
+
+fn validated_term(term: &str) -> Result<&str, String> {
+    let term = term.trim();
+    if term.is_empty() || term.contains(['\n', '\r']) {
+        return Err("dictionary term must be one non-empty line".to_owned());
+    }
+    Ok(term)
+}
+
+fn read_dictionary_contents(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(format!(
+            "cannot read user dictionary {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+/// Replaces the dictionary via a fully written same-directory temporary file,
+/// so readers see either the old file or the complete new file, never a torn
+/// edit.
+fn write_user_dictionary(path: &Path, contents: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("dictionary path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create dictionary directory {}: {error}", parent.display()))?;
+    let mut file = tempfile::Builder::new()
+        .prefix(".dictionary.txt.")
+        .tempfile_in(parent)
+        .map_err(|error| format!("cannot stage dictionary write in {}: {error}", parent.display()))?;
+    file.write_all(contents.as_bytes())
+        .and_then(|()| file.as_file().sync_all())
+        .map_err(|error| format!("cannot write user dictionary {}: {error}", path.display()))?;
+    file.persist(path)
+        .map_err(|error| format!("cannot persist user dictionary {}: {}", path.display(), error.error))?;
+    Ok(())
 }
 
 /// Loads user dictionary terms, logging a local diagnostic on a genuine read

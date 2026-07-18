@@ -439,22 +439,14 @@ async fn actor_loop(
     // Delivery mode is resolved once at daemon start, like the Deepgram
     // toggle. A running daemon keeps that choice until its next restart.
     let delivery_mode = voisu_app::config::delivery_mode();
-    // The Deepgram keyterm snapshot, resolved once at startup. Threaded into
-    // every adapter rebuild so the supervised replay tail never re-reads the
-    // dictionary file (no filesystem I/O or fallible logging in that path).
-    let keyterms = Arc::new(voisu_app::dictionary::deepgram_keyterms(
-        &voisu_app::dictionary::merged_terms(),
-    ));
-    let mut deepgram: Option<Box<dyn TranscriptProvider>> = Some(build_deepgram_provider(
-        deepgram_enabled,
-        controlled,
-        &keyterms,
-        &reaper,
-    ));
-    let mut groq: Option<Box<dyn TranscriptProvider>> = Some(if controlled {
-        Box::new(ControlledProvider::from_env(Provider::Groq))
-    } else {
-        Box::new(GroqProvider::new(reaper.clone()))
+    // Production adapters are built only at a Recording or replay boundary,
+    // after resolving that operation's dictionary snapshot below. Controlled
+    // adapters keep their existing one-shot failure seams across retries.
+    let mut deepgram: Option<Box<dyn TranscriptProvider>> = controlled.then(|| {
+        build_deepgram_provider(deepgram_enabled, true, &[], &reaper)
+    });
+    let mut groq: Option<Box<dyn TranscriptProvider>> = controlled.then(|| {
+        build_groq_provider(true, String::new(), &reaper)
     });
     // The processing supervisor cannot inspect task-local provider state after a
     // panic, so retain the providers configured for this Recording beside the
@@ -522,6 +514,29 @@ async fn actor_loop(
                     let id = next_id;
                     next_id += 1;
                     state = ActorState::Replaying(id);
+                    // Resolve a single snapshot before adapters are built. The
+                    // replay supervisor only receives these values; its tail is
+                    // deliberately filesystem-free.
+                    let replay_terms = voisu_app::dictionary::merged_terms();
+                    let replay_keyterms = Arc::new(voisu_app::dictionary::deepgram_keyterms(
+                        &replay_terms,
+                    ));
+                    let replay_whisper_prompt = Arc::new(
+                        voisu_app::dictionary::whisper_prompt_for_terms(&replay_terms),
+                    );
+                    if !controlled {
+                        deepgram = Some(build_deepgram_provider(
+                            deepgram_enabled,
+                            false,
+                            &replay_keyterms,
+                            &reaper,
+                        ));
+                        groq = Some(build_groq_provider(
+                            false,
+                            replay_whisper_prompt.as_ref().clone(),
+                            &reaper,
+                        ));
+                    }
                     let current_deepgram =
                         deepgram.take().expect("Deepgram adapter is available");
                     let current_groq = groq.take().expect("Groq adapter is available");
@@ -551,7 +566,8 @@ async fn actor_loop(
                         id,
                         controlled,
                         deepgram_enabled,
-                        Arc::clone(&keyterms),
+                        replay_keyterms,
+                        replay_whisper_prompt,
                         reply,
                         tx.clone(),
                         reaper.clone(),
@@ -577,6 +593,26 @@ async fn actor_loop(
                 Command::Start | Command::Toggle if matches!(state, ActorState::Idle) => {
                     let id = next_id;
                     next_id += 1;
+                    // A dictionary edit becomes visible at this Recording
+                    // boundary, never mid-utterance. Both providers receive
+                    // derivatives of exactly this one merged snapshot.
+                    let session_terms = voisu_app::dictionary::merged_terms();
+                    let session_keyterms = voisu_app::dictionary::deepgram_keyterms(&session_terms);
+                    let session_whisper_prompt =
+                        voisu_app::dictionary::whisper_prompt_for_terms(&session_terms);
+                    if !controlled {
+                        deepgram = Some(build_deepgram_provider(
+                            deepgram_enabled,
+                            false,
+                            &session_keyterms,
+                            &reaper,
+                        ));
+                        groq = Some(build_groq_provider(
+                            false,
+                            session_whisper_prompt,
+                            &reaper,
+                        ));
+                    }
                     // The correlation ID exists from the moment the Recording is
                     // accepted, so startup failures and recovery evidence are
                     // correlated even though no adapter has started yet.
@@ -669,8 +705,15 @@ async fn actor_loop(
                     reply,
                 } = *started;
                 capture = Some(returned_capture);
-                deepgram = Some(returned_deepgram);
-                groq = Some(returned_groq);
+                if controlled {
+                    deepgram = Some(returned_deepgram);
+                    groq = Some(returned_groq);
+                } else {
+                    // The next production Recording/replay builds fresh
+                    // providers from its own dictionary snapshot.
+                    drop(returned_deepgram);
+                    drop(returned_groq);
+                }
                 let correlation = match &state {
                     ActorState::Starting {
                         id: starting_id,
@@ -926,8 +969,15 @@ async fn actor_loop(
                     reply,
                     response,
                 } = *completed;
-                deepgram = Some(returned_deepgram);
-                groq = Some(returned_groq);
+                if controlled {
+                    deepgram = Some(returned_deepgram);
+                    groq = Some(returned_groq);
+                } else {
+                    // Replay's next production invocation resolves and builds
+                    // its own snapshot; retaining these adapters would be stale.
+                    drop(returned_deepgram);
+                    drop(returned_groq);
+                }
                 validator = Some(returned_validator);
                 // `supervise_replay` drained the provider reaper before this
                 // acknowledgement, so the Idle transition never blocks the loop.
@@ -1257,9 +1307,9 @@ fn elapsed_millis(started_at: Instant) -> u64 {
 /// entirely and the Recording runs Groq-only. Otherwise the controlled test
 /// adapter or the live streaming adapter is used, exactly as before.
 ///
-/// `keyterms` is the dictionary snapshot resolved once at daemon start, never a
-/// fresh `merged_terms()` read: this runs in the supervised replay tail on the
-/// panic-rebuild path, which must do no filesystem I/O or fallible logging.
+/// `keyterms` is an already-resolved Recording or replay snapshot. This builder
+/// never calls `merged_terms()`: the supervised replay tail can rebuild safely
+/// without filesystem I/O or fallible logging.
 fn build_deepgram_provider(
     deepgram_enabled: bool,
     controlled: bool,
@@ -1275,6 +1325,20 @@ fn build_deepgram_provider(
             reaper.clone(),
             keyterms.to_vec(),
         ))
+    }
+}
+
+/// Builds Groq from the same pre-resolved snapshot as Deepgram. Controlled
+/// tests do not issue Whisper requests, so their provider has no prompt.
+fn build_groq_provider(
+    controlled: bool,
+    whisper_prompt: String,
+    reaper: &ProviderReaper,
+) -> Box<dyn TranscriptProvider> {
+    if controlled {
+        Box::new(ControlledProvider::from_env(Provider::Groq))
+    } else {
+        Box::new(GroqProvider::with_prompt(reaper.clone(), whisper_prompt))
     }
 }
 
@@ -1918,6 +1982,7 @@ async fn supervise_replay(
     controlled: bool,
     deepgram_enabled: bool,
     keyterms: Arc<Vec<String>>,
+    whisper_prompt: Arc<String>,
     reply: oneshot::Sender<Response>,
     actor: mpsc::Sender<ActorMessage>,
     reaper: ProviderReaper,
@@ -1936,7 +2001,13 @@ async fn supervise_replay(
                 "Replay {id}: replay task failed: {join_error}"
             ));
             let (deepgram, groq, validator) =
-                rebuild_replay_adapters(controlled, deepgram_enabled, &keyterms, &reaper);
+                rebuild_replay_adapters(
+                    controlled,
+                    deepgram_enabled,
+                    &keyterms,
+                    whisper_prompt.as_ref(),
+                    &reaper,
+                );
             ReplayCompletion {
                 id,
                 deepgram,
@@ -1963,17 +2034,18 @@ fn rebuild_replay_adapters(
     controlled: bool,
     deepgram_enabled: bool,
     keyterms: &[String],
+    whisper_prompt: &str,
     reaper: &ProviderReaper,
 ) -> (
     Box<dyn TranscriptProvider>,
     Box<dyn TranscriptProvider>,
     Box<dyn TranscriptValidator>,
 ) {
-    // Use the daemon-start toggle and keyterm snapshot, never a fresh config or
-    // dictionary read: this runs inside the supervised replay tail, which must
-    // stay panic-free and free of filesystem I/O and stray stderr, and a live
-    // `voisu deepgram` toggle must not change behavior before the documented
-    // daemon restart.
+    // Use the daemon-start toggle and captured provider snapshots, never a
+    // fresh config or dictionary read: this runs inside the supervised replay
+    // tail, which must stay panic-free and free of filesystem I/O and stray
+    // stderr. A live `voisu deepgram` toggle still takes effect only after the
+    // documented daemon restart.
     let deepgram = build_deepgram_provider(deepgram_enabled, controlled, keyterms, reaper);
     if controlled {
         (
@@ -1984,7 +2056,7 @@ fn rebuild_replay_adapters(
     } else {
         (
             deepgram,
-            Box::new(GroqProvider::new(reaper.clone())),
+            build_groq_provider(false, whisper_prompt.to_owned(), reaper),
             Box::new(MergeResultValidator::new()),
         )
     }

@@ -29,6 +29,9 @@ enum CliAction {
     AuthVerify(Provider),
     SetDeepgram(bool),
     Delivery(Option<DeliveryMode>),
+    DictionaryAdd(String),
+    DictionaryRemove(String),
+    DictionaryList { json: bool },
     Service(UserServiceAction),
     Help,
 }
@@ -45,6 +48,9 @@ fn main() -> ExitCode {
         Ok(CliAction::AuthVerify(provider)) => auth_verify(provider),
         Ok(CliAction::SetDeepgram(enabled)) => set_deepgram(enabled),
         Ok(CliAction::Delivery(mode)) => delivery(mode),
+        Ok(CliAction::DictionaryAdd(term)) => dictionary_add(&term),
+        Ok(CliAction::DictionaryRemove(term)) => dictionary_remove(&term),
+        Ok(CliAction::DictionaryList { json }) => dictionary_list(json),
         Ok(CliAction::Service(action)) => match manage_user_service(action) {
             Ok(report) => {
                 println!("{}", report.message);
@@ -301,6 +307,50 @@ fn delivery(mode: Option<DeliveryMode>) -> ExitCode {
     }
 }
 
+fn dictionary_add(term: &str) -> ExitCode {
+    match voisu_app::dictionary::add_user_term(term) {
+        Ok(true) => {
+            println!("dictionary term added: {term}");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            println!("dictionary term already present: {term}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => fail(4, &message),
+    }
+}
+
+fn dictionary_remove(term: &str) -> ExitCode {
+    match voisu_app::dictionary::remove_user_term(term) {
+        Ok(true) => {
+            println!("dictionary term removed: {term}");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => fail(4, &format!("dictionary term not found: {term}")),
+        Err(message) => fail(4, &message),
+    }
+}
+
+fn dictionary_list(json: bool) -> ExitCode {
+    match voisu_app::dictionary::user_terms() {
+        Ok(terms) if json => match serde_json::to_string(&terms) {
+            Ok(terms) => {
+                println!("{terms}");
+                ExitCode::SUCCESS
+            }
+            Err(_) => fail(1, "cannot encode dictionary terms as JSON"),
+        },
+        Ok(terms) => {
+            for term in terms {
+                println!("{term}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(message) => fail(4, &message),
+    }
+}
+
 fn credential_from_stdin() -> Result<Credential, BoundaryError> {
     let mut credential = String::new();
     std::io::stdin()
@@ -413,6 +463,20 @@ fn parse_command() -> Result<CliAction, String> {
         [command, mode] if command == "delivery" => {
             Ok(CliAction::Delivery(Some(parse_delivery_mode(mode)?)))
         }
+        [dictionary, action, term] if dictionary == "dictionary" && action == "add" => {
+            Ok(CliAction::DictionaryAdd(term.clone()))
+        }
+        [dictionary, action, term] if dictionary == "dictionary" && action == "remove" => {
+            Ok(CliAction::DictionaryRemove(term.clone()))
+        }
+        [dictionary, action] if dictionary == "dictionary" && action == "list" => {
+            Ok(CliAction::DictionaryList { json: false })
+        }
+        [dictionary, action, flag]
+            if dictionary == "dictionary" && action == "list" && flag == "--json" =>
+        {
+            Ok(CliAction::DictionaryList { json: true })
+        }
         [service, action] if service == "service" => {
             Ok(CliAction::Service(parse_service_action(action)?))
         }
@@ -460,7 +524,7 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: voisu <start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|delivery|service>\n\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu delivery [type|clipboard|guarded]  # choose Transcript Delivery (default type); no argument shows the persisted mode\n  voisu service <install|start|stop|restart|status|uninstall>"
+    "usage: voisu <start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|delivery|dictionary|service>\n\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu delivery [type|clipboard|guarded]  # choose Transcript Delivery (default type); no argument shows the persisted mode\n  voisu dictionary add <term>\n  voisu dictionary remove <term>\n  voisu dictionary list [--json]\n  voisu service <install|start|stop|restart|status|uninstall>"
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {
