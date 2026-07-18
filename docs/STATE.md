@@ -2,24 +2,30 @@
 > Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-18
 
 ## 🚧 In progress / next
-- **Everything AFK-doable is SHIPPED.** Remaining work is **HITL-gated on Raja**:
-  1. **RPM ship gate** (runs ONCE): `TMPDIR=/var/tmp RUST_TEST_THREADS=4
-     VOISU_COMMIT=$(git rev-parse HEAD) packaging/build-rpm.sh` on a clean
-     committed tree; cargo clean before/after; ~11–14 GB disk. Installed RPM is
-     still `gitfd3c663` (pre-criticals, pre-latency). GREEN LIGHT given.
-  2. **Ticket 02** — live Groq-only evaluation on the new install (Deepgram OFF;
-     tail + proper-noun quality → `.scratch/voisu-latency/assets/02-groq-only-evidence.md`).
-  3. **Ticket 03** — Deepgram fate decision (keep-as-opt-in vs delete), after 02.
-  4. **PR #31 (systemd sandboxing) merge** — HELD until after the live eval;
-     every directive then needs real-install validation (voisu doctor, live
-     Recording, overlay startup).
-- Hardening 05 hygiene sweep still waits (BoundaryError boxing, lint-allow
-  cleanup — the CI gate documented these as hardening-05 debts).
+- **LATENCY EFFORT COMPLETE. All hardening criticals + 03/04 CLOSED.** Queued next:
+  1. **Flip Deepgram default to ON** (Raja, 2026-07-18: keep the jargon accuracy
+     as the everyday default; the toggle stays for the fast path). First code
+     change of the next session — do NOT do standalone.
+  2. **Hardening 05 hygiene sweep** — BoundaryError boxing + the justified
+     lint-allow debts the CI gate documented; also bump the 3 s `wait_for_marker`
+     bound (flaked once under RPM-build contention).
+  3. On the **next RPM build/install**: packaged units now carry the sandbox
+     directives; then DELETE the validation drop-ins at
+     `~/.config/systemd/user/voisu{,-overlay}.service.d/sandbox-validation.conf`
+     (they duplicate the merged unit and keep the live install sandboxed until then).
 - Priority 2 unchanged: Overlay visual polish. Future idea: packaging beyond RPM.
 
 ## Status
-- **Latency AFK tickets:** L-01 Deepgram default-OFF toggle (PR #27), L-04 FLAC
-  upload (PR #28) merged. Ticket 05 closed as already-shipped (PR #24).
+- **Latency effort CLOSED (all 5 tickets).** L-01 toggle (PR #27), L-04 FLAC
+  (PR #28), L-05 already-shipped (PR #24). L-02 live eval done on RPM
+  `git58a607f`: Groq-only tails 474–1075 ms vs reconciled 727–1670 ms (−25–36%),
+  but Groq-only mangled 8/9 jargon probes that reconciliation repaired —
+  evidence in `.scratch/voisu-latency/assets/02-groq-only-evidence.md`.
+  L-03 DECISION: Deepgram KEPT (default flips to ON next session).
+- **Hardening 03 VALIDATED + merged (PR #31):** sandboxed units proven on the
+  live install via drop-ins — doctor 6/6 PASS, full reconciled Recording
+  delivered, overlay layer-shell with zero degradation, `MemoryDenyWriteExecute`
+  fine on the daemon.
 - **History-pretty (PR #30):** `voisu history` renders a human-first paged view
   (transcript + tail latency headline, top-20 newest, Enter-to-page on TTY);
   `voisu history --json` keeps the old byte-identical JSON. Terminal-escape
