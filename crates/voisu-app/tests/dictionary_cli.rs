@@ -80,6 +80,30 @@ fn dictionary_remove_is_case_insensitive_and_preserves_everything_else() {
 }
 
 #[test]
+fn dictionary_add_rejects_a_comment_marker_term_without_writing_it() {
+    let cli = DictionaryCli::new();
+
+    // A leading '#' is a whole-line comment; adding it would store vocabulary the
+    // parser silently drops. It must fail with a nonzero exit and write nothing.
+    let leading = cli.run(&["dictionary", "add", "#project"]);
+    assert_eq!(leading.status.code(), Some(4), "{leading:?}");
+    assert!(String::from_utf8_lossy(&leading.stderr).contains("comment"));
+
+    // An inline " # " boundary would store only "Tokio" while claiming the whole
+    // string was added.
+    let inline = cli.run(&["dictionary", "add", "Tokio # runtime"]);
+    assert_eq!(inline.status.code(), Some(4), "{inline:?}");
+
+    // Neither rejected term reached the file.
+    assert!(!cli.dictionary_path().exists(), "no dictionary written");
+
+    // "C#" (# not preceded by whitespace) is a real term and is accepted.
+    let sharp = cli.run(&["dictionary", "add", "C#"]);
+    assert!(sharp.status.success(), "{sharp:?}");
+    assert_eq!(fs::read_to_string(cli.dictionary_path()).unwrap(), "C#\n");
+}
+
+#[test]
 fn dictionary_remove_reports_a_missing_term_with_the_dispatcher_not_found_exit_code() {
     let cli = DictionaryCli::new();
 
