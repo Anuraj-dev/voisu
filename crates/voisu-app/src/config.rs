@@ -92,7 +92,8 @@ fn read_setting(path: &Path) -> Option<bool> {
 /// document. Comments (`#`), blank lines, surrounding whitespace, and unrelated
 /// keys are ignored. Only the root table is honored: once a `[table]` (or
 /// `[[array]]`) header is seen the key belongs to that table, never the root
-/// toggle, so `[other]\ndeepgram_enabled = true` never enables the Provider. A
+/// toggle, so `[other]\ndeepgram_enabled = false` is ignored and the root
+/// setting still decides (falling back to the default when absent). A
 /// missing key or an unrecognised value yields `None` so the caller falls back
 /// to the default instead of failing on a hand-edited file.
 fn parse_deepgram_enabled(contents: &str) -> Option<bool> {
