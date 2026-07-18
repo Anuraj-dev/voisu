@@ -304,3 +304,17 @@ symmetric `phonetic_matching` feeding gate + selection) plus one alignment fix
 (`b2b83a0`), Sol APPROVE. Findings-per-round fell 6→3→2→3→5→1→0. Rejected
 alternative: continuing to patch with the same agent, which the six wasted rounds
 show does not converge — a fresh context beats an entrenched one.
+
+## 2026-07-18 — Post-audit hardening sequencing + trigger-ruled refactors
+**Why:** Full audit found 2 criticals (daemon wedge via unsupervised
+capture_pump panic; blocking stop_child on Tokio workers) living in the same
+files latency tickets 01/04 touch. Decided: criticals land right after the
+accuracy branch integrates and BEFORE latency (small diffs rebase cheap;
+rejected "everything waits" as it delays live correctness fixes). systemd
+hardening + CI cargo-audit/clippy are parallel-safe anytime (packaging/CI only).
+Minors bundled into one hygiene ticket behind latency (rejected per-ticket
+tracking overhead). Big refactors get TRIGGER RULES, not queue slots —
+system.rs split before overlay/desktop-target work, provider collectionization
+before a 3rd provider, nested-compositor e2e with the overlay milestone and
+CI-ONLY (Raja: local e2e eats his machine) — rejected firm scheduling to avoid
+churning files twice. Map: `.scratch/voisu-hardening/`.

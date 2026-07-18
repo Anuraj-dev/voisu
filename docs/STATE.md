@@ -1,5 +1,5 @@
 # Voisu — State
-> Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-17
+> Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-18
 
 ## 🚧 In progress / next
 - **Transcription-accuracy effort is CODE-COMPLETE and fully integrated** on branch
@@ -29,8 +29,10 @@
   `supervise_replay`), (2) wrap blocking `stop_child` in `spawn_blocking`
   (system.rs:1476/1488 — up to ~2 s worker-thread stall per stop). Both touch the
   same files as latency tickets 01 & 04; criticals land first so latency rebases
-  over small diffs. Full audit backlog is being charted in the hardening
-  wayfinder map (rest of it waits BEHIND latency).
+  over small diffs. Full backlog charted in the **hardening wayfinder map
+  `.scratch/voisu-hardening/`** (5 tickets; 03 systemd-hardening + 04
+  CI-audit/clippy are parallel-safe ANYTIME — packaging/CI only; 05 hygiene
+  sweep waits behind latency; refactors/e2e are trigger-ruled fog in the map).
 - **Latency effort queued behind this branch** (separate map `.scratch/voisu-latency/`
   + plan `docs/specs/2026-07-17-latency-optimization.md`; decisions D1–D4 in
   `decisions.md`). Do NOT start until `feature/transcription-accuracy` integrates
@@ -40,6 +42,12 @@
   kill-Overlay-mid-Recording, clean uninstall.
 
 ## Status
+- **Full codebase audit done (2026-07-18):** types 8/10, modularity 6/10,
+  security 8.5/10, quality 7/10, testing 7/10; 297 tests green. Two verified
+  criticals (see priority block above); full report + backlog in
+  `.scratch/voisu-hardening/`. Strengths to preserve listed in the report —
+  don't refactor away `Credential` no-Debug, redaction layers, overlay
+  feature isolation.
 - **Ticket 04 (Groq accuracy): CLOSED, Sol APPROVE.** Merged via `1503d26`.
   `dictionary.rs` (`merged_terms()`, `whisper_prompt()`, 224-token budget),
   Whisper prompt + `language=en` + `temperature=0`, `VOISU_GROQ_MODEL` override

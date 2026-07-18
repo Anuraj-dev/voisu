@@ -22,3 +22,4 @@
 | ../.scratch/voisu-implementation/issues/ | Ten ordered implementation tickets |
 | specs/2026-07-17-latency-optimization.md | Latency effort plan (Deepgram toggle, FLAC, delivery fix) |
 | ../.scratch/voisu-latency/ | Latency wayfinder map + tickets 01–05 |
+| ../.scratch/voisu-hardening/ | Post-audit hardening wayfinder map + tickets 01–05 + full audit report (assets/audit-2026-07-18.md) |
