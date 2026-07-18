@@ -69,9 +69,21 @@ fn isolate_deepgram_config(
     command: &mut Command,
     environment: &[(&str, &str)],
 ) -> Option<TempDir> {
+    // A test that drives the toggle itself keeps its own override untouched.
     if environment
         .iter()
-        .any(|(name, _)| *name == "XDG_CONFIG_HOME" || *name == "VOISU_DISABLE_DEEPGRAM")
+        .any(|(name, _)| *name == "VOISU_DISABLE_DEEPGRAM")
+    {
+        return None;
+    }
+    // Otherwise strip any VOISU_DISABLE_DEEPGRAM inherited from the parent
+    // shell/CI, which would silently disable Deepgram across the dual-Provider
+    // suite.
+    command.env_remove("VOISU_DISABLE_DEEPGRAM");
+    // A test with its own XDG_CONFIG_HOME supplies its own config; leave it be.
+    if environment
+        .iter()
+        .any(|(name, _)| *name == "XDG_CONFIG_HOME")
     {
         return None;
     }
@@ -6230,6 +6242,62 @@ fn a_disabled_deepgram_runs_groq_only_and_records_the_disabled_diagnostic() {
     );
 
     daemon.terminate();
+}
+
+#[test]
+fn a_failed_groq_only_recording_still_records_deepgram_as_not_started() {
+    // Finding 1: the disabled-Deepgram normalization must run on EVERY exit
+    // path, not only a successful completion barrier. Each failure mode below
+    // ends the Recording with no delivered Transcript, yet the disabled Deepgram
+    // Provider must still appear exactly once as NotStarted with the canonical
+    // diagnostic — never Completion, and never an Aborted entry carrying an
+    // unrelated capture/abort diagnostic.
+    for failure in [
+        ("VOISU_TEST_PROVIDER_COMPLETE_FAILURE", "groq"), // Groq completion failure
+        ("VOISU_TEST_PROVIDER_SEND_FAILURE", "groq"),     // Groq streaming failure
+        ("VOISU_TEST_CAPTURE_FINISH_FAILURE", "1"),       // capture-finalization failure
+    ] {
+        let runtime = TempDir::new().unwrap();
+        let daemon = Daemon::start_with_env(
+            runtime.path(),
+            &[
+                ("VOISU_DISABLE_DEEPGRAM", "1"),
+                ("VOISU_TEST_GROQ_TRANSCRIPT", "groq only transcript"),
+                failure,
+            ],
+        );
+
+        assert!(voisu(runtime.path(), "start").status.success());
+        // Drives the synchronous failures (completion, capture-finalization); a
+        // streaming failure aborts mid-Recording and may already have returned
+        // the daemon to Idle, so the record is polled for below regardless.
+        let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+        assert_eq!(stopped["ok"], false, "{failure:?} must fail the Recording: {stopped}");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let record = loop {
+            let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+            if history["history"].as_array().is_some_and(|records| !records.is_empty()) {
+                break history["history"][0].clone();
+            }
+            assert!(Instant::now() < deadline, "no failed record was retained for {failure:?}");
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        assert!(!record["error"].is_null(), "{failure:?} must retain an error: {record}");
+        let failures = record["provider_failures"].as_array().unwrap();
+        let deepgram: Vec<_> = failures
+            .iter()
+            .filter(|entry| entry["provider"] == "deepgram")
+            .collect();
+        assert_eq!(deepgram.len(), 1, "one Deepgram entry for {failure:?}: {record}");
+        assert_eq!(deepgram[0]["stage"], "not_started", "{failure:?}: {record}");
+        assert_eq!(
+            deepgram[0]["diagnostic"], "Deepgram disabled for this Recording",
+            "{failure:?}: {record}"
+        );
+        daemon.terminate();
+    }
 }
 
 #[test]

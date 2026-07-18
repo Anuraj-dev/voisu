@@ -12,7 +12,7 @@
 //! whitespace, and unrelated keys so a hand-edited file degrades to the default
 //! rather than erroring.
 
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 /// The single configuration key: whether the Deepgram Provider is enabled.
@@ -85,15 +85,23 @@ fn read_setting(path: &Path) -> Option<bool> {
     }
 }
 
-/// Parses the `deepgram_enabled` boolean from a minimal TOML document. Comments
-/// (`#`), blank lines, surrounding whitespace, and unrelated keys are ignored.
-/// A missing key or an unrecognised value yields `None` so the caller falls back
+/// Parses the root-scope `deepgram_enabled` boolean from a minimal TOML
+/// document. Comments (`#`), blank lines, surrounding whitespace, and unrelated
+/// keys are ignored. Only the root table is honored: once a `[table]` (or
+/// `[[array]]`) header is seen the key belongs to that table, never the root
+/// toggle, so `[other]\ndeepgram_enabled = true` never enables the Provider. A
+/// missing key or an unrecognised value yields `None` so the caller falls back
 /// to the default instead of failing on a hand-edited file.
 fn parse_deepgram_enabled(contents: &str) -> Option<bool> {
     for line in contents.lines() {
         let line = strip_comment(line).trim();
         if line.is_empty() {
             continue;
+        }
+        if line.starts_with('[') {
+            // A table header: root-scope keys are done, so the toggle is either
+            // already returned above or absent from the root.
+            return None;
         }
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -116,26 +124,87 @@ fn strip_comment(line: &str) -> &str {
     line.split('#').next().unwrap_or(line)
 }
 
-/// Writes the single-key config file, creating the parent `voisu` directory if
-/// needed. The file is owned entirely by this key, so it is rewritten whole.
+/// The managed comment lines emitted above the toggle. Stripped when merging so
+/// a rewrite never accumulates duplicate headers.
+const MANAGED_LINES: [&str; 3] = [
+    "# Voisu daemon configuration.",
+    "# Whether the Deepgram Provider participates in a Recording.",
+    "# Managed by `voisu deepgram on|off`; read once at daemon start.",
+];
+
+/// Persists the toggle, creating the parent `voisu` directory if needed and
+/// preserving any unrelated content already in the file. The write is atomic: a
+/// same-directory temp file is fully written then renamed into place, so an
+/// interrupted write never leaves a partially written config.
 fn write_setting(path: &Path, enabled: bool) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!("cannot create config directory {}: {error}", parent.display())
-        })?;
-    }
-    std::fs::write(path, render(enabled))
-        .map_err(|error| format!("cannot write config {}: {error}", path.display()))
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("config path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!("cannot create config directory {}: {error}", parent.display())
+    })?;
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    write_atomic(path, parent, &merge_content(&existing, enabled))
 }
 
-/// Renders the persisted config file body for a given toggle value.
+/// Writes `contents` to `path` atomically via a same-directory temp file and a
+/// rename, so a reader never observes a torn file and a crash mid-write leaves
+/// the previous config intact.
+fn write_atomic(path: &Path, parent: &Path, contents: &str) -> Result<(), String> {
+    let mut file = tempfile::Builder::new()
+        .prefix(".config.toml.")
+        .tempfile_in(parent)
+        .map_err(|error| format!("cannot stage config write in {}: {error}", parent.display()))?;
+    file.write_all(contents.as_bytes())
+        .and_then(|()| file.as_file().sync_all())
+        .map_err(|error| format!("cannot write config {}: {error}", path.display()))?;
+    file.persist(path)
+        .map_err(|error| format!("cannot persist config {}: {}", path.display(), error.error))?;
+    Ok(())
+}
+
+/// Produces the new file body: the managed toggle at the root, followed by every
+/// unrelated line preserved verbatim. A prior root-scope toggle and the managed
+/// header comments are dropped so the result never duplicates them; keys under a
+/// `[table]` are preserved untouched.
+fn merge_content(existing: &str, enabled: bool) -> String {
+    let mut in_root = true;
+    let mut preserved: Vec<&str> = Vec::new();
+    for line in existing.lines() {
+        let trimmed = strip_comment(line).trim();
+        if trimmed.starts_with('[') {
+            in_root = false;
+        }
+        let is_managed_comment = MANAGED_LINES.contains(&line.trim());
+        let is_root_toggle = in_root
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == DEEPGRAM_ENABLED_KEY);
+        if is_managed_comment || is_root_toggle {
+            continue;
+        }
+        preserved.push(line);
+    }
+    let mut out = render(enabled);
+    let body = preserved.join("\n");
+    let body = body.trim_matches('\n');
+    if !body.is_empty() {
+        out.push('\n');
+        out.push_str(body);
+        out.push('\n');
+    }
+    out
+}
+
+/// Renders the managed block: the header comments and the toggle line.
 fn render(enabled: bool) -> String {
-    format!(
-        "# Voisu daemon configuration.\n\
-         # Whether the Deepgram Provider participates in a Recording.\n\
-         # Managed by `voisu deepgram on|off`; read once at daemon start.\n\
-         {DEEPGRAM_ENABLED_KEY} = {enabled}\n"
-    )
+    let mut out = String::new();
+    for line in MANAGED_LINES {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&format!("{DEEPGRAM_ENABLED_KEY} = {enabled}\n"));
+    out
 }
 
 #[cfg(test)]
@@ -209,5 +278,67 @@ other_key = 5
     fn a_rendered_file_round_trips_through_the_parser() {
         assert_eq!(parse_deepgram_enabled(&render(true)), Some(true));
         assert_eq!(parse_deepgram_enabled(&render(false)), Some(false));
+    }
+
+    #[test]
+    fn a_toggle_under_a_table_is_not_read_as_the_root_setting() {
+        // Real TOML scopes this key to `[other]`, so it must NOT enable the
+        // Provider against the default-off policy.
+        assert_eq!(
+            parse_deepgram_enabled("[other]\ndeepgram_enabled = true\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_root_toggle_before_a_table_is_honoured() {
+        assert_eq!(
+            parse_deepgram_enabled("deepgram_enabled = true\n[other]\nx = 1\n"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_duplicate_root_toggle_takes_the_first_value() {
+        assert_eq!(
+            parse_deepgram_enabled("deepgram_enabled = false\ndeepgram_enabled = true\n"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn writing_preserves_unrelated_content_and_rewrites_the_toggle_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# a user's own note\ndeepgram_enabled = true\n[keyterms]\nboost = 5\n",
+        )
+        .unwrap();
+        write_setting(&path, false).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        // The toggle now reads false, exactly once, at the root.
+        assert_eq!(read_setting(&path), Some(false));
+        assert_eq!(contents.matches("deepgram_enabled").count(), 1, "{contents}");
+        // Unrelated content survives untouched.
+        assert!(contents.contains("# a user's own note"), "{contents}");
+        assert!(contents.contains("[keyterms]"), "{contents}");
+        assert!(contents.contains("boost = 5"), "{contents}");
+    }
+
+    #[test]
+    fn repeated_writes_do_not_accumulate_managed_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_setting(&path, true).unwrap();
+        write_setting(&path, false).unwrap();
+        write_setting(&path, true).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            contents.matches(MANAGED_LINES[0]).count(),
+            1,
+            "the managed header appears exactly once: {contents}"
+        );
+        assert_eq!(read_setting(&path), Some(true));
     }
 }
