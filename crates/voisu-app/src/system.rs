@@ -1231,7 +1231,15 @@ fn wait_for_child(
     }
 }
 
-pub struct PipeWireCapture;
+pub struct PipeWireCapture {
+    reaper: ProviderReaper,
+}
+
+impl PipeWireCapture {
+    pub fn new(reaper: ProviderReaper) -> Self {
+        Self { reaper }
+    }
+}
 
 struct CaptureReaderState {
     chunks: VecDeque<AudioChunk>,
@@ -1341,6 +1349,8 @@ impl AudioCapture for PipeWireCapture {
             state,
             reader: Some(reader),
             stderr_reader: Some(stderr_reader),
+            cleanup: None,
+            reaper: self.reaper.clone(),
             pcm: Vec::new(),
             started: Instant::now(),
             deadline,
@@ -1370,6 +1380,8 @@ struct PipeWireActiveCapture {
     state: Arc<Mutex<CaptureReaderState>>,
     reader: Option<thread::JoinHandle<()>>,
     stderr_reader: Option<thread::JoinHandle<Vec<u8>>>,
+    cleanup: Option<tokio::task::JoinHandle<Result<Vec<u8>, BoundaryError>>>,
+    reaper: ProviderReaper,
     pcm: Vec<u8>,
     started: Instant,
     deadline: Duration,
@@ -1384,18 +1396,22 @@ impl PipeWireActiveCapture {
     }
 
     async fn stop_child(&mut self, graceful: bool) -> Result<Vec<u8>, BoundaryError> {
-        let child = self.child.take().ok_or_else(|| {
-            BoundaryError::new(BoundaryKind::Capture, "pw-record already finalized")
-        })?;
-        let reader = self.reader.take();
-        let stderr_reader = self.stderr_reader.take();
-        tokio::task::spawn_blocking(move || {
-            stop_child_blocking(child, reader, stderr_reader, graceful)
-        })
-        .await
-        .map_err(|_| {
-            BoundaryError::new(BoundaryKind::Capture, "pw-record cleanup task failed")
-        })?
+        if self.cleanup.is_none() {
+            let child = self.child.take().ok_or_else(|| {
+                BoundaryError::new(BoundaryKind::Capture, "pw-record already finalized")
+            })?;
+            let reader = self.reader.take();
+            let stderr_reader = self.stderr_reader.take();
+            self.cleanup = Some(tokio::task::spawn_blocking(move || {
+                stop_child_blocking(child, reader, stderr_reader, graceful)
+            }));
+        }
+        let result = self.cleanup.as_mut().expect("capture cleanup is present").await;
+        self.cleanup.take();
+        result
+            .map_err(|_| {
+                BoundaryError::new(BoundaryKind::Capture, "pw-record cleanup task failed")
+            })?
     }
 
     fn validate_audio(&self) -> Result<(), BoundaryError> {
@@ -1533,7 +1549,13 @@ impl ActiveCapture for PipeWireActiveCapture {
 
 impl Drop for PipeWireActiveCapture {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
+        if let Some(cleanup) = self.cleanup.take() {
+            // An outer abort deadline may drop stop_child after it transferred
+            // pw-record and both reader handles to spawn_blocking. Retain that
+            // task in the actor-owned supervisor; every workflow drains it before
+            // its acknowledgement permits the next Recording.
+            self.reaper.adopt_capture(cleanup);
+        } else if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             reap_briefly(&mut child);
         }
@@ -1700,16 +1722,16 @@ struct GroqStream {
 /// `spawn_blocking` curl reap those tasks own — has completed.
 type ReapTask = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
-/// Actor-owned supervisor that keeps every provider-stream cleanup alive and
-/// awaitable. When a provider stream is dropped mid-abort — for example the
-/// abort deadline elapsed and Tokio dropped the abort future that owned the
-/// boxed stream — the stream signals cancellation and hands its still-live chunk
-/// tasks here. Adoption is SYNCHRONOUS: it retains the raw handles inside a
+/// Actor-owned supervisor that keeps capture and provider-stream cleanup alive
+/// and awaitable. When an adapter is dropped mid-abort — for example the abort
+/// deadline elapsed and Tokio dropped the future that owned it — the adapter
+/// hands its still-live cleanup task here. Adoption is SYNCHRONOUS: it retains
+/// the raw handles inside a
 /// future without spawning and without touching `Handle::try_current()`, so a
 /// stream dropped from any thread — including during runtime teardown — always
-/// lands its cleanup in this supervisor. The retained cleanup AWAITS each chunk
-/// task (never `abort()`, which would drop the task's nested `spawn_blocking`
-/// handle and detach the still-running curl before the child is reaped).
+/// lands its cleanup in this supervisor. The retained cleanup AWAITS each task
+/// (never `abort()`, which would drop a nested `spawn_blocking` handle and
+/// detach the still-running process cleanup before the child is reaped).
 /// Drains are serialized: a concurrent drain waits for the in-flight one and
 /// then re-checks, so it can never observe an empty supervisor while another
 /// drain still holds unfinished cleanup. Each workflow task drains this
@@ -1751,6 +1773,13 @@ impl ProviderReaper {
             }));
     }
 
+    fn adopt_capture(
+        &self,
+        cleanup: tokio::task::JoinHandle<Result<Vec<u8>, BoundaryError>>,
+    ) {
+        self.adopt(VecDeque::from([cleanup]));
+    }
+
     /// Number of cleanup futures currently retained and not being drained.
     /// Test-observability only — production callers gate on `drain` /
     /// `drain_to_completion`, never on this count, because a cleanup being
@@ -1773,12 +1802,14 @@ impl ProviderReaper {
     /// unfinished cleanup — but a caller about to tear down the runtime would
     /// then drop the supervisor and detach that cleanup after all, so teardown
     /// paths must use this instead and keep draining. Each retained cleanup is
-    /// internally bounded (a cancelled curl wait kills and reaps its child
-    /// within its own poll bound), so this terminates; the service unit's
+    /// internally bounded (capture and provider waits kill and reap their child
+    /// within their own poll bounds), so this terminates; the service unit's
     /// explicit TimeoutStopSec is the external last-resort backstop.
     pub async fn drain_to_completion(&self, pass: Duration) {
         while !self.drain(pass).await {
-            eprintln!("provider cleanup still draining");
+            // Guaranteed-completion callers gate the Idle transition on this
+            // drain; a failed stderr write must not panic it (`eprintln!` does).
+            let _ = writeln!(std::io::stderr(), "provider cleanup still draining");
         }
     }
 
@@ -4549,6 +4580,63 @@ mod tests {
             merge_chunk_transcripts(vec![first.join(" "), second.join(" ")]);
         let expected: Vec<String> = (0..60).map(|i| format!("w{i}")).collect();
         assert_eq!(merged, expected.join(" "), "the 30-word overlap is deduped");
+    }
+
+    #[tokio::test]
+    async fn dropped_capture_retains_blocking_cleanup_until_reaper_drain() {
+        let reaper = ProviderReaper::new();
+        let entered = Arc::new(AtomicBool::new(false));
+        let cleanup_done = Arc::new(AtomicBool::new(false));
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let entered_task = Arc::clone(&entered);
+        let cleanup_done_task = Arc::clone(&cleanup_done);
+        let cleanup = tokio::task::spawn_blocking(move || {
+            entered_task.store(true, Ordering::SeqCst);
+            let _ = release_rx.recv();
+            cleanup_done_task.store(true, Ordering::SeqCst);
+            Ok(Vec::new())
+        });
+        wait_for(&entered).await;
+
+        let capture = PipeWireActiveCapture {
+            child: None,
+            state: Arc::new(Mutex::new(CaptureReaderState {
+                chunks: VecDeque::new(),
+                received_bytes: 0,
+                eof: true,
+                error: None,
+            })),
+            reader: None,
+            stderr_reader: None,
+            cleanup: Some(cleanup),
+            reaper: reaper.clone(),
+            pcm: Vec::new(),
+            started: Instant::now(),
+            deadline: DEFAULT_RECORDING_DEADLINE,
+        };
+
+        // This is the state produced when an outer abort deadline drops
+        // stop_child while its spawn_blocking cleanup still owns pw-record.
+        drop(capture);
+        assert_eq!(
+            reaper.pending(),
+            1,
+            "capture cleanup must be retained instead of detached"
+        );
+        assert!(
+            !cleanup_done.load(Ordering::SeqCst),
+            "cleanup must still be live before the actor drains the reaper"
+        );
+
+        let _ = release.send(());
+        assert!(
+            reaper.drain(Duration::from_secs(2)).await,
+            "the retained capture cleanup must drain before Idle"
+        );
+        assert!(
+            cleanup_done.load(Ordering::SeqCst),
+            "draining must await the blocking capture cleanup"
+        );
     }
 
     #[tokio::test]
