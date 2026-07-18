@@ -418,7 +418,7 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: voisu <start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|service>\n\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default off)\n  voisu service <install|start|stop|restart|status|uninstall>"
+    "usage: voisu <start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|service>\n\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu service <install|start|stop|restart|status|uninstall>"
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {

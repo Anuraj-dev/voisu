@@ -433,9 +433,10 @@ async fn actor_loop(
         Box::new(PipeWireCapture::new(reaper.clone()))
     });
     // The persisted (or env-overridden) Deepgram toggle, resolved once at daemon
-    // start. Default OFF puts the daemon on the fast Groq-only path; when OFF the
-    // Deepgram adapter is a no-network stand-in so `begin_recording` never opens
-    // a Deepgram stream and the completion barrier waits on Groq alone.
+    // start. Default ON puts the daemon on the reconciled dual-Provider path;
+    // when OFF (via `voisu deepgram off` or VOISU_DISABLE_DEEPGRAM) the Deepgram
+    // adapter is a no-network stand-in so `begin_recording` never opens a Deepgram
+    // stream and the completion barrier waits on Groq alone.
     let deepgram_enabled = voisu_app::config::deepgram_enabled();
     // The Deepgram keyterm snapshot, resolved once at startup. Threaded into
     // every adapter rebuild so the supervised replay tail never re-reads the

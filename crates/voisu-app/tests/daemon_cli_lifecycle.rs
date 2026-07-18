@@ -88,7 +88,8 @@ fn disable_shortcuts_unless_bus_injected(command: &mut Command, environment: &[(
 /// Acceptance daemons inherit the developer's real `XDG_CONFIG_HOME`, so pin
 /// them to an isolated config directory that enables the Deepgram Provider. This
 /// keeps the dual-Provider suite exercising both Providers regardless of the
-/// machine's persisted `voisu deepgram` setting (the shipped default is OFF). A
+/// machine's persisted `voisu deepgram` setting (the shipped default is ON, but
+/// a developer may have persisted OFF locally). A
 /// test that sets its own `XDG_CONFIG_HOME` or `VOISU_DISABLE_DEEPGRAM` opts out
 /// and drives the toggle itself.
 fn isolate_deepgram_config(
