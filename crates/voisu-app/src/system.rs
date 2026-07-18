@@ -1691,9 +1691,11 @@ fn groq_prestream_active(total_received_bytes: usize) -> bool {
 /// past the limit (for example when a capture backlog appended at Stop pushes it
 /// over) is split into 60 s windows with a 4 s overlap so no single request is
 /// oversized and the word-overlap dedup can stitch the seams.
+// A one-element Vec<Range> IS the intent: the whole capture as a single chunk.
+#[allow(clippy::single_range_in_vec_init)]
 fn plan_finalize_chunks(len: usize) -> Vec<std::ops::Range<usize>> {
     if len <= GROQ_FULL_AUDIO_MAX_BYTES {
-        return Vec::from([0..len]);
+        return vec![0..len];
     }
     let step = GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES;
     let mut ranges = Vec::new();
