@@ -644,10 +644,9 @@ impl ProviderHttpClient {
         credential: Credential,
         request: ProviderHttpRequest,
     ) -> Result<u16, BoundaryError> {
-        let result = tokio::task::spawn_blocking(move || authenticated_status(credential, request))
+        tokio::task::spawn_blocking(move || authenticated_status(credential, request))
             .await
-            .map_err(|_| BoundaryError::new(BoundaryKind::ProviderAuthentication, "provider request task failed"))?;
-        result
+            .map_err(|_| BoundaryError::new(BoundaryKind::ProviderAuthentication, "provider request task failed"))?
     }
 
     pub async fn verify(&self, provider: Provider, credential: Credential) -> Result<(), BoundaryError> {
@@ -1450,7 +1449,7 @@ fn stop_child_blocking(
     // process that was still capturing when interrupted may exit nonzero.
     let exited_before_stop = matches!(child.try_wait(), Ok(Some(_)));
     if graceful {
-        if let Some(pid) = child.id().try_into().ok() {
+        if let Ok(pid) = child.id().try_into() {
             unsafe {
                 libc::kill(pid, libc::SIGINT);
             }
@@ -2378,6 +2377,7 @@ enum DeepgramConnectionEnd {
 /// redialed at most `DEEPGRAM_RECONNECT_ATTEMPTS` times (audio already in
 /// flight during the drop is lost — the parallel Groq stream covers the gap);
 /// past the budget the error is stored here and surfaces through `complete()`.
+#[allow(clippy::too_many_arguments)] // WS plumbing carries the full session context; fate tied to the Deepgram keep/delete decision
 async fn deepgram_ws_task(
     url: String,
     credential: Credential,
@@ -2564,6 +2564,7 @@ async fn deepgram_ws_connect(
 /// terminal summary `Metadata` before closing — Deepgram's contract is to
 /// process remaining audio, return final results plus summary metadata, then
 /// terminate; anything less may be a truncated Transcript.
+#[allow(clippy::too_many_arguments)] // WS plumbing carries the full session context; fate tied to the Deepgram keep/delete decision
 async fn drive_deepgram_connection(
     socket: DeepgramSocket,
     outbound: &mut tokio::sync::mpsc::UnboundedReceiver<DeepgramOutbound>,
@@ -4303,7 +4304,7 @@ fn poll_libei(
     deadline: Instant,
 ) -> Result<(), BoundaryError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let millis = remaining.as_millis().min(100).max(1) as libc::c_int;
+    let millis = remaining.as_millis().clamp(1, 100) as libc::c_int;
     let mut pollfd = libc::pollfd {
         fd: unsafe { (api.get_fd)(context) },
         events: libc::POLLIN,
