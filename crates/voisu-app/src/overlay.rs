@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 
 use voisu_core::{DaemonState, OverlayEvent, OverlayOutcome, Response};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum OverlayPhase {
+    #[default]
     Hidden,
     Recording,
     Processing,
@@ -162,6 +163,45 @@ impl PresentationController {
         }
         self.unavailable_until = None;
         OverlayView::HIDDEN
+    }
+}
+
+/// The pure "WHEN to re-present" and "WHEN to notify" decision for the fallback
+/// (non-layer-shell) window, kept out of the GTK adapter so it is unit-testable.
+///
+/// A layer-shell surface is kept above by the compositor, but Wayland gives a
+/// plain regular toplevel neither keep-above nor a programmatic raise. The
+/// overlay therefore re-`present()`s the window on each transition INTO a new
+/// visible phase so it resurfaces above whatever occluded it — and *only* on
+/// that edge, never on every 200 ms level-triggered redisplay (e.g. Recording
+/// activity ticks), which would fight the user's focus.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResurfaceDecision {
+    /// The view entered a new visible phase: re-present the fallback window.
+    pub resurface: bool,
+    /// The view entered the Recording phase specifically: the fallback path
+    /// fires a single desktop notification as a secondary "buried window" cue.
+    pub entered_recording: bool,
+}
+
+/// Edge-tracker over the phase sequence rendered by the observer. Pure and
+/// adapter-free so the resurface and notify edges are tested without GTK.
+#[derive(Debug, Default)]
+pub struct PresentationTracker {
+    last_phase: OverlayPhase,
+}
+
+impl PresentationTracker {
+    /// Reports the resurface/notify edges implied by rendering `view` after the
+    /// previously observed view. A repeat of the same phase yields no edges.
+    pub fn observe(&mut self, view: OverlayView) -> ResurfaceDecision {
+        let entered = view.phase != self.last_phase;
+        let decision = ResurfaceDecision {
+            resurface: entered && view.is_visible(),
+            entered_recording: entered && matches!(view.phase, OverlayPhase::Recording),
+        };
+        self.last_phase = view.phase;
+        decision
     }
 }
 
@@ -517,6 +557,50 @@ mod tests {
         );
         assert_eq!(surface_failure.backend, FeedbackBackend::DesktopNotification);
         assert_eq!(surface_failure.degradation, Some(crate::feedback::FeedbackDegradation::SurfaceCreationFailure));
+    }
+
+    #[test]
+    fn red_resurface_fires_once_per_transition_into_a_visible_phase() {
+        // RED proof: Wayland denies a regular toplevel keep-above, so the
+        // fallback window must be re-presented on each transition INTO a visible
+        // phase — and only then. Without the pure `PresentationTracker` edge, the
+        // adapter would either never resurface a buried capsule or spam
+        // `present()` on every 200 ms level-triggered tick, stealing focus.
+        let recording = OverlayView::from_response(&overlay_status(DaemonState::Recording, None));
+        let processing = OverlayView::from_response(&overlay_status(DaemonState::Processing, None));
+        let mut tracker = PresentationTracker::default();
+        // hidden -> Recording: a new visible phase, so resurface once.
+        assert!(tracker.observe(recording).resurface);
+        // Recording -> Recording (a level-triggered redisplay) must NOT re-present.
+        assert!(!tracker.observe(recording).resurface);
+        // Recording -> Processing: a new visible phase, resurface again.
+        assert!(tracker.observe(processing).resurface);
+        // Processing -> Hidden is not a visible phase: never resurface.
+        assert!(!tracker.observe(OverlayView::HIDDEN).resurface);
+        // Hidden -> Hidden never resurfaces.
+        assert!(!tracker.observe(OverlayView::HIDDEN).resurface);
+        // Hidden -> Recording again is a fresh transition: resurface once more.
+        assert!(tracker.observe(recording).resurface);
+    }
+
+    #[test]
+    fn red_recording_start_edge_triggers_a_notification_once() {
+        // RED proof: the fallback (non-layer-shell) path fires a desktop
+        // notification only when Recording STARTS, never on every activity tick
+        // and never on other phases. The edge is the same pure tracker; the
+        // adapter gates it on the fallback backend.
+        let recording = OverlayView::from_response(&overlay_status(DaemonState::Recording, None));
+        let processing = OverlayView::from_response(&overlay_status(DaemonState::Processing, None));
+        let mut tracker = PresentationTracker::default();
+        // Entering Recording is the notify edge.
+        assert!(tracker.observe(recording).entered_recording);
+        // Staying in Recording (activity redisplay) does not re-notify.
+        assert!(!tracker.observe(recording).entered_recording);
+        // Moving to Processing is not a Recording start.
+        assert!(!tracker.observe(processing).entered_recording);
+        // Hidden then Recording is a fresh start: notify again.
+        assert!(!tracker.observe(OverlayView::HIDDEN).entered_recording);
+        assert!(tracker.observe(recording).entered_recording);
     }
 
     #[test]
