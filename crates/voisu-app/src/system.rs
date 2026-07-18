@@ -5226,6 +5226,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // The tungstenite accept_hdr callback's Err type is the crate's ~136-byte
+    // http::Response — fixed by the third-party signature, not shrinkable here.
+    #[allow(clippy::result_large_err)]
     async fn deepgram_streams_binary_audio_and_returns_only_finalized_segments() {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::handshake::server::{

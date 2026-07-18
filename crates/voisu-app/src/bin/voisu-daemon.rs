@@ -294,13 +294,16 @@ impl Drop for SocketCleanup {
     }
 }
 
+// Completion payloads are boxed: each carries adapters plus evidence (hundreds
+// of bytes), and an unboxed variant would bloat every ActorMessage on the
+// channel to the largest completion's size.
 enum ActorMessage {
     Command(Command, oneshot::Sender<Response>),
-    Started(StartupCompletion),
+    Started(Box<StartupCompletion>),
     PumpTerminated(u64),
-    Completed(Completion),
+    Completed(Box<Completion>),
     Recovered(u64),
-    ReplayCompleted(ReplayCompletion),
+    ReplayCompleted(Box<ReplayCompletion>),
     /// The Global Shortcuts listener reports the desktop-approved Trigger Key
     /// binding once (or `None` when the portal is unavailable or denied), so the
     /// `Shortcut` command can display it. Binding never gates Recording control.
@@ -592,14 +595,14 @@ async fn actor_loop(
                             &mut current_groq,
                             id,
                         );
-                        let _ = actor.blocking_send(ActorMessage::Started(StartupCompletion {
+                        let _ = actor.blocking_send(ActorMessage::Started(Box::new(StartupCompletion {
                             id,
                             capture: current_capture,
                             deepgram: current_deepgram,
                             groq: current_groq,
                             result,
                             reply,
-                        }));
+                        })));
                     });
                 }
                 Command::Start => {
@@ -662,7 +665,7 @@ async fn actor_loop(
                     groq: returned_groq,
                     result,
                     reply,
-                } = started;
+                } = *started;
                 capture = Some(returned_capture);
                 deepgram = Some(returned_deepgram);
                 groq = Some(returned_groq);
@@ -920,7 +923,7 @@ async fn actor_loop(
                     validator: returned_validator,
                     reply,
                     response,
-                } = completed;
+                } = *completed;
                 deepgram = Some(returned_deepgram);
                 groq = Some(returned_groq);
                 validator = Some(returned_validator);
@@ -1754,14 +1757,14 @@ async fn supervise_recording(
     // cleanup even when one bounded drain pass expires.
     reaper.drain_to_completion(RECOVERY_ABORT_DEADLINE).await;
     let _ = actor
-        .send(ActorMessage::Completed(Completion {
+        .send(ActorMessage::Completed(Box::new(Completion {
             id,
             result: recording.result,
             evidence: recording.evidence,
             validator: recording.validator,
             delivery: recording.delivery,
             reply,
-        }))
+        })))
         .await;
 }
 
@@ -1926,7 +1929,9 @@ async fn supervise_replay(
     // acknowledging: ReplayCompleted alone permits the Idle transition, so the
     // next Recording cannot overlap this replay's blocking cleanup.
     reaper.drain_to_completion(RECOVERY_ABORT_DEADLINE).await;
-    let _ = actor.send(ActorMessage::ReplayCompleted(completion)).await;
+    let _ = actor
+        .send(ActorMessage::ReplayCompleted(Box::new(completion)))
+        .await;
 }
 
 /// Rebuilds the provider and validation adapters after a replay panic dropped

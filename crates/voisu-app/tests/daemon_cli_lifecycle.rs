@@ -2172,6 +2172,9 @@ fn spawn_mock_deepgram(markers: &Path, behavior: MockDeepgramBehavior) -> String
     endpoint
 }
 
+// The tungstenite accept_hdr callback's Err type is the crate's ~136-byte
+// http::Response — fixed by the third-party signature, not shrinkable here.
+#[allow(clippy::result_large_err)]
 fn serve_mock_deepgram_connection(
     connection: std::net::TcpStream,
     markers: &Path,
