@@ -15,7 +15,10 @@ use voisu_app::feedback::{
     after_surface_creation, select_feedback_backend, FeedbackBackend, FeedbackCapabilities,
     FeedbackDegradation, FeedbackSelection, OverlayRestartPolicy, SessionKind,
 };
-use voisu_app::overlay::{OverlayPhase, OverlayView, PresentationController};
+use voisu_app::overlay::{
+    poll_tick, ObservedSignal, OverlayPhase, OverlayView, PresentationController,
+    PresentationTracker, RecordingNotifyLatch, TickAction,
+};
 use voisu_core::{Command, PROTOCOL_VERSION, Request, Response, socket_path};
 
 fn main() {
@@ -197,6 +200,15 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         window.set_keyboard_mode(KeyboardMode::None);
         window.set_exclusive_zone(-1);
     }
+    // Fallback (regular-surface) path, e.g. GNOME/Mutter which does not
+    // implement zwlr_layer_shell_v1. The window is already frameless
+    // (decorated(false)) and non-resizable at the capsule's default size, so it
+    // reads as an overlay rather than a normal app window. Corner positioning is
+    // best-effort only: Wayland gives a regular toplevel no global positioning
+    // API, so we do NOT fight the compositor for a screen corner — it places the
+    // window, and resurfacing (below) keeps it visible. Keep-above is likewise
+    // impossible for a plain toplevel, so `install_surface_feedback` re-presents
+    // the window on each transition into a visible phase instead.
     // Realization creates the GdkSurface on the first real show. A present
     // surface is honest proof of local surface creation, so install the
     // click-through input region. GTK realizing without a surface is the only
@@ -267,10 +279,12 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     // realize probe above runs on that first real show — not on a startup
     // flash. Polling starts immediately so an early Recording is shown without
     // the old 500 ms + 200 ms grace.
-    install_surface_feedback(window, label, meter, capsule, switched);
+    install_surface_feedback(application.clone(), selection, window, label, meter, capsule, switched);
 }
 
 fn install_surface_feedback(
+    application: gtk::Application,
+    selection: FeedbackSelection,
     window: gtk::ApplicationWindow,
     label: gtk::Label,
     meter: gtk::Label,
@@ -278,6 +292,12 @@ fn install_surface_feedback(
     switched: Rc<Cell<bool>>,
 ) {
     let controller = Rc::new(RefCell::new(PresentationController::default()));
+    // Resurfacing and the Recording-start notification are only needed on the
+    // fallback path: a layer-shell surface is kept above by the compositor and
+    // has no "buried window" problem, so its behavior is left untouched.
+    let is_fallback = selection.backend == FeedbackBackend::RegularSurface;
+    let tracker = Rc::new(RefCell::new(PresentationTracker::default()));
+    let notify_latch = Rc::new(RefCell::new(RecordingNotifyLatch::default()));
     let reduced_motion = gtk::Settings::default()
         .map(|settings| !settings.is_gtk_enable_animations())
         .unwrap_or(true);
@@ -288,12 +308,55 @@ fn install_surface_feedback(
             return gtk::glib::ControlFlow::Break;
         }
         let now = Instant::now();
-        let view = match read_status() {
-            Some(response) => controller.borrow_mut().observe(&response, now),
-            None => controller.borrow_mut().observe_unreachable(now),
+        // The notify edge is driven by the OBSERVED daemon signal, kept separate
+        // from the rendered phase: a failed status read renders an unavailable
+        // capsule but is not a reachable observation, so it must not disturb the
+        // Recording notification latch.
+        let (view, signal) = match read_status() {
+            Some(response) => {
+                let view = controller.borrow_mut().observe(&response, now);
+                (view, ObservedSignal::Reachable(view.phase))
+            }
+            None => (
+                controller.borrow_mut().observe_unreachable(now),
+                ObservedSignal::Unreachable,
+            ),
         };
         render_surface(&window, &label, &meter, &capsule, view, reduced_motion);
-        gtk::glib::ControlFlow::Continue
+        // render_surface realizes the window on its first real show; the realize
+        // callback may have found no surface and handed feedback to the
+        // notification backend, setting `switched`. The pure `poll_tick` owns the
+        // ordering: it breaks on that handoff BEFORE the tracker or latch observe
+        // this tick, so a retired window is never re-presented and no duplicate
+        // notification is sent. The bin only runs the resulting side effects.
+        match poll_tick(
+            switched.get(),
+            is_fallback,
+            view,
+            signal,
+            &mut tracker.borrow_mut(),
+            &mut notify_latch.borrow_mut(),
+        ) {
+            TickAction::Break => gtk::glib::ControlFlow::Break,
+            TickAction::Continue { resurface, notify } => {
+                // Wayland denies a plain toplevel keep-above; re-present it on
+                // each transition into a visible phase to resurface above
+                // occluders.
+                if resurface {
+                    window.present();
+                }
+                // A buried fallback window may be missed on GNOME, so signal
+                // Recording start with a bounded desktop notification. Failure
+                // here never breaks the overlay — send_notification cannot panic
+                // and its delivery is the compositor's concern.
+                if notify {
+                    let notification = gtk::gio::Notification::new("Voisu");
+                    notification.set_body(Some(view.visible_label));
+                    application.send_notification(Some("overlay-recording"), &notification);
+                }
+                gtk::glib::ControlFlow::Continue
+            }
+        }
     });
 }
 
