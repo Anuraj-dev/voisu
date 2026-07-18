@@ -1,3 +1,6 @@
+// BoundaryError is rich by design; boxing it is hardening-05 hygiene.
+#![allow(clippy::result_large_err)]
+
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;

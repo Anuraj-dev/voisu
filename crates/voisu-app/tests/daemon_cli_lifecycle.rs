@@ -1,3 +1,11 @@
+// Test-harness allowances: the Daemon/child wrappers own termination and
+// reaping via their terminate()/crash() methods (zombie_processes can't see
+// that); BoundaryError is rich by design (result_large_err → hardening-05);
+// verbose one-off helper types are acceptable in a lifecycle harness.
+#![allow(clippy::zombie_processes)]
+#![allow(clippy::result_large_err)]
+#![allow(clippy::type_complexity)]
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
