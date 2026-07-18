@@ -4393,7 +4393,7 @@ fn build_groq_curl_config(
     let path = curl_config_escape(file_path);
     let model = curl_config_escape(&params.model);
     let mut config = format!(
-        "url = \"{endpoint}\"\nheader = \"Authorization: Bearer {credential}\"\nform = \"file=@{path};filename=recording.wav;type=audio/wav\"\nform = \"model={model}\"\nform = \"response_format=json\"\nform = \"temperature=0\"\n"
+        "url = \"{endpoint}\"\nheader = \"Authorization: Bearer {credential}\"\nform = \"file=@{path};filename=recording.flac;type=audio/flac\"\nform = \"model={model}\"\nform = \"response_format=json\"\nform = \"temperature=0\"\n"
     );
     if !params.language.is_empty() {
         let language = curl_config_escape(&params.language);
@@ -4416,11 +4416,11 @@ fn request_groq_chunk(
 ) -> Result<String, BoundaryError> {
     let mut file = tempfile::Builder::new()
         .prefix("voisu-recording-")
-        .suffix(".wav")
+        .suffix(".flac")
         .tempfile()
         .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "temporary audio file unavailable"))?;
-    let wav = wav_from_pcm(&pcm)?;
-    file.write_all(&wav)
+    let flac = flac_from_pcm(&pcm)?;
+    file.write_all(&flac)
         .and_then(|()| file.flush())
         .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "temporary audio write failed"))?;
     let config = build_groq_curl_config(&endpoint, &credential, &file.path().to_string_lossy(), params)?;
@@ -4479,28 +4479,36 @@ fn merge_chunk_transcripts(transcripts: Vec<String>) -> String {
     merged.join(" ")
 }
 
-fn wav_from_pcm(pcm: &[u8]) -> Result<Vec<u8>, BoundaryError> {
-    let data_len = u32::try_from(pcm.len()).map_err(|_| {
-        BoundaryError::new(BoundaryKind::Provider, "Recording is too large for WAV")
+fn flac_from_pcm(pcm: &[u8]) -> Result<Vec<u8>, BoundaryError> {
+    use flacenc::bitsink::ByteSink;
+    use flacenc::component::BitRepr;
+    use flacenc::config::Encoder;
+    use flacenc::error::Verify;
+    use flacenc::source::MemSource;
+
+    let mut chunks = pcm.chunks_exact(2);
+    let samples: Vec<i32> = chunks
+        .by_ref()
+        .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]) as i32)
+        .collect();
+    if !chunks.remainder().is_empty() {
+        return Err(BoundaryError::new(
+            BoundaryKind::Provider,
+            "Recording PCM length is invalid",
+        ));
+    }
+    let config = Encoder::default().into_verified().map_err(|_| {
+        BoundaryError::new(BoundaryKind::Provider, "FLAC encoder configuration is invalid")
     })?;
-    let riff_len = data_len.checked_add(36).ok_or_else(|| {
-        BoundaryError::new(BoundaryKind::Provider, "Recording WAV length overflow")
+    let source = MemSource::from_samples(&samples, 1, 16, 16_000);
+    let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size).map_err(
+        |_| BoundaryError::new(BoundaryKind::Provider, "Recording FLAC encode failed"),
+    )?;
+    let mut sink = ByteSink::new();
+    stream.write(&mut sink).map_err(|_| {
+        BoundaryError::new(BoundaryKind::Provider, "Recording FLAC output failed")
     })?;
-    let mut wav = Vec::with_capacity(pcm.len() + 44);
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&riff_len.to_le_bytes());
-    wav.extend_from_slice(b"WAVEfmt ");
-    wav.extend_from_slice(&16_u32.to_le_bytes());
-    wav.extend_from_slice(&1_u16.to_le_bytes());
-    wav.extend_from_slice(&1_u16.to_le_bytes());
-    wav.extend_from_slice(&16_000_u32.to_le_bytes());
-    wav.extend_from_slice(&32_000_u32.to_le_bytes());
-    wav.extend_from_slice(&2_u16.to_le_bytes());
-    wav.extend_from_slice(&16_u16.to_le_bytes());
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_len.to_le_bytes());
-    wav.extend_from_slice(pcm);
-    Ok(wav)
+    Ok(sink.into_inner())
 }
 
 #[cfg(test)]
@@ -4586,6 +4594,33 @@ mod tests {
         assert!(config.contains("form = \"prompt=Tokio, serde, SELinux\""));
         assert!(config.contains("form = \"response_format=json\""));
         assert!(config.contains("Authorization: Bearer secret-token"));
+    }
+
+    #[test]
+    fn groq_recording_payload_is_valid_flac() {
+        let pcm = vec![0_u8; 16_000 * 2];
+        let flac = flac_from_pcm(&pcm).expect("one second Recording encodes");
+
+        assert_eq!(&flac[..4], b"fLaC");
+        assert!(flac.len() < pcm.len(), "silence compresses below raw PCM");
+    }
+
+    #[test]
+    fn groq_curl_config_uploads_a_flac_recording() {
+        let credential = Credential::new("secret-token".to_owned()).unwrap();
+        let config = build_groq_curl_config(
+            "https://api.groq.com/v1",
+            &credential,
+            "/tmp/rec.flac",
+            &test_groq_params(),
+        )
+        .expect("valid config");
+
+        assert!(config.contains(
+            "form = \"file=@/tmp/rec.flac;filename=recording.flac;type=audio/flac\""
+        ));
+        assert!(!config.contains("recording.wav"));
+        assert!(!config.contains("audio/wav"));
     }
 
     #[test]

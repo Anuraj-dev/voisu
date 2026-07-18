@@ -34,6 +34,7 @@ xkbcommon = { version = "0.9", default-features = false }
 zbus = { version = "5.13.2", default-features = false, features = ["tokio"] }
 gtk4 = { version = "0.11", features = ["v4_10"], optional = true }
 gtk4-layer-shell = { version = "0.8", optional = true }
+flacenc = { version = "0.5.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

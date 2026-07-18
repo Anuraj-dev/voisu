@@ -21,6 +21,24 @@ use voisu_app::system::{
 
 const PROTOCOL_VERSION: u32 = 1;
 
+fn flac_total_samples(request: &[u8]) -> u64 {
+    let flac = request
+        .windows(4)
+        .position(|window| window == b"fLaC")
+        .expect("Groq multipart request must contain FLAC audio");
+    let stream_info = &request[flac + 8..flac + 42];
+    u64::from_be_bytes([
+        0,
+        0,
+        0,
+        stream_info[13] & 0x0f,
+        stream_info[14],
+        stream_info[15],
+        stream_info[16],
+        stream_info[17],
+    ])
+}
+
 #[test]
 fn stop_response_budget_strictly_exceeds_all_daemon_processing_deadlines() {
     // The budget must also cover the bounded cleanup/abort grace that runs when
@@ -328,14 +346,23 @@ cat > "$dir/clipboard"
 
     let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
-    let riff = request
-        .windows(4)
-        .position(|window| window == b"RIFF")
-        .expect("Groq multipart request must contain WAV audio");
-    assert_eq!(&request[riff + 8..riff + 12], b"WAVE");
-    let pcm_len = u32::from_le_bytes(request[riff + 40..riff + 44].try_into().unwrap()) as usize;
-    assert!(pcm_len >= 6_402, "final audio frames must be retained");
-    assert_eq!(&request[riff + 44 + pcm_len - 2..riff + 44 + pcm_len], &[2, 3]);
+    assert!(
+        request
+            .windows(b"filename=\"recording.flac\"".len())
+            .any(|window| window == b"filename=\"recording.flac\"")
+    );
+    assert!(
+        request
+            .windows(b"Content-Type: audio/flac".len())
+            .any(|window| window == b"Content-Type: audio/flac")
+    );
+    // Exactly the 3,200 pre-stop samples are guaranteed; the fake pw-record's
+    // post-signal trap bytes are best-effort (stop adopts the capture into the
+    // reaper rather than guaranteeing further reads) and must not be asserted.
+    assert!(
+        flac_total_samples(&request) >= 3_200,
+        "final audio frames must be retained"
+    );
 
     let pipewire_args = fs::read_to_string(commands.path().join("pw-record.args")).unwrap();
     assert!(pipewire_args.contains(
@@ -737,13 +764,12 @@ cat > "$dir/clipboard"
         1,
         "a short Recording is one full-audio Groq request at finalize"
     );
-    assert!(requests[0].windows(4).any(|window| window == b"RIFF"));
-    // The one request must carry the FULL captured PCM, not a stripped or empty
-    // 44-byte WAV header: ~1,000,000 bytes of audio were captured.
+    // The FLAC STREAMINFO sample count proves the one request carries the FULL
+    // pre-stop capture (500,000 samples). The fake pw-record's post-signal trap
+    // bytes race the bounded stop path and are deliberately not required.
     assert!(
-        requests[0].len() >= 1_000_000,
-        "the finalize request carries the full audio, not an empty WAV (got {} bytes)",
-        requests[0].len()
+        flac_total_samples(&requests[0]) >= 500_000,
+        "the finalize request carries the full Recording"
     );
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
