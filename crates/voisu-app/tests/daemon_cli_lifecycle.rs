@@ -4535,12 +4535,29 @@ done
         .unwrap()
         .parse::<u32>()
         .unwrap();
+    let started = proc_state_and_start(pid)
+        .expect("pw-record must be inspectable right after its pid marker");
     thread::sleep(Duration::from_millis(1500));
-    assert!(
-        Path::new(&format!("/proc/{pid}")).exists(),
-        "pw-record was killed by the blocking-pool thread reap"
-    );
+    // A bare /proc existence check would also pass for an unreaped zombie or a
+    // reused pid; require the SAME process (starttime) still running.
+    let (state, start_time) = proc_state_and_start(pid)
+        .expect("pw-record was killed by the blocking-pool thread reap");
+    assert_eq!(start_time, started.1, "pw-record pid was reused by another process");
+    assert_ne!(state, 'Z', "pw-record is a zombie: it was killed by the thread reap");
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
     daemon.terminate();
+}
+
+/// Reads (state, starttime) for a pid from /proc/<pid>/stat, parsing after the
+/// last ')' so a comm containing spaces or parentheses cannot shift fields.
+fn proc_state_and_start(pid: u32) -> Option<(char, u64)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit_once(')')?.1;
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    // starttime is field 22 of stat; the first field after ')' is field 3.
+    let start_time = fields.nth(18)?.parse::<u64>().ok()?;
+    Some((state, start_time))
 }
 
 #[test]
