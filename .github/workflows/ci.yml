@@ -28,3 +28,39 @@ jobs:
             cargo test -p voisu-app
             echo "::endgroup::"
           done
+
+  clippy:
+    name: Lint gate (clippy -D warnings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (all targets, warnings are errors)
+        run: cargo clippy --all-targets --workspace -- -D warnings
+
+  audit:
+    name: Advisory gate (cargo-audit vs Cargo.lock)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # Prebuilt cargo-audit binary — no from-source compile, cached by the
+      # install-action. Chosen over rustsec/audit-check because it behaves
+      # identically on push and pull_request (audit-check's annotation path
+      # diverges by event and silently no-ops on fork PRs), needs no
+      # GITHUB_TOKEN, and lets us pin explicit --ignore exceptions inline.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Audits the committed Cargo.lock against the RustSec advisory DB.
+      # --deny warnings escalates unmaintained/yanked notices to failures too.
+      # Document any accepted advisory here with a trailing --ignore RUSTSEC-YYYY-NNNN
+      # (with a comment justifying the exception) rather than silencing the whole job.
+      - name: cargo audit
+        run: cargo audit --deny warnings
