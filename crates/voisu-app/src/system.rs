@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::{FromRawFd, IntoRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
@@ -3796,19 +3796,58 @@ fn keyboard_keymap_text(api: &EiApi, device: *mut EiDevice) -> Result<String, Bo
             "active keyboard layout unavailable",
         ));
     }
+    // The dup owns the descriptor so every exit closes it.
     let file = unsafe { File::from_raw_fd(owned_fd) };
-    let mut bytes = Vec::with_capacity(size);
-    file.take(size as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| {
-            BoundaryError::new(BoundaryKind::Delivery, "active keyboard layout unavailable")
-        })?;
+    read_keymap_fd(file.as_raw_fd(), size)
+}
+
+/// Reads a compiled XKB keymap of `size` bytes from an EIS keymap descriptor.
+///
+/// The keymap descriptor is a shared open file description whose offset is NOT
+/// guaranteed to sit at the start: a compositor that populates the backing
+/// memfd with `write()` leaves the offset at the end, and `F_DUPFD_CLOEXEC`
+/// shares that offset rather than resetting it — as does any earlier read of
+/// the same keymap. Reading through the ordinary file cursor therefore yielded
+/// zero bytes, and libxkbcommon rejected the resulting empty string
+/// (`[XKB-822] Failed to parse input xkb string`), stranding every Delivery on
+/// the clipboard fallback. `pread` reads from absolute offset 0, so it neither
+/// depends on nor mutates the shared offset. This mirrors the mmap-based
+/// consumption the wl_keyboard/EIS keymap convention expects.
+fn read_keymap_fd(fd: libc::c_int, size: usize) -> Result<String, BoundaryError> {
+    let unavailable =
+        || BoundaryError::new(BoundaryKind::Delivery, "active keyboard layout unavailable");
+    let mut bytes = vec![0u8; size];
+    let mut filled = 0usize;
+    while filled < size {
+        // SAFETY: `fd` is live for the call and the destination is an owned
+        // buffer with at least `size - filled` bytes remaining at `filled`.
+        let read = unsafe {
+            libc::pread(
+                fd,
+                bytes[filled..].as_mut_ptr().cast(),
+                size - filled,
+                filled as libc::off_t,
+            )
+        };
+        if read < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(unavailable());
+        }
+        if read == 0 {
+            // Short descriptor: the advertised size overstates the payload.
+            break;
+        }
+        filled += read as usize;
+    }
+    bytes.truncate(filled);
+    // The convention advertises the keymap size including its terminating NUL,
+    // which the compiler must not see.
     if bytes.last() == Some(&0) {
         bytes.pop();
     }
-    String::from_utf8(bytes).map_err(|_| {
-        BoundaryError::new(BoundaryKind::Delivery, "active keyboard layout unavailable")
-    })
+    String::from_utf8(bytes).map_err(|_| unavailable())
 }
 
 struct NativeEiSender {
@@ -5655,6 +5694,52 @@ mod tests {
 
         assert_eq!(us.control, dvorak.control);
         assert_ne!(us.paste, dvorak.paste);
+    }
+
+    /// A compositor that populates the keymap memfd with `write()` leaves the
+    /// shared offset at the end; reading through the file cursor then returned
+    /// an empty keymap that libxkbcommon rejected, forcing the clipboard
+    /// fallback. The read must not depend on the shared offset.
+    #[test]
+    fn keymap_fd_reads_the_whole_keymap_regardless_of_the_shared_file_offset() {
+        use std::io::{Seek, SeekFrom, Write};
+        use xkbcommon::xkb;
+
+        let context = xkb::Context::new(xkb::CONTEXT_NO_ENVIRONMENT_NAMES);
+        let source = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "pc105",
+            "us",
+            "",
+            Some(String::new()),
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .unwrap();
+        let expected = source.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+
+        // Mirror the EIS handoff: keymap plus terminating NUL, size counting it.
+        let mut payload = expected.clone().into_bytes();
+        payload.push(0);
+        let size = payload.len();
+
+        // SAFETY: a fresh anonymous descriptor owned by this test.
+        let raw = unsafe { libc::memfd_create(c"voisu-keymap-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0, "memfd_create failed");
+        let mut backing = unsafe { File::from_raw_fd(raw) };
+        backing.write_all(&payload).unwrap();
+
+        // The write left the offset at the end — the failing production case.
+        assert_eq!(backing.stream_position().unwrap(), size as u64);
+        let text = read_keymap_fd(backing.as_raw_fd(), size).unwrap();
+        assert_eq!(text, expected);
+        assert!(resolve_keyboard_paste_keys(text, 0).is_ok());
+
+        // An offset already at the start stays correct, and the read leaves the
+        // shared offset untouched for any later reader.
+        backing.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(read_keymap_fd(backing.as_raw_fd(), size).unwrap(), expected);
+        assert_eq!(backing.stream_position().unwrap(), 0);
     }
 
     #[test]
