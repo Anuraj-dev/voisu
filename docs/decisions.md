@@ -318,3 +318,21 @@ system.rs split before overlay/desktop-target work, provider collectionization
 before a 3rd provider, nested-compositor e2e with the overlay milestone and
 CI-ONLY (Raja: local e2e eats his machine) — rejected firm scheduling to avoid
 churning files twice. Map: `.scratch/voisu-hardening/`.
+
+## 2026-07-18 — Spawn external children from long-lived threads (pdeathsig rule)
+**Why:** PR_SET_PDEATHSIG delivers on the death of the forking THREAD, not the
+process. pw-record was spawned inside `spawn_blocking`; Tokio reaps idle
+blocking-pool threads after ~10 s, so every recording longer than that was
+SIGKILLed. Fix: the capture reader thread (which lives as long as the child)
+spawns pw-record itself and hands the Child back over an mpsc channel. Rejected
+alternatives: dropping pdeathsig (loses orphan cleanup) and raising the pool
+keep-alive (fragile, global). Regression test pins /proc starttime + non-zombie
++ daemon status; a `VOISU_TEST_BLOCKING_KEEP_ALIVE_MS` seam shrinks keep-alive.
+
+## 2026-07-18 — rustls crypto backend = ring, installed explicitly at startup
+**Why:** tokio-tungstenite's `rustls-tls-webpki-roots` selects no crypto
+backend; rustls 0.23 then panics at first TLS use ("no process-level
+CryptoProvider"). Chose ring (pregenerated asm, no cmake) over aws-lc-rs
+(cmake would break the vendored offline RPM build); `install_crypto_provider()`
+is idempotent and runs first in daemon main. Ring's static link adds
+`Apache-2.0 AND ISC` to the RPM License tag and its texts ship via %license.
