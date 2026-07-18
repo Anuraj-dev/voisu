@@ -25,6 +25,7 @@ enum CliAction {
     Doctor,
     AuthSet(Provider),
     AuthVerify(Provider),
+    SetDeepgram(bool),
     Service(UserServiceAction),
     Help,
 }
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
             Err(error) => fail(2, error.public_message()),
         },
         Ok(CliAction::AuthVerify(provider)) => auth_verify(provider),
+        Ok(CliAction::SetDeepgram(enabled)) => set_deepgram(enabled),
         Ok(CliAction::Service(action)) => match manage_user_service(action) {
             Ok(report) => {
                 println!("{}", report.message);
@@ -159,6 +161,23 @@ fn auth_set(provider: Provider, credential: Credential) -> ExitCode {
     }
 }
 
+/// Persists the Deepgram on/off toggle to the local config file. The daemon
+/// reads it at start, so the change takes effect on the next daemon start; the
+/// message reminds the user to restart a running daemon.
+fn set_deepgram(enabled: bool) -> ExitCode {
+    match voisu_app::config::set_deepgram_enabled(enabled) {
+        Ok(_) => {
+            println!(
+                "Deepgram {} for new Recordings; restart the daemon to apply \
+                 (voisu service restart)",
+                if enabled { "enabled" } else { "disabled" }
+            );
+            ExitCode::SUCCESS
+        }
+        Err(message) => fail(4, &message),
+    }
+}
+
 fn credential_from_stdin() -> Result<Credential, BoundaryError> {
     let mut credential = String::new();
     std::io::stdin()
@@ -259,6 +278,9 @@ fn parse_command() -> Result<CliAction, String> {
         [auth, verify, provider] if auth == "auth" && verify == "verify" => {
             Ok(CliAction::AuthVerify(parse_provider(provider)?))
         }
+        [command, state] if command == "deepgram" => {
+            Ok(CliAction::SetDeepgram(parse_toggle(state)?))
+        }
         [service, action] if service == "service" => {
             Ok(CliAction::Service(parse_service_action(action)?))
         }
@@ -280,6 +302,14 @@ fn parse_service_action(value: &str) -> Result<UserServiceAction, String> {
     }
 }
 
+fn parse_toggle(value: &str) -> Result<bool, String> {
+    match value {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err("deepgram must be on or off".to_owned()),
+    }
+}
+
 fn parse_provider(value: &str) -> Result<Provider, String> {
     match value {
         "groq" => Ok(Provider::Groq),
@@ -289,7 +319,7 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: voisu <start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|service>\n\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu service <install|start|stop|restart|status|uninstall>"
+    "usage: voisu <start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|service>\n\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default off)\n  voisu service <install|start|stop|restart|status|uninstall>"
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {

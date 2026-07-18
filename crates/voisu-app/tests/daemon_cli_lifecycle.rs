@@ -39,6 +39,7 @@ fn stop_response_budget_strictly_exceeds_all_daemon_processing_deadlines() {
 struct Daemon {
     child: Child,
     _provider_stub: Option<TempDir>,
+    _config_dir: Option<TempDir>,
 }
 
 /// Every acceptance daemon keeps its Global Shortcuts listener OFF unless the
@@ -56,6 +57,42 @@ fn disable_shortcuts_unless_bus_injected(command: &mut Command, environment: &[(
             command.env("VOISU_DISABLE_DIRECT_DELIVERY", "1");
         }
     }
+}
+
+/// Acceptance daemons inherit the developer's real `XDG_CONFIG_HOME`, so pin
+/// them to an isolated config directory that enables the Deepgram Provider. This
+/// keeps the dual-Provider suite exercising both Providers regardless of the
+/// machine's persisted `voisu deepgram` setting (the shipped default is OFF). A
+/// test that sets its own `XDG_CONFIG_HOME` or `VOISU_DISABLE_DEEPGRAM` opts out
+/// and drives the toggle itself.
+fn isolate_deepgram_config(
+    command: &mut Command,
+    environment: &[(&str, &str)],
+) -> Option<TempDir> {
+    // A test that drives the toggle itself keeps its own override untouched.
+    if environment
+        .iter()
+        .any(|(name, _)| *name == "VOISU_DISABLE_DEEPGRAM")
+    {
+        return None;
+    }
+    // Otherwise strip any VOISU_DISABLE_DEEPGRAM inherited from the parent
+    // shell/CI, which would silently disable Deepgram across the dual-Provider
+    // suite.
+    command.env_remove("VOISU_DISABLE_DEEPGRAM");
+    // A test with its own XDG_CONFIG_HOME supplies its own config; leave it be.
+    if environment
+        .iter()
+        .any(|(name, _)| *name == "XDG_CONFIG_HOME")
+    {
+        return None;
+    }
+    let dir = TempDir::new().unwrap();
+    let voisu_dir = dir.path().join("voisu");
+    fs::create_dir_all(&voisu_dir).unwrap();
+    fs::write(voisu_dir.join("config.toml"), "deepgram_enabled = true\n").unwrap();
+    command.env("XDG_CONFIG_HOME", dir.path());
+    Some(dir)
 }
 
 fn isolate_process_group(command: &mut Command) {
@@ -87,6 +124,7 @@ impl Daemon {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         disable_shortcuts_unless_bus_injected(&mut command, environment);
+        let config_dir = isolate_deepgram_config(&mut command, environment);
         for (name, value) in environment {
             command.env(name, value);
         }
@@ -101,6 +139,7 @@ impl Daemon {
                 return Self {
                     child,
                     _provider_stub: None,
+                    _config_dir: config_dir,
                 };
             }
             if let Some(status) = child.try_wait().expect("daemon status should be readable") {
@@ -125,16 +164,22 @@ impl Daemon {
             .stderr(Stdio::piped())
             .env_remove("VOISU_DEEPGRAM_API_KEY");
         disable_shortcuts_unless_bus_injected(&mut command, environment);
+        let config_dir = isolate_deepgram_config(&mut command, environment);
         let explicit_deepgram = environment
             .iter()
             .any(|(name, _)| *name == "VOISU_DEEPGRAM_API_KEY");
+        let deepgram_disabled = environment
+            .iter()
+            .any(|(name, _)| *name == "VOISU_DISABLE_DEEPGRAM");
         let live_smoke = std::env::var_os("VOISU_LIVE_SMOKE").as_deref()
             == Some(std::ffi::OsStr::new("1"));
         let original_path = environment
             .iter()
             .find_map(|(name, value)| (*name == "PATH").then_some((*value).to_owned()))
             .unwrap_or_else(|| std::env::var("PATH").unwrap());
-        let provider_stub = (!explicit_deepgram && !live_smoke).then(|| {
+        // A disabled Deepgram Provider must have no credential injected: the
+        // graceful-degrade acceptance needs a genuinely absent credential.
+        let provider_stub = (!explicit_deepgram && !live_smoke && !deepgram_disabled).then(|| {
             let stub = TempDir::new().unwrap();
             let delegate = std::env::split_paths(&original_path)
                 .map(|directory| directory.join("curl"))
@@ -171,6 +216,7 @@ impl Daemon {
                 return Self {
                     child,
                     _provider_stub: provider_stub,
+                    _config_dir: config_dir,
                 };
             }
             if let Some(status) = child.try_wait().expect("daemon status should be readable") {
@@ -6154,4 +6200,243 @@ fn recovery_diagnostics_carry_the_recordings_correlation_id() {
             .any(|line| line.contains(&tag) && line.contains("provider abort failed")),
         "provider recovery diagnostics must carry the correlation ID: {diagnostics}"
     );
+}
+
+#[test]
+fn a_disabled_deepgram_runs_groq_only_and_records_the_disabled_diagnostic() {
+    // With Deepgram disabled the Recording must run Groq-only: exactly one Source
+    // Transcript (Groq), a source_groq selection, no reconciliation, and a
+    // visible NotStarted history entry recording why Deepgram never ran.
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_DISABLE_DEEPGRAM", "1"),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "the groq only transcript"),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "deepgram must never run"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["evidence"]["transcript_selection"], "source_groq");
+    assert_eq!(stopped["evidence"]["reconciliation_requested"], false);
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    let sources = record["source_transcripts"].as_array().unwrap();
+    assert_eq!(sources.len(), 1, "only Groq contributes a Source Transcript: {history}");
+    assert_eq!(sources[0]["provider"], "groq", "{history}");
+    assert_eq!(record["final_transcript"], "the groq only transcript", "{history}");
+
+    let failures = record["provider_failures"].as_array().unwrap();
+    let disabled = failures
+        .iter()
+        .find(|failure| failure["provider"] == "deepgram")
+        .expect("the disabled Deepgram Provider is recorded");
+    assert_eq!(disabled["stage"], "not_started", "{history}");
+    assert_eq!(
+        disabled["diagnostic"], "Deepgram disabled for this Recording",
+        "{history}"
+    );
+
+    daemon.terminate();
+}
+
+#[test]
+fn a_failed_groq_only_recording_still_records_deepgram_as_not_started() {
+    // Finding 1: the disabled-Deepgram normalization must run on EVERY exit
+    // path, not only a successful completion barrier. Each failure mode below
+    // ends the Recording with no delivered Transcript, yet the disabled Deepgram
+    // Provider must still appear exactly once as NotStarted with the canonical
+    // diagnostic — never Completion, and never an Aborted entry carrying an
+    // unrelated capture/abort diagnostic.
+    for failure in [
+        ("VOISU_TEST_PROVIDER_COMPLETE_FAILURE", "groq"), // Groq completion failure
+        ("VOISU_TEST_PROVIDER_SEND_FAILURE", "groq"),     // Groq streaming failure
+        ("VOISU_TEST_CAPTURE_FINISH_FAILURE", "1"),       // capture-finalization failure
+    ] {
+        let runtime = TempDir::new().unwrap();
+        let daemon = Daemon::start_with_env(
+            runtime.path(),
+            &[
+                ("VOISU_DISABLE_DEEPGRAM", "1"),
+                ("VOISU_TEST_GROQ_TRANSCRIPT", "groq only transcript"),
+                failure,
+            ],
+        );
+
+        assert!(voisu(runtime.path(), "start").status.success());
+        // Drives the synchronous failures (completion, capture-finalization); a
+        // streaming failure aborts mid-Recording and may already have returned
+        // the daemon to Idle, so the record is polled for below regardless.
+        let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+        assert_eq!(stopped["ok"], false, "{failure:?} must fail the Recording: {stopped}");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let record = loop {
+            let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+            if history["history"].as_array().is_some_and(|records| !records.is_empty()) {
+                break history["history"][0].clone();
+            }
+            assert!(Instant::now() < deadline, "no failed record was retained for {failure:?}");
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        assert!(!record["error"].is_null(), "{failure:?} must retain an error: {record}");
+        let failures = record["provider_failures"].as_array().unwrap();
+        let deepgram: Vec<_> = failures
+            .iter()
+            .filter(|entry| entry["provider"] == "deepgram")
+            .collect();
+        assert_eq!(deepgram.len(), 1, "one Deepgram entry for {failure:?}: {record}");
+        assert_eq!(deepgram[0]["stage"], "not_started", "{failure:?}: {record}");
+        assert_eq!(
+            deepgram[0]["diagnostic"], "Deepgram disabled for this Recording",
+            "{failure:?}: {record}"
+        );
+        daemon.terminate();
+    }
+}
+
+#[test]
+fn a_disabled_deepgram_processing_panic_still_records_deepgram_as_not_started() {
+    // Finding 3: the supervisor — not process_recording — builds the record when
+    // the processing task panics (here via the Delivery panic seam, after a
+    // successful Groq-only completion). A disabled Deepgram must still read as
+    // the canonical NotStarted there, never the panic's Aborted-unknown outcome.
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_DISABLE_DEEPGRAM", "1"),
+            ("VOISU_TEST_DELIVERY_PANIC", "1"),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "groq only transcript"),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    let failed = voisu(runtime.path(), "stop");
+    assert_eq!(failed.status.code(), Some(4), "{}", stderr(&failed));
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    let failures = record["provider_failures"].as_array().unwrap();
+    let deepgram: Vec<_> = failures
+        .iter()
+        .filter(|entry| entry["provider"] == "deepgram")
+        .collect();
+    assert_eq!(deepgram.len(), 1, "one Deepgram entry after a panic: {record}");
+    assert_eq!(deepgram[0]["stage"], "not_started", "{record}");
+    assert_eq!(
+        deepgram[0]["diagnostic"], "Deepgram disabled for this Recording",
+        "{record}"
+    );
+    // Groq still carries the panic's Aborted-unknown outcome.
+    let groq = failures
+        .iter()
+        .find(|entry| entry["provider"] == "groq")
+        .expect("Groq is recorded");
+    assert_eq!(groq["stage"], "aborted", "{record}");
+
+    daemon.terminate();
+}
+
+#[test]
+fn a_disabled_deepgram_without_a_credential_still_completes_the_recording() {
+    // The pre-toggle hard-fail: a missing Deepgram credential killed the whole
+    // Recording because DeepgramProvider::start loaded the secret eagerly. With
+    // Deepgram disabled the adapter is never built, so no credential is loaded
+    // and a Groq-only Recording still delivers. VOISU_TEST_SECRET_STORE keeps
+    // the un-fixed path hermetic (it fails the load instead of hitting the real
+    // Secret Service).
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+head -c 6400 /dev/zero | tr '\000' '\001'
+trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
+i=0
+while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+cat > "$dir/clipboard"
+"#,
+    );
+
+    let (endpoint, _request_rx, server) = local_groq_server("hello from Groq");
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_DISABLE_DEEPGRAM", "1"),
+            ("VOISU_TEST_SECRET_STORE", "unavailable"),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", &endpoint),
+            ("VOISU_RECORDING_DEADLINE_MS", "5000"),
+        ],
+    );
+
+    let started = voisu(runtime.path(), "start");
+    assert!(started.status.success(), "{}", stderr(&started));
+    thread::sleep(Duration::from_millis(50));
+    let stopped = voisu(runtime.path(), "stop");
+    assert!(
+        stopped.status.success(),
+        "a disabled Deepgram must never fail the Recording on a missing credential: {}",
+        stderr(&stopped)
+    );
+    assert_eq!(
+        fs::read_to_string(commands.path().join("clipboard")).unwrap(),
+        "hello from Groq"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn deepgram_cli_toggle_persists_the_setting_across_starts() {
+    // `voisu deepgram on|off` writes the persisted config file the daemon reads
+    // at start; the value survives a re-read (a restart).
+    let config = TempDir::new().unwrap();
+    let run = |state: &str| {
+        Command::new(env!("CARGO_BIN_EXE_voisu"))
+            .args(["deepgram", state])
+            .env("XDG_CONFIG_HOME", config.path())
+            .output()
+            .unwrap()
+    };
+    let config_file = config.path().join("voisu").join("config.toml");
+
+    let off = run("off");
+    assert!(off.status.success(), "{}", stderr(&off));
+    assert!(
+        fs::read_to_string(&config_file).unwrap().contains("deepgram_enabled = false"),
+        "off persists a disabled setting"
+    );
+
+    let on = run("on");
+    assert!(on.status.success(), "{}", stderr(&on));
+    assert!(
+        fs::read_to_string(&config_file).unwrap().contains("deepgram_enabled = true"),
+        "on persists an enabled setting"
+    );
+
+    let bad = Command::new(env!("CARGO_BIN_EXE_voisu"))
+        .args(["deepgram", "maybe"])
+        .env("XDG_CONFIG_HOME", config.path())
+        .output()
+        .unwrap();
+    assert!(!bad.status.success(), "an invalid toggle is rejected");
 }

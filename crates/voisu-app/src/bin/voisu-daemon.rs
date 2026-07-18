@@ -36,6 +36,10 @@ const MAX_FRAME_BYTES: u64 = 16 * 1024;
 const IO_DEADLINE: Duration = CAPTURE_FINALIZE_DEADLINE;
 const MAX_CONNECTIONS: usize = 32;
 const PROVIDER_DEADLINE: Duration = PROVIDER_COMPLETION_DEADLINE;
+/// The canonical diagnostic recorded for the Deepgram Provider when it is
+/// disabled for a Recording. Surfaced in history so a single-Provider Recording
+/// records *why* only one source ran, never a silent absence.
+const DEEPGRAM_DISABLED_DIAGNOSTIC: &str = "Deepgram disabled for this Recording";
 static CONTROLLED_DELIVERY_PANICKED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
@@ -419,14 +423,21 @@ async fn actor_loop(
     } else {
         Box::new(PipeWireCapture::new(reaper.clone()))
     });
-    let mut deepgram: Option<Box<dyn TranscriptProvider>> = Some(if controlled {
-        Box::new(ControlledProvider::from_env(Provider::Deepgram))
-    } else {
-        Box::new(DeepgramProvider::with_keyterms(
-            reaper.clone(),
-            voisu_app::dictionary::merged_terms(),
-        ))
-    });
+    // The persisted (or env-overridden) Deepgram toggle, resolved once at daemon
+    // start. Default OFF puts the daemon on the fast Groq-only path; when OFF the
+    // Deepgram adapter is a no-network stand-in so `begin_recording` never opens
+    // a Deepgram stream and the completion barrier waits on Groq alone.
+    let deepgram_enabled = voisu_app::config::deepgram_enabled();
+    // The Deepgram keyterm snapshot, resolved once at startup. Threaded into
+    // every adapter rebuild so the supervised replay tail never re-reads the
+    // dictionary file (no filesystem I/O or fallible logging in that path).
+    let keyterms = Arc::new(voisu_app::dictionary::merged_terms());
+    let mut deepgram: Option<Box<dyn TranscriptProvider>> = Some(build_deepgram_provider(
+        deepgram_enabled,
+        controlled,
+        &keyterms,
+        &reaper,
+    ));
     let mut groq: Option<Box<dyn TranscriptProvider>> = Some(if controlled {
         Box::new(ControlledProvider::from_env(Provider::Groq))
     } else {
@@ -531,6 +542,8 @@ async fn actor_loop(
                         replay,
                         id,
                         controlled,
+                        deepgram_enabled,
+                        Arc::clone(&keyterms),
                         reply,
                         tx.clone(),
                         reaper.clone(),
@@ -612,10 +625,12 @@ async fn actor_loop(
                         current_delivery,
                         Arc::clone(&diagnostics),
                         debug_capture,
+                        deepgram_enabled,
                     ));
                     tokio::spawn(supervise_recording(
                         processing,
                         controlled,
+                        deepgram_enabled,
                         configured_providers.clone(),
                         panic_evidence,
                         Some(reply),
@@ -686,6 +701,9 @@ async fn actor_loop(
                                 &mut record.provider_failures,
                                 "daemon shutting down; Recording aborted during startup",
                             );
+                            if !deepgram_enabled {
+                                normalize_disabled_deepgram(&mut record.provider_failures);
+                            }
                             if let Err(error) = diagnostics.record(record) {
                                 eprintln!(
                                     "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
@@ -846,6 +864,9 @@ async fn actor_loop(
                                     provider, stage, diagnostic,
                                 ));
                             }
+                            if !deepgram_enabled {
+                                normalize_disabled_deepgram(&mut record.provider_failures);
+                            }
                             if let Err(error) = diagnostics.record(record) {
                                 eprintln!(
                                     "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
@@ -938,10 +959,12 @@ async fn actor_loop(
                         current_delivery,
                         Arc::clone(&diagnostics),
                         debug_capture,
+                        deepgram_enabled,
                     ));
                     tokio::spawn(supervise_recording(
                         processing,
                         controlled,
+                        deepgram_enabled,
                         configured_providers.clone(),
                         panic_evidence,
                         None,
@@ -1035,10 +1058,12 @@ async fn actor_loop(
                         current_delivery,
                         Arc::clone(&diagnostics),
                         debug_capture,
+                        deepgram_enabled,
                     ));
                     tokio::spawn(supervise_recording(
                         processing,
                         controlled,
+                        deepgram_enabled,
                         configured_providers.clone(),
                         panic_evidence,
                         None,
@@ -1186,6 +1211,33 @@ fn atomic_millis(value: &AtomicU64) -> Option<u64> {
 
 fn elapsed_millis(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Builds the Deepgram Provider adapter for this daemon. When Deepgram is
+/// disabled, a [`DisabledProvider`] stands in: it opens no network, so
+/// `begin_recording` skips the real Deepgram start (and its credential load)
+/// entirely and the Recording runs Groq-only. Otherwise the controlled test
+/// adapter or the live streaming adapter is used, exactly as before.
+///
+/// `keyterms` is the dictionary snapshot resolved once at daemon start, never a
+/// fresh `merged_terms()` read: this runs in the supervised replay tail on the
+/// panic-rebuild path, which must do no filesystem I/O or fallible logging.
+fn build_deepgram_provider(
+    deepgram_enabled: bool,
+    controlled: bool,
+    keyterms: &[String],
+    reaper: &ProviderReaper,
+) -> Box<dyn TranscriptProvider> {
+    if !deepgram_enabled {
+        Box::new(DisabledProvider::new(Provider::Deepgram))
+    } else if controlled {
+        Box::new(ControlledProvider::from_env(Provider::Deepgram))
+    } else {
+        Box::new(DeepgramProvider::with_keyterms(
+            reaper.clone(),
+            keyterms.to_vec(),
+        ))
+    }
 }
 
 /// Starts a Recording. If a later step of the start sequence fails, everything
@@ -1432,6 +1484,7 @@ async fn process_recording(
     mut delivery: Box<dyn DeliveryAdapter>,
     diagnostics: Arc<DiagnosticStore>,
     debug_capture: bool,
+    deepgram_enabled: bool,
 ) -> RecordingResult {
     let ActiveRecording {
         id,
@@ -1465,6 +1518,9 @@ async fn process_recording(
                 &mut provider_failures,
                 error.diagnostic(),
             );
+            if !deepgram_enabled {
+                normalize_disabled_deepgram(&mut provider_failures);
+            }
             let record = diagnostic_record(
                 &evidence,
                 Vec::new(),
@@ -1568,6 +1624,16 @@ async fn process_recording(
         account_for_missing_providers(&source_records, &mut provider_failures, error.diagnostic());
     }
 
+    // Deepgram was disabled for this Recording: whatever the completion, abort,
+    // or torn-down accounting recorded above (Completion when the barrier
+    // resolved instantly, Aborted on a capture/streaming failure that never
+    // reached the barrier), collapse it to the single canonical NotStarted
+    // record on EVERY exit path — success or failure — so a Groq-only Recording
+    // always shows why only one source ran.
+    if !deepgram_enabled {
+        normalize_disabled_deepgram(&mut provider_failures);
+    }
+
     let record = diagnostic_record(
         &evidence,
         source_records,
@@ -1595,6 +1661,7 @@ async fn process_recording(
 async fn supervise_recording(
     processing: JoinHandle<RecordingResult>,
     controlled: bool,
+    deepgram_enabled: bool,
     configured_providers: Vec<Provider>,
     panic_evidence: LifecycleEvidence,
     reply: Option<oneshot::Sender<Response>>,
@@ -1614,7 +1681,7 @@ async fn supervise_recording(
                 format!("Recording processing task failed at an unknown point: {join_error}"),
             )
             .with_public_message("Recording processing failed at an unknown point");
-            let provider_failures = configured_providers
+            let mut provider_failures: Vec<ProviderFailure> = configured_providers
                 .into_iter()
                 .map(|provider| {
                     ProviderFailure::new(
@@ -1624,6 +1691,11 @@ async fn supervise_recording(
                     )
                 })
                 .collect();
+            // A disabled Deepgram never ran, so even when processing panicked its
+            // history entry must read as the canonical NotStarted, not Aborted.
+            if !deepgram_enabled {
+                normalize_disabled_deepgram(&mut provider_failures);
+            }
             let record = diagnostic_record(
                 &panic_evidence,
                 Vec::new(),
@@ -1696,6 +1768,22 @@ fn rebuild_recording_adapters(
 /// stream HAD started) is recorded as Aborted with the cause. Start-sequence
 /// failures do their own accounting, because a provider never reached there is
 /// NotStarted, not Aborted.
+/// Collapses whatever failure the pipeline recorded for a disabled Deepgram
+/// Provider into the single canonical NotStarted entry. Disabled Deepgram never
+/// produces a Source Transcript, so replacing its entry can never hide a real
+/// result; it only normalizes bookkeeping the completion/abort accounting
+/// emitted while unaware the Provider was intentionally skipped. Sorted by
+/// Provider to match the coordinator's ordering convention.
+fn normalize_disabled_deepgram(provider_failures: &mut Vec<ProviderFailure>) {
+    provider_failures.retain(|failure| failure.provider != Provider::Deepgram);
+    provider_failures.push(ProviderFailure::new(
+        Provider::Deepgram,
+        ProviderFailureStage::NotStarted,
+        DEEPGRAM_DISABLED_DIAGNOSTIC,
+    ));
+    provider_failures.sort_by_key(|failure| failure.provider);
+}
+
 fn account_for_missing_providers(
     source_records: &[SourceTranscriptRecord],
     provider_failures: &mut Vec<ProviderFailure>,
@@ -1773,6 +1861,8 @@ async fn supervise_replay(
     replay: JoinHandle<ReplayResult>,
     id: u64,
     controlled: bool,
+    deepgram_enabled: bool,
+    keyterms: Arc<Vec<String>>,
     reply: oneshot::Sender<Response>,
     actor: mpsc::Sender<ActorMessage>,
     reaper: ProviderReaper,
@@ -1790,7 +1880,8 @@ async fn supervise_replay(
             log_best_effort(format_args!(
                 "Replay {id}: replay task failed: {join_error}"
             ));
-            let (deepgram, groq, validator) = rebuild_replay_adapters(controlled, &reaper);
+            let (deepgram, groq, validator) =
+                rebuild_replay_adapters(controlled, deepgram_enabled, &keyterms, &reaper);
             ReplayCompletion {
                 id,
                 deepgram,
@@ -1813,24 +1904,29 @@ async fn supervise_replay(
 /// the originals. Mirrors the actor's startup construction.
 fn rebuild_replay_adapters(
     controlled: bool,
+    deepgram_enabled: bool,
+    keyterms: &[String],
     reaper: &ProviderReaper,
 ) -> (
     Box<dyn TranscriptProvider>,
     Box<dyn TranscriptProvider>,
     Box<dyn TranscriptValidator>,
 ) {
+    // Use the daemon-start toggle and keyterm snapshot, never a fresh config or
+    // dictionary read: this runs inside the supervised replay tail, which must
+    // stay panic-free and free of filesystem I/O and stray stderr, and a live
+    // `voisu deepgram` toggle must not change behavior before the documented
+    // daemon restart.
+    let deepgram = build_deepgram_provider(deepgram_enabled, controlled, keyterms, reaper);
     if controlled {
         (
-            Box::new(ControlledProvider::from_env(Provider::Deepgram)),
+            deepgram,
             Box::new(ControlledProvider::from_env(Provider::Groq)),
             Box::new(ControlledValidator::from_env()),
         )
     } else {
         (
-            Box::new(DeepgramProvider::with_keyterms(
-                reaper.clone(),
-                voisu_app::dictionary::merged_terms(),
-            )),
+            deepgram,
             Box::new(GroqProvider::new(reaper.clone())),
             Box::new(MergeResultValidator::new()),
         )
@@ -2306,6 +2402,58 @@ impl ActiveCapture for ControlledActiveCapture {
     }
 }
 
+/// A Provider adapter used when its Provider is disabled for this daemon. It
+/// performs no network work: `start` opens nothing, `send_audio` drops every
+/// chunk, and `complete` resolves immediately with the canonical disabled
+/// diagnostic. In the completion barrier this makes the disabled Provider finish
+/// instantly without a Source Transcript, so the barrier waits on the other
+/// Provider alone and the disabled Provider leaves a visible history entry
+/// instead of a silent absence.
+struct DisabledProvider {
+    provider: Provider,
+}
+
+impl DisabledProvider {
+    fn new(provider: Provider) -> Self {
+        Self { provider }
+    }
+}
+
+impl TranscriptProvider for DisabledProvider {
+    fn start(&mut self, _recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError> {
+        Ok(Box::new(DisabledStream {
+            provider: self.provider,
+        }))
+    }
+}
+
+struct DisabledStream {
+    provider: Provider,
+}
+
+impl ProviderStream for DisabledStream {
+    fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    fn send_audio(&mut self, _chunk: AudioChunk) -> BoundaryFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn complete(&mut self, _audio: CapturedAudio) -> BoundaryFuture<'_, SourceTranscript> {
+        Box::pin(async {
+            Err(BoundaryError::new(
+                BoundaryKind::Provider,
+                DEEPGRAM_DISABLED_DIAGNOSTIC,
+            ))
+        })
+    }
+}
+
 struct ControlledProvider {
     provider: Provider,
     text: String,
@@ -2596,6 +2744,7 @@ mod tests {
 
         supervise_recording(
             processing,
+            true,
             true,
             vec![Provider::Groq],
             evidence,
