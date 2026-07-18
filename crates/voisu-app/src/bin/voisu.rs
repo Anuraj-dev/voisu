@@ -22,6 +22,7 @@ const IO_DEADLINE: Duration = Duration::from_secs(2);
 
 enum CliAction {
     Daemon(Command),
+    History { json: bool },
     Doctor,
     AuthSet(Provider),
     AuthVerify(Provider),
@@ -33,6 +34,7 @@ enum CliAction {
 fn main() -> ExitCode {
     match parse_command() {
         Ok(CliAction::Daemon(command)) => daemon_command(command),
+        Ok(CliAction::History { json }) => history_command(json),
         Ok(CliAction::Doctor) => doctor(),
         Ok(CliAction::AuthSet(provider)) => match credential_from_stdin() {
             Ok(credential) => auth_set(provider, credential),
@@ -55,21 +57,23 @@ fn main() -> ExitCode {
     }
 }
 
-fn daemon_command(command: Command) -> ExitCode {
+/// Sends one command to the daemon and returns the typed response, or an
+/// `ExitCode` (already reported to the user) when the round-trip fails.
+fn send_command(command: Command) -> Result<Response, ExitCode> {
     let path = match socket_path() {
         Ok(path) => path,
-        Err(message) => return fail(2, &message),
+        Err(message) => return Err(fail(2, &message)),
     };
     let mut stream = match UnixStream::connect(path) {
         Ok(stream) => stream,
         Err(_) => {
             println!("daemon unavailable");
-            return ExitCode::from(3);
+            return Err(ExitCode::from(3));
         }
     };
 
     if stream.set_write_timeout(Some(IO_DEADLINE)).is_err() {
-        return fail(1, "failed to configure daemon connection deadline");
+        return Err(fail(1, "failed to configure daemon connection deadline"));
     }
 
     // A replay drives the same provider/validation boundaries as Stop, so it
@@ -87,28 +91,35 @@ fn daemon_command(command: Command) -> ExitCode {
         command,
     };
     if serde_json::to_writer(&mut stream, &request).is_err() || stream.write_all(b"\n").is_err() {
-        return fail(1, "failed to send command to daemon");
+        return Err(fail(1, "failed to send command to daemon"));
     }
     let response = match read_response_frame(&mut stream, response_deadline) {
         Ok(response) => response,
-        Err(message) => return fail(1, &message),
+        Err(message) => return Err(fail(1, &message)),
     };
     let envelope: VersionEnvelope = match serde_json::from_str(&response) {
         Ok(envelope) => envelope,
-        Err(_) => return fail(1, "daemon returned an invalid response"),
+        Err(_) => return Err(fail(1, "daemon returned an invalid response")),
     };
     if envelope.version != PROTOCOL_VERSION {
-        return fail(
+        return Err(fail(
             5,
             &format!(
                 "IPC protocol mismatch: daemon uses {}, CLI uses {}",
                 envelope.version, PROTOCOL_VERSION
             ),
-        );
+        ));
     }
-    let response: Response = match serde_json::from_str(&response) {
+    match serde_json::from_str(&response) {
+        Ok(response) => Ok(response),
+        Err(_) => Err(fail(1, "daemon returned an invalid response")),
+    }
+}
+
+fn daemon_command(command: Command) -> ExitCode {
+    let response = match send_command(command) {
         Ok(response) => response,
-        Err(_) => return fail(1, "daemon returned an invalid response"),
+        Err(code) => return code,
     };
     if response.ok {
         if let Some(export) = &response.export {
@@ -130,6 +141,88 @@ fn daemon_command(command: Command) -> ExitCode {
     } else {
         fail(4, &response.message)
     }
+}
+
+/// `voisu history`. By default renders a human-first, newest-first view that
+/// foregrounds tail latency and each Provider's outcome, paginating 20 at a time
+/// when stdout and stdin are a TTY. `--json` prints the byte-for-byte raw
+/// history response (the historic behavior) so scripts never break.
+fn history_command(json: bool) -> ExitCode {
+    let response = match send_command(Command::History) {
+        Ok(response) => response,
+        Err(code) => return code,
+    };
+    if !response.ok {
+        return fail(4, &response.message);
+    }
+    let Some(history) = response.history else {
+        println!("{}", response.message);
+        return ExitCode::SUCCESS;
+    };
+    if json {
+        // Byte-compatible with the historic `voisu history` output.
+        return match serde_json::to_string_pretty(&history) {
+            Ok(encoded) => {
+                println!("{encoded}");
+                ExitCode::SUCCESS
+            }
+            Err(_) => fail(1, "daemon returned an invalid diagnostic history"),
+        };
+    }
+    let records = match serde_json::to_value(&history) {
+        Ok(records) => records,
+        Err(_) => return fail(1, "daemon returned an invalid diagnostic history"),
+    };
+    render_history_pretty(&records)
+}
+
+/// Prints the pretty history, paginating only when stdout AND stdin are a TTY.
+/// Piped or scripted invocations print the first page without ever blocking.
+fn render_history_pretty(records: &serde_json::Value) -> ExitCode {
+    use std::io::IsTerminal;
+    use voisu_app::history_view::{
+        DEFAULT_PAGE_SIZE, RenderStyle, pagination_prompt, render_history_noninteractive, render_page,
+    };
+
+    let stdout = std::io::stdout();
+    let color = stdout.is_terminal();
+    let interactive = color && std::io::stdin().is_terminal();
+    let style = RenderStyle {
+        now_ms: voisu_core::unix_millis_now(),
+        color,
+        transcript_width: 72,
+    };
+
+    if !interactive {
+        let out = render_history_noninteractive(records, DEFAULT_PAGE_SIZE, &style);
+        print!("{out}");
+        let _ = std::io::stdout().flush();
+        return ExitCode::SUCCESS;
+    }
+
+    let mut start = 0;
+    loop {
+        let page = render_page(records, start, DEFAULT_PAGE_SIZE, &style);
+        print!("{}", page.body);
+        let _ = std::io::stdout().flush();
+        start += page.shown;
+        if page.remaining == 0 || page.shown == 0 {
+            break;
+        }
+        print!("{}", pagination_prompt(page.remaining, DEFAULT_PAGE_SIZE));
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) => break, // EOF — stop paging.
+            Ok(_) => {
+                if line.trim_start().starts_with('q') {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 
@@ -261,7 +354,10 @@ fn parse_command() -> Result<CliAction, String> {
         [command] if command == "toggle" => Ok(CliAction::Daemon(Command::Toggle)),
         [command] if command == "status" => Ok(CliAction::Daemon(Command::Status)),
         [command] if command == "shortcut" => Ok(CliAction::Daemon(Command::Shortcut)),
-        [command] if command == "history" => Ok(CliAction::Daemon(Command::History)),
+        [command] if command == "history" => Ok(CliAction::History { json: false }),
+        [command, flag] if command == "history" && flag == "--json" => {
+            Ok(CliAction::History { json: true })
+        }
         [command, correlation_id] if command == "export" => {
             Ok(CliAction::Daemon(Command::Export((*correlation_id).to_owned())))
         }
@@ -319,7 +415,7 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: voisu <start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|service>\n\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default off)\n  voisu service <install|start|stop|restart|status|uninstall>"
+    "usage: voisu <start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|service>\n\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default off)\n  voisu service <install|start|stop|restart|status|uninstall>"
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {
