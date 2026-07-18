@@ -1079,9 +1079,10 @@ fn spawn_recording_processing(
         (validator_adapter, delivery_adapter) => {
             *validator = validator_adapter;
             *delivery = delivery_adapter;
+            *state = ActorState::Recording(recording);
             return Err((
                 Box::new(Response::rejected(
-                    Some(DaemonState::Idle),
+                    Some(state_label(state)),
                     "Recording adapters are unavailable",
                 )),
                 reply,

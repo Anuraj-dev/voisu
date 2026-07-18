@@ -864,6 +864,13 @@ cat > "$dir/clipboard"
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 
+    if let Err(err) = fs::remove_file(commands.path().join("pw-record.ready")) {
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "failed to remove stale pw-record ready marker: {err}"
+        );
+    }
     let restarted = start_recording_when_recovered(runtime.path());
     assert!(restarted.status.success(), "{}", stderr(&restarted));
     wait_for_marker(commands.path(), "pw-record.ready");
