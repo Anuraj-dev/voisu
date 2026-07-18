@@ -550,6 +550,110 @@ cat > "$dir/clipboard"
 }
 
 #[test]
+fn dictionary_edits_between_recordings_reach_the_next_deepgram_and_whisper_snapshot() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    let config = TempDir::new().unwrap();
+    fs::create_dir_all(config.path().join("voisu")).unwrap();
+    fs::write(
+        config.path().join("voisu").join("config.toml"),
+        "deepgram_enabled = true\n",
+    )
+    .unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do /usr/bin/sleep 1; i=$((i + 1)); done\n",
+    );
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        "#!/bin/sh\ncat > /dev/null\n",
+    );
+    let deepgram_endpoint = spawn_mock_deepgram(
+        commands.path(),
+        MockDeepgramBehavior::Finalize("hello from Deepgram"),
+    );
+    let (groq_endpoint, groq_requests, _groq_live_requests, groq_server) =
+        local_groq_chunk_server(vec!["hello from Groq", "hello from Groq"]);
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let config_home = config.path().display().to_string();
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("XDG_CONFIG_HOME", &config_home),
+            ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", &groq_endpoint),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "pw-record.ready");
+    let first_stop = voisu(runtime.path(), "stop");
+    assert!(first_stop.status.success(), "{}", stderr(&first_stop));
+    wait_for_marker(commands.path(), "deepgram.closed");
+    let first_handshake = fs::read_to_string(commands.path().join("deepgram.handshake")).unwrap();
+    assert!(
+        !first_handshake.contains("friendname"),
+        "the first Recording predates the edit: {first_handshake}"
+    );
+    fs::remove_file(commands.path().join("deepgram.closed")).unwrap();
+
+    let added = voisu_with_env(
+        runtime.path(),
+        &["dictionary", "add", "FriendName"],
+        &[("XDG_CONFIG_HOME", &config_home)],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let second_stop = voisu(runtime.path(), "stop");
+    assert!(second_stop.status.success(), "{}", stderr(&second_stop));
+    wait_for_marker(commands.path(), "deepgram.closed");
+    let second_handshake = fs::read_to_string(commands.path().join("deepgram.handshake")).unwrap();
+    assert!(
+        second_handshake.contains("keyterm=FriendName"),
+        "the next Recording must use the edited dictionary: {second_handshake}"
+    );
+    assert!(
+        second_handshake.matches("keyterm=").count()
+            <= voisu_app::dictionary::DEEPGRAM_KEYTERM_COUNT_LIMIT,
+        "the next Recording still applies the keyterm count cap: {second_handshake}"
+    );
+    let encoded_keyterm_bytes: usize = second_handshake
+        .lines()
+        .next()
+        .unwrap()
+        .split('&')
+        .filter_map(|parameter| parameter.strip_prefix("keyterm="))
+        .map(str::len)
+        .sum();
+    assert!(
+        encoded_keyterm_bytes <= voisu_app::dictionary::DEEPGRAM_KEYTERM_TOKEN_BUDGET,
+        "percent-encoding only expands terms, so this also proves the raw keyterms fit: \
+         {second_handshake}"
+    );
+
+    let requests = groq_requests.recv_timeout(Duration::from_secs(3)).unwrap();
+    groq_server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    let first_groq = String::from_utf8_lossy(&requests[0]);
+    let second_groq = String::from_utf8_lossy(&requests[1]);
+    assert!(!first_groq.contains("FriendName"), "{first_groq}");
+    assert!(
+        second_groq.contains("FriendName"),
+        "the next Recording must use the same snapshot in Whisper: {second_groq}"
+    );
+}
+
+#[test]
 fn deepgram_source_transcript_delivers_when_groq_fails() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();

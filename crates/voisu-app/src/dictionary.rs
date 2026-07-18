@@ -16,7 +16,9 @@
 //! comment, blank lines are ignored, and a missing file means built-ins only.
 
 use std::collections::HashSet;
-use std::io::ErrorKind;
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// Whisper honours only ~224 tokens of prompt. The prompt builder appends terms
@@ -145,6 +147,74 @@ pub fn merged_terms() -> Vec<String> {
     merged_terms_with(load_user_terms(&user_dictionary_path()))
 }
 
+/// Adds a user term to the end of the personal dictionary. Existing terms are
+/// compared case-insensitively, so the user's first spelling and ordering win.
+pub fn add_user_term(term: &str) -> Result<bool, String> {
+    add_user_term_at(&user_dictionary_path(), term)
+}
+
+/// Path-parameterised core of [`add_user_term`]. The whole read-modify-write is
+/// serialised under an exclusive advisory lock so two concurrent `add` (or
+/// `add`/`remove`) invocations cannot silently lose each other's edit.
+fn add_user_term_at(path: &Path, term: &str) -> Result<bool, String> {
+    let term = validated_add_term(term)?;
+    let _lock = DictionaryLock::acquire(path)?;
+    let existing = read_dictionary_contents(path)?;
+    if parse_user_terms(&existing)
+        .iter()
+        .any(|existing_term| comparison_key(existing_term) == comparison_key(term))
+    {
+        return Ok(false);
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(term);
+    updated.push('\n');
+    write_user_dictionary(path, &updated)?;
+    Ok(true)
+}
+
+/// Removes every case-insensitive occurrence of a user term while leaving
+/// comments, blank lines, and the order of all other lines byte-for-byte intact.
+pub fn remove_user_term(term: &str) -> Result<bool, String> {
+    remove_user_term_at(&user_dictionary_path(), term)
+}
+
+/// Path-parameterised core of [`remove_user_term`], serialised under the same
+/// exclusive advisory lock as [`add_user_term_at`] so a concurrent add and
+/// remove cannot lose each other's edit.
+fn remove_user_term_at(path: &Path, term: &str) -> Result<bool, String> {
+    let term = validated_term(term)?;
+    let _lock = DictionaryLock::acquire(path)?;
+    let existing = read_dictionary_contents(path)?;
+    let mut removed = false;
+    let mut updated = String::with_capacity(existing.len());
+    for line in existing.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line).trim_end_matches('\r');
+        let matches = comparison_key(strip_comment(content)) == comparison_key(term);
+        if matches {
+            removed = true;
+        } else {
+            updated.push_str(line);
+        }
+    }
+    if !removed {
+        return Ok(false);
+    }
+    write_user_dictionary(path, &updated)?;
+    Ok(true)
+}
+
+/// Reads only the personal dictionary terms, in their stored order. Built-in
+/// vocabulary is deliberately excluded so the CLI manages exactly what users
+/// have written.
+pub fn user_terms() -> Result<Vec<String>, String> {
+    read_user_terms(&user_dictionary_path())
+}
+
 /// The Deepgram keyterm vocabulary: `terms` truncated in order to the
 /// [`DEEPGRAM_KEYTERM_TOKEN_BUDGET`] and [`DEEPGRAM_KEYTERM_COUNT_LIMIT`].
 /// Deepgram returns a 400 response when its keyterm token cap is exceeded,
@@ -176,7 +246,14 @@ pub fn deepgram_keyterms(terms: &[String]) -> Vec<String> {
 /// instructions — Whisper biases toward prompt vocabulary, it is not an
 /// instruction channel.
 pub fn whisper_prompt() -> String {
-    whisper_prompt_from_terms(&merged_terms())
+    whisper_prompt_for_terms(&merged_terms())
+}
+
+/// Builds a Whisper vocabulary prompt from an already-resolved dictionary
+/// snapshot. The daemon uses this with the same terms used for Deepgram so one
+/// Recording cannot mix vocabulary versions across Providers.
+pub fn whisper_prompt_for_terms(terms: &[String]) -> String {
+    whisper_prompt_from_terms(terms)
 }
 
 /// The resolved user dictionary path: `$XDG_CONFIG_HOME/voisu/dictionary.txt`,
@@ -188,6 +265,137 @@ fn user_dictionary_path() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .unwrap_or_else(|| PathBuf::from(".config"));
     base.join("voisu").join("dictionary.txt")
+}
+
+/// The canonical key for comparing two dictionary terms for equality —
+/// idempotent add, remove matching, and merge de-duplication all route through
+/// it. Matching is case-insensitive via Rust's [`str::to_lowercase`], which is
+/// Unicode-aware *simple* lowercasing but NOT full case folding: expanding or
+/// locale-specific equivalences (e.g. German "Straße" vs "STRASSE") are out of
+/// scope and treated as distinct terms.
+fn comparison_key(term: &str) -> String {
+    term.trim().to_lowercase()
+}
+
+fn validated_term(term: &str) -> Result<&str, String> {
+    let term = term.trim();
+    if term.is_empty() || term.contains(['\n', '\r']) {
+        return Err("dictionary term must be one non-empty line".to_owned());
+    }
+    Ok(term)
+}
+
+/// Validates a term destined for the dictionary file. Beyond the single-line
+/// rule of [`validated_term`], it rejects any term that the parser's
+/// [`strip_comment`] grammar would truncate or empty — otherwise `add '#project'`
+/// would silently store a comment, and `add "Tokio # runtime"` would store only
+/// "Tokio" while claiming the whole string was added. Terms whose `#` is not a
+/// comment boundary (`C#`, `F#` — `#` not preceded by whitespace) are accepted.
+fn validated_add_term(term: &str) -> Result<&str, String> {
+    let term = validated_term(term)?;
+    if strip_comment(term) != term {
+        return Err(format!(
+            "dictionary term {term:?} contains a '#' comment marker (a '#' at the start or \
+             after a space begins a comment, so only its prefix would be stored); \
+             terms like 'C#' where '#' follows a non-space are allowed"
+        ));
+    }
+    Ok(term)
+}
+
+/// An exclusive advisory lock serialising the whole read-modify-write of the
+/// user dictionary. Two concurrent `add`/`remove` invocations otherwise each
+/// read the original file, edit independently, and atomically rename — the last
+/// rename silently discarding the other's change. The lock is held on a stable
+/// sibling `dictionary.txt.lock` file (via `flock(2)` from the existing `libc`
+/// dependency) from before the read through after the rename. Readers of the
+/// dictionary itself — the daemon load path and `list` — stay lock-free: the
+/// atomic rename already hands them the old or the new file, never a torn edit.
+struct DictionaryLock {
+    _file: std::fs::File,
+}
+
+impl DictionaryLock {
+    fn acquire(dictionary_path: &Path) -> Result<Self, String> {
+        let parent = dictionary_path
+            .parent()
+            .ok_or_else(|| format!("dictionary path has no parent: {}", dictionary_path.display()))?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!("cannot create dictionary directory {}: {error}", parent.display())
+        })?;
+        let lock_path = dictionary_lock_path(dictionary_path);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| format!("cannot open dictionary lock {}: {error}", lock_path.display()))?;
+        // Blocking exclusive advisory lock. flock is tied to the open file
+        // description, so two threads in this process (each with its own open
+        // fd) serialise against each other exactly as separate processes do.
+        // SAFETY: a valid, owned fd is passed to a libc call with no other
+        // preconditions; the return value is checked below.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!(
+                "cannot lock dictionary {}: {}",
+                lock_path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+impl Drop for DictionaryLock {
+    fn drop(&mut self) {
+        // Releasing on drop is belt-and-braces: closing the fd already drops the
+        // lock. SAFETY: the fd is still open and owned until this struct drops.
+        unsafe {
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// The sibling lock file for a dictionary path: `dictionary.txt` → `dictionary.txt.lock`.
+fn dictionary_lock_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_else(|| std::ffi::OsString::from("dictionary.txt"));
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+fn read_dictionary_contents(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(format!(
+            "cannot read user dictionary {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+/// Replaces the dictionary via a fully written same-directory temporary file,
+/// so readers see either the old file or the complete new file, never a torn
+/// edit.
+fn write_user_dictionary(path: &Path, contents: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("dictionary path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create dictionary directory {}: {error}", parent.display()))?;
+    let mut file = tempfile::Builder::new()
+        .prefix(".dictionary.txt.")
+        .tempfile_in(parent)
+        .map_err(|error| format!("cannot stage dictionary write in {}: {error}", parent.display()))?;
+    file.write_all(contents.as_bytes())
+        .and_then(|()| file.as_file().sync_all())
+        .map_err(|error| format!("cannot write user dictionary {}: {error}", path.display()))?;
+    file.persist(path)
+        .map_err(|error| format!("cannot persist user dictionary {}: {}", path.display(), error.error))?;
+    Ok(())
 }
 
 /// Loads user dictionary terms, logging a local diagnostic on a genuine read
@@ -255,7 +463,7 @@ fn merged_terms_with(user: Vec<String>) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut merged: Vec<String> = Vec::new();
     for term in user.into_iter().chain(builtin_terms()) {
-        if seen.insert(term.to_lowercase()) {
+        if seen.insert(comparison_key(&term)) {
             merged.push(term);
         }
     }
@@ -515,5 +723,69 @@ Tokio   # inline comment
         let terms = vec!["a".repeat(DEEPGRAM_KEYTERM_TOKEN_BUDGET + 1), "later".to_owned()];
 
         assert_eq!(deepgram_keyterms(&terms), Vec::<String>::new());
+    }
+
+    #[test]
+    fn add_rejects_terms_the_comment_grammar_would_alter_but_keeps_c_sharp() {
+        // A leading '#' is a whole-line comment: storing it would write vocabulary
+        // the parser silently drops.
+        assert!(validated_add_term("#project").is_err());
+        // An inline " # " boundary would store only the prefix ("Tokio") while the
+        // user asked to add the whole string.
+        assert!(validated_add_term("Tokio # runtime").is_err());
+        // "C#"/"F#" — '#' not preceded by whitespace — are real terms and survive.
+        assert_eq!(validated_add_term("C#"), Ok("C#"));
+        assert_eq!(validated_add_term("F#"), Ok("F#"));
+        // An ordinary multi-word term with no '#' is fine.
+        assert_eq!(validated_add_term("dist tag"), Ok("dist tag"));
+    }
+
+    #[test]
+    fn comparison_key_is_trim_plus_lowercase() {
+        assert_eq!(comparison_key("  Tokio  "), "tokio");
+        assert_eq!(comparison_key("TOKIO"), comparison_key("tokio"));
+    }
+
+    #[test]
+    fn concurrent_adds_through_the_lock_keep_both_terms() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dictionary.txt");
+        // A barrier maximises the read-modify-write overlap: without the
+        // exclusive lock both threads read the empty file and the second rename
+        // clobbers the first term. With the lock, both terms always survive.
+        let barrier = Arc::new(Barrier::new(2));
+
+        let handles: Vec<_> = ["alpha", "beta"]
+            .into_iter()
+            .map(|term| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    add_user_term_at(&path, term).unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let terms = read_user_terms(&path).unwrap();
+        assert!(terms.iter().any(|t| t == "alpha"), "alpha lost: {terms:?}");
+        assert!(terms.iter().any(|t| t == "beta"), "beta lost: {terms:?}");
+    }
+
+    #[test]
+    fn add_and_remove_at_a_path_round_trip_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dictionary.txt");
+
+        assert_eq!(add_user_term_at(&path, "Tokio"), Ok(true));
+        assert_eq!(add_user_term_at(&path, "tokio"), Ok(false), "idempotent");
+        assert_eq!(remove_user_term_at(&path, "TOKIO"), Ok(true));
+        assert_eq!(remove_user_term_at(&path, "Tokio"), Ok(false), "already gone");
     }
 }
