@@ -101,6 +101,10 @@ pub struct PresentationController {
     /// mistaking it for the already-displayed event and suppressing the flash.
     displayed_event: Option<(u64, u64)>,
     terminal_until: Option<Instant>,
+    /// Deadline for the daemon-unavailable flash, deliberately separate from
+    /// `terminal_until`: an unreachable blip must never extend or consume a
+    /// terminal event's display window, and vice versa.
+    unavailable_until: Option<Instant>,
     /// Whether the last poll observed the daemon as unreachable. Edge-triggering
     /// the daemon-unavailable flash off this flag keeps a persistently-down
     /// daemon from re-arming the capsule on every level-triggered poll.
@@ -110,8 +114,11 @@ pub struct PresentationController {
 impl PresentationController {
     pub fn observe(&mut self, response: &Response, now: Instant) -> OverlayView {
         // A successful reachable observation clears the unreachable edge so a
-        // LATER reachable->unreachable transition flashes the capsule again.
+        // LATER reachable->unreachable transition flashes the capsule again,
+        // and drops the unavailable deadline so it cannot leak into a terminal
+        // event's window.
         self.unreachable = false;
+        self.unavailable_until = None;
         // Any live in-progress state (Recording or Processing) is driven straight
         // from status and supersedes the previous terminal feedback window. The
         // retained observer event stays attached to every OverlayStatus response,
@@ -147,13 +154,13 @@ impl PresentationController {
     pub fn observe_unreachable(&mut self, now: Instant) -> OverlayView {
         if !self.unreachable {
             self.unreachable = true;
-            self.terminal_until = Some(now + TERMINAL_DISPLAY);
+            self.unavailable_until = Some(now + TERMINAL_DISPLAY);
             return OverlayView::daemon_unavailable();
         }
-        if self.terminal_until.is_some_and(|until| now < until) {
+        if self.unavailable_until.is_some_and(|until| now < until) {
             return OverlayView::daemon_unavailable();
         }
-        self.terminal_until = None;
+        self.unavailable_until = None;
         OverlayView::HIDDEN
     }
 }
@@ -297,6 +304,47 @@ mod tests {
                 .observe(&overlay_status(DaemonState::Idle, Some(event_from(instance_b, 1, OverlayOutcome::DeliveryFailure))), t1)
                 .phase,
             OverlayPhase::Failure,
+        );
+    }
+
+    #[test]
+    fn an_unreachable_blip_near_expiry_cannot_extend_a_terminal_events_window() {
+        // Review finding on the shared deadline: a terminal event shown at t0,
+        // a daemon drop just before its 2s window expires, then recovery must
+        // NOT redisplay the retained event against the unavailable deadline —
+        // that would stretch a nominal 2-second capsule to nearly 4 seconds.
+        let mut controller = PresentationController::default();
+        let t0 = Instant::now();
+        let delivered = event(3, OverlayOutcome::Delivered);
+        let terminal = overlay_status(DaemonState::Idle, Some(delivered));
+        assert_eq!(controller.observe(&terminal, t0).phase, OverlayPhase::Success);
+        // Daemon drops just before the terminal window expires: the
+        // unavailable capsule flashes on its own deadline.
+        let near_expiry = t0 + TERMINAL_DISPLAY - Duration::from_millis(100);
+        assert_eq!(
+            controller.observe_unreachable(near_expiry).phase,
+            OverlayPhase::Failure,
+        );
+        // Daemon recovers after the terminal window elapsed: the retained
+        // event must stay hidden, not ride the unavailable deadline.
+        let after_terminal_window = t0 + TERMINAL_DISPLAY + Duration::from_millis(100);
+        assert_eq!(
+            controller.observe(&terminal, after_terminal_window).phase,
+            OverlayPhase::Hidden,
+        );
+        // Symmetric containment: a terminal window survives an unreachable
+        // blip unchanged — shown for its remainder, hidden at its own expiry.
+        let mut symmetric = PresentationController::default();
+        let fresh = overlay_status(DaemonState::Idle, Some(event(4, OverlayOutcome::Delivered)));
+        assert_eq!(symmetric.observe(&fresh, t0).phase, OverlayPhase::Success);
+        symmetric.observe_unreachable(t0 + Duration::from_millis(500));
+        assert_eq!(
+            symmetric.observe(&fresh, t0 + Duration::from_millis(600)).phase,
+            OverlayPhase::Success,
+        );
+        assert_eq!(
+            symmetric.observe(&fresh, t0 + TERMINAL_DISPLAY).phase,
+            OverlayPhase::Hidden,
         );
     }
 
