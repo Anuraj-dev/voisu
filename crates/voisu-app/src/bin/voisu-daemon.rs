@@ -248,6 +248,7 @@ impl SingleInstance {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .mode(0o600)
             .open(path)
             .map_err(|error| format!("cannot open daemon lock: {error}"))?;
