@@ -3324,12 +3324,7 @@ impl RemoteDesktopPortal for FedoraRemoteDesktopPortal {
             )
             .await
             {
-                close_portal_session(&connection, session_path.as_str()).await;
-                let error = classify_remote_desktop_failure(error);
-                if terminal_remote_desktop_failure(error.diagnostic()) {
-                    clear_restore_token();
-                }
-                return Err(error);
+                return Err(fail_and_close(&connection, session_path.as_str(), error).await);
             }
 
             let start_options: std::collections::HashMap<&str, Value<'_>> =
@@ -3349,12 +3344,7 @@ impl RemoteDesktopPortal for FedoraRemoteDesktopPortal {
             {
                 Ok(results) => results,
                 Err(error) => {
-                    close_portal_session(&connection, session_path.as_str()).await;
-                    let error = classify_remote_desktop_failure(error);
-                    if terminal_remote_desktop_failure(error.diagnostic()) {
-                        clear_restore_token();
-                    }
-                    return Err(error);
+                    return Err(fail_and_close(&connection, session_path.as_str(), error).await);
                 }
             };
             if let Some(token) = started
@@ -3423,6 +3413,19 @@ fn classify_remote_desktop_failure(error: BoundaryError) -> BoundaryError {
         "RemoteDesktop portal unavailable"
     };
     BoundaryError::new(BoundaryKind::Delivery, reason)
+}
+
+async fn fail_and_close(
+    connection: &zbus::Connection,
+    session_path: &str,
+    error: BoundaryError,
+) -> BoundaryError {
+    close_portal_session(connection, session_path).await;
+    let error = classify_remote_desktop_failure(error);
+    if terminal_remote_desktop_failure(error.diagnostic()) {
+        clear_restore_token();
+    }
+    error
 }
 
 struct FedoraDirectDeliverySession {
@@ -5223,6 +5226,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // The tungstenite accept_hdr callback's Err type is the crate's ~136-byte
+    // http::Response — fixed by the third-party signature, not shrinkable here.
+    #[allow(clippy::result_large_err)]
     async fn deepgram_streams_binary_audio_and_returns_only_finalized_segments() {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::handshake::server::{

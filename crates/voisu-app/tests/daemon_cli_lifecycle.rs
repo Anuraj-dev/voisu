@@ -1,9 +1,7 @@
 // Test-harness allowances: the Daemon/child wrappers own termination and
 // reaping via their terminate()/crash() methods (zombie_processes can't see
-// that); BoundaryError is rich by design (result_large_err → hardening-05);
-// verbose one-off helper types are acceptable in a lifecycle harness.
+// that); verbose one-off helper types are acceptable in a lifecycle harness.
 #![allow(clippy::zombie_processes)]
-#![allow(clippy::result_large_err)]
 #![allow(clippy::type_complexity)]
 
 use std::fs;
@@ -309,6 +307,7 @@ printf '%s\n' "$@" > "$dir/pw-record.args"
 env | sort > "$dir/pw-record.env"
 head -c 6400 /dev/zero | tr '\000' '\001'
 trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
+: > "$dir/pw-record.ready"
 i=0
 while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
 "#,
@@ -342,7 +341,7 @@ cat > "$dir/clipboard"
 
     let started = voisu(runtime.path(), "start");
     assert!(started.status.success(), "{}", stderr(&started));
-    thread::sleep(Duration::from_millis(50));
+    wait_for_marker(commands.path(), "pw-record.ready");
     let status_started = Instant::now();
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
     assert!(status_started.elapsed() < Duration::from_millis(100));
@@ -394,6 +393,7 @@ fn clipboard_delivery_succeeds_while_wl_copy_serves_the_clipboard_past_exit() {
 dir=$(dirname "$0")
 head -c 6400 /dev/zero | tr '\000' '\001'
 trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
+: > "$dir/pw-record.ready"
 i=0
 while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
 "#,
@@ -429,7 +429,7 @@ exit 0
 
     let started = voisu(runtime.path(), "start");
     assert!(started.status.success(), "{}", stderr(&started));
-    thread::sleep(Duration::from_millis(50));
+    wait_for_marker(commands.path(), "pw-record.ready");
     let stop_started = Instant::now();
     let stopped = voisu(runtime.path(), "stop");
     assert!(
@@ -798,6 +798,7 @@ dir=$(dirname "$0")
 printf '%s\n' "$$" >> "$dir/pw-record.pids"
 head -c 6400 /dev/zero | tr '\000' '\001'
 trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
+: > "$dir/pw-record.ready"
 i=0
 while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
 "#,
@@ -863,9 +864,16 @@ cat > "$dir/clipboard"
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 
+    if let Err(err) = fs::remove_file(commands.path().join("pw-record.ready")) {
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "failed to remove stale pw-record ready marker: {err}"
+        );
+    }
     let restarted = start_recording_when_recovered(runtime.path());
     assert!(restarted.status.success(), "{}", stderr(&restarted));
-    thread::sleep(Duration::from_millis(50));
+    wait_for_marker(commands.path(), "pw-record.ready");
     let recovered = voisu(runtime.path(), "stop");
     assert!(recovered.status.success(), "{}", stderr(&recovered));
     request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -2103,7 +2111,7 @@ fn start_recording_when_recovered(runtime_dir: &Path) -> Output {
 /// test can Stop without racing the stub under load.
 fn wait_for_marker(directory: &Path, name: &str) {
     let marker = directory.join(name);
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         if marker.exists() {
             return;
@@ -2164,6 +2172,9 @@ fn spawn_mock_deepgram(markers: &Path, behavior: MockDeepgramBehavior) -> String
     endpoint
 }
 
+// The tungstenite accept_hdr callback's Err type is the crate's ~136-byte
+// http::Response — fixed by the third-party signature, not shrinkable here.
+#[allow(clippy::result_large_err)]
 fn serve_mock_deepgram_connection(
     connection: std::net::TcpStream,
     markers: &Path,

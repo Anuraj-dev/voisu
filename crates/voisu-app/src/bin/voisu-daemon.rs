@@ -1,9 +1,3 @@
-// This bin is its own crate root, so lib.rs allows do not reach it. Rich
-// BoundaryError values in Err position, the wide ActorMessage enum, and the
-// supervisor argument lists are deliberate; shrinking them belongs to the
-// hardening-05 hygiene sweep, not this CI gate.
-#![allow(clippy::result_large_err)]
-#![allow(clippy::large_enum_variant)]
 #![allow(clippy::too_many_arguments)]
 
 use std::fs::{self, File, OpenOptions};
@@ -300,13 +294,16 @@ impl Drop for SocketCleanup {
     }
 }
 
+// Completion payloads are boxed: each carries adapters plus evidence (hundreds
+// of bytes), and an unboxed variant would bloat every ActorMessage on the
+// channel to the largest completion's size.
 enum ActorMessage {
     Command(Command, oneshot::Sender<Response>),
-    Started(StartupCompletion),
+    Started(Box<StartupCompletion>),
     PumpTerminated(u64),
-    Completed(Completion),
+    Completed(Box<Completion>),
     Recovered(u64),
-    ReplayCompleted(ReplayCompletion),
+    ReplayCompleted(Box<ReplayCompletion>),
     /// The Global Shortcuts listener reports the desktop-approved Trigger Key
     /// binding once (or `None` when the portal is unavailable or denied), so the
     /// `Shortcut` command can display it. Binding never gates Recording control.
@@ -504,7 +501,7 @@ async fn actor_loop(
                     let _ = reply.send(Response::with_history(records));
                 }
                 Command::Export(correlation_id) => {
-                    let response = match diagnostics.find(&correlation_id) {
+                    let response = match diagnostics.find(correlation_id.as_str()) {
                         Ok(Some(record)) => Response::with_export(voisu_core::export_record(
                             record,
                             std::env::vars(),
@@ -540,7 +537,7 @@ async fn actor_loop(
                     // panic — otherwise a panic would drop the borrowed adapters
                     // and wedge the daemon in Replaying forever.
                     let replay = tokio::spawn(replay_recording(
-                        fixture_name,
+                        fixture_name.into_inner(),
                         id,
                         diagnostics.fixture_dir(),
                         current_deepgram,
@@ -598,14 +595,14 @@ async fn actor_loop(
                             &mut current_groq,
                             id,
                         );
-                        let _ = actor.blocking_send(ActorMessage::Started(StartupCompletion {
+                        let _ = actor.blocking_send(ActorMessage::Started(Box::new(StartupCompletion {
                             id,
                             capture: current_capture,
                             deepgram: current_deepgram,
                             groq: current_groq,
                             result,
                             reply,
-                        }));
+                        })));
                     });
                 }
                 Command::Start => {
@@ -615,39 +612,29 @@ async fn actor_loop(
                     ));
                 }
                 Command::Stop | Command::Toggle if matches!(state, ActorState::Recording(_)) => {
-                    let ActorState::Recording(recording) =
-                        std::mem::replace(&mut state, ActorState::Idle)
-                    else {
-                        unreachable!()
-                    };
-                    let mut processing_evidence = recording.evidence.clone();
-                    processing_evidence.streamed_chunk_count =
-                        recording.chunk_counter.load(Ordering::SeqCst);
-                    processing_evidence.first_chunk_ms =
-                        atomic_millis(&recording.first_chunk_ms);
-                    let panic_evidence = processing_evidence.clone();
-                    state = ActorState::Processing(processing_evidence);
-                    let current_validator = validator.take().expect("validator is available");
-                    let current_delivery = delivery.take().expect("Delivery adapter is available");
-                    let processing = tokio::spawn(process_recording(
-                        recording,
-                        current_validator,
-                        current_delivery,
-                        Arc::clone(&diagnostics),
-                        debug_capture,
-                        deepgram_enabled,
-                    ));
-                    tokio::spawn(supervise_recording(
-                        processing,
-                        controlled,
-                        deepgram_enabled,
-                        configured_providers.clone(),
-                        panic_evidence,
-                        Some(reply),
-                        tx.clone(),
-                        Arc::clone(&diagnostics),
-                        reaper.clone(),
-                    ));
+                    match take_active_recording(&mut state) {
+                        Ok(recording) => {
+                            if let Err((response, Some(reply))) = spawn_recording_processing(
+                                &mut state,
+                                recording,
+                                &mut validator,
+                                &mut delivery,
+                                Arc::clone(&diagnostics),
+                                debug_capture,
+                                controlled,
+                                deepgram_enabled,
+                                configured_providers.clone(),
+                                Some(reply),
+                                tx.clone(),
+                                reaper.clone(),
+                            ) {
+                                let _ = reply.send(*response);
+                            }
+                        }
+                        Err(response) => {
+                            let _ = reply.send(*response);
+                        }
+                    }
                 }
                 Command::Stop => {
                     let _ = reply.send(Response::rejected(
@@ -678,7 +665,7 @@ async fn actor_loop(
                     groq: returned_groq,
                     result,
                     reply,
-                } = started;
+                } = *started;
                 capture = Some(returned_capture);
                 deepgram = Some(returned_deepgram);
                 groq = Some(returned_groq);
@@ -936,7 +923,7 @@ async fn actor_loop(
                     validator: returned_validator,
                     reply,
                     response,
-                } = completed;
+                } = *completed;
                 deepgram = Some(returned_deepgram);
                 groq = Some(returned_groq);
                 validator = Some(returned_validator);
@@ -949,39 +936,22 @@ async fn actor_loop(
             }
             ActorMessage::PumpTerminated(id) => {
                 if matches!(&state, ActorState::Recording(recording) if recording.id == id) {
-                    let ActorState::Recording(recording) =
-                        std::mem::replace(&mut state, ActorState::Idle)
-                    else {
-                        unreachable!()
-                    };
-                    let mut processing_evidence = recording.evidence.clone();
-                    processing_evidence.streamed_chunk_count =
-                        recording.chunk_counter.load(Ordering::SeqCst);
-                    processing_evidence.first_chunk_ms =
-                        atomic_millis(&recording.first_chunk_ms);
-                    let panic_evidence = processing_evidence.clone();
-                    state = ActorState::Processing(processing_evidence);
-                    let current_validator = validator.take().expect("validator is available");
-                    let current_delivery = delivery.take().expect("Delivery adapter is available");
-                    let processing = tokio::spawn(process_recording(
-                        recording,
-                        current_validator,
-                        current_delivery,
-                        Arc::clone(&diagnostics),
-                        debug_capture,
-                        deepgram_enabled,
-                    ));
-                    tokio::spawn(supervise_recording(
-                        processing,
-                        controlled,
-                        deepgram_enabled,
-                        configured_providers.clone(),
-                        panic_evidence,
-                        None,
-                        tx.clone(),
-                        Arc::clone(&diagnostics),
-                        reaper.clone(),
-                    ));
+                    if let Ok(recording) = take_active_recording(&mut state) {
+                        let _ = spawn_recording_processing(
+                            &mut state,
+                            recording,
+                            &mut validator,
+                            &mut delivery,
+                            Arc::clone(&diagnostics),
+                            debug_capture,
+                            controlled,
+                            deepgram_enabled,
+                            configured_providers.clone(),
+                            None,
+                            tx.clone(),
+                            reaper.clone(),
+                        );
+                    }
                 }
             }
             ActorMessage::Completed(completed) => {
@@ -1047,40 +1017,22 @@ async fn actor_loop(
                     // no client reply: processing runs to completion (Delivery
                     // included) and its acknowledgement returns the actor to
                     // Idle, which releases the shutdown acknowledgement below.
-                    let ActorState::Recording(recording) =
-                        std::mem::replace(&mut state, ActorState::Idle)
-                    else {
-                        unreachable!()
-                    };
-                    let mut processing_evidence = recording.evidence.clone();
-                    processing_evidence.streamed_chunk_count =
-                        recording.chunk_counter.load(Ordering::SeqCst);
-                    processing_evidence.first_chunk_ms =
-                        atomic_millis(&recording.first_chunk_ms);
-                    let panic_evidence = processing_evidence.clone();
-                    state = ActorState::Processing(processing_evidence);
-                    let current_validator = validator.take().expect("validator is available");
-                    let current_delivery =
-                        delivery.take().expect("Delivery adapter is available");
-                    let processing = tokio::spawn(process_recording(
-                        recording,
-                        current_validator,
-                        current_delivery,
-                        Arc::clone(&diagnostics),
-                        debug_capture,
-                        deepgram_enabled,
-                    ));
-                    tokio::spawn(supervise_recording(
-                        processing,
-                        controlled,
-                        deepgram_enabled,
-                        configured_providers.clone(),
-                        panic_evidence,
-                        None,
-                        tx.clone(),
-                        Arc::clone(&diagnostics),
-                        reaper.clone(),
-                    ));
+                    if let Ok(recording) = take_active_recording(&mut state) {
+                        let _ = spawn_recording_processing(
+                            &mut state,
+                            recording,
+                            &mut validator,
+                            &mut delivery,
+                            Arc::clone(&diagnostics),
+                            debug_capture,
+                            controlled,
+                            deepgram_enabled,
+                            configured_providers.clone(),
+                            None,
+                            tx.clone(),
+                            reaper.clone(),
+                        );
+                    }
                 }
             }
         }
@@ -1095,6 +1047,76 @@ async fn actor_loop(
             return;
         }
     }
+}
+
+fn take_active_recording(state: &mut ActorState) -> Result<ActiveRecording, Box<Response>> {
+    match std::mem::replace(state, ActorState::Idle) {
+        ActorState::Recording(recording) => Ok(recording),
+        current => {
+            let daemon_state = state_label(&current);
+            *state = current;
+            Err(Box::new(Response::rejected(
+                Some(daemon_state),
+                "Recording is no longer active",
+            )))
+        }
+    }
+}
+
+fn spawn_recording_processing(
+    state: &mut ActorState,
+    recording: ActiveRecording,
+    validator: &mut Option<Box<dyn TranscriptValidator>>,
+    delivery: &mut Option<Box<dyn DeliveryAdapter>>,
+    diagnostics: Arc<DiagnosticStore>,
+    debug_capture: bool,
+    controlled: bool,
+    deepgram_enabled: bool,
+    configured_providers: Vec<Provider>,
+    reply: Option<oneshot::Sender<Response>>,
+    actor: mpsc::Sender<ActorMessage>,
+    reaper: ProviderReaper,
+) -> Result<(), (Box<Response>, Option<oneshot::Sender<Response>>)> {
+    let (current_validator, current_delivery) = match (validator.take(), delivery.take()) {
+        (Some(validator), Some(delivery)) => (validator, delivery),
+        (validator_adapter, delivery_adapter) => {
+            *validator = validator_adapter;
+            *delivery = delivery_adapter;
+            *state = ActorState::Recording(recording);
+            return Err((
+                Box::new(Response::rejected(
+                    Some(state_label(state)),
+                    "Recording adapters are unavailable",
+                )),
+                reply,
+            ));
+        }
+    };
+    let mut processing_evidence = recording.evidence.clone();
+    processing_evidence.streamed_chunk_count = recording.chunk_counter.load(Ordering::SeqCst);
+    processing_evidence.first_chunk_ms = atomic_millis(&recording.first_chunk_ms);
+    let panic_evidence = processing_evidence.clone();
+    *state = ActorState::Processing(processing_evidence);
+    let processing = tokio::spawn(process_recording(
+        recording,
+        current_validator,
+        current_delivery,
+        Arc::clone(&diagnostics),
+        debug_capture,
+        deepgram_enabled,
+    ));
+    tokio::spawn(supervise_recording(
+        processing,
+        controlled,
+        deepgram_enabled,
+        configured_providers,
+        panic_evidence,
+        reply,
+        actor,
+        diagnostics,
+        reaper,
+    ));
+    Ok(())
 }
 
 fn state_label(state: &ActorState) -> DaemonState {
@@ -1735,14 +1757,14 @@ async fn supervise_recording(
     // cleanup even when one bounded drain pass expires.
     reaper.drain_to_completion(RECOVERY_ABORT_DEADLINE).await;
     let _ = actor
-        .send(ActorMessage::Completed(Completion {
+        .send(ActorMessage::Completed(Box::new(Completion {
             id,
             result: recording.result,
             evidence: recording.evidence,
             validator: recording.validator,
             delivery: recording.delivery,
             reply,
-        }))
+        })))
         .await;
 }
 
@@ -1907,7 +1929,9 @@ async fn supervise_replay(
     // acknowledging: ReplayCompleted alone permits the Idle transition, so the
     // next Recording cannot overlap this replay's blocking cleanup.
     reaper.drain_to_completion(RECOVERY_ABORT_DEADLINE).await;
-    let _ = actor.send(ActorMessage::ReplayCompleted(completion)).await;
+    let _ = actor
+        .send(ActorMessage::ReplayCompleted(Box::new(completion)))
+        .await;
 }
 
 /// Rebuilds the provider and validation adapters after a replay panic dropped
