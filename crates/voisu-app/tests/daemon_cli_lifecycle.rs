@@ -6489,3 +6489,122 @@ fn deepgram_cli_toggle_persists_the_setting_across_starts() {
         .unwrap();
     assert!(!bad.status.success(), "an invalid toggle is rejected");
 }
+
+#[test]
+fn delivery_cli_sets_gets_and_persists_guarded_while_rejecting_invalid_modes() {
+    let config = TempDir::new().unwrap();
+    let run = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_voisu"))
+            .args(arguments)
+            .env("XDG_CONFIG_HOME", config.path())
+            .output()
+            .unwrap()
+    };
+    let config_file = config.path().join("voisu").join("config.toml");
+
+    let initial = run(&["delivery"]);
+    assert!(initial.status.success(), "{}", stderr(&initial));
+    assert_eq!(stdout(&initial), "delivery mode: type\n");
+
+    let clipboard = run(&["delivery", "clipboard"]);
+    assert!(clipboard.status.success(), "{}", stderr(&clipboard));
+    assert!(
+        fs::read_to_string(&config_file)
+            .unwrap()
+            .contains("delivery_mode = \"clipboard\""),
+        "clipboard mode persists"
+    );
+    assert_eq!(stdout(&run(&["delivery"])), "delivery mode: clipboard\n");
+
+    let guarded = run(&["delivery", "guarded"]);
+    assert!(guarded.status.success(), "{}", stderr(&guarded));
+    assert!(
+        stdout(&guarded).contains("guarded delivery is not yet available; persisted for when it ships"),
+        "{}",
+        stdout(&guarded)
+    );
+    assert_eq!(stdout(&run(&["delivery"])), "delivery mode: guarded\n");
+
+    let bad = run(&["delivery", "future"]);
+    assert_eq!(bad.status.code(), Some(2), "{}", stderr(&bad));
+    assert!(
+        stderr(&bad).contains("delivery mode must be type, clipboard, or guarded"),
+        "{}",
+        stderr(&bad)
+    );
+}
+
+#[test]
+fn clipboard_delivery_mode_uses_the_clipboard_only_adapter() {
+    let runtime = TempDir::new().unwrap();
+    let config = TempDir::new().unwrap();
+    let config_dir = config.path().join("voisu");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "deepgram_enabled = false\ndelivery_mode = \"clipboard\"\n",
+    )
+    .unwrap();
+
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+head -c 6400 /dev/zero | tr '\000' '\001'
+trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
+i=0
+while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+cat > "$dir/clipboard"
+"#,
+    );
+
+    let (endpoint, _request_rx, server) = local_groq_server("clipboard-only Transcript");
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("XDG_CONFIG_HOME", config.path().to_str().unwrap()),
+            // Keep the production adapter selection active while keeping any
+            // portal connection hermetic. Clipboard mode must not touch it.
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/voisu-no-portal"),
+            ("VOISU_DISABLE_SHORTCUTS", "1"),
+            ("VOISU_TEST_SECRET_STORE", "unavailable"),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", &endpoint),
+            ("VOISU_RECORDING_DEADLINE_MS", "5000"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    thread::sleep(Duration::from_millis(50));
+    let stopped = voisu(runtime.path(), "stop");
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    assert_eq!(
+        fs::read_to_string(commands.path().join("clipboard")).unwrap(),
+        "clipboard-only Transcript"
+    );
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    assert_eq!(record["delivery_method"], "clipboard_fallback", "{history}");
+    assert_eq!(
+        record["delivery_fallback_reason"],
+        "direct Delivery disabled for this run",
+        "clipboard mode must skip the emulated-input adapter: {history}"
+    );
+
+    daemon.terminate();
+    server.join().unwrap();
+}
