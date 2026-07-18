@@ -336,3 +336,11 @@ CryptoProvider"). Chose ring (pregenerated asm, no cmake) over aws-lc-rs
 (cmake would break the vendored offline RPM build); `install_crypto_provider()`
 is idempotent and runs first in daemon main. Ring's static link adds
 `Apache-2.0 AND ISC` to the RPM License tag and its texts ship via %license.
+
+## 2026-07-18 — Read EIS/portal keymap fds with pread at offset 0
+**Why:** the keymap fd is a shared open file description whose offset the
+compositor leaves at EOF after populating the memfd via write(); reading
+through the cursor yielded empty input and xkbcommon parse failures, stranding
+every Delivery on clipboard_fallback. pread neither depends on nor mutates the
+shared offset (also seal-proof). Alternative rejected: lseek(0) before read —
+it mutates shared state another reader may depend on.
