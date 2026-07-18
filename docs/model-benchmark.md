@@ -313,3 +313,25 @@ as a cheap second opinion; implementation alternates freely (both are competent,
    but converge reliably, Sol to ship cleaner first diffs with rarer but sharper defects.
 5. Both models need an explicit "do not touch docs/STATE/checkpoint/benchmark files" fence in every
    dispatch prompt — one scope-creep incident each this window.
+
+## Post-latency ride-alongs (history-pretty feature + hardening 03/04) — rows 114–121
+
+| # | Ticket | Task | Model (effort) | Result | Review findings vs its work | Fix rounds | Notes |
+|---|---|---|---|---|---|---|---|
+| 114 | HIST | Impl: human-first `voisu history` (pure history_view renderer, tail headline, TTY-gated paging, --json byte-compat) | Opus 4.8 (high) | delivered 343 tests (330+13 RED-first), overlay clean; doctor correctly left alone; NO doc creep (fence worked) | r1 (Sol high): REQUEST_CHANGES — 1 high 1 medium | 1 | 12.7 min, 100.1k tokens, 38 tool uses; commit 7525a37 |
+| 115 | HIST | First review | Sol (high, cladex) | REQUEST_CHANGES: terminal escape injection from network transcripts (HIGH), saturating_sub fakes "tail 0ms" on reversed timings (MED); verified send_command refactor, --json byte-compat, TTY gating, UTF-8 truncation clean | — | — | 2.9 min, 16 turns, $0.98 nominal, 120.9k in / 5.6k out |
+| 116 | H-04 | Impl: CI clippy+audit gates + RustSec pre-triage (web-verified, no hits) + webpki-roots shim analysis | Opus 4.8 (high) | ci.yml only; audit gate green first run; clippy red as predicted (13 voisu-core errors matching its honest pre-guess) | driver triage | — | 5.7 min, 55.6k tokens, 18 tool uses; worktree isolation; PR #29 |
+| 117 | H-04 | Clippy round-1 triage: doc-paragraph fixes + justified crate-level result_large_err allow (BoundaryError boxing → hardening-05) | Driver (Fable, inline) | voisu-core compiles clean | — | — | comment-only + attribute change |
+| 118 | HIST | Rework: C0/C1 sanitization at the truncate_inline choke point + checked_sub tail | Opus 4.8 (high) | both confirmed + fixed, 3 RED-first tests, 346 total, overlay clean | r2 (Sol medium): APPROVE — verified single-choke-point claim + U+2028/29 + enum-label trust | 1 | 9.8 min, 139.6k cumulative tokens; PR #30 merged CI-green |
+| 119 | HIST | Re-review round 2 | Sol (medium, cladex) | APPROVE | — | — | 2.6 min, 28 turns, $0.65 nominal |
+| 120 | H-04 | Clippy iteration rounds 2–8 (driver): crate-root allows for voisu-app lib + bins + tests (lib.rs allows do NOT reach bin/test crate roots), 3 real one-line fixes, WS fn allows, and a final real fix — explicit `truncate(false)` on the flock lock file (suspicious_open_options) | Driver (Fable, inline) | 7 CI rounds to converge (clippy stops at the first failing target, so errors surfaced one crate root at a time); audit+test gates green every round; PR #29 merged | — | — | INCIDENT: round-6 allow commit landed directly on main (cwd slip after PR-30 merge; push won the race vs TaskStop). Benign (attribute/comment-only), disclosed, PR #29 re-triggered against updated main. Lesson: pin cwd (`git -C`) in every compound git command when a worktree is active |
+| 121 | H-03 | Draft: systemd unit sandboxing for both user units + packaging-fedora.md rationale section | Driver (Fable, inline) | PR #31 opened, `systemd-analyze verify` clean; merge HELD until after live latency eval (unvalidated sandbox directives must not confound measurements) | — | — | inline (small config draft, no dispatch); MemoryDenyWriteExecute on daemon only, overlay AF_UNIX-only |
+
+**Ride-along notes.** The doc fence (explicit "do not touch docs/STATE/checkpoint/benchmark" line in
+every dispatch prompt) held for all three post-latency dispatches — zero scope creep after it was
+adopted. Rows 114–119 reinforce the row-103–113 pattern: Opus converges reliably with one review
+round; Sol at high found a genuine security defect (terminal escape injection) on its first pass.
+The H-04 clippy convergence cost (7 CI rounds) was a driver/tooling problem, not a model problem:
+no local clippy on this machine forced CI-iteration, and clippy's stop-at-first-failing-target
+behavior serialized the discovery. One real bug-class fix fell out of the gate: the flock lock file
+now states `truncate(false)` intent explicitly.
