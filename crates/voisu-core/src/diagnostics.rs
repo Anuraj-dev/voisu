@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -561,7 +561,9 @@ pub fn export_record(
 /// files private (0600) and never leaves the local filesystem. One internal
 /// lock serializes every load-prune-persist cycle so concurrent writers (the
 /// actor answering history/export while a completed Recording persists its
-/// record) can never clobber each other from stale snapshots.
+/// record) can never clobber each other from stale snapshots. Poison is recovered:
+/// the mutex guards no in-memory state, and every on-disk rewrite is atomic, so a
+/// panic while holding it cannot leave invariants that require abandoning the lock.
 pub struct DiagnosticStore {
     dir: PathBuf,
     policy: RetentionPolicy,
@@ -596,6 +598,10 @@ impl DiagnosticStore {
 
     fn history_file(&self) -> PathBuf {
         self.dir.join("history.json")
+    }
+
+    fn lock_store(&self) -> MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn load_raw(&self) -> Vec<DiagnosticRecord> {
@@ -679,7 +685,7 @@ impl DiagnosticStore {
     /// removes any now-expired debug audio, and returns the retained history
     /// (newest first).
     pub fn record(&self, record: DiagnosticRecord) -> io::Result<Vec<DiagnosticRecord>> {
-        let _guard = self.lock.lock().expect("diagnostics lock is not poisoned");
+        let _guard = self.lock_store();
         let mut records = self.load_raw();
         records.push(record);
         self.prune_and_persist(records)
@@ -689,7 +695,7 @@ impl DiagnosticStore {
     /// expired debug audio as a side effect so a reader never sees an entry the
     /// retention policy has already expired.
     pub fn history(&self) -> io::Result<Vec<DiagnosticRecord>> {
-        let _guard = self.lock.lock().expect("diagnostics lock is not poisoned");
+        let _guard = self.lock_store();
         let records = self.load_raw();
         self.prune_and_persist(records)
     }
@@ -712,7 +718,7 @@ impl DiagnosticStore {
         // enough stale leftovers could otherwise exhaust the bounded create
         // retries and fail the rewrite that was supposed to clean them up.
         {
-            let _guard = self.lock.lock().expect("diagnostics lock is not poisoned");
+            let _guard = self.lock_store();
             if let Ok(entries) = fs::read_dir(&self.dir) {
                 for entry in entries.flatten() {
                     if entry
@@ -726,7 +732,7 @@ impl DiagnosticStore {
             }
         }
         let kept = self.history()?;
-        let _guard = self.lock.lock().expect("diagnostics lock is not poisoned");
+        let _guard = self.lock_store();
         let referenced: Vec<&str> = kept
             .iter()
             .filter_map(|record| record.debug_audio.as_ref())
@@ -881,4 +887,33 @@ pub async fn replay_capture(
         provider_failures,
         decision,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_store_recovers_a_poisoned_serialization_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            DiagnosticStore::open(
+                dir.path().join("diagnostics"),
+                RetentionPolicy::default(),
+            )
+            .unwrap(),
+        );
+        let poisoning_store = std::sync::Arc::clone(&store);
+        let poisoned = std::thread::spawn(move || {
+            let _guard = poisoning_store.lock.lock().unwrap();
+            panic!("poison diagnostics serialization lock");
+        });
+        assert!(poisoned.join().is_err());
+
+        let history = store
+            .record(DiagnosticRecord::new("after-poison".to_owned(), 1))
+            .expect("a poisoned serialization lock must not block diagnostics");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].correlation_id, "after-poison");
+    }
 }

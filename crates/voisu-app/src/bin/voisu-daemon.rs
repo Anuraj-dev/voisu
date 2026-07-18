@@ -3,7 +3,7 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,7 @@ const MAX_FRAME_BYTES: u64 = 16 * 1024;
 const IO_DEADLINE: Duration = CAPTURE_FINALIZE_DEADLINE;
 const MAX_CONNECTIONS: usize = 32;
 const PROVIDER_DEADLINE: Duration = PROVIDER_COMPLETION_DEADLINE;
+static CONTROLLED_DELIVERY_PANICKED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     voisu_app::system::install_crypto_provider();
@@ -382,6 +383,16 @@ struct Completion {
     reply: Option<oneshot::Sender<Response>>,
 }
 
+/// The adapters and Recording outcome returned through the processing task's
+/// supervisor. If processing panics, the supervisor rebuilds the stateless
+/// adapters and still sends a failed Completed acknowledgement.
+struct RecordingResult {
+    result: Result<(), BoundaryError>,
+    evidence: LifecycleEvidence,
+    validator: Box<dyn TranscriptValidator>,
+    delivery: Box<dyn DeliveryAdapter>,
+}
+
 async fn actor_loop(
     mut rx: mpsc::Receiver<ActorMessage>,
     tx: mpsc::Sender<ActorMessage>,
@@ -421,6 +432,10 @@ async fn actor_loop(
     } else {
         Box::new(GroqProvider::new(reaper.clone()))
     });
+    // The processing supervisor cannot inspect task-local provider state after a
+    // panic, so retain the providers configured for this Recording beside the
+    // actor-owned adapters and pass that list into every supervised stop path.
+    let configured_providers = vec![Provider::Deepgram, Provider::Groq];
     let mut validator: Option<Box<dyn TranscriptValidator>> = if controlled {
         Some(Box::new(ControlledValidator::from_env()))
     } else {
@@ -587,18 +602,25 @@ async fn actor_loop(
                         recording.chunk_counter.load(Ordering::SeqCst);
                     processing_evidence.first_chunk_ms =
                         atomic_millis(&recording.first_chunk_ms);
+                    let panic_evidence = processing_evidence.clone();
                     state = ActorState::Processing(processing_evidence);
-                    let actor = tx.clone();
                     let current_validator = validator.take().expect("validator is available");
                     let current_delivery = delivery.take().expect("Delivery adapter is available");
-                    tokio::spawn(process_recording(
+                    let processing = tokio::spawn(process_recording(
                         recording,
                         current_validator,
                         current_delivery,
-                        actor,
-                        Some(reply),
                         Arc::clone(&diagnostics),
                         debug_capture,
+                    ));
+                    tokio::spawn(supervise_recording(
+                        processing,
+                        controlled,
+                        configured_providers.clone(),
+                        panic_evidence,
+                        Some(reply),
+                        tx.clone(),
+                        Arc::clone(&diagnostics),
                         reaper.clone(),
                     ));
                 }
@@ -904,17 +926,25 @@ async fn actor_loop(
                         recording.chunk_counter.load(Ordering::SeqCst);
                     processing_evidence.first_chunk_ms =
                         atomic_millis(&recording.first_chunk_ms);
+                    let panic_evidence = processing_evidence.clone();
                     state = ActorState::Processing(processing_evidence);
                     let current_validator = validator.take().expect("validator is available");
                     let current_delivery = delivery.take().expect("Delivery adapter is available");
-                    tokio::spawn(process_recording(
+                    let processing = tokio::spawn(process_recording(
                         recording,
                         current_validator,
                         current_delivery,
-                        tx.clone(),
-                        None,
                         Arc::clone(&diagnostics),
                         debug_capture,
+                    ));
+                    tokio::spawn(supervise_recording(
+                        processing,
+                        controlled,
+                        configured_providers.clone(),
+                        panic_evidence,
+                        None,
+                        tx.clone(),
+                        Arc::clone(&diagnostics),
                         reaper.clone(),
                     ));
                 }
@@ -924,7 +954,7 @@ async fn actor_loop(
                 delivery = Some(completed.delivery);
                 if matches!(&state, ActorState::Processing(evidence) if evidence.recording_id == completed.id)
                 {
-                    // `process_recording` drained the provider reaper before
+                    // `supervise_recording` drained the provider reaper before
                     // sending this acknowledgement, so any stream dropped
                     // mid-cleanup has already completed its retained curl reap;
                     // the acknowledgement alone permits this Idle transition and
@@ -992,18 +1022,26 @@ async fn actor_loop(
                         recording.chunk_counter.load(Ordering::SeqCst);
                     processing_evidence.first_chunk_ms =
                         atomic_millis(&recording.first_chunk_ms);
+                    let panic_evidence = processing_evidence.clone();
                     state = ActorState::Processing(processing_evidence);
                     let current_validator = validator.take().expect("validator is available");
                     let current_delivery =
                         delivery.take().expect("Delivery adapter is available");
-                    tokio::spawn(process_recording(
+                    let processing = tokio::spawn(process_recording(
                         recording,
                         current_validator,
                         current_delivery,
-                        tx.clone(),
-                        None,
                         Arc::clone(&diagnostics),
                         debug_capture,
+                    ));
+                    tokio::spawn(supervise_recording(
+                        processing,
+                        controlled,
+                        configured_providers.clone(),
+                        panic_evidence,
+                        None,
+                        tx.clone(),
+                        Arc::clone(&diagnostics),
                         reaper.clone(),
                     ));
                 }
@@ -1390,12 +1428,9 @@ async fn process_recording(
     recording: ActiveRecording,
     mut validator: Box<dyn TranscriptValidator>,
     mut delivery: Box<dyn DeliveryAdapter>,
-    actor: mpsc::Sender<ActorMessage>,
-    reply: Option<oneshot::Sender<Response>>,
     diagnostics: Arc<DiagnosticStore>,
     debug_capture: bool,
-    reaper: ProviderReaper,
-) {
+) -> RecordingResult {
     let ActiveRecording {
         id,
         stop_tx,
@@ -1406,15 +1441,48 @@ async fn process_recording(
         mut evidence,
     } = recording;
     let _ = stop_tx.send(());
+    let pump = pump.await;
+    evidence.streamed_chunk_count = chunk_counter.load(Ordering::SeqCst);
+    evidence.first_chunk_ms = atomic_millis(&first_chunk_ms);
+    let correlation_id = evidence.correlation_id.clone();
     let PumpOutput {
         mut capture,
         providers,
         stream_error,
-    } = pump.await.expect("capture pump should not panic");
-    evidence.streamed_chunk_count = chunk_counter.load(Ordering::SeqCst);
-    evidence.first_chunk_ms = atomic_millis(&first_chunk_ms);
+    } = match pump {
+        Ok(output) => output,
+        Err(join_error) => {
+            evidence.stages.push(LifecycleStage::CaptureAborted);
+            let error = BoundaryError::new(
+                BoundaryKind::Capture,
+                format!("capture pump task failed: {join_error}"),
+            );
+            let mut provider_failures = Vec::new();
+            account_for_missing_providers(
+                &[],
+                &mut provider_failures,
+                error.diagnostic(),
+            );
+            let record = diagnostic_record(
+                &evidence,
+                Vec::new(),
+                provider_failures,
+                None,
+                None,
+                Some(&error),
+            );
+            if let Err(record_error) = diagnostics.record(record) {
+                eprintln!("Recording {id}: writing diagnostics failed: {record_error}");
+            }
+            return RecordingResult {
+                result: Err(error),
+                evidence,
+                validator,
+                delivery,
+            };
+        }
+    };
 
-    let correlation_id = evidence.correlation_id.clone();
     // Local diagnostic evidence collected alongside the lifecycle evidence and
     // persisted to bounded local history once the Recording completes. Raw audio
     // is captured only when the user explicitly enabled debug capture.
@@ -1510,25 +1578,116 @@ async fn process_recording(
         eprintln!("Recording {id}: writing diagnostics failed: {error}");
     }
 
-    // Every provider stream of this Recording has been consumed or dropped by
-    // now, so any cleanup a mid-abort drop adopted is already retained in the
-    // reaper. Drain it here — off the actor loop — before acknowledging: the
-    // Completed acknowledgement alone permits the Idle transition, so Idle is
-    // never observable while this Recording's blocking cleanup is live.
-    if !reaper.drain(RECOVERY_ABORT_DEADLINE).await {
-        eprintln!("Recording {id}: provider cleanup did not drain within the abort bound");
+    RecordingResult {
+        result,
+        evidence,
+        validator,
+        delivery,
     }
+}
 
+/// Awaits the supervised Recording processing task and reports Completed on
+/// EVERY path. If processing panicked, its adapters were dropped with the task,
+/// so the supervisor rebuilds the stateless adapters, records a failed Recording,
+/// and returns the actor to Idle instead of leaving it wedged in Processing.
+async fn supervise_recording(
+    processing: JoinHandle<RecordingResult>,
+    controlled: bool,
+    configured_providers: Vec<Provider>,
+    panic_evidence: LifecycleEvidence,
+    reply: Option<oneshot::Sender<Response>>,
+    actor: mpsc::Sender<ActorMessage>,
+    diagnostics: Arc<DiagnosticStore>,
+    reaper: ProviderReaper,
+) {
+    let id = panic_evidence.recording_id;
+    let recording = match processing.await {
+        Ok(result) => result,
+        Err(join_error) => {
+            log_best_effort(format_args!(
+                "Recording {id}: processing task failed: {join_error}"
+            ));
+            let error = BoundaryError::new(
+                BoundaryKind::Validation,
+                format!("Recording processing task failed at an unknown point: {join_error}"),
+            )
+            .with_public_message("Recording processing failed at an unknown point");
+            let provider_failures = configured_providers
+                .into_iter()
+                .map(|provider| {
+                    ProviderFailure::new(
+                        provider,
+                        ProviderFailureStage::Aborted,
+                        "provider outcome is unknown: the Recording processing task failed",
+                    )
+                })
+                .collect();
+            let record = diagnostic_record(
+                &panic_evidence,
+                Vec::new(),
+                provider_failures,
+                None,
+                None,
+                Some(&error),
+            );
+            if let Err(record_error) = diagnostics.record(record) {
+                log_best_effort(format_args!(
+                    "Recording {id}: writing diagnostics failed: {record_error}"
+                ));
+            }
+            let (validator, delivery) = rebuild_recording_adapters(controlled);
+            RecordingResult {
+                result: Err(error),
+                evidence: panic_evidence,
+                validator,
+                delivery,
+            }
+        }
+    };
+    // Every provider stream has been consumed or dropped now, including streams
+    // dropped by a panic and adopted into the reaper. Drain before acknowledging:
+    // Completed alone permits the Idle transition.
+    if !reaper.drain(RECOVERY_ABORT_DEADLINE).await {
+        log_best_effort(format_args!(
+            "Recording {id}: provider cleanup did not drain within the abort bound"
+        ));
+    }
     let _ = actor
         .send(ActorMessage::Completed(Completion {
             id,
-            result,
-            evidence,
-            validator,
-            delivery,
+            result: recording.result,
+            evidence: recording.evidence,
+            validator: recording.validator,
+            delivery: recording.delivery,
             reply,
         }))
         .await;
+}
+
+/// Writes a diagnostic line to stderr, swallowing any write failure: a stderr
+/// write failure must not panic on the guaranteed-completion supervisor path.
+fn log_best_effort(message: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{message}");
+}
+
+fn rebuild_recording_adapters(
+    controlled: bool,
+) -> (Box<dyn TranscriptValidator>, Box<dyn DeliveryAdapter>) {
+    if controlled {
+        (
+            Box::new(ControlledValidator::from_env()),
+            Box::new(ControlledDelivery),
+        )
+    } else {
+        let delivery: Box<dyn DeliveryAdapter> =
+            if std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_some() {
+                Box::new(PortalClipboardDelivery::clipboard_only())
+            } else {
+                Box::new(PortalClipboardDelivery::default())
+            };
+        (Box::new(MergeResultValidator::new()), delivery)
+    }
 }
 
 /// Enforces the no-silent-absence invariant: every configured provider must end
@@ -1628,7 +1787,9 @@ async fn supervise_replay(
             response: result.response,
         },
         Err(join_error) => {
-            eprintln!("Replay {id}: replay task failed: {join_error}");
+            log_best_effort(format_args!(
+                "Replay {id}: replay task failed: {join_error}"
+            ));
             let (deepgram, groq, validator) = rebuild_replay_adapters(controlled, &reaper);
             ReplayCompletion {
                 id,
@@ -1644,7 +1805,9 @@ async fn supervise_replay(
     // adopting their cleanup into the reaper. Drain it before acknowledging:
     // ReplayCompleted alone permits the Idle transition.
     if !reaper.drain(RECOVERY_ABORT_DEADLINE).await {
-        eprintln!("Replay {id}: provider cleanup did not drain within the abort bound");
+        log_best_effort(format_args!(
+            "Replay {id}: provider cleanup did not drain within the abort bound"
+        ));
     }
     let _ = actor.send(ActorMessage::ReplayCompleted(completion)).await;
 }
@@ -1989,6 +2152,7 @@ async fn serve(stream: UnixStream, actor: mpsc::Sender<ActorMessage>) -> Result<
 
 struct ControlledCapture {
     fail_begin_once: bool,
+    panic_next_chunk_once: bool,
     finish_failures_remaining: u32,
     recording_outcome_once: Option<String>,
     fail_abort: bool,
@@ -2015,6 +2179,7 @@ impl ControlledCapture {
         let chunk_delay = env_millis("VOISU_TEST_CHUNK_DELAY_MS");
         Self {
             fail_begin_once: std::env::var_os("VOISU_TEST_CAPTURE_BEGIN_FAILURE").is_some(),
+            panic_next_chunk_once: std::env::var_os("VOISU_TEST_CAPTURE_PUMP_PANIC").is_some(),
             finish_failures_remaining: std::env::var("VOISU_TEST_CAPTURE_FINISH_FAILURES")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -2041,10 +2206,12 @@ impl AudioCapture for ControlledCapture {
                 "controlled-capture-begin-detail",
             ));
         }
+        let panic_next_chunk = std::mem::take(&mut self.panic_next_chunk_once);
         let fail_finish = self.finish_failures_remaining > 0;
         self.finish_failures_remaining = self.finish_failures_remaining.saturating_sub(1);
         let recording_outcome = self.recording_outcome_once.take();
         Ok(Box::new(ControlledActiveCapture {
+            panic_next_chunk,
             fail_finish,
             recording_outcome,
             fail_abort: self.fail_abort,
@@ -2058,6 +2225,7 @@ impl AudioCapture for ControlledCapture {
 }
 
 struct ControlledActiveCapture {
+    panic_next_chunk: bool,
     fail_finish: bool,
     recording_outcome: Option<String>,
     fail_abort: bool,
@@ -2071,6 +2239,9 @@ struct ControlledActiveCapture {
 impl ActiveCapture for ControlledActiveCapture {
     fn next_chunk(&mut self) -> BoundaryFuture<'_, Option<AudioChunk>> {
         Box::pin(async move {
+            if std::mem::take(&mut self.panic_next_chunk) {
+                panic!("controlled capture pump panic");
+            }
             // The Recording Deadline is enforced on the next-chunk poll, exactly
             // like the real PipeWire capture: once the configured number of
             // chunks has streamed, a forgotten Recording stops itself with a
@@ -2392,6 +2563,11 @@ struct ControlledDelivery;
 
 impl DeliveryAdapter for ControlledDelivery {
     fn deliver(&mut self, _transcript: Transcript) -> BoundaryFuture<'_, DeliveryOutcome> {
+        if std::env::var_os("VOISU_TEST_DELIVERY_PANIC").is_some()
+            && !CONTROLLED_DELIVERY_PANICKED.swap(true, Ordering::SeqCst)
+        {
+            panic!("controlled Delivery panic");
+        }
         Box::pin(async {
             Ok(match std::env::var("VOISU_TEST_DELIVERY_FALLBACK") {
                 Ok(reason) => DeliveryOutcome::clipboard_fallback(reason),
@@ -2404,6 +2580,49 @@ impl DeliveryAdapter for ControlledDelivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn processing_panic_records_only_the_configured_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let diagnostics = Arc::new(
+            DiagnosticStore::open(
+                dir.path().join("diagnostics"),
+                RetentionPolicy::default(),
+            )
+            .unwrap(),
+        );
+        let evidence = base_evidence(7, "configured-provider-panic".to_owned(), Vec::new());
+        let processing: JoinHandle<RecordingResult> = tokio::spawn(async {
+            panic!("controlled processing panic");
+        });
+        let (actor, mut messages) = mpsc::channel(1);
+
+        supervise_recording(
+            processing,
+            true,
+            vec![Provider::Groq],
+            evidence,
+            None,
+            actor,
+            Arc::clone(&diagnostics),
+            ProviderReaper::new(),
+        )
+        .await;
+
+        assert!(matches!(messages.recv().await, Some(ActorMessage::Completed(_))));
+        let history = diagnostics.history().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].provider_failures.len(), 1);
+        assert_eq!(history[0].provider_failures[0].provider, Provider::Groq);
+        assert_eq!(
+            history[0].provider_failures[0].stage,
+            ProviderFailureStage::Aborted
+        );
+        assert_eq!(
+            history[0].provider_failures[0].diagnostic,
+            "provider outcome is unknown: the Recording processing task failed"
+        );
+    }
 
     /// The graceful shutdown must JOIN the actor, never abandon the join on a
     /// deadline: an abandoned actor keeps running detached while it still owns
