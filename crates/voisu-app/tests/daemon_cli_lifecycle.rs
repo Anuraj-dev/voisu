@@ -4488,6 +4488,62 @@ exec setsid sleep infinity
 }
 
 #[test]
+// PR_SET_PDEATHSIG is armed against the forking THREAD, not the process: a
+// pw-record spawned directly on a transient Tokio blocking-pool thread is
+// SIGKILLed when that idle thread is reaped (~10 s in production), killing
+// every longer Recording. The shrunken keep-alive makes an unfixed spawn path
+// fail within ~1 s; the capture must survive the pool-thread reap.
+fn recording_survives_blocking_pool_thread_reap() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s' "$$" > "$dir/pw-record.pid.$$"
+mv "$dir/pw-record.pid.$$" "$dir/pw-record.pid"
+trap 'exit 0' INT TERM
+i=0
+while test "$i" -lt 600; do
+  head -c 3200 /dev/zero | tr '\000' '\001'
+  sleep 0.01
+  i=$((i + 1))
+done
+"#,
+    );
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
+            ("VOISU_TEST_BLOCKING_KEEP_ALIVE_MS", "50"),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "pw-record.pid");
+    let pid = fs::read_to_string(commands.path().join("pw-record.pid"))
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    thread::sleep(Duration::from_millis(1500));
+    assert!(
+        Path::new(&format!("/proc/{pid}")).exists(),
+        "pw-record was killed by the blocking-pool thread reap"
+    );
+    daemon.terminate();
+}
+
+#[test]
 fn single_instance_rejection_preserves_the_live_daemon_and_cleanup_owns_one_inode() {
     let runtime = TempDir::new().unwrap();
     let daemon = Daemon::start(runtime.path());

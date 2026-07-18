@@ -1260,15 +1260,6 @@ impl AudioCapture for PipeWireCapture {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(|_| {
-            BoundaryError::new(BoundaryKind::Capture, "pw-record unavailable")
-        })?;
-        let mut stdout = child.stdout.take().ok_or_else(|| {
-            BoundaryError::new(BoundaryKind::Capture, "pw-record stdout unavailable")
-        })?;
-        let mut stderr = child.stderr.take().ok_or_else(|| {
-            BoundaryError::new(BoundaryKind::Capture, "pw-record stderr unavailable")
-        })?;
         let state = Arc::new(Mutex::new(CaptureReaderState {
             chunks: VecDeque::new(),
             received_bytes: 0,
@@ -1276,7 +1267,40 @@ impl AudioCapture for PipeWireCapture {
             error: None,
         }));
         let reader_state = Arc::clone(&state);
+        // pw-record MUST be spawned from the reader thread, never from the
+        // caller: `guard_external_child` arms PR_SET_PDEATHSIG, and the kernel
+        // delivers that signal when the FORKING THREAD exits, not the process.
+        // The caller runs on a transient Tokio blocking-pool thread that is
+        // reaped after ~10 s idle, which SIGKILLed every Recording longer than
+        // that. The reader thread lives until the capture ends, so parent-death
+        // delivery degrades to exactly the daemon-death contract intended.
+        let (handoff_tx, handoff_rx) =
+            std::sync::mpsc::channel::<Result<(Child, std::process::ChildStderr), &'static str>>();
         let reader = thread::spawn(move || {
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(_) => {
+                    let _ = handoff_tx.send(Err("pw-record unavailable"));
+                    return;
+                }
+            };
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let (Some(mut stdout), Some(stderr)) = (stdout, stderr) else {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = handoff_tx.send(Err("pw-record stdout unavailable"));
+                return;
+            };
+            if let Err(returned) = handoff_tx.send(Ok((child, stderr))) {
+                // begin() is blocked on recv, so this only happens if it
+                // panicked; reclaim the child rather than leaking it.
+                if let Ok((mut child, _)) = returned.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return;
+            }
             let mut buffer = vec![0_u8; PCM_CHUNK_BYTES];
             loop {
                 match stdout.read(&mut buffer) {
@@ -1303,6 +1327,10 @@ impl AudioCapture for PipeWireCapture {
                 }
             }
         });
+        let (child, mut stderr) = handoff_rx
+            .recv()
+            .map_err(|_| BoundaryError::new(BoundaryKind::Capture, "pw-record unavailable"))?
+            .map_err(|message| BoundaryError::new(BoundaryKind::Capture, message))?;
         let stderr_reader = thread::spawn(move || {
             read_capped(&mut stderr, MAX_RETAINED_STDERR_BYTES).unwrap_or_default()
         });

@@ -37,9 +37,26 @@ const IO_DEADLINE: Duration = CAPTURE_FINALIZE_DEADLINE;
 const MAX_CONNECTIONS: usize = 32;
 const PROVIDER_DEADLINE: Duration = PROVIDER_COMPLETION_DEADLINE;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     voisu_app::system::install_crypto_provider();
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    // Test-only seam (VOISU_TEST_* namespace, never set by the packaged unit):
+    // shrinks the blocking-pool idle keep-alive so the acceptance test for the
+    // PR_SET_PDEATHSIG parent-THREAD contract can observe a pool-thread reap
+    // in milliseconds instead of Tokio's production ~10 s.
+    if let Some(keep_alive) = std::env::var("VOISU_TEST_BLOCKING_KEEP_ALIVE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    {
+        builder.thread_keep_alive(Duration::from_millis(keep_alive));
+    }
+    let runtime = builder.build().expect("Tokio runtime construction failed");
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     let systemd_owned = matches!(
         std::env::args().skip(1).collect::<Vec<_>>().as_slice(),
         [argument] if argument == "--systemd"
