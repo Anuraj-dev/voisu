@@ -1,15 +1,12 @@
-// BoundaryError is rich by design; boxing it is hardening-05 hygiene.
-#![allow(clippy::result_large_err)]
-
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use voisu_core::{
-    BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, PROTOCOL_VERSION, Provider,
-    ProviderAuthenticator, ReadinessInspector, ReadinessStatus, Request, Response, SecretStore,
-    VersionEnvelope, socket_path,
+    BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, ExportCorrelationId,
+    PROTOCOL_VERSION, Provider, ProviderAuthenticator, ReadinessInspector, ReadinessStatus,
+    ReplayFixturePath, Request, Response, SecretStore, VersionEnvelope, socket_path,
 };
 use voisu_app::service::{UserServiceAction, manage_user_service};
 use voisu_app::system::{
@@ -362,10 +359,12 @@ fn parse_command() -> Result<CliAction, String> {
             Ok(CliAction::History { json: true })
         }
         [command, correlation_id] if command == "export" => {
-            Ok(CliAction::Daemon(Command::Export((*correlation_id).to_owned())))
+            Ok(CliAction::Daemon(Command::Export(ExportCorrelationId::new(
+                correlation_id.clone(),
+            ))))
         }
         [command, path] if command == "replay" => {
-            Ok(CliAction::Daemon(Command::Replay((*path).to_owned())))
+            Ok(CliAction::Daemon(Command::Replay(ReplayFixturePath::new(path.clone()))))
         }
         [command] if command == "doctor" => Ok(CliAction::Doctor),
         [command] if command == "--help" || command == "-h" || command == "help" => {

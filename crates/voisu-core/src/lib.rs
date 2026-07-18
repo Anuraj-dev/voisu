@@ -1,10 +1,5 @@
 //! Shared domain, provider coordination, and IPC types for Voisu.
 
-// BoundaryError carries rich failure diagnostics by design, and several public
-// seams return it in Err position. Boxing/shrinking it is a cross-cutting
-// change owned by the hardening-05 hygiene sweep, not this CI gate.
-#![allow(clippy::result_large_err)]
-
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::future::Future;
@@ -78,10 +73,40 @@ pub enum Command {
     /// Returns the retained local diagnostic history (newest first).
     History,
     /// Returns a redacted, self-contained diagnostic export for one correlation ID.
-    Export(String),
+    Export(ExportCorrelationId),
     /// Replays a fixed captured fixture at the given path through the provider
     /// and validation boundaries without capturing audio again.
-    Replay(String),
+    Replay(ReplayFixturePath),
+}
+
+/// Correlation ID accepted by the diagnostic-export command.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ExportCorrelationId(String);
+
+impl ExportCorrelationId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Fixture path accepted by the replay command.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ReplayFixturePath(String);
+
+impl ReplayFixturePath {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -329,7 +354,7 @@ pub struct BoundaryError {
     kind: BoundaryKind,
     diagnostic: String,
     public_message: Option<&'static str>,
-    transcript_failure: Option<TranscriptFailureEvidence>,
+    transcript_failure: Option<Box<TranscriptFailureEvidence>>,
     provider_failures: Vec<ProviderFailure>,
 }
 
@@ -358,12 +383,12 @@ impl BoundaryError {
     }
 
     pub fn with_transcript_failure(mut self, evidence: TranscriptFailureEvidence) -> Self {
-        self.transcript_failure = Some(evidence);
+        self.transcript_failure = Some(Box::new(evidence));
         self
     }
 
     pub fn transcript_failure(&self) -> Option<&TranscriptFailureEvidence> {
-        self.transcript_failure.as_ref()
+        self.transcript_failure.as_deref()
     }
 
     /// Attaches provider-failure evidence to an error so a failure on a path
