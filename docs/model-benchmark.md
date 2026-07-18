@@ -163,6 +163,45 @@ host proves the tools.
 | 87 | live-gate | CLI keyterm accuracy pass (dictionary reorder + compounds + truncation-guard test) | Fable 5 driver (inline) | root cause was prompt-budget truncation, not missing terms; P2 WER 19.3%→10.5%, all CLI compounds now correct; 299 tests | skipped (trivial diff per review policy) | — | live retest overall: raw 10.8%, formatting-adjusted 9.2% — first sub-10 result |
 | 88 | delivery-keymap | EIS keymap fd pread fix (system.rs read_keymap_fd + memfd regression test) | prior-session driver (adopted from worktree); Fable 5 driver verified+rebased | fix matched root-cause hypothesis exactly; test GREEN, 300/300 workspace | Sol (high) — first review | APPROVE, no findings, ~112k tokens | staged-uncommitted work in /tmp worktree was adoptable; committed, rebased onto post-#23 main clean |
 
+## Hardening criticals via cladex (H1/H2, 2026-07-18)
+
+> New this session: all Sol dispatches ran via **cladex** — a local CLIProxyAPI bridge running Sol inside
+> the Claude Code harness instead of the codex CLI ("Sol via cladex"). Effort passed with the native
+> `--effort` flag (wire-verified: proxy log shows the level applied). Costs are **NOMINAL** (Claude Code
+> pricing math over proxy traffic; actual billing is the Codex Plus subscription). Durations are
+> wall-clock for the headless session.
+
+| # | Ticket | Task | Model (effort) | Result | Review findings vs its work | Fix rounds | Notes |
+|---|---|---|---|---|---|---|---|
+| 89 | H1 | Feature impl: supervise process_recording, mirror supervise_replay | Sol (medium, cladex) | delivered 1cbb82e, 301 tests, clean TDD w/ RED evidence | r1: 1 BLOCKER + 1 MAJOR + 1 MINOR | 2 rework rounds to clear | 10.8 min, 70 turns, 143k in / 15k out, $2.67 nominal |
+| 90 | H1 | Review round 1 | Sol (high, cladex) | REQUEST_CHANGES — real BLOCKER: supervisor itself could re-panic on poisoned diagnostics lock | — | — | 3.9 min, $1.37; high-value catch |
+| 91 | H1 | Rework round 1 | Sol (medium, cladex) | delivered, 303 tests; poison-tolerant lock + honest panic classification | r2: rollback-unsafe persisted enum variant (MAJOR) + disabled-provider inaccuracy (MINOR) | — | 11.0 min, 78 turns, $2.70 |
+| 92 | H1 | Re-review round 2 | Sol (medium, cladex) | REQUEST_CHANGES, both findings legit (rollback wipe scenario subtle) | — | — | 2.8 min, $0.88 |
+| 93 | H1 | Rework round 2 | Sol (medium, cladex) | delivered, 304 tests; followed orchestrator binding decisions (reuse Aborted stage, configured-provider plumbing) | r3: 1 HIGH remained (eprintln! panics on failed stderr write on guaranteed-completion path) | — | 7.5 min, $3.62 |
+| 94 | H1 | Re-review round 3 | Sol (medium, cladex) | REQUEST_CHANGES — the eprintln HIGH; genuinely same wedge class | — | — | 3.5 min, $0.95 |
+| 95 | H1 | Point fix: log_best_effort helper, 5 sites both supervisors | Driver (Fable) inline + Opus 4.8 (high) | delivered fcd9066 | r4: APPROVE, 0 findings | closed ticket | Opus: 3.1 min, 37.8k tokens, first-try clean |
+| 96 | H1 | Confirmation review round 4 | Sol (medium, cladex) | APPROVE | — | — | 45 s, $0.30; PR #25 merged, CI green |
+| 97 | H2 | Feature impl: stop_child → spawn_blocking | Sol (medium, cladex) | delivered b30d3e0, 301 tests; excellent single-worker responsiveness regression | r1: 1 MAJOR — cancellation-unsafe (timeout drops future, detaches cleanup) | 2 rework rounds to clear | 8.6 min, 51 turns, $2.11 |
+| 98 | H2 | Review round 1 | Sol (high, cladex) | REQUEST_CHANGES — the cancellation MAJOR; subtle (old inline blocking was accidentally cancel-proof) | — | — | 3.7 min, $0.68 |
+| 99 | H2 | Rework round 1: reaper adoption + drain_to_completion | Sol (medium, cladex) | delivered, 302 tests; driver rebased onto merged H1 and reconciled drain sites into supervise_recording/replay (306 after rebase) | r2: 1 MAJOR (pre-stop Drop path still detached) + 1 MINOR (250 ms test bound flaky) | — | 8.4 min, 69 turns, $2.48 |
+| 100 | H2 | Re-review round 2 | Sol (medium, cladex) | REQUEST_CHANGES, both legit | — | — | 3.5 min, $0.98 |
+| 101 | H2 | Rework round 2: Drop-path adoption (adopt_capture_blocking, poison-tolerant retain) | Opus 4.8 (high) | delivered be18833, 307 tests, RED-first | r3: APPROVE, 0 findings | closed ticket | 6.6 min, 70.8k tokens; matches standing routing rec (ownership/lifecycle → Opus) |
+| 102 | H2 | Confirmation review round 3 | Sol (medium, cladex) | APPROVE | — | — | 1.5 min, $0.54; PR #26 pending CI merge |
+
+### Running observations (H1/H2, cladex session)
+- **cladex (Sol inside the Claude Code harness) worked flawlessly across 12 dispatches** — full tool use,
+  TDD, JSON usage capture; `--effort` passes through to Codex reasoning effort (wire-verified). A viable
+  codex-CLI replacement: tokens bill to the Codex quota, none to the Claude quota, and the harness's cache
+  reads (21M+ cumulative) are the dominant token class.
+- **Sol's review ladder again earned its cost**: every round's findings were real (poisoned-lock re-wedge,
+  rollback history wipe, eprintln-panic class, cancellation detach, pre-stop Drop bypass) — zero false
+  REQUEST_CHANGES across 7 review rounds on the two tickets.
+- **Sol as implementer**: strong first passes, but each introduced one subtle second-order defect
+  (rollback-unsafe variant; cancellation-unsafety) that review caught. Opus 4.8 high closed both tickets'
+  final scoped lifecycle fixes first-try with zero findings — consistent with the ticket-03-era rec.
+- **Session split after Raja's 50/50 directive**: the Claude side took point fixes, scoped lifecycle
+  rework, and docs; Sol kept architecture-grade implementation + all reviews.
+
 ## Final report — accuracy effort + live gates (rows 61–87, 2026-07-18)
 
 Extends the tickets-01–13 report above; that snapshot stands as history. 27 dispatches across the

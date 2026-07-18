@@ -344,3 +344,31 @@ through the cursor yielded empty input and xkbcommon parse failures, stranding
 every Delivery on clipboard_fallback. pread neither depends on nor mutates the
 shared offset (also seal-proof). Alternative rejected: lseek(0) before read —
 it mutates shared state another reader may depend on.
+
+## 2026-07-18 — Guaranteed-completion supervisor paths must be panic-free
+**Why:** A supervisor that panics before sending Completed/Recovered/ReplayCompleted
+re-creates the permanent wedge it exists to prevent. Concretely: DiagnosticStore
+locks recover poison (`lock_store`; the mutex guards only file-cycle serialization,
+disk writes are atomic); logging uses best-effort writes (`log_best_effort` /
+`let _ = writeln!`) because `eprintln!` panics on failed stderr writes; no new
+persisted enum discriminators (old binary's `load_raw` turns one unknown variant
+into a silent full-history wipe on rollback). Alternative rejected: catch_unwind
+wrapping — fixing each panic source is simpler and reviewable.
+
+## 2026-07-18 — Idle is gated on reaper drain_to_completion; cleanup is adopted, never detached
+**Why:** spawn_blocking made stop_child cancellation-unsafe (an outer 2 s timeout
+could drop the future and detach live pw-record cleanup). Instead of enlarging
+outer deadlines (fragile coupling), all cancelled or dropped capture/provider
+cleanup is adopted into the actor-owned ProviderReaper (retained JoinHandle on
+cancel; `adopt_capture_blocking` on pre-stop Drop, runtime-free) and every
+Idle-permitting path drains to completion — the next Recording can never overlap
+the previous one's cleanup. Each retained cleanup is internally bounded, so the
+drain terminates; the service unit's TimeoutStopSec is the last-resort backstop.
+
+## 2026-07-18 — cladex adopted as the Sol dispatch channel; ~50/50 Claude/Codex split (Raja)
+**Why:** cladex (Claude Code harness → local CLIProxyAPI → gpt-5.6-*) gives Sol
+full harness tooling, JSON usage capture, and native `--effort` passthrough
+(verified in the proxy debug log), while billing the Codex Plus quota. Raja's
+budget directive: split work ~50/50 — Sol keeps architecture-grade implementation
+and all reviews; Claude (driver/Opus) takes scoped lifecycle fixes, point work,
+reconciliation, and docs. Codex CLI remains the fallback if the proxy misbehaves.
