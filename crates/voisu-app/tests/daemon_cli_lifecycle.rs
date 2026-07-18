@@ -6301,6 +6301,48 @@ fn a_failed_groq_only_recording_still_records_deepgram_as_not_started() {
 }
 
 #[test]
+fn a_disabled_deepgram_processing_panic_still_records_deepgram_as_not_started() {
+    // Finding 3: the supervisor — not process_recording — builds the record when
+    // the processing task panics (here via the Delivery panic seam, after a
+    // successful Groq-only completion). A disabled Deepgram must still read as
+    // the canonical NotStarted there, never the panic's Aborted-unknown outcome.
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_DISABLE_DEEPGRAM", "1"),
+            ("VOISU_TEST_DELIVERY_PANIC", "1"),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "groq only transcript"),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    let failed = voisu(runtime.path(), "stop");
+    assert_eq!(failed.status.code(), Some(4), "{}", stderr(&failed));
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    let failures = record["provider_failures"].as_array().unwrap();
+    let deepgram: Vec<_> = failures
+        .iter()
+        .filter(|entry| entry["provider"] == "deepgram")
+        .collect();
+    assert_eq!(deepgram.len(), 1, "one Deepgram entry after a panic: {record}");
+    assert_eq!(deepgram[0]["stage"], "not_started", "{record}");
+    assert_eq!(
+        deepgram[0]["diagnostic"], "Deepgram disabled for this Recording",
+        "{record}"
+    );
+    // Groq still carries the panic's Aborted-unknown outcome.
+    let groq = failures
+        .iter()
+        .find(|entry| entry["provider"] == "groq")
+        .expect("Groq is recorded");
+    assert_eq!(groq["stage"], "aborted", "{record}");
+
+    daemon.terminate();
+}
+
+#[test]
 fn a_disabled_deepgram_without_a_credential_still_completes_the_recording() {
     // The pre-toggle hard-fail: a missing Deepgram credential killed the whole
     // Recording because DeepgramProvider::start loaded the secret eagerly. With

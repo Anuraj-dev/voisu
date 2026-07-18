@@ -143,7 +143,19 @@ fn write_setting(path: &Path, enabled: bool) -> Result<(), String> {
     std::fs::create_dir_all(parent).map_err(|error| {
         format!("cannot create config directory {}: {error}", parent.display())
     })?;
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    // Only a genuinely absent file starts from empty. A permission error or
+    // invalid UTF-8 must abort the write untouched — treating it as empty would
+    // let the atomic replace destroy content the merge promised to preserve.
+    let existing = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(format!(
+                "cannot read existing config {} before writing: {error}",
+                path.display()
+            ));
+        }
+    };
     write_atomic(path, parent, &merge_content(&existing, enabled))
 }
 
@@ -324,6 +336,26 @@ other_key = 5
         assert!(contents.contains("# a user's own note"), "{contents}");
         assert!(contents.contains("[keyterms]"), "{contents}");
         assert!(contents.contains("boost = 5"), "{contents}");
+    }
+
+    #[test]
+    fn writing_over_an_unreadable_file_fails_without_destroying_it() {
+        // Invalid UTF-8 must not read as an absent file: treating it as empty
+        // would let the atomic replace overwrite the original with only the
+        // managed block, destroying the content the merge promised to preserve.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = [0xff, 0xfe, 0x00, 0x42];
+        std::fs::write(&path, original).unwrap();
+        assert!(
+            write_setting(&path, true).is_err(),
+            "an unreadable existing config must abort the write"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "the original bytes are left untouched"
+        );
     }
 
     #[test]
