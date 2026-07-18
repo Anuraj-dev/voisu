@@ -1693,7 +1693,7 @@ fn groq_prestream_active(total_received_bytes: usize) -> bool {
 /// oversized and the word-overlap dedup can stitch the seams.
 fn plan_finalize_chunks(len: usize) -> Vec<std::ops::Range<usize>> {
     if len <= GROQ_FULL_AUDIO_MAX_BYTES {
-        return vec![0..len];
+        return Vec::from([0..len]);
     }
     let step = GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES;
     let mut ranges = Vec::new();
