@@ -16,8 +16,8 @@ use voisu_app::feedback::{
     FeedbackDegradation, FeedbackSelection, OverlayRestartPolicy, SessionKind,
 };
 use voisu_app::overlay::{
-    ObservedSignal, OverlayPhase, OverlayView, PresentationController, PresentationTracker,
-    RecordingNotifyLatch,
+    poll_tick, ObservedSignal, OverlayPhase, OverlayView, PresentationController,
+    PresentationTracker, RecordingNotifyLatch, TickAction,
 };
 use voisu_core::{Command, PROTOCOL_VERSION, Request, Response, socket_path};
 
@@ -325,28 +325,38 @@ fn install_surface_feedback(
         render_surface(&window, &label, &meter, &capsule, view, reduced_motion);
         // render_surface realizes the window on its first real show; the realize
         // callback may have found no surface and handed feedback to the
-        // notification backend. Re-check before touching the now-retired window
-        // so this same tick cannot present() it or send a duplicate notification.
-        if switched.get() {
-            return gtk::glib::ControlFlow::Break;
-        }
-        if is_fallback {
-            // Wayland denies a plain toplevel keep-above; re-present it on each
-            // transition into a visible phase so it resurfaces above occluders.
-            if tracker.borrow_mut().observe(view) {
-                window.present();
+        // notification backend, setting `switched`. The pure `poll_tick` owns the
+        // ordering: it breaks on that handoff BEFORE the tracker or latch observe
+        // this tick, so a retired window is never re-presented and no duplicate
+        // notification is sent. The bin only runs the resulting side effects.
+        match poll_tick(
+            switched.get(),
+            is_fallback,
+            view,
+            signal,
+            &mut tracker.borrow_mut(),
+            &mut notify_latch.borrow_mut(),
+        ) {
+            TickAction::Break => gtk::glib::ControlFlow::Break,
+            TickAction::Continue { resurface, notify } => {
+                // Wayland denies a plain toplevel keep-above; re-present it on
+                // each transition into a visible phase to resurface above
+                // occluders.
+                if resurface {
+                    window.present();
+                }
+                // A buried fallback window may be missed on GNOME, so signal
+                // Recording start with a bounded desktop notification. Failure
+                // here never breaks the overlay — send_notification cannot panic
+                // and its delivery is the compositor's concern.
+                if notify {
+                    let notification = gtk::gio::Notification::new("Voisu");
+                    notification.set_body(Some(view.visible_label));
+                    application.send_notification(Some("overlay-recording"), &notification);
+                }
+                gtk::glib::ControlFlow::Continue
             }
-            // A buried fallback window may be missed on GNOME, so signal
-            // Recording start with a bounded desktop notification. Failure here
-            // never breaks the overlay — send_notification cannot panic and its
-            // delivery is the compositor's concern.
-            if notify_latch.borrow_mut().observe(signal) {
-                let notification = gtk::gio::Notification::new("Voisu");
-                notification.set_body(Some(view.visible_label));
-                application.send_notification(Some("overlay-recording"), &notification);
-            }
         }
-        gtk::glib::ControlFlow::Continue
     });
 }
 

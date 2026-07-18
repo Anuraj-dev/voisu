@@ -237,6 +237,41 @@ impl RecordingNotifyLatch {
     }
 }
 
+/// The outcome of one fallback-path poll tick, decided purely so the adapter's
+/// side effects (`window.present()`, `send_notification`) stay a thin match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TickAction {
+    /// Stop driving the window this tick and break the poll loop.
+    Break,
+    /// Keep polling; `resurface`/`notify` say which side effects to run.
+    Continue { resurface: bool, notify: bool },
+}
+
+/// Pure decision for a single poll tick, owning the ordering the adapter relied
+/// on implicitly. Crucially, a surface handoff detected AFTER `render_surface`
+/// (`switched_after_render`) yields `Break` BEFORE the tracker or latch observe
+/// the tick — so a retired (handed-off) window is never re-presented and no
+/// duplicate notification is sent on the same tick. Keeping this ordering pure
+/// lets a test pin it; a future refactor that drops the guard fails the test.
+pub fn poll_tick(
+    switched_after_render: bool,
+    is_fallback: bool,
+    view: OverlayView,
+    signal: ObservedSignal,
+    tracker: &mut PresentationTracker,
+    notify_latch: &mut RecordingNotifyLatch,
+) -> TickAction {
+    if switched_after_render {
+        return TickAction::Break;
+    }
+    if !is_fallback {
+        return TickAction::Continue { resurface: false, notify: false };
+    }
+    let resurface = tracker.observe(view);
+    let notify = notify_latch.observe(signal);
+    TickAction::Continue { resurface, notify }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +693,63 @@ mod tests {
                 "a reachable {reset:?} must re-arm the Recording notification",
             );
         }
+    }
+
+    #[test]
+    fn red_a_surface_handoff_after_render_breaks_before_any_tracker_or_latch_mutation() {
+        // Sol round-2 minor: the post-render_surface() `switched` guard must
+        // break BEFORE the resurface tracker or notify latch observe the tick,
+        // or a handed-off (retired) window could be re-presented and a duplicate
+        // notification sent on the same tick. Proven by state: a Break tick must
+        // leave both the tracker and the latch untouched.
+        let recording = OverlayView::from_response(&overlay_status(DaemonState::Recording, None));
+        let mut tracker = PresentationTracker::default();
+        let mut latch = RecordingNotifyLatch::default();
+        // Prime both to a known state: tracker's last_phase = Recording, latch latched.
+        assert!(tracker.observe(recording));
+        assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)));
+
+        // A tick where the realize callback handed off (switched_after_render =
+        // true) must Break — even on the fallback path with a fresh visible view
+        // that would otherwise resurface and notify.
+        let action = poll_tick(
+            true,
+            true,
+            OverlayView::HIDDEN,
+            ObservedSignal::Reachable(OverlayPhase::Hidden),
+            &mut tracker,
+            &mut latch,
+        );
+        assert_eq!(action, TickAction::Break);
+
+        // No mutation: had the guard run the tracker on HIDDEN, last_phase would
+        // be Hidden and the next Recording would count as a fresh transition
+        // (true). Had it run the latch on a reachable Hidden, the latch would
+        // reset and the next Recording would refire (true). Both staying false
+        // proves poll_tick broke before touching either.
+        assert!(!tracker.observe(recording));
+        assert!(!latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)));
+    }
+
+    #[test]
+    fn red_a_live_fallback_tick_resurfaces_and_notifies_on_a_recording_edge() {
+        // Companion to the guard test: with no handoff, a fallback Recording-edge
+        // tick both resurfaces and notifies; a non-fallback tick runs neither.
+        let recording = OverlayView::from_response(&overlay_status(DaemonState::Recording, None));
+        let signal = ObservedSignal::Reachable(OverlayPhase::Recording);
+        let mut tracker = PresentationTracker::default();
+        let mut latch = RecordingNotifyLatch::default();
+        assert_eq!(
+            poll_tick(false, true, recording, signal, &mut tracker, &mut latch),
+            TickAction::Continue { resurface: true, notify: true },
+        );
+        // The layer-shell (non-fallback) path never resurfaces or notifies here.
+        let mut tracker = PresentationTracker::default();
+        let mut latch = RecordingNotifyLatch::default();
+        assert_eq!(
+            poll_tick(false, false, recording, signal, &mut tracker, &mut latch),
+            TickAction::Continue { resurface: false, notify: false },
+        );
     }
 
     #[test]
