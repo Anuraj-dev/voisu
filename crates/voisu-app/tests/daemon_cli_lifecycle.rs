@@ -4436,7 +4436,10 @@ impl MockPortal {
             .expect("mock portal should accept activations");
     }
 
-    /// The desktop revokes the session (permission withdrawn / portal restart).
+    /// The desktop emits `Session.Closed`. The signal carries no reason — a
+    /// benign compositor/backend reset closes the session exactly the same way
+    /// a withdrawn permission does — so this is just a closure, not proof of a
+    /// revocation.
     fn close_session(&self) {
         self.control
             .send(PortalCommand::CloseSession)
