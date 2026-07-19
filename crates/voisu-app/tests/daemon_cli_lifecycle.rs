@@ -3970,16 +3970,45 @@ enum PortalCommand {
 struct PortalShared {
     session: Arc<std::sync::Mutex<Option<String>>>,
     close_calls: Arc<AtomicUsize>,
+    /// How many BindShortcuts calls the daemon has made, so scripted behaviors
+    /// (transient failures, refuse-on-rebind) can key off the attempt count.
+    bind_attempts: Arc<AtomicUsize>,
+}
+
+impl PortalShared {
+    fn new() -> Self {
+        Self {
+            session: Arc::new(std::sync::Mutex::new(None)),
+            close_calls: Arc::new(AtomicUsize::new(0)),
+            bind_attempts: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 
 /// How the controlled portal behaves on the bus.
 #[derive(Clone)]
 struct PortalBehavior {
-    deny_bind: bool,
     trigger_description: String,
     /// Answer with request handles and a session handle DIFFERENT from the
     /// predictable client-constructed paths, like a pre-0.9 portal.
     divergent: bool,
+    /// The first N BindShortcuts calls answer with response 2 ("interaction
+    /// ended some other way") — a transient backend hiccup — then approve.
+    transient_bind_failures: u32,
+    /// From attempt N onward, BindShortcuts answers with response 1 (an explicit
+    /// user cancellation, permanent). `None` never refuses.
+    permanent_refusal_after: Option<u32>,
+}
+
+impl PortalBehavior {
+    fn approving() -> Self {
+        Self {
+            trigger_description: "Super+Alt+V".to_owned(),
+            divergent: false,
+            transient_bind_failures: 0,
+            permanent_refusal_after: None,
+        }
+    }
 }
 
 /// The mock `org.freedesktop.portal.Session` object registered at each created
@@ -4099,9 +4128,19 @@ impl GlobalShortcutsService {
             "/org/freedesktop/portal/desktop/request/{sender}/{}{suffix}",
             portal_token(&options, "handle_token")
         );
-        if self.behavior.deny_bind {
-            // The user (or desktop policy) refused the Trigger Key dialog.
+        let attempt = self.shared.bind_attempts.fetch_add(1, Ordering::SeqCst) as u32;
+        let refuses = self
+            .behavior
+            .permanent_refusal_after
+            .is_some_and(|after| attempt >= after);
+        if refuses {
+            // Response 1: an explicit user cancellation — permanent.
             emit_portal_response(connection, &request_path, 1, std::collections::HashMap::new())
+                .await;
+        } else if attempt < self.behavior.transient_bind_failures {
+            // Response 2: "interaction ended some other way" — a transient
+            // backend hiccup the daemon must retry, not treat as permanent.
+            emit_portal_response(connection, &request_path, 2, std::collections::HashMap::new())
                 .await;
         } else {
             // The response's `shortcuts` must be a typed a(sa{sv}) array — the
@@ -4146,18 +4185,35 @@ struct MockPortal {
 
 impl MockPortal {
     fn start() -> Self {
-        Self::start_configured(PortalBehavior {
-            deny_bind: false,
-            trigger_description: "Super+Alt+V".to_owned(),
-            divergent: false,
-        })
+        Self::start_configured(PortalBehavior::approving())
     }
 
     fn start_denying() -> Self {
+        // Every BindShortcuts is refused with response 1 (user cancellation).
         Self::start_configured(PortalBehavior {
-            deny_bind: true,
             trigger_description: String::new(),
-            divergent: false,
+            permanent_refusal_after: Some(0),
+            ..PortalBehavior::approving()
+        })
+    }
+
+    /// A portal that approves the first N BindShortcuts with response 2
+    /// ("interaction ended some other way") — a transient backend hiccup — then
+    /// approves, so the daemon must retry rather than retire.
+    fn start_transient_bind_failures(count: u32) -> Self {
+        Self::start_configured(PortalBehavior {
+            transient_bind_failures: count,
+            ..PortalBehavior::approving()
+        })
+    }
+
+    /// A portal that approves the first bind and then refuses every later one
+    /// with response 1 (an explicit user cancellation, permanent) — the shape of
+    /// a genuine revocation observed on the rebind that follows a Session.Closed.
+    fn start_refusing_after_first_bind() -> Self {
+        Self::start_configured(PortalBehavior {
+            permanent_refusal_after: Some(1),
+            ..PortalBehavior::approving()
         })
     }
 
@@ -4165,18 +4221,14 @@ impl MockPortal {
     /// handles, like pre-0.9 xdg-desktop-portal.
     fn start_divergent() -> Self {
         Self::start_configured(PortalBehavior {
-            deny_bind: false,
-            trigger_description: "Super+Alt+V".to_owned(),
             divergent: true,
+            ..PortalBehavior::approving()
         })
     }
 
     fn start_configured(behavior: PortalBehavior) -> Self {
         let bus = PrivateBus::start();
-        let shared = PortalShared {
-            session: Arc::new(std::sync::Mutex::new(None)),
-            close_calls: Arc::new(AtomicUsize::new(0)),
-        };
+        let shared = PortalShared::new();
         let (control, service) =
             Self::spawn_service(bus.address.clone(), behavior.clone(), shared.clone());
         Self {
@@ -4294,6 +4346,13 @@ impl MockPortal {
         self.shared.close_calls.load(Ordering::SeqCst)
     }
 
+    /// How many BindShortcuts calls the daemon has made — used to prove the
+    /// listener re-attempts a binding at most once after a genuine revocation
+    /// rather than reprompting repeatedly.
+    fn bind_attempts(&self) -> usize {
+        self.shared.bind_attempts.load(Ordering::SeqCst)
+    }
+
     /// The portal process crashes: its service loop ends and its connection
     /// drops, releasing `org.freedesktop.portal.Desktop` on the still-running
     /// bus (observable as NameOwnerChanged with an empty new owner).
@@ -4322,21 +4381,14 @@ impl MockPortal {
     /// models login, where the daemon starts before the desktop portal is ready.
     fn start_deferred() -> Self {
         let bus = PrivateBus::start();
-        let shared = PortalShared {
-            session: Arc::new(std::sync::Mutex::new(None)),
-            close_calls: Arc::new(AtomicUsize::new(0)),
-        };
+        let shared = PortalShared::new();
         // A dropped receiver leaves the control sender inert until the portal is
         // actually served; `restart_service` installs a live one.
         let (control, _dropped) = tokio::sync::mpsc::unbounded_channel();
         Self {
             bus,
             shared,
-            behavior: PortalBehavior {
-                deny_bind: false,
-                trigger_description: "Super+Alt+V".to_owned(),
-                divergent: false,
-            },
+            behavior: PortalBehavior::approving(),
             control,
             service: None,
         }
@@ -4351,15 +4403,8 @@ impl MockPortal {
     /// `drop_connection_then_return`).
     fn start_restartable() -> Self {
         let bus = PrivateBus::start_restartable();
-        let shared = PortalShared {
-            session: Arc::new(std::sync::Mutex::new(None)),
-            close_calls: Arc::new(AtomicUsize::new(0)),
-        };
-        let behavior = PortalBehavior {
-            deny_bind: false,
-            trigger_description: "Super+Alt+V".to_owned(),
-            divergent: false,
-        };
+        let shared = PortalShared::new();
+        let behavior = PortalBehavior::approving();
         let (control, service) =
             Self::spawn_service(bus.address.clone(), behavior.clone(), shared.clone());
         Self {
@@ -4667,12 +4712,17 @@ fn trigger_key_permission_denial_leaves_cli_control_usable() {
 }
 
 #[test]
-// Acceptance proof for portal recovery that already existed on `main`; Ticket
-// 10 adds production-boundary clipboard evidence, not a new portal algorithm.
+// Acceptance proof (with production-boundary clipboard evidence) that a GENUINE
+// revocation permanently retires the Trigger Key: the desktop closes the session
+// and then refuses the one rebind the listener attempts, so it stops without
+// reprompting. A benign session reset is covered separately
+// (`session_closed_rebinds_the_trigger_key_without_a_restart`).
 fn trigger_key_portal_revocation_leaves_cli_control_usable() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
-    let portal = MockPortal::start();
+    // Approves the first bind, then refuses every later one with response 1 —
+    // the shape of a user who has genuinely revoked the Trigger Key.
+    let portal = MockPortal::start_refusing_after_first_bind();
     let daemon = start_portal_clipboard_daemon(
         runtime.path(),
         commands.path(),
@@ -4680,9 +4730,9 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
     );
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
-    // The desktop revokes the session (the same observable path as a portal
-    // restart dropping it): the listener retires, the displayed binding is
-    // cleared, and CLI start/stop/toggle keep working.
+    // The desktop closes the session. The listener clears the binding and makes
+    // exactly one rebind attempt, which the portal refuses (response 1): the
+    // Trigger Key is retired for good, and CLI start/stop/toggle keep working.
     portal.close_session();
     wait_for_shortcut(
         runtime.path(),
@@ -4708,8 +4758,33 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
         "1"
     );
 
+    // Exactly two BindShortcuts: the initial success plus the single refused
+    // re-attempt. Wait for the re-attempt to land, then confirm it never grows —
+    // a revocation costs one retry, never repeated reprompting.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while portal.bind_attempts() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the closed session never triggered a rebind attempt"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        portal.bind_attempts(),
+        2,
+        "a genuine revocation must not reprompt beyond one refused re-attempt"
+    );
+
     let diagnostics = daemon.terminate_and_stderr();
-    assert!(diagnostics.contains("Trigger Key portal ended"), "{diagnostics}");
+    assert!(
+        diagnostics.contains("Trigger Key session closed; rebinding"),
+        "{diagnostics}"
+    );
+    assert!(
+        diagnostics.contains("Trigger Key binding is unavailable"),
+        "{diagnostics}"
+    );
 }
 
 #[test]
@@ -4899,50 +4974,57 @@ fn trigger_key_rebinds_after_the_activation_stream_drops() {
 }
 
 #[test]
-fn explicit_trigger_key_revocation_is_not_reprompted() {
+fn session_closed_rebinds_the_trigger_key_without_a_restart() {
     let runtime = TempDir::new().unwrap();
+    // The portal keeps approving — a benign session reset (e.g. a compositor or
+    // backend reset across suspend), not a revocation.
     let portal = MockPortal::start();
-    let daemon = Daemon::start_with_env(
+    let _daemon = Daemon::start_with_env(
         runtime.path(),
         &[
             ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
-            // A tiny backoff: if the listener were going to (wrongly) rebind, it
-            // would do so within the window checked below.
             ("VOISU_TEST_SHORTCUT_REBIND_INITIAL_MS", "15"),
             ("VOISU_TEST_SHORTCUT_REBIND_MAX_MS", "40"),
         ],
     );
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
-    // The desktop revokes the session (Session.Closed): a deliberate, permanent
-    // decision. The binding clears and must STAY cleared — never reprompted.
+    // Session.Closed carries no reason, so it must NOT be treated as permanent:
+    // the daemon rebinds on its own and the Trigger Key keeps working, with no
+    // manual restart.
     portal.close_session();
-    wait_for_shortcut(
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    portal.activate();
+    wait_for_status(runtime.path(), "Recording\n");
+    portal.activate();
+    wait_for_status(runtime.path(), "idle\n");
+}
+
+#[test]
+fn trigger_key_binds_after_a_transient_bind_interruption() {
+    let runtime = TempDir::new().unwrap();
+    // The portal answers the first two BindShortcuts with response 2
+    // ("interaction ended some other way") — a transient backend hiccup during
+    // warmup, NOT a user cancellation — then approves.
+    let portal = MockPortal::start_transient_bind_failures(2);
+    let _daemon = Daemon::start_with_env(
         runtime.path(),
-        "No Trigger Key is bound; start, stop, and toggle remain available\n",
+        &[
+            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
+            ("VOISU_TEST_SHORTCUT_REBIND_INITIAL_MS", "15"),
+            ("VOISU_TEST_SHORTCUT_REBIND_MAX_MS", "40"),
+        ],
     );
 
-    // Well past several backoff intervals the Trigger Key is still unbound: the
-    // portal still owns the name, so a rebind would show it again.
-    thread::sleep(Duration::from_millis(300));
-    assert_eq!(
-        stdout(&voisu(runtime.path(), "shortcut")),
-        "No Trigger Key is bound; start, stop, and toggle remain available\n"
-    );
-    // CLI Recording control is unaffected by the revocation.
-    assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
-    assert_eq!(
-        stdout(&voisu(runtime.path(), "toggle")),
-        "Transcript submitted through the compositor; preserved on the clipboard\n"
-    );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    // A non-cancellation refusal must stay retryable: the daemon keeps trying
+    // and binds once the portal settles — the exact #60 login-race shape.
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
-    let diagnostics = daemon.terminate_and_stderr();
-    assert!(diagnostics.contains("Trigger Key portal ended"), "{diagnostics}");
-    assert!(
-        !diagnostics.contains("rebinding the Trigger Key"),
-        "explicit revocation must not trigger a rebind: {diagnostics}"
-    );
+    portal.activate();
+    wait_for_status(runtime.path(), "Recording\n");
+    portal.activate();
+    wait_for_status(runtime.path(), "idle\n");
 }
 
 #[test]

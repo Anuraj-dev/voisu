@@ -2335,7 +2335,10 @@ impl RebindBackoff {
     /// instead of finishing the nap.
     async fn wait_or_shutdown(&mut self, actor: &mpsc::Sender<ActorMessage>) -> bool {
         let nap = self.current;
-        self.current = (self.current * 2).min(self.max);
+        // Saturating so an absurd (but valid) test interval can never overflow
+        // the doubling into a Duration panic, which would kill this detached
+        // task and leave the Trigger Key dead while the daemon lives on.
+        self.current = self.current.saturating_mul(2).min(self.max);
         tokio::select! {
             _ = tokio::time::sleep(nap) => false,
             _ = actor.closed() => true,
@@ -2349,11 +2352,15 @@ impl RebindBackoff {
 /// suspend/resume, clears the displayed binding and retries with bounded
 /// backoff until the portal is reachable and the Trigger Key rebinds on its own
 /// — no manual restart. A portal that leaves the bus (crash/restart) clears the
-/// binding immediately and rebinds once a new portal owns the name. Only a
-/// deliberate, permanent decision retires the listener for good: an explicit
-/// revocation (Session.Closed) or a refused bind — neither is reprompted.
-/// Throughout, CLI start/stop/toggle stay fully usable and `voisu shortcut`
-/// never shows a stale binding. Tests substitute the portal edge by pointing
+/// binding immediately and rebinds once a new portal owns the name. A
+/// `Session.Closed` is likewise treated as recoverable — the XDG protocol gives
+/// it no reason, so a benign compositor/backend reset must not kill the binding.
+/// Only one truly permanent decision retires the listener for good: a refused
+/// bind (portal response 1, an explicit user cancellation). A genuine
+/// revocation therefore costs at most one silent re-attempt, which the refusal
+/// then retires — no repeated reprompting. Throughout, CLI start/stop/toggle
+/// stay fully usable and `voisu shortcut` never shows a stale binding. Tests
+/// substitute the portal edge by pointing
 /// `DBUS_SESSION_BUS_ADDRESS` at a private bus running a controlled portal
 /// service — the daemon itself always runs this production listener.
 async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>) {
@@ -2431,14 +2438,21 @@ async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>) {
                         }
                     }
                 }
-                Ok(voisu_core::ShortcutEvent::Revoked) => {
+                Ok(voisu_core::ShortcutEvent::SessionClosed) => {
                     eprintln!(
-                        "Trigger Key portal ended; start, stop, and toggle remain available"
+                        "Trigger Key session closed; rebinding the Trigger Key"
                     );
-                    // Clear the displayed binding: a revoked portal must not
-                    // leave `voisu shortcut` claiming a retired Trigger Key.
+                    // A closed session is recoverable: clear the displayed
+                    // binding and rebind with backoff. If the user genuinely
+                    // revoked the Trigger Key, the next bind is refused (response
+                    // 1) and retires the listener then — so this costs at most
+                    // one silent re-attempt, never repeated reprompting.
                     let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
-                    return;
+                    announced_down = true;
+                    if backoff.wait_or_shutdown(&actor).await {
+                        return;
+                    }
+                    continue 'rebind;
                 }
                 Ok(voisu_core::ShortcutEvent::PortalLost) => {
                     eprintln!(

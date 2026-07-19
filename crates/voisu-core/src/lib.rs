@@ -2006,8 +2006,13 @@ pub trait ShortcutPortal: Send {
 pub enum ShortcutEvent {
     /// The user pressed the Trigger Key.
     Activated,
-    /// The desktop closed the session (permission revoked). Do not rebind.
-    Revoked,
+    /// The desktop emitted `Session.Closed`. The XDG Session protocol defines
+    /// this only as "the session ended" and GlobalShortcuts carries no reason,
+    /// so it is NOT proof of a deliberate revocation — a compositor or backend
+    /// reset (e.g. across suspend) closes the session the same way. The binding
+    /// is stale and must be cleared, but the listener rebinds; a genuine
+    /// revocation surfaces as a refused bind on the next attempt.
+    SessionClosed,
     /// The portal vanished from the bus (crash or shutdown). The binding is
     /// stale and must be cleared; the session keeps waiting for a new owner.
     PortalLost,
@@ -2023,8 +2028,9 @@ pub trait ShortcutSession: Send {
     /// The desktop-approved binding for display during setup.
     fn binding(&self) -> TriggerKeyBinding;
 
-    /// Awaits the next session event: a Trigger Key activation, a desktop
-    /// revocation, or a portal loss/restart transition. A `Shortcut` boundary
-    /// error signals a stream failure the listener treats as final retirement.
+    /// Awaits the next session event: a Trigger Key activation, a session
+    /// closure, or a portal loss/restart transition. A `Shortcut` boundary error
+    /// signals that the underlying connection ended (all streams closed) — a
+    /// recoverable stream failure the listener answers by rebinding.
     fn next_event(&mut self) -> BoundaryFuture<'_, ShortcutEvent>;
 }

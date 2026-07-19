@@ -237,13 +237,15 @@ where
                 BoundaryError::new(kind, format!("portal {method} response malformed: {error}"))
             })?;
         if code != 0 {
-            // A non-zero code is a deliberate refusal by the desktop or user, not
-            // a transient outage: mark it permanent so the listener retires
-            // instead of reprompting on an already-made decision.
-            return Err(BoundaryError::new(kind, format!(
-                "the desktop denied or cancelled the {method} request (response {code})"
-            ))
-            .permanent());
+            let error = BoundaryError::new(
+                kind,
+                format!("the desktop did not approve the {method} request (response {code})"),
+            );
+            // Only response 1 is an explicit user cancellation — a deliberate,
+            // permanent decision. Any other non-zero code (e.g. 2, "interaction
+            // ended some other way") can be a transient backend hiccup during
+            // warmup, so it stays retryable rather than retiring the listener.
+            return Err(if code == 1 { error.permanent() } else { error });
         }
         return Ok(results);
     }
@@ -507,12 +509,14 @@ impl ShortcutSession for FedoraShortcutSession {
                         None => return self.stream_ended(),
                     },
                     closed = self.closures.next() => match closed {
-                        // The desktop emitted Session.Closed: the user or policy
-                        // deliberately revoked the Trigger Key. This is permanent
-                        // — the listener must never reprompt.
+                        // The desktop emitted Session.Closed. That means only
+                        // "the session ended", with no reason — a compositor or
+                        // backend reset closes it the same way a revocation does.
+                        // Report it as a recoverable closure; the listener
+                        // rebinds and a genuine revocation refuses the next bind.
                         Some(_) => {
                             self.retired = true;
-                            return Ok(ShortcutEvent::Revoked);
+                            return Ok(ShortcutEvent::SessionClosed);
                         }
                         // The stream ended because the connection died, not
                         // because the desktop closed the session: recoverable.
