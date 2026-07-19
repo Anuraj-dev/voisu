@@ -476,3 +476,12 @@ delivers keyring-primary + loud 0600 fallback + no startup blocking with zero ne
 provider's line present; lock uncreatable ≠ copy survived). Outcome (gone/survived/unverifiable) is
 keyed on the target provider's line and classified solely inside FileSecretStore::remove; callers relay.
 All fallback-file mutations flock-serialized (CredentialsLock mirrors DictionaryLock).
+
+## 2026-07-20 — Packaging credential architecture (ticket 09)
+**Why:** GPG apt-signing key gets a passphrase (protects keyring + offline backup; CI still signs
+non-interactively via loopback pinentry with GPG_PASSPHRASE secret — rejected passphrase-free for a key
+whose leak would poison friends' apt trust). The AUR SSH key is the opposite call: dedicated,
+passphrase-free, scope-limited deploy key, because the release workflow must push PKGBUILDs unattended
+and the key can only push to our own AUR packages (web account controls stay password-guarded; AUR 2FA
+verified nonexistent upstream as of today — enable when shipped). Secret VALUES live only in Raja's
+password manager + GH Actions secrets; repo/docs record locations only.
