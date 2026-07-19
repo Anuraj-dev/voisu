@@ -2957,6 +2957,53 @@ fn auth_set_succeeds_quietly_when_a_read_only_config_dir_holds_no_plaintext_copy
 }
 
 #[test]
+fn auth_set_succeeds_quietly_when_only_the_other_providers_plaintext_line_exists() {
+    // The fallback file holds ONLY a Deepgram line and the read-only dir makes
+    // the sibling lock file uncreatable. Storing a GROQ key in the keyring has
+    // nothing to prune — the unrelated Deepgram line must not be reported as a
+    // surviving Groq plaintext copy.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let dir = config_home.path().join("voisu");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("credentials");
+    fs::write(&file, "deepgram=other-provider-secret\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let stored = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[
+            ("VOISU_TEST_SECRET_STORE", "available"),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+        ],
+        "controlled-secret",
+    );
+
+    // Restore permissions so the TempDir can clean up.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        stored.status.success(),
+        "no Groq plaintext line exists, so the store must report success: {}",
+        stderr(&stored)
+    );
+    assert_eq!(stdout(&stored), "Groq credential stored\n");
+    assert!(
+        !stderr(&stored).contains("WARNING"),
+        "another provider's line must not raise this provider's alarm: {}",
+        stderr(&stored)
+    );
+    assert!(!stderr(&stored).contains("controlled-secret"));
+    // The unrelated Deepgram line is untouched.
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "deepgram=other-provider-secret\n"
+    );
+}
+
+#[test]
 fn a_credential_stored_in_the_fallback_file_is_loaded_back() {
     // Round trip: an unavailable keyring writes the file, and a later load with
     // the same unavailable keyring reads it straight back (env override absent).

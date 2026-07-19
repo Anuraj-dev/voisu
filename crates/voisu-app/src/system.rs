@@ -25,7 +25,7 @@ use voisu_core::{
 
 use crate::focus::SharedFocusProbe;
 use crate::process::guard_external_child;
-use crate::secret_file::FileSecretStore;
+use crate::secret_file::{FileSecretStore, RemoveError};
 
 const PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 pub const CAPTURE_FINALIZE_DEADLINE: Duration = PROCESS_DEADLINE;
@@ -689,42 +689,39 @@ impl SecretStore for SecretToolStore {
                 // file when empty) so a later locked-at-boot window can never
                 // silently serve a stale plaintext key. A failed prune must
                 // not report a completed migration — so it is loud and an
-                // error — but the wording stays honest about what is actually
-                // known: "the copy survived" only when the file is
-                // demonstrably still there, "could not verify" when its
-                // existence is unknowable, and plain success when the copy is
-                // demonstrably gone (nothing stale can ever be served).
+                // error — with wording taken straight from `remove`'s own
+                // classification (the single place the file is read, so this
+                // relay can never disagree with it): "the copy survived" only
+                // when the provider's line was verified on disk, "could not
+                // verify" when its presence is unknowable.
                 match FileSecretStore::at_default().remove(provider) {
                     Ok(_) => Ok(()),
-                    Err(_) => match FileSecretStore::at_default().path().try_exists() {
-                        Ok(false) => Ok(()),
-                        Ok(true) => {
-                            warn_plaintext_prune_failed(PlaintextPruneFailure::CopySurvived);
-                            Err(BoundaryError::new(
-                                BoundaryKind::SecretStorage,
-                                "plaintext prune failed after a successful keyring store",
-                            )
-                            .with_public_message(
-                                "the key was stored in your keyring, but the old plaintext \
-                                 copy could not be removed and would still be used if the \
-                                 keyring is locked — delete the credentials file next to \
-                                 config.toml, then re-run `voisu doctor`",
-                            ))
-                        }
-                        Err(_) => {
-                            warn_plaintext_prune_failed(PlaintextPruneFailure::Unverifiable);
-                            Err(BoundaryError::new(
-                                BoundaryKind::SecretStorage,
-                                "plaintext prune unverifiable after a successful keyring store",
-                            )
-                            .with_public_message(
-                                "the key was stored in your keyring, but Voisu could not \
-                                 verify whether an old plaintext copy remains — check for a \
-                                 credentials file next to config.toml, then re-run \
-                                 `voisu doctor`",
-                            ))
-                        }
-                    },
+                    Err(RemoveError::TargetPresent(_)) => {
+                        warn_plaintext_prune_failed(PlaintextPruneFailure::CopySurvived);
+                        Err(BoundaryError::new(
+                            BoundaryKind::SecretStorage,
+                            "plaintext prune failed after a successful keyring store",
+                        )
+                        .with_public_message(
+                            "the key was stored in your keyring, but the old plaintext \
+                             copy could not be removed and would still be used if the \
+                             keyring is locked — delete the credentials file next to \
+                             config.toml, then re-run `voisu doctor`",
+                        ))
+                    }
+                    Err(RemoveError::Unverifiable(_)) => {
+                        warn_plaintext_prune_failed(PlaintextPruneFailure::Unverifiable);
+                        Err(BoundaryError::new(
+                            BoundaryKind::SecretStorage,
+                            "plaintext prune unverifiable after a successful keyring store",
+                        )
+                        .with_public_message(
+                            "the key was stored in your keyring, but Voisu could not \
+                             verify whether an old plaintext copy remains — check for a \
+                             credentials file next to config.toml, then re-run \
+                             `voisu doctor`",
+                        ))
+                    }
                 }
             }
             Err(reason) => {

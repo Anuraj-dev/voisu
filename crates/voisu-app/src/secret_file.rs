@@ -20,6 +20,20 @@ pub fn default_path() -> PathBuf {
     crate::config::config_dir().join("credentials")
 }
 
+/// Why a [`FileSecretStore::remove`] failed, when it did. Classified once,
+/// inside `remove` where the file is actually read, so a caller relaying the
+/// outcome (the migration in `SecretToolStore::replace`) cannot re-derive a
+/// disagreeing answer from a second look at the file.
+#[derive(Debug)]
+pub enum RemoveError {
+    /// The requested provider's line was verified on disk and could not be
+    /// pruned — a real surviving plaintext copy.
+    TargetPresent(BoundaryError),
+    /// Whether the requested provider's line exists could not be determined;
+    /// callers must say "could not verify", never that a copy survived.
+    Unverifiable(BoundaryError),
+}
+
 /// A minimal, line-oriented `0600` credential file. Each provider occupies one
 /// `deepgram=<key>` / `groq=<key>` line; writing one provider preserves the
 /// other, mirroring the config writer's both-key contract.
@@ -83,27 +97,40 @@ impl FileSecretStore {
     /// Removes a provider's line, deleting the file entirely once it holds no
     /// more credentials. Returns whether a line was actually removed. Used to
     /// migrate a key out of the plaintext file when the keyring accepts it.
-    pub fn remove(&self, provider: Provider) -> Result<bool, BoundaryError> {
+    ///
+    /// Every failure is classified here, where the file is actually read, so
+    /// callers relay the classification instead of re-deriving a possibly
+    /// disagreeing one: [`RemoveError::TargetPresent`] means the provider's
+    /// line was verified on disk and could not be pruned;
+    /// [`RemoveError::Unverifiable`] means its presence could not be
+    /// determined at all.
+    pub fn remove(&self, provider: Provider) -> Result<bool, RemoveError> {
         // Lock acquisition can fail where no fallback file was ever written —
         // a missing parent directory, or a read-only config dir in which the
-        // sibling lock file cannot be created. A demonstrably absent file
-        // means there is nothing to prune, so that must NOT read as an error a
-        // caller would relay as a surviving plaintext copy. The unlocked
-        // existence check is best-effort (TOCTOU), which is fine: `Ok(false)`
-        // is claimed only on a definitive not-found, and a file that appears
-        // concurrently can only be a fresher write than the one being pruned.
+        // sibling lock file cannot be created. Classify by CONTENT, not mere
+        // existence: a file holding only the OTHER provider's line has nothing
+        // of this provider's to prune, so it must not read as this provider's
+        // surviving plaintext copy. The lock-free read is safe for the same
+        // reason the normal read path is lock-free — the atomic persist hands
+        // readers old-or-new, never a torn edit — and TOCTOU is benign:
+        // `Ok(false)` is claimed only on a definitively absent target line,
+        // and a target line appearing after the check can only be a newer
+        // concurrent write, not the one being pruned.
         let _lock = match CredentialsLock::acquire(&self.path) {
             Ok(lock) => lock,
             Err(error) => {
-                return match std::fs::metadata(&self.path) {
+                return match std::fs::read_to_string(&self.path) {
                     Err(io) if io.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                    // The file is really there and cannot be pruned.
-                    Ok(_) => Err(error),
-                    // Existence is unknowable: stay conservative, but say so.
-                    Err(_) => Err(BoundaryError::new(
+                    Ok(contents) => match find_line(&contents, provider) {
+                        // The provider's line is really there and unprunable.
+                        Some(_) => Err(RemoveError::TargetPresent(error)),
+                        None => Ok(false),
+                    },
+                    // Neither lockable nor readable: presence is unknowable.
+                    Err(_) => Err(RemoveError::Unverifiable(BoundaryError::new(
                         BoundaryKind::SecretStorage,
-                        "cannot verify whether a credential fallback file exists",
-                    )),
+                        "cannot verify whether the credential fallback file holds this provider",
+                    ))),
                 };
             }
         };
@@ -111,10 +138,10 @@ impl FileSecretStore {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(_) => {
-                return Err(BoundaryError::new(
+                return Err(RemoveError::Unverifiable(BoundaryError::new(
                     BoundaryKind::SecretStorage,
                     "cannot read the credential fallback file before pruning",
-                ));
+                )));
             }
         };
         let key = provider_key(provider);
@@ -133,28 +160,32 @@ impl FileSecretStore {
             return Ok(false);
         }
         // Delete the file outright when no credentials remain, so a migrated
-        // fallback leaves nothing plaintext behind.
+        // fallback leaves nothing plaintext behind. From here on the target
+        // line was verified present, so every failure is `TargetPresent`.
         if kept.iter().all(|line| line.trim().is_empty()) {
             match std::fs::remove_file(&self.path) {
                 Ok(()) => return Ok(true),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
                 Err(_) => {
-                    return Err(BoundaryError::new(
+                    return Err(RemoveError::TargetPresent(BoundaryError::new(
                         BoundaryKind::SecretStorage,
                         "cannot delete the emptied credential fallback file",
-                    ));
+                    )));
                 }
             }
         }
         let parent = self.path.parent().ok_or_else(|| {
-            BoundaryError::new(BoundaryKind::SecretStorage, "credential fallback path has no parent")
+            RemoveError::TargetPresent(BoundaryError::new(
+                BoundaryKind::SecretStorage,
+                "credential fallback path has no parent",
+            ))
         })?;
         let mut body = String::from(HEADER);
         for line in kept {
             body.push_str(line);
             body.push('\n');
         }
-        self.write_atomic(parent, &body)?;
+        self.write_atomic(parent, &body).map_err(RemoveError::TargetPresent)?;
         Ok(true)
     }
 
@@ -426,6 +457,33 @@ mod tests {
         assert!(
             !removed.expect("an absent file is not an error"),
             "an absent file means nothing was removed"
+        );
+    }
+
+    #[test]
+    fn a_read_only_dir_where_only_the_other_provider_is_stored_is_nothing_to_prune() {
+        // The lock file is uncreatable, but the fallback file's CONTENT shows
+        // no line for the requested provider — the mere existence of another
+        // provider's line must not read as THIS provider's surviving copy.
+        // The lock-free content read is safe for the same reason the normal
+        // read path is lock-free: the atomic persist hands old-or-new, never
+        // a torn edit.
+        let (_dir, store) = temp_store();
+        let parent = store.path().parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(store.path(), "deepgram=other-provider-key\n").unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let removed = store.remove(Provider::Groq);
+        // Restore so the TempDir can clean up.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            !removed.expect("an absent target line is not an error"),
+            "an absent target line means nothing was removed"
+        );
+        // The other provider's line is untouched.
+        assert_eq!(
+            store.read(Provider::Deepgram).unwrap().unwrap().expose_to_boundary(),
+            "other-provider-key"
         );
     }
 
