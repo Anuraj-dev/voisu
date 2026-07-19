@@ -354,6 +354,7 @@ pub struct BoundaryError {
     kind: BoundaryKind,
     diagnostic: String,
     public_message: Option<&'static str>,
+    permanent: bool,
     transcript_failure: Option<Box<TranscriptFailureEvidence>>,
     provider_failures: Vec<ProviderFailure>,
 }
@@ -372,9 +373,24 @@ impl BoundaryError {
             kind,
             diagnostic: diagnostic.into(),
             public_message: None,
+            permanent: false,
             transcript_failure: None,
             provider_failures: Vec::new(),
         }
+    }
+
+    /// Marks a failure that retrying cannot resolve — e.g. the desktop or user
+    /// refused the Trigger Key. Callers that would otherwise retry a boundary
+    /// use this to stop instead of reattempting a decision already made.
+    pub fn permanent(mut self) -> Self {
+        self.permanent = true;
+        self
+    }
+
+    /// Whether retrying this failure is futile because the outcome will not
+    /// change (a deliberate refusal), as opposed to a transient unavailability.
+    pub fn is_permanent(&self) -> bool {
+        self.permanent
     }
 
     pub fn with_public_message(mut self, message: &'static str) -> Self {
@@ -1984,14 +2000,23 @@ pub trait ShortcutPortal: Send {
 }
 
 /// What a live Global Shortcuts session observed next. The distinction matters
-/// to the listener: revocation is final, while a portal restart must clear the
-/// stale binding and then rebind once the portal returns.
+/// to the listener: a closed session or a portal restart clears the stale
+/// binding and rebinds; permanence comes only from a refused bind (portal
+/// response 1), never from any event here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShortcutEvent {
     /// The user pressed the Trigger Key.
     Activated,
-    /// The desktop closed the session (permission revoked). Do not rebind.
-    Revoked,
+    /// The desktop emitted `Session.Closed`. The XDG Session protocol defines
+    /// this only as "the session ended" and GlobalShortcuts carries no reason,
+    /// so it is NOT proof of a deliberate revocation — a compositor or backend
+    /// reset (e.g. across suspend) closes the session the same way. The binding
+    /// is stale and must be cleared, but the listener rebinds with bounded
+    /// backoff. A genuine revocation is expected to surface as a refused bind
+    /// (portal response 1) on a later attempt — that refusal, not the closure,
+    /// is what permanently retires the Trigger Key; if the portal neither
+    /// accepts nor refuses the rebind, re-attempts continue.
+    SessionClosed,
     /// The portal vanished from the bus (crash or shutdown). The binding is
     /// stale and must be cleared; the session keeps waiting for a new owner.
     PortalLost,
@@ -2007,8 +2032,9 @@ pub trait ShortcutSession: Send {
     /// The desktop-approved binding for display during setup.
     fn binding(&self) -> TriggerKeyBinding;
 
-    /// Awaits the next session event: a Trigger Key activation, a desktop
-    /// revocation, or a portal loss/restart transition. A `Shortcut` boundary
-    /// error signals a stream failure the listener treats as final retirement.
+    /// Awaits the next session event: a Trigger Key activation, a session
+    /// closure, or a portal loss/restart transition. A `Shortcut` boundary error
+    /// signals that the underlying connection ended (all streams closed) — a
+    /// recoverable stream failure the listener answers by rebinding.
     fn next_event(&mut self) -> BoundaryFuture<'_, ShortcutEvent>;
 }

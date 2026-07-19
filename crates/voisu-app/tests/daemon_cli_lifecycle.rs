@@ -3872,6 +3872,80 @@ impl PrivateBus {
             _config: config,
         }
     }
+
+    /// A private bus that listens on a FIXED socket path so it can be killed and
+    /// restarted at the SAME address — used to simulate the daemon's own D-Bus
+    /// connection dropping (as a suspend/resume can) and then coming back.
+    fn start_restartable() -> Self {
+        let config = TempDir::new().expect("bus config directory should exist");
+        let socket = config.path().join("bus.sock");
+        let config_path = config.path().join("bus.conf");
+        Self::write_restartable_config(&config_path, &socket);
+        let child = Self::spawn_restartable(&config_path);
+        Self {
+            child,
+            // A guid-less address so a fresh bus (with a new guid) at the same
+            // socket path is reconnectable on rebind.
+            address: format!("unix:path={}", socket.display()),
+            _config: config,
+        }
+    }
+
+    fn write_restartable_config(config_path: &Path, socket: &Path) {
+        fs::write(
+            config_path,
+            format!(
+                r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path={}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"#,
+                socket.display()
+            ),
+        )
+        .expect("bus config should be written");
+    }
+
+    fn spawn_restartable(config_path: &Path) -> Child {
+        let mut command = Command::new("dbus-daemon");
+        command
+            .arg(format!("--config-file={}", config_path.display()))
+            .args(["--nofork", "--print-address"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        isolate_process_group(&mut command);
+        let mut child = command.spawn().expect("dbus-daemon should start");
+        let stdout = child.stdout.take().expect("dbus-daemon stdout");
+        let mut printed = String::new();
+        BufReader::new(stdout)
+            .read_line(&mut printed)
+            .expect("dbus-daemon should print its address");
+        assert!(!printed.trim().is_empty(), "dbus-daemon printed no address");
+        child
+    }
+
+    /// Kills the running bus (any daemon connection to it dies with it) and
+    /// respawns a fresh bus at the same socket path.
+    fn restart(&mut self) {
+        let process_group = -(self.child.id() as i32);
+        // SAFETY: the bus is a process-group leader owned by this test.
+        let _ = unsafe { libc::kill(process_group, libc::SIGKILL) };
+        let _ = self.child.wait();
+        let socket = self._config.path().join("bus.sock");
+        let config_path = self._config.path().join("bus.conf");
+        // A stale socket file would block the fresh bus from binding the path.
+        let _ = fs::remove_file(&socket);
+        self.child = Self::spawn_restartable(&config_path);
+    }
 }
 
 impl Drop for PrivateBus {
@@ -3896,16 +3970,45 @@ enum PortalCommand {
 struct PortalShared {
     session: Arc<std::sync::Mutex<Option<String>>>,
     close_calls: Arc<AtomicUsize>,
+    /// How many BindShortcuts calls the daemon has made, so scripted behaviors
+    /// (transient failures, refuse-on-rebind) can key off the attempt count.
+    bind_attempts: Arc<AtomicUsize>,
+}
+
+impl PortalShared {
+    fn new() -> Self {
+        Self {
+            session: Arc::new(std::sync::Mutex::new(None)),
+            close_calls: Arc::new(AtomicUsize::new(0)),
+            bind_attempts: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 
 /// How the controlled portal behaves on the bus.
 #[derive(Clone)]
 struct PortalBehavior {
-    deny_bind: bool,
     trigger_description: String,
     /// Answer with request handles and a session handle DIFFERENT from the
     /// predictable client-constructed paths, like a pre-0.9 portal.
     divergent: bool,
+    /// The first N BindShortcuts calls answer with response 2 ("interaction
+    /// ended some other way") — a transient backend hiccup — then approve.
+    transient_bind_failures: u32,
+    /// From attempt N onward, BindShortcuts answers with response 1 (an explicit
+    /// user cancellation, permanent). `None` never refuses.
+    permanent_refusal_after: Option<u32>,
+}
+
+impl PortalBehavior {
+    fn approving() -> Self {
+        Self {
+            trigger_description: "Super+Alt+V".to_owned(),
+            divergent: false,
+            transient_bind_failures: 0,
+            permanent_refusal_after: None,
+        }
+    }
 }
 
 /// The mock `org.freedesktop.portal.Session` object registered at each created
@@ -4025,9 +4128,19 @@ impl GlobalShortcutsService {
             "/org/freedesktop/portal/desktop/request/{sender}/{}{suffix}",
             portal_token(&options, "handle_token")
         );
-        if self.behavior.deny_bind {
-            // The user (or desktop policy) refused the Trigger Key dialog.
+        let attempt = self.shared.bind_attempts.fetch_add(1, Ordering::SeqCst) as u32;
+        let refuses = self
+            .behavior
+            .permanent_refusal_after
+            .is_some_and(|after| attempt >= after);
+        if refuses {
+            // Response 1: an explicit user cancellation — permanent.
             emit_portal_response(connection, &request_path, 1, std::collections::HashMap::new())
+                .await;
+        } else if attempt < self.behavior.transient_bind_failures {
+            // Response 2: "interaction ended some other way" — a transient
+            // backend hiccup the daemon must retry, not treat as permanent.
+            emit_portal_response(connection, &request_path, 2, std::collections::HashMap::new())
                 .await;
         } else {
             // The response's `shortcuts` must be a typed a(sa{sv}) array — the
@@ -4072,18 +4185,35 @@ struct MockPortal {
 
 impl MockPortal {
     fn start() -> Self {
-        Self::start_configured(PortalBehavior {
-            deny_bind: false,
-            trigger_description: "Super+Alt+V".to_owned(),
-            divergent: false,
-        })
+        Self::start_configured(PortalBehavior::approving())
     }
 
     fn start_denying() -> Self {
+        // Every BindShortcuts is refused with response 1 (user cancellation).
         Self::start_configured(PortalBehavior {
-            deny_bind: true,
             trigger_description: String::new(),
-            divergent: false,
+            permanent_refusal_after: Some(0),
+            ..PortalBehavior::approving()
+        })
+    }
+
+    /// A portal that approves the first N BindShortcuts with response 2
+    /// ("interaction ended some other way") — a transient backend hiccup — then
+    /// approves, so the daemon must retry rather than retire.
+    fn start_transient_bind_failures(count: u32) -> Self {
+        Self::start_configured(PortalBehavior {
+            transient_bind_failures: count,
+            ..PortalBehavior::approving()
+        })
+    }
+
+    /// A portal that approves the first bind and then refuses every later one
+    /// with response 1 (an explicit user cancellation, permanent) — the shape of
+    /// a genuine revocation observed on the rebind that follows a Session.Closed.
+    fn start_refusing_after_first_bind() -> Self {
+        Self::start_configured(PortalBehavior {
+            permanent_refusal_after: Some(1),
+            ..PortalBehavior::approving()
         })
     }
 
@@ -4091,18 +4221,14 @@ impl MockPortal {
     /// handles, like pre-0.9 xdg-desktop-portal.
     fn start_divergent() -> Self {
         Self::start_configured(PortalBehavior {
-            deny_bind: false,
-            trigger_description: "Super+Alt+V".to_owned(),
             divergent: true,
+            ..PortalBehavior::approving()
         })
     }
 
     fn start_configured(behavior: PortalBehavior) -> Self {
         let bus = PrivateBus::start();
-        let shared = PortalShared {
-            session: Arc::new(std::sync::Mutex::new(None)),
-            close_calls: Arc::new(AtomicUsize::new(0)),
-        };
+        let shared = PortalShared::new();
         let (control, service) =
             Self::spawn_service(bus.address.clone(), behavior.clone(), shared.clone());
         Self {
@@ -4220,6 +4346,14 @@ impl MockPortal {
         self.shared.close_calls.load(Ordering::SeqCst)
     }
 
+    /// How many BindShortcuts calls the daemon has made — used both to prove
+    /// that a refused bind (portal response 1) retires the listener with no
+    /// further attempts, and to synchronize rebind tests on the observable
+    /// generation change instead of a possibly-stale displayed binding.
+    fn bind_attempts(&self) -> usize {
+        self.shared.bind_attempts.load(Ordering::SeqCst)
+    }
+
     /// The portal process crashes: its service loop ends and its connection
     /// drops, releasing `org.freedesktop.portal.Desktop` on the still-running
     /// bus (observable as NameOwnerChanged with an empty new owner).
@@ -4243,6 +4377,58 @@ impl MockPortal {
         self.service = Some(service);
     }
 
+    /// A live private bus with NO portal service on it yet: the daemon can reach
+    /// the bus but binding fails until `serve_now()` brings the portal up. This
+    /// models login, where the daemon starts before the desktop portal is ready.
+    fn start_deferred() -> Self {
+        let bus = PrivateBus::start();
+        let shared = PortalShared::new();
+        // A dropped receiver leaves the control sender inert until the portal is
+        // actually served; `restart_service` installs a live one.
+        let (control, _dropped) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            bus,
+            shared,
+            behavior: PortalBehavior::approving(),
+            control,
+            service: None,
+        }
+    }
+
+    /// Brings the portal service up on the (already running) deferred bus.
+    fn serve_now(&mut self) {
+        self.restart_service();
+    }
+
+    /// A portal on a bus that can be restarted at the same address (see
+    /// `drop_connection_then_return`).
+    fn start_restartable() -> Self {
+        let bus = PrivateBus::start_restartable();
+        let shared = PortalShared::new();
+        let behavior = PortalBehavior::approving();
+        let (control, service) =
+            Self::spawn_service(bus.address.clone(), behavior.clone(), shared.clone());
+        Self {
+            bus,
+            shared,
+            behavior,
+            control,
+            service: Some(service),
+        }
+    }
+
+    /// The daemon's D-Bus connection drops and a fresh bus and portal return at
+    /// the SAME address — the suspend/resume shape. Killing the bus severs the
+    /// daemon's live connection (its activation stream ends), then a new bus and
+    /// portal come back so the daemon can rebind on its own.
+    fn drop_connection_then_return(&mut self) {
+        self.bus.restart();
+        // The old service thread's connection died with the bus; unblock and
+        // join it, then serve a fresh portal on the restarted bus.
+        self.stop_service();
+        self.restart_service();
+    }
+
     /// One user press of the desktop-approved Trigger Key.
     fn activate(&self) {
         self.control
@@ -4250,7 +4436,10 @@ impl MockPortal {
             .expect("mock portal should accept activations");
     }
 
-    /// The desktop revokes the session (permission withdrawn / portal restart).
+    /// The desktop emits `Session.Closed`. The signal carries no reason — a
+    /// benign compositor/backend reset closes the session exactly the same way
+    /// a withdrawn permission does — so this is just a closure, not proof of a
+    /// revocation.
     fn close_session(&self) {
         self.control
             .send(PortalCommand::CloseSession)
@@ -4298,6 +4487,24 @@ fn wait_for_shortcut(runtime_dir: &Path, expected: &str) -> String {
         assert!(
             Instant::now() < deadline,
             "shortcut never became {expected:?}; last was {shortcut:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Waits until the daemon has made at least `expected` BindShortcuts calls.
+/// Rebind tests synchronize on this observable generation change BEFORE
+/// waiting on the displayed binding: right after a closure or connection drop
+/// the display still shows the pre-drop Trigger Key, so waiting on that value
+/// alone can return before the daemon has even processed the drop — and an
+/// activation sent then races the retiring session.
+fn wait_for_bind_attempts(portal: &MockPortal, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while portal.bind_attempts() < expected {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never reached {expected} bind attempts; saw {}",
+            portal.bind_attempts()
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -4527,12 +4734,19 @@ fn trigger_key_permission_denial_leaves_cli_control_usable() {
 }
 
 #[test]
-// Acceptance proof for portal recovery that already existed on `main`; Ticket
-// 10 adds production-boundary clipboard evidence, not a new portal algorithm.
+// Acceptance proof (with production-boundary clipboard evidence) that a refused
+// bind (portal response 1) permanently retires the Trigger Key: the desktop
+// closes the session, the listener rebinds, and the refusal stops all further
+// prompting. This pins the refusal path — the retirement is enforced by the
+// portal's answer, not by an attempt budget in the listener. A benign session
+// reset is covered separately
+// (`session_closed_rebinds_the_trigger_key_without_a_restart`).
 fn trigger_key_portal_revocation_leaves_cli_control_usable() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
-    let portal = MockPortal::start();
+    // Approves the first bind, then refuses every later one with response 1 —
+    // the shape of a user who has genuinely revoked the Trigger Key.
+    let portal = MockPortal::start_refusing_after_first_bind();
     let daemon = start_portal_clipboard_daemon(
         runtime.path(),
         commands.path(),
@@ -4540,9 +4754,9 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
     );
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
-    // The desktop revokes the session (the same observable path as a portal
-    // restart dropping it): the listener retires, the displayed binding is
-    // cleared, and CLI start/stop/toggle keep working.
+    // The desktop closes the session. The listener clears the binding and
+    // rebinds; the portal refuses (response 1), which retires the Trigger Key
+    // for good while CLI start/stop/toggle keep working.
     portal.close_session();
     wait_for_shortcut(
         runtime.path(),
@@ -4568,8 +4782,27 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
         "1"
     );
 
+    // Exactly two BindShortcuts: the initial success plus the refused
+    // re-attempt. Wait for the re-attempt to land, then confirm the count never
+    // grows — the refusal retired the listener, so there is no further
+    // prompting.
+    wait_for_bind_attempts(&portal, 2);
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        portal.bind_attempts(),
+        2,
+        "a refused rebind must retire the listener; the attempt count must not grow"
+    );
+
     let diagnostics = daemon.terminate_and_stderr();
-    assert!(diagnostics.contains("Trigger Key portal ended"), "{diagnostics}");
+    assert!(
+        diagnostics.contains("Trigger Key session closed; rebinding"),
+        "{diagnostics}"
+    );
+    assert!(
+        diagnostics.contains("Trigger Key binding is unavailable"),
+        "{diagnostics}"
+    );
 }
 
 #[test]
@@ -4683,6 +4916,141 @@ fn unavailable_portal_leaves_cli_control_usable() {
         diagnostics.contains("Trigger Key binding is unavailable"),
         "{diagnostics}"
     );
+}
+
+#[test]
+fn trigger_key_binds_without_restart_once_the_portal_becomes_available() {
+    let runtime = TempDir::new().unwrap();
+    // The daemon starts before the desktop portal is ready (the login race): the
+    // bus is up but no portal owns the name yet, so the initial bind fails.
+    let mut portal = MockPortal::start_deferred();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
+            ("VOISU_TEST_SHORTCUT_REBIND_INITIAL_MS", "15"),
+            ("VOISU_TEST_SHORTCUT_REBIND_MAX_MS", "40"),
+        ],
+    );
+
+    // No Trigger Key yet, but the daemon stays fully usable over the CLI while
+    // it retries in the background.
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "shortcut")),
+        "No Trigger Key is bound; start, stop, and toggle remain available\n"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "toggle")),
+        "Transcript submitted through the compositor; preserved on the clipboard\n"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+
+    // The portal comes up: the daemon must bind the Trigger Key on its own, with
+    // NO restart, and the Trigger Key must then drive Recordings.
+    portal.serve_now();
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    portal.activate();
+    wait_for_status(runtime.path(), "Recording\n");
+    portal.activate();
+    wait_for_status(runtime.path(), "idle\n");
+}
+
+#[test]
+fn trigger_key_rebinds_after_the_activation_stream_drops() {
+    let runtime = TempDir::new().unwrap();
+    let mut portal = MockPortal::start_restartable();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
+            ("VOISU_TEST_SHORTCUT_REBIND_INITIAL_MS", "15"),
+            ("VOISU_TEST_SHORTCUT_REBIND_MAX_MS", "40"),
+        ],
+    );
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    // The daemon's D-Bus connection drops (its activation stream ends) and a
+    // fresh bus and portal return at the same address — the suspend/resume
+    // shape. A dropped stream is NOT a revocation: the listener must rebind the
+    // Trigger Key on its own, without a restart. Synchronize on the second
+    // BindShortcuts call first — the displayed binding still shows the pre-drop
+    // Trigger Key, so waiting on that value alone could pass before the daemon
+    // even noticed the drop and the activation below would be lost.
+    portal.drop_connection_then_return();
+    wait_for_bind_attempts(&portal, 2);
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    // The rebound Trigger Key drives Recordings again.
+    portal.activate();
+    wait_for_status(runtime.path(), "Recording\n");
+    portal.activate();
+    wait_for_status(runtime.path(), "idle\n");
+
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains("Trigger Key activation stream failed"),
+        "a dropped stream must be treated as a recoverable rebind: {diagnostics}"
+    );
+}
+
+#[test]
+fn session_closed_rebinds_the_trigger_key_without_a_restart() {
+    let runtime = TempDir::new().unwrap();
+    // The portal keeps approving — a benign session reset (e.g. a compositor or
+    // backend reset across suspend), not a revocation.
+    let portal = MockPortal::start();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
+            ("VOISU_TEST_SHORTCUT_REBIND_INITIAL_MS", "15"),
+            ("VOISU_TEST_SHORTCUT_REBIND_MAX_MS", "40"),
+        ],
+    );
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    // Session.Closed carries no reason, so it must NOT be treated as permanent:
+    // the daemon rebinds on its own and the Trigger Key keeps working, with no
+    // manual restart. The second BindShortcuts call is the proof the closure
+    // was processed and a new generation bound; only then is the displayed
+    // binding the rebound one and an activation guaranteed to hit the live
+    // session rather than race the retiring one.
+    portal.close_session();
+    wait_for_bind_attempts(&portal, 2);
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    portal.activate();
+    wait_for_status(runtime.path(), "Recording\n");
+    portal.activate();
+    wait_for_status(runtime.path(), "idle\n");
+}
+
+#[test]
+fn trigger_key_binds_after_a_transient_bind_interruption() {
+    let runtime = TempDir::new().unwrap();
+    // The portal answers the first two BindShortcuts with response 2
+    // ("interaction ended some other way") — a transient backend hiccup during
+    // warmup, NOT a user cancellation — then approves.
+    let portal = MockPortal::start_transient_bind_failures(2);
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
+            ("VOISU_TEST_SHORTCUT_REBIND_INITIAL_MS", "15"),
+            ("VOISU_TEST_SHORTCUT_REBIND_MAX_MS", "40"),
+        ],
+    );
+
+    // A non-cancellation refusal must stay retryable: the daemon keeps trying
+    // and binds once the portal settles — the exact #60 login-race shape.
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    portal.activate();
+    wait_for_status(runtime.path(), "Recording\n");
+    portal.activate();
+    wait_for_status(runtime.path(), "idle\n");
 }
 
 #[test]

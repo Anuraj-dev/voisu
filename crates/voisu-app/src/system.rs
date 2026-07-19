@@ -237,9 +237,15 @@ where
                 BoundaryError::new(kind, format!("portal {method} response malformed: {error}"))
             })?;
         if code != 0 {
-            return Err(BoundaryError::new(kind, format!(
-                "the desktop denied or cancelled the {method} request (response {code})"
-            )));
+            let error = BoundaryError::new(
+                kind,
+                format!("the desktop did not approve the {method} request (response {code})"),
+            );
+            // Only response 1 is an explicit user cancellation — a deliberate,
+            // permanent decision. Any other non-zero code (e.g. 2, "interaction
+            // ended some other way") can be a transient backend hiccup during
+            // warmup, so it stays retryable rather than retiring the listener.
+            return Err(if code == 1 { error.permanent() } else { error });
         }
         return Ok(results);
     }
@@ -458,12 +464,13 @@ pub struct FedoraShortcutSession {
 }
 
 impl FedoraShortcutSession {
-    /// Best-effort, bounded `Session.Close`; runs at most once.
-    async fn close(&mut self) {
-        if std::mem::replace(&mut self.retired, true) {
-            return;
-        }
-        close_portal_session(&self.connection, self.session_path.as_str()).await;
+    /// The daemon's own D-Bus connection ended: all three signal streams close
+    /// together. That is a transient, recoverable failure — not a revocation —
+    /// so the dead session is retired and a stream error is reported, which the
+    /// listener answers by rebinding once the portal is reachable again.
+    fn stream_ended(&mut self) -> Result<voisu_core::ShortcutEvent, BoundaryError> {
+        self.retired = true;
+        Err(shortcut_error("Trigger Key activation stream ended"))
     }
 }
 
@@ -499,24 +506,25 @@ impl ShortcutSession for FedoraShortcutSession {
                                 return Ok(ShortcutEvent::Activated);
                             }
                         }
-                        None => {
-                            // The daemon's own bus connection ended; close what
-                            // can still be closed and treat it as revocation.
-                            self.close().await;
-                            return Ok(ShortcutEvent::Revoked);
-                        }
+                        None => return self.stream_ended(),
                     },
-                    closed = self.closures.next() => {
-                        // The desktop closed the session: permission revoked.
-                        // Nothing is left to Close on the portal side.
-                        let _ = closed;
-                        self.retired = true;
-                        return Ok(ShortcutEvent::Revoked);
-                    }
+                    closed = self.closures.next() => match closed {
+                        // The desktop emitted Session.Closed. That means only
+                        // "the session ended", with no reason — a compositor or
+                        // backend reset closes it the same way a revocation does.
+                        // Report it as a recoverable closure; the listener
+                        // rebinds and a genuine revocation refuses the next bind.
+                        Some(_) => {
+                            self.retired = true;
+                            return Ok(ShortcutEvent::SessionClosed);
+                        }
+                        // The stream ended because the connection died, not
+                        // because the desktop closed the session: recoverable.
+                        None => return self.stream_ended(),
+                    },
                     owner_change = self.owner_changes.next() => {
                         let Some(message) = owner_change else {
-                            self.close().await;
-                            return Ok(ShortcutEvent::Revoked);
+                            return self.stream_ended();
                         };
                         // NameOwnerChanged(name s, old_owner s, new_owner s):
                         // an empty new owner means the portal left the bus; a
