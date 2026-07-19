@@ -84,15 +84,28 @@ impl FileSecretStore {
     /// more credentials. Returns whether a line was actually removed. Used to
     /// migrate a key out of the plaintext file when the keyring accepts it.
     pub fn remove(&self, provider: Provider) -> Result<bool, BoundaryError> {
-        // A missing parent directory means no credentials file can exist, so
-        // there is nothing to lock or prune (and `remove` must not create the
-        // directory just to lock inside it).
+        // Lock acquisition can fail where no fallback file was ever written —
+        // a missing parent directory, or a read-only config dir in which the
+        // sibling lock file cannot be created. A demonstrably absent file
+        // means there is nothing to prune, so that must NOT read as an error a
+        // caller would relay as a surviving plaintext copy. The unlocked
+        // existence check is best-effort (TOCTOU), which is fine: `Ok(false)`
+        // is claimed only on a definitive not-found, and a file that appears
+        // concurrently can only be a fresher write than the one being pruned.
         let _lock = match CredentialsLock::acquire(&self.path) {
             Ok(lock) => lock,
-            Err(_) if self.path.parent().is_none_or(|parent| !parent.exists()) => {
-                return Ok(false);
+            Err(error) => {
+                return match std::fs::metadata(&self.path) {
+                    Err(io) if io.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                    // The file is really there and cannot be pruned.
+                    Ok(_) => Err(error),
+                    // Existence is unknowable: stay conservative, but say so.
+                    Err(_) => Err(BoundaryError::new(
+                        BoundaryKind::SecretStorage,
+                        "cannot verify whether a credential fallback file exists",
+                    )),
+                };
             }
-            Err(error) => return Err(error),
         };
         let existing = match std::fs::read_to_string(&self.path) {
             Ok(contents) => contents,
@@ -395,6 +408,25 @@ mod tests {
             "deepgram-key"
         );
         assert!(store.path().exists(), "the file survives while a key remains");
+    }
+
+    #[test]
+    fn a_read_only_dir_with_no_file_is_nothing_to_prune_not_an_error() {
+        // A read-only config dir where no fallback file was ever written makes
+        // the sibling lock file uncreatable — but there is nothing to prune,
+        // so `remove` must report "nothing removed", never an error that a
+        // caller would relay as a surviving plaintext copy.
+        let (_dir, store) = temp_store();
+        let parent = store.path().parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let removed = store.remove(Provider::Groq);
+        // Restore so the TempDir can clean up.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            !removed.expect("an absent file is not an error"),
+            "an absent file means nothing was removed"
+        );
     }
 
     #[test]

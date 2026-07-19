@@ -2918,6 +2918,45 @@ fn auth_set_reports_a_surviving_plaintext_copy_instead_of_claiming_migration() {
 }
 
 #[test]
+fn auth_set_succeeds_quietly_when_a_read_only_config_dir_holds_no_plaintext_copy() {
+    // A read-only ~/.config/voisu with NO credentials file means there is
+    // nothing to prune after a successful keyring store. The inability to
+    // create the sibling lock file there must not be reported as a surviving
+    // plaintext copy: the store succeeded and no stale key exists anywhere.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let dir = config_home.path().join("voisu");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let stored = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[
+            ("VOISU_TEST_SECRET_STORE", "available"),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+        ],
+        "controlled-secret",
+    );
+
+    // Restore permissions so the TempDir can clean up.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        stored.status.success(),
+        "a prune-free keyring store must report success: {}",
+        stderr(&stored)
+    );
+    assert_eq!(stdout(&stored), "Groq credential stored\n");
+    assert!(
+        !stderr(&stored).contains("WARNING"),
+        "no plaintext copy exists, so no alarm may fire: {}",
+        stderr(&stored)
+    );
+    assert!(!stderr(&stored).contains("controlled-secret"));
+}
+
+#[test]
 fn a_credential_stored_in_the_fallback_file_is_loaded_back() {
     // Round trip: an unavailable keyring writes the file, and a later load with
     // the same unavailable keyring reads it straight back (env override absent).

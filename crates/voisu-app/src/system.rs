@@ -688,23 +688,43 @@ impl SecretStore for SecretToolStore {
                 // plaintext fallback: drop that provider's line (deleting the
                 // file when empty) so a later locked-at-boot window can never
                 // silently serve a stale plaintext key. A failed prune must
-                // not report a completed migration — the stale copy is still
-                // on disk and WOULD be served — so it is loud and an error.
+                // not report a completed migration — so it is loud and an
+                // error — but the wording stays honest about what is actually
+                // known: "the copy survived" only when the file is
+                // demonstrably still there, "could not verify" when its
+                // existence is unknowable, and plain success when the copy is
+                // demonstrably gone (nothing stale can ever be served).
                 match FileSecretStore::at_default().remove(provider) {
                     Ok(_) => Ok(()),
-                    Err(_) => {
-                        warn_plaintext_copy_survived();
-                        Err(BoundaryError::new(
-                            BoundaryKind::SecretStorage,
-                            "plaintext prune failed after a successful keyring store",
-                        )
-                        .with_public_message(
-                            "the key was stored in your keyring, but the old plaintext \
-                             copy could not be removed and would still be used if the \
-                             keyring is locked — delete the credentials file next to \
-                             config.toml, then re-run `voisu doctor`",
-                        ))
-                    }
+                    Err(_) => match FileSecretStore::at_default().path().try_exists() {
+                        Ok(false) => Ok(()),
+                        Ok(true) => {
+                            warn_plaintext_prune_failed(PlaintextPruneFailure::CopySurvived);
+                            Err(BoundaryError::new(
+                                BoundaryKind::SecretStorage,
+                                "plaintext prune failed after a successful keyring store",
+                            )
+                            .with_public_message(
+                                "the key was stored in your keyring, but the old plaintext \
+                                 copy could not be removed and would still be used if the \
+                                 keyring is locked — delete the credentials file next to \
+                                 config.toml, then re-run `voisu doctor`",
+                            ))
+                        }
+                        Err(_) => {
+                            warn_plaintext_prune_failed(PlaintextPruneFailure::Unverifiable);
+                            Err(BoundaryError::new(
+                                BoundaryKind::SecretStorage,
+                                "plaintext prune unverifiable after a successful keyring store",
+                            )
+                            .with_public_message(
+                                "the key was stored in your keyring, but Voisu could not \
+                                 verify whether an old plaintext copy remains — check for a \
+                                 credentials file next to config.toml, then re-run \
+                                 `voisu doctor`",
+                            ))
+                        }
+                    },
                 }
             }
             Err(reason) => {
@@ -940,18 +960,34 @@ fn warn_fallback(notice: FallbackNotice) {
     }
 }
 
-/// The loud notice for a plaintext copy that survived a successful keyring
-/// store. It shares the fallback warnings' channel (stderr, naming the file
-/// and the remedy) but not their once-per-process gate: this is a distinct,
-/// rarer situation that must never be swallowed because an ordinary fallback
-/// warning fired first.
-fn warn_plaintext_copy_survived() {
+/// What is actually known when the post-store plaintext prune fails: the copy
+/// is demonstrably still on disk, or its existence could not be checked at
+/// all. The wording must never claim more than what was observed.
+enum PlaintextPruneFailure {
+    CopySurvived,
+    Unverifiable,
+}
+
+/// The loud notice for a plaintext prune that failed after a successful
+/// keyring store. It shares the fallback warnings' channel (stderr, naming
+/// the file and the remedy) but not their once-per-process gate: this is a
+/// distinct, rarer situation that must never be swallowed because an ordinary
+/// fallback warning fired first.
+fn warn_plaintext_prune_failed(failure: PlaintextPruneFailure) {
     let path = FileSecretStore::at_default().path().display().to_string();
-    eprintln!(
-        "voisu: WARNING — the key is stored in your keyring, but the old plaintext copy at \
-         {path} could not be removed. If the keyring is ever locked at start, that stale key \
-         would be used. Delete {path}, then re-run `voisu doctor`."
-    );
+    match failure {
+        PlaintextPruneFailure::CopySurvived => eprintln!(
+            "voisu: WARNING — the key is stored in your keyring, but the old plaintext copy at \
+             {path} could not be removed. If the keyring is ever locked at start, that stale key \
+             would be used. Delete {path}, then re-run `voisu doctor`."
+        ),
+        PlaintextPruneFailure::Unverifiable => eprintln!(
+            "voisu: WARNING — the key is stored in your keyring, but Voisu could not verify \
+             whether an old plaintext copy remains at {path}. If one does and the keyring is \
+             ever locked at start, that stale key would be used. Check for and delete {path}, \
+             then re-run `voisu doctor`."
+        ),
+    }
 }
 
 pub struct ProviderHttpClient;
