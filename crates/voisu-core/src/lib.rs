@@ -577,17 +577,172 @@ pub trait ReadinessInspector: Send {
     fn inspect(&mut self) -> Vec<ReadinessFinding>;
 }
 
+/// Where a provider's key currently lives, so keep/replace and migration
+/// prompts can be an informed choice rather than a blind one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyLocation {
+    /// Stored in the desktop keyring (Secret Service) — the secure home.
+    Keyring,
+    /// Only in the 0600 plaintext fallback file (saved while the keyring was
+    /// unavailable); a candidate for migration back into the keyring.
+    PlaintextFile,
+    /// Supplied by an environment variable, which wins at runtime over anything
+    /// stored.
+    EnvOverride,
+}
+
+/// A diagnosis of a provider's key: where it lives (with the credential), or why
+/// it could not be read. `Absent` is a definitive "nothing stored"; `Locked`,
+/// `Unavailable`, and `ToolMissing` mean the keyring could not be consulted, so
+/// callers must steer the user to fix the keyring rather than assume no key.
+pub enum KeyDiagnosis {
+    Found {
+        location: KeyLocation,
+        credential: Credential,
+    },
+    /// The provider's environment override variable is set but its value
+    /// cannot form a credential (it is empty or contains a line break). The
+    /// override still wins at runtime, so a stored key is shadowed by a broken
+    /// one — callers must steer the user to unset or fix the variable, never
+    /// report the stored key as the effective one.
+    EnvOverrideInvalid,
+    /// The keyring is reachable and holds no key, and no fallback file exists.
+    Absent,
+    /// The keyring is locked or refused access.
+    Locked,
+    /// No desktop Secret Service is running or activatable.
+    Unavailable,
+    /// The `secret-tool` helper binary is not installed.
+    ToolMissing,
+}
+
+impl KeyDiagnosis {
+    /// The location of a found key, if any.
+    pub fn location(&self) -> Option<KeyLocation> {
+        match self {
+            Self::Found { location, .. } => Some(*location),
+            _ => None,
+        }
+    }
+
+    /// Whether a usable key was found (anywhere).
+    pub fn is_configured(&self) -> bool {
+        matches!(self, Self::Found { .. })
+    }
+}
+
 /// Boundary for desktop Secret Service. Implementations must never persist a
-/// credential outside the desktop secret service.
+/// credential outside the desktop secret service except through an explicit,
+/// loudly-announced fallback.
 pub trait SecretStore: Send {
     fn replace(&mut self, provider: Provider, credential: Credential) -> Result<(), BoundaryError>;
     fn load(&mut self, provider: Provider) -> Result<Credential, BoundaryError>;
+
+    /// Diagnoses where a provider's key lives (or why it cannot be read), for
+    /// informed keep/replace and migration prompts. The default cannot tell one
+    /// failure from another, so it reports `Keyring`/`Absent` only.
+    fn diagnose(&mut self, provider: Provider) -> KeyDiagnosis {
+        match self.load(provider) {
+            Ok(credential) => KeyDiagnosis::Found {
+                location: KeyLocation::Keyring,
+                credential,
+            },
+            Err(_) => KeyDiagnosis::Absent,
+        }
+    }
 }
 
 /// Boundary for an independent, post-storage provider-auth check. It returns
 /// no provider response content, only an authorization result.
 pub trait ProviderAuthenticator: Send {
     fn verify(&mut self, provider: Provider, credential: Credential) -> BoundaryFuture<'_, ()>;
+}
+
+/// The classified outcome of a live per-provider credential round trip.
+///
+/// Classifying once, here, lets every surface — the setup wizard, `voisu
+/// doctor`, `voisu auth verify`, and daemon logs — report the same actionable
+/// meaning instead of a bare HTTP status. A wrong key is the only definitively
+/// bad state; throttling, quota, and unreachability are transient and are not
+/// the key's fault.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderKeyStatus {
+    /// The credential authenticated (2xx).
+    Valid,
+    /// The provider rejected the credential (401/403): the key is wrong.
+    InvalidKey,
+    /// The provider is throttling this key right now (429 with `Retry-After`).
+    /// The key is fine, so this is transient.
+    RateLimited,
+    /// The key's allowance is spent (bare 429, no `Retry-After`).
+    QuotaExhausted,
+    /// The provider could not be reached or returned another status (network
+    /// failure, 5xx, timeout). Transient and not the key's fault.
+    Unreachable,
+}
+
+impl ProviderKeyStatus {
+    /// Classifies an HTTP status and whether a `Retry-After` header accompanied
+    /// it. Pure so the mapping is unit-tested without any network.
+    pub fn classify(http_status: u16, retry_after_present: bool) -> Self {
+        match http_status {
+            200..=299 => Self::Valid,
+            401 | 403 => Self::InvalidKey,
+            429 if retry_after_present => Self::RateLimited,
+            429 => Self::QuotaExhausted,
+            _ => Self::Unreachable,
+        }
+    }
+
+    /// Whether the credential authenticated.
+    pub fn is_valid(self) -> bool {
+        matches!(self, Self::Valid)
+    }
+
+    /// Whether this is a transient condition (the key may be fine) rather than a
+    /// definitively wrong key.
+    pub fn is_transient(self) -> bool {
+        matches!(
+            self,
+            Self::RateLimited | Self::QuotaExhausted | Self::Unreachable
+        )
+    }
+
+    /// The readiness severity a `voisu doctor` line should carry: only a wrong
+    /// key is a hard failure; throttling, quota, and unreachability are warnings.
+    pub fn readiness(self) -> ReadinessStatus {
+        match self {
+            Self::Valid => ReadinessStatus::Pass,
+            Self::InvalidKey => ReadinessStatus::Fail,
+            Self::RateLimited | Self::QuotaExhausted | Self::Unreachable => ReadinessStatus::Warn,
+        }
+    }
+
+    /// A one-line, user-facing explanation. `InvalidKey` always names the fix so
+    /// no surface leaves the user guessing.
+    pub fn headline(self) -> &'static str {
+        match self {
+            Self::Valid => "key valid",
+            Self::InvalidKey => "key invalid — run `voisu setup`",
+            Self::RateLimited => "rate-limited (transient — try again shortly)",
+            Self::QuotaExhausted => "free-tier quota exhausted",
+            Self::Unreachable => "provider unreachable (transient)",
+        }
+    }
+}
+
+/// Free-tier guidance shown when a key is missing, invalid, or over quota, so a
+/// friend knows the provider's free allowance covers daily dictation. Figures
+/// are from the distribution research digest (§5/§9).
+pub fn provider_free_tier_hint(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Deepgram => {
+            "Deepgram grants $200 of free credit with no card (about a year at 1–2 h/day); create a key at https://console.deepgram.com"
+        }
+        Provider::Groq => {
+            "Groq's free tier covers ~2000 requests and 28,800 audio-seconds per day — ample for daily dictation; create a key at https://console.groq.com/keys"
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

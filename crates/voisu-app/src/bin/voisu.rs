@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 
 use voisu_core::{
     BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, ExportCorrelationId,
-    PROTOCOL_VERSION, Provider, ProviderAuthenticator, ReadinessInspector, ReadinessStatus,
-    ReplayFixturePath, Request, Response, SecretStore, VersionEnvelope, socket_path,
+    KeyDiagnosis, KeyLocation, PROTOCOL_VERSION, Provider, ProviderAuthenticator, ProviderKeyStatus,
+    ReadinessInspector, ReadinessStatus, ReplayFixturePath, Request, Response, SecretStore,
+    VersionEnvelope, provider_free_tier_hint, socket_path,
 };
 use voisu_app::service::{UserServiceAction, manage_user_service};
 use voisu_app::system::{
@@ -25,6 +26,7 @@ enum CliAction {
     Daemon(Command),
     History { json: bool },
     Doctor,
+    Setup,
     AuthSet(Provider),
     AuthVerify(Provider),
     SetDeepgram(bool),
@@ -41,6 +43,7 @@ fn main() -> ExitCode {
         Ok(CliAction::Daemon(command)) => daemon_command(command),
         Ok(CliAction::History { json }) => history_command(json),
         Ok(CliAction::Doctor) => doctor(),
+        Ok(CliAction::Setup) => setup(),
         Ok(CliAction::AuthSet(provider)) => match credential_from_stdin() {
             Ok(credential) => auth_set(provider, credential),
             Err(error) => fail(2, error.public_message()),
@@ -237,7 +240,7 @@ fn render_history_pretty(records: &serde_json::Value) -> ExitCode {
 
 fn doctor() -> ExitCode {
     let findings = FedoraReadiness.inspect();
-    let has_failure = findings.iter().any(|finding| finding.status == ReadinessStatus::Fail);
+    let mut has_failure = findings.iter().any(|finding| finding.status == ReadinessStatus::Fail);
     for finding in findings {
         println!(
             "{}: {} ({})",
@@ -246,10 +249,14 @@ fn doctor() -> ExitCode {
             finding.detail
         );
     }
-    let focus_backend = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
+    // One runtime serves both the focus probe and the live per-provider key
+    // round trips, so the CLI never needs an ambient async runtime.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
+        .ok();
+    let focus_backend = runtime
+        .as_ref()
         .map(|runtime| runtime.block_on(voisu_app::focus::detect_focus_backend()))
         .unwrap_or(voisu_app::focus::FocusBackendKind::None);
     if focus_backend == voisu_app::focus::FocusBackendKind::None {
@@ -257,10 +264,113 @@ fn doctor() -> ExitCode {
     } else {
         println!("Focus guard: {}", focus_backend.as_str());
     }
+    // The live key checks reach the network; a test that pins other doctor
+    // output opts out with VOISU_TEST_SKIP_DOCTOR_KEYS and covers the key
+    // classification through dedicated seams instead.
+    if std::env::var_os("VOISU_TEST_SKIP_DOCTOR_KEYS").is_none() {
+        if let Some(runtime) = runtime.as_ref() {
+            has_failure |= doctor_provider_keys(runtime);
+        }
+    }
     if has_failure {
         ExitCode::from(4)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Live per-provider key round trips. A wrong key (401/403) is a hard failure
+/// naming the fix; a missing key, quota, throttle, or unreachable provider is a
+/// warning, since none of those is a definitively bad key. Returns whether any
+/// hard failure was found.
+fn doctor_provider_keys(runtime: &tokio::runtime::Runtime) -> bool {
+    let mut has_failure = false;
+    let deepgram_enabled = voisu_app::config::deepgram_enabled();
+    for provider in [Provider::Deepgram, Provider::Groq] {
+        let label = provider.cli_label();
+        if provider == Provider::Deepgram && !deepgram_enabled {
+            println!("{label} key: SKIP (Deepgram is off; run `voisu deepgram on` to enable)");
+            continue;
+        }
+        match SecretToolStore.diagnose(provider) {
+            KeyDiagnosis::Found { location, credential } => {
+                let status = runtime.block_on(ProviderHttpClient.check(provider, credential));
+                println!(
+                    "{label} key: {} ({})",
+                    status.headline(),
+                    status.readiness().cli_label()
+                );
+                match location {
+                    KeyLocation::PlaintextFile => println!(
+                        "  stored in the plaintext fallback file — run `voisu setup` to migrate it into your keyring"
+                    ),
+                    KeyLocation::EnvOverride => println!(
+                        "  provided by {} (overrides any stored key)",
+                        provider.environment_variable()
+                    ),
+                    KeyLocation::Keyring => {}
+                }
+                match status {
+                    ProviderKeyStatus::InvalidKey => {
+                        has_failure = true;
+                        println!("  {}", provider_free_tier_hint(provider));
+                    }
+                    ProviderKeyStatus::QuotaExhausted => {
+                        println!("  {}", provider_free_tier_hint(provider));
+                    }
+                    _ => {}
+                }
+            }
+            // The keyring could not be consulted: steer the user at the real fix
+            // (unlock / start / install) rather than telling them to write a
+            // plaintext key they may not need to.
+            KeyDiagnosis::Locked => println!(
+                "{label} key: keyring locked — unlock it, or run `voisu setup` to store a key (WARN)"
+            ),
+            KeyDiagnosis::Unavailable => println!(
+                "{label} key: no desktop keyring available — run `voisu setup` to store a key (WARN)"
+            ),
+            KeyDiagnosis::ToolMissing => println!(
+                "{label} key: secret-tool is not installed — install libsecret-tools, or run `voisu setup` (WARN)"
+            ),
+            // A present env override always wins at runtime, so a malformed
+            // one shadows every stored key and breaks dictation: a hard
+            // failure naming the variable, never a PASS on the shadowed key.
+            KeyDiagnosis::EnvOverrideInvalid => {
+                has_failure = true;
+                let variable = provider.environment_variable();
+                println!(
+                    "{label} key: {variable} is set but is not a usable key (empty or contains \
+                     a line break), and it overrides any stored key — unset or fix {variable} (FAIL)"
+                );
+            }
+            KeyDiagnosis::Absent => {
+                println!("{label} key: not configured — run `voisu setup` (WARN)");
+                println!("  {}", provider_free_tier_hint(provider));
+            }
+        }
+    }
+    has_failure
+}
+
+/// `voisu setup` — the interactive, re-runnable wizard that validates each key
+/// live before storing it. All logic lives in the injectable `voisu_app::setup`
+/// core; here we supply the real terminal, keyring, and live validator.
+fn setup() -> ExitCode {
+    use voisu_app::setup::{LiveKeyValidator, ProviderOutcome, StdioWizard, run_setup};
+    let outcome = run_setup(&mut StdioWizard, &mut SecretToolStore, &mut LiveKeyValidator);
+    // A run that stored/kept no usable key (every provider skipped or its store
+    // failed) did not accomplish setup's job, so it must not report success.
+    let usable = |outcome: ProviderOutcome| {
+        matches!(
+            outcome,
+            ProviderOutcome::Stored | ProviderOutcome::Kept | ProviderOutcome::StoredUnverified
+        )
+    };
+    if usable(outcome.deepgram) || usable(outcome.groq) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(4)
     }
 }
 
@@ -451,6 +561,7 @@ fn parse_command() -> Result<CliAction, String> {
             Ok(CliAction::Daemon(Command::Replay(ReplayFixturePath::new(path.clone()))))
         }
         [command] if command == "doctor" => Ok(CliAction::Doctor),
+        [command] if command == "setup" => Ok(CliAction::Setup),
         [command] if command == "--help" || command == "-h" || command == "help" => {
             Ok(CliAction::Help)
         }
@@ -528,7 +639,7 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: voisu <start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|delivery|dictionary|service>\n\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu delivery [type|clipboard|guarded]  # choose Transcript Delivery (default type); no argument shows the persisted mode\n  voisu dictionary add <term>\n  voisu dictionary remove <term>\n  voisu dictionary list [--json]\n  voisu service <install|start|stop|restart|status|uninstall>"
+    "usage: voisu <setup|start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|delivery|dictionary|service>\n\n  voisu setup  # guided, re-runnable wizard: validate and store your Deepgram and Groq keys\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor  # capability, focus-guard, and live per-key round-trip checks\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu delivery [type|clipboard|guarded]  # choose Transcript Delivery (default type); no argument shows the persisted mode\n  voisu dictionary add <term>\n  voisu dictionary remove <term>\n  voisu dictionary list [--json]\n  voisu service <install|start|stop|restart|status|uninstall>"
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {

@@ -2036,6 +2036,32 @@ fn voisu_with_env(runtime_dir: &Path, arguments: &[&str], environment: &[(&str, 
     command.output().expect("CLI should run")
 }
 
+/// Runs the CLI with the developer's real config and provider env neutralized:
+/// `XDG_CONFIG_HOME` is pinned to a caller-owned dir, and the key/disable env
+/// overrides are stripped (a caller can re-add any it needs via `environment`).
+/// New key-aware tests use this so an ambient `~/.config/voisu` or `VOISU_*`
+/// var can never flip their result.
+fn voisu_isolated(
+    runtime_dir: &Path,
+    config_home: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Output {
+    fs::set_permissions(runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_voisu"));
+    command
+        .args(arguments)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env_remove("VOISU_DEEPGRAM_API_KEY")
+        .env_remove("VOISU_GROQ_API_KEY")
+        .env_remove("VOISU_DISABLE_DEEPGRAM");
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    command.output().expect("CLI should run")
+}
+
 fn voisu_with_secret(
     runtime_dir: &Path,
     arguments: &[&str],
@@ -2466,6 +2492,7 @@ fn doctor_reports_each_fedora_capability_through_the_public_cli() {
         .env("XDG_RUNTIME_DIR", runtime.path())
         .env("VOISU_TEST_READINESS", "pass")
         .env("VOISU_TEST_FOCUS_BACKEND", "hyprland")
+        .env("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")
         .output()
         .expect("doctor should run");
 
@@ -2485,6 +2512,7 @@ fn doctor_explains_that_guarded_delivery_fails_closed_without_a_focus_backend() 
         &[
             ("VOISU_TEST_READINESS", "pass"),
             ("VOISU_TEST_FOCUS_BACKEND", "none"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
         ],
     );
 
@@ -2503,7 +2531,10 @@ fn doctor_exposes_actionable_warn_and_fail_outcomes() {
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("VOISU_TEST_READINESS", "pipewire=fail,clipboard=warn")],
+        &[
+            ("VOISU_TEST_READINESS", "pipewire=fail,clipboard=warn"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
     );
 
     assert_eq!(doctor.status.code(), Some(4));
@@ -2517,7 +2548,11 @@ fn doctor_exercises_real_capabilities_instead_of_command_headings_or_socket_conn
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start(runtime.path());
     let commands = FakeCommands::new();
-    let doctor = voisu_with_env(runtime.path(), &["doctor"], &[("PATH", &commands.path())]);
+    let doctor = voisu_with_env(
+        runtime.path(),
+        &["doctor"],
+        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+    );
 
     assert!(doctor.status.success(), "{}", stderr(&doctor));
     assert_eq!(commands.read("pw-cli.args"), "info\n0\n");
@@ -2549,7 +2584,11 @@ fn doctor_clipboard_passes_while_wl_copy_serves_the_clipboard_past_exit() {
     // the roundtrip must read that as a healthy clipboard, not a timeout.
     commands.touch("wl-copy.serving");
     let started = Instant::now();
-    let doctor = voisu_with_env(runtime.path(), &["doctor"], &[("PATH", &commands.path())]);
+    let doctor = voisu_with_env(
+        runtime.path(),
+        &["doctor"],
+        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+    );
 
     assert!(doctor.status.success(), "{}", stdout(&doctor));
     assert!(
@@ -2576,7 +2615,11 @@ fn doctor_reports_a_reachable_secret_service_without_a_match_as_pass() {
     // The probe attribute never matches on a healthy unlocked keyring; a clean
     // no-match (nonzero exit, empty stdout/stderr) proves the service is
     // reachable and must read PASS, not WARN.
-    let doctor = voisu_with_env(runtime.path(), &["doctor"], &[("PATH", &commands.path())]);
+    let doctor = voisu_with_env(
+        runtime.path(),
+        &["doctor"],
+        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+    );
 
     assert!(doctor.status.success(), "{}", stderr(&doctor));
     assert!(
@@ -2599,7 +2642,11 @@ fn doctor_warns_when_the_secret_service_reports_an_error() {
     // A D-Bus/service failure (or locked keyring) exits nonzero AND writes a
     // diagnostic to stderr; that is the only case that warrants WARN.
     commands.touch("secret-tool.dbuserror");
-    let doctor = voisu_with_env(runtime.path(), &["doctor"], &[("PATH", &commands.path())]);
+    let doctor = voisu_with_env(
+        runtime.path(),
+        &["doctor"],
+        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+    );
 
     assert!(
         stdout(&doctor).contains("Secret storage: WARN"),
@@ -2609,6 +2656,157 @@ fn doctor_warns_when_the_secret_service_reports_an_error() {
     assert!(
         stdout(&doctor).contains("unlock the keyring or log in to the desktop session"),
         "{}",
+        stdout(&doctor)
+    );
+}
+
+#[test]
+fn doctor_reports_valid_provider_keys_as_pass() {
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "none"),
+            ("VOISU_TEST_SECRET_STORE", "available"),
+            ("VOISU_TEST_STORED_DEEPGRAM_CREDENTIAL", "deepgram-key"),
+            ("VOISU_TEST_STORED_GROQ_CREDENTIAL", "groq-key"),
+            ("VOISU_TEST_AUTH_DEEPGRAM", "authorized"),
+            ("VOISU_TEST_AUTH_GROQ", "authorized"),
+        ],
+    );
+
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    assert!(stdout(&doctor).contains("Deepgram key: key valid (PASS)"), "{}", stdout(&doctor));
+    assert!(stdout(&doctor).contains("Groq key: key valid (PASS)"), "{}", stdout(&doctor));
+}
+
+#[test]
+fn doctor_flags_an_invalid_key_as_a_failure_naming_the_fix() {
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "none"),
+            ("VOISU_DISABLE_DEEPGRAM", "1"),
+            ("VOISU_TEST_SECRET_STORE", "available"),
+            ("VOISU_TEST_STORED_GROQ_CREDENTIAL", "groq-key"),
+            ("VOISU_TEST_AUTH_GROQ", "401"),
+        ],
+    );
+
+    assert_eq!(doctor.status.code(), Some(4), "an invalid key is a hard failure");
+    assert!(
+        stdout(&doctor).contains("Groq key: key invalid — run `voisu setup` (FAIL)"),
+        "{}",
+        stdout(&doctor)
+    );
+    assert!(stdout(&doctor).contains("Deepgram key: SKIP"), "{}", stdout(&doctor));
+}
+
+#[test]
+fn doctor_tells_a_locked_keyring_to_unlock_not_to_run_setup() {
+    // A locked keyring must steer the user to UNLOCK it, not to write a plaintext
+    // key — and it is a warning, not a hard failure.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "none"),
+            ("VOISU_DISABLE_DEEPGRAM", "1"),
+            ("VOISU_TEST_SECRET_STORE", "locked"),
+        ],
+    );
+
+    assert!(doctor.status.success(), "a locked keyring is a warning: {}", stderr(&doctor));
+    assert!(
+        stdout(&doctor).contains("Groq key: keyring locked — unlock it"),
+        "{}",
+        stdout(&doctor)
+    );
+    assert!(!stdout(&doctor).contains("Groq key: not configured"), "{}", stdout(&doctor));
+}
+
+#[test]
+fn doctor_reports_a_bare_429_as_quota_and_a_missing_key_as_a_warning() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let config_home = TempDir::new().unwrap();
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "none"),
+            // Deepgram: stored key that returns a bare 429 → quota (WARN, not fail).
+            // Groq: no stored key → not configured (WARN, not fail).
+            ("VOISU_TEST_SECRET_STORE", "available"),
+            ("VOISU_TEST_STORED_DEEPGRAM_CREDENTIAL", "deepgram-key"),
+            ("VOISU_TEST_AUTH_DEEPGRAM", "429"),
+        ],
+    );
+
+    assert!(doctor.status.success(), "transient states are warnings: {}", stderr(&doctor));
+    assert!(
+        stdout(&doctor).contains("Deepgram key: free-tier quota exhausted (WARN)"),
+        "{}",
+        stdout(&doctor)
+    );
+    assert!(
+        stdout(&doctor).contains("Groq key: not configured — run `voisu setup` (WARN)"),
+        "{}",
+        stdout(&doctor)
+    );
+}
+
+#[test]
+fn doctor_fails_a_present_but_invalid_env_override_naming_the_variable() {
+    // An exported-but-empty override wins at runtime (`load` treats any present
+    // variable as authoritative), so doctor must FAIL it and name the variable
+    // — not silently fall through to the keyring key and print PASS.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "none"),
+            ("VOISU_DISABLE_DEEPGRAM", "1"),
+            // A healthy stored key that the broken override shadows at runtime.
+            ("VOISU_TEST_SECRET_STORE", "available"),
+            ("VOISU_TEST_STORED_GROQ_CREDENTIAL", "groq-key"),
+            ("VOISU_TEST_AUTH_GROQ", "authorized"),
+            ("VOISU_GROQ_API_KEY", ""),
+        ],
+    );
+
+    assert_eq!(doctor.status.code(), Some(4), "a broken override is a hard failure: {}", stdout(&doctor));
+    assert!(
+        stdout(&doctor).contains("unset or fix VOISU_GROQ_API_KEY"),
+        "the remedy must name the variable: {}",
+        stdout(&doctor)
+    );
+    assert!(
+        !stdout(&doctor).contains("Groq key: key valid (PASS)"),
+        "the shadowed keyring key must not be reported as effective: {}",
         stdout(&doctor)
     );
 }
@@ -2639,21 +2837,249 @@ fn auth_set_replaces_a_credential_without_echoing_it() {
 }
 
 #[test]
-fn denied_secret_storage_names_the_headless_fallback_without_leaking_credential() {
+fn a_locked_keyring_falls_back_to_a_0600_file_with_a_loud_warning() {
+    // A locked/denied Secret Service must not fail the store: after the retry
+    // budget it falls back to a 0600 file, LOUDLY (gh's silent fallback is the
+    // anti-pattern), never leaking the credential onto stderr.
     let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
     let denied = voisu_with_secret(
         runtime.path(),
         &["auth", "set", "deepgram"],
-        &[("VOISU_TEST_SECRET_STORE", "denied")],
+        &[
+            ("VOISU_TEST_SECRET_STORE", "denied"),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+        ],
         "controlled-secret",
     );
 
-    assert_eq!(denied.status.code(), Some(4));
-    assert_eq!(
-        stderr(&denied),
-        "Secret storage is unavailable; set VOISU_GROQ_API_KEY or VOISU_DEEPGRAM_API_KEY for development or headless use\n"
+    assert!(denied.status.success(), "{}", stderr(&denied));
+    assert_eq!(stdout(&denied), "Deepgram credential stored\n");
+    let warning = stderr(&denied);
+    assert!(warning.contains("WARNING"), "fallback must be loud: {warning}");
+    assert!(warning.contains("locked"), "locked keyring must be named: {warning}");
+    assert!(warning.contains("0600"), "the file mode must be named: {warning}");
+    assert!(!warning.contains("controlled-secret"), "credential must never leak");
+    // The credential landed in the 0600 fallback file.
+    let file = config_home.path().join("voisu").join("credentials");
+    let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "fallback file must be owner-only");
+    assert!(fs::read_to_string(&file).unwrap().contains("deepgram=controlled-secret"));
+}
+
+#[test]
+fn auth_set_reports_a_surviving_plaintext_copy_instead_of_claiming_migration() {
+    // The keyring store succeeds, but the old plaintext copy cannot be removed
+    // (config dir non-writable). Claiming success would leave a stale key that
+    // a later locked-at-boot load silently serves — the command must instead
+    // warn loudly and refuse to report a completed migration.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let dir = config_home.path().join("voisu");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("credentials");
+    fs::write(&file, "groq=stale-plaintext-secret\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    // The directory refuses writes, so pruning the plaintext line must fail.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let stored = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[
+            ("VOISU_TEST_SECRET_STORE", "available"),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+        ],
+        "fresh-secret",
     );
-    assert!(!stderr(&denied).contains("controlled-secret"));
+
+    // Restore permissions so the TempDir can clean up.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(
+        stored.status.code(),
+        Some(4),
+        "a surviving plaintext copy must not report success: {}",
+        stderr(&stored)
+    );
+    let warning = stderr(&stored);
+    assert!(warning.contains("WARNING"), "the leftover must be loud: {warning}");
+    assert!(
+        warning.contains("plaintext copy"),
+        "the leftover plaintext copy must be named: {warning}"
+    );
+    assert!(!warning.contains("stale-plaintext-secret"), "no credential may leak: {warning}");
+    assert!(!warning.contains("fresh-secret"), "no credential may leak: {warning}");
+    // The stale copy is in fact still on disk — the truth being reported.
+    assert!(
+        fs::read_to_string(&file).unwrap().contains("stale-plaintext-secret"),
+        "the scenario requires the plaintext copy to survive"
+    );
+}
+
+#[test]
+fn auth_set_succeeds_quietly_when_a_read_only_config_dir_holds_no_plaintext_copy() {
+    // A read-only ~/.config/voisu with NO credentials file means there is
+    // nothing to prune after a successful keyring store. The inability to
+    // create the sibling lock file there must not be reported as a surviving
+    // plaintext copy: the store succeeded and no stale key exists anywhere.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let dir = config_home.path().join("voisu");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let stored = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[
+            ("VOISU_TEST_SECRET_STORE", "available"),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+        ],
+        "controlled-secret",
+    );
+
+    // Restore permissions so the TempDir can clean up.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        stored.status.success(),
+        "a prune-free keyring store must report success: {}",
+        stderr(&stored)
+    );
+    assert_eq!(stdout(&stored), "Groq credential stored\n");
+    assert!(
+        !stderr(&stored).contains("WARNING"),
+        "no plaintext copy exists, so no alarm may fire: {}",
+        stderr(&stored)
+    );
+    assert!(!stderr(&stored).contains("controlled-secret"));
+}
+
+#[test]
+fn auth_set_succeeds_quietly_when_only_the_other_providers_plaintext_line_exists() {
+    // The fallback file holds ONLY a Deepgram line and the read-only dir makes
+    // the sibling lock file uncreatable. Storing a GROQ key in the keyring has
+    // nothing to prune — the unrelated Deepgram line must not be reported as a
+    // surviving Groq plaintext copy.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let dir = config_home.path().join("voisu");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("credentials");
+    fs::write(&file, "deepgram=other-provider-secret\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let stored = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[
+            ("VOISU_TEST_SECRET_STORE", "available"),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+        ],
+        "controlled-secret",
+    );
+
+    // Restore permissions so the TempDir can clean up.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        stored.status.success(),
+        "no Groq plaintext line exists, so the store must report success: {}",
+        stderr(&stored)
+    );
+    assert_eq!(stdout(&stored), "Groq credential stored\n");
+    assert!(
+        !stderr(&stored).contains("WARNING"),
+        "another provider's line must not raise this provider's alarm: {}",
+        stderr(&stored)
+    );
+    assert!(!stderr(&stored).contains("controlled-secret"));
+    // The unrelated Deepgram line is untouched.
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "deepgram=other-provider-secret\n"
+    );
+}
+
+#[test]
+fn a_credential_stored_in_the_fallback_file_is_loaded_back() {
+    // Round trip: an unavailable keyring writes the file, and a later load with
+    // the same unavailable keyring reads it straight back (env override absent).
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let config = config_home.path().to_str().unwrap();
+    let stored = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[
+            ("VOISU_TEST_SECRET_STORE", "unavailable"),
+            ("XDG_CONFIG_HOME", config),
+        ],
+        "fallback-groq-key",
+    );
+    assert!(stored.status.success(), "{}", stderr(&stored));
+    assert!(stderr(&stored).contains("no desktop Secret Service is available"), "{}", stderr(&stored));
+
+    let verified = voisu_with_env(
+        runtime.path(),
+        &["auth", "verify", "groq"],
+        &[
+            ("VOISU_TEST_SECRET_STORE", "unavailable"),
+            ("XDG_CONFIG_HOME", config),
+            ("VOISU_TEST_AUTH_GROQ", "authorized"),
+        ],
+    );
+    assert!(verified.status.success(), "{}", stderr(&verified));
+    assert_eq!(stdout(&verified), "Groq authentication verified\n");
+}
+
+#[test]
+fn setup_wizard_validates_each_key_then_persists_both() {
+    // End to end through the real CLI: two keys typed one per line, each
+    // validated live (seam) before saving. With no keyring available the wizard
+    // persists to the loud 0600 fallback, which a re-run would then offer to keep.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_voisu"));
+    command
+        .arg("setup")
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("VOISU_TEST_SECRET_STORE", "unavailable")
+        .env("VOISU_TEST_AUTH_DEEPGRAM", "authorized")
+        .env("VOISU_TEST_AUTH_GROQ", "authorized")
+        .env("XDG_CONFIG_HOME", config_home.path())
+        // Neutralize the developer's real provider env so a stale override does
+        // not turn the wizard's key prompts into env-keep prompts.
+        .env_remove("VOISU_DEEPGRAM_API_KEY")
+        .env_remove("VOISU_GROQ_API_KEY")
+        .env_remove("VOISU_DISABLE_DEEPGRAM")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("setup should run");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"deepgram-secret\ngroq-secret\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("Deepgram key validated and stored."), "{out}");
+    assert!(out.contains("Groq key validated and stored."), "{out}");
+    assert!(out.contains("Run `voisu doctor`"), "{out}");
+    // The keys landed in the 0600 fallback file, never echoed to stdout.
+    assert!(!out.contains("deepgram-secret") && !out.contains("groq-secret"), "{out}");
+    let file = config_home.path().join("voisu").join("credentials");
+    let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let body = fs::read_to_string(&file).unwrap();
+    assert!(body.contains("deepgram=deepgram-secret"), "{body}");
+    assert!(body.contains("groq=groq-secret"), "{body}");
 }
 
 #[test]
@@ -2684,35 +3110,88 @@ fn auth_set_writes_exact_credential_bytes_and_isolates_secret_tool_environment()
 }
 
 #[test]
-fn auth_set_bounds_stalled_secret_tool_and_reports_missing_tool_without_leaking_credential() {
+fn auth_set_bounds_a_stalled_or_missing_secret_tool_then_falls_back_without_leaking() {
+    // A stalled keyring must be bounded, then fall back to the 0600 file loudly.
     let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
     let commands = FakeCommands::new();
     commands.touch("secret-tool.stall");
     let started = Instant::now();
     let stalled = voisu_with_secret(
         runtime.path(),
         &["auth", "set", "groq"],
-        &[("PATH", &commands.path())],
+        &[("PATH", &commands.path()), ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())],
         "controlled-secret",
     );
-    assert_eq!(stalled.status.code(), Some(4));
+    assert!(stalled.status.success(), "{}", stderr(&stalled));
     assert!(started.elapsed() < Duration::from_secs(4), "secret-tool must have a bounded wait");
+    assert!(stderr(&stalled).contains("WARNING"), "fallback must be loud: {}", stderr(&stalled));
     assert!(!stderr(&stalled).contains("controlled-secret"));
 
+    // With no secret-tool on PATH at all, the store still succeeds via the file,
+    // naming the absent Secret Service.
+    let missing_config = TempDir::new().unwrap();
     let missing = voisu_with_secret(
         runtime.path(),
         &["auth", "set", "groq"],
-        &[("PATH", runtime.path().to_str().unwrap())],
+        &[
+            ("PATH", runtime.path().to_str().unwrap()),
+            ("XDG_CONFIG_HOME", missing_config.path().to_str().unwrap()),
+        ],
         "controlled-secret",
     );
-    assert_eq!(missing.status.code(), Some(4));
-    assert!(stderr(&missing).contains("Secret storage is unavailable"));
+    assert!(missing.status.success(), "{}", stderr(&missing));
+    assert!(stderr(&missing).contains("secret-tool helper is not installed"), "{}", stderr(&missing));
     assert!(!stderr(&missing).contains("controlled-secret"));
+}
+
+#[test]
+fn auth_set_retries_an_activating_keyring_within_budget_then_falls_back() {
+    // A secret-tool that fails with an empty stderr reads as the service still
+    // activating: the store retries within a bounded budget (here zeroed via the
+    // seam), then falls back to the 0600 file. This exercises the retry loop and
+    // the VOISU_TEST_KEYRING_RETRY_MS seam.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let stub = TempDir::new().unwrap();
+    // Written directly (not via write_fake_command, whose `trap 'exit 0' EXIT`
+    // would mask the failure): drain stdin so the credential write does not
+    // EPIPE, record the call, then fail with an EMPTY stderr — the "still
+    // activating" signal that the store path retries.
+    let stub_path = stub.path().join("secret-tool");
+    fs::write(
+        &stub_path,
+        "#!/bin/sh\ncat > /dev/null\ndir=$(dirname \"$0\")\nprintf 'x' >> \"$dir/secret-tool.calls\"\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&stub_path, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!("{}:{}", stub.path().display(), std::env::var("PATH").unwrap());
+    let started = Instant::now();
+    let stored = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[
+            ("PATH", &path),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+            ("VOISU_TEST_KEYRING_RETRY_MS", "0"),
+        ],
+        "controlled-secret",
+    );
+    assert!(stored.status.success(), "{}", stderr(&stored));
+    assert!(started.elapsed() < Duration::from_secs(4), "the retry budget must stay bounded");
+    // One immediate attempt plus three bounded retries.
+    let calls = fs::read_to_string(stub.path().join("secret-tool.calls")).unwrap();
+    assert_eq!(calls.len(), 4, "expected 1 immediate + 3 retried attempts, got {}", calls.len());
+    assert!(
+        config_home.path().join("voisu").join("credentials").exists(),
+        "the exhausted budget must fall back to the file"
+    );
 }
 
 #[test]
 fn auth_set_bounds_a_child_that_never_drains_a_large_stdin() {
     let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
     let commands = FakeCommands::new();
     // The stall stub sleeps without ever reading stdin. With a credential larger
     // than the OS pipe buffer, the parent's stdin write would block forever
@@ -2723,10 +3202,10 @@ fn auth_set_bounds_a_child_that_never_drains_a_large_stdin() {
     let stalled = voisu_with_secret(
         runtime.path(),
         &["auth", "set", "groq"],
-        &[("PATH", &commands.path())],
+        &[("PATH", &commands.path()), ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())],
         &large_credential,
     );
-    assert_eq!(stalled.status.code(), Some(4));
+    assert!(stalled.status.success(), "{}", stderr(&stalled));
     assert!(
         started.elapsed() < Duration::from_secs(4),
         "a child that never drains stdin must still be bounded, elapsed {:?}",
@@ -2738,6 +3217,7 @@ fn auth_set_bounds_a_child_that_never_drains_a_large_stdin() {
 #[test]
 fn auth_set_is_bounded_when_a_descendant_holds_the_pipes_past_child_exit() {
     let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
     let commands = FakeCommands::new();
     // The child exits successfully but leaves a setsid grandchild holding its
     // stdout/stderr pipes open; an unbounded pipe-reader join would block the
@@ -2747,14 +3227,23 @@ fn auth_set_is_bounded_when_a_descendant_holds_the_pipes_past_child_exit() {
     let held = voisu_with_secret(
         runtime.path(),
         &["auth", "set", "groq"],
-        &[("PATH", &commands.path())],
+        &[("PATH", &commands.path()), ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())],
         "controlled-secret",
     );
-    assert_eq!(held.status.code(), Some(4));
+    // Bounded, non-leaking, AND a real outcome: the descendant-held pipes read
+    // as a keyring failure, so the store must still succeed by falling back to
+    // the 0600 file — loudly. Without these asserts a regression to exit 4, a
+    // crash, or a missing fallback file would pass on timing alone.
+    assert!(held.status.success(), "{}", stderr(&held));
     assert!(
         started.elapsed() < Duration::from_secs(4),
         "pipe-reader joins must be bounded when a descendant holds the pipes, elapsed {:?}",
         started.elapsed()
+    );
+    assert!(stderr(&held).contains("WARNING"), "the fallback must be loud: {}", stderr(&held));
+    assert!(
+        config_home.path().join("voisu").join("credentials").exists(),
+        "the bounded failure must still land the credential in the fallback file"
     );
     assert!(!stderr(&held).contains("controlled-secret"));
 }
@@ -2762,6 +3251,7 @@ fn auth_set_is_bounded_when_a_descendant_holds_the_pipes_past_child_exit() {
 #[test]
 fn auth_set_is_bounded_when_the_child_crashes_while_a_descendant_holds_the_pipes() {
     let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
     let commands = FakeCommands::new();
     // The child is SIGKILLed (abnormal exit) while a setsid grandchild holds
     // the pipes: the error path must still give every helper thread a bounded
@@ -2771,10 +3261,10 @@ fn auth_set_is_bounded_when_the_child_crashes_while_a_descendant_holds_the_pipes
     let crashed = voisu_with_secret(
         runtime.path(),
         &["auth", "set", "groq"],
-        &[("PATH", &commands.path())],
+        &[("PATH", &commands.path()), ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())],
         "controlled-secret",
     );
-    assert_eq!(crashed.status.code(), Some(4));
+    assert!(crashed.status.success(), "{}", stderr(&crashed));
     assert!(
         started.elapsed() < Duration::from_secs(4),
         "cleanup after an abnormal child exit must stay bounded, elapsed {:?}",
@@ -2833,7 +3323,7 @@ fn auth_verify_checks_each_provider_without_retaining_or_printing_response_conte
     assert!(groq.status.success(), "{}", stderr(&groq));
     assert_eq!(stdout(&groq), "Groq authentication verified\n");
     assert_eq!(deepgram.status.code(), Some(4));
-    assert_eq!(stderr(&deepgram), "Provider authentication failed\n");
+    assert_eq!(stderr(&deepgram), "key invalid — run `voisu setup`\n");
     let combined = format!("{}{}{}{}", stdout(&groq), stderr(&groq), stdout(&deepgram), stderr(&deepgram));
     assert!(!combined.contains("controlled-secret"));
     assert!(!combined.contains("response content"));
@@ -2856,7 +3346,7 @@ fn auth_verify_requires_2xx_discards_response_and_isolates_curl_environment() {
     );
 
     assert_eq!(verified.status.code(), Some(4), "a redirect is not an authenticated API response");
-    assert_eq!(stderr(&verified), "Provider authentication failed\n");
+    assert_eq!(stderr(&verified), "provider unreachable (transient)\n");
     assert!(!format!("{}{}", stdout(&verified), stderr(&verified)).contains("stored-credential"));
     let arguments = commands.read("curl.args");
     assert_eq!(arguments.lines().next(), Some("-q"));
@@ -5936,7 +6426,7 @@ fn doctor_daemon_probe_is_bounded_under_a_trickling_peer() {
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("VOISU_TEST_READINESS", "pass")],
+        &[("VOISU_TEST_READINESS", "pass"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
     );
     let elapsed = started.elapsed();
     assert!(
@@ -5979,7 +6469,7 @@ fn doctor_daemon_probe_rejects_a_flooding_peer_at_the_response_cap() {
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("VOISU_TEST_READINESS", "pass")],
+        &[("VOISU_TEST_READINESS", "pass"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
     );
     let elapsed = started.elapsed();
     assert!(
