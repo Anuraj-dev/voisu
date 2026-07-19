@@ -3872,6 +3872,80 @@ impl PrivateBus {
             _config: config,
         }
     }
+
+    /// A private bus that listens on a FIXED socket path so it can be killed and
+    /// restarted at the SAME address — used to simulate the daemon's own D-Bus
+    /// connection dropping (as a suspend/resume can) and then coming back.
+    fn start_restartable() -> Self {
+        let config = TempDir::new().expect("bus config directory should exist");
+        let socket = config.path().join("bus.sock");
+        let config_path = config.path().join("bus.conf");
+        Self::write_restartable_config(&config_path, &socket);
+        let child = Self::spawn_restartable(&config_path);
+        Self {
+            child,
+            // A guid-less address so a fresh bus (with a new guid) at the same
+            // socket path is reconnectable on rebind.
+            address: format!("unix:path={}", socket.display()),
+            _config: config,
+        }
+    }
+
+    fn write_restartable_config(config_path: &Path, socket: &Path) {
+        fs::write(
+            config_path,
+            format!(
+                r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path={}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"#,
+                socket.display()
+            ),
+        )
+        .expect("bus config should be written");
+    }
+
+    fn spawn_restartable(config_path: &Path) -> Child {
+        let mut command = Command::new("dbus-daemon");
+        command
+            .arg(format!("--config-file={}", config_path.display()))
+            .args(["--nofork", "--print-address"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        isolate_process_group(&mut command);
+        let mut child = command.spawn().expect("dbus-daemon should start");
+        let stdout = child.stdout.take().expect("dbus-daemon stdout");
+        let mut printed = String::new();
+        BufReader::new(stdout)
+            .read_line(&mut printed)
+            .expect("dbus-daemon should print its address");
+        assert!(!printed.trim().is_empty(), "dbus-daemon printed no address");
+        child
+    }
+
+    /// Kills the running bus (any daemon connection to it dies with it) and
+    /// respawns a fresh bus at the same socket path.
+    fn restart(&mut self) {
+        let process_group = -(self.child.id() as i32);
+        // SAFETY: the bus is a process-group leader owned by this test.
+        let _ = unsafe { libc::kill(process_group, libc::SIGKILL) };
+        let _ = self.child.wait();
+        let socket = self._config.path().join("bus.sock");
+        let config_path = self._config.path().join("bus.conf");
+        // A stale socket file would block the fresh bus from binding the path.
+        let _ = fs::remove_file(&socket);
+        self.child = Self::spawn_restartable(&config_path);
+    }
 }
 
 impl Drop for PrivateBus {
@@ -4241,6 +4315,72 @@ impl MockPortal {
         );
         self.control = control;
         self.service = Some(service);
+    }
+
+    /// A live private bus with NO portal service on it yet: the daemon can reach
+    /// the bus but binding fails until `serve_now()` brings the portal up. This
+    /// models login, where the daemon starts before the desktop portal is ready.
+    fn start_deferred() -> Self {
+        let bus = PrivateBus::start();
+        let shared = PortalShared {
+            session: Arc::new(std::sync::Mutex::new(None)),
+            close_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        // A dropped receiver leaves the control sender inert until the portal is
+        // actually served; `restart_service` installs a live one.
+        let (control, _dropped) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            bus,
+            shared,
+            behavior: PortalBehavior {
+                deny_bind: false,
+                trigger_description: "Super+Alt+V".to_owned(),
+                divergent: false,
+            },
+            control,
+            service: None,
+        }
+    }
+
+    /// Brings the portal service up on the (already running) deferred bus.
+    fn serve_now(&mut self) {
+        self.restart_service();
+    }
+
+    /// A portal on a bus that can be restarted at the same address (see
+    /// `drop_connection_then_return`).
+    fn start_restartable() -> Self {
+        let bus = PrivateBus::start_restartable();
+        let shared = PortalShared {
+            session: Arc::new(std::sync::Mutex::new(None)),
+            close_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let behavior = PortalBehavior {
+            deny_bind: false,
+            trigger_description: "Super+Alt+V".to_owned(),
+            divergent: false,
+        };
+        let (control, service) =
+            Self::spawn_service(bus.address.clone(), behavior.clone(), shared.clone());
+        Self {
+            bus,
+            shared,
+            behavior,
+            control,
+            service: Some(service),
+        }
+    }
+
+    /// The daemon's D-Bus connection drops and a fresh bus and portal return at
+    /// the SAME address — the suspend/resume shape. Killing the bus severs the
+    /// daemon's live connection (its activation stream ends), then a new bus and
+    /// portal come back so the daemon can rebind on its own.
+    fn drop_connection_then_return(&mut self) {
+        self.bus.restart();
+        // The old service thread's connection died with the bus; unblock and
+        // join it, then serve a fresh portal on the restarted bus.
+        self.stop_service();
+        self.restart_service();
     }
 
     /// One user press of the desktop-approved Trigger Key.
@@ -4682,6 +4822,126 @@ fn unavailable_portal_leaves_cli_control_usable() {
     assert!(
         diagnostics.contains("Trigger Key binding is unavailable"),
         "{diagnostics}"
+    );
+}
+
+#[test]
+fn trigger_key_binds_without_restart_once_the_portal_becomes_available() {
+    let runtime = TempDir::new().unwrap();
+    // The daemon starts before the desktop portal is ready (the login race): the
+    // bus is up but no portal owns the name yet, so the initial bind fails.
+    let mut portal = MockPortal::start_deferred();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
+            ("VOISU_TEST_SHORTCUT_REBIND_INITIAL_MS", "15"),
+            ("VOISU_TEST_SHORTCUT_REBIND_MAX_MS", "40"),
+        ],
+    );
+
+    // No Trigger Key yet, but the daemon stays fully usable over the CLI while
+    // it retries in the background.
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "shortcut")),
+        "No Trigger Key is bound; start, stop, and toggle remain available\n"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "toggle")),
+        "Transcript submitted through the compositor; preserved on the clipboard\n"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+
+    // The portal comes up: the daemon must bind the Trigger Key on its own, with
+    // NO restart, and the Trigger Key must then drive Recordings.
+    portal.serve_now();
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    portal.activate();
+    wait_for_status(runtime.path(), "Recording\n");
+    portal.activate();
+    wait_for_status(runtime.path(), "idle\n");
+}
+
+#[test]
+fn trigger_key_rebinds_after_the_activation_stream_drops() {
+    let runtime = TempDir::new().unwrap();
+    let mut portal = MockPortal::start_restartable();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
+            ("VOISU_TEST_SHORTCUT_REBIND_INITIAL_MS", "15"),
+            ("VOISU_TEST_SHORTCUT_REBIND_MAX_MS", "40"),
+        ],
+    );
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    // The daemon's D-Bus connection drops (its activation stream ends) and a
+    // fresh bus and portal return at the same address — the suspend/resume
+    // shape. A dropped stream is NOT a revocation: the listener must rebind the
+    // Trigger Key on its own, without a restart.
+    portal.drop_connection_then_return();
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    // The rebound Trigger Key drives Recordings again.
+    portal.activate();
+    wait_for_status(runtime.path(), "Recording\n");
+    portal.activate();
+    wait_for_status(runtime.path(), "idle\n");
+
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains("Trigger Key activation stream failed"),
+        "a dropped stream must be treated as a recoverable rebind: {diagnostics}"
+    );
+}
+
+#[test]
+fn explicit_trigger_key_revocation_is_not_reprompted() {
+    let runtime = TempDir::new().unwrap();
+    let portal = MockPortal::start();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
+            // A tiny backoff: if the listener were going to (wrongly) rebind, it
+            // would do so within the window checked below.
+            ("VOISU_TEST_SHORTCUT_REBIND_INITIAL_MS", "15"),
+            ("VOISU_TEST_SHORTCUT_REBIND_MAX_MS", "40"),
+        ],
+    );
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    // The desktop revokes the session (Session.Closed): a deliberate, permanent
+    // decision. The binding clears and must STAY cleared — never reprompted.
+    portal.close_session();
+    wait_for_shortcut(
+        runtime.path(),
+        "No Trigger Key is bound; start, stop, and toggle remain available\n",
+    );
+
+    // Well past several backoff intervals the Trigger Key is still unbound: the
+    // portal still owns the name, so a rebind would show it again.
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "shortcut")),
+        "No Trigger Key is bound; start, stop, and toggle remain available\n"
+    );
+    // CLI Recording control is unaffected by the revocation.
+    assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "toggle")),
+        "Transcript submitted through the compositor; preserved on the clipboard\n"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(diagnostics.contains("Trigger Key portal ended"), "{diagnostics}");
+    assert!(
+        !diagnostics.contains("rebinding the Trigger Key"),
+        "explicit revocation must not trigger a rebind: {diagnostics}"
     );
 }
 

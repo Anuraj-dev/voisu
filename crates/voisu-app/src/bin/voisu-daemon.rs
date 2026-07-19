@@ -2291,27 +2291,113 @@ async fn run_replay(
 /// listener logs and moves on rather than blocking future activations forever.
 const SHORTCUT_TOGGLE_REPLY_DEADLINE: Duration = Duration::from_secs(60);
 
+/// Production bounds for the self-healing rebind backoff: quick first retries,
+/// then capped, retried indefinitely. The daemon is long-lived, so a portal
+/// that is not yet ready at login or an activation stream dropped by
+/// suspend/resume is temporary — Voisu keeps trying until the desktop portal is
+/// reachable and the Trigger Key binds on its own, with no manual restart.
+const SHORTCUT_REBIND_INITIAL: Duration = Duration::from_secs(1);
+const SHORTCUT_REBIND_MAX: Duration = Duration::from_secs(30);
+
+/// Bounded, indefinitely-retrying backoff between attempts to re-establish the
+/// Trigger Key binding. Test builds shrink the interval through
+/// `VOISU_TEST_SHORTCUT_REBIND_INITIAL_MS` / `VOISU_TEST_SHORTCUT_REBIND_MAX_MS`
+/// so the suite never waits on real seconds.
+struct RebindBackoff {
+    initial: Duration,
+    max: Duration,
+    current: Duration,
+}
+
+impl RebindBackoff {
+    fn from_env() -> Self {
+        // A one-millisecond floor keeps the interval from collapsing to a busy
+        // loop even if a test sets it to zero.
+        let initial = env_millis_or("VOISU_TEST_SHORTCUT_REBIND_INITIAL_MS", SHORTCUT_REBIND_INITIAL)
+            .max(Duration::from_millis(1));
+        let max =
+            env_millis_or("VOISU_TEST_SHORTCUT_REBIND_MAX_MS", SHORTCUT_REBIND_MAX).max(initial);
+        Self {
+            initial,
+            max,
+            current: initial,
+        }
+    }
+
+    /// A fresh, healthy binding restarts the backoff from its initial interval.
+    fn reset(&mut self) {
+        self.current = self.initial;
+    }
+
+    /// Sleeps the current interval, then grows it toward `max`. Returns `true`
+    /// if the daemon is shutting down — the actor dropped its receiver — so a
+    /// sleeping backoff never delays teardown and the listener exits at once
+    /// instead of finishing the nap.
+    async fn wait_or_shutdown(&mut self, actor: &mpsc::Sender<ActorMessage>) -> bool {
+        let nap = self.current;
+        self.current = (self.current * 2).min(self.max);
+        tokio::select! {
+            _ = tokio::time::sleep(nap) => false,
+            _ = actor.closed() => true,
+        }
+    }
+}
+
 /// Binds the Trigger Key through the Global Shortcuts portal and turns each
-/// activation into a Toggle. An unavailable portal, a denied or revoked
-/// permission, or a stream error retires the listener quietly, clears the
-/// displayed binding, and leaves CLI start/stop/toggle fully usable. A portal
-/// that leaves the bus (crash/restart) clears the binding immediately and the
-/// listener rebinds once a new portal owns the name, so the binding is never
-/// stale and a restarted portal ends up rebound. Tests substitute the portal
-/// edge by pointing `DBUS_SESSION_BUS_ADDRESS` at a private bus running a
-/// controlled portal service — the daemon itself always runs this production
-/// listener.
+/// activation into a Toggle. The binding is self-healing: an unavailable or
+/// unresponsive portal at login, or an activation stream dropped by
+/// suspend/resume, clears the displayed binding and retries with bounded
+/// backoff until the portal is reachable and the Trigger Key rebinds on its own
+/// — no manual restart. A portal that leaves the bus (crash/restart) clears the
+/// binding immediately and rebinds once a new portal owns the name. Only a
+/// deliberate, permanent decision retires the listener for good: an explicit
+/// revocation (Session.Closed) or a refused bind — neither is reprompted.
+/// Throughout, CLI start/stop/toggle stay fully usable and `voisu shortcut`
+/// never shows a stale binding. Tests substitute the portal edge by pointing
+/// `DBUS_SESSION_BUS_ADDRESS` at a private bus running a controlled portal
+/// service — the daemon itself always runs this production listener.
 async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>) {
     let mut portal: Box<dyn ShortcutPortal> = Box::new(FedoraShortcutPortal::new());
+    let mut backoff = RebindBackoff::from_env();
+    // Whether the daemon has already announced that the Trigger Key is down, so
+    // the retry loop logs the first failure and the eventual recovery — never
+    // one line per attempt.
+    let mut announced_down = false;
     'rebind: loop {
         let mut session = match portal.bind().await {
             Ok(session) => session,
-            Err(error) => {
-                eprintln!("Trigger Key binding is unavailable: {}", error.diagnostic());
+            Err(error) if error.is_permanent() => {
+                // The desktop or user refused the Trigger Key. Retrying would
+                // reprompt an already-made decision, so retire quietly like an
+                // explicit revocation; start, stop, and toggle stay available.
+                eprintln!(
+                    "Trigger Key binding is unavailable: {}; start, stop, and toggle remain available",
+                    error.diagnostic()
+                );
                 let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
                 return;
             }
+            Err(error) => {
+                if !announced_down {
+                    eprintln!(
+                        "Trigger Key binding is unavailable: {}; retrying until the desktop portal is ready",
+                        error.diagnostic()
+                    );
+                    announced_down = true;
+                }
+                // Keep the displayed binding truthful while the portal is down.
+                let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
+                if backoff.wait_or_shutdown(&actor).await {
+                    return;
+                }
+                continue 'rebind;
+            }
         };
+        if announced_down {
+            eprintln!("Trigger Key bound");
+            announced_down = false;
+        }
+        backoff.reset();
         if actor
             .send(ActorMessage::ShortcutBound(Some(session.binding())))
             .await
@@ -2370,12 +2456,20 @@ async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>) {
                 }
                 Err(error) => {
                     eprintln!(
-                        "Trigger Key activation stream failed: {}; start, stop, and toggle \
-                         remain available",
+                        "Trigger Key activation stream failed: {}; rebinding the Trigger Key",
                         error.diagnostic()
                     );
                     let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
-                    return;
+                    // A dropped stream (e.g. after suspend/resume) is transient:
+                    // clear the binding and rebind with backoff instead of
+                    // retiring the listener. Mark the binding down so a bind
+                    // failure during recovery stays quiet and the eventual
+                    // success logs "Trigger Key bound".
+                    announced_down = true;
+                    if backoff.wait_or_shutdown(&actor).await {
+                        return;
+                    }
+                    continue 'rebind;
                 }
             }
         }
@@ -2442,6 +2536,14 @@ fn env_millis(name: &str) -> Duration {
         .and_then(|value| value.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or_default()
+}
+
+fn env_millis_or(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(default)
 }
 
 impl ControlledCapture {

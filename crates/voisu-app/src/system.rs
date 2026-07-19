@@ -237,9 +237,13 @@ where
                 BoundaryError::new(kind, format!("portal {method} response malformed: {error}"))
             })?;
         if code != 0 {
+            // A non-zero code is a deliberate refusal by the desktop or user, not
+            // a transient outage: mark it permanent so the listener retires
+            // instead of reprompting on an already-made decision.
             return Err(BoundaryError::new(kind, format!(
                 "the desktop denied or cancelled the {method} request (response {code})"
-            )));
+            ))
+            .permanent());
         }
         return Ok(results);
     }
@@ -458,12 +462,13 @@ pub struct FedoraShortcutSession {
 }
 
 impl FedoraShortcutSession {
-    /// Best-effort, bounded `Session.Close`; runs at most once.
-    async fn close(&mut self) {
-        if std::mem::replace(&mut self.retired, true) {
-            return;
-        }
-        close_portal_session(&self.connection, self.session_path.as_str()).await;
+    /// The daemon's own D-Bus connection ended: all three signal streams close
+    /// together. That is a transient, recoverable failure — not a revocation —
+    /// so the dead session is retired and a stream error is reported, which the
+    /// listener answers by rebinding once the portal is reachable again.
+    fn stream_ended(&mut self) -> Result<voisu_core::ShortcutEvent, BoundaryError> {
+        self.retired = true;
+        Err(shortcut_error("Trigger Key activation stream ended"))
     }
 }
 
@@ -499,24 +504,23 @@ impl ShortcutSession for FedoraShortcutSession {
                                 return Ok(ShortcutEvent::Activated);
                             }
                         }
-                        None => {
-                            // The daemon's own bus connection ended; close what
-                            // can still be closed and treat it as revocation.
-                            self.close().await;
+                        None => return self.stream_ended(),
+                    },
+                    closed = self.closures.next() => match closed {
+                        // The desktop emitted Session.Closed: the user or policy
+                        // deliberately revoked the Trigger Key. This is permanent
+                        // — the listener must never reprompt.
+                        Some(_) => {
+                            self.retired = true;
                             return Ok(ShortcutEvent::Revoked);
                         }
+                        // The stream ended because the connection died, not
+                        // because the desktop closed the session: recoverable.
+                        None => return self.stream_ended(),
                     },
-                    closed = self.closures.next() => {
-                        // The desktop closed the session: permission revoked.
-                        // Nothing is left to Close on the portal side.
-                        let _ = closed;
-                        self.retired = true;
-                        return Ok(ShortcutEvent::Revoked);
-                    }
                     owner_change = self.owner_changes.next() => {
                         let Some(message) = owner_change else {
-                            self.close().await;
-                            return Ok(ShortcutEvent::Revoked);
+                            return self.stream_ended();
                         };
                         // NameOwnerChanged(name s, old_owner s, new_owner s):
                         // an empty new owner means the portal left the bus; a

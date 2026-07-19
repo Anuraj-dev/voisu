@@ -354,6 +354,7 @@ pub struct BoundaryError {
     kind: BoundaryKind,
     diagnostic: String,
     public_message: Option<&'static str>,
+    permanent: bool,
     transcript_failure: Option<Box<TranscriptFailureEvidence>>,
     provider_failures: Vec<ProviderFailure>,
 }
@@ -372,9 +373,24 @@ impl BoundaryError {
             kind,
             diagnostic: diagnostic.into(),
             public_message: None,
+            permanent: false,
             transcript_failure: None,
             provider_failures: Vec::new(),
         }
+    }
+
+    /// Marks a failure that retrying cannot resolve — e.g. the desktop or user
+    /// refused the Trigger Key. Callers that would otherwise retry a boundary
+    /// use this to stop instead of reattempting a decision already made.
+    pub fn permanent(mut self) -> Self {
+        self.permanent = true;
+        self
+    }
+
+    /// Whether retrying this failure is futile because the outcome will not
+    /// change (a deliberate refusal), as opposed to a transient unavailability.
+    pub fn is_permanent(&self) -> bool {
+        self.permanent
     }
 
     pub fn with_public_message(mut self, message: &'static str) -> Self {
