@@ -2000,8 +2000,9 @@ pub trait ShortcutPortal: Send {
 }
 
 /// What a live Global Shortcuts session observed next. The distinction matters
-/// to the listener: revocation is final, while a portal restart must clear the
-/// stale binding and then rebind once the portal returns.
+/// to the listener: a closed session or a portal restart clears the stale
+/// binding and rebinds; permanence comes only from a refused bind (portal
+/// response 1), never from any event here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShortcutEvent {
     /// The user pressed the Trigger Key.
@@ -2010,8 +2011,11 @@ pub enum ShortcutEvent {
     /// this only as "the session ended" and GlobalShortcuts carries no reason,
     /// so it is NOT proof of a deliberate revocation — a compositor or backend
     /// reset (e.g. across suspend) closes the session the same way. The binding
-    /// is stale and must be cleared, but the listener rebinds; a genuine
-    /// revocation surfaces as a refused bind on the next attempt.
+    /// is stale and must be cleared, but the listener rebinds with bounded
+    /// backoff. A genuine revocation is expected to surface as a refused bind
+    /// (portal response 1) on a later attempt — that refusal, not the closure,
+    /// is what permanently retires the Trigger Key; if the portal neither
+    /// accepts nor refuses the rebind, re-attempts continue.
     SessionClosed,
     /// The portal vanished from the bus (crash or shutdown). The binding is
     /// stale and must be cleared; the session keeps waiting for a new owner.

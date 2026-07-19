@@ -4346,9 +4346,10 @@ impl MockPortal {
         self.shared.close_calls.load(Ordering::SeqCst)
     }
 
-    /// How many BindShortcuts calls the daemon has made — used to prove the
-    /// listener re-attempts a binding at most once after a genuine revocation
-    /// rather than reprompting repeatedly.
+    /// How many BindShortcuts calls the daemon has made — used both to prove
+    /// that a refused bind (portal response 1) retires the listener with no
+    /// further attempts, and to synchronize rebind tests on the observable
+    /// generation change instead of a possibly-stale displayed binding.
     fn bind_attempts(&self) -> usize {
         self.shared.bind_attempts.load(Ordering::SeqCst)
     }
@@ -4483,6 +4484,24 @@ fn wait_for_shortcut(runtime_dir: &Path, expected: &str) -> String {
         assert!(
             Instant::now() < deadline,
             "shortcut never became {expected:?}; last was {shortcut:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Waits until the daemon has made at least `expected` BindShortcuts calls.
+/// Rebind tests synchronize on this observable generation change BEFORE
+/// waiting on the displayed binding: right after a closure or connection drop
+/// the display still shows the pre-drop Trigger Key, so waiting on that value
+/// alone can return before the daemon has even processed the drop — and an
+/// activation sent then races the retiring session.
+fn wait_for_bind_attempts(portal: &MockPortal, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while portal.bind_attempts() < expected {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never reached {expected} bind attempts; saw {}",
+            portal.bind_attempts()
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -4712,10 +4731,12 @@ fn trigger_key_permission_denial_leaves_cli_control_usable() {
 }
 
 #[test]
-// Acceptance proof (with production-boundary clipboard evidence) that a GENUINE
-// revocation permanently retires the Trigger Key: the desktop closes the session
-// and then refuses the one rebind the listener attempts, so it stops without
-// reprompting. A benign session reset is covered separately
+// Acceptance proof (with production-boundary clipboard evidence) that a refused
+// bind (portal response 1) permanently retires the Trigger Key: the desktop
+// closes the session, the listener rebinds, and the refusal stops all further
+// prompting. This pins the refusal path — the retirement is enforced by the
+// portal's answer, not by an attempt budget in the listener. A benign session
+// reset is covered separately
 // (`session_closed_rebinds_the_trigger_key_without_a_restart`).
 fn trigger_key_portal_revocation_leaves_cli_control_usable() {
     let runtime = TempDir::new().unwrap();
@@ -4730,9 +4751,9 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
     );
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
-    // The desktop closes the session. The listener clears the binding and makes
-    // exactly one rebind attempt, which the portal refuses (response 1): the
-    // Trigger Key is retired for good, and CLI start/stop/toggle keep working.
+    // The desktop closes the session. The listener clears the binding and
+    // rebinds; the portal refuses (response 1), which retires the Trigger Key
+    // for good while CLI start/stop/toggle keep working.
     portal.close_session();
     wait_for_shortcut(
         runtime.path(),
@@ -4758,22 +4779,16 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
         "1"
     );
 
-    // Exactly two BindShortcuts: the initial success plus the single refused
-    // re-attempt. Wait for the re-attempt to land, then confirm it never grows —
-    // a revocation costs one retry, never repeated reprompting.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while portal.bind_attempts() < 2 {
-        assert!(
-            Instant::now() < deadline,
-            "the closed session never triggered a rebind attempt"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    // Exactly two BindShortcuts: the initial success plus the refused
+    // re-attempt. Wait for the re-attempt to land, then confirm the count never
+    // grows — the refusal retired the listener, so there is no further
+    // prompting.
+    wait_for_bind_attempts(&portal, 2);
     thread::sleep(Duration::from_millis(200));
     assert_eq!(
         portal.bind_attempts(),
         2,
-        "a genuine revocation must not reprompt beyond one refused re-attempt"
+        "a refused rebind must retire the listener; the attempt count must not grow"
     );
 
     let diagnostics = daemon.terminate_and_stderr();
@@ -4956,8 +4971,12 @@ fn trigger_key_rebinds_after_the_activation_stream_drops() {
     // The daemon's D-Bus connection drops (its activation stream ends) and a
     // fresh bus and portal return at the same address — the suspend/resume
     // shape. A dropped stream is NOT a revocation: the listener must rebind the
-    // Trigger Key on its own, without a restart.
+    // Trigger Key on its own, without a restart. Synchronize on the second
+    // BindShortcuts call first — the displayed binding still shows the pre-drop
+    // Trigger Key, so waiting on that value alone could pass before the daemon
+    // even noticed the drop and the activation below would be lost.
     portal.drop_connection_then_return();
+    wait_for_bind_attempts(&portal, 2);
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
     // The rebound Trigger Key drives Recordings again.
@@ -4991,8 +5010,12 @@ fn session_closed_rebinds_the_trigger_key_without_a_restart() {
 
     // Session.Closed carries no reason, so it must NOT be treated as permanent:
     // the daemon rebinds on its own and the Trigger Key keeps working, with no
-    // manual restart.
+    // manual restart. The second BindShortcuts call is the proof the closure
+    // was processed and a new generation bound; only then is the displayed
+    // binding the rebound one and an activation guaranteed to hit the live
+    // session rather than race the retiring one.
     portal.close_session();
+    wait_for_bind_attempts(&portal, 2);
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
     portal.activate();

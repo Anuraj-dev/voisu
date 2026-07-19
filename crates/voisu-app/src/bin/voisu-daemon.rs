@@ -2356,11 +2356,16 @@ impl RebindBackoff {
 /// `Session.Closed` is likewise treated as recoverable — the XDG protocol gives
 /// it no reason, so a benign compositor/backend reset must not kill the binding.
 /// Only one truly permanent decision retires the listener for good: a refused
-/// bind (portal response 1, an explicit user cancellation). A genuine
-/// revocation therefore costs at most one silent re-attempt, which the refusal
-/// then retires — no repeated reprompting. Throughout, CLI start/stop/toggle
-/// stay fully usable and `voisu shortcut` never shows a stale binding. Tests
-/// substitute the portal edge by pointing
+/// bind (portal response 1, an explicit user cancellation), which stops all
+/// further prompting. A genuine revocation is expected to surface as exactly
+/// that refusal on the rebind after the closure — but the bound is the
+/// portal's to enforce, not this listener's: if the portal neither accepts nor
+/// refuses the rebind (a timeout, a response-2 hiccup), bounded-backoff
+/// re-attempts continue, because retiring on an unanswered rebind would
+/// permanently kill the Trigger Key on the benign resets this loop exists to
+/// survive. Throughout, CLI start/stop/toggle stay fully usable and
+/// `voisu shortcut` never shows a stale binding. Tests substitute the portal
+/// edge by pointing
 /// `DBUS_SESSION_BUS_ADDRESS` at a private bus running a controlled portal
 /// service — the daemon itself always runs this production listener.
 async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>) {
@@ -2443,10 +2448,12 @@ async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>) {
                         "Trigger Key session closed; rebinding the Trigger Key"
                     );
                     // A closed session is recoverable: clear the displayed
-                    // binding and rebind with backoff. If the user genuinely
-                    // revoked the Trigger Key, the next bind is refused (response
-                    // 1) and retires the listener then — so this costs at most
-                    // one silent re-attempt, never repeated reprompting.
+                    // binding and rebind with backoff. A genuine revocation is
+                    // expected to answer that rebind with a refusal (response
+                    // 1), which is what retires the listener; if the portal
+                    // neither accepts nor refuses, re-attempts continue on
+                    // backoff — the closure alone never retires the Trigger
+                    // Key, or a benign reset would kill it for good.
                     let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
                     announced_down = true;
                     if backoff.wait_or_shutdown(&actor).await {
