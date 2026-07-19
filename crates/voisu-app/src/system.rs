@@ -687,9 +687,25 @@ impl SecretStore for SecretToolStore {
                 // The keyring now holds the key, so migrate it out of the
                 // plaintext fallback: drop that provider's line (deleting the
                 // file when empty) so a later locked-at-boot window can never
-                // silently serve a stale plaintext key.
-                let _ = FileSecretStore::at_default().remove(provider);
-                Ok(())
+                // silently serve a stale plaintext key. A failed prune must
+                // not report a completed migration — the stale copy is still
+                // on disk and WOULD be served — so it is loud and an error.
+                match FileSecretStore::at_default().remove(provider) {
+                    Ok(_) => Ok(()),
+                    Err(_) => {
+                        warn_plaintext_copy_survived();
+                        Err(BoundaryError::new(
+                            BoundaryKind::SecretStorage,
+                            "plaintext prune failed after a successful keyring store",
+                        )
+                        .with_public_message(
+                            "the key was stored in your keyring, but the old plaintext \
+                             copy could not be removed and would still be used if the \
+                             keyring is locked — delete the credentials file next to \
+                             config.toml, then re-run `voisu doctor`",
+                        ))
+                    }
+                }
             }
             Err(reason) => {
                 warn_fallback(FallbackNotice::Store(reason));
@@ -733,12 +749,17 @@ impl SecretStore for SecretToolStore {
     }
 
     fn diagnose(&mut self, provider: Provider) -> KeyDiagnosis {
-        if let Some(credential) = std::env::var_os(provider.environment_variable())
-            .and_then(|value| Credential::new(value.to_string_lossy().into_owned()).ok())
-        {
-            return KeyDiagnosis::Found {
-                location: KeyLocation::EnvOverride,
-                credential,
+        // Mirror `load`: any PRESENT env variable is authoritative at runtime,
+        // so a present-but-malformed value (empty, stray newline) must be
+        // diagnosed as the broken override it is — never silently skipped in
+        // favour of the keyring/file key it shadows.
+        if let Some(value) = std::env::var_os(provider.environment_variable()) {
+            return match Credential::new(value.to_string_lossy().into_owned()) {
+                Ok(credential) => KeyDiagnosis::Found {
+                    location: KeyLocation::EnvOverride,
+                    credential,
+                },
+                Err(_) => KeyDiagnosis::EnvOverrideInvalid,
             };
         }
         let fallback = FileSecretStore::at_default();
@@ -917,6 +938,20 @@ fn warn_fallback(notice: FallbackNotice) {
             path
         ),
     }
+}
+
+/// The loud notice for a plaintext copy that survived a successful keyring
+/// store. It shares the fallback warnings' channel (stderr, naming the file
+/// and the remedy) but not their once-per-process gate: this is a distinct,
+/// rarer situation that must never be swallowed because an ordinary fallback
+/// warning fired first.
+fn warn_plaintext_copy_survived() {
+    let path = FileSecretStore::at_default().path().display().to_string();
+    eprintln!(
+        "voisu: WARNING — the key is stored in your keyring, but the old plaintext copy at \
+         {path} could not be removed. If the keyring is ever locked at start, that stale key \
+         would be used. Delete {path}, then re-run `voisu doctor`."
+    );
 }
 
 pub struct ProviderHttpClient;

@@ -600,6 +600,12 @@ pub enum KeyDiagnosis {
         location: KeyLocation,
         credential: Credential,
     },
+    /// The provider's environment override variable is set but its value
+    /// cannot form a credential (it is empty or contains a line break). The
+    /// override still wins at runtime, so a stored key is shadowed by a broken
+    /// one — callers must steer the user to unset or fix the variable, never
+    /// report the stored key as the effective one.
+    EnvOverrideInvalid,
     /// The keyring is reachable and holds no key, and no fallback file exists.
     Absent,
     /// The keyring is locked or refused access.

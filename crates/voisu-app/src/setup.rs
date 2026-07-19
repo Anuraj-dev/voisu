@@ -126,6 +126,18 @@ fn configure_provider(
                 return ProviderOutcome::Kept;
             }
         }
+        // The notice fires on the PRESENCE of the override, not on its
+        // parseability: a present-but-malformed value (empty, stray newline)
+        // still wins at runtime and breaks dictation, so it must be named
+        // before prompting for a key to store for after the fix.
+        KeyDiagnosis::EnvOverrideInvalid => {
+            let variable = provider.environment_variable();
+            io.writeln(&format!(
+                "Note: the {variable} environment variable is set but is not a usable key \
+                 (empty or contains a line break), and it overrides any stored key at runtime — \
+                 unset or fix {variable} before dictating."
+            ));
+        }
         // Absent, or the keyring could not be consulted (locked/unavailable/tool
         // missing): fall through and prompt for a key.
         _ => {}
@@ -443,6 +455,9 @@ mod tests {
     struct FakeStore {
         keys: HashMap<&'static str, String>,
         locations: HashMap<&'static str, KeyLocation>,
+        /// Providers whose env override is present but cannot form a
+        /// credential (empty or multi-line) — diagnosed before any stored key.
+        invalid_env: Vec<&'static str>,
         fail_replace: bool,
     }
 
@@ -464,6 +479,9 @@ mod tests {
             }
         }
         fn diagnose(&mut self, provider: Provider) -> KeyDiagnosis {
+            if self.invalid_env.contains(&provider.secret_service_value()) {
+                return KeyDiagnosis::EnvOverrideInvalid;
+            }
             match self.keys.get(provider.secret_service_value()) {
                 Some(value) => KeyDiagnosis::Found {
                     location: self
@@ -584,6 +602,34 @@ mod tests {
             "{}",
             io.transcript()
         );
+    }
+
+    #[test]
+    fn a_present_but_invalid_env_override_is_flagged_before_prompting() {
+        // The env notice must fire on the PRESENCE of the variable, not on its
+        // parseability: an empty/multi-line override still wins at runtime and
+        // silently breaks dictation, so the wizard must name it before
+        // prompting for a key to store.
+        let mut store = FakeStore::default();
+        store.invalid_env.push("deepgram");
+        let mut io = FakeIo::new(vec![Some("deepgram-key"), Some("")], vec![]);
+        let mut validator = FakeValidator {
+            statuses: vec![ProviderKeyStatus::Valid],
+        };
+        let outcome = run_setup(&mut io, &mut store, &mut validator);
+        assert!(
+            io.transcript().contains("VOISU_DEEPGRAM_API_KEY"),
+            "the broken override must be named: {}",
+            io.transcript()
+        );
+        assert!(
+            io.transcript().contains("unset or fix"),
+            "the remedy must be stated: {}",
+            io.transcript()
+        );
+        // The wizard still prompts so a key can be stored for after the fix.
+        assert_eq!(outcome.deepgram, ProviderOutcome::Stored);
+        assert_eq!(store.keys.get("deepgram").map(String::as_str), Some("deepgram-key"));
     }
 
     #[test]

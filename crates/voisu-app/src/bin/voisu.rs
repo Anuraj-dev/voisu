@@ -333,6 +333,17 @@ fn doctor_provider_keys(runtime: &tokio::runtime::Runtime) -> bool {
             KeyDiagnosis::ToolMissing => println!(
                 "{label} key: secret-tool is not installed — install libsecret-tools, or run `voisu setup` (WARN)"
             ),
+            // A present env override always wins at runtime, so a malformed
+            // one shadows every stored key and breaks dictation: a hard
+            // failure naming the variable, never a PASS on the shadowed key.
+            KeyDiagnosis::EnvOverrideInvalid => {
+                has_failure = true;
+                let variable = provider.environment_variable();
+                println!(
+                    "{label} key: {variable} is set but is not a usable key (empty or contains \
+                     a line break), and it overrides any stored key — unset or fix {variable} (FAIL)"
+                );
+            }
             KeyDiagnosis::Absent => {
                 println!("{label} key: not configured — run `voisu setup` (WARN)");
                 println!("  {}", provider_free_tier_hint(provider));

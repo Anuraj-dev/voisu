@@ -10,6 +10,7 @@
 
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use voisu_core::{BoundaryError, BoundaryKind, Credential, Provider};
@@ -54,6 +55,7 @@ impl FileSecretStore {
         // that do not honour Unix modes rather than refusing to store.
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
 
+        let _lock = CredentialsLock::acquire(&self.path)?;
         let existing = self.read_lines()?;
         let rendered = merge_line(&existing, provider, credential.expose_to_boundary());
         self.write_atomic(parent, &rendered)
@@ -82,6 +84,16 @@ impl FileSecretStore {
     /// more credentials. Returns whether a line was actually removed. Used to
     /// migrate a key out of the plaintext file when the keyring accepts it.
     pub fn remove(&self, provider: Provider) -> Result<bool, BoundaryError> {
+        // A missing parent directory means no credentials file can exist, so
+        // there is nothing to lock or prune (and `remove` must not create the
+        // directory just to lock inside it).
+        let _lock = match CredentialsLock::acquire(&self.path) {
+            Ok(lock) => lock,
+            Err(_) if self.path.parent().is_none_or(|parent| !parent.exists()) => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
         let existing = match std::fs::read_to_string(&self.path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -174,6 +186,71 @@ impl FileSecretStore {
         let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
         Ok(())
     }
+}
+
+/// An exclusive advisory lock serialising every fallback-file mutation
+/// (`store` and `remove`) across processes, mirroring the repository's
+/// `DictionaryLock` convention (kernel `flock(2)` on a stable sibling file,
+/// held from before the read through after the atomic rename/delete). Two
+/// concurrent mutations otherwise each read their own snapshot and the last
+/// write silently discards — or resurrects — the other's line: a migration
+/// pruning Deepgram from a stale snapshot would delete the file just after a
+/// keyring-less process atomically wrote Groq's ONLY copy. Readers stay
+/// lock-free: the atomic persist already hands them the old or the new file,
+/// never a torn edit.
+struct CredentialsLock {
+    _file: std::fs::File,
+}
+
+impl CredentialsLock {
+    fn acquire(credentials_path: &Path) -> Result<Self, BoundaryError> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(lock_path(credentials_path))
+            .map_err(|_| {
+                BoundaryError::new(
+                    BoundaryKind::SecretStorage,
+                    "cannot open the credential fallback lock file",
+                )
+            })?;
+        // Blocking exclusive advisory lock. flock is tied to the open file
+        // description, so two threads in this process (each with its own open
+        // fd) serialise against each other exactly as separate processes do.
+        // SAFETY: a valid, owned fd is passed to a libc call with no other
+        // preconditions; the return value is checked below.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(BoundaryError::new(
+                BoundaryKind::SecretStorage,
+                "cannot lock the credential fallback file",
+            ));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+impl Drop for CredentialsLock {
+    fn drop(&mut self) {
+        // Releasing on drop is belt-and-braces: closing the fd already drops
+        // the lock. SAFETY: the fd is still open and owned until this drops.
+        unsafe {
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// The sibling lock file for the credentials path: `credentials` →
+/// `credentials.lock`. The lock file itself never holds a secret, so it is
+/// simply left in place.
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_else(|| std::ffi::OsString::from("credentials"));
+    name.push(".lock");
+    path.with_file_name(name)
 }
 
 /// The file key for a provider: the same lowercase token used on the Secret
@@ -318,6 +395,80 @@ mod tests {
             "deepgram-key"
         );
         assert!(store.path().exists(), "the file survives while a key remains");
+    }
+
+    #[test]
+    fn fallback_file_mutations_serialise_on_the_sibling_lock() {
+        // `flock(2)` is tied to the open file description, so a second fd in
+        // this process contends exactly as a separate process would (the same
+        // property `DictionaryLock` relies on). While the lock is held, a
+        // concurrent `store`/`remove` must block — otherwise two processes each
+        // read a stale snapshot and the last atomic rename silently discards
+        // (or resurrects) the other's line.
+        use std::os::unix::io::AsRawFd;
+        use std::time::Duration;
+
+        let (_dir, store) = temp_store();
+        store
+            .store(Provider::Groq, &Credential::new("groq-key".to_owned()).unwrap())
+            .unwrap();
+
+        let lock_path = store.path().with_file_name("credentials.lock");
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .expect("mutations must create the sibling lock file");
+        // SAFETY: a valid, owned fd passed to flock; return value checked.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        // A store from an independent handle must wait for the lock.
+        let path = store.path().to_path_buf();
+        let (stored_tx, stored_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let other = FileSecretStore::at(path);
+            other
+                .store(Provider::Deepgram, &Credential::new("deepgram-key".to_owned()).unwrap())
+                .unwrap();
+            let _ = stored_tx.send(());
+        });
+        assert!(
+            stored_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a concurrent store must block while the lock is held"
+        );
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
+        stored_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the blocked store must complete once the lock is released");
+        writer.join().unwrap();
+
+        // A remove must serialise the same way.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let path = store.path().to_path_buf();
+        let (removed_tx, removed_rx) = std::sync::mpsc::channel();
+        let remover = std::thread::spawn(move || {
+            let other = FileSecretStore::at(path);
+            assert!(other.remove(Provider::Groq).unwrap());
+            let _ = removed_tx.send(());
+        });
+        assert!(
+            removed_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a concurrent remove must block while the lock is held"
+        );
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
+        removed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the blocked remove must complete once the lock is released");
+        remover.join().unwrap();
+
+        // The serialised interleaving lost nothing: Deepgram's line survived
+        // the remove that ran from a different handle's snapshot.
+        assert!(store.read(Provider::Groq).unwrap().is_none());
+        assert_eq!(
+            store.read(Provider::Deepgram).unwrap().unwrap().expose_to_boundary(),
+            "deepgram-key"
+        );
     }
 
     #[test]

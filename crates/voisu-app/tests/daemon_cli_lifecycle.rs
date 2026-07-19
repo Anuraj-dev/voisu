@@ -2775,6 +2775,43 @@ fn doctor_reports_a_bare_429_as_quota_and_a_missing_key_as_a_warning() {
 }
 
 #[test]
+fn doctor_fails_a_present_but_invalid_env_override_naming_the_variable() {
+    // An exported-but-empty override wins at runtime (`load` treats any present
+    // variable as authoritative), so doctor must FAIL it and name the variable
+    // — not silently fall through to the keyring key and print PASS.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "none"),
+            ("VOISU_DISABLE_DEEPGRAM", "1"),
+            // A healthy stored key that the broken override shadows at runtime.
+            ("VOISU_TEST_SECRET_STORE", "available"),
+            ("VOISU_TEST_STORED_GROQ_CREDENTIAL", "groq-key"),
+            ("VOISU_TEST_AUTH_GROQ", "authorized"),
+            ("VOISU_GROQ_API_KEY", ""),
+        ],
+    );
+
+    assert_eq!(doctor.status.code(), Some(4), "a broken override is a hard failure: {}", stdout(&doctor));
+    assert!(
+        stdout(&doctor).contains("unset or fix VOISU_GROQ_API_KEY"),
+        "the remedy must name the variable: {}",
+        stdout(&doctor)
+    );
+    assert!(
+        !stdout(&doctor).contains("Groq key: key valid (PASS)"),
+        "the shadowed keyring key must not be reported as effective: {}",
+        stdout(&doctor)
+    );
+}
+
+#[test]
 fn auth_set_replaces_a_credential_without_echoing_it() {
     let runtime = TempDir::new().unwrap();
     let first = voisu_with_secret(
@@ -2828,6 +2865,56 @@ fn a_locked_keyring_falls_back_to_a_0600_file_with_a_loud_warning() {
     let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "fallback file must be owner-only");
     assert!(fs::read_to_string(&file).unwrap().contains("deepgram=controlled-secret"));
+}
+
+#[test]
+fn auth_set_reports_a_surviving_plaintext_copy_instead_of_claiming_migration() {
+    // The keyring store succeeds, but the old plaintext copy cannot be removed
+    // (config dir non-writable). Claiming success would leave a stale key that
+    // a later locked-at-boot load silently serves — the command must instead
+    // warn loudly and refuse to report a completed migration.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let dir = config_home.path().join("voisu");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("credentials");
+    fs::write(&file, "groq=stale-plaintext-secret\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    // The directory refuses writes, so pruning the plaintext line must fail.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let stored = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[
+            ("VOISU_TEST_SECRET_STORE", "available"),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+        ],
+        "fresh-secret",
+    );
+
+    // Restore permissions so the TempDir can clean up.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(
+        stored.status.code(),
+        Some(4),
+        "a surviving plaintext copy must not report success: {}",
+        stderr(&stored)
+    );
+    let warning = stderr(&stored);
+    assert!(warning.contains("WARNING"), "the leftover must be loud: {warning}");
+    assert!(
+        warning.contains("plaintext copy"),
+        "the leftover plaintext copy must be named: {warning}"
+    );
+    assert!(!warning.contains("stale-plaintext-secret"), "no credential may leak: {warning}");
+    assert!(!warning.contains("fresh-secret"), "no credential may leak: {warning}");
+    // The stale copy is in fact still on disk — the truth being reported.
+    assert!(
+        fs::read_to_string(&file).unwrap().contains("stale-plaintext-secret"),
+        "the scenario requires the plaintext copy to survive"
+    );
 }
 
 #[test]
@@ -3057,11 +3144,20 @@ fn auth_set_is_bounded_when_a_descendant_holds_the_pipes_past_child_exit() {
         &[("PATH", &commands.path()), ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())],
         "controlled-secret",
     );
-    // Bounded and non-leaking are the invariants; the outcome falls back to file.
+    // Bounded, non-leaking, AND a real outcome: the descendant-held pipes read
+    // as a keyring failure, so the store must still succeed by falling back to
+    // the 0600 file — loudly. Without these asserts a regression to exit 4, a
+    // crash, or a missing fallback file would pass on timing alone.
+    assert!(held.status.success(), "{}", stderr(&held));
     assert!(
         started.elapsed() < Duration::from_secs(4),
         "pipe-reader joins must be bounded when a descendant holds the pipes, elapsed {:?}",
         started.elapsed()
+    );
+    assert!(stderr(&held).contains("WARNING"), "the fallback must be loud: {}", stderr(&held));
+    assert!(
+        config_home.path().join("voisu").join("credentials").exists(),
+        "the bounded failure must still land the credential in the fallback file"
     );
     assert!(!stderr(&held).contains("controlled-secret"));
 }
