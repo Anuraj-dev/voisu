@@ -1,65 +1,77 @@
 # Voisu — State
-> Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-19 (night)
+> Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-20 (early AM)
 
 ## 🚧 In progress / next
-- **Friends map (.scratch/voisu-friends/, GH #32) — phase A is 7/8 done.** Remaining:
-  1. **Ticket 06 (keyring probe, GH #38): BLOCKED on Raja rebooting/logging in fresh.** Dispatch after.
-  2. **Ticket 07 (setup wizard, GH #39):** after 06.
-  3. **Phase B (tickets 09–15, GH #41–47):** 09 is Raja's guided accounts HITL checklist, then packaging.
-- **HITL queue for Raja:** (a) live KDE test of guarded mode (`voisu delivery guarded` → restart → focus-hold
-  auto-types / focus-switch falls to clipboard+notification) — merge NOT gated, post-merge check;
-  (b) reboot for ticket 06; (c) live GNOME VM visual check of the overlay fallback before friend rollout;
-  (d) on next RPM install: DELETE `~/.config/systemd/user/voisu{,-overlay}.service.d/sandbox-validation.conf`.
-- **ROUTING CHANGE (Raja, 2026-07-19, pinned in CLAUDE.md):** Codex quota nearly exhausted — Sol/Codex =
-  REVIEWS ONLY; ALL implementation → Opus 4.8 subagents (Fable subagent if architectural). No Terra/Luna.
+- **PHASE A COMPLETE** (friends map, .scratch/voisu-friends/, GH #32). Next: **phase B**.
+  1. **Ticket 09 (GH #41) — Raja's guided accounts checklist: STARTING NOW** in a fresh Fable-medium
+     session (handoff prompt delivered; Raja is live for HITL).
+  2. Then packaging tickets 10–15 (GH #42–47); ticket 10 = cargo-deb (GH #42) is unblocked.
+- **HITL queue for Raja:** (a) reboot + suspend/resume check of the Trigger Key self-heal (PR #61) on the
+  next installed-binary update — also note whether KDE re-prompts after a real shortcut revocation;
+  (b) live KDE guarded-mode test (PR #56); (c) GNOME VM visual check of overlay fallback (PR #59);
+  (d) live `voisu setup` smoke vs real ksecretd + real Deepgram/Groq keys (PR #62);
+  (e) optional: install keyring probe kit (.scratch/voisu-friends/assets/06-keyring-probe/INSTALL.md),
+  reboot, check `journalctl --user -t voisu-keyring-probe -b`; (f) on next RPM install delete
+  `~/.config/systemd/user/voisu{,-overlay}.service.d/sandbox-validation.conf`.
 
 ## Status
-- **Fix batch DONE (2026-07-18/19):** Deepgram default ON (PR #48), hardening-05 sweep (PR #49),
-  keyterm cap by priority (PR #51), service-ready deadline split (PR #52), overlay unavailable-capsule
-  fix (PR #54). The externally-reported "Daemon unavailable never times out" finding is FULLY RESOLVED
-  (#54 edge-triggered flash + separate unavailable_until deadline; #59 resurface/notify tracker).
-- **Map tickets closed:** 01 ADR 0007 (PR #53) · 02 delivery_mode (PR #55) · 03 focus research (asset)
-  · 04 guarded delivery (PR #56) · 05 dictionary CLI + hot-reload (PR #57) · 08 GNOME fallback (PR #59).
-- Test baseline: **391 passed / 0 failed**, both default and `--features voisu-app/overlay`.
-- CI flake tracked: **GH #58** — managed_service_lifecycle goes *inactive* under the 3x parallel flake
-  gate (4 hits, always passes on rerun; deadline bump didn't fix; needs journal capture or isolation).
-- Repo is now **PUBLIC** (Raja: free Actions minutes; private billing was blocked).
-- `docs/model-benchmark.md` rows through 156 (Opus/Sol per-ticket verdicts this session).
+- **Ticket 06 (keyring probe) closed 2026-07-19:** Secret Service = ksecretd (PAM-launched, NOT kwalletd6),
+  reachable AND unlocked ~29s before daemon start, 45–48ms round trips, zero prompts. Asset:
+  .scratch/voisu-friends/assets/06-keyring-service-probe.md.
+- **GH #60 fixed via PR #61 (merged):** Trigger Key now self-heals across reboot/suspend — backoff rebind
+  (1s→30s cap, indefinite), Session.Closed recoverable, only portal response 1 (refusal) retires it.
+- **Ticket 07 closed via PR #62 (merged, 5 review rounds):** `voisu setup` wizard (injected-IO, signal-safe
+  hidden entry), keyring storage on the secret-tool boundary (NO keyring crate — dep-stack deviation
+  reviewer-endorsed), flock-serialized loud 0600 fallback, real plaintext→keyring migration with
+  content-aware prune classification, `voisu doctor` provider-key classification incl. malformed-env FAIL.
+  Deferred follow-up (in PR #62 body): wizard-scale keyring deadline vs 2s PROCESS_DEADLINE.
+- Test baseline: **431 passed / 0 failed**, both default and `--features voisu-app/overlay`.
+- CI flake #58 family: managed_service_lifecycle + service_cli batch (5 local failures once, clean rerun)
+  + "controlled processing panic" unit test — all rerun-once, never twice on the same PR.
+- `docs/model-benchmark.md` rows through 172.
+- **ROUTING (Raja):** Sol/cladex = REVIEWS ONLY (first high, re-reviews medium); ALL implementation →
+  Opus 4.8 high (architectural → Fable medium); Sol dispatch fails → retry Sol once → Fable subagent;
+  2 failed review rounds → discard implementer → Fable.
 
 ## Architecture map
-- Domain, IPC, Transcript decision, FocusProbe trait -> `crates/voisu-core/src/lib.rs`, `diagnostics.rs`
-- Fedora capture/provider/clipboard/portal/libei adapters + GuardedDelivery + GroqProvider::with_prompt -> `crates/voisu-app/src/system.rs`
+- Domain, IPC, Transcript decision, FocusProbe trait, ShortcutEvent, KeyDiagnosis, ProviderKeyStatus -> `crates/voisu-core/src/lib.rs`
+- Fedora capture/provider/clipboard/portal/libei adapters, GuardedDelivery, SecretToolStore (retry+diagnose+replace), portal_request permanence -> `crates/voisu-app/src/system.rs`
+- Setup wizard (WizardIo/SecretStore/KeyValidator traits, EchoGuard) -> `crates/voisu-app/src/setup.rs`
+- Fallback credentials file (CredentialsLock flock, RemoveError content-aware classification) -> `crates/voisu-app/src/secret_file.rs`
 - Focus probes (KWin script/D-Bus push + sender auth, hyprctl, Null) -> `crates/voisu-app/src/focus.rs`
-- Recording/replay supervision, per-Recording dictionary snapshot, delivery_mode wiring -> `crates/voisu-app/src/bin/voisu-daemon.rs`
-- Persisted config (deepgram_enabled + delivery_mode, both-key writer) -> `crates/voisu-app/src/config.rs`
-- Dictionary file edits (flock-serialized) + Whisper prompt + keyterm cap -> `crates/voisu-app/src/dictionary.rs`
-- Public CLI (`voisu deepgram|delivery|dictionary|history`; setup lands here) -> `crates/voisu-app/src/bin/voisu.rs`
-- GTK Overlay + pure controllers (PresentationController/Tracker, NotifyLatch, poll_tick) -> `crates/voisu-app/src/bin/voisu-overlay.rs`, `overlay.rs`, `feedback.rs`
-- Daemon + Overlay user-service lifecycle -> `crates/voisu-app/src/service.rs`
-- RPM units/spec/build/smoke -> `packaging/` · CI gates -> `.github/workflows/ci.yml`
-- Friends map -> `.scratch/voisu-friends/` (map.md has per-ticket resolution lines; issues/01–15)
-- Research digest -> `.scratch/voisu-research/2026-07-18-distribution-decisions.md`
+- Recording/replay supervision, shortcut_listener self-heal (RebindBackoff, VOISU_TEST_SHORTCUT_REBIND_*_MS seams) -> `crates/voisu-app/src/bin/voisu-daemon.rs`
+- Persisted config (both-key-preserving writer) -> `crates/voisu-app/src/config.rs`
+- Dictionary (flock-serialized) + keyterm cap -> `crates/voisu-app/src/dictionary.rs`
+- Public CLI (`voisu setup|doctor|deepgram|delivery|dictionary|history|auth`) -> `crates/voisu-app/src/bin/voisu.rs`
+- GTK Overlay + pure controllers -> `crates/voisu-app/src/bin/voisu-overlay.rs`, `overlay.rs`, `feedback.rs`
+- Service lifecycle -> `crates/voisu-app/src/service.rs` · RPM/CI -> `packaging/`, `.github/workflows/ci.yml`
+- Friends map + per-ticket resolutions -> `.scratch/voisu-friends/` (map.md; issues/01–15; assets/)
 
 ## Stack & run
 - Stack: Rust 2024 + Tokio + serde + zbus 5 + GTK4 (opt-in) + runtime libei + flacenc · Run: `cargo run -p voisu-app --bin voisu-daemon` · Test: `cargo test --workspace`
 - Robust test count: `cargo test --workspace 2>&1 | grep -oE "[0-9]+ passed; [0-9]+ failed" | awk '{p+=$1; f+=$3} END {print p, f}'`
 
 ## Key decisions (top; full log in decisions.md)
-- **Codex = reviews only; Claude implements everything** (Raja 2026-07-19; quota). Sol first review high, re-reviews medium; Sol-implemented code → Opus reviews.
-- **Guarded delivery**: strict stable_id-only match; fail closed on unknown; KWin all-string D-Bus wire (callDBus INT32 trap) + sender auth + 10-min staleness bound; long-dwell clipboard fallback is the accepted tradeoff.
-- **Dictionary edits flock-serialized**; per-Recording snapshot feeds BOTH providers; supervised tail never touches the fs.
-- **GNOME**: plain-window fallback with re-present-on-visible-transition + Recording notification from OBSERVED daemon states; wl-copy shell-out stays (Flatpak-proofing = phase B).
-- **GTK4 locked, Electron rejected** (ADR 0007); packaging = cargo-deb + AUR + COPR + apt repo, one on-tag workflow.
+- **Trigger Key permanence contract (PR #61):** only a refused bind (portal response 1) retires the
+  listener; Session.Closed and stream death are recoverable; the no-reprompt bound is the portal's to
+  enforce, not the listener's.
+- **No `keyring` crate (PR #62):** both its Secret Service backends drag duplicate D-Bus stacks next to
+  zbus 5; secret-tool boundary delivers the same intent with zero new deps.
+- **Fallback-file honesty (PR #62):** prune outcome keyed on target-provider line content —
+  gone/survived/unverifiable — classified once in FileSecretStore::remove; all mutations flock-serialized.
+- **Codex = reviews only; Claude implements** (Raja 2026-07-19); Sol retry-once-then-Fable (2026-07-19).
+- **Guarded delivery**: strict stable_id-only match; fail closed on unknown (PR #56).
 
 ## Gotchas
 - **cladex JSON output carries ONLY the final message** — every review prompt must demand self-contained
-  final findings (one Sol review was lost and re-dispatched; rule now standing).
+  final findings. One dispatch died silently (proxy start/stop only) — hence retry-once-then-Fable.
+- **Resumed subagents may arm a Monitor and stall** — dispatch prompts for resumed agents should say
+  "run everything synchronously; do not wait on monitors" (one Fable fix round stalled this way).
 - **No local clippy (no rustup)** — CI is the only clippy oracle; keep diffs lint-clean by inspection.
-- Disk tight (~7 GB free after cleanup; target/debug/incremental deleted 2026-07-19, wavs purged).
-  `cargo clean` before RPM builds; `TMPDIR=/var/tmp RUST_TEST_THREADS=4`.
-- **Don't switch branches while a tree-using agent runs** (one collision + one near-miss this session).
-- CI flake #58: rerun the test gate once before investigating; if it recurs on the same PR twice, stop.
-- Deepgram keyterms capped (user-first, 500-token/100-term) — safe now, still don't bloat the glossary.
+- Disk tight (~7 GB free). `cargo clean` before RPM builds; `TMPDIR=/var/tmp RUST_TEST_THREADS=4`.
+- **Don't switch branches while a tree-using agent runs.**
+- CI/local flake family (#58): rerun once; twice on the same PR → stop and investigate.
+- gh's GraphQL PR-edit is broken on this repo (deprecated Projects-classic) — PATCH PR bodies via
+  `gh api -X PATCH repos/Anuraj-dev/voisu/pulls/<n> -F body=@file`.
 - `packaging/build-rpm.sh` needs a clean COMMITTED checkout · COPR builders have NO network (vendor crates).
-- Hyprland RemoteDesktop/EIS needs a live smoke before promising auto-type on Omarchy.
 - Use `CONTEXT.md` terms exactly; default builds GTK-free (`--features overlay` for the Overlay).

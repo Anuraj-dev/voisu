@@ -458,3 +458,21 @@ per rendered transition into a visible phase. The Recording notification derives
 states (RecordingNotifyLatch): an unreachable blip mid-Recording must not re-notify — rendered-phase
 edges alone refire across the unavailable capsule. Clipboard keeps the wl-copy shell-out (speaks
 wl_data_device, works on GNOME); Flatpak-proofing deferred to phase-B packaging.
+
+## 2026-07-20 — Trigger Key permanence = portal refusal only (PR #61)
+**Why:** XDG protocol gives Session.Closed no reason field, and connection death is indistinguishable
+from benign compositor resets — treating either as revocation left the shortcut permanently dead after
+reboot/suspend (GH #60). Only an explicit response-1 refusal retires the listener; everything else
+rebinds on bounded backoff. Rejected: a listener-side one-reattempt budget (would re-break self-healing
+when a benign reset's first rebind fails transiently).
+
+## 2026-07-20 — No `keyring` crate; secret-tool boundary for key storage (PR #62)
+**Why:** both keyring backends drag a duplicate D-Bus stack (C libdbus or zbus 4 + async-io/aes) beside
+our zbus 5 — COPR vendored-build bloat for zero capability gain. The existing secret-tool boundary
+delivers keyring-primary + loud 0600 fallback + no startup blocking with zero new deps. Reviewer-endorsed.
+
+## 2026-07-20 — Fallback-file prune honesty: content-keyed tri-state, classified once (PR #62)
+**Why:** three review rounds of false alarms proved existence checks lie (file present ≠ target
+provider's line present; lock uncreatable ≠ copy survived). Outcome (gone/survived/unverifiable) is
+keyed on the target provider's line and classified solely inside FileSecretStore::remove; callers relay.
+All fallback-file mutations flock-serialized (CredentialsLock mirrors DictionaryLock).
