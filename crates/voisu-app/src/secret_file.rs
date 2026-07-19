@@ -78,6 +78,61 @@ impl FileSecretStore {
         }
     }
 
+    /// Removes a provider's line, deleting the file entirely once it holds no
+    /// more credentials. Returns whether a line was actually removed. Used to
+    /// migrate a key out of the plaintext file when the keyring accepts it.
+    pub fn remove(&self, provider: Provider) -> Result<bool, BoundaryError> {
+        let existing = match std::fs::read_to_string(&self.path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => {
+                return Err(BoundaryError::new(
+                    BoundaryKind::SecretStorage,
+                    "cannot read the credential fallback file before pruning",
+                ));
+            }
+        };
+        let key = provider_key(provider);
+        let mut kept: Vec<&str> = Vec::new();
+        let mut removed = false;
+        for line in existing.lines() {
+            if line == HEADER.trim_end() {
+                continue;
+            }
+            match line.split_once('=') {
+                Some((name, _)) if name.trim() == key => removed = true,
+                _ => kept.push(line),
+            }
+        }
+        if !removed {
+            return Ok(false);
+        }
+        // Delete the file outright when no credentials remain, so a migrated
+        // fallback leaves nothing plaintext behind.
+        if kept.iter().all(|line| line.trim().is_empty()) {
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => return Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                Err(_) => {
+                    return Err(BoundaryError::new(
+                        BoundaryKind::SecretStorage,
+                        "cannot delete the emptied credential fallback file",
+                    ));
+                }
+            }
+        }
+        let parent = self.path.parent().ok_or_else(|| {
+            BoundaryError::new(BoundaryKind::SecretStorage, "credential fallback path has no parent")
+        })?;
+        let mut body = String::from(HEADER);
+        for line in kept {
+            body.push_str(line);
+            body.push('\n');
+        }
+        self.write_atomic(parent, &body)?;
+        Ok(true)
+    }
+
     fn read_lines(&self) -> Result<String, BoundaryError> {
         match std::fs::read_to_string(&self.path) {
             Ok(contents) => Ok(contents),
@@ -233,6 +288,36 @@ mod tests {
         assert_eq!(body.matches("groq=").count(), 1, "{body}");
         assert_eq!(body.matches("deepgram=").count(), 1, "{body}");
         assert_eq!(body.matches("# Voisu credential fallback").count(), 1, "{body}");
+    }
+
+    #[test]
+    fn removing_the_last_provider_deletes_the_file() {
+        let (_dir, store) = temp_store();
+        store
+            .store(Provider::Groq, &Credential::new("groq-key".to_owned()).unwrap())
+            .unwrap();
+        assert!(store.remove(Provider::Groq).unwrap(), "a stored key is removed");
+        assert!(!store.path().exists(), "an emptied fallback file is deleted");
+        // Removing an absent provider is a no-op, not an error.
+        assert!(!store.remove(Provider::Groq).unwrap());
+    }
+
+    #[test]
+    fn removing_one_provider_preserves_the_other() {
+        let (_dir, store) = temp_store();
+        store
+            .store(Provider::Groq, &Credential::new("groq-key".to_owned()).unwrap())
+            .unwrap();
+        store
+            .store(Provider::Deepgram, &Credential::new("deepgram-key".to_owned()).unwrap())
+            .unwrap();
+        assert!(store.remove(Provider::Groq).unwrap());
+        assert!(store.read(Provider::Groq).unwrap().is_none());
+        assert_eq!(
+            store.read(Provider::Deepgram).unwrap().unwrap().expose_to_boundary(),
+            "deepgram-key"
+        );
+        assert!(store.path().exists(), "the file survives while a key remains");
     }
 
     #[test]

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use voisu_core::{
     socket_path, ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture,
     BoundaryKind, CancelRegistry, CapturedAudio, Command as DaemonCommand, Credential,
-    DeliveryAdapter, DeliveryOutcome, Provider,
+    DeliveryAdapter, DeliveryOutcome, KeyDiagnosis, KeyLocation, Provider,
     ProviderAuthenticator, ProviderKeyStatus, ProviderStream, ReadinessCapability, ReadinessFinding,
     MergeResult, ReadinessInspector, ReadinessStatus, ReconciliationKind, ReconciliationModel,
     Request, Response, SecretStore, ShortcutPortal, ShortcutSession, SourceTranscript, Transcript,
@@ -577,13 +577,16 @@ pub struct SecretToolStore;
 
 /// Why the desktop Secret Service could not serve a request. It selects the
 /// fallback warning wording — ticket 06 established that an unowned/activatable
-/// name is a distinct failure from an owned-but-locked collection.
+/// name is a distinct failure from an owned-but-locked collection, and a missing
+/// helper binary is distinct from both.
 #[derive(Clone, Copy)]
 enum FallbackReason {
     /// No Secret Service owns `org.freedesktop.secrets`, or it could not start.
     Unavailable,
     /// The service answered but is locked or refused access.
     Locked,
+    /// The `secret-tool` helper binary is not installed.
+    ToolMissing,
 }
 
 impl FallbackReason {
@@ -593,6 +596,7 @@ impl FallbackReason {
                 "no desktop Secret Service is available on this session (no keyring is running or activatable)"
             }
             Self::Locked => "the desktop keyring is locked or refused access",
+            Self::ToolMissing => "the secret-tool helper is not installed",
         }
     }
 
@@ -602,8 +606,34 @@ impl FallbackReason {
                 "start a Secret Service (KWallet or GNOME Keyring) then re-run `voisu setup` to migrate"
             }
             Self::Locked => "unlock your keyring (e.g. in KWallet) then re-run `voisu setup` to migrate",
+            Self::ToolMissing => {
+                "install secret-tool (libsecret-tools) then re-run `voisu setup` to migrate"
+            }
         }
     }
+
+    /// The reason-specific error surfaced when no credential can be produced —
+    /// its public message steers the user at the real fix, not a generic hint.
+    fn load_error(self) -> BoundaryError {
+        BoundaryError::new(BoundaryKind::SecretStorage, "keyring load failed")
+            .with_public_message(match self {
+                Self::Unavailable => {
+                    "no desktop Secret Service is available; run `voisu setup` to store a key"
+                }
+                Self::Locked => "the desktop keyring is locked; unlock it, or run `voisu setup`",
+                Self::ToolMissing => "the secret-tool helper is not installed",
+            })
+    }
+}
+
+/// The situation that triggered a plaintext-fallback warning. Storing to the
+/// file and reading from it are different acts with different wording, and
+/// reading plaintext while the keyring is actually available is a migration
+/// nudge, not a keyring failure.
+enum FallbackNotice {
+    Store(FallbackReason),
+    Read(FallbackReason),
+    ReadWhileKeyringAvailable,
 }
 
 /// The default desktop keyring retry budget: one immediate attempt then short
@@ -653,9 +683,16 @@ enum LoadStep {
 impl SecretStore for SecretToolStore {
     fn replace(&mut self, provider: Provider, credential: Credential) -> Result<(), BoundaryError> {
         match store_primary(provider, &credential) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // The keyring now holds the key, so migrate it out of the
+                // plaintext fallback: drop that provider's line (deleting the
+                // file when empty) so a later locked-at-boot window can never
+                // silently serve a stale plaintext key.
+                let _ = FileSecretStore::at_default().remove(provider);
+                Ok(())
+            }
             Err(reason) => {
-                warn_fallback_once(reason);
+                warn_fallback(FallbackNotice::Store(reason));
                 FileSecretStore::at_default().store(provider, &credential)
             }
         }
@@ -667,15 +704,67 @@ impl SecretStore for SecretToolStore {
         if let Some(credential) = std::env::var_os(provider.environment_variable()) {
             return Credential::new(credential.to_string_lossy().into_owned());
         }
+        let fallback = FileSecretStore::at_default();
         match load_primary(provider) {
             LoadPrimary::Found(credential) => Ok(credential),
-            // A definitively absent key still consults the fallback file (a prior
-            // headless `voisu setup` may have written it) before giving up.
-            LoadPrimary::Missing => read_fallback_credential(provider),
-            LoadPrimary::Failed(reason) => {
-                warn_fallback_once(reason);
-                read_fallback_credential(provider)
-            }
+            // Keyring reachable but no key: a prior headless fallback write may
+            // still hold it — reading that plaintext while the keyring is
+            // available is a migration nudge, not a keyring failure.
+            LoadPrimary::Missing => match fallback.read(provider)? {
+                Some(credential) => {
+                    warn_fallback(FallbackNotice::ReadWhileKeyringAvailable);
+                    Ok(credential)
+                }
+                None => Err(BoundaryError::new(
+                    BoundaryKind::SecretStorage,
+                    "no stored credential for provider",
+                )),
+            },
+            // Keyring unreachable: only warn about reading the file when we
+            // actually read one; otherwise surface the keyring's real problem.
+            LoadPrimary::Failed(reason) => match fallback.read(provider)? {
+                Some(credential) => {
+                    warn_fallback(FallbackNotice::Read(reason));
+                    Ok(credential)
+                }
+                None => Err(reason.load_error()),
+            },
+        }
+    }
+
+    fn diagnose(&mut self, provider: Provider) -> KeyDiagnosis {
+        if let Some(credential) = std::env::var_os(provider.environment_variable())
+            .and_then(|value| Credential::new(value.to_string_lossy().into_owned()).ok())
+        {
+            return KeyDiagnosis::Found {
+                location: KeyLocation::EnvOverride,
+                credential,
+            };
+        }
+        let fallback = FileSecretStore::at_default();
+        match load_primary(provider) {
+            LoadPrimary::Found(credential) => KeyDiagnosis::Found {
+                location: KeyLocation::Keyring,
+                credential,
+            },
+            LoadPrimary::Missing => match fallback.read(provider) {
+                Ok(Some(credential)) => KeyDiagnosis::Found {
+                    location: KeyLocation::PlaintextFile,
+                    credential,
+                },
+                _ => KeyDiagnosis::Absent,
+            },
+            LoadPrimary::Failed(reason) => match fallback.read(provider) {
+                Ok(Some(credential)) => KeyDiagnosis::Found {
+                    location: KeyLocation::PlaintextFile,
+                    credential,
+                },
+                _ => match reason {
+                    FallbackReason::Locked => KeyDiagnosis::Locked,
+                    FallbackReason::ToolMissing => KeyDiagnosis::ToolMissing,
+                    FallbackReason::Unavailable => KeyDiagnosis::Unavailable,
+                },
+            },
         }
     }
 }
@@ -686,18 +775,6 @@ enum LoadPrimary {
     Found(Credential),
     Missing,
     Failed(FallbackReason),
-}
-
-/// Reads the fallback file, mapping absence onto the standard secret-storage
-/// error (whose public message points the user at the env vars / `voisu setup`).
-fn read_fallback_credential(provider: Provider) -> Result<Credential, BoundaryError> {
-    match FileSecretStore::at_default().read(provider)? {
-        Some(credential) => Ok(credential),
-        None => Err(BoundaryError::new(
-            BoundaryKind::SecretStorage,
-            "no stored credential for provider",
-        )),
-    }
 }
 
 /// The controlled seam value, if the test harness set one.
@@ -773,7 +850,7 @@ fn secret_tool_store(provider: Provider, credential: &Credential) -> StoreStep {
         // activating — the one edge worth a bounded retry (ticket 06).
         Ok(outcome) if outcome.stderr.is_empty() => StoreStep::Retry(FallbackReason::Unavailable),
         Ok(_) => StoreStep::Stop(FallbackReason::Locked),
-        Err(ProcessError::Unavailable) => StoreStep::Stop(FallbackReason::Unavailable),
+        Err(ProcessError::Unavailable) => StoreStep::Stop(FallbackReason::ToolMissing),
         Err(ProcessError::TimedOut) => StoreStep::Stop(FallbackReason::Locked),
         // A crashed or otherwise anomalous child is not retried — retrying only
         // reproduces the crash and would blow the bounded budget.
@@ -800,28 +877,45 @@ fn secret_tool_load(provider: Provider) -> LoadStep {
         },
         Ok(outcome) if outcome.stderr.is_empty() => LoadStep::Missing,
         Ok(_) => LoadStep::Stop(FallbackReason::Locked),
-        Err(ProcessError::Unavailable) => LoadStep::Stop(FallbackReason::Unavailable),
+        Err(ProcessError::Unavailable) => LoadStep::Stop(FallbackReason::ToolMissing),
         Err(ProcessError::TimedOut) => LoadStep::Stop(FallbackReason::Locked),
         // A crashed/anomalous child is not retried (see `secret_tool_store`).
         Err(_) => LoadStep::Stop(FallbackReason::Unavailable),
     }
 }
 
-/// Prints the loud, one-time-per-process fallback warning. Naming the file and
-/// the remedy is the whole point: gh's *silent* keyring fallback is the named
-/// anti-pattern we refuse to repeat.
-fn warn_fallback_once(reason: FallbackReason) {
+/// Prints the loud, one-time-per-process fallback warning with wording that
+/// matches what actually happened — storing to the file, reading from it because
+/// the keyring is down, or reading plaintext while the keyring is up (a migration
+/// nudge). Naming the file and the remedy is the whole point: gh's *silent*
+/// keyring fallback is the named anti-pattern we refuse to repeat.
+fn warn_fallback(notice: FallbackNotice) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        let path = FileSecretStore::at_default().path().display().to_string();
-        eprintln!(
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let path = FileSecretStore::at_default().path().display().to_string();
+    match notice {
+        FallbackNotice::Store(reason) => eprintln!(
             "voisu: WARNING — {}. Storing the API key in a 0600 file at {} instead \
              (less secure than the keyring). To fix: {}.",
             reason.detail(),
             path,
             reason.remedy()
-        );
+        ),
+        FallbackNotice::Read(reason) => eprintln!(
+            "voisu: WARNING — {}. Reading the API key from the 0600 file at {} \
+             (less secure than the keyring). To fix: {}.",
+            reason.detail(),
+            path,
+            reason.remedy()
+        ),
+        FallbackNotice::ReadWhileKeyringAvailable => eprintln!(
+            "voisu: WARNING — reading the API key from the 0600 file at {} even though \
+             your keyring is available. Run `voisu setup` to migrate it into the keyring.",
+            path
+        ),
     }
 }
 

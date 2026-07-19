@@ -577,11 +577,73 @@ pub trait ReadinessInspector: Send {
     fn inspect(&mut self) -> Vec<ReadinessFinding>;
 }
 
+/// Where a provider's key currently lives, so keep/replace and migration
+/// prompts can be an informed choice rather than a blind one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyLocation {
+    /// Stored in the desktop keyring (Secret Service) — the secure home.
+    Keyring,
+    /// Only in the 0600 plaintext fallback file (saved while the keyring was
+    /// unavailable); a candidate for migration back into the keyring.
+    PlaintextFile,
+    /// Supplied by an environment variable, which wins at runtime over anything
+    /// stored.
+    EnvOverride,
+}
+
+/// A diagnosis of a provider's key: where it lives (with the credential), or why
+/// it could not be read. `Absent` is a definitive "nothing stored"; `Locked`,
+/// `Unavailable`, and `ToolMissing` mean the keyring could not be consulted, so
+/// callers must steer the user to fix the keyring rather than assume no key.
+pub enum KeyDiagnosis {
+    Found {
+        location: KeyLocation,
+        credential: Credential,
+    },
+    /// The keyring is reachable and holds no key, and no fallback file exists.
+    Absent,
+    /// The keyring is locked or refused access.
+    Locked,
+    /// No desktop Secret Service is running or activatable.
+    Unavailable,
+    /// The `secret-tool` helper binary is not installed.
+    ToolMissing,
+}
+
+impl KeyDiagnosis {
+    /// The location of a found key, if any.
+    pub fn location(&self) -> Option<KeyLocation> {
+        match self {
+            Self::Found { location, .. } => Some(*location),
+            _ => None,
+        }
+    }
+
+    /// Whether a usable key was found (anywhere).
+    pub fn is_configured(&self) -> bool {
+        matches!(self, Self::Found { .. })
+    }
+}
+
 /// Boundary for desktop Secret Service. Implementations must never persist a
-/// credential outside the desktop secret service.
+/// credential outside the desktop secret service except through an explicit,
+/// loudly-announced fallback.
 pub trait SecretStore: Send {
     fn replace(&mut self, provider: Provider, credential: Credential) -> Result<(), BoundaryError>;
     fn load(&mut self, provider: Provider) -> Result<Credential, BoundaryError>;
+
+    /// Diagnoses where a provider's key lives (or why it cannot be read), for
+    /// informed keep/replace and migration prompts. The default cannot tell one
+    /// failure from another, so it reports `Keyring`/`Absent` only.
+    fn diagnose(&mut self, provider: Provider) -> KeyDiagnosis {
+        match self.load(provider) {
+            Ok(credential) => KeyDiagnosis::Found {
+                location: KeyLocation::Keyring,
+                credential,
+            },
+            Err(_) => KeyDiagnosis::Absent,
+        }
+    }
 }
 
 /// Boundary for an independent, post-storage provider-auth check. It returns

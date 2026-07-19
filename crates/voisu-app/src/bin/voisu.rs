@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use voisu_core::{
     BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, ExportCorrelationId,
-    PROTOCOL_VERSION, Provider, ProviderAuthenticator, ProviderKeyStatus, ReadinessInspector,
-    ReadinessStatus, ReplayFixturePath, Request, Response, SecretStore, VersionEnvelope,
-    provider_free_tier_hint, socket_path,
+    KeyDiagnosis, KeyLocation, PROTOCOL_VERSION, Provider, ProviderAuthenticator, ProviderKeyStatus,
+    ReadinessInspector, ReadinessStatus, ReplayFixturePath, Request, Response, SecretStore,
+    VersionEnvelope, provider_free_tier_hint, socket_path,
 };
 use voisu_app::service::{UserServiceAction, manage_user_service};
 use voisu_app::system::{
@@ -292,14 +292,24 @@ fn doctor_provider_keys(runtime: &tokio::runtime::Runtime) -> bool {
             println!("{label} key: SKIP (Deepgram is off; run `voisu deepgram on` to enable)");
             continue;
         }
-        match SecretToolStore.load(provider) {
-            Ok(credential) => {
+        match SecretToolStore.diagnose(provider) {
+            KeyDiagnosis::Found { location, credential } => {
                 let status = runtime.block_on(ProviderHttpClient.check(provider, credential));
                 println!(
                     "{label} key: {} ({})",
                     status.headline(),
                     status.readiness().cli_label()
                 );
+                match location {
+                    KeyLocation::PlaintextFile => println!(
+                        "  stored in the plaintext fallback file — run `voisu setup` to migrate it into your keyring"
+                    ),
+                    KeyLocation::EnvOverride => println!(
+                        "  provided by {} (overrides any stored key)",
+                        provider.environment_variable()
+                    ),
+                    KeyLocation::Keyring => {}
+                }
                 match status {
                     ProviderKeyStatus::InvalidKey => {
                         has_failure = true;
@@ -311,7 +321,19 @@ fn doctor_provider_keys(runtime: &tokio::runtime::Runtime) -> bool {
                     _ => {}
                 }
             }
-            Err(_) => {
+            // The keyring could not be consulted: steer the user at the real fix
+            // (unlock / start / install) rather than telling them to write a
+            // plaintext key they may not need to.
+            KeyDiagnosis::Locked => println!(
+                "{label} key: keyring locked — unlock it, or run `voisu setup` to store a key (WARN)"
+            ),
+            KeyDiagnosis::Unavailable => println!(
+                "{label} key: no desktop keyring available — run `voisu setup` to store a key (WARN)"
+            ),
+            KeyDiagnosis::ToolMissing => println!(
+                "{label} key: secret-tool is not installed — install libsecret-tools, or run `voisu setup` (WARN)"
+            ),
+            KeyDiagnosis::Absent => {
                 println!("{label} key: not configured — run `voisu setup` (WARN)");
                 println!("  {}", provider_free_tier_hint(provider));
             }
@@ -324,9 +346,21 @@ fn doctor_provider_keys(runtime: &tokio::runtime::Runtime) -> bool {
 /// live before storing it. All logic lives in the injectable `voisu_app::setup`
 /// core; here we supply the real terminal, keyring, and live validator.
 fn setup() -> ExitCode {
-    use voisu_app::setup::{LiveKeyValidator, StdioWizard, run_setup};
-    run_setup(&mut StdioWizard, &mut SecretToolStore, &mut LiveKeyValidator);
-    ExitCode::SUCCESS
+    use voisu_app::setup::{LiveKeyValidator, ProviderOutcome, StdioWizard, run_setup};
+    let outcome = run_setup(&mut StdioWizard, &mut SecretToolStore, &mut LiveKeyValidator);
+    // A run that stored/kept no usable key (every provider skipped or its store
+    // failed) did not accomplish setup's job, so it must not report success.
+    let usable = |outcome: ProviderOutcome| {
+        matches!(
+            outcome,
+            ProviderOutcome::Stored | ProviderOutcome::Kept | ProviderOutcome::StoredUnverified
+        )
+    };
+    if usable(outcome.deepgram) || usable(outcome.groq) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(4)
+    }
 }
 
 fn auth_set(provider: Provider, credential: Credential) -> ExitCode {

@@ -7,7 +7,10 @@
 //! terminal, network, or keyring. The thin production glue ([`StdioWizard`],
 //! [`LiveKeyValidator`]) lives at the bottom of this file.
 
-use voisu_core::{Credential, Provider, ProviderKeyStatus, SecretStore, provider_free_tier_hint};
+use voisu_core::{
+    Credential, KeyDiagnosis, KeyLocation, Provider, ProviderKeyStatus, SecretStore,
+    provider_free_tier_hint,
+};
 
 /// Injected terminal IO. Prompts and messages both flow through here so a test
 /// can script every keystroke and capture every line.
@@ -81,11 +84,51 @@ fn configure_provider(
     io.writeln(&format!("== {name} =="));
     io.writeln(provider_free_tier_hint(provider));
 
-    if store.load(provider).is_ok()
-        && ask_yes_no(io, &format!("A {name} key is already configured. Keep it?"), true)
-    {
-        io.writeln(&format!("Keeping the existing {name} key."));
-        return ProviderOutcome::Kept;
+    // An informed keep/replace: say WHERE the key lives so keeping a plaintext or
+    // env-override key is a deliberate choice, and migrate a plaintext key back
+    // into the keyring on keep when the keyring is available again.
+    match store.diagnose(provider) {
+        KeyDiagnosis::Found { location: KeyLocation::EnvOverride, .. } => {
+            io.writeln(&format!(
+                "Note: {name} is set via the {} environment variable, which wins at runtime — \
+                 unset it to use a stored key.",
+                provider.environment_variable()
+            ));
+            if ask_yes_no(io, &format!("Keep the {name} environment key?"), true) {
+                return ProviderOutcome::Kept;
+            }
+        }
+        KeyDiagnosis::Found { location: KeyLocation::Keyring, .. } => {
+            if ask_yes_no(
+                io,
+                &format!("A {name} key is already stored in your keyring. Keep it?"),
+                true,
+            ) {
+                io.writeln(&format!("Keeping the existing {name} key."));
+                return ProviderOutcome::Kept;
+            }
+        }
+        KeyDiagnosis::Found { location: KeyLocation::PlaintextFile, credential } => {
+            io.writeln(&format!(
+                "A {name} key is stored in the plaintext fallback file (saved while the keyring \
+                 was unavailable)."
+            ));
+            if ask_yes_no(io, "Keep it, migrating into your keyring if available?", true) {
+                match store.replace(provider, credential) {
+                    Ok(()) => io.writeln(&format!(
+                        "Kept the {name} key (migrated into the keyring if it was available)."
+                    )),
+                    Err(error) => io.writeln(&format!(
+                        "Kept the {name} key: {}",
+                        error.public_message()
+                    )),
+                }
+                return ProviderOutcome::Kept;
+            }
+        }
+        // Absent, or the keyring could not be consulted (locked/unavailable/tool
+        // missing): fall through and prompt for a key.
+        _ => {}
     }
 
     loop {
@@ -225,26 +268,103 @@ fn read_line() -> Option<String> {
     }
 }
 
-/// Reads one line from stdin with terminal echo disabled, restoring the terminal
-/// afterwards. Falls back to a plain read if the terminal cannot be reconfigured.
+/// Published so the SIGINT/SIGQUIT handler can restore the terminal from an
+/// async-signal context without touching any lock or allocation.
+static ECHO_GUARD_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static ECHO_GUARD_LFLAG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Restores terminal echo, then re-raises the signal with its default
+/// disposition so the process still dies as the user intended — now with the
+/// shell's echo intact rather than silently off. Only calls async-signal-safe
+/// functions (`tcgetattr`/`tcsetattr`/`signal`/`raise`).
+extern "C" fn restore_echo_on_signal(signal: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    let fd = ECHO_GUARD_FD.load(Ordering::SeqCst);
+    if fd >= 0 {
+        // SAFETY: async-signal-safe termios calls on a valid fd; the lflag to
+        // restore was published before the handler was installed.
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut termios) == 0 {
+                termios.c_lflag = ECHO_GUARD_LFLAG.load(Ordering::SeqCst) as libc::tcflag_t;
+                libc::tcsetattr(fd, libc::TCSANOW, &termios);
+            }
+        }
+    }
+    // SAFETY: restoring the default disposition and re-raising are AS-safe.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
+
+/// Restores the terminal and the previous signal handlers on every exit path
+/// (normal return, `?`, or a panic), so a hidden read can never leave the shell
+/// with echo off.
+struct EchoGuard {
+    fd: i32,
+    original: libc::termios,
+    old_sigint: libc::sigaction,
+    old_sigquit: libc::sigaction,
+}
+
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        // SAFETY: restores the saved termios and sigactions captured on entry.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+            libc::sigaction(libc::SIGINT, &self.old_sigint, std::ptr::null_mut());
+            libc::sigaction(libc::SIGQUIT, &self.old_sigquit, std::ptr::null_mut());
+        }
+        ECHO_GUARD_FD.store(-1, Ordering::SeqCst);
+    }
+}
+
+/// Reads one line from stdin with terminal echo disabled. A RAII guard restores
+/// the terminal on every ordinary exit, and a temporary SIGINT/SIGQUIT handler
+/// restores it when the user interrupts mid-entry — so no exit path (including
+/// Ctrl-C) leaves the friend's shell with echo silently off. Falls back to a
+/// plain read if the terminal cannot be reconfigured.
 fn read_line_without_echo() -> Option<String> {
-    // SAFETY: `tcgetattr`/`tcsetattr` on the stdin fd only read and write a
-    // local `termios`; on any failure we restore nothing and fall back to a
-    // plain read.
+    use std::sync::atomic::Ordering;
+    // SAFETY: termios/sigaction calls on the stdin fd with local storage; every
+    // path either installs the RAII guard or returns before altering the tty.
     unsafe {
         let fd = libc::STDIN_FILENO;
         let mut original: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(fd, &mut original) != 0 {
             return read_line();
         }
+
+        // Publish the state the signal handler needs to restore echo.
+        ECHO_GUARD_LFLAG.store(original.c_lflag as u32, Ordering::SeqCst);
+        ECHO_GUARD_FD.store(fd, Ordering::SeqCst);
+
+        // Install the interrupt-time restorers and capture the previous ones.
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = restore_echo_on_signal as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = 0;
+        let mut old_sigint: libc::sigaction = std::mem::zeroed();
+        let mut old_sigquit: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGINT, &action, &mut old_sigint);
+        libc::sigaction(libc::SIGQUIT, &action, &mut old_sigquit);
+
+        let _guard = EchoGuard {
+            fd,
+            original,
+            old_sigint,
+            old_sigquit,
+        };
+
         let mut hidden = original;
         hidden.c_lflag &= !libc::ECHO;
         if libc::tcsetattr(fd, libc::TCSANOW, &hidden) != 0 {
+            // The guard still restores handlers/termios on drop.
             return read_line();
         }
-        let line = read_line();
-        libc::tcsetattr(fd, libc::TCSANOW, &original);
-        line
+        read_line()
     }
 }
 
@@ -316,10 +436,13 @@ mod tests {
         }
     }
 
-    /// An in-memory secret store.
+    /// An in-memory secret store. `locations` lets a test pin where a key
+    /// "lives" (keyring by default) so the wizard's informed keep/replace and
+    /// migration prompts can be exercised.
     #[derive(Default)]
     struct FakeStore {
         keys: HashMap<&'static str, String>,
+        locations: HashMap<&'static str, KeyLocation>,
         fail_replace: bool,
     }
 
@@ -330,12 +453,27 @@ mod tests {
             }
             self.keys
                 .insert(provider.secret_service_value(), credential.expose_to_boundary().to_owned());
+            // A successful store migrates a key into the keyring.
+            self.locations.insert(provider.secret_service_value(), KeyLocation::Keyring);
             Ok(())
         }
         fn load(&mut self, provider: Provider) -> Result<Credential, BoundaryError> {
             match self.keys.get(provider.secret_service_value()) {
                 Some(value) => Credential::new(value.clone()),
                 None => Err(BoundaryError::new(BoundaryKind::SecretStorage, "absent")),
+            }
+        }
+        fn diagnose(&mut self, provider: Provider) -> KeyDiagnosis {
+            match self.keys.get(provider.secret_service_value()) {
+                Some(value) => KeyDiagnosis::Found {
+                    location: self
+                        .locations
+                        .get(provider.secret_service_value())
+                        .copied()
+                        .unwrap_or(KeyLocation::Keyring),
+                    credential: Credential::new(value.clone()).unwrap(),
+                },
+                None => KeyDiagnosis::Absent,
             }
         }
     }
@@ -426,6 +564,43 @@ mod tests {
         // The stored key is untouched.
         assert_eq!(store.keys.get("deepgram").map(String::as_str), Some("existing-deepgram"));
         assert_eq!(outcome.groq, ProviderOutcome::Stored);
+    }
+
+    #[test]
+    fn an_env_override_is_flagged_before_keeping() {
+        // A key present via an env override must be announced (env wins at
+        // runtime) so keeping it is an informed choice.
+        let mut store = FakeStore::default();
+        store.keys.insert("deepgram", "env-deepgram".to_owned());
+        store.locations.insert("deepgram", KeyLocation::EnvOverride);
+        let mut io = FakeIo::new(vec![Some("groq-key")], vec![Some("y")]);
+        let mut validator = FakeValidator {
+            statuses: vec![ProviderKeyStatus::Valid],
+        };
+        let outcome = run_setup(&mut io, &mut store, &mut validator);
+        assert_eq!(outcome.deepgram, ProviderOutcome::Kept);
+        assert!(
+            io.transcript().contains("environment variable, which wins at runtime"),
+            "{}",
+            io.transcript()
+        );
+    }
+
+    #[test]
+    fn a_plaintext_key_is_offered_migration_on_keep() {
+        // A key living only in the plaintext fallback is surfaced as such and,
+        // on keep, re-stored (migrated) through replace.
+        let mut store = FakeStore::default();
+        store.keys.insert("deepgram", "file-deepgram".to_owned());
+        store.locations.insert("deepgram", KeyLocation::PlaintextFile);
+        // Keep+migrate Deepgram (yes), then skip Groq.
+        let mut io = FakeIo::new(vec![Some("")], vec![Some("y")]);
+        let mut validator = FakeValidator { statuses: vec![] };
+        let outcome = run_setup(&mut io, &mut store, &mut validator);
+        assert_eq!(outcome.deepgram, ProviderOutcome::Kept);
+        assert!(io.transcript().contains("plaintext fallback file"), "{}", io.transcript());
+        // The migration re-stored it, flipping its location to the keyring.
+        assert_eq!(store.locations.get("deepgram"), Some(&KeyLocation::Keyring));
     }
 
     #[test]

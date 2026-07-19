@@ -2036,6 +2036,32 @@ fn voisu_with_env(runtime_dir: &Path, arguments: &[&str], environment: &[(&str, 
     command.output().expect("CLI should run")
 }
 
+/// Runs the CLI with the developer's real config and provider env neutralized:
+/// `XDG_CONFIG_HOME` is pinned to a caller-owned dir, and the key/disable env
+/// overrides are stripped (a caller can re-add any it needs via `environment`).
+/// New key-aware tests use this so an ambient `~/.config/voisu` or `VOISU_*`
+/// var can never flip their result.
+fn voisu_isolated(
+    runtime_dir: &Path,
+    config_home: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Output {
+    fs::set_permissions(runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_voisu"));
+    command
+        .args(arguments)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env_remove("VOISU_DEEPGRAM_API_KEY")
+        .env_remove("VOISU_GROQ_API_KEY")
+        .env_remove("VOISU_DISABLE_DEEPGRAM");
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    command.output().expect("CLI should run")
+}
+
 fn voisu_with_secret(
     runtime_dir: &Path,
     arguments: &[&str],
@@ -2637,9 +2663,11 @@ fn doctor_warns_when_the_secret_service_reports_an_error() {
 #[test]
 fn doctor_reports_valid_provider_keys_as_pass() {
     let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
     let _daemon = Daemon::start(runtime.path());
-    let doctor = voisu_with_env(
+    let doctor = voisu_isolated(
         runtime.path(),
+        config_home.path(),
         &["doctor"],
         &[
             ("VOISU_TEST_READINESS", "pass"),
@@ -2660,9 +2688,11 @@ fn doctor_reports_valid_provider_keys_as_pass() {
 #[test]
 fn doctor_flags_an_invalid_key_as_a_failure_naming_the_fix() {
     let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
     let _daemon = Daemon::start(runtime.path());
-    let doctor = voisu_with_env(
+    let doctor = voisu_isolated(
         runtime.path(),
+        config_home.path(),
         &["doctor"],
         &[
             ("VOISU_TEST_READINESS", "pass"),
@@ -2684,12 +2714,41 @@ fn doctor_flags_an_invalid_key_as_a_failure_naming_the_fix() {
 }
 
 #[test]
+fn doctor_tells_a_locked_keyring_to_unlock_not_to_run_setup() {
+    // A locked keyring must steer the user to UNLOCK it, not to write a plaintext
+    // key — and it is a warning, not a hard failure.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "none"),
+            ("VOISU_DISABLE_DEEPGRAM", "1"),
+            ("VOISU_TEST_SECRET_STORE", "locked"),
+        ],
+    );
+
+    assert!(doctor.status.success(), "a locked keyring is a warning: {}", stderr(&doctor));
+    assert!(
+        stdout(&doctor).contains("Groq key: keyring locked — unlock it"),
+        "{}",
+        stdout(&doctor)
+    );
+    assert!(!stdout(&doctor).contains("Groq key: not configured"), "{}", stdout(&doctor));
+}
+
+#[test]
 fn doctor_reports_a_bare_429_as_quota_and_a_missing_key_as_a_warning() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start(runtime.path());
     let config_home = TempDir::new().unwrap();
-    let doctor = voisu_with_env(
+    let doctor = voisu_isolated(
         runtime.path(),
+        config_home.path(),
         &["doctor"],
         &[
             ("VOISU_TEST_READINESS", "pass"),
@@ -2699,7 +2758,6 @@ fn doctor_reports_a_bare_429_as_quota_and_a_missing_key_as_a_warning() {
             ("VOISU_TEST_SECRET_STORE", "available"),
             ("VOISU_TEST_STORED_DEEPGRAM_CREDENTIAL", "deepgram-key"),
             ("VOISU_TEST_AUTH_DEEPGRAM", "429"),
-            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
         ],
     );
 
@@ -2819,6 +2877,11 @@ fn setup_wizard_validates_each_key_then_persists_both() {
         .env("VOISU_TEST_AUTH_DEEPGRAM", "authorized")
         .env("VOISU_TEST_AUTH_GROQ", "authorized")
         .env("XDG_CONFIG_HOME", config_home.path())
+        // Neutralize the developer's real provider env so a stale override does
+        // not turn the wizard's key prompts into env-keep prompts.
+        .env_remove("VOISU_DEEPGRAM_API_KEY")
+        .env_remove("VOISU_GROQ_API_KEY")
+        .env_remove("VOISU_DISABLE_DEEPGRAM")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2905,8 +2968,51 @@ fn auth_set_bounds_a_stalled_or_missing_secret_tool_then_falls_back_without_leak
         "controlled-secret",
     );
     assert!(missing.status.success(), "{}", stderr(&missing));
-    assert!(stderr(&missing).contains("no desktop Secret Service is available"), "{}", stderr(&missing));
+    assert!(stderr(&missing).contains("secret-tool helper is not installed"), "{}", stderr(&missing));
     assert!(!stderr(&missing).contains("controlled-secret"));
+}
+
+#[test]
+fn auth_set_retries_an_activating_keyring_within_budget_then_falls_back() {
+    // A secret-tool that fails with an empty stderr reads as the service still
+    // activating: the store retries within a bounded budget (here zeroed via the
+    // seam), then falls back to the 0600 file. This exercises the retry loop and
+    // the VOISU_TEST_KEYRING_RETRY_MS seam.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let stub = TempDir::new().unwrap();
+    // Written directly (not via write_fake_command, whose `trap 'exit 0' EXIT`
+    // would mask the failure): drain stdin so the credential write does not
+    // EPIPE, record the call, then fail with an EMPTY stderr — the "still
+    // activating" signal that the store path retries.
+    let stub_path = stub.path().join("secret-tool");
+    fs::write(
+        &stub_path,
+        "#!/bin/sh\ncat > /dev/null\ndir=$(dirname \"$0\")\nprintf 'x' >> \"$dir/secret-tool.calls\"\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&stub_path, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!("{}:{}", stub.path().display(), std::env::var("PATH").unwrap());
+    let started = Instant::now();
+    let stored = voisu_with_secret(
+        runtime.path(),
+        &["auth", "set", "groq"],
+        &[
+            ("PATH", &path),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+            ("VOISU_TEST_KEYRING_RETRY_MS", "0"),
+        ],
+        "controlled-secret",
+    );
+    assert!(stored.status.success(), "{}", stderr(&stored));
+    assert!(started.elapsed() < Duration::from_secs(4), "the retry budget must stay bounded");
+    // One immediate attempt plus three bounded retries.
+    let calls = fs::read_to_string(stub.path().join("secret-tool.calls")).unwrap();
+    assert_eq!(calls.len(), 4, "expected 1 immediate + 3 retried attempts, got {}", calls.len());
+    assert!(
+        config_home.path().join("voisu").join("credentials").exists(),
+        "the exhausted budget must fall back to the file"
+    );
 }
 
 #[test]
