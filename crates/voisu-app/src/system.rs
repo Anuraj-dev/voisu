@@ -16,7 +16,7 @@ use voisu_core::{
     socket_path, ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture,
     BoundaryKind, CancelRegistry, CapturedAudio, Command as DaemonCommand, Credential,
     DeliveryAdapter, DeliveryOutcome, Provider,
-    ProviderAuthenticator, ProviderStream, ReadinessCapability, ReadinessFinding,
+    ProviderAuthenticator, ProviderKeyStatus, ProviderStream, ReadinessCapability, ReadinessFinding,
     MergeResult, ReadinessInspector, ReadinessStatus, ReconciliationKind, ReconciliationModel,
     Request, Response, SecretStore, ShortcutPortal, ShortcutSession, SourceTranscript, Transcript,
     TranscriptDecision, TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator,
@@ -25,6 +25,7 @@ use voisu_core::{
 
 use crate::focus::SharedFocusProbe;
 use crate::process::guard_external_child;
+use crate::secret_file::FileSecretStore;
 
 const PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 pub const CAPTURE_FINALIZE_DEADLINE: Duration = PROCESS_DEADLINE;
@@ -574,63 +575,253 @@ impl Drop for FedoraShortcutSession {
 
 pub struct SecretToolStore;
 
+/// Why the desktop Secret Service could not serve a request. It selects the
+/// fallback warning wording — ticket 06 established that an unowned/activatable
+/// name is a distinct failure from an owned-but-locked collection.
+#[derive(Clone, Copy)]
+enum FallbackReason {
+    /// No Secret Service owns `org.freedesktop.secrets`, or it could not start.
+    Unavailable,
+    /// The service answered but is locked or refused access.
+    Locked,
+}
+
+impl FallbackReason {
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Unavailable => {
+                "no desktop Secret Service is available on this session (no keyring is running or activatable)"
+            }
+            Self::Locked => "the desktop keyring is locked or refused access",
+        }
+    }
+
+    fn remedy(self) -> &'static str {
+        match self {
+            Self::Unavailable => {
+                "start a Secret Service (KWallet or GNOME Keyring) then re-run `voisu setup` to migrate"
+            }
+            Self::Locked => "unlock your keyring (e.g. in KWallet) then re-run `voisu setup` to migrate",
+        }
+    }
+}
+
+/// The default desktop keyring retry budget: one immediate attempt then short
+/// backoffs, ≈4.25s total, absorbing an edge-case slow activation without ever
+/// blocking daemon startup (the load is lazy, at first use — ticket 06). Only an
+/// `Unavailable` (activating) result is retried; a `Locked` collection is not,
+/// since retries cannot unlock it.
+const KEYRING_RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+];
+
+/// The retry backoff, overridable to a flat per-step delay (0 = instant) via
+/// `VOISU_TEST_KEYRING_RETRY_MS` so a test can exercise the budget without real
+/// waits.
+fn keyring_retry_backoff() -> Vec<Duration> {
+    if let Some(ms) = std::env::var("VOISU_TEST_KEYRING_RETRY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return vec![Duration::from_millis(ms); KEYRING_RETRY_BACKOFF.len()];
+    }
+    KEYRING_RETRY_BACKOFF.to_vec()
+}
+
+/// One attempt at the desktop Secret Service store.
+enum StoreStep {
+    Stored,
+    Retry(FallbackReason),
+    Stop(FallbackReason),
+}
+
+/// One attempt at the desktop Secret Service lookup. The lookup is a single
+/// synchronous D-Bus round trip (activation, if needed, blocks within the one
+/// bounded call), so — unlike the store path — there is no retry variant: the
+/// load resolves immediately, guaranteeing a Recording's first key read is never
+/// delayed by a retry spin.
+enum LoadStep {
+    Found(Credential),
+    /// The service is reachable but holds no such credential — definitive, so
+    /// the caller consults the fallback file rather than retrying.
+    Missing,
+    Stop(FallbackReason),
+}
+
 impl SecretStore for SecretToolStore {
     fn replace(&mut self, provider: Provider, credential: Credential) -> Result<(), BoundaryError> {
-        if let Some(mode) = std::env::var_os("VOISU_TEST_SECRET_STORE") {
-            return controlled_secret_store(&mode.to_string_lossy());
-        }
-        let outcome = run_restricted(
-            "secret-tool",
-            &["store", "--label=Voisu cloud credential", "voisu-provider", provider.secret_service_value()],
-            Some(credential.expose_to_boundary().as_bytes()),
-            false,
-        )
-        .map_err(secret_storage_error)?;
-        if outcome.success {
-            Ok(())
-        } else {
-            Err(BoundaryError::new(
-                BoundaryKind::SecretStorage,
-                "secret service denied credential storage",
-            ))
+        match store_primary(provider, &credential) {
+            Ok(()) => Ok(()),
+            Err(reason) => {
+                warn_fallback_once(reason);
+                FileSecretStore::at_default().store(provider, &credential)
+            }
         }
     }
 
     fn load(&mut self, provider: Provider) -> Result<Credential, BoundaryError> {
+        // The env override wins over any stored key, preserving the historic
+        // development/headless path.
         if let Some(credential) = std::env::var_os(provider.environment_variable()) {
             return Credential::new(credential.to_string_lossy().into_owned());
         }
-        if let Some(mode) = std::env::var_os("VOISU_TEST_SECRET_STORE") {
-            if mode == "available" {
-                let name = match provider {
-                    Provider::Groq => "VOISU_TEST_STORED_GROQ_CREDENTIAL",
-                    Provider::Deepgram => "VOISU_TEST_STORED_DEEPGRAM_CREDENTIAL",
-                };
-                return std::env::var(name)
-                    .map_err(|_| BoundaryError::new(BoundaryKind::SecretStorage, "controlled credential missing"))
-                    .and_then(Credential::new);
+        match load_primary(provider) {
+            LoadPrimary::Found(credential) => Ok(credential),
+            // A definitively absent key still consults the fallback file (a prior
+            // headless `voisu setup` may have written it) before giving up.
+            LoadPrimary::Missing => read_fallback_credential(provider),
+            LoadPrimary::Failed(reason) => {
+                warn_fallback_once(reason);
+                read_fallback_credential(provider)
             }
-            return controlled_secret_store(&mode.to_string_lossy()).and_then(|()| {
-                Err(BoundaryError::new(BoundaryKind::SecretStorage, "controlled credential missing"))
-            });
         }
-        let outcome = run_restricted(
-            "secret-tool",
-            &["lookup", "voisu-provider", provider.secret_service_value()],
-            None,
-            true,
-        )
-        .map_err(secret_storage_error)?;
-        if !outcome.success {
-            return Err(BoundaryError::new(
-                BoundaryKind::SecretStorage,
-                "secret service lookup denied",
-            ));
+    }
+}
+
+/// The outcome of the primary (desktop Secret Service) load after its retry
+/// budget.
+enum LoadPrimary {
+    Found(Credential),
+    Missing,
+    Failed(FallbackReason),
+}
+
+/// Reads the fallback file, mapping absence onto the standard secret-storage
+/// error (whose public message points the user at the env vars / `voisu setup`).
+fn read_fallback_credential(provider: Provider) -> Result<Credential, BoundaryError> {
+    match FileSecretStore::at_default().read(provider)? {
+        Some(credential) => Ok(credential),
+        None => Err(BoundaryError::new(
+            BoundaryKind::SecretStorage,
+            "no stored credential for provider",
+        )),
+    }
+}
+
+/// The controlled seam value, if the test harness set one.
+fn secret_seam_mode() -> Option<String> {
+    std::env::var_os("VOISU_TEST_SECRET_STORE").map(|value| value.to_string_lossy().into_owned())
+}
+
+/// Stores to the primary with a bounded retry, honoring the test seam. `Ok`
+/// means stored; `Err(reason)` means the caller should fall back to the file.
+fn store_primary(provider: Provider, credential: &Credential) -> Result<(), FallbackReason> {
+    if let Some(mode) = secret_seam_mode() {
+        return match mode.as_str() {
+            "available" => Ok(()),
+            "denied" | "locked" => Err(FallbackReason::Locked),
+            _ => Err(FallbackReason::Unavailable),
+        };
+    }
+    let mut backoff = keyring_retry_backoff().into_iter();
+    loop {
+        match secret_tool_store(provider, credential) {
+            StoreStep::Stored => return Ok(()),
+            StoreStep::Stop(reason) => return Err(reason),
+            StoreStep::Retry(reason) => match backoff.next() {
+                Some(delay) => std::thread::sleep(delay),
+                None => return Err(reason),
+            },
         }
-        let credential = String::from_utf8(outcome.stdout).map_err(|_| {
-            BoundaryError::new(BoundaryKind::SecretStorage, "secret service returned invalid data")
-        })?;
-        Credential::new(credential.trim_end().to_owned())
+    }
+}
+
+/// Loads from the primary with a bounded retry, honoring the test seam.
+fn load_primary(provider: Provider) -> LoadPrimary {
+    if let Some(mode) = secret_seam_mode() {
+        if mode == "available" {
+            let name = match provider {
+                Provider::Groq => "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+                Provider::Deepgram => "VOISU_TEST_STORED_DEEPGRAM_CREDENTIAL",
+            };
+            return match std::env::var(name).ok().and_then(|value| Credential::new(value).ok()) {
+                Some(credential) => LoadPrimary::Found(credential),
+                None => LoadPrimary::Missing,
+            };
+        }
+        return match mode.as_str() {
+            "denied" | "locked" => LoadPrimary::Failed(FallbackReason::Locked),
+            _ => LoadPrimary::Failed(FallbackReason::Unavailable),
+        };
+    }
+    match secret_tool_load(provider) {
+        LoadStep::Found(credential) => LoadPrimary::Found(credential),
+        LoadStep::Missing => LoadPrimary::Missing,
+        LoadStep::Stop(reason) => LoadPrimary::Failed(reason),
+    }
+}
+
+/// One real `secret-tool store`. An empty stderr on failure reads as the service
+/// still activating (retryable); a diagnostic on stderr, a timed-out prompt, or
+/// invalid data read as a locked/denied collection (not retryable).
+fn secret_tool_store(provider: Provider, credential: &Credential) -> StoreStep {
+    match run_restricted(
+        "secret-tool",
+        &[
+            "store",
+            "--label=Voisu cloud credential",
+            "voisu-provider",
+            provider.secret_service_value(),
+        ],
+        Some(credential.expose_to_boundary().as_bytes()),
+        false,
+    ) {
+        Ok(outcome) if outcome.success => StoreStep::Stored,
+        // A nonzero exit with no diagnostic reads as the service still
+        // activating — the one edge worth a bounded retry (ticket 06).
+        Ok(outcome) if outcome.stderr.is_empty() => StoreStep::Retry(FallbackReason::Unavailable),
+        Ok(_) => StoreStep::Stop(FallbackReason::Locked),
+        Err(ProcessError::Unavailable) => StoreStep::Stop(FallbackReason::Unavailable),
+        Err(ProcessError::TimedOut) => StoreStep::Stop(FallbackReason::Locked),
+        // A crashed or otherwise anomalous child is not retried — retrying only
+        // reproduces the crash and would blow the bounded budget.
+        Err(_) => StoreStep::Stop(FallbackReason::Unavailable),
+    }
+}
+
+/// One real `secret-tool lookup`. A clean no-match (nonzero exit, empty stderr)
+/// is `Missing`; a stderr diagnostic or a timed-out prompt is a locked/denied
+/// collection; a spawn failure is the service being unavailable.
+fn secret_tool_load(provider: Provider) -> LoadStep {
+    match run_restricted(
+        "secret-tool",
+        &["lookup", "voisu-provider", provider.secret_service_value()],
+        None,
+        true,
+    ) {
+        Ok(outcome) if outcome.success => match String::from_utf8(outcome.stdout) {
+            Ok(value) => match Credential::new(value.trim_end().to_owned()) {
+                Ok(credential) => LoadStep::Found(credential),
+                Err(_) => LoadStep::Missing,
+            },
+            Err(_) => LoadStep::Stop(FallbackReason::Locked),
+        },
+        Ok(outcome) if outcome.stderr.is_empty() => LoadStep::Missing,
+        Ok(_) => LoadStep::Stop(FallbackReason::Locked),
+        Err(ProcessError::Unavailable) => LoadStep::Stop(FallbackReason::Unavailable),
+        Err(ProcessError::TimedOut) => LoadStep::Stop(FallbackReason::Locked),
+        // A crashed/anomalous child is not retried (see `secret_tool_store`).
+        Err(_) => LoadStep::Stop(FallbackReason::Unavailable),
+    }
+}
+
+/// Prints the loud, one-time-per-process fallback warning. Naming the file and
+/// the remedy is the whole point: gh's *silent* keyring fallback is the named
+/// anti-pattern we refuse to repeat.
+fn warn_fallback_once(reason: FallbackReason) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        let path = FileSecretStore::at_default().path().display().to_string();
+        eprintln!(
+            "voisu: WARNING — {}. Storing the API key in a 0600 file at {} instead \
+             (less secure than the keyring). To fix: {}.",
+            reason.detail(),
+            path,
+            reason.remedy()
+        );
     }
 }
 
@@ -645,21 +836,23 @@ pub struct ProviderHttpRequest {
 }
 
 impl ProviderHttpClient {
-    /// Runs the shared authenticated provider request boundary and returns only
-    /// its HTTP status. Future Groq transcription can reuse this async boundary
-    /// without inheriting credentials or curl configuration from the CLI.
+    /// Runs the shared authenticated provider request boundary and returns its
+    /// HTTP status together with whether the response carried a `Retry-After`
+    /// header. Future Groq transcription can reuse this async boundary without
+    /// inheriting credentials or curl configuration from the CLI.
     pub async fn authenticated_status(
         &self,
         credential: Credential,
         request: ProviderHttpRequest,
-    ) -> Result<u16, BoundaryError> {
+    ) -> Result<AuthProbe, BoundaryError> {
         tokio::task::spawn_blocking(move || authenticated_status(credential, request))
             .await
             .map_err(|_| BoundaryError::new(BoundaryKind::ProviderAuthentication, "provider request task failed"))?
     }
 
-    pub async fn verify(&self, provider: Provider, credential: Credential) -> Result<(), BoundaryError> {
-        let request = match provider {
+    /// The endpoint used for the cheapest authenticated round trip per provider.
+    fn probe_request(provider: Provider) -> ProviderHttpRequest {
+        match provider {
             Provider::Groq => ProviderHttpRequest {
                 url: "https://api.groq.com/openai/v1/models",
                 authorization_scheme: "Bearer",
@@ -668,63 +861,101 @@ impl ProviderHttpClient {
                 url: "https://api.deepgram.com/v1/projects",
                 authorization_scheme: "Token",
             },
+        }
+    }
+
+    /// Performs a live credential round trip and classifies the outcome. A
+    /// transport failure (curl missing, timeout, connection refused) is a
+    /// transient `Unreachable`, never a wrong-key verdict. Tests bypass the
+    /// network via `VOISU_TEST_AUTH_{GROQ,DEEPGRAM}` (see [`controlled_key_status`]).
+    pub async fn check(&self, provider: Provider, credential: Credential) -> ProviderKeyStatus {
+        let controlled = match provider {
+            Provider::Groq => std::env::var_os("VOISU_TEST_AUTH_GROQ"),
+            Provider::Deepgram => std::env::var_os("VOISU_TEST_AUTH_DEEPGRAM"),
         };
-        let status = self.authenticated_status(credential, request).await?;
-        if (200..300).contains(&status) {
-            Ok(())
-        } else {
-            Err(BoundaryError::new(
+        if let Some(mode) = controlled {
+            return controlled_key_status(&mode.to_string_lossy());
+        }
+        match self
+            .authenticated_status(credential, Self::probe_request(provider))
+            .await
+        {
+            Ok(probe) => ProviderKeyStatus::classify(probe.status, probe.retry_after),
+            Err(_) => ProviderKeyStatus::Unreachable,
+        }
+    }
+
+    /// Verifies a credential, mapping a non-valid classification onto a
+    /// `BoundaryError` whose public message is the same actionable headline
+    /// every other surface shows.
+    pub async fn verify(&self, provider: Provider, credential: Credential) -> Result<(), BoundaryError> {
+        match self.check(provider, credential).await {
+            ProviderKeyStatus::Valid => Ok(()),
+            status => Err(BoundaryError::new(
                 BoundaryKind::ProviderAuthentication,
-                "provider returned a non-success HTTP status",
-            ))
+                "provider credential round trip did not authenticate",
+            )
+            .with_public_message(status.headline())),
         }
     }
 }
 
 impl ProviderAuthenticator for ProviderHttpClient {
     fn verify(&mut self, provider: Provider, credential: Credential) -> BoundaryFuture<'_, ()> {
-        Box::pin(async move {
-            let controlled = match provider {
-                Provider::Groq => std::env::var_os("VOISU_TEST_AUTH_GROQ"),
-                Provider::Deepgram => std::env::var_os("VOISU_TEST_AUTH_DEEPGRAM"),
-            };
-            if let Some(result) = controlled {
-                return if result == "authorized" {
-                    Ok(())
-                } else {
-                    Err(BoundaryError::new(
-                        BoundaryKind::ProviderAuthentication,
-                        "controlled provider rejected credential",
-                    ))
-                };
-            }
-            ProviderHttpClient::verify(&ProviderHttpClient, provider, credential).await
-        })
+        Box::pin(async move { ProviderHttpClient.verify(provider, credential).await })
+    }
+}
+
+/// The HTTP status of an authenticated probe plus whether a `Retry-After`
+/// header accompanied it, which distinguishes a transient rate limit from a
+/// spent quota on a bare 429.
+pub struct AuthProbe {
+    pub status: u16,
+    pub retry_after: bool,
+}
+
+/// Maps a `VOISU_TEST_AUTH_*` seam value onto a classification so tests exercise
+/// every branch without touching the network. `authorized` stays the historic
+/// success token; `denied` stays the historic rejection (a wrong key).
+fn controlled_key_status(mode: &str) -> ProviderKeyStatus {
+    match mode {
+        "authorized" | "valid" | "200" => ProviderKeyStatus::Valid,
+        "denied" | "invalid" | "401" | "403" => ProviderKeyStatus::InvalidKey,
+        "ratelimited" | "429-retry" => ProviderKeyStatus::RateLimited,
+        "quota" | "429" => ProviderKeyStatus::QuotaExhausted,
+        "unreachable" | "500" | "502" | "503" => ProviderKeyStatus::Unreachable,
+        other => match other.parse::<u16>() {
+            Ok(status) => ProviderKeyStatus::classify(status, false),
+            Err(_) => ProviderKeyStatus::Unreachable,
+        },
     }
 }
 
 fn authenticated_status(
     credential: Credential,
     request: ProviderHttpRequest,
-) -> Result<u16, BoundaryError> {
+) -> Result<AuthProbe, BoundaryError> {
     let credential = curl_config_escape(credential.expose_to_boundary());
     let config = format!(
         "url = \"{}\"\nheader = \"Authorization: {} {credential}\"\n",
         request.url, request.authorization_scheme,
     );
+    // `--fail` is deliberately omitted: it makes curl exit non-zero on a 4xx/5xx
+    // and swallows the status, collapsing 401/403/429/5xx into one opaque error.
+    // Without it curl completes with exit 0 and writes the code, so the caller
+    // can classify. A non-zero exit now means a genuine transport failure.
     let outcome = run_restricted(
         "curl",
         &[
             "-q",
             "--config",
             "-",
-            "--fail",
             "--silent",
             "--show-error",
             "--output",
             "/dev/null",
             "--write-out",
-            "%{http_code}",
+            "%{http_code}\t%header{retry-after}",
             "--max-time",
             "2",
         ],
@@ -735,30 +966,35 @@ fn authenticated_status(
     if !outcome.success {
         return Err(BoundaryError::new(
             BoundaryKind::ProviderAuthentication,
-            "provider rejected credential",
+            "provider request did not complete",
         ));
     }
-    let status = std::str::from_utf8(&outcome.stdout)
-        .ok()
-        .and_then(|value| value.trim().parse::<u16>().ok())
-        .ok_or_else(|| {
+    let rendered = std::str::from_utf8(&outcome.stdout)
+        .map_err(|_| {
             BoundaryError::new(BoundaryKind::ProviderAuthentication, "provider returned no HTTP status")
         })?;
-    Ok(status)
+    parse_auth_probe(rendered).ok_or_else(|| {
+        BoundaryError::new(BoundaryKind::ProviderAuthentication, "provider returned no HTTP status")
+    })
+}
+
+/// Parses curl's `%{http_code}\t%header{retry-after}` write-out. The status is
+/// the first tab-separated field; `Retry-After` is present when the second
+/// field is non-empty and is a real value (older curl that lacks `%header{}`
+/// writes the literal token, which is treated as absent).
+fn parse_auth_probe(rendered: &str) -> Option<AuthProbe> {
+    let line = rendered.trim_end_matches(['\r', '\n']);
+    let mut fields = line.splitn(2, '\t');
+    let status = fields.next()?.trim().parse::<u16>().ok()?;
+    let retry_after = fields
+        .next()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty() && !value.starts_with('%'));
+    Some(AuthProbe { status, retry_after })
 }
 
 fn curl_config_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn secret_storage_error(error: ProcessError) -> BoundaryError {
-    let detail = match error {
-        ProcessError::Unavailable => "secret-tool unavailable",
-        ProcessError::Input => "secret-tool rejected credential input",
-        ProcessError::TimedOut => "secret-tool deadline elapsed",
-        ProcessError::Wait | ProcessError::Output => "secret-tool execution failed",
-    };
-    BoundaryError::new(BoundaryKind::SecretStorage, detail)
 }
 
 fn provider_authentication_error(error: ProcessError) -> BoundaryError {
@@ -982,14 +1218,6 @@ fn read_bounded_frame(stream: &mut UnixStream, started: Instant) -> Result<Strin
 
 fn readiness(capability: ReadinessCapability, status: ReadinessStatus, detail: &str) -> ReadinessFinding {
     ReadinessFinding { capability, status, detail: detail.to_owned() }
-}
-
-fn controlled_secret_store(mode: &str) -> Result<(), BoundaryError> {
-    if mode == "available" {
-        Ok(())
-    } else {
-        Err(BoundaryError::new(BoundaryKind::SecretStorage, "controlled secret service denied access"))
-    }
 }
 
 struct ProcessOutcome {

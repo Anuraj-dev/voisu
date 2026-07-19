@@ -590,6 +590,93 @@ pub trait ProviderAuthenticator: Send {
     fn verify(&mut self, provider: Provider, credential: Credential) -> BoundaryFuture<'_, ()>;
 }
 
+/// The classified outcome of a live per-provider credential round trip.
+///
+/// Classifying once, here, lets every surface — the setup wizard, `voisu
+/// doctor`, `voisu auth verify`, and daemon logs — report the same actionable
+/// meaning instead of a bare HTTP status. A wrong key is the only definitively
+/// bad state; throttling, quota, and unreachability are transient and are not
+/// the key's fault.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderKeyStatus {
+    /// The credential authenticated (2xx).
+    Valid,
+    /// The provider rejected the credential (401/403): the key is wrong.
+    InvalidKey,
+    /// The provider is throttling this key right now (429 with `Retry-After`).
+    /// The key is fine, so this is transient.
+    RateLimited,
+    /// The key's allowance is spent (bare 429, no `Retry-After`).
+    QuotaExhausted,
+    /// The provider could not be reached or returned another status (network
+    /// failure, 5xx, timeout). Transient and not the key's fault.
+    Unreachable,
+}
+
+impl ProviderKeyStatus {
+    /// Classifies an HTTP status and whether a `Retry-After` header accompanied
+    /// it. Pure so the mapping is unit-tested without any network.
+    pub fn classify(http_status: u16, retry_after_present: bool) -> Self {
+        match http_status {
+            200..=299 => Self::Valid,
+            401 | 403 => Self::InvalidKey,
+            429 if retry_after_present => Self::RateLimited,
+            429 => Self::QuotaExhausted,
+            _ => Self::Unreachable,
+        }
+    }
+
+    /// Whether the credential authenticated.
+    pub fn is_valid(self) -> bool {
+        matches!(self, Self::Valid)
+    }
+
+    /// Whether this is a transient condition (the key may be fine) rather than a
+    /// definitively wrong key.
+    pub fn is_transient(self) -> bool {
+        matches!(
+            self,
+            Self::RateLimited | Self::QuotaExhausted | Self::Unreachable
+        )
+    }
+
+    /// The readiness severity a `voisu doctor` line should carry: only a wrong
+    /// key is a hard failure; throttling, quota, and unreachability are warnings.
+    pub fn readiness(self) -> ReadinessStatus {
+        match self {
+            Self::Valid => ReadinessStatus::Pass,
+            Self::InvalidKey => ReadinessStatus::Fail,
+            Self::RateLimited | Self::QuotaExhausted | Self::Unreachable => ReadinessStatus::Warn,
+        }
+    }
+
+    /// A one-line, user-facing explanation. `InvalidKey` always names the fix so
+    /// no surface leaves the user guessing.
+    pub fn headline(self) -> &'static str {
+        match self {
+            Self::Valid => "key valid",
+            Self::InvalidKey => "key invalid — run `voisu setup`",
+            Self::RateLimited => "rate-limited (transient — try again shortly)",
+            Self::QuotaExhausted => "free-tier quota exhausted",
+            Self::Unreachable => "provider unreachable (transient)",
+        }
+    }
+}
+
+/// Free-tier guidance shown when a key is missing, invalid, or over quota, so a
+/// friend knows the provider's free allowance covers daily dictation. Figures
+/// are from the distribution research digest (§5/§9).
+pub fn provider_free_tier_hint(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Deepgram => {
+            "Deepgram grants $200 of free credit with no card (about a year at 1–2 h/day); create a key at https://console.deepgram.com"
+        }
+        Provider::Groq => {
+            "Groq's free tier covers ~2000 requests and 28,800 audio-seconds per day — ample for daily dictation; create a key at https://console.groq.com/keys"
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SourceTranscript {
     pub provider: Provider,

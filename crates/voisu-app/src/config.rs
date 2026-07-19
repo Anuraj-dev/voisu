@@ -106,15 +106,22 @@ fn resolve_delivery_mode(persisted: Option<DeliveryMode>) -> DeliveryMode {
     persisted.unwrap_or_default()
 }
 
-/// The resolved config path: `$XDG_CONFIG_HOME/voisu/config.toml`, falling back
-/// to `~/.config/voisu/config.toml`. Mirrors the user dictionary resolution.
-fn config_path() -> PathBuf {
+/// The `voisu` config directory: `$XDG_CONFIG_HOME/voisu`, falling back to
+/// `~/.config/voisu`. Shared by the config file and the credential fallback
+/// file so both honour the same XDG resolution.
+pub fn config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .unwrap_or_else(|| PathBuf::from(".config"));
-    base.join("voisu").join("config.toml")
+    base.join("voisu")
+}
+
+/// The resolved config path: `$XDG_CONFIG_HOME/voisu/config.toml`, falling back
+/// to `~/.config/voisu/config.toml`. Mirrors the user dictionary resolution.
+fn config_path() -> PathBuf {
+    config_dir().join("config.toml")
 }
 
 /// Reads the persisted Deepgram setting. A missing file yields `None` (the
