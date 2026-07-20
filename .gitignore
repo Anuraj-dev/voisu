@@ -2,3 +2,10 @@
 
 # RPM build artifacts (packaging/build-rpm.sh output)
 /dist/
+
+# makepkg output inside the AUR package dirs. Narrowly scoped so the committed
+# PKGBUILD, .SRCINFO, *.install and LICENSE.ring-* sidecars stay tracked.
+/packaging/aur/*/src/
+/packaging/aur/*/pkg/
+/packaging/aur/*/*.pkg.tar.*
+/packaging/aur/*/*.tar.gz

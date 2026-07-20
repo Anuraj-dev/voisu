@@ -8,17 +8,23 @@ post_install() {
     cat <<'EOF'
 
 Voisu is installed. Its dictation daemon and Overlay run as systemd *user*
-services and are NOT enabled automatically. To start Voisu for your user, run:
+services and are NOT enabled automatically.
+
+1. Store your provider keys (guided, re-runnable):
+
+    voisu setup
+
+2. Start the dictation daemon for your user:
 
     systemctl --user daemon-reload
     systemctl --user enable --now voisu.service
 
-To also run the optional Overlay -- the on-screen status surface that reflects
-daemon state -- run:
+3. Optionally start the Overlay -- the on-screen status surface that reflects
+   daemon state:
 
     systemctl --user enable --now voisu-overlay.service
 
-Configure your provider key first with:  voisu setup
+Before uninstalling, disable these user services FIRST (see below).
 EOF
 }
 
@@ -36,11 +42,20 @@ EOF
 post_remove() {
     cat <<'EOF'
 
-Voisu has been removed. If you enabled its user services, disable them for your
-user with:
+Voisu has been removed.
 
-    systemctl --user disable --now voisu.service
-    systemctl --user disable --now voisu-overlay.service
+NOTE: the user services should be disabled BEFORE removing the package -- pacman
+has already deleted the unit files, so `systemctl --user disable` can no longer
+resolve them. The correct order next time is:
+
+    systemctl --user disable --now voisu.service voisu-overlay.service
+    sudo pacman -R voisu-bin
+
+If the services were still enabled at removal, clear the now-dangling
+enablement symlinks by hand:
+
+    rm -f ~/.config/systemd/user/graphical-session.target.wants/voisu.service
+    rm -f ~/.config/systemd/user/graphical-session.target.wants/voisu-overlay.service
     systemctl --user daemon-reload
 
 Your Voisu configuration and state under ~/.config/voisu and

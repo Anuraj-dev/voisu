@@ -12,10 +12,17 @@ pkgrel=1
 pkgdesc="Cloud-first Linux dictation for Wayland (prebuilt binaries)"
 arch=('x86_64')
 url="https://github.com/Anuraj-Dev/voisu"
-license=('MIT' 'Apache-2.0' 'ISC')
+license=('MIT' 'Apache-2.0' 'ISC' 'BSD-3-Clause')
+# Same runtime boundaries as the source package: pipewire-audio ships pw-record
+# (the base `pipewire` package does not), wireplumber ships wpctl for the
+# microphone readiness check, wl-clipboard/libsecret/curl are subprocesses,
+# xdg-desktop-portal is a D-Bus service, and libxkbcommon is linked directly.
 depends=('gtk4'
          'gtk4-layer-shell'
+         'libxkbcommon'
          'pipewire'
+         'pipewire-audio'
+         'wireplumber'
          'wl-clipboard'
          'libsecret'
          'curl'
@@ -23,16 +30,26 @@ depends=('gtk4'
 optdepends=('libei: direct Delivery of the Transcript into the focused window'
             'xdg-desktop-portal-kde: portal backend for KDE Plasma'
             'xdg-desktop-portal-hyprland: portal backend for Hyprland')
-provides=('voisu')
+provides=("voisu=$pkgver")
 conflicts=('voisu')
 install="$pkgname.install"
 # NOTE: the release asset does not exist until the first tagged release. The
 # tarball 'SKIP' below MUST be replaced with the pinned sha256 (or b2sum, as
-# cargo-aur emits) at the first real release, then regenerate .SRCINFO. The
-# release tarball built by the release workflow is expected to contain, at the
-# top level: voisu, voisu-daemon, voisu-overlay, voisu.service,
-# voisu-overlay.service, LICENSE, LICENSE.ring, LICENSE.ring-BoringSSL,
-# LICENSE.ring-other-bits.
+# cargo-aur emits) at the first real release, then regenerate .SRCINFO.
+#
+# RELEASE TARBALL CONTRACT (ticket 14). The archive must contain, at the top
+# level:
+#   voisu, voisu-daemon, voisu-overlay
+#   voisu.service, voisu-overlay.service
+#   LICENSE
+#   ring/LICENSE
+#   ring/LICENSE-BoringSSL
+#   ring/LICENSE-other-bits
+#   ring/src/polyfill/once_cell/LICENSE-APACHE
+#   ring/src/polyfill/once_cell/LICENSE-MIT
+#   ring/third_party/fiat/LICENSE
+# ring's tree must keep those UPSTREAM names and paths so the cross-references
+# inside ring's own LICENSE manifest resolve once installed.
 source=("$pkgname-$pkgver.tar.gz::https://github.com/Anuraj-Dev/voisu/releases/download/v$pkgver/voisu-$pkgver-${CARCH}.tar.gz")
 sha256sums=('SKIP')
 
@@ -46,10 +63,16 @@ package() {
         "$pkgdir/usr/lib/systemd/user/voisu-overlay.service"
 
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-    install -Dm644 LICENSE.ring \
-        "$pkgdir/usr/share/licenses/$pkgname/LICENSE.ring"
-    install -Dm644 LICENSE.ring-BoringSSL \
-        "$pkgdir/usr/share/licenses/$pkgname/LICENSE.ring-BoringSSL"
-    install -Dm644 LICENSE.ring-other-bits \
-        "$pkgdir/usr/share/licenses/$pkgname/LICENSE.ring-other-bits"
+
+    # Preserve ring's upstream license tree verbatim.
+    local ringlic="$pkgdir/usr/share/licenses/$pkgname/ring"
+    install -Dm644 ring/LICENSE              "$ringlic/LICENSE"
+    install -Dm644 ring/LICENSE-BoringSSL    "$ringlic/LICENSE-BoringSSL"
+    install -Dm644 ring/LICENSE-other-bits   "$ringlic/LICENSE-other-bits"
+    install -Dm644 ring/src/polyfill/once_cell/LICENSE-APACHE \
+        "$ringlic/src/polyfill/once_cell/LICENSE-APACHE"
+    install -Dm644 ring/src/polyfill/once_cell/LICENSE-MIT \
+        "$ringlic/src/polyfill/once_cell/LICENSE-MIT"
+    install -Dm644 ring/third_party/fiat/LICENSE \
+        "$ringlic/third_party/fiat/LICENSE"
 }
