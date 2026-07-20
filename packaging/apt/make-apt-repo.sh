@@ -85,11 +85,25 @@ valid_days=${VOISU_APT_VALID_DAYS:-30}
 # suite/codename/component land inside filesystem paths and the Release header,
 # so they must be conservative Debian identifiers: a leading alnum then only
 # [A-Za-z0-9.+_-]. This rejects '', '/', '..', whitespace and control chars.
-is_identifier() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.+_-]*$'; }
+# Whole-string case globs (NOT grep, which matches line-by-line and would wave an
+# embedded-newline value through on one clean line).
+is_identifier() {
+    case $1 in
+        '' ) return 1 ;;
+        [!A-Za-z0-9]* ) return 1 ;;          # must start with an alnum
+        *[!A-Za-z0-9.+_-]* ) return 1 ;;     # only [A-Za-z0-9.+_-] throughout
+        * ) return 0 ;;
+    esac
+}
 # origin/label are Release VALUES only (may contain spaces) but must be a single
-# printable line -- no newlines/control chars that could forge header fields.
+# printable line -- any non-printable char (newline/tab/control) is rejected so a
+# value cannot forge extra header fields.
 is_header_value() {
-    printf '%s' "$1" | grep -Eq '^[[:print:]]+$' && ! printf '%s' "$1" | grep -q '[[:cntrl:]]'
+    case $1 in
+        '' ) return 1 ;;
+        *[![:print:]]* ) return 1 ;;
+        * ) return 0 ;;
+    esac
 }
 
 for pair in "suite=$suite" "codename=$codename" "component=$component"; do

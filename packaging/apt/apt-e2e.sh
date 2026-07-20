@@ -95,6 +95,7 @@ if test "$phase" != image; then
     mkdir -p "$scratch"/{out/v1,out/v2,cargo,target}
     # Scripts under test come from the committed tree, not the live checkout.
     git -C "$repo_root" show "$commit:packaging/apt/make-apt-repo.sh" > "$scratch/make-apt-repo.sh"
+    chmod +x "$scratch/make-apt-repo.sh"
     manifest="$scratch/manifest.txt"
 fi
 
