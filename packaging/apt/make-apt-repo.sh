@@ -275,19 +275,40 @@ if ! flock -w 60 9; then
     exit 1
 fi
 
-# GC stage/keyring debris a crashed prior run may have left inside the served
-# dists/ tree (each run uses fresh mktemp names, so a later run never reuses
-# them; without this they would be fetchable at non-canonical paths forever).
-# Safe under the lock: no other publisher is mid-commit.
-if test -d "$repo_dir/dists"; then
-    find "$repo_dir/dists" -maxdepth 1 \( -name '.stage.*' -o -name '.keyring.*' \) \
-        -exec rm -rf {} + 2>/dev/null || true
-fi
-
 # --- lay out the pool ------------------------------------------------------
 pool_rel="pool/${component}/v/voisu"
 dist_rel="dists/${suite}"
 bin_rel="${component}/binary-${arch}"
+
+# --- recover, then GC, debris of a hard-crashed prior run --------------------
+# A SIGKILL/power loss between the commit's two renames bypasses the EXIT trap
+# and leaves the ONLY valid metadata tree at dists/.stage.<random>.old with the
+# suite dir absent. Restore it BEFORE garbage collection so a subsequent
+# failure in THIS run (contaminated pool, signing error) still leaves the
+# previously valid metadata live. Only after the suite dir exists (restored or
+# already live) is remaining .stage.*/.keyring.* debris redundant and safe to
+# delete (fresh mktemp names each run mean nothing here belongs to this run).
+# All under the publisher lock: no other publisher is mid-commit.
+if test -d "$repo_dir/dists"; then
+    if ! test -d "$repo_dir/$dist_rel"; then
+        for d in "$repo_dir"/dists/.stage.*.old; do
+            test -d "$d" || continue
+            mv "$d" "$repo_dir/$dist_rel"
+            printf 'recovered live metadata from crashed publish (%s)\n' "$(basename "$d")" >&2
+            break
+        done
+    fi
+    # Plain .stage.* (never-committed staging) and .keyring.* are never valid
+    # live metadata -- always safe to collect. The .stage.*.old recovery trees
+    # are only redundant once the suite dir exists.
+    find "$repo_dir/dists" -maxdepth 1 \
+        \( -name '.stage.*' ! -name '.stage.*.old' -o -name '.keyring.*' \) \
+        -exec rm -rf {} + 2>/dev/null || true
+    if test -d "$repo_dir/$dist_rel"; then
+        find "$repo_dir/dists" -maxdepth 1 -name '.stage.*.old' \
+            -exec rm -rf {} + 2>/dev/null || true
+    fi
+fi
 assert_safe_rel "$pool_rel"
 assert_safe_rel "$dist_rel"
 mkdir -p "$repo_dir/$pool_rel"
@@ -383,7 +404,13 @@ cleanup_stage() {
     if test -d "$old_dir" && ! test -d "$live_dir"; then
         mv "$old_dir" "$live_dir" 2>/dev/null || true
     fi
-    rm -rf "$stage_dir" "$old_dir" "$staged_key" 2>/dev/null || true
+    rm -rf "$stage_dir" "$staged_key" 2>/dev/null || true
+    # Delete old_dir only once live metadata verifiably exists (committed or
+    # restored); if the restore mv above failed, old_dir is still the only
+    # copy -- keep it for the next run's startup recovery.
+    if test -d "$live_dir"; then
+        rm -rf "$old_dir" 2>/dev/null || true
+    fi
 }
 trap cleanup_stage EXIT
 mkdir -p "$stage_dir/$bin_rel"
