@@ -19,10 +19,14 @@ next agent (or you tomorrow) starts cheap.
 Updated by Raja 2026-07-19: Codex quota is nearly exhausted — Codex/GPT models are for REVIEWS ONLY.
 All implementation goes to Claude models.
 
+**Codex budget cap (Raja, 2026-07-20): 2 Sol/cladex reviews REMAINING.** Decrement this line each time
+one is dispatched. At 0 (or if cladex dies), STOP using codex/cladex entirely until Raja re-enables it —
+ALL reviews (first and re-reviews) then go to a claude-opus-4-8 subagent at high effort.
+
 | Work | Model | Effort |
 |---|---|---|
-| Code review — FIRST review of a ticket | gpt-5.6-sol | high (Sol never goes above high) |
-| Code review — re-reviews after the first, until merge | gpt-5.6-sol | medium |
+| Code review — FIRST review of a ticket | gpt-5.6-sol (while budget lasts, else Opus 4.8 high) | high (Sol never goes above high) |
+| Code review — re-reviews after the first, until merge | gpt-5.6-sol (while budget lasts, else Opus 4.8 high) | medium |
 | ALL implementation (features, fixes, glue, config, packaging) | claude-opus-4-8 subagent | high |
 | Genuinely complex / architectural tickets (concurrency, IPC, provider streaming, reconciliation) | claude-fable-5 subagent | medium |
 | Review of code a Claude model wrote is still Sol; review of Fable-written code may go to Opus if Sol quota is critical | — | — |
