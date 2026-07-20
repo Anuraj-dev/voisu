@@ -164,13 +164,20 @@ for lic in ring/LICENSE ring/LICENSE-BoringSSL ring/LICENSE-other-bits; do
     fi
 done
 
-cp packaging/voisu.spec "$topdir/SPECS/voisu.spec"
+# Bake the computed Release/commit into the spec as %global. A plain
+# `rpmbuild --rebuild` of the resulting SRPM (COPR mock, a friend's box) has no
+# access to our --defines, so without this the embedded macros would collapse to
+# Release 1.gitunknown; the %global lines make the SRPM self-describing and its
+# rebuilds byte-for-byte NEVR-stable. Same mechanism as packaging/copr/make-srpm.sh.
+{
+    printf '%%global voisu_release %s\n' "$voisu_release"
+    printf '%%global voisu_commit %s\n' "$commit"
+    cat packaging/voisu.spec
+} > "$topdir/SPECS/voisu.spec"
 
 # --- build the source RPM only (embeds Source0 + Source1) ------------------
 rpmbuild -bs \
     --define "_topdir $topdir" \
-    --define "voisu_commit $commit" \
-    --define "voisu_release $voisu_release" \
     "$topdir/SPECS/voisu.spec"
 
 rm -rf "$output_dir"
