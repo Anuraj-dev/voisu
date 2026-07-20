@@ -3189,6 +3189,148 @@ fn auth_set_retries_an_activating_keyring_within_budget_then_falls_back() {
 }
 
 #[test]
+fn auth_verify_recovers_from_a_transient_secret_service_lookup_denial() {
+    // A per-Recording (here per-`auth verify`) credential lookup that hits a
+    // transient D-Bus/ksecretd denial — a nonzero exit WITH a stderr diagnostic —
+    // must retry within a small bounded budget and recover, not hard-fail the
+    // whole activation. The stub denies the first lookup then serves the
+    // credential; one retry recovers within the single load.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let stub = TempDir::new().unwrap();
+    let stub_path = stub.path().join("secret-tool");
+    // First `lookup` invocation: no calls file yet → deny with a stderr
+    // diagnostic (the transient-denial shape). Every later invocation: the file
+    // exists → serve the credential on stdout. Each call appends one byte so the
+    // test can count invocations.
+    fs::write(
+        &stub_path,
+        "#!/bin/sh\n\
+         dir=$(dirname \"$0\")\n\
+         if [ -f \"$dir/secret-tool.calls\" ]; then\n\
+         \tprintf 'x' >> \"$dir/secret-tool.calls\"\n\
+         \tprintf 'recovered-secret'\n\
+         \texit 0\n\
+         fi\n\
+         printf 'x' >> \"$dir/secret-tool.calls\"\n\
+         echo 'org.freedesktop.Secret.Error: transient denial' 1>&2\n\
+         exit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&stub_path, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!("{}:{}", stub.path().display(), std::env::var("PATH").unwrap());
+    let started = Instant::now();
+    let verified = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["auth", "verify", "groq"],
+        &[
+            ("PATH", &path),
+            ("VOISU_TEST_KEYRING_RETRY_MS", "0"),
+            // Seam the network probe so a recovered load reports success without
+            // any real HTTP call.
+            ("VOISU_TEST_AUTH_GROQ", "authorized"),
+        ],
+    );
+
+    assert!(
+        verified.status.success(),
+        "a transient denial must recover, not fail the activation: {}",
+        stderr(&verified)
+    );
+    assert_eq!(stdout(&verified), "Groq authentication verified\n");
+    assert!(started.elapsed() < Duration::from_secs(4), "the load retry must stay bounded");
+    // One denied attempt plus one recovered attempt: exactly two lookups.
+    let calls = fs::read_to_string(stub.path().join("secret-tool.calls")).unwrap();
+    assert_eq!(calls.len(), 2, "expected 1 denied + 1 recovered lookup, got {}", calls.len());
+    assert!(
+        !format!("{}{}", stdout(&verified), stderr(&verified)).contains("recovered-secret"),
+        "the credential value must never be echoed"
+    );
+}
+
+#[test]
+fn auth_verify_surfaces_the_loud_failure_when_a_lookup_denial_persists() {
+    // A persistent denial (every lookup fails with a stderr diagnostic) must
+    // exhaust the small retry budget and then surface the existing loud keyring
+    // failure — the retry must not mask a genuinely unavailable Secret Service.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let stub = TempDir::new().unwrap();
+    let stub_path = stub.path().join("secret-tool");
+    fs::write(
+        &stub_path,
+        "#!/bin/sh\n\
+         dir=$(dirname \"$0\")\n\
+         printf 'x' >> \"$dir/secret-tool.calls\"\n\
+         echo 'org.freedesktop.Secret.Error: denied' 1>&2\n\
+         exit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&stub_path, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!("{}:{}", stub.path().display(), std::env::var("PATH").unwrap());
+    let started = Instant::now();
+    let denied = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["auth", "verify", "groq"],
+        &[("PATH", &path), ("VOISU_TEST_KEYRING_RETRY_MS", "0")],
+    );
+
+    assert_eq!(denied.status.code(), Some(4), "a persistent denial is a hard failure: {}", stderr(&denied));
+    assert!(
+        stderr(&denied).contains("keyring is locked"),
+        "the persistent-denial failure must stay loud: {}",
+        stderr(&denied)
+    );
+    assert!(started.elapsed() < Duration::from_secs(4), "the exhausted retry budget must stay bounded");
+    // One immediate attempt plus two bounded retries: the lookup budget is smaller
+    // than the store budget because it runs on the per-Recording hot path.
+    let calls = fs::read_to_string(stub.path().join("secret-tool.calls")).unwrap();
+    assert_eq!(calls.len(), 3, "expected 1 immediate + 2 retried lookups, got {}", calls.len());
+}
+
+#[test]
+fn auth_verify_does_not_retry_a_clean_no_match_lookup() {
+    // A genuine "no such key" lookup is a nonzero exit with EMPTY stderr. That is
+    // definitive absence, not a transient denial: it must NOT be retried (so the
+    // common unconfigured-key and file-fallback paths add no latency) and must
+    // still surface the env-var setup guidance verbatim.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let stub = TempDir::new().unwrap();
+    let stub_path = stub.path().join("secret-tool");
+    fs::write(
+        &stub_path,
+        "#!/bin/sh\n\
+         dir=$(dirname \"$0\")\n\
+         printf 'x' >> \"$dir/secret-tool.calls\"\n\
+         exit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&stub_path, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!("{}:{}", stub.path().display(), std::env::var("PATH").unwrap());
+    let absent = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["auth", "verify", "groq"],
+        &[("PATH", &path), ("VOISU_TEST_KEYRING_RETRY_MS", "0")],
+    );
+
+    assert_eq!(absent.status.code(), Some(4));
+    assert!(
+        stderr(&absent).contains(
+            "Secret storage is unavailable; set VOISU_GROQ_API_KEY or VOISU_DEEPGRAM_API_KEY"
+        ),
+        "a clean no-match must surface the env-var setup guidance: {}",
+        stderr(&absent)
+    );
+    // Exactly one lookup: a definitive no-match is never retried.
+    let calls = fs::read_to_string(stub.path().join("secret-tool.calls")).unwrap();
+    assert_eq!(calls.len(), 1, "a clean no-match must not be retried, got {} lookups", calls.len());
+}
+
+#[test]
 fn auth_set_bounds_a_child_that_never_drains_a_large_stdin() {
     let runtime = TempDir::new().unwrap();
     let config_home = TempDir::new().unwrap();
@@ -4071,6 +4213,12 @@ fi
                 "VOISU_GROQ_RECONCILIATION_URL",
                 "https://reconciliation.test/chat/completions",
             ),
+            // Opt out of the session credential cache: this test's timing
+            // choreography relies on the RECONCILIATION performing its own slow
+            // secret-tool lookup (the ~1.5s that lets the outer 3s reconciliation
+            // deadline fire mid-curl). A zero TTL keeps every load re-reading, so
+            // the reconciliation still shells out and hits the "slow" marker.
+            ("VOISU_TEST_CREDENTIAL_CACHE_TTL_MS", "0"),
         ],
     );
 
