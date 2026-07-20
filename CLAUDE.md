@@ -19,7 +19,7 @@ next agent (or you tomorrow) starts cheap.
 Updated by Raja 2026-07-19: Codex quota is nearly exhausted — Codex/GPT models are for REVIEWS ONLY.
 All implementation goes to Claude models.
 
-**Codex budget cap (Raja, 2026-07-20): 2 Sol/cladex reviews REMAINING** (Raja granted +1 on 2026-07-20 evening; one is reserved for ticket 14's first review, the other is flexible). Decrement this line each time
+**Codex budget cap (Raja, 2026-07-20): 1 Sol/cladex review REMAINING** (reserved for ticket 14's first review; the flexible slot was spent on PR #68 re-r4). At 0 (or if cladex dies), STOP using codex/cladex until Raja re-enables it — all reviews then go to a claude-opus-4-8 subagent at high effort. Decrement this line each time
 one is dispatched. At 0 (or if cladex dies), STOP using codex/cladex entirely until Raja re-enables it —
 ALL reviews (first and re-reviews) then go to a claude-opus-4-8 subagent at high effort.
 
