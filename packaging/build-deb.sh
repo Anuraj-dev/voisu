@@ -21,7 +21,7 @@ set -euo pipefail
 # missing/wrong cargo-deb, out-of-tree output dir) all run before any
 # Debian-only step, so they are exercisable on any host.
 
-root=$(git rev-parse --show-toplevel)
+root=$(realpath "$(git rev-parse --show-toplevel)")
 cd "$root"
 
 # Pinned to the exact cargo-deb version this package was validated with.
@@ -51,11 +51,12 @@ fi
 #   tagged release  -> <base>-N              (VOISU_DEB_RELEASE=N, N a positive integer)
 #   dev build       -> <base>~git<ct>.<count>.<sha>-1
 # The leading `~` guarantees any dev version sorts BEFORE the matching <base>-N
-# release. For dev builds the ordering key is the committer timestamp (%ct,
-# monotonic in real time) followed by the commit count along history (strictly
-# increasing along a linear branch) -- both are decimal integers compared
-# numerically by dpkg, so a later commit can never receive a lower version. The
-# short SHA is only an identifier appended last, never relied on for ordering.
+# release. For dev builds the PRIMARY ordering key is the commit count along
+# history (strictly increasing for any descendant commit, immune to committer
+# clock skew); the committer timestamp is a secondary tiebreaker only. Both are
+# decimal integers compared numerically by dpkg. The short SHA is only an
+# identifier appended last, never relied on for ordering. The count is only
+# trustworthy with full history, so shallow clones are refused.
 if test -n "${VOISU_DEB_RELEASE:-}"; then
     if ! printf '%s' "$VOISU_DEB_RELEASE" | grep -Eq '^[1-9][0-9]*$'; then
         printf 'VOISU_DEB_RELEASE must be a positive integer (got "%s")\n' "$VOISU_DEB_RELEASE" >&2
@@ -77,10 +78,14 @@ if test -n "${VOISU_DEB_RELEASE:-}"; then
     fi
     deb_version="${base_version}-${VOISU_DEB_RELEASE}"
 else
+    if test "$(git rev-parse --is-shallow-repository)" = "true"; then
+        printf '%s\n' 'refusing a dev build from a shallow clone: the commit count that orders dev versions needs full history (git fetch --unshallow)' >&2
+        exit 1
+    fi
     ct=$(git show -s --format=%ct "$commit")
     count=$(git rev-list --count "$commit")
     short=$(git rev-parse --short=12 "$commit")
-    deb_version="${base_version}~git${ct}.${count}.${short}-1"
+    deb_version="${base_version}~git${count}.${ct}.${short}-1"
 fi
 
 # --- toolchain checks ------------------------------------------------------
@@ -97,11 +102,18 @@ if test "$have_cargo_deb" != "$CARGO_DEB_VERSION"; then
 fi
 
 # --- output dir: canonicalize and confine to $root/dist/ -------------------
-# Guard BEFORE any destructive step. realpath -m resolves symlinks/.. without
-# requiring the path to exist, then we only permit a target strictly beneath
-# $root/dist/ -- so $root, $HOME, / (and anything outside the tree) are refused.
-output_dir=${VOISU_DEB_OUTPUT_DIR:-"$root/dist/deb"}
-dist_root=$(realpath -m "$root/dist")
+# Guard BEFORE any destructive step. dist/ is git-ignored, so a clean checkout
+# can still carry a symlinked dist redirecting the deletion boundary elsewhere
+# ($root/dist -> $HOME); refuse that outright. $root is already canonical, so a
+# non-symlink $root/dist canonicalizes to itself, and realpath -m on the output
+# path then resolves any nested symlinks/.. -- only a target strictly beneath
+# the real $root/dist/ is permitted; $root, $HOME, / are refused.
+if test -L "$root/dist"; then
+    printf 'refusing: %s/dist is a symlink; remove it so the output dir stays inside the tree\n' "$root" >&2
+    exit 1
+fi
+dist_root="$root/dist"
+output_dir=${VOISU_DEB_OUTPUT_DIR:-"$dist_root/deb"}
 output_dir=$(realpath -m "$output_dir")
 case "$output_dir" in
     "$dist_root"/?*) : ;;

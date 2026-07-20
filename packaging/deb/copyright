@@ -21,8 +21,6 @@ Files: packaging/deb/LICENSE.ring-BoringSSL
 Copyright: 2015-2016 Google Inc.
  2009 The Go Authors
  2015 The Chromium Authors
- 1998-2011 The OpenSSL Project
- 1995-1998 Eric Young
 License: Apache-2.0 and BSD-3-clause
 Comment:
  Code sourced into *ring* from BoringSSL is under the Apache-2.0 license, with
