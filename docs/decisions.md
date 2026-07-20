@@ -520,3 +520,12 @@ queued-job races). make-srpm.sh now fetches full history + tags, derives the ver
 metadata, and if `v<version>` exists checks out THAT commit to build the release; otherwise it's a
 snapshot of HEAD. Rejected for now: COPR API-token pinned-ref builds (new secret + more surface) —
 revisit in ticket 14 if the release workflow wants it.
+
+## 2026-07-20 — COPR builds only the highest release tag; snapshots are a bootstrap-only mode
+**Why:** the COPR webhook carries no commit, and deriving the build target from the clone's mutable
+HEAD loses provenance (tag-before-branch pushes, queued-job races, tags on non-default branches).
+make-srpm.sh now fetches tags fail-closed and builds the highest valid `v<semver>` tag's commit,
+validating the tag name against that commit's own tree; a snapshot of HEAD is built only when no
+release tag exists (pre-first-release). Queued races collapse to "latest release wins". Rejected:
+per-tag pinned builds via the COPR API (needs a new API-token secret — ticket 14 may add it) and
+deriving the tag from HEAD's version (the round-2 defect).

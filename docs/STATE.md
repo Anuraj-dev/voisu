@@ -1,17 +1,16 @@
 # Voisu — State
-> Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-20 (~17:50)
+> Cloud-first Linux desktop dictation app (Fedora KDE Plasma / Wayland) · Last checkpoint: 2026-07-20 (~20:31)
 
 ## 🚧 In progress / next
-- **Ticket 12 (COPR, GH #44) mid-fix-round on `feat/copr-channel` / PR #66.** Sol's first review (high)
-  returned 15 findings (4 major). Orchestrator direction on the majors: (1) make-srpm.sh self-pins tag
-  builds (fetch tags+history, checkout `v<cargo-version>` commit when it exists; no COPR API token);
-  (2) ONE Release policy — all pre-release `0.<count>.<ct>.git<sha>`, tagged plain `N` from a committed
-  packaging value (build-rpm.sh change in scope); (3) %check exports TMPDIR=/var/tmp
-  RUST_TEST_THREADS=4; (4) version derived from cargo metadata, validated == spec, respin via the
-  committed release-number value. An Opus fix agent (2nd — first was killed mid-run by Raja; its main
-  fix commit `8297d04` survived locally) is verifying/finishing/pushing. **Next step: Sol re-review at
-  medium once it pushes, then merge on CI green.** Then ticket 13 (apt repo — Pages vs Cloudsmith
-  decided in-ticket), 14 (release workflow + CI smoke), 15 (live desktop validation, HITL), 16 below.
+- **Ticket 12 (COPR, GH #44) MERGED** — PR #66 (main f69039b) after 3 review rounds (Sol high → Sol
+  medium → cladex died twice → Opus high APPROVE). **NEXT: ticket 13 (apt repo, GH #45 —
+  `.scratch/voisu-friends/issues/13-apt-repo-channel.md`; Pages vs Cloudsmith decided in-ticket)**,
+  then 14 (release workflow + CI smoke), 15 (live desktop validation, HITL), 16 below. Routing
+  unchanged: Opus 4.8 high implements, Sol reviews (first high, re-reviews medium; cladex dies →
+  retry once → Opus reviews), 2 failed rounds → driver/Fable inline.
+- **COPR runbook notes (ticket 12):** channel serves ONLY the highest v<semver> tag once tags exist
+  (dev snapshots = local scripts); a stray high tag (v9.9.9) stalls all release builds fail-closed
+  until deleted; respin = bump packaging/rpm-release + retag + re-trigger webhook.
 - **Ticket 16 filed (GH #65, `.scratch/voisu-friends/issues/16-license-tree-deb-rpm.md`):** ring
   license-tree compliance gap in deb + RPM (renamed paths dangling from ring's manifest; once_cell +
   fiat texts missing). Fix mirrors packaging/aur/voisu/PKGBUILD. Land before first tagged release.
@@ -33,13 +32,15 @@
 - **Tickets 10 (deb, PR #63) and 11 (AUR, PR #64) MERGED.** Ticket 11 closed with Sol zero-findings
   approve. AUR deps corrected: pipewire-audio (owns pw-record), wireplumber (wpctl), libxkbcommon
   runtime, checkdepends python+dbus; `options=('!lto')` (ring). namcap clean.
-- **Ticket 12 round 0 (PR #66, unmerged):** cargo-vendor SRPM (Source1 vendor tarball, offline %build),
-  packaging/build-srpm.sh + packaging/copr/make-srpm.sh (COPR custom-source; SRPM phase networked,
-  mock phase not), .github/workflows/copr-trigger.yml (v* tag → webhook), spec voisu_release macro.
-  Offline rebuild proven in fedora:43 --network=none; found+fixed --define non-persistence
-  (%global baking). 15 review findings in flight (above).
+- **Ticket 12 (COPR, PR #66) MERGED:** cargo-vendor SRPM (Source1 vendor tarball, offline %build),
+  shared packaging/rpm-lib.sh (unified Release policy, symlink-proof confinement, vendor+verify,
+  ordering self-test), build-srpm.sh + copr/make-srpm.sh (custom-source; SRPM phase networked, mock
+  phase not; HEAD-independent highest-tag self-pinning, fail-closed fetches), copr-trigger.yml
+  (v<semver> tag → webhook, hardened). Offline rebuild proven fedora:43 --network=none; %check
+  exports TMPDIR/RUST_TEST_THREADS; committed packaging/rpm-release for respins.
 - Phase A complete (01–08); ticket 09 accounts/keys live. Test baseline: **431 passed / 0 failed**.
-- `docs/model-benchmark.md` rows through 179. CI flake #58 family: rerun once, never twice.
+- `docs/model-benchmark.md` rows through 182. CI flake #58 family: rerun once, never twice —
+  root cause of one family member found + filed as GH #67 (missing wait_for_marker).
 - **ROUTING (Raja):** Sol/cladex = REVIEWS ONLY (first high, re-reviews medium); ALL implementation →
   Opus 4.8 high (architectural → Fable medium); 2 failed review rounds → discard implementer → Fable/driver.
 
