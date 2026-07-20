@@ -503,3 +503,20 @@ newer package as a downgrade. `git rev-list --count` is monotonic along history,
 timestamp is a tiebreaker and the short SHA is an identifier only, never an ordering key. The count is
 only trustworthy with full history, so shallow clones are refused outright. Rejected: SHA-based
 ordering (random with respect to commit order — the original bug).
+
+## 2026-07-20 — One RPM Release policy across dev, COPR snapshot, and tagged builds
+**Why:** the dev path's `1.git<hex>` orders by random commit hash and outranks the first tagged
+release `1`, so systems with a dev RPM would never upgrade to the real channel. Unified: every
+pre-release build (dev + COPR snapshot) uses `0.<count>.<ct>.git<sha>` (count = full-history
+`rev-list --count`, monotonic; timestamp tiebreaker), tagged releases use plain `N` from a
+committed packaging value (respin = bump it). Cost: one-time `--oldpackage` downgrade on machines
+with an installed `1.git<sha>` dev RPM (Raja's). Rejected: starting official releases at `2`
+forever to outrank stale dev builds — pays a permanent numbering tax for a one-machine problem.
+
+## 2026-07-20 — COPR tag builds self-pin in make-srpm.sh instead of via an API token
+**Why:** the only COPR credential is the webhook URL (ticket 09); the generic webhook rebuild
+clones mutable default-branch HEAD, so a tag push could build the wrong commit (tag-before-branch,
+queued-job races). make-srpm.sh now fetches full history + tags, derives the version from cargo
+metadata, and if `v<version>` exists checks out THAT commit to build the release; otherwise it's a
+snapshot of HEAD. Rejected for now: COPR API-token pinned-ref builds (new secret + more surface) —
+revisit in ticket 14 if the release workflow wants it.
