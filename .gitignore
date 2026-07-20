@@ -9,3 +9,6 @@
 /packaging/aur/*/pkg/
 /packaging/aur/*/*.pkg.tar.*
 /packaging/aur/*/*.tar.gz
+
+# COPR Custom source-method scratch (packaging/copr/make-srpm.sh)
+_copr_srpm/
