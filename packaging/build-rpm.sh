@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Dev-machine Fedora RPM: tests the exact commit, builds it, and packages binary
+# RPMs via rpmbuild -ba from a Cargo.lock-pinned, byte-reproducible vendored
+# source archive. Shares the version derivation, unified Release policy, and
+# vendor+verify logic with the COPR path via packaging/rpm-lib.sh.
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=packaging/rpm-lib.sh
+source "$script_dir/rpm-lib.sh"
+
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 
 requested_commit=${VOISU_COMMIT:-HEAD}
 commit=$(git rev-parse --verify "${requested_commit}^{commit}")
-version=0.1.0
 output_dir=${VOISU_RPM_OUTPUT_DIR:-"$root/dist/rpm"}
 
 if test -n "$(git status --porcelain)"; then
@@ -17,8 +25,23 @@ if test "$(git rev-parse HEAD)" != "$(git rev-parse "$commit")"; then
     printf '%s\n' 'VOISU_COMMIT must be the checked-out commit' >&2
     exit 1
 fi
+if test "$(git rev-parse --is-shallow-repository)" = "true"; then
+    printf '%s\n' 'refusing a build from a shallow clone: the commit count that orders pre-release versions needs full history (git fetch --unshallow)' >&2
+    exit 1
+fi
 
-printf 'Testing exact Voisu commit: %s\n' "$commit"
+# Version from cargo metadata (verified against the spec); unified Release policy.
+version=$(voisu_derive_version "$root")
+if tag_commit=$(git rev-parse --verify --quiet "refs/tags/v${version}^{commit}" 2>/dev/null) \
+        && test "$tag_commit" = "$commit"; then
+    tag_number=$(voisu_tag_release_number "$root")
+    voisu_release=$(voisu_compute_release "$root" "$commit" yes "$tag_number")
+else
+    voisu_release=$(voisu_compute_release "$root" "$commit" no "")
+fi
+voisu_assert_release_ordering "$version"
+
+printf 'Testing exact Voisu commit: %s (Release %s)\n' "$commit" "$voisu_release"
 cargo test --locked --workspace
 cargo build --locked --release --workspace
 cargo check --locked -p voisu-app --features overlay
@@ -28,70 +51,31 @@ cleanup() { rm -rf "$topdir"; }
 trap cleanup EXIT
 mkdir -p "$topdir"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
 
+# Source0: exact-commit git archive; work only from its extraction.
 archive="$topdir/SOURCES/voisu-${version}.tar.gz"
 git archive --format=tar.gz --prefix="voisu-${version}/" "$commit" > "$archive"
-# List once to a file: `tar -tzf | grep -q` dies of SIGPIPE under pipefail
-# when grep exits on an early match while tar is still writing.
-tar -tzf "$archive" > "$topdir/source-archive.list"
-grep -qx "voisu-${version}/Cargo.lock" "$topdir/source-archive.list"
-grep -qx "voisu-${version}/LICENSE" "$topdir/source-archive.list"
-grep -qx "voisu-${version}/packaging/voisu.service" "$topdir/source-archive.list"
-grep -qx "voisu-${version}/packaging/voisu-overlay.service" "$topdir/source-archive.list"
-
-# Reproducibility: vendor from an extraction of the exact-commit git archive
-# (never the working tree), and archive deterministically. --sort fixes entry
-# order, --owner/--group/--numeric-owner fix ownership, --mtime fixes timestamps,
-# --mode normalizes permission bits (so a differing build umask cannot change the
-# headers), and `gzip -n` drops the gzip name/timestamp. The self-test then runs
-# an INDEPENDENT cargo vendor of the same commit and requires a byte-identical
-# archive, proving cargo vendor output stability rather than only tar/gzip
-# determinism.
-commit_epoch=$(git show -s --format=%ct "$commit")
 extract_dir="$topdir/extract"
 mkdir -p "$extract_dir"
 tar -xzf "$archive" -C "$extract_dir"
+src="$extract_dir/voisu-${version}"
 
-vendor_into() {
-    # $1 = parent directory to hold voisu-vendor-${version}
-    mkdir -p "$1"
-    ( cd "$extract_dir/voisu-${version}" \
-        && cargo vendor --locked "$1/voisu-vendor-${version}" >/dev/null )
-}
+# Source1: byte-reproducible vendor tarball + independent re-vendor self-test +
+# source/ring-license sanity (shared helper).
+commit_epoch=$(git show -s --format=%ct "$commit")
+voisu_vendor_and_verify "$src" "$version" "$commit_epoch" "$topdir/scratch" \
+    "$topdir/SOURCES/voisu-vendor-${version}.tar.gz"
 
-deterministic_vendor_archive() {
-    # $1 = parent directory containing voisu-vendor-${version}, $2 = output path
-    tar --sort=name --mtime="@${commit_epoch}" \
-        --owner=0 --group=0 --numeric-owner --mode='u+rw,go=rX' \
-        -C "$1" -cf - "voisu-vendor-${version}" | gzip -n > "$2"
-}
+# Spec from the extracted tree, Release/commit baked as %global (so the SRPM that
+# -ba also emits is self-describing, matching build-srpm.sh).
+{
+    printf '%%global voisu_release %s\n' "$voisu_release"
+    printf '%%global voisu_commit %s\n' "$commit"
+    cat "$src/packaging/voisu.spec"
+} > "$topdir/SPECS/voisu.spec"
 
-vendor_into "$topdir/vendor"
-vendor_archive="$topdir/SOURCES/voisu-vendor-${version}.tar.gz"
-deterministic_vendor_archive "$topdir/vendor" "$vendor_archive"
-
-# Discriminating self-test: an independent cargo vendor of the same commit must
-# produce a byte-identical archive. This fails loudly on either cargo vendor
-# instability or a regression in the deterministic tar/gzip invariants.
-vendor_into "$topdir/vendor-verify"
-repro_archive="$topdir/voisu-vendor-repro.tar.gz"
-deterministic_vendor_archive "$topdir/vendor-verify" "$repro_archive"
-if ! cmp -s "$vendor_archive" "$repro_archive"; then
-    printf '%s\n' 'vendor archive is not reproducible: an independent cargo vendor of the same commit differs' >&2
-    exit 1
-fi
-rm -rf "$topdir/vendor-verify" "$repro_archive"
-
-tar -tzf "$vendor_archive" > "$topdir/vendor-archive.list"
-grep -q "^voisu-vendor-${version}/" "$topdir/vendor-archive.list"
-
-cp packaging/voisu.spec "$topdir/SPECS/voisu.spec"
-
-rpmbuild -ba \
-    --define "_topdir $topdir" \
-    --define "voisu_commit $commit" \
-    "$topdir/SPECS/voisu.spec"
+rpmbuild -ba --define "_topdir $topdir" "$topdir/SPECS/voisu.spec"
 
 rm -rf "$output_dir"
 mkdir -p "$output_dir"
 find "$topdir/RPMS" -type f -name '*.rpm' -exec cp -t "$output_dir" {} +
-printf 'RPM artifacts written to %s\n' "$output_dir"
+printf 'RPM artifacts (Release %s) written to %s\n' "$voisu_release" "$output_dir"

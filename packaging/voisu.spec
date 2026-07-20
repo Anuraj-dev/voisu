@@ -1,14 +1,16 @@
 Name:           voisu
 Version:        0.1.0
 %{!?voisu_commit:%global voisu_commit unknown}
-# Release is computed by the build scripts, ONE spec serving both channels:
-#   - dev machine (build-rpm.sh): voisu_release undefined -> 1.git<commit>
-#   - COPR channel (build-srpm.sh / make-srpm.sh): voisu_release is a
-#     monotonically increasing snapshot release like 0.<count>.<ct>.git<sha>,
-#     whose leading 0. sorts before an eventual tagged 1%%{?dist} and whose
-#     commit-count primary key increases for any descendant commit (immune to
-#     committer clock skew), so `dnf upgrade` always sees a newer NEVR.
-Release:        %{?voisu_release}%{!?voisu_release:1.git%{?voisu_commit}}%{?dist}
+# Release is computed by the build scripts and baked in as %%global voisu_release
+# (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
+#   - pre-release builds (build-rpm.sh dev path AND COPR snapshots via
+#     build-srpm.sh / make-srpm.sh): 0.<count>.<ct>.git<sha> — the leading 0.
+#     keeps every snapshot below any tagged release, and the commit-count primary
+#     key increases for any descendant commit (immune to committer clock skew).
+#   - tagged releases: a plain integer N from the committed packaging/rpm-release.
+# The fallback below is only reached if the spec is built raw without the scripts;
+# its leading 0. keeps such an accidental build below every real release.
+Release:        %{?voisu_release}%{!?voisu_release:0.0.gitunknown}%{?dist}
 Summary:        Cloud-first Linux dictation for Fedora Wayland
 # Voisu is MIT; the statically linked ring crate adds ISC (new code) and
 # Apache-2.0 (BoringSSL-derived code). Ring's license texts ship in %%license.
@@ -93,6 +95,12 @@ cargo build --offline --release --locked --workspace
 cargo build --offline --release --locked -p voisu-app --features overlay --bin voisu-overlay
 
 %check
+# Constrained builders (mock/COPR) do not inherit the caller's environment, so
+# export the tmpfs-quota workaround here: /var/tmp is real disk (default /tmp may
+# be a size-capped tmpfs) and RUST_TEST_THREADS bounds the test processes that
+# each spawn a dbus-daemon/python/curl subprocess. Documented repo gotcha.
+export TMPDIR=/var/tmp
+export RUST_TEST_THREADS=4
 cargo test --offline --release --locked --workspace
 cargo check --offline --release --locked -p voisu-app --features overlay
 

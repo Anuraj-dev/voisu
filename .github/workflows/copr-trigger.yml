@@ -1,36 +1,62 @@
 name: Trigger COPR rebuild
 
-# Ticket 12 (GH issue #44). Minimal wiring: a v* tag push pokes the COPR
-# project's Custom-source webhook, which rebuilds the vendored, offline-buildable
-# SRPM (packaging/copr/make-srpm.sh) for the anuraj-dev/voisu COPR channel.
-# The full release workflow (SRPM upload, matrix, smoke) is ticket 14; this is
-# only the rebuild trigger.
+# Ticket 12 (GH issue #44). Minimal wiring: a v<X.Y.Z> tag push pokes the COPR
+# project's Custom-source webhook, which self-pins and rebuilds the vendored,
+# offline-buildable SRPM (packaging/copr/make-srpm.sh) for the anuraj-dev/voisu
+# COPR channel. The full release workflow (SRPM upload, matrix, smoke) is ticket
+# 14; this is only the rebuild trigger.
 #
-# COPR's custom webhook is triggered by a plain POST with an empty body. The
-# URL is a secret (COPR_WEBHOOK_URL) and is passed through the environment, never
-# interpolated into the command line, so it is never echoed into the log.
+# The webhook is a plain POST; COPR ignores the body. The URL is a secret
+# (COPR_WEBHOOK_URL): it is not embedded in this workflow's source, is written
+# from the environment into a curl config file (never the process argv), and is
+# masked by GitHub in logs.
 
 on:
   push:
     tags:
       - 'v*'
 
-permissions:
-  contents: read
+# The job reads nothing from the repo and needs no token.
+permissions: {}
 
 jobs:
   trigger:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Skip tag deletions (a push event with deleted=true).
+    if: ${{ github.event.deleted == false }}
     steps:
       - name: POST the COPR custom webhook
         env:
           COPR_WEBHOOK_URL: ${{ secrets.COPR_WEBHOOK_URL }}
+          TAG_NAME: ${{ github.ref_name }}
         run: |
-          if [ -z "${COPR_WEBHOOK_URL}" ]; then
+          set -euo pipefail
+
+          # Only real vX.Y.Z release tags trigger a rebuild.
+          if ! printf '%s' "$TAG_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "ref '$TAG_NAME' is not a vX.Y.Z release tag; nothing to trigger" >&2
+            exit 0
+          fi
+          if [ -z "${COPR_WEBHOOK_URL:-}" ]; then
             echo "COPR_WEBHOOK_URL secret is not set" >&2
             exit 1
           fi
-          # --fail: non-2xx is a hard error. The URL comes from the environment,
-          # so it never appears in the command line or the run log.
-          curl --fail --silent --show-error -X POST -o /dev/null "${COPR_WEBHOOK_URL}"
-          echo "COPR rebuild webhook triggered."
+
+          # Write the secret URL into a curl config file via the shell builtin
+          # printf (no external process, no argv exposure), then curl -K it.
+          cfg="$(mktemp)"
+          trap 'rm -f "$cfg"' EXIT
+          printf 'url = "%s"\n' "$COPR_WEBHOOK_URL" > "$cfg"
+
+          # --fail-style handling by hand: accept only a 2xx, keep curl's nonzero
+          # exit for transport errors (bad DNS, timeout, TLS).
+          code="$(curl --config "$cfg" --request POST \
+              --silent --show-error \
+              --connect-timeout 15 --max-time 60 --retry 2 --retry-delay 5 \
+              --output /dev/null --write-out '%{http_code}')"
+          echo "COPR webhook responded HTTP $code"
+          case "$code" in
+            2??) echo "COPR rebuild triggered for $TAG_NAME." ;;
+            *)   echo "unexpected HTTP status $code from COPR webhook" >&2; exit 1 ;;
+          esac
