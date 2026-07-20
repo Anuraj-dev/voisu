@@ -5,7 +5,7 @@ Version:        0.1.0
 #   - dev machine (build-rpm.sh): voisu_release undefined -> 1.git<commit>
 #   - COPR channel (build-srpm.sh / make-srpm.sh): voisu_release is a
 #     monotonically increasing snapshot release like 0.<count>.<ct>.git<sha>,
-#     whose leading 0. sorts before an eventual tagged 1%{?dist} and whose
+#     whose leading 0. sorts before an eventual tagged 1%%{?dist} and whose
 #     commit-count primary key increases for any descendant commit (immune to
 #     committer clock skew), so `dnf upgrade` always sees a newer NEVR.
 Release:        %{?voisu_release}%{!?voisu_release:1.git%{?voisu_commit}}%{?dist}
