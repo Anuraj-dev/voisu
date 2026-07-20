@@ -1,0 +1,88 @@
+# Maintainer: Anuraj Jit Saikia <rajasaikia1644@gmail.com>
+pkgname=voisu
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Cloud-first Linux dictation for Wayland (daemon, CLI, and optional Overlay)"
+arch=('x86_64')
+url="https://github.com/Anuraj-Dev/voisu"
+# Voisu itself is MIT. The voisu, voisu-daemon and voisu-overlay binaries
+# statically link the ring crate, which adds ISC (new ring code) and Apache-2.0
+# (BoringSSL-derived code). All three license texts are installed.
+license=('MIT' 'Apache-2.0' 'ISC')
+depends=('gtk4'
+         'gtk4-layer-shell'
+         'pipewire'
+         'wl-clipboard'
+         'libsecret'
+         'curl'
+         'xdg-desktop-portal')
+makedepends=('cargo' 'libxkbcommon')
+optdepends=('libei: direct Delivery of the Transcript into the focused window'
+            'xdg-desktop-portal-kde: portal backend for KDE Plasma'
+            'xdg-desktop-portal-hyprland: portal backend for Hyprland')
+# ring bundles C crypto objects; makepkg's default LTO drops ring_core_* symbols
+# at link time ("undefined symbol: ring_core_0_17_14__*"). Disabling makepkg LTO
+# only affects the intermediate C/C++ objects, not Rust's own release codegen.
+options=('!lto')
+install="$pkgname.install"
+# NOTE: the release tarball checksum is SKIP only because no v0.1.0 tag exists
+# yet (the first tagged release ships with the release workflow). At the first
+# real release, replace the tarball 'SKIP' below with the pinned sha256 via
+# `updpkgsums` and regenerate .SRCINFO.
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Anuraj-Dev/voisu/archive/refs/tags/v$pkgver.tar.gz"
+        'LICENSE.ring'
+        'LICENSE.ring-BoringSSL'
+        'LICENSE.ring-other-bits')
+sha256sums=('SKIP'
+            'b3d734001a94efff3579978d953391aa7115f877657d25eb54037a43875d078a'
+            '005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d'
+            'f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f')
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    # Fetch exactly the Cargo.lock-pinned dependencies (whole graph, including
+    # the feature-gated Overlay deps) so build()/check() run fully offline.
+    cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    # Base build is GTK-free: produces voisu and voisu-daemon.
+    cargo build --frozen --release --workspace
+    # The Overlay is feature-gated behind voisu-app/overlay.
+    cargo build --frozen --release -p voisu-app --features overlay --bin voisu-overlay
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo test --frozen --release --workspace
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+
+    install -Dm755 target/release/voisu "$pkgdir/usr/bin/voisu"
+    install -Dm755 target/release/voisu-daemon "$pkgdir/usr/bin/voisu-daemon"
+    install -Dm755 target/release/voisu-overlay "$pkgdir/usr/bin/voisu-overlay"
+
+    # systemd *user* units (Voisu never runs privileged system services).
+    install -Dm644 packaging/voisu.service \
+        "$pkgdir/usr/lib/systemd/user/voisu.service"
+    install -Dm644 packaging/voisu-overlay.service \
+        "$pkgdir/usr/lib/systemd/user/voisu-overlay.service"
+
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 "$srcdir/LICENSE.ring" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE.ring"
+    install -Dm644 "$srcdir/LICENSE.ring-BoringSSL" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE.ring-BoringSSL"
+    install -Dm644 "$srcdir/LICENSE.ring-other-bits" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE.ring-other-bits"
+
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

@@ -1,0 +1,49 @@
+# Voisu ships its dictation daemon and Overlay as systemd *user* services.
+# pacman scriptlets run as root and must never enable a per-user service on the
+# user's behalf, so these functions only PRINT the enable/disable instructions.
+# This mirrors the Fedora RPM %systemd_user_post scriptlet, which likewise never
+# auto-enables the user units (Arch convention: NEVER silently enable a service).
+
+post_install() {
+    cat <<'EOF'
+
+Voisu is installed. Its dictation daemon and Overlay run as systemd *user*
+services and are NOT enabled automatically. To start Voisu for your user, run:
+
+    systemctl --user daemon-reload
+    systemctl --user enable --now voisu.service
+
+To also run the optional Overlay -- the on-screen status surface that reflects
+daemon state -- run:
+
+    systemctl --user enable --now voisu-overlay.service
+
+Configure your provider key first with:  voisu setup
+EOF
+}
+
+post_upgrade() {
+    cat <<'EOF'
+
+Voisu has been upgraded. If its user services are already enabled, reload and
+restart them for your user:
+
+    systemctl --user daemon-reload
+    systemctl --user try-restart voisu.service voisu-overlay.service
+EOF
+}
+
+post_remove() {
+    cat <<'EOF'
+
+Voisu has been removed. If you enabled its user services, disable them for your
+user with:
+
+    systemctl --user disable --now voisu.service
+    systemctl --user disable --now voisu-overlay.service
+    systemctl --user daemon-reload
+
+Your Voisu configuration and state under ~/.config/voisu and
+~/.local/state/voisu are left untouched.
+EOF
+}

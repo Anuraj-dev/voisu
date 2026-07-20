@@ -1,0 +1,55 @@
+# Maintainer: Anuraj Jit Saikia <rajasaikia1644@gmail.com>
+#
+# Hand-written in cargo-aur's style. cargo-aur was not run to generate this
+# skeleton because (a) it targets single-binary crates and would need manual
+# extension for Voisu's three binaries plus the two systemd user units, and
+# (b) no GitHub Release / prebuilt tarball exists yet to point it at. When the
+# release workflow (ticket 14) publishes a `cargo aur` tarball, this file's
+# fields already match cargo-aur's output layout.
+pkgname=voisu-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Cloud-first Linux dictation for Wayland (prebuilt binaries)"
+arch=('x86_64')
+url="https://github.com/Anuraj-Dev/voisu"
+license=('MIT' 'Apache-2.0' 'ISC')
+depends=('gtk4'
+         'gtk4-layer-shell'
+         'pipewire'
+         'wl-clipboard'
+         'libsecret'
+         'curl'
+         'xdg-desktop-portal')
+optdepends=('libei: direct Delivery of the Transcript into the focused window'
+            'xdg-desktop-portal-kde: portal backend for KDE Plasma'
+            'xdg-desktop-portal-hyprland: portal backend for Hyprland')
+provides=('voisu')
+conflicts=('voisu')
+install="$pkgname.install"
+# NOTE: the release asset does not exist until the first tagged release. The
+# tarball 'SKIP' below MUST be replaced with the pinned sha256 (or b2sum, as
+# cargo-aur emits) at the first real release, then regenerate .SRCINFO. The
+# release tarball built by the release workflow is expected to contain, at the
+# top level: voisu, voisu-daemon, voisu-overlay, voisu.service,
+# voisu-overlay.service, LICENSE, LICENSE.ring, LICENSE.ring-BoringSSL,
+# LICENSE.ring-other-bits.
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Anuraj-Dev/voisu/releases/download/v$pkgver/voisu-$pkgver-${CARCH}.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    install -Dm755 voisu "$pkgdir/usr/bin/voisu"
+    install -Dm755 voisu-daemon "$pkgdir/usr/bin/voisu-daemon"
+    install -Dm755 voisu-overlay "$pkgdir/usr/bin/voisu-overlay"
+
+    install -Dm644 voisu.service "$pkgdir/usr/lib/systemd/user/voisu.service"
+    install -Dm644 voisu-overlay.service \
+        "$pkgdir/usr/lib/systemd/user/voisu-overlay.service"
+
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 LICENSE.ring \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE.ring"
+    install -Dm644 LICENSE.ring-BoringSSL \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE.ring-BoringSSL"
+    install -Dm644 LICENSE.ring-other-bits \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE.ring-other-bits"
+}
