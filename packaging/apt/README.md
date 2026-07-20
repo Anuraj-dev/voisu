@@ -49,7 +49,7 @@ sudo apt-get install -y ca-certificates curl gnupg
 #    the first fingerprint would still trust the whole file you dearmor).
 tmp="$(mktemp -d)"
 curl -fsSL https://anuraj-dev.github.io/voisu/voisu-archive-keyring.asc -o "$tmp/key.asc"
-npub="$(gpg --show-keys --with-colons "$tmp/key.asc" | grep -c '^pub:')"
+npub="$(gpg --show-keys --with-colons "$tmp/key.asc" | grep -c '^pub:' || true)"
 [ "$npub" = 1 ] || { echo "REJECT: bundle has $npub primary keys, expected 1" >&2; exit 1; }
 got="$(gpg --show-keys --with-colons "$tmp/key.asc" | awk -F: '$1=="pub"{p=1;next} p&&$1=="fpr"{print $10;exit}')"
 [ "$got" = "$EXPECT" ] || { echo "FINGERPRINT MISMATCH: got $got, expected $EXPECT" >&2; exit 1; }
@@ -212,16 +212,19 @@ main checkout is never destructively wiped.**
       BASE=https://anuraj-dev.github.io/voisu
       EXPECT=4149EE3868B36B6007592966D08BCFDC34125B28
       tmp="$(mktemp -d)"; export GNUPGHOME="$tmp/gnupg"; mkdir -m700 "$GNUPGHOME"
-      # Isolate ALL apt state to $tmp so update/policy/download can only be
-      # satisfied by the Voisu source below — never by a pre-configured mirror.
-      LISTS="$tmp/lists"; mkdir -p "$LISTS/partial"
+      # Isolate ALL apt state (lists, cache, keyring) to $tmp so update/policy/
+      # download can only be satisfied by the Voisu source below — never by a
+      # pre-configured mirror — and the whole test runs UNPRIVILEGED: no sudo,
+      # nothing under /etc or /var is touched or left behind.
       SRC="$tmp/voisu.list"
+      mkdir -p "$tmp/state/lists/partial" "$tmp/cache"
       APT="-o Dir::Etc::sourcelist=$SRC -o Dir::Etc::sourceparts=/dev/null \
-           -o Dir::State::lists=$LISTS -o APT::Get::List-Cleanup=0"
+           -o Dir::State=$tmp/state -o Dir::Cache=$tmp/cache \
+           -o APT::Get::List-Cleanup=0"
 
       # 1. served bundle: exactly one primary key, fingerprint == pinned one
       curl -fsSL "$BASE/voisu-archive-keyring.asc" -o "$tmp/key.asc"
-      npub="$(gpg --show-keys --with-colons "$tmp/key.asc" | grep -c '^pub:')"
+      npub="$(gpg --show-keys --with-colons "$tmp/key.asc" | grep -c '^pub:' || true)"
       [ "$npub" = 1 ] || { echo "REJECT: $npub primary keys"; exit 1; }
       got="$(gpg --show-keys --with-colons "$tmp/key.asc" | awk -F: '$1=="pub"{p=1;next} p&&$1=="fpr"{print $10;exit}')"
       [ "$got" = "$EXPECT" ] || { echo "MISMATCH: $got"; exit 1; }
@@ -232,8 +235,9 @@ main checkout is never destructively wiped.**
       gpgv --keyring "$tmp/voisu.gpg" "$tmp/InRelease" && echo "InRelease OK"
 
       # 3. isolated update + ASSERTED policy + identity-checked fetch
-      sudo install -m0644 "$tmp/voisu.gpg" /etc/apt/keyrings/voisu-archive-keyring.gpg
-      echo "deb [signed-by=/etc/apt/keyrings/voisu-archive-keyring.gpg arch=amd64] $BASE stable main" > "$SRC"
+      #    (signed-by points at the verified TEMP keyring — the smoke test never
+      #    installs anything into the system's /etc/apt/keyrings)
+      echo "deb [signed-by=$tmp/voisu.gpg arch=amd64] $BASE stable main" > "$SRC"
       apt-get update $APT
       # candidate must come from OUR base URL, not some other configured source
       apt-cache policy voisu $APT | tee "$tmp/policy.txt"

@@ -200,7 +200,7 @@ verify_manifest() {
     # The image the debs were built with must still be the current one (finding 4):
     # reject an absent, duplicated, or mismatched image_id.
     local n_img m_img cur_img
-    n_img=$(grep -c '^image_id=' "$manifest")
+    n_img=$(grep -c '^image_id=' "$manifest" || true)
     if test "$n_img" -ne 1; then
         printf 'manifest has %s image_id lines (expected exactly 1); rebuild the debs\n' "$n_img" >&2; exit 1
     fi
@@ -278,7 +278,7 @@ curl -fsSL http://127.0.0.1:8099/voisu-archive-keyring.asc -o "$tmp/key.asc"
 # The bundle must contain EXACTLY ONE primary key whose fingerprint is the
 # publisher's; a bundle with an extra appended primary key must fail closed
 # (finding 2) -- checking only the first fpr would trust the whole bundle.
-npub=$(gpg --show-keys --with-colons "$tmp/key.asc" | grep -c '^pub:')
+npub=$(gpg --show-keys --with-colons "$tmp/key.asc" | grep -c '^pub:' || true)
 if test "$npub" -ne 1; then
     echo "FAIL: served bundle has $npub primary keys (expected 1)"; exit 1
 fi

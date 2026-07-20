@@ -208,7 +208,10 @@ assert_safe_rel() {
 # BOTH new inputs AND every pre-existing pool entry, so a contaminated gh-pages
 # checkout cannot smuggle a hostile (or superficially-canonical-but-unexpected)
 # .deb into the signed Packages.
-deb_version_ok() { printf '%s' "$1" | grep -Eq '^([0-9]+:)?[0-9][A-Za-z0-9.+~]*(-[A-Za-z0-9.+~]+)?$'; }
+# Full dpkg version grammar: the upstream part may itself contain hyphens when
+# a Debian revision follows (dpkg splits on the LAST hyphen), so a hyphenated
+# pre-release base from build-deb.sh (e.g. 0.1.0-rc1-1) must be accepted.
+deb_version_ok() { printf '%s' "$1" | grep -Eq '^([0-9]+:)?[0-9][A-Za-z0-9.+~]*(-[A-Za-z0-9.+~]+)*$'; }
 validate_deb() {   # $1 = path; echoes canonical basename on success, else fails
     local f=$1 p v a canon
     if test -L "$f"; then printf 'refusing: %s is a symlink\n' "$f" >&2; return 1; fi
@@ -270,6 +273,15 @@ exec 9>"$repo_dir/.publish.lock"
 if ! flock -w 60 9; then
     printf 'refusing: another publisher holds the lock on %s\n' "$repo_dir" >&2
     exit 1
+fi
+
+# GC stage/keyring debris a crashed prior run may have left inside the served
+# dists/ tree (each run uses fresh mktemp names, so a later run never reuses
+# them; without this they would be fetchable at non-canonical paths forever).
+# Safe under the lock: no other publisher is mid-commit.
+if test -d "$repo_dir/dists"; then
+    find "$repo_dir/dists" -maxdepth 1 \( -name '.stage.*' -o -name '.keyring.*' \) \
+        -exec rm -rf {} + 2>/dev/null || true
 fi
 
 # --- lay out the pool ------------------------------------------------------
@@ -364,8 +376,15 @@ old_dir="${stage_dir}.old"
 # staged key and any freshly-added new debs exist as side effects. The added
 # debs are harmless (unreferenced by the still-live old index); nothing else
 # live has been mutated -- no old .deb deleted, no metadata swapped, no key
-# overwritten.
-cleanup_stage() { rm -rf "$stage_dir" "$old_dir" "$staged_key" 2>/dev/null || true; }
+# overwritten. If the commit itself dies between its two renames (live already
+# moved aside, stage not yet live), old_dir holds the ONLY copy of the live
+# metadata -- restore it instead of deleting it.
+cleanup_stage() {
+    if test -d "$old_dir" && ! test -d "$live_dir"; then
+        mv "$old_dir" "$live_dir" 2>/dev/null || true
+    fi
+    rm -rf "$stage_dir" "$old_dir" "$staged_key" 2>/dev/null || true
+}
 trap cleanup_stage EXIT
 mkdir -p "$stage_dir/$bin_rel"
 
@@ -469,7 +488,7 @@ gpg --armor --export "$gpg_key" > "$staged_key"
 if ! test -s "$staged_key"; then
     printf 'failed to export the public key for %s\n' "$gpg_key" >&2; exit 1
 fi
-npub=$(gpg --show-keys --with-colons "$staged_key" | grep -c '^pub:')
+npub=$(gpg --show-keys --with-colons "$staged_key" | grep -c '^pub:' || true)
 if test "$npub" -ne 1; then
     printf 'refusing: exported keyring carries %s primary keys (expected exactly 1)\n' "$npub" >&2; exit 1
 fi
