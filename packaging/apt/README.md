@@ -43,10 +43,15 @@ EXPECT=4149EE3868B36B6007592966D08BCFDC34125B28
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl gnupg
 
-# 2. Fetch the key to a temp file and verify its fingerprint BEFORE trusting it.
+# 2. Fetch the key to a temp file and verify it BEFORE trusting it. The bundle
+#    must contain EXACTLY ONE primary key with the expected fingerprint — a
+#    bundle with an extra appended primary key must be rejected (checking only
+#    the first fingerprint would still trust the whole file you dearmor).
 tmp="$(mktemp -d)"
 curl -fsSL https://anuraj-dev.github.io/voisu/voisu-archive-keyring.asc -o "$tmp/key.asc"
-got="$(gpg --show-keys --with-colons "$tmp/key.asc" | awk -F: '/^fpr:/{print $10; exit}')"
+npub="$(gpg --show-keys --with-colons "$tmp/key.asc" | grep -c '^pub:')"
+[ "$npub" = 1 ] || { echo "REJECT: bundle has $npub primary keys, expected 1" >&2; exit 1; }
+got="$(gpg --show-keys --with-colons "$tmp/key.asc" | awk -F: '$1=="pub"{p=1;next} p&&$1=="fpr"{print $10;exit}')"
 [ "$got" = "$EXPECT" ] || { echo "FINGERPRINT MISMATCH: got $got, expected $EXPECT" >&2; exit 1; }
 
 # 3. Install the verified key as a dedicated keyring (0644, apt-sandbox readable).
@@ -207,10 +212,18 @@ main checkout is never destructively wiped.**
       BASE=https://anuraj-dev.github.io/voisu
       EXPECT=4149EE3868B36B6007592966D08BCFDC34125B28
       tmp="$(mktemp -d)"; export GNUPGHOME="$tmp/gnupg"; mkdir -m700 "$GNUPGHOME"
+      # Isolate ALL apt state to $tmp so update/policy/download can only be
+      # satisfied by the Voisu source below — never by a pre-configured mirror.
+      LISTS="$tmp/lists"; mkdir -p "$LISTS/partial"
+      SRC="$tmp/voisu.list"
+      APT="-o Dir::Etc::sourcelist=$SRC -o Dir::Etc::sourceparts=/dev/null \
+           -o Dir::State::lists=$LISTS -o APT::Get::List-Cleanup=0"
 
-      # 1. served key fingerprint matches the pinned one
+      # 1. served bundle: exactly one primary key, fingerprint == pinned one
       curl -fsSL "$BASE/voisu-archive-keyring.asc" -o "$tmp/key.asc"
-      got="$(gpg --show-keys --with-colons "$tmp/key.asc" | awk -F: '/^fpr:/{print $10; exit}')"
+      npub="$(gpg --show-keys --with-colons "$tmp/key.asc" | grep -c '^pub:')"
+      [ "$npub" = 1 ] || { echo "REJECT: $npub primary keys"; exit 1; }
+      got="$(gpg --show-keys --with-colons "$tmp/key.asc" | awk -F: '$1=="pub"{p=1;next} p&&$1=="fpr"{print $10;exit}')"
       [ "$got" = "$EXPECT" ] || { echo "MISMATCH: $got"; exit 1; }
 
       # 2. the signed InRelease verifies under that key
@@ -218,14 +231,18 @@ main checkout is never destructively wiped.**
       curl -fsSL "$BASE/dists/stable/InRelease" -o "$tmp/InRelease"
       gpgv --keyring "$tmp/voisu.gpg" "$tmp/InRelease" && echo "InRelease OK"
 
-      # 3. isolated apt update + policy + real package fetch (needs sudo/apt on Ubuntu)
+      # 3. isolated update + ASSERTED policy + identity-checked fetch
       sudo install -m0644 "$tmp/voisu.gpg" /etc/apt/keyrings/voisu-archive-keyring.gpg
-      echo "deb [signed-by=/etc/apt/keyrings/voisu-archive-keyring.gpg arch=amd64] $BASE stable main" \
-        | sudo tee /etc/apt/sources.list.d/voisu.list
-      sudo apt-get update \
-        -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/voisu.list \
-        -o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0
-      apt-cache policy voisu
-      ( cd "$tmp" && apt-get download voisu ) && echo "package fetch OK"
+      echo "deb [signed-by=/etc/apt/keyrings/voisu-archive-keyring.gpg arch=amd64] $BASE stable main" > "$SRC"
+      apt-get update $APT
+      # candidate must come from OUR base URL, not some other configured source
+      apt-cache policy voisu $APT | tee "$tmp/policy.txt"
+      grep -q "$BASE" "$tmp/policy.txt" || { echo "FAIL: voisu candidate not from $BASE"; exit 1; }
+      # fetch from the isolated source and verify the downloaded file's identity
+      ( cd "$tmp" && apt-get download voisu $APT )
+      deb="$(ls "$tmp"/voisu_*_amd64.deb)"
+      [ "$(dpkg-deb --field "$deb" Package)" = voisu ] \
+        && [ "$(dpkg-deb --field "$deb" Architecture)" = amd64 ] \
+        && echo "package fetch OK: $(basename "$deb")"
       rm -rf "$tmp"
       ```

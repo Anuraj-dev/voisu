@@ -169,19 +169,23 @@ BUILDER
         -e CARGO_HOME=/opt/cargo-cache \
         "$image" bash /opt/builder.sh
 
-    # Manifest: pin commit, image, and artifact/script hashes (finding 6).
-    local v1 v2
+    # Manifest: pin commit, the EXACT image ID used, and artifact/script hashes
+    # (findings 4, 6). image_id is the content identity of voisu-apt-e2e, so a
+    # later friend run can't pair a stale/tampered image with a passing manifest.
+    local v1 v2 img_id
     v1=$(ls "$scratch"/out/v1/*.deb) ; v2=$(ls "$scratch"/out/v2/*.deb)
+    img_id=$("$engine" image inspect --format '{{.Id}}' "$image")
     {
         printf 'commit=%s\n' "$commit"
         printf 'image=%s\n' "$base_image"
+        printf 'image_id=%s\n' "$img_id"
         printf 'make_apt_repo_sha256=%s\n' "$(sha256_of "$scratch/make-apt-repo.sh")"
         printf 'v1_deb=%s\n' "$(basename "$v1")"
         printf 'v1_sha256=%s\n' "$(sha256_of "$v1")"
         printf 'v2_deb=%s\n' "$(basename "$v2")"
         printf 'v2_sha256=%s\n' "$(sha256_of "$v2")"
     } > "$manifest"
-    printf 'manifest written: %s\n' "$manifest"
+    printf 'manifest written: %s (image_id %s)\n' "$manifest" "$img_id"
 }
 
 # --- verify the manifest matches this commit + exactly one v1/v2 (finding 6) -
@@ -192,6 +196,21 @@ verify_manifest() {
     local m_commit; m_commit=$(awk -F= '/^commit=/{print $2}' "$manifest")
     if test "$m_commit" != "$commit"; then
         printf 'manifest commit %s != current HEAD %s; rebuild the debs\n' "$m_commit" "$commit" >&2; exit 1
+    fi
+    # The image the debs were built with must still be the current one (finding 4):
+    # reject an absent, duplicated, or mismatched image_id.
+    local n_img m_img cur_img
+    n_img=$(grep -c '^image_id=' "$manifest")
+    if test "$n_img" -ne 1; then
+        printf 'manifest has %s image_id lines (expected exactly 1); rebuild the debs\n' "$n_img" >&2; exit 1
+    fi
+    m_img=$(awk -F= '/^image_id=/{print $2}' "$manifest")
+    if ! cur_img=$("$engine" image inspect --format '{{.Id}}' "$image" 2>/dev/null); then
+        printf 'image %s not present; rebuild it (image phase) and the debs\n' "$image" >&2; exit 1
+    fi
+    if test "$m_img" != "$cur_img"; then
+        printf 'image %s identity %s != manifest %s; rebuild the debs against the current image\n' \
+            "$image" "$cur_img" "$m_img" >&2; exit 1
     fi
     local n1 n2
     n1=$(ls "$scratch"/out/v1/*.deb 2>/dev/null | wc -l)
@@ -256,11 +275,18 @@ done
 echo "=== add repo the DOCUMENTED way ($EXPECT_HELP) ==="
 tmp=$(mktemp -d)
 curl -fsSL http://127.0.0.1:8099/voisu-archive-keyring.asc -o "$tmp/key.asc"
-got=$(gpg --show-keys --with-colons "$tmp/key.asc" | awk -F: '/^fpr:/{print $10; exit}')
-if test "$got" != "$keyfpr"; then
-    echo "FAIL: served key fingerprint $got != publisher key $keyfpr"; exit 1
+# The bundle must contain EXACTLY ONE primary key whose fingerprint is the
+# publisher's; a bundle with an extra appended primary key must fail closed
+# (finding 2) -- checking only the first fpr would trust the whole bundle.
+npub=$(gpg --show-keys --with-colons "$tmp/key.asc" | grep -c '^pub:')
+if test "$npub" -ne 1; then
+    echo "FAIL: served bundle has $npub primary keys (expected 1)"; exit 1
 fi
-echo "[evidence] served key fingerprint matches publisher: $got"
+got=$(gpg --show-keys --with-colons "$tmp/key.asc" | awk -F: '$1=="pub"{p=1;next} p&&$1=="fpr"{print $10;exit}')
+if test "$got" != "$keyfpr"; then
+    echo "FAIL: served primary fingerprint $got != publisher key $keyfpr"; exit 1
+fi
+echo "[evidence] served bundle has exactly one primary key, fingerprint matches publisher: $got"
 install -d -m 0755 /etc/apt/keyrings
 gpg --dearmor < "$tmp/key.asc" > "$tmp/voisu.gpg"
 install -m 0644 "$tmp/voisu.gpg" /etc/apt/keyrings/voisu-archive-keyring.gpg

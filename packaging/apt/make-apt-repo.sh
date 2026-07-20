@@ -201,33 +201,41 @@ assert_safe_rel() {
     done
 }
 
-# --- validate the .deb inputs at the signing boundary (finding 4) ----------
-# Not just "dpkg-deb can parse it": extract and check the control fields and the
-# canonical filename. Everything we sign must be a real Voisu amd64 package.
+# --- .deb validation at the signing boundary (findings 1, 4) ---------------
+# Not just "dpkg-deb can parse it": a package we sign into the index must be a
+# regular non-symlink file, a real Voisu amd64 package, with a sane Debian
+# version and the exact canonical filename its own control fields imply. Used for
+# BOTH new inputs AND every pre-existing pool entry, so a contaminated gh-pages
+# checkout cannot smuggle a hostile (or superficially-canonical-but-unexpected)
+# .deb into the signed Packages.
 deb_version_ok() { printf '%s' "$1" | grep -Eq '^([0-9]+:)?[0-9][A-Za-z0-9.+~]*(-[A-Za-z0-9.+~]+)?$'; }
+validate_deb() {   # $1 = path; echoes canonical basename on success, else fails
+    local f=$1 p v a canon
+    if test -L "$f"; then printf 'refusing: %s is a symlink\n' "$f" >&2; return 1; fi
+    if ! test -f "$f"; then printf 'refusing: %s is not a regular file\n' "$f" >&2; return 1; fi
+    case "$f" in *.deb) : ;; *) printf 'refusing: %s does not look like a .deb\n' "$f" >&2; return 1 ;; esac
+    p=$(dpkg-deb --field "$f" Package 2>/dev/null) || { printf 'refusing: %s is not a valid Debian package\n' "$f" >&2; return 1; }
+    v=$(dpkg-deb --field "$f" Version 2>/dev/null)
+    a=$(dpkg-deb --field "$f" Architecture 2>/dev/null)
+    if test "$p" != voisu; then printf 'refusing %s: Package is %q, expected voisu\n' "$f" "$p" >&2; return 1; fi
+    if test "$a" != "$arch"; then printf 'refusing %s: Architecture is %q, expected %s\n' "$f" "$a" "$arch" >&2; return 1; fi
+    if ! deb_version_ok "$v"; then printf 'refusing %s: %q is not a sane Debian version\n' "$f" "$v" >&2; return 1; fi
+    canon="${p}_${v}_${a}.deb"
+    if test "$(basename "$f")" != "$canon"; then printf 'refusing %s: filename does not match control fields (expected %s)\n' "$f" "$canon" >&2; return 1; fi
+    printf '%s' "$canon"
+}
+# Referenced .deb basenames inside an index object (auto-detects gzip).
+index_refs() {
+    local f=$1
+    if gzip -t "$f" 2>/dev/null; then gzip -cd "$f"; else cat "$f"; fi \
+        | awk '/^Filename:/{sub(/^Filename:[ \t]*/,""); sub(/.*\//,""); print}'
+}
+
+# Validate the NEW inputs and remember canonical names (the immutability check
+# needs them before writing).
 declare -a canon_names=()
 for deb in "${debs[@]}"; do
-    if ! test -f "$deb"; then
-        printf 'refusing: %s is not a regular file\n' "$deb" >&2
-        exit 1
-    fi
-    case "$deb" in *.deb) : ;; *) printf 'refusing: %s does not look like a .deb\n' "$deb" >&2; exit 1 ;; esac
-    p=$(dpkg-deb --field "$deb" Package 2>/dev/null) || { printf 'refusing: %s is not a valid Debian package\n' "$deb" >&2; exit 1; }
-    v=$(dpkg-deb --field "$deb" Version 2>/dev/null)
-    a=$(dpkg-deb --field "$deb" Architecture 2>/dev/null)
-    if test "$p" != voisu; then
-        printf 'refusing %s: Package is %q, expected voisu\n' "$deb" "$p" >&2; exit 1
-    fi
-    if test "$a" != "$arch"; then
-        printf 'refusing %s: Architecture is %q, expected %s\n' "$deb" "$a" "$arch" >&2; exit 1
-    fi
-    if ! deb_version_ok "$v"; then
-        printf 'refusing %s: %q is not a sane Debian version\n' "$deb" "$v" >&2; exit 1
-    fi
-    canon="${p}_${v}_${a}.deb"
-    if test "$(basename "$deb")" != "$canon"; then
-        printf 'refusing %s: filename does not match control fields (expected %s)\n' "$deb" "$canon" >&2; exit 1
-    fi
+    canon=$(validate_deb "$deb") || exit 1
     canon_names+=("$canon")
 done
 # Reject two inputs that claim the same (package,version,arch) but differ.
@@ -277,9 +285,10 @@ mkdir -p "$repo_dir/$pool_rel"
 assert_safe_rel '.nojekyll'
 : > "$repo_dir/.nojekyll"
 
-# Add each deb to the pool under its CANONICAL name. Published bytes are
-# immutable: an existing same-name file with identical bytes is a no-op; with
-# different bytes it is a hard error (finding 3).
+# Add each new deb to the pool under its CANONICAL name. Adding is additive and
+# safe: the still-live old index does not reference the new files. Published
+# bytes are immutable: an existing same-name file with identical bytes is a
+# no-op; with different bytes it is a hard error (finding 3).
 for idx in "${!debs[@]}"; do
     deb=${debs[$idx]}
     canon=${canon_names[$idx]}
@@ -298,51 +307,84 @@ for idx in "${!debs[@]}"; do
     cp "$deb" "$dest"
 done
 
-# --- retention (finding 16) ------------------------------------------------
-# Keep the newest $keep versions of voisu in the pool by Debian version order;
-# delete only the older, now-unreferenced .debs BEFORE regenerating metadata, so
-# no Packages entry ever points at a removed file. gh-pages/Pages storage stays
-# bounded.
-prune_pool() {
-    local dir="$repo_dir/$pool_rel"
-    local -a files=()
-    local f
-    for f in "$dir"/*.deb; do test -e "$f" && files+=("$f"); done
-    test "${#files[@]}" -le "$keep" && return 0
-    # selection sort by Debian version (descending) using dpkg --compare-versions.
-    local i j tmp vi vj n=${#files[@]}
-    for ((i=0; i<n-1; i++)); do
-        for ((j=i+1; j<n; j++)); do
-            vi=$(dpkg-deb --field "${files[$i]}" Version)
-            vj=$(dpkg-deb --field "${files[$j]}" Version)
-            if dpkg --compare-versions "$vj" gt "$vi"; then
-                tmp=${files[$i]}; files[$i]=${files[$j]}; files[$j]=$tmp
-            fi
-        done
-    done
-    for ((i=keep; i<n; i++)); do
-        printf 'retention: removing old pool package %s\n' "$(basename "${files[$i]}")"
-        rm -f "${files[$i]}"
-    done
-}
-prune_pool
+# --- validate EVERY existing pool entry (finding 1) ------------------------
+# After adding the known-good inputs, re-scan the whole pool: a contaminated
+# checkout could carry a pre-existing package that would otherwise be indexed
+# and signed wholesale. Fail closed on any subdirectory, any non-.deb file, any
+# symlink, or anything that is not a canonical Voisu amd64 package. Collect the
+# (name, version, path) of every valid entry for the retention decision.
+declare -a pool_names=() pool_paths=() pool_versions=()
+shopt -s nullglob
+for entry in "$repo_dir/$pool_rel"/*; do
+    if test -d "$entry"; then
+        printf 'refusing: unexpected subdirectory in the pool: %s\n' "$entry" >&2; exit 1
+    fi
+    case "$entry" in
+        *.deb) : ;;
+        *) printf 'refusing: unexpected non-.deb entry in the pool: %s\n' "$entry" >&2; exit 1 ;;
+    esac
+    name=$(validate_deb "$entry") || exit 1
+    pool_names+=("$name"); pool_paths+=("$entry")
+    pool_versions+=("$(dpkg-deb --field "$entry" Version)")
+done
+shopt -u nullglob
 
-# --- stage the metadata, self-test, swap atomically (findings 9,10,11,12) --
+# --- retention DECISION (finding 5: decide now, delete only after commit) ---
+# Choose the newest $keep versions to keep; the rest are pruned, but ONLY after
+# the new metadata + signatures + key export + self-tests all succeed. That way
+# a failed publish never leaves the still-live index pointing at a deleted .deb.
+declare -a keep_names=() prune_paths=()
+pool_n=${#pool_paths[@]}
+sort_idx=()
+for ((i=0; i<pool_n; i++)); do sort_idx+=("$i"); done
+for ((x=0; x<pool_n-1; x++)); do
+    for ((y=x+1; y<pool_n; y++)); do
+        if dpkg --compare-versions "${pool_versions[${sort_idx[$y]}]}" gt "${pool_versions[${sort_idx[$x]}]}"; then
+            t=${sort_idx[$x]}; sort_idx[$x]=${sort_idx[$y]}; sort_idx[$y]=$t
+        fi
+    done
+done
+for ((r=0; r<pool_n; r++)); do
+    gi=${sort_idx[$r]}
+    if test "$r" -lt "$keep"; then keep_names+=("${pool_names[$gi]}"); else prune_paths+=("${pool_paths[$gi]}"); fi
+done
+declare -A keep_set=()
+for n in "${keep_names[@]}"; do keep_set["$n"]=1; done
+
+# --- stage metadata in an UNPREDICTABLE, guarded dir (finding 3) -----------
+# mktemp yields a random 0700 name (no predictable sibling for a symlink attack),
+# and EVERY temp file lives inside it or in a mktemp'd sibling.
+assert_safe_rel 'dists'
+mkdir -p "$repo_dir/dists"
 live_dir="$repo_dir/$dist_rel"
-stage_rel="dists/.stage.${suite}.$$"
-old_rel="dists/.old.${suite}.$$"
-assert_safe_rel "$stage_rel"
-assert_safe_rel "$old_rel"
-stage_dir="$repo_dir/$stage_rel"
-rm -rf "$stage_dir"
+stage_dir=$(mktemp -d "$repo_dir/dists/.stage.XXXXXX")
+staged_key=$(mktemp "$repo_dir/dists/.keyring.XXXXXX")
+old_dir="${stage_dir}.old"
+# Roll back cleanly if anything fails before the commit: only the stage dir, the
+# staged key and any freshly-added new debs exist as side effects. The added
+# debs are harmless (unreferenced by the still-live old index); nothing else
+# live has been mutated -- no old .deb deleted, no metadata swapped, no key
+# overwritten.
+cleanup_stage() { rm -rf "$stage_dir" "$old_dir" "$staged_key" 2>/dev/null || true; }
+trap cleanup_stage EXIT
 mkdir -p "$stage_dir/$bin_rel"
 
-# Packages index (Filename fields are repo-root-relative -> pool/...).
-( cd "$repo_dir" && apt-ftparchive packages "$pool_rel" ) > "$stage_dir/$bin_rel/Packages"
+# Packages: index the whole pool, then WHITELIST only the retained versions, so
+# the index never references a to-be-pruned .deb. All temp files stay in stage.
+raw_pkgs="$stage_dir/.Packages.raw"
+( cd "$repo_dir" && apt-ftparchive packages "$pool_rel" ) > "$raw_pkgs"
+keep_list=$(printf '%s\n' "${keep_names[@]}")
+awk -v keep="$keep_list" '
+    BEGIN{ n=split(keep,a,"\n"); for(i=1;i<=n;i++) if(a[i]!="") K[a[i]]=1; RS=""; FS="\n" }
+    { fn=""
+      for(i=1;i<=NF;i++) if($i ~ /^Filename:/){ fn=$i; sub(/^Filename:[ \t]*/,"",fn); sub(/.*\//,"",fn) }
+      if(fn in K) printf "%s\n\n", $0
+    }' "$raw_pkgs" > "$stage_dir/$bin_rel/Packages"
+rm -f "$raw_pkgs"
 gzip -9 -n -c "$stage_dir/$bin_rel/Packages" > "$stage_dir/$bin_rel/Packages.gz"
 
-# Release over the staged tree (paths relative to the suite dir).
-release_tmp="$repo_dir/dists/.release.$$"
+# Release over the staged tree (paths relative to the suite dir); temp in stage.
+release_tmp="$stage_dir/.Release.raw"
 ( apt-ftparchive \
     -o "APT::FTPArchive::Release::Origin=$origin" \
     -o "APT::FTPArchive::Release::Label=$label" \
@@ -367,7 +409,6 @@ rm -f "$release_tmp"
 "${gpg_sign[@]}" --detach-sign --output "$stage_dir/Release.gpg" "$stage_dir/Release"
 
 # --- self-test the STAGED metadata (finding 12) ----------------------------
-# Signatures verify.
 if ! gpg --verify "$stage_dir/InRelease" >/dev/null 2>&1; then
     printf 'self-test FAILED: InRelease clearsignature does not verify\n' >&2; exit 1
 fi
@@ -394,39 +435,62 @@ assert_release_hashes() {
 assert_release_hashes "$stage_dir/Release" "$stage_dir"
 
 # by-hash: content-addressed copies of each index, published AFTER Release so
-# they are not themselves re-listed. Prior digests are carried over on swap so
-# clients mid-fetch during cache skew still resolve (Acquire-By-Hash).
+# they are not themselves re-listed. Prior digests are carried over for the
+# cache-skew window, but ONLY when COHERENT: a prior index object is retained
+# solely if every .deb it references is still in the kept set (finding 6). This
+# GCs objects that would 404 a pruned .deb and bounds by-hash growth alongside
+# the pool.
 by_hash_dir="$stage_dir/$bin_rel/by-hash/SHA256"
 mkdir -p "$by_hash_dir"
 for rel in Packages Packages.gz; do
     dig=$(sha256sum "$stage_dir/$bin_rel/$rel" | awk '{print $1}')
     cp "$stage_dir/$bin_rel/$rel" "$by_hash_dir/$dig"
 done
-# Carry over the previous by-hash objects (retain old index digests) without
-# clobbering the new ones.
 if test -d "$live_dir/$bin_rel/by-hash/SHA256"; then
     for old in "$live_dir/$bin_rel/by-hash/SHA256"/*; do
         test -e "$old" || continue
-        test -e "$by_hash_dir/$(basename "$old")" || cp "$old" "$by_hash_dir/"
+        b=$(basename "$old")
+        test -e "$by_hash_dir/$b" && continue
+        coherent=1
+        while IFS= read -r ref; do
+            test -z "$ref" && continue
+            test -n "${keep_set[$ref]:-}" || { coherent=0; break; }
+        done < <(index_refs "$old")
+        test "$coherent" -eq 1 && cp "$old" "$by_hash_dir/"
     done
 fi
 
-# Atomic-ish swap under the held lock: move any live suite dir aside, move the
-# staged one in, drop the old. The gap is microseconds and serialized by flock;
-# ticket 14's publish workflow should additionally use a GitHub Actions
-# concurrency group so two release jobs never race the gh-pages branch.
-if test -d "$live_dir"; then
-    mv "$live_dir" "$repo_dir/$old_rel"
-fi
-mv "$stage_dir" "$live_dir"
-rm -rf "$repo_dir/$old_rel"
-
-# --- publish the public key alongside the packages -------------------------
-assert_safe_rel 'voisu-archive-keyring.asc'
-gpg --armor --export "$gpg_key" > "$repo_dir/voisu-archive-keyring.asc"
-if ! test -s "$repo_dir/voisu-archive-keyring.asc"; then
+# --- export + validate the KEY into the stage BEFORE any live mutation -------
+# (finding 5): a failed/empty/multi-primary export must abort before the live
+# key or metadata is touched. The served bundle must contain EXACTLY ONE primary
+# public key -- our signer -- so a client that (correctly) pins the primary
+# fingerprint can trust the whole bundle.
+gpg --armor --export "$gpg_key" > "$staged_key"
+if ! test -s "$staged_key"; then
     printf 'failed to export the public key for %s\n' "$gpg_key" >&2; exit 1
 fi
+npub=$(gpg --show-keys --with-colons "$staged_key" | grep -c '^pub:')
+if test "$npub" -ne 1; then
+    printf 'refusing: exported keyring carries %s primary keys (expected exactly 1)\n' "$npub" >&2; exit 1
+fi
+
+# --- COMMIT (finding 5) ----------------------------------------------------
+# Everything prospective has succeeded. Now, and only now, mutate live state:
+# swap the metadata dir in, install the validated key, and finally delete the
+# pruned .debs (which the freshly-live index no longer references). Ordered so a
+# mid-sequence failure never leaves the live index pointing at a deleted file.
+if test -d "$live_dir"; then
+    mv "$live_dir" "$old_dir"
+fi
+mv "$stage_dir" "$live_dir"
+assert_safe_rel 'voisu-archive-keyring.asc'
+mv "$staged_key" "$repo_dir/voisu-archive-keyring.asc"
+rm -rf "$old_dir"
+for p in "${prune_paths[@]}"; do
+    printf 'retention: removing old pool package %s\n' "$(basename "$p")"
+    rm -f "$p"
+done
+trap - EXIT
 
 printf 'published %d package(s) to %s (keep=%d, valid %d days)\n' \
     "${#debs[@]}" "$repo_dir" "$keep" "$valid_days"
