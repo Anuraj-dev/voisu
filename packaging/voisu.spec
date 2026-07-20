@@ -1,7 +1,14 @@
 Name:           voisu
 Version:        0.1.0
 %{!?voisu_commit:%global voisu_commit unknown}
-Release:        1.git%{?voisu_commit}%{?dist}
+# Release is computed by the build scripts, ONE spec serving both channels:
+#   - dev machine (build-rpm.sh): voisu_release undefined -> 1.git<commit>
+#   - COPR channel (build-srpm.sh / make-srpm.sh): voisu_release is a
+#     monotonically increasing snapshot release like 0.<count>.<ct>.git<sha>,
+#     whose leading 0. sorts before an eventual tagged 1%{?dist} and whose
+#     commit-count primary key increases for any descendant commit (immune to
+#     committer clock skew), so `dnf upgrade` always sees a newer NEVR.
+Release:        %{?voisu_release}%{!?voisu_release:1.git%{?voisu_commit}}%{?dist}
 Summary:        Cloud-first Linux dictation for Fedora Wayland
 # Voisu is MIT; the statically linked ring crate adds ISC (new code) and
 # Apache-2.0 (BoringSSL-derived code). Ring's license texts ship in %%license.

@@ -1,0 +1,36 @@
+name: Trigger COPR rebuild
+
+# Ticket 12 (GH issue #44). Minimal wiring: a v* tag push pokes the COPR
+# project's Custom-source webhook, which rebuilds the vendored, offline-buildable
+# SRPM (packaging/copr/make-srpm.sh) for the anuraj-dev/voisu COPR channel.
+# The full release workflow (SRPM upload, matrix, smoke) is ticket 14; this is
+# only the rebuild trigger.
+#
+# COPR's custom webhook is triggered by a plain POST with an empty body. The
+# URL is a secret (COPR_WEBHOOK_URL) and is passed through the environment, never
+# interpolated into the command line, so it is never echoed into the log.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST the COPR custom webhook
+        env:
+          COPR_WEBHOOK_URL: ${{ secrets.COPR_WEBHOOK_URL }}
+        run: |
+          if [ -z "${COPR_WEBHOOK_URL}" ]; then
+            echo "COPR_WEBHOOK_URL secret is not set" >&2
+            exit 1
+          fi
+          # --fail: non-2xx is a hard error. The URL comes from the environment,
+          # so it never appears in the command line or the run log.
+          curl --fail --silent --show-error -X POST -o /dev/null "${COPR_WEBHOOK_URL}"
+          echo "COPR rebuild webhook triggered."
