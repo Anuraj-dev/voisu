@@ -16,11 +16,15 @@ set -euo pipefail
 # binaries were compiled against that distribution's libraries, so the binaries
 # must be BUILT here too, not cross-copied from another distro. CI builds this
 # on Ubuntu 24.10 (ticket 14).
+#
+# The pure-validation guards below (dirty tree, non-HEAD, bad VOISU_DEB_RELEASE,
+# missing/wrong cargo-deb, out-of-tree output dir) all run before any
+# Debian-only step, so they are exercisable on any host.
 
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 
-# Pinned to the version validated for this package.
+# Pinned to the exact cargo-deb version this package was validated with.
 CARGO_DEB_VERSION=3.7.0
 
 # --- reproducibility guards (mirror build-rpm.sh) --------------------------
@@ -35,12 +39,77 @@ if test "$(git rev-parse HEAD)" != "$(git rev-parse "$commit")"; then
     exit 1
 fi
 
-# --- toolchain check -------------------------------------------------------
+# --- upstream version comes from the crate metadata, never hardcoded -------
+base_version=$(cargo pkgid -p voisu-app | sed -E 's/.*[#@]//')
+if ! printf '%s' "$base_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.+~-][0-9A-Za-z.+~-]*)?$'; then
+    printf 'could not determine a sane crate version from cargo pkgid (got "%s")\n' "$base_version" >&2
+    exit 1
+fi
+
+# --- Debian version scheme -------------------------------------------------
+# Every distinct payload gets a STRICTLY INCREASING version:
+#   tagged release  -> <base>-N              (VOISU_DEB_RELEASE=N, N a positive integer)
+#   dev build       -> <base>~git<ct>.<count>.<sha>-1
+# The leading `~` guarantees any dev version sorts BEFORE the matching <base>-N
+# release. For dev builds the ordering key is the committer timestamp (%ct,
+# monotonic in real time) followed by the commit count along history (strictly
+# increasing along a linear branch) -- both are decimal integers compared
+# numerically by dpkg, so a later commit can never receive a lower version. The
+# short SHA is only an identifier appended last, never relied on for ordering.
+if test -n "${VOISU_DEB_RELEASE:-}"; then
+    if ! printf '%s' "$VOISU_DEB_RELEASE" | grep -Eq '^[1-9][0-9]*$'; then
+        printf 'VOISU_DEB_RELEASE must be a positive integer (got "%s")\n' "$VOISU_DEB_RELEASE" >&2
+        exit 1
+    fi
+    # A tagged release must sit exactly on its release tag. Repo convention: a
+    # `v`-prefixed semver tag (e.g. v0.1.0). No tags exist yet, so a release
+    # build is only possible once the release commit is tagged.
+    release_tag="v${base_version}"
+    if ! tag_commit=$(git rev-parse --verify --quiet "refs/tags/${release_tag}^{commit}" 2>/dev/null); then
+        printf 'release build requires tag %s to exist; create it on the release commit first\n' \
+            "$release_tag" >&2
+        exit 1
+    fi
+    if test "$tag_commit" != "$commit"; then
+        printf 'release build requires HEAD to be exactly at tag %s (%s), but HEAD is %s\n' \
+            "$release_tag" "$tag_commit" "$commit" >&2
+        exit 1
+    fi
+    deb_version="${base_version}-${VOISU_DEB_RELEASE}"
+else
+    ct=$(git show -s --format=%ct "$commit")
+    count=$(git rev-list --count "$commit")
+    short=$(git rev-parse --short=12 "$commit")
+    deb_version="${base_version}~git${ct}.${count}.${short}-1"
+fi
+
+# --- toolchain checks ------------------------------------------------------
 if ! command -v cargo-deb >/dev/null 2>&1; then
     printf 'cargo-deb not found; install it with: cargo install cargo-deb --version %s --locked\n' \
         "$CARGO_DEB_VERSION" >&2
     exit 1
 fi
+have_cargo_deb=$(cargo-deb --version 2>/dev/null | awk '{print $NF}')
+if test "$have_cargo_deb" != "$CARGO_DEB_VERSION"; then
+    printf 'cargo-deb %s is required but found "%s"; install it with: cargo install cargo-deb --version %s --locked --force\n' \
+        "$CARGO_DEB_VERSION" "${have_cargo_deb:-none}" "$CARGO_DEB_VERSION" >&2
+    exit 1
+fi
+
+# --- output dir: canonicalize and confine to $root/dist/ -------------------
+# Guard BEFORE any destructive step. realpath -m resolves symlinks/.. without
+# requiring the path to exist, then we only permit a target strictly beneath
+# $root/dist/ -- so $root, $HOME, / (and anything outside the tree) are refused.
+output_dir=${VOISU_DEB_OUTPUT_DIR:-"$root/dist/deb"}
+dist_root=$(realpath -m "$root/dist")
+output_dir=$(realpath -m "$output_dir")
+case "$output_dir" in
+    "$dist_root"/?*) : ;;
+    *) printf 'refusing to use output dir %s: must be under %s/\n' "$output_dir" "$dist_root" >&2
+       exit 1 ;;
+esac
+
+# --- Debian-only step: $auto needs dpkg-shlibdeps --------------------------
 if ! command -v dpkg-shlibdeps >/dev/null 2>&1; then
     printf '%s\n' \
         'dpkg-shlibdeps not found: this .deb must be built on Ubuntu/Debian.' \
@@ -51,23 +120,10 @@ if ! command -v dpkg-shlibdeps >/dev/null 2>&1; then
     exit 1
 fi
 
-# --- Debian version scheme -------------------------------------------------
-# Every distinct payload gets a strictly increasing version:
-#   tagged release  -> 0.1.0-N          (VOISU_DEB_RELEASE=N)
-#   dev build       -> 0.1.0~gitYYYYMMDD.<12-char sha>-1
-# The `~` makes a dev version sort BEFORE the matching 0.1.0-N release.
-base_version=0.1.0
-short=$(git rev-parse --short=12 "$commit")
-if test -n "${VOISU_DEB_RELEASE:-}"; then
-    deb_version="${base_version}-${VOISU_DEB_RELEASE}"
-else
-    day=$(git show -s --format=%cd --date=format:%Y%m%d "$commit")
-    deb_version="${base_version}~git${day}.${short}-1"
-fi
-
 # --- generate a changelog whose top entry matches the computed version -----
 # git formats the date (correct RFC-2822 weekday), keeping lintian happy.
 changelog_date=$(git show -s --format=%cd --date=format:'%a, %d %b %Y %H:%M:%S %z' "$commit")
+short=$(git rev-parse --short=12 "$commit")
 mkdir -p "$root/target/deb"
 cat > "$root/target/deb/changelog" <<EOF
 voisu (${deb_version}) unstable; urgency=medium
@@ -83,11 +139,7 @@ EOF
 cargo build --locked --release --workspace
 cargo build --locked --release -p voisu-app --features overlay --bin voisu-overlay
 
-# --- clean output dir (guard against empty/root path) ----------------------
-output_dir=${VOISU_DEB_OUTPUT_DIR:-"$root/dist/deb"}
-case "$output_dir" in
-    ""|/) printf 'refusing to operate on output dir "%s"\n' "$output_dir" >&2; exit 1 ;;
-esac
+# --- recreate the (already-validated) output dir ---------------------------
 rm -rf "$output_dir"
 mkdir -p "$output_dir"
 
