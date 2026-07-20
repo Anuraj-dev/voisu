@@ -485,3 +485,21 @@ passphrase-free, scope-limited deploy key, because the release workflow must pus
 and the key can only push to our own AUR packages (web account controls stay password-guarded; AUR 2FA
 verified nonexistent upstream as of today — enable when shipped). Secret VALUES live only in Raja's
 password manager + GH Actions secrets; repo/docs record locations only.
+
+## 2026-07-20 — The .deb is built on Ubuntu only; the build script fails loudly elsewhere
+**Why:** cargo-deb's `$auto` dependency discovery runs dpkg-shlibdeps, which reads the built ELF
+binaries and maps their SONAMEs and symbol-version floors (GLIBC, GTK) to versioned Ubuntu packages.
+It exists only on Debian derivatives, and it is only *correct* when the binaries were compiled against
+that distribution's libraries — a Fedora-built binary would encode a GLIBC floor Ubuntu can't satisfy.
+Rejected: hardcoding the dependency list (drops real ABI floors, so a package installs then crashes at
+startup) and silently building inside a container from `build-deb.sh` (hides the constraint and still
+needs the container to do the compile). CI builds it on Ubuntu 24.10 in ticket 14.
+
+## 2026-07-20 — Debian dev versions order on commit count, not committer timestamp
+**Why:** dev versions are `<base>~git<count>.<ct>.<sha>-1`. The first ordering component must be
+monotonic for any descendant commit. Committer timestamps are not: clock corrections, imported commits,
+and explicit GIT_COMMITTER_DATE can make a child older than its parent, which would make apt refuse the
+newer package as a downgrade. `git rev-list --count` is monotonic along history, so it leads; the
+timestamp is a tiebreaker and the short SHA is an identifier only, never an ordering key. The count is
+only trustworthy with full history, so shallow clones are refused outright. Rejected: SHA-based
+ordering (random with respect to commit order — the original bug).

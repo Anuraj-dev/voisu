@@ -8,6 +8,7 @@
 | decisions.md | Append-only log of load-bearing choices + why |
 | conventions.md | Stack, run/test commands, naming (ubiquitous language) |
 | packaging-fedora.md | Exact Fedora RPM build, install, upgrade, removal, and smoke procedure |
+| specs/2026-07-20-overlay-audio-waveform.md | Approved (unimplemented) spec: live bar meter in the Overlay during Recording |
 | release-evidence.md | Ticket 13 evidence matrix: proven tests and host-pending checks |
 | model-benchmark.md | Standing experiment: per-dispatch log comparing codex models (Sol/Terra/Luna) vs Opus as coder/reviewer agents |
 | old_context.md | Honest pre-tracking backstory (planning phase summary) |
