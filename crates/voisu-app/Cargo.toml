@@ -1,9 +1,68 @@
 [package]
 name = "voisu-app"
 version = "0.1.0"
+description = "Cloud-first Linux dictation for Wayland"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+# Debian/Ubuntu packaging (cargo-deb). Mirrors the Fedora RPM
+# (packaging/voisu.spec): all three binaries plus both systemd *user* units in
+# one package, no auto-enable (see packaging/deb/postinst). MUST be built on
+# Ubuntu -- see packaging/build-deb.sh; the `$auto` depends below needs
+# dpkg-shlibdeps to encode the real ELF/GLIBC requirements.
+[package.metadata.deb]
+name = "voisu"
+maintainer = "Anuraj Jit Saikia <rajasaikia1644@gmail.com>"
+section = "utils"
+priority = "optional"
+extended-description = """\
+Voisu turns a bounded Recording into a validated Transcript and performs \
+Delivery into the focused application, with clipboard preservation as the \
+fallback. The daemon and CLI stay usable without GTK; the optional Overlay \
+adds a separate on-screen status surface that reflects daemon state. The \
+Trigger Key and Delivery use desktop portals."""
+# `$auto` = dpkg-shlibdeps against the built ELF binaries: it encodes the real
+# linked libraries and their version floors (libc6 with the GLIBC symbol floor,
+# libgcc-s1, libxkbcommon0, and the GTK4/Pango/Cairo/GLib stack pulled in by the
+# Overlay). The remaining entries are runtime tools Voisu execs or portal
+# services it talks to -- not linked, so shlibdeps cannot see them -- mapped
+# from the RPM Requires to their Ubuntu 24.10 package names:
+#   (portals)            -> xdg-desktop-portal   (Trigger Key + Delivery)
+#   pipewire-utils       -> pipewire-bin         (pw-record)
+#   wireplumber          -> wireplumber          (wpctl)
+#   wl-clipboard         -> wl-clipboard         (wl-copy/wl-paste)
+#   /usr/bin/secret-tool -> libsecret-tools      (secret-tool binary)
+#   curl                 -> curl                 (provider HTTPS/WSS)
+depends = "$auto, xdg-desktop-portal, pipewire-bin, wireplumber, wl-clipboard, libsecret-tools, curl"
+# libei is dlopen()'d by SONAME at runtime (an optional auto-type capability),
+# never linked -- so it is Recommends, mirroring the RPM `Recommends: libei`.
+recommends = "libei1"
+# Overlay binary is feature-gated; build with the same feature the RPM uses.
+features = ["overlay"]
+maintainer-scripts = "../../packaging/deb"
+# Generated per build by build-deb.sh so the changelog version always matches
+# the computed Debian version (target/ is git-ignored).
+changelog = "../../target/deb/changelog"
+# Explicit assets. Binary sources use the literal `target/release/` prefix so
+# cargo-deb recognizes them as Cargo build products (builds them with the
+# overlay feature and strips them); other sources are relative to this manifest.
+# Layout mirrors the RPM: three binaries to /usr/bin, both user units to
+# /usr/lib/systemd/user, and ring's statically linked license texts + a DEP-5
+# copyright covering Voisu (MIT) and ring (ISC / Apache-2.0).
+assets = [
+    ["target/release/voisu", "usr/bin/", "755"],
+    ["target/release/voisu-daemon", "usr/bin/", "755"],
+    ["target/release/voisu-overlay", "usr/bin/", "755"],
+    ["../../packaging/voisu.service", "usr/lib/systemd/user/", "644"],
+    ["../../packaging/voisu-overlay.service", "usr/lib/systemd/user/", "644"],
+    ["../../packaging/deb/lintian-overrides", "usr/share/lintian/overrides/voisu", "644"],
+    ["../../packaging/deb/copyright", "usr/share/doc/voisu/copyright", "644"],
+    ["../../packaging/deb/LICENSE.ring", "usr/share/doc/voisu/LICENSE.ring", "644"],
+    ["../../packaging/deb/LICENSE.ring-BoringSSL", "usr/share/doc/voisu/LICENSE.ring-BoringSSL", "644"],
+    ["../../packaging/deb/LICENSE.ring-other-bits", "usr/share/doc/voisu/LICENSE.ring-other-bits", "644"],
+    ["../../README.md", "usr/share/doc/voisu/README", "644"],
+]
 
 [[bin]]
 name = "voisu"

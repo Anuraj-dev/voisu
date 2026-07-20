@@ -1,0 +1,14 @@
+# Voisu's daemon and Overlay are systemd *user* services. The postinst/postrm
+# scripts only PRINT the `systemctl --user ...` commands as guidance inside a
+# heredoc; they never execute systemctl. A root maintainer script must not
+# touch a per-user unit, so this is deliberate and mirrors the Fedora RPM UX.
+# lintian's plain text match on "systemctl" is a false positive here.
+voisu: maintainer-script-calls-systemctl
+
+# The binaries expose built-in help (`voisu --help` and per-subcommand help).
+# Dedicated man pages are out of scope for this packaging ticket.
+voisu: no-manual-page
+
+# This package is distributed through a self-hosted apt repo, not the Debian
+# archive, so there is no ITP/RFP bug for the initial changelog to close.
+voisu: initial-upload-closes-no-bugs

@@ -1,0 +1,31 @@
+#!/bin/sh
+set -e
+
+# Voisu ships its daemon and Overlay as systemd *user* services. A package
+# postinst runs as root and cannot (and must not) enable a per-user service on
+# the user's behalf, so this script only PRINTS the enable instructions. This
+# mirrors the Fedora RPM, whose %systemd_user_post scriptlet likewise never
+# auto-enables the user units.
+
+case "$1" in
+    configure)
+        cat <<'EOF'
+
+Voisu is installed. Its dictation daemon and Overlay run as systemd *user*
+services and are NOT enabled automatically. To start Voisu for your user, run:
+
+    systemctl --user daemon-reload
+    systemctl --user enable --now voisu.service
+
+To also run the optional Overlay -- the on-screen status surface that reflects
+daemon state -- run:
+
+    systemctl --user enable --now voisu-overlay.service
+
+EOF
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+esac
+
+exit 0

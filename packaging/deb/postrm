@@ -1,0 +1,28 @@
+#!/bin/sh
+set -e
+
+# Counterpart to postinst: print the disable/cleanup guidance. Root cannot tear
+# down a per-user service, so this only PRINTS instructions, mirroring the RPM
+# %systemd_user_postun UX (which never touches the user's enablement state).
+
+case "$1" in
+    remove|purge)
+        cat <<'EOF'
+
+Voisu has been removed. If you enabled its user services, disable them for your
+user with:
+
+    systemctl --user disable --now voisu.service
+    systemctl --user disable --now voisu-overlay.service
+    systemctl --user daemon-reload
+
+Your Voisu configuration and state under ~/.config/voisu and
+~/.local/state/voisu are left untouched.
+
+EOF
+        ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+esac
+
+exit 0
