@@ -8,14 +8,12 @@ rust-version.workspace = true
 
 # Debian/Ubuntu packaging (cargo-deb). Mirrors the Fedora RPM
 # (packaging/voisu.spec): all three binaries plus both systemd *user* units in
-# one package, no auto-enable (see packaging/deb/postinst). Runtime dependency
-# names are the Ubuntu 24.10 equivalents of the RPM Requires/Recommends,
-# verified against the live 24.10 apt database.
+# one package, no auto-enable (see packaging/deb/postinst). MUST be built on
+# Ubuntu -- see packaging/build-deb.sh; the `$auto` depends below needs
+# dpkg-shlibdeps to encode the real ELF/GLIBC requirements.
 [package.metadata.deb]
 name = "voisu"
-maintainer = "Voisu maintainers <voisu@example.invalid>"
-copyright = "2026, Voisu maintainers <voisu@example.invalid>"
-license-file = ["../../LICENSE", "0"]
+maintainer = "Anuraj Jit Saikia <rajasaikia1644@gmail.com>"
 section = "utils"
 priority = "optional"
 extended-description = """\
@@ -24,31 +22,34 @@ Delivery into the focused application, with clipboard preservation as the \
 fallback. The daemon and CLI stay usable without GTK; the optional Overlay \
 adds a separate on-screen status surface that reflects daemon state. The \
 Trigger Key and Delivery use desktop portals."""
-# RPM Requires -> Ubuntu 24.10:
-#   gtk4               -> libgtk-4-1            (Overlay links GTK4)
-#   gtk4-layer-shell   -> libgtk4-layer-shell0  (Overlay links layer-shell)
-#   (portals)          -> xdg-desktop-portal    (Trigger Key + Delivery)
-#   pipewire-utils     -> pipewire-bin          (pw-record)
-#   wireplumber        -> wireplumber           (wpctl)
-#   wl-clipboard       -> wl-clipboard          (wl-copy/wl-paste)
-#   /usr/bin/secret-tool -> libsecret-tools     (secret-tool binary)
-#   curl               -> curl                  (provider HTTPS/WSS)
-# libc6 is the ELF interpreter/libc all three binaries link (normally derived by
-# dpkg-shlibdeps; added explicitly because the package is built on a non-Debian
-# host where shlibdeps is unavailable).
-depends = "libc6, libgtk-4-1, libgtk4-layer-shell0, xdg-desktop-portal, pipewire-bin, wireplumber, wl-clipboard, libsecret-tools, curl"
+# `$auto` = dpkg-shlibdeps against the built ELF binaries: it encodes the real
+# linked libraries and their version floors (libc6 with the GLIBC symbol floor,
+# libgcc-s1, libxkbcommon0, and the GTK4/Pango/Cairo/GLib stack pulled in by the
+# Overlay). The remaining entries are runtime tools Voisu execs or portal
+# services it talks to -- not linked, so shlibdeps cannot see them -- mapped
+# from the RPM Requires to their Ubuntu 24.10 package names:
+#   (portals)            -> xdg-desktop-portal   (Trigger Key + Delivery)
+#   pipewire-utils       -> pipewire-bin         (pw-record)
+#   wireplumber          -> wireplumber          (wpctl)
+#   wl-clipboard         -> wl-clipboard         (wl-copy/wl-paste)
+#   /usr/bin/secret-tool -> libsecret-tools      (secret-tool binary)
+#   curl                 -> curl                 (provider HTTPS/WSS)
+depends = "$auto, xdg-desktop-portal, pipewire-bin, wireplumber, wl-clipboard, libsecret-tools, curl"
 # libei is dlopen()'d by SONAME at runtime (an optional auto-type capability),
 # never linked -- so it is Recommends, mirroring the RPM `Recommends: libei`.
 recommends = "libei1"
 # Overlay binary is feature-gated; build with the same feature the RPM uses.
 features = ["overlay"]
 maintainer-scripts = "../../packaging/deb"
-changelog = "../../packaging/deb/changelog"
+# Generated per build by build-deb.sh so the changelog version always matches
+# the computed Debian version (target/ is git-ignored).
+changelog = "../../target/deb/changelog"
 # Explicit assets. Binary sources use the literal `target/release/` prefix so
 # cargo-deb recognizes them as Cargo build products (builds them with the
 # overlay feature and strips them); other sources are relative to this manifest.
 # Layout mirrors the RPM: three binaries to /usr/bin, both user units to
-# /usr/lib/systemd/user.
+# /usr/lib/systemd/user, and ring's statically linked license texts + a DEP-5
+# copyright covering Voisu (MIT) and ring (ISC / Apache-2.0).
 assets = [
     ["target/release/voisu", "usr/bin/", "755"],
     ["target/release/voisu-daemon", "usr/bin/", "755"],
@@ -56,6 +57,10 @@ assets = [
     ["../../packaging/voisu.service", "usr/lib/systemd/user/", "644"],
     ["../../packaging/voisu-overlay.service", "usr/lib/systemd/user/", "644"],
     ["../../packaging/deb/lintian-overrides", "usr/share/lintian/overrides/voisu", "644"],
+    ["../../packaging/deb/copyright", "usr/share/doc/voisu/copyright", "644"],
+    ["../../packaging/deb/LICENSE.ring", "usr/share/doc/voisu/LICENSE.ring", "644"],
+    ["../../packaging/deb/LICENSE.ring-BoringSSL", "usr/share/doc/voisu/LICENSE.ring-BoringSSL", "644"],
+    ["../../packaging/deb/LICENSE.ring-other-bits", "usr/share/doc/voisu/LICENSE.ring-other-bits", "644"],
     ["../../README.md", "usr/share/doc/voisu/README", "644"],
 ]
 
