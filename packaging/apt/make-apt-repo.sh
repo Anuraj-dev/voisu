@@ -279,6 +279,12 @@ fi
 pool_rel="pool/${component}/v/voisu"
 dist_rel="dists/${suite}"
 bin_rel="${component}/binary-${arch}"
+# Symlink guards MUST precede the recovery mv below: a contaminated checkout
+# shipping dists (or dists/<suite>) as a symlink would otherwise let the
+# restore write through it before the commit-phase guards run.
+assert_safe_rel 'dists'
+assert_safe_rel "$dist_rel"
+assert_safe_rel "$pool_rel"
 
 # --- recover, then GC, debris of a hard-crashed prior run --------------------
 # A SIGKILL/power loss between the commit's two renames bypasses the EXIT trap
@@ -309,8 +315,6 @@ if test -d "$repo_dir/dists"; then
             -exec rm -rf {} + 2>/dev/null || true
     fi
 fi
-assert_safe_rel "$pool_rel"
-assert_safe_rel "$dist_rel"
 mkdir -p "$repo_dir/$pool_rel"
 
 # GitHub Pages runs Jekyll by default; a .nojekyll marker disables that so the
