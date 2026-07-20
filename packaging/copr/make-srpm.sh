@@ -54,7 +54,9 @@ for tool in git cargo tar gzip; do
     fi
 done
 
-root=$(git rev-parse --show-toplevel)
+# realpath: voisu_confine_under's contract needs a canonical base (parity with
+# build-srpm.sh; don't rely on git canonicalizing implicitly).
+root=$(realpath "$(git rev-parse --show-toplevel)")
 cd "$root"
 
 # Fetch all tags + full history BEFORE classification. FAIL-CLOSED: if origin
@@ -62,7 +64,7 @@ cd "$root"
 # silently publish a snapshot instead of a fresh release, or a stale tag after a
 # respin retag. (No origin at all = deliberate local test mode, refs as-is.)
 if git remote get-url origin >/dev/null 2>&1; then
-    if ! git fetch --tags --force --prune; then
+    if ! git fetch --tags --force --prune --prune-tags; then
         printf '%s\n' 'refusing: tag fetch from origin failed; will not classify release vs snapshot from possibly stale refs' >&2
         exit 1
     fi
