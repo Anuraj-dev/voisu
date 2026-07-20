@@ -49,7 +49,7 @@ fi
 # --- Debian version scheme -------------------------------------------------
 # Every distinct payload gets a STRICTLY INCREASING version:
 #   tagged release  -> <base>-N              (VOISU_DEB_RELEASE=N, N a positive integer)
-#   dev build       -> <base>~git<ct>.<count>.<sha>-1
+#   dev build       -> <base>~git<count>.<ct>.<sha>-1
 # The leading `~` guarantees any dev version sorts BEFORE the matching <base>-N
 # release. For dev builds the PRIMARY ordering key is the commit count along
 # history (strictly increasing for any descendant commit, immune to committer
