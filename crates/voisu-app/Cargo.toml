@@ -1,9 +1,63 @@
 [package]
 name = "voisu-app"
 version = "0.1.0"
+description = "Cloud-first Linux dictation for Wayland"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+# Debian/Ubuntu packaging (cargo-deb). Mirrors the Fedora RPM
+# (packaging/voisu.spec): all three binaries plus both systemd *user* units in
+# one package, no auto-enable (see packaging/deb/postinst). Runtime dependency
+# names are the Ubuntu 24.10 equivalents of the RPM Requires/Recommends,
+# verified against the live 24.10 apt database.
+[package.metadata.deb]
+name = "voisu"
+maintainer = "Voisu maintainers <voisu@example.invalid>"
+copyright = "2026, Voisu maintainers <voisu@example.invalid>"
+license-file = ["../../LICENSE", "0"]
+section = "utils"
+priority = "optional"
+extended-description = """\
+Voisu turns a bounded Recording into a validated Transcript and performs \
+Delivery into the focused application, with clipboard preservation as the \
+fallback. The daemon and CLI stay usable without GTK; the optional Overlay \
+adds a separate on-screen status surface that reflects daemon state. The \
+Trigger Key and Delivery use desktop portals."""
+# RPM Requires -> Ubuntu 24.10:
+#   gtk4               -> libgtk-4-1            (Overlay links GTK4)
+#   gtk4-layer-shell   -> libgtk4-layer-shell0  (Overlay links layer-shell)
+#   (portals)          -> xdg-desktop-portal    (Trigger Key + Delivery)
+#   pipewire-utils     -> pipewire-bin          (pw-record)
+#   wireplumber        -> wireplumber           (wpctl)
+#   wl-clipboard       -> wl-clipboard          (wl-copy/wl-paste)
+#   /usr/bin/secret-tool -> libsecret-tools     (secret-tool binary)
+#   curl               -> curl                  (provider HTTPS/WSS)
+# libc6 is the ELF interpreter/libc all three binaries link (normally derived by
+# dpkg-shlibdeps; added explicitly because the package is built on a non-Debian
+# host where shlibdeps is unavailable).
+depends = "libc6, libgtk-4-1, libgtk4-layer-shell0, xdg-desktop-portal, pipewire-bin, wireplumber, wl-clipboard, libsecret-tools, curl"
+# libei is dlopen()'d by SONAME at runtime (an optional auto-type capability),
+# never linked -- so it is Recommends, mirroring the RPM `Recommends: libei`.
+recommends = "libei1"
+# Overlay binary is feature-gated; build with the same feature the RPM uses.
+features = ["overlay"]
+maintainer-scripts = "../../packaging/deb"
+changelog = "../../packaging/deb/changelog"
+# Explicit assets. Binary sources use the literal `target/release/` prefix so
+# cargo-deb recognizes them as Cargo build products (builds them with the
+# overlay feature and strips them); other sources are relative to this manifest.
+# Layout mirrors the RPM: three binaries to /usr/bin, both user units to
+# /usr/lib/systemd/user.
+assets = [
+    ["target/release/voisu", "usr/bin/", "755"],
+    ["target/release/voisu-daemon", "usr/bin/", "755"],
+    ["target/release/voisu-overlay", "usr/bin/", "755"],
+    ["../../packaging/voisu.service", "usr/lib/systemd/user/", "644"],
+    ["../../packaging/voisu-overlay.service", "usr/lib/systemd/user/", "644"],
+    ["../../packaging/deb/lintian-overrides", "usr/share/lintian/overrides/voisu", "644"],
+    ["../../README.md", "usr/share/doc/voisu/README", "644"],
+]
 
 [[bin]]
 name = "voisu"

@@ -1,0 +1,7 @@
+voisu (0.1.0-1) oracular; urgency=medium
+
+  * Initial Debian/Ubuntu package built with cargo-deb (ticket 10).
+  * Ships the voisu, voisu-daemon and voisu-overlay binaries and both systemd
+    user units, mirroring the Fedora RPM layout and enable-instruction UX.
+
+ -- Voisu maintainers <voisu@example.invalid>  Mon, 20 Jul 2026 00:00:00 +0000
