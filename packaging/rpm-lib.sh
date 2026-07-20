@@ -49,8 +49,12 @@ voisu_derive_version() {
 #   $1 = checkout root
 voisu_tag_release_number() {
     local root=$1 n
-    n=$(tr -d '[:space:]' < "$root/packaging/rpm-release")
-    if ! printf '%s' "$n" | grep -Eq '^[1-9][0-9]*$'; then
+    # $(<file) strips only trailing newlines; internal/leading whitespace or a
+    # second line then fails the integer check instead of being silently glued.
+    # [[ =~ ]] anchors over the WHOLE string (grep would match line-by-line and
+    # wave a multi-line file through).
+    n=$(<"$root/packaging/rpm-release")
+    if ! [[ $n =~ ^[1-9][0-9]*$ ]]; then
         printf 'packaging/rpm-release must contain a positive integer (got "%s")\n' "$n" >&2
         return 1
     fi
@@ -73,17 +77,27 @@ voisu_compute_release() {
 }
 
 # --- path confinement (mirrors build-deb.sh / build-srpm.sh) ----------------
-# Resolve $2, require it strictly beneath the real $1 (rejecting symlink escapes
-# and $1 itself), and echo the canonical path. $1 must already be canonical and
-# a non-symlink directory.
+# Require $2 strictly beneath the real $1, rejecting $1 itself and ANY symlink
+# anywhere along the candidate path — not just a symlinked base. The check
+# compares the fully resolved path against the purely lexical normalization
+# (realpath -sm): if they differ, some component is a symlink, and accepting the
+# resolved target would let e.g. `_copr_srpm -> packaging` aim the caller's
+# rm -rf at an unrelated repo directory. Echoes the (lexical == real) path.
+# $1 must already be canonical and a non-symlink directory.
 #   $1 = confinement base   $2 = candidate path
 voisu_confine_under() {
-    local base=$1 cand=$2 resolved
-    if test -L "$base"; then
-        printf 'refusing: %s is a symlink; remove it so the output stays inside the tree\n' "$base" >&2
+    local base=$1 cand=$2 resolved lexical
+    if test -L "$base" || ! test -d "$base"; then
+        printf 'refusing: %s is a symlink or not a directory; the confinement base must be a real directory\n' "$base" >&2
         return 1
     fi
     resolved=$(realpath -m "$cand")
+    lexical=$(realpath -sm "$cand")
+    if test "$resolved" != "$lexical"; then
+        printf 'refusing to use %s: it traverses a symlink (resolves to %s); remove the symlink so the output stays inside the tree\n' \
+            "$lexical" "$resolved" >&2
+        return 1
+    fi
     case "$resolved" in
         "$base"/?*) printf '%s' "$resolved" ;;
         *) printf 'refusing to use %s: must be strictly under %s/\n' "$resolved" "$base" >&2

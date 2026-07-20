@@ -15,11 +15,17 @@ set -euo pipefail
 # SELF-PINNING PROVENANCE. The webhook (.github/workflows/copr-trigger.yml) only
 # pokes COPR to "rebuild the package"; it carries no commit. COPR then clones the
 # repo, but a plain HEAD clone is a moving target (tag pushed before the branch,
-# queued jobs racing, a tag cut off a non-default branch). So this script does
-# NOT trust clone HEAD for releases: it fetches all tags + full history, derives
-# the version from the exact-commit cargo metadata, and if tag v<version> exists
-# it builds the RELEASE from THAT tag's commit regardless of what HEAD points at.
-# With no matching tag it builds a snapshot of HEAD. This pins release provenance
+# queued jobs racing, a tag cut off a non-default branch). So this script never
+# derives anything from mutable HEAD when releases exist: it fetches all tags +
+# full history (FAIL-CLOSED — a failed fetch aborts rather than risking a stale
+# or missing tag set), then builds the HIGHEST v<semver> tag's commit as the
+# release, wherever HEAD points and whichever branch carried the tag. The tag
+# name must match the version in that commit's own tree (catches a mis-cut tag).
+# Only when NO release tag exists at all does it build a snapshot of HEAD — i.e.
+# the pre-first-release bootstrap phase. After the first release, the COPR
+# channel intentionally serves releases only; dev snapshots come from the local
+# build-srpm.sh/build-rpm.sh paths. Queued-webhook races collapse harmlessly:
+# whichever job runs later still builds the newest release. This pins provenance
 # using only the COPR_WEBHOOK_URL secret we have; a token-based pinned-ref API
 # build (copr-cli against an explicit commit) needs a new COPR API secret and is
 # ticket 14's option (HITL), not wired here.
@@ -51,27 +57,51 @@ done
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 
-# Fetch all tags + full history BEFORE classification, and reject a clone that is
-# still shallow (the commit count that orders pre-release builds needs it).
-git fetch --tags --force --prune >/dev/null 2>&1 || true
-if test "$(git rev-parse --is-shallow-repository)" = "true"; then
-    git fetch --unshallow >/dev/null 2>&1 || true
+# Fetch all tags + full history BEFORE classification. FAIL-CLOSED: if origin
+# exists, a failed fetch aborts — building from potentially stale refs could
+# silently publish a snapshot instead of a fresh release, or a stale tag after a
+# respin retag. (No origin at all = deliberate local test mode, refs as-is.)
+if git remote get-url origin >/dev/null 2>&1; then
+    if ! git fetch --tags --force --prune; then
+        printf '%s\n' 'refusing: tag fetch from origin failed; will not classify release vs snapshot from possibly stale refs' >&2
+        exit 1
+    fi
+    if test "$(git rev-parse --is-shallow-repository)" = "true"; then
+        if ! git fetch --unshallow --tags; then
+            printf '%s\n' 'refusing: could not unshallow the clone; the pre-release commit count needs full history' >&2
+            exit 1
+        fi
+    fi
+else
+    printf '%s\n' 'note: no origin remote; local test mode, using local refs as-is' >&2
 fi
 if test "$(git rev-parse --is-shallow-repository)" = "true"; then
-    printf '%s\n' 'refusing: clone is still shallow after fetch; the pre-release commit count needs full history' >&2
+    printf '%s\n' 'refusing: clone is still shallow; the pre-release commit count needs full history' >&2
     exit 1
 fi
 
-# Version from the current checkout, verified against its spec.
-version=$(voisu_derive_version "$root")
-
-# Self-pin: build the release from tag v<version> if it exists, else snapshot HEAD.
-if tag_commit=$(git rev-parse --verify --quiet "refs/tags/v${version}^{commit}" 2>/dev/null); then
-    build_commit=$tag_commit
+# Self-pin: the build target is the HIGHEST v<semver> release tag, independent of
+# what HEAD points at. Only with no release tags at all (pre-first-release) does
+# this build a snapshot of HEAD.
+latest_tag=$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+if test -n "$latest_tag"; then
+    build_commit=$(git rev-parse --verify "refs/tags/${latest_tag}^{commit}")
     tagged=yes
 else
     build_commit=$(git rev-parse --verify HEAD)
     tagged=no
+fi
+
+# The version comes from the BUILD COMMIT's own tree (never the clone checkout):
+# extract it first, derive, and for a release require the tag name to match.
+probe_dir=$(mktemp -d "${TMPDIR:-/var/tmp}/voisu-copr-probe.XXXXXX")
+trap 'rm -rf "$probe_dir"' EXIT
+git archive --format=tar "$build_commit" | tar -x -C "$probe_dir"
+version=$(voisu_derive_version "$probe_dir")
+if test "$tagged" = yes && test "v${version}" != "$latest_tag"; then
+    printf 'mis-cut tag: %s points at commit %s whose tree declares version %s\n' \
+        "$latest_tag" "$build_commit" "$version" >&2
+    exit 1
 fi
 
 # Result dir: confine strictly under the checkout (rm -rf target). Configure the
@@ -84,18 +114,12 @@ mkdir -p "$resultdir"
 git archive --format=tar.gz --prefix="voisu-${version}/" "$build_commit" \
     > "$resultdir/voisu-${version}.tar.gz"
 workdir=$(mktemp -d "${TMPDIR:-/var/tmp}/voisu-copr.XXXXXX")
-trap 'rm -rf "$workdir"' EXIT
+trap 'rm -rf "$workdir" "$probe_dir"' EXIT
 tar -xzf "$resultdir/voisu-${version}.tar.gz" -C "$workdir"
 src="$workdir/voisu-${version}"
 
-# The built commit's tree must agree on the version (tag v<version> guarantees it;
-# this catches a mis-cut tag).
-built_version=$(voisu_derive_version "$src")
-if test "$built_version" != "$version"; then
-    printf 'version mismatch: checkout says %s but build commit %s says %s\n' \
-        "$version" "$build_commit" "$built_version" >&2
-    exit 1
-fi
+# ($version already came from this same commit's tree via the probe extraction,
+# and a release additionally proved v$version == the tag name — no re-check.)
 
 # Unified Release policy (packaging/rpm-lib.sh).
 if test "$tagged" = yes; then

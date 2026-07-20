@@ -60,8 +60,9 @@ Wayland. It keeps the daemon and CLI usable without GTK and uses desktop
 portals for the Trigger Key and direct Delivery, with clipboard preservation
 as the fallback.
 
-The package is built from the exact tested git commit recorded in the RPM
-Release metadata and a Cargo.lock-pinned source archive.
+The package is built from a Cargo.lock-pinned source archive of one exact git
+commit. Pre-release builds carry that commit in their Release string; tagged
+releases carry it as the %%global voisu_commit baked into the SRPM's spec.
 
 %package overlay
 Summary:        Optional GTK4 Voisu Overlay
