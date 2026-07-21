@@ -122,6 +122,9 @@ install -D -m 0755 target/release/voisu-daemon %{buildroot}%{_bindir}/voisu-daem
 install -D -m 0755 target/release/voisu-overlay %{buildroot}%{_bindir}/voisu-overlay
 install -D -m 0644 packaging/voisu.service %{buildroot}%{_userunitdir}/voisu.service
 install -D -m 0644 packaging/voisu-overlay.service %{buildroot}%{_userunitdir}/voisu-overlay.service
+# Desktop entry gives the portal a stable app_id (voisu) so KDE's Global
+# Shortcuts portal resolves the same persistent binding across restarts.
+install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/voisu.desktop
 
 %post
 %systemd_user_post voisu.service
@@ -153,6 +156,7 @@ install -D -m 0644 packaging/voisu-overlay.service %{buildroot}%{_userunitdir}/v
 %{_bindir}/voisu
 %{_bindir}/voisu-daemon
 %{_userunitdir}/voisu.service
+%{_datadir}/applications/voisu.desktop
 
 %files overlay
 %{_bindir}/voisu-overlay

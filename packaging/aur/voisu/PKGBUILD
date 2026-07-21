@@ -104,6 +104,11 @@ package() {
     install -Dm644 packaging/voisu-overlay.service \
         "$pkgdir/usr/lib/systemd/user/voisu-overlay.service"
 
+    # Desktop entry gives the portal a stable app_id (voisu) so KDE's Global
+    # Shortcuts portal resolves the same persistent binding across restarts.
+    install -Dm644 packaging/voisu.desktop \
+        "$pkgdir/usr/share/applications/voisu.desktop"
+
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 
     # ring's license tree, kept at its upstream names/paths so the
