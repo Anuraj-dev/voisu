@@ -62,6 +62,15 @@ aur_push() {
 
     find "$clone" -maxdepth 1 -mindepth 1 ! -name .git -exec rm -rf {} +
     cp -a "$dir"/. "$clone/"
+    # AUR forbids blobs in package repos: the source tarball is fetched from
+    # source=() at build time and must never be committed (AUR's pre-receive hook
+    # rejects blobs over 488.28 KiB). updpkgsums downloads the tag archive into
+    # the source staging dir to pin its sha256; strip that tarball plus any
+    # makepkg build detritus so only PKGBUILD/.SRCINFO/.install/license files ship.
+    find "$clone" -mindepth 1 -maxdepth 1 \
+        \( -name '*.tar.gz' -o -name '*.tar.*' -o -name '*.tar' \
+           -o -name src -o -name pkg \) \
+        -exec rm -rf {} +
     (
         cd "$clone"
         git add -A
