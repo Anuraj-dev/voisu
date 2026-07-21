@@ -83,8 +83,9 @@ License: ISC
 
 License: Apache-2.0
  On Debian systems the full text of the Apache License 2.0 can be found in
- /usr/share/common-licenses/Apache-2.0, and the verbatim upstream copy sourced
- with *ring* is installed as /usr/share/doc/voisu/LICENSE.ring-BoringSSL.
+ /usr/share/common-licenses/Apache-2.0, and the verbatim upstream copies sourced
+ with *ring* are installed under /usr/share/doc/voisu/ring/ (LICENSE-BoringSSL,
+ src/polyfill/once_cell/LICENSE-APACHE, and third_party/fiat/LICENSE).
 
 License: BSD-3-clause
  Redistribution and use in source and binary forms, with or without

@@ -142,10 +142,13 @@ install -D -m 0644 packaging/voisu-overlay.service %{buildroot}%{_userunitdir}/v
 %systemd_user_postun voisu-overlay.service
 
 %files
+# %%license copies each listed FILE into %%{_licensedir}/%%{name}/ by BASENAME,
+# which would flatten ring's tree and collide the three files named LICENSE
+# (voisu's own MIT, ring/LICENSE, ring/third_party/fiat/LICENSE). Mark the whole
+# ring DIRECTORY instead: rpm installs it recursively, preserving the upstream
+# paths so ring's LICENSE-manifest cross-references resolve.
 %license LICENSE
-%license ring/LICENSE ring/LICENSE-BoringSSL ring/LICENSE-other-bits
-%license ring/src/polyfill/once_cell/LICENSE-APACHE ring/src/polyfill/once_cell/LICENSE-MIT
-%license ring/third_party/fiat/LICENSE
+%license ring
 %doc README.md
 %{_bindir}/voisu
 %{_bindir}/voisu-daemon
