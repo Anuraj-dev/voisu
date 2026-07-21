@@ -63,8 +63,8 @@ package() {
     install -Dm644 voisu-overlay.service \
         "$pkgdir/usr/lib/systemd/user/voisu-overlay.service"
 
-    # Desktop entry gives the portal a stable app_id (voisu) so KDE's Global
-    # Shortcuts portal resolves the same persistent binding across restarts.
+    # Desktop entry makes a resolvable app_id (voisu) available to portal
+    # backends that support it; the stable session token is the primary fix.
     install -Dm644 voisu.desktop "$pkgdir/usr/share/applications/voisu.desktop"
 
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
