@@ -12,9 +12,11 @@ Version:        0.1.0
 # its leading 0. keeps such an accidental build below every real release.
 Release:        %{?voisu_release}%{!?voisu_release:0.0.gitunknown}%{?dist}
 Summary:        Cloud-first Linux dictation for Fedora Wayland
-# Voisu is MIT; the statically linked ring crate adds ISC (new code) and
-# Apache-2.0 (BoringSSL-derived code). Ring's license texts ship in %%license.
-License:        MIT AND Apache-2.0 AND ISC
+# Voisu is MIT; the statically linked ring crate adds ISC (new code),
+# Apache-2.0 and BSD-3-Clause (BoringSSL-derived code), plus MIT/Apache-2.0
+# (once_cell polyfill) and Apache-2.0 (fiat). Ring's full upstream license tree
+# ships in %%license under ring/.
+License:        MIT AND Apache-2.0 AND ISC AND BSD-3-Clause
 URL:            https://github.com/Anuraj-Dev/voisu
 Source0:        %{name}-%{version}.tar.gz
 Source1:        voisu-vendor-%{version}.tar.gz
@@ -78,10 +80,19 @@ GTK-free; installing this package adds the separate Overlay process.
 %prep
 %autosetup -n %{name}-%{version}
 tar -xzf %{SOURCE1} -C ..
-# Statically linked ring is ISC AND Apache-2.0; its texts must ship with the RPM.
-cp ../voisu-vendor-%{version}/ring/LICENSE LICENSE.ring
-cp ../voisu-vendor-%{version}/ring/LICENSE-BoringSSL LICENSE.ring-BoringSSL
-cp ../voisu-vendor-%{version}/ring/LICENSE-other-bits LICENSE.ring-other-bits
+# Statically linked ring carries ISC, Apache-2.0, BSD-3-Clause and MIT texts; its
+# full upstream license tree must ship with the RPM. Preserve ring's UPSTREAM
+# names/paths (ring/... with the once_cell polyfill and fiat sub-paths) so the
+# cross-references inside ring's own LICENSE manifest resolve. Source of truth is
+# the vendored ring crate inside the Source1 vendor tarball.
+_ringsrc=../voisu-vendor-%{version}/ring
+mkdir -p ring/src/polyfill/once_cell ring/third_party/fiat
+cp $_ringsrc/LICENSE                                ring/LICENSE
+cp $_ringsrc/LICENSE-BoringSSL                       ring/LICENSE-BoringSSL
+cp $_ringsrc/LICENSE-other-bits                      ring/LICENSE-other-bits
+cp $_ringsrc/src/polyfill/once_cell/LICENSE-APACHE   ring/src/polyfill/once_cell/LICENSE-APACHE
+cp $_ringsrc/src/polyfill/once_cell/LICENSE-MIT      ring/src/polyfill/once_cell/LICENSE-MIT
+cp $_ringsrc/third_party/fiat/LICENSE                ring/third_party/fiat/LICENSE
 mkdir -p .cargo
 cat > .cargo/config.toml <<'EOF'
 [source.crates-io]
@@ -131,7 +142,10 @@ install -D -m 0644 packaging/voisu-overlay.service %{buildroot}%{_userunitdir}/v
 %systemd_user_postun voisu-overlay.service
 
 %files
-%license LICENSE LICENSE.ring LICENSE.ring-BoringSSL LICENSE.ring-other-bits
+%license LICENSE
+%license ring/LICENSE ring/LICENSE-BoringSSL ring/LICENSE-other-bits
+%license ring/src/polyfill/once_cell/LICENSE-APACHE ring/src/polyfill/once_cell/LICENSE-MIT
+%license ring/third_party/fiat/LICENSE
 %doc README.md
 %{_bindir}/voisu
 %{_bindir}/voisu-daemon
