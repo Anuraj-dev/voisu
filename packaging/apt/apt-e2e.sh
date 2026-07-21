@@ -361,6 +361,54 @@ if ! dpkg --compare-versions "$v2ver" gt "$v1ver"; then
     echo "FAIL: $v2ver is not greater than $v1ver"; exit 1
 fi
 echo "[evidence] PASS: upgraded $v1ver -> $v2ver with signature verification enforced"
+
+echo '=== REFRESH: re-sign the EXISTING pool, assert published bytes immutable ==='
+# Pool currently holds v1 + v2 (keep default 3, nothing pruned). Snapshot every
+# pool file's bytes, run the metadata-only refresh, and assert nothing changed.
+pool="$repo/pool/main/v/voisu"
+before=$(cd "$pool" && sha256sum ./* | sort)
+VOISU_APT_GPG_KEY="$keyfpr" /opt/make-apt-repo.sh --refresh "$repo"
+after=$(cd "$pool" && sha256sum ./* | sort)
+if [ "$before" != "$after" ]; then
+    echo "FAIL: --refresh mutated pool bytes"; printf '%s\n---\n%s\n' "$before" "$after"; exit 1
+fi
+echo "[evidence] pool bytes unchanged across --refresh"
+
+# Both signatures still verify over the refreshed Release.
+gpg --verify "$repo/dists/stable/InRelease" >/dev/null 2>&1 \
+    || { echo 'FAIL: InRelease does not verify after refresh'; exit 1; }
+gpg --verify "$repo/dists/stable/Release.gpg" "$repo/dists/stable/Release" >/dev/null 2>&1 \
+    || { echo 'FAIL: detached Release.gpg does not verify after refresh'; exit 1; }
+echo '[evidence] InRelease + detached Release.gpg both verify after refresh'
+
+# The exported public bundle is still EXACTLY one primary key.
+npub=$(gpg --show-keys --with-colons "$repo/voisu-archive-keyring.asc" | grep -c '^pub:' || true)
+[ "$npub" = 1 ] || { echo "FAIL: refreshed key bundle has $npub primary keys"; exit 1; }
+
+# Packages/by-hash consistency: the digest Release lists for Packages must exist
+# under by-hash and match the file on disk.
+pkg_dig=$(sha256sum "$repo/dists/stable/main/binary-amd64/Packages" | awk '{print $1}')
+grep -q "$pkg_dig" "$repo/dists/stable/Release" \
+    || { echo 'FAIL: Release omits the refreshed Packages digest'; exit 1; }
+[ -f "$repo/dists/stable/main/binary-amd64/by-hash/SHA256/$pkg_dig" ] \
+    || { echo 'FAIL: by-hash lacks the refreshed Packages digest'; exit 1; }
+echo '[evidence] Packages digest is consistent between Release and by-hash after refresh'
+
+# apt can still update + (re)install against the refreshed, re-signed metadata.
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y voisu
+echo '[evidence] apt updated + reinstalled against refreshed metadata'
+
+echo '=== a subsequent NORMAL publish still applies retention (keep=1 prunes v1) ==='
+# Re-publishing the already-present v2 with keep=1 must prune v1: this proves the
+# normal publish path (retention, index regen, signing) still works after a
+# refresh, without needing a fresh build.
+VOISU_APT_KEEP=1 VOISU_APT_GPG_KEY="$keyfpr" /opt/make-apt-repo.sh "$repo" "$v2deb"
+poolcount=$(ls -1 "$pool"/*.deb | wc -l)
+[ "$poolcount" = 1 ] || { echo "FAIL: keep=1 publish after refresh left $poolcount packages (expected 1)"; exit 1; }
+gpg --verify "$repo/dists/stable/InRelease" >/dev/null 2>&1 \
+    || { echo 'FAIL: InRelease does not verify after post-refresh publish'; exit 1; }
+echo '[evidence] PASS: --refresh preserves pool bytes; normal publish still enforces keep-N'
 FRIEND
     "$engine" run --rm --security-opt label=disable \
         -v "$scratch/out:/out" \

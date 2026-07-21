@@ -1,0 +1,67 @@
+name: Refresh apt repository signature
+
+# Ticket 14 (GH issue #46). The signed apt Release carries
+# Valid-Until = now + 30 days (packaging/apt/make-apt-repo.sh). If no release
+# ships within that window, `apt update` starts rejecting the repo as expired.
+# This scheduled job re-signs the EXISTING pool with a fresh Valid-Until every
+# week, touching no published .deb bytes (make-apt-repo.sh --refresh regenerates
+# and re-signs the metadata only). It shares the gh-pages concurrency group with
+# the release publish so the two never race the branch.
+#
+# NOTE: this fails until the gh-pages branch exists (HITL one-time setup in
+# packaging/apt/README.md) and the first release has populated the pool.
+
+on:
+  schedule:
+    - cron: '17 4 * * 1'   # 04:17 UTC every Monday
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  refresh:
+    name: Re-sign apt Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: voisu-gh-pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+      - name: Install publisher tooling
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends apt-utils gnupg dpkg-dev coreutils util-linux gzip
+      - name: Re-sign apt Release with a fresh Valid-Until
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME=$(mktemp -d); chmod 700 "$GNUPGHOME"
+          passfile=$(mktemp)
+          # Scrub the passphrase file AND the imported private key on ANY exit
+          # (set -e aborting on a make-apt-repo failure would otherwise leak them).
+          trap 'rm -f "$passfile"; rm -rf "$GNUPGHOME"' EXIT
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          printf '%s' "$GPG_PASSPHRASE" > "$passfile"
+          VOISU_APT_GPG_KEY=4149EE3868B36B6007592966D08BCFDC34125B28 \
+          VOISU_APT_GPG_PASSPHRASE_FILE="$passfile" \
+            packaging/apt/make-apt-repo.sh --refresh "$GITHUB_WORKSPACE/gh-pages"
+      - name: Commit and push refreshed metadata
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/gh-pages"
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no metadata change (already fresh)"; exit 0
+          fi
+          git commit -m "apt: scheduled Release re-sign (fresh Valid-Until)"
+          git push origin gh-pages
