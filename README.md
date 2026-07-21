@@ -1,10 +1,11 @@
 # Voisu
 
 Voisu is a cloud-first Linux desktop dictation application. Its first supported
-environment is Fedora KDE Plasma on Wayland.
+environment is Fedora KDE Plasma on Wayland. It runs as a set of systemd **user**
+services: press the Trigger Key, speak, and a validated Transcript is inserted
+into the focused application.
 
-The project is currently in planning. Implementation begins only after the
-product specification and tracer-bullet ticket graph are approved.
+Project page and full install docs: **https://anuraj-dev.github.io/voisu/**
 
 ## Product promise
 
@@ -12,7 +13,60 @@ Press the Trigger Key once, speak naturally, press it again, and receive one
 validated Transcript in the focused application. If direct insertion is not
 available, the Transcript remains available on the clipboard.
 
-## Planning artifacts
+## Installation
+
+### Fedora (COPR)
+
+```sh
+sudo dnf copr enable anuraj-dev/voisu
+sudo dnf install voisu
+```
+
+### Arch (AUR)
+
+```sh
+yay -S voisu-bin      # prebuilt
+yay -S voisu          # build from source (pick one; they conflict)
+```
+
+### Debian / Ubuntu (apt)
+
+Targets **Ubuntu 26.04 LTS, amd64**.
+
+```sh
+# 1. Add Voisu's signing key.
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://anuraj-dev.github.io/voisu/voisu-archive-keyring.asc \
+  | sudo tee /etc/apt/keyrings/voisu-archive-keyring.asc >/dev/null
+
+# 2. Add the repository.
+echo 'deb [signed-by=/etc/apt/keyrings/voisu-archive-keyring.asc arch=amd64] https://anuraj-dev.github.io/voisu stable main' \
+  | sudo tee /etc/apt/sources.list.d/voisu.list
+
+# 3. Install.
+sudo apt-get update && sudo apt-get install -y voisu
+```
+
+Signing key fingerprint: `4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28`.
+For the fingerprint-verified install path, see
+[`packaging/apt/README.md`](packaging/apt/README.md).
+
+### After install
+
+Voisu ships as systemd **user** services and is intentionally not auto-started.
+Enable it for your user:
+
+```sh
+systemctl --user enable --now voisu.service
+# optional on-screen Overlay:
+systemctl --user enable --now voisu-overlay.service
+```
+
+## License
+
+Voisu is licensed under the [MIT License](LICENSE).
+
+## Development docs
 
 - [Domain language](CONTEXT.md)
 - [Platform research](docs/research/linux-platform.md)
