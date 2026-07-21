@@ -63,5 +63,5 @@ mismatch: the GTK window background rendered as a visible square-cornered
 rectangle behind the rounded capsule. Corrected with a transparent window
 background so only the 32 px-radius capsule surface is drawn, then all states
 (Recording, Processing, Success, Failure, Daemon unavailable, Idle-hidden)
-were recaptured and pass. Captures are stored in
-`.scratch/voisu-implementation/screenshots/ticket-11/`.
+were recaptured and pass. Captures are retained in the maintainer's
+release archive.

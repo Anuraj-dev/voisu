@@ -145,7 +145,7 @@ fn shortcut_error(detail: impl Into<String>) -> BoundaryError {
 /// handles — against the caller's own D-Bus identity, so the session must live
 /// on a persistent native connection owned by the daemon; a per-call
 /// `busctl`/`gdbus` subprocess can create a session but can never receive its
-/// activations (see docs/decisions.md). Every failure — no session bus, portal
+/// activations (see docs/adr/). Every failure — no session bus, portal
 /// name absent, permission denied — fails closed with a `Shortcut` boundary and
 /// never fabricates a binding.
 pub struct FedoraShortcutPortal;
@@ -718,7 +718,7 @@ fn lookup_retry_backoff() -> Vec<Duration> {
 /// before the keyring is consulted again. Chosen to comfortably outlast any
 /// transient Secret-Service hiccup (seconds) while bounding how long a
 /// mid-session key rotation can be served stale to a few minutes — the daemon
-/// re-reads the keyring once the entry expires. See docs/decisions.md
+/// re-reads the keyring once the entry expires. See docs/adr/
 /// (2026-07-20) for why staleness is bounded by a TTL rather than by a
 /// per-Recording 401/403 signal.
 const CREDENTIAL_CACHE_TTL: Duration = Duration::from_secs(300);

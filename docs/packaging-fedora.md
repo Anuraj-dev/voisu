@@ -234,8 +234,8 @@ enablement states that cannot be faithfully reproduced are reported instead of
 silently downgraded.
 RPM-owned files are never modified. The opt-in invocation additionally runs readiness, starts the packaged
 user service, performs a real three-second Recording, stops it, and verifies that
-a Transcript is available through `wl-paste`. The orchestrator must complete the
-interactive KDE/Wayland checks in `docs/release-evidence.md`, including portal
+a Transcript is available through `wl-paste`. The release process additionally requires completing the
+interactive KDE/Wayland release-evidence checks, including portal
 approval, direct Delivery, clipboard fallback, login start, and upgrade/removal
 behavior. These checks are intentionally not run by the default build.
 
