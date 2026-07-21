@@ -1,0 +1,32 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Architectures: amd64
+Codename: stable
+Components: main
+Date: Tue, 21 Jul 2026 08:20:33 +0000
+Acquire-By-Hash: yes
+Valid-Until: Thu, 20 Aug 2026 08:20:33 +0000
+Description: Voisu apt repository
+Label: Voisu
+Origin: Voisu
+Suite: stable
+MD5Sum:
+ 97ebf1710c0420e149ba1cc8825522a9             1191 main/binary-amd64/Packages
+ 11669a7df7a53d9e6d9de75f8bf21e92              784 main/binary-amd64/Packages.gz
+SHA1:
+ b425c6a0e0826e328ed947a3f18c815cf3071900             1191 main/binary-amd64/Packages
+ 84e5895132bd1ad6485a25ab5a7759e25c0f7b2a              784 main/binary-amd64/Packages.gz
+SHA256:
+ 9fa0e8b1d58342cc090cdcff41ab888b3032430b6a05905afc75584d0072431d             1191 main/binary-amd64/Packages
+ c583b91b588e3ef5b43a4e505b2b9e3c6e5e421690010b04bafb705e5f58a04d              784 main/binary-amd64/Packages.gz
+SHA512:
+ 1082c6e039ab7aba639244b45e7ff01db88762d921960f03102c1646e7625d271aaa06330d651f726d90c0b0bacaab133e97b204b861fc3ccda2f3eedaacaaa1             1191 main/binary-amd64/Packages
+ 5048bcc8439583c017b815dfea56e2cb330979d306851fa8d988bd88880d9725e805751c24b2cbf9594a334c6efbc61f22d199ebe4acfabe78f6f5c782c26e59              784 main/binary-amd64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+iHUEARYKAB0WIQRBSe44aLNrYAdZKWbQi8/cNBJbKAUCal8r0QAKCRDQi8/cNBJb
+KNdUAP9Sw0ymGKk5oHnVQ+lc5gYHyyM/e/JXnyHTABZ7loGNTQEA1LaQ6oJKAgr5
+UjNRuQW598WIzRQe6EeP6/Pq1itDEwA=
+=gx1z
+-----END PGP SIGNATURE-----

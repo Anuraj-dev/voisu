@@ -1,0 +1,22 @@
+Package: voisu
+Architecture: amd64
+Version: 0.1.0-1
+Priority: optional
+Section: utils
+Maintainer: Anuraj Jit Saikia <rajasaikia1644@gmail.com>
+Installed-Size: 12377
+Depends: curl, libc6 (>= 2.39), libcairo2 (>= 1.10.0), libglib2.0-0t64 (>= 2.54.0), libgtk-4-1 (>= 4.0.0), libgtk4-layer-shell0 (>= 1.0.2), libsecret-tools, libxkbcommon0 (>= 0.5.0), pipewire-bin, wireplumber, wl-clipboard, xdg-desktop-portal
+Recommends: libei1
+Filename: pool/main/v/voisu/voisu_0.1.0-1_amd64.deb
+Size: 2731836
+MD5sum: b00342c5862052b4bf607ba9b07429f2
+SHA1: dc56931200652a0254f102ca45573d76448557f3
+SHA256: 463ce49b8e4d2e930f1b980331f0377fc50d44bca436f6b755703c783a81751b
+SHA512: d56f22f5e45f0a5b4ea35cb46c14c9044412382785f10174f8d8901cb5fa5e97f1bab13430eb9b43cce3a4a5fd449a9c6c54726454e52c6351f19061088cbe34
+Description: Cloud-first Linux dictation for Wayland
+ Voisu turns a bounded Recording into a validated Transcript and performs
+ Delivery into the focused application, with clipboard preservation as the
+ fallback. The daemon and CLI stay usable without GTK; the optional Overlay adds
+ a separate on-screen status surface that reflects daemon state. The Trigger Key
+ and Delivery use desktop portals.
+
