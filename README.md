@@ -103,9 +103,9 @@ Voisu is licensed under the [MIT License](LICENSE).
 
 ## Development docs
 
+- [Roadmap and known limitations](docs/ROADMAP.md)
+- [Contributing](CONTRIBUTING.md)
 - [Domain language](CONTEXT.md)
-- [Platform research](docs/research/linux-platform.md)
 - [Architectural decisions](docs/adr/)
-- [Wayfinder map](.scratch/voisu-wayfinder/map.md)
-- [Approved specification](.scratch/voisu-spec/issues/01-fedora-cloud-dictation.md)
-- [Implementation tickets](.scratch/voisu-implementation/issues/)
+- [Platform research](docs/research/linux-platform.md)
+- [Fedora packaging](docs/packaging-fedora.md)

@@ -417,7 +417,7 @@ enum ActorState {
     /// idle and stays responsive, but Start/Toggle are rejected with a
     /// retryable message until the cleanup acknowledges completion: deferring
     /// commands instead would reorder them and could begin a Recording whose
-    /// client already gave up (see docs/decisions.md).
+    /// client already gave up (see docs/adr/).
     Recovering(u64),
     /// A fixture replay is borrowing the provider and validation adapters. The
     /// daemon reads idle but rejects Start/Toggle until the replay returns them.

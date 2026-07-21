@@ -12,3 +12,8 @@
 
 # COPR Custom source-method scratch (packaging/copr/make-srpm.sh)
 _copr_srpm/
+
+# Private agent-workflow overlay (own git repo: Anuraj-dev/voisu-internal)
+/internal/
+/CLAUDE.md
+/AGENTS.md
