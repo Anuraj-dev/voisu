@@ -529,3 +529,11 @@ validating the tag name against that commit's own tree; a snapshot of HEAD is bu
 release tag exists (pre-first-release). Queued races collapse to "latest release wins". Rejected:
 per-tag pinned builds via the COPR API (needs a new API-token secret — ticket 14 may add it) and
 deriving the tag from HEAD's version (the round-2 defect).
+
+## 2026-07-20 — Apt channel: GitHub Pages self-hosted (apt-ftparchive + own GPG key)
+**Why:** Ticket 09 already provisioned exactly this path (key, committed public keyring,
+GPG_PRIVATE_KEY/GPG_PASSPHRASE secrets) while the Cloudsmith token was explicitly skipped; self-hosting
+adds zero third-party accounts/approval risk and composes directly into ticket 14's on-tag workflow.
+Rejected: Cloudsmith/packagecloud free OSS tier (signup + token + tier-approval dependency).
+Corollaries: published package bytes are immutable (respin ⇒ version bump); support matrix pinned to
+Ubuntu 26.04 amd64 until the Overlay's gtk4-layer-shell floor is resolved (24.04 lacks the package).
