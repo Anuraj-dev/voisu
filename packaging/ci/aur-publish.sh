@@ -34,6 +34,12 @@ trap 'rm -rf "$work"' EXIT
 #   remote newer  -> hard fail
 #   remote equal  -> idempotent no-op (skip; also avoids a pkgrel downgrade)
 #   remote older  -> proceed (or a brand-new/empty AUR repo)
+#
+# BY DESIGN: an equal remote pkgver is a no-op EVEN IF the staged content differs
+# (this script always forces pkgrel=1), so a pkgrel-only or packaging-metadata-
+# only AUR update can never ship through the release pipeline. Per the respin
+# policy, packaging-only fixes require cutting a new patch-version release. No
+# tree-comparison / pkgrel-bump logic is implemented intentionally.
 aur_push() {
     local name=$1 dir=$2 target_ver=$3
     local clone="$work/$name.git"

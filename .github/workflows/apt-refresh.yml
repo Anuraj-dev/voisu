@@ -44,12 +44,15 @@ jobs:
         run: |
           set -euo pipefail
           export GNUPGHOME=$(mktemp -d); chmod 700 "$GNUPGHOME"
+          passfile=$(mktemp)
+          # Scrub the passphrase file AND the imported private key on ANY exit
+          # (set -e aborting on a make-apt-repo failure would otherwise leak them).
+          trap 'rm -f "$passfile"; rm -rf "$GNUPGHOME"' EXIT
           printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
-          passfile=$(mktemp); printf '%s' "$GPG_PASSPHRASE" > "$passfile"
+          printf '%s' "$GPG_PASSPHRASE" > "$passfile"
           VOISU_APT_GPG_KEY=4149EE3868B36B6007592966D08BCFDC34125B28 \
           VOISU_APT_GPG_PASSPHRASE_FILE="$passfile" \
             packaging/apt/make-apt-repo.sh --refresh "$GITHUB_WORKSPACE/gh-pages"
-          rm -f "$passfile"
       - name: Commit and push refreshed metadata
         run: |
           set -euo pipefail

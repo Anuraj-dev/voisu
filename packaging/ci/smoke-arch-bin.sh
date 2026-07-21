@@ -42,6 +42,21 @@ rm -rf "$build"; mkdir -p "$build"
 cp "$repo_root"/packaging/aur/voisu-bin/* "$build/"
 cp "$tarball" "$build/voisu-${version}-x86_64.tar.gz"
 sed -i "s/^pkgver=.*/pkgver=${version}/; s/^pkgrel=.*/pkgrel=1/" "$build/PKGBUILD"
+
+# Before rewriting source= to the local file, VALIDATE the committed PKGBUILD's
+# published GitHub-Release URL template: its basename (with pkgver + CARCH
+# substituted) must equal the tarball this workflow actually built and will
+# upload. A wrong path/arch token would otherwise pass the gate and then 404 for
+# real AUR users installing voisu-bin.
+tmpl=$(sed -n 's/^source=.*::\(.*\)")/\1/p' "$build/PKGBUILD" | head -1)
+test -n "$tmpl" || { echo "FAIL: could not read the source URL template from voisu-bin PKGBUILD"; exit 1; }
+expected_basename=$(CARCH=x86_64 pkgver="$version" bash -c "basename \"$tmpl\"")
+if test "$expected_basename" != "voisu-${version}-x86_64.tar.gz"; then
+    echo "FAIL: voisu-bin source URL basename '$expected_basename' != built tarball 'voisu-${version}-x86_64.tar.gz'" >&2
+    exit 1
+fi
+echo "[evidence] published source URL basename resolves to the built tarball: $expected_basename"
+
 # Repoint source at the local tarball (makepkg resolves a bare filename from the
 # PKGBUILD dir) and pin its sha256 the same way aur-publish.sh does.
 sum=$(sha256sum "$build/voisu-${version}-x86_64.tar.gz" | awk '{print $1}')

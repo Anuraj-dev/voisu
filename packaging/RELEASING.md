@@ -183,7 +183,10 @@ Recovery from an expired repo is simply to re-run the refresh (Actions →
   are guarded by `vercmp` against the remote pkgver (an equal version is a no-op, a
   newer remote hard-fails) so a re-run of an older release can never downgrade AUR.
   `publish-aur` also runs in a `voisu-aur-publish` concurrency group so two runs
-  cannot interleave.
+  cannot interleave. **By design, an equal remote pkgver is a no-op even if content
+  differs** (the pipeline always forces `pkgrel=1`), so a pkgrel-only / packaging-
+  metadata-only AUR fix cannot ship on its own — cut a new patch-version release for
+  it, per the respin policy.
 - **Need genuinely new content under the same version number**: you cannot — apt and
   the published bytes are immutable per version. Bump the patch version and cut a new
   tag. (A deb-only rebuild of identical source can bump `VOISU_DEB_RELEASE` in the
