@@ -23,6 +23,21 @@ use voisu_core::{Command, PROTOCOL_VERSION, Request, Response, socket_path};
 
 fn main() {
     let arguments: Vec<_> = env::args().skip(1).collect();
+    // The released binary must answer the standard version/help probes with
+    // exit 0 before any GTK/overlay work.
+    match arguments.as_slice() {
+        [flag] if flag == "--version" || flag == "-V" => {
+            println!("voisu-overlay {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        [flag] if flag == "--help" || flag == "-h" => {
+            println!(
+                "voisu-overlay — the optional Voisu feedback observer.\n\nusage: voisu-overlay [--report-backend|--supervise|--version|-V|--help|-h]"
+            );
+            return;
+        }
+        _ => {}
+    }
     let exit_code = if arguments.as_slice() == ["--supervise"] {
         supervise_overlay()
     } else {

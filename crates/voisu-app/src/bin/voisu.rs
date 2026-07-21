@@ -36,6 +36,7 @@ enum CliAction {
     DictionaryList { json: bool },
     Service(UserServiceAction),
     Help,
+    Version,
 }
 
 fn main() -> ExitCode {
@@ -63,6 +64,10 @@ fn main() -> ExitCode {
         },
         Ok(CliAction::Help) => {
             println!("{}", usage());
+            ExitCode::SUCCESS
+        }
+        Ok(CliAction::Version) => {
+            println!("voisu {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Err(message) => fail(2, &message),
@@ -565,6 +570,7 @@ fn parse_command() -> Result<CliAction, String> {
         [command] if command == "--help" || command == "-h" || command == "help" => {
             Ok(CliAction::Help)
         }
+        [command] if command == "--version" || command == "-V" => Ok(CliAction::Version),
         [auth, set, provider] if auth == "auth" && set == "set" => {
             Ok(CliAction::AuthSet(parse_provider(provider)?))
         }

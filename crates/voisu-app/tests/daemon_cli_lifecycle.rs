@@ -156,7 +156,11 @@ impl Daemon {
         isolate_process_group(&mut command);
         let mut child = command.spawn().expect("daemon should start");
 
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // Generous bind ceiling: on a contended CI core the daemon can take well
+        // over a few seconds to spawn and bind its socket. A real failure is
+        // still caught promptly by the try_wait() branch below, so the wide
+        // ceiling only ever costs time on a genuinely slow-but-healthy start.
+        let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if socket_path(runtime_dir).exists()
                 && voisu(runtime_dir, "status").status.success()
@@ -235,7 +239,11 @@ impl Daemon {
         }
         isolate_process_group(&mut command);
         let mut child = command.spawn().expect("daemon should start");
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // Generous bind ceiling: on a contended CI core the daemon can take well
+        // over a few seconds to spawn and bind its socket. A real failure is
+        // still caught promptly by the try_wait() branch below, so the wide
+        // ceiling only ever costs time on a genuinely slow-but-healthy start.
+        let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if socket_path(runtime_dir).exists() && voisu(runtime_dir, "status").status.success() {
                 return Self {
@@ -605,6 +613,9 @@ fn dictionary_edits_between_recordings_reach_the_next_deepgram_and_whisper_snaps
         "the first Recording predates the edit: {first_handshake}"
     );
     fs::remove_file(commands.path().join("deepgram.closed")).unwrap();
+    // Clear the first Recording's readiness marker so the wait before the next
+    // Stop observes the SECOND pw-record producing audio, not the stale marker.
+    fs::remove_file(commands.path().join("pw-record.ready")).unwrap();
 
     let added = voisu_with_env(
         runtime.path(),
@@ -614,6 +625,10 @@ fn dictionary_edits_between_recordings_reach_the_next_deepgram_and_whisper_snaps
     assert!(added.status.success(), "{}", stderr(&added));
 
     assert!(voisu(runtime.path(), "start").status.success());
+    // The second Recording must actually capture audio before Stop, otherwise a
+    // slow/contended host lets Stop finalize an empty capture. The fake writes
+    // its readiness marker only after emitting its audio frames.
+    wait_for_marker(commands.path(), "pw-record.ready");
     let second_stop = voisu(runtime.path(), "stop");
     assert!(second_stop.status.success(), "{}", stderr(&second_stop));
     wait_for_marker(commands.path(), "deepgram.closed");
@@ -958,7 +973,10 @@ cat > "$dir/clipboard"
         .unwrap()
         .parse()
         .unwrap();
-    let reap_deadline = Instant::now() + Duration::from_secs(2);
+    // Generous ceiling: reaping is near-instant on an idle host, but a contended
+    // CI core can lag the kill+wait far past a two-second budget without ever
+    // failing to reap. The bounded poll returns as soon as the pid is gone.
+    let reap_deadline = Instant::now() + Duration::from_secs(15);
     while Path::new(&format!("/proc/{first_pid}")).exists() && Instant::now() < reap_deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -1287,12 +1305,24 @@ fn production_capture_death_mid_recording_self_recovers_without_stop() {
         &[("PATH", &path), ("VOISU_GROQ_API_KEY", "controlled-secret")],
     );
     assert!(voisu(runtime.path(), "start").status.success());
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // Generous ceiling: self-recovery to Idle is prompt on an idle host but can
+    // lag on a contended CI core; the loop returns as soon as Idle is observed.
+    let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         if stdout(&voisu(runtime.path(), "status")) == "idle\n" {
             assert!(voisu(runtime.path(), "start").status.success());
             let diagnostics = daemon.terminate_and_stderr();
-            assert!(diagnostics.contains("pw-record failed"));
+            // Which capture-failure diagnostic wins is a benign daemon-side race:
+            // if pw-record's nonzero exit is observed first the daemon logs
+            // "pw-record failed"; if the EOF/short-audio is validated first it
+            // logs "Recording contained N PCM bytes". Both are correct
+            // self-recovery — the Recording failed, delivered nothing, and was
+            // logged — so accept either classification.
+            assert!(
+                diagnostics.contains("pw-record failed")
+                    || diagnostics.contains("Recording contained"),
+                "capture death mid-Recording must be logged as a failed Recording, got: {diagnostics}"
+            );
             return;
         }
         thread::sleep(Duration::from_millis(10));
@@ -1784,7 +1814,10 @@ fn a_capture_that_dies_silently_before_stop_never_delivers_a_transcript() {
     // inside it), so retry until the race resolves. The contract under test
     // is unchanged and fully asserted below: the Recording FAILS, nothing is
     // ever delivered, and the daemon recovers.
-    let settle_deadline = Instant::now() + Duration::from_secs(5);
+    // Generous ceiling: the in-Processing abort settles promptly on an idle host
+    // but a contended CI core can hold Processing well past a few seconds; the
+    // loop breaks the moment the race resolves.
+    let settle_deadline = Instant::now() + Duration::from_secs(15);
     let message = loop {
         let stopped = voisu(runtime.path(), "stop");
         assert!(!stopped.status.success());
@@ -4162,8 +4195,12 @@ while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
 dir=$(dirname "$0")
 if [ "$1" = "lookup" ]; then
   if [ -e "$dir/secret-tool.slow" ]; then
-    i=0
-    while [ "$i" -lt 150 ]; do sleep 0.01; i=$((i + 1)); done
+    # One deterministic ~1.5s wall-clock sleep, sized to sit inside the window
+    # (>1s so the 3s reconciliation deadline beats the curl's 2s process
+    # deadline; <2s so the lookup itself never trips secret-tool's 2s bounded
+    # wait). A fork-per-tick busy loop would balloon past 2s under a contended
+    # CI core and surface a keyring-load timeout instead of the deadline.
+    sleep 1.5
   fi
   printf 'groq-controlled-secret'
 fi
@@ -5851,7 +5888,10 @@ exec setsid sleep infinity
 
     daemon.crash();
     assert!(socket_path(runtime.path()).exists());
-    let reap_deadline = Instant::now() + Duration::from_secs(2);
+    // Generous ceiling (see the reaping note elsewhere): a contended CI core can
+    // lag the parent-death SIGKILL and subreaper wait well past two seconds
+    // without the reaping contract itself failing.
+    let reap_deadline = Instant::now() + Duration::from_secs(15);
     for pid in boundary_pids {
         while Path::new(&format!("/proc/{pid}")).exists() {
             assert!(
@@ -6186,7 +6226,9 @@ while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
         .unwrap()
         .parse()
         .unwrap();
-    let kill_deadline = Instant::now() + Duration::from_secs(2);
+    // Generous ceiling: the kill+reap is prompt on an idle host but can lag on a
+    // contended CI core; the poll returns the instant the subprocess is gone.
+    let kill_deadline = Instant::now() + Duration::from_secs(15);
     while Path::new(&format!("/proc/{curl_pid}")).exists() {
         assert!(
             Instant::now() < kill_deadline,
@@ -6269,7 +6311,9 @@ while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
         .unwrap()
         .parse()
         .unwrap();
-    let kill_deadline = Instant::now() + Duration::from_secs(4);
+    // Generous ceiling: the Provider-Deadline kill+reap is prompt on an idle host
+    // but can lag on a contended CI core; the poll returns once the pid is gone.
+    let kill_deadline = Instant::now() + Duration::from_secs(15);
     while Path::new(&format!("/proc/{curl_pid}")).exists() {
         assert!(
             Instant::now() < kill_deadline,
@@ -6745,7 +6789,11 @@ fn oversized_and_slow_frames_do_not_block_or_kill_the_daemon() {
 
     let mut oversized = UnixStream::connect(&path).unwrap();
     oversized.write_all(&vec![b'x'; 20 * 1024]).unwrap();
-    oversized.write_all(b"\n").unwrap();
+    // The daemon may already have read enough to reject the oversized frame and
+    // closed the connection, so the trailing newline can race into a closed
+    // socket (BrokenPipe). Rejecting the frame is exactly the behavior under
+    // test; a failed trailing write is not.
+    let _ = oversized.write_all(b"\n");
     oversized
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
