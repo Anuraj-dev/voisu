@@ -117,6 +117,7 @@ jobs:
           strip "$troot/voisu" "$troot/voisu-daemon" "$troot/voisu-overlay"
           install -m644 packaging/voisu.service         "$troot/voisu.service"
           install -m644 packaging/voisu-overlay.service "$troot/voisu-overlay.service"
+          install -m644 packaging/voisu.desktop         "$troot/voisu.desktop"
           install -m644 LICENSE                         "$troot/LICENSE"
           install -m644 packaging/aur/voisu/LICENSE.ring            "$troot/ring/LICENSE"
           install -m644 packaging/aur/voisu/LICENSE.ring-BoringSSL  "$troot/ring/LICENSE-BoringSSL"
