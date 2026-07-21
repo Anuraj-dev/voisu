@@ -43,6 +43,11 @@ bump without a merge (e.g. to promote a pending patch to a minor), run the workf
 the Actions UI with the `bump` input. The workflow never tags and never publishes —
 releasing stays the deliberate manual tag push.
 
+A red `Version bump` run is self-healing: if `main` moved between the run's checkout and
+its final push (race-guard skip or a rejected non-fast-forward push), the commits are not
+lost — the next merge to `main` re-classifies everything since the last
+`chore(release):` marker and bumps accordingly. No manual repair needed.
+
 ## Pipeline stages
 
 ```

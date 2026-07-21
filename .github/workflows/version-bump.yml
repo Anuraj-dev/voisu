@@ -10,7 +10,7 @@ name: Version bump
 #   1. crates/voisu-app/Cargo.toml   version = "X.Y.Z"
 #   2. crates/voisu-core/Cargo.toml  version = "X.Y.Z" (lockstep)
 #   3. packaging/voisu.spec          Version:        X.Y.Z (column-aligned)
-#   4. Cargo.lock                    (regenerated via offline `cargo update`)
+#   4. Cargo.lock                    (regenerated via `cargo update`)
 # plus a prepended packaging/voisu.spec %changelog entry. The release pipeline's
 # validate stage fails closed if the tag name and the tree version disagree, and
 # packaging/rpm-lib.sh:voisu_derive_version() fails if cargo metadata and the
@@ -88,16 +88,17 @@ jobs:
           # into the script via ${{ }} (injection hardening). These are SHAs and
           # a constrained choice input, but the pattern is applied uniformly.
           EVENT: ${{ github.event_name }}
-          BEFORE: ${{ github.event.before }}
           SHA: ${{ github.sha }}
           DISPATCH_BUMP: ${{ github.event.inputs.bump }}
         run: |
           set -euo pipefail
 
-          # Base of the commit range. On push, the pre-push SHA; if that is
-          # unusable (workflow_dispatch, a fresh branch's all-zero before, or a
-          # SHA not in this shallow-free checkout) fall back to the last
+          # Base of the commit range: the last release marker — the last
           # chore(release): commit or the last v* tag, whichever is newer.
+          # Deliberately NOT github.event.before: if a prior run was skipped by
+          # the race guard, its commits would vanish from a before-anchored
+          # range and under-bump. Anchoring at the marker is self-healing —
+          # every commit since the last bump is always (re)classified.
           pick_base() {
             local a b
             a=$(git log --grep='^chore(release):' --format='%H' -n 1 2>/dev/null || true)
@@ -115,18 +116,13 @@ jobs:
             fi
           }
 
-          base=""
-          zero='0000000000000000000000000000000000000000'
-          if [ "$EVENT" = "push" ] \
-             && [ -n "${BEFORE:-}" ] \
-             && [ "$BEFORE" != "$zero" ] \
-             && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
-            base="$BEFORE"
-          else
-            base="$(pick_base)"
-          fi
+          base="$(pick_base)"
           if [ -n "$base" ]; then
             rng="${base}..${SHA}"
+          elif git rev-parse -q --verify "${SHA}^" >/dev/null 2>&1; then
+            # No release marker anywhere in history: classify only the pushed
+            # head commit — never walk the entire history.
+            rng="${SHA}^..${SHA}"
           else
             rng="$SHA"
           fi
@@ -220,6 +216,8 @@ jobs:
           # ${{ }}), then sanitized: strip a leading bullet dash and cap length.
           if [ -n "${RANGE_BASE:-}" ]; then
             rng="${RANGE_BASE}..${SHA}"
+          elif git rev-parse -q --verify "${SHA}^" >/dev/null 2>&1; then
+            rng="${SHA}^..${SHA}"
           else
             rng="$SHA"
           fi
@@ -234,8 +232,9 @@ jobs:
             while IFS= read -r line; do
               [ -n "$line" ] || continue
               # strip a leading "- " so a subject that is itself a bullet does
-              # not double up; collapse to a single line; cap to 100 chars.
-              line=$(printf '%s' "$line" | sed -E 's/^-[[:space:]]*//' | tr -d '\r')
+              # not double up; escape % as %% (rpm macro-expands % in
+              # %changelog at build time); single line; cap to 100 chars.
+              line=$(printf '%s' "$line" | sed -E 's/^-[[:space:]]*//; s/%/%%/g' | tr -d '\r')
               line=${line:0:100}
               printf -- '- %s\n' "$line"
               n=$((n + 1))
@@ -263,7 +262,10 @@ jobs:
           mv packaging/voisu.spec.new packaging/voisu.spec
 
           # 4: regenerate the two workspace crates' Cargo.lock version entries.
-          cargo update -p voisu-app -p voisu-core --offline
+          # No --offline: a fresh runner has no crates.io index and offline
+          # resolution exits 101 there (reproduced in review); the runner has
+          # network and only the two path-local workspace crates move.
+          cargo update -p voisu-app -p voisu-core
 
       - name: Diff whitelist — only the four version files may have changed
         if: steps.detect.outputs.bump_type != ''
