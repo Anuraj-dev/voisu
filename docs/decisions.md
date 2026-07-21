@@ -564,3 +564,21 @@ once the entry expires) and comfortably outlasts any transient hiccup. An unused
 is kept as the seam for a future auth-rejection hook. Rejected: retrying the empty-stderr `Missing`
 arm (penalizes every file-fallback Recording); wiring 401/403 invalidation now (blast radius). Full
 retry/cache semantics and budgets live in `crates/voisu-app/src/system.rs`.
+
+## 2026-07-21 — Release pipeline invariants (ticket 14, PR #71)
+**Why:** (1) Release tags must be ancestors of main (`merge-base --is-ancestor`, fail closed) — a
+well-formed tag on a stale/unmerged commit would otherwise publish to every channel; rejected trusting
+operator discipline alone. (2) Smoke gates install the locally built artifacts through each distro's real
+package-manager path (staged apt repo over local HTTP, rpm build+install, makepkg for source AND the
+voisu-bin tarball) because publishing is gated on smoke, so live channels cannot exist at gate time —
+rejected gating on post-publish channel installs (would invert the safety ordering). (3) AUR publishes are
+vercmp-guarded (remote newer → hard fail; equal → no-op EVEN IF content differs, pkgrel pinned to 1), so a
+re-run of an older release can never downgrade AUR; corollary: packaging-only AUR fixes require a
+patch-version release, per the published-bytes-immutable respin policy.
+
+## 2026-07-21 — RPM ships ring licenses via `%license ring` directory form (ticket 16, PR #72)
+**Why:** `%license`/`%doc` copy listed FILES into %{_licensedir}/%{name}/ by basename — the per-file form
+flattened ring's tree and three files named LICENSE collided, with fiat's Apache text silently replacing
+voisu's own MIT license while rpmbuild exited 0 (reviewer-reproduced). The directory form preserves the
+upstream tree so ring's LICENSE-manifest cross-references resolve. Rejected: %install-staged absolute
+%license paths (more moving parts for the same payload).
