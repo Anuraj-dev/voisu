@@ -95,6 +95,23 @@ echo "== systemd-analyze verify (both user units) =="
 systemd-analyze verify /usr/lib/systemd/user/voisu.service
 systemd-analyze verify /usr/lib/systemd/user/voisu-overlay.service
 
+# --- assertion: a fresh home cannot break namespace setup ---
+echo "== fresh-home safety: the unit provisions its own config/state dirs =="
+# A fresh home that never created ~/.config/voisu or ~/.local/state/voisu must
+# still start. ProtectSystem=strict + ReadWritePaths=%h/.config/voisu failed
+# systemd's namespace setup (status=226/NAMESPACE) on such a host, restart-looping
+# into start-limit-hit. The unit now declares ConfigurationDirectory/StateDirectory
+# (systemd creates them BEFORE sandbox setup); ReadWritePaths must reference no %h
+# home path. No systemd user session exists in this container, so this static check
+# is the strongest honest guard here.
+unit=/usr/lib/systemd/user/voisu.service
+grep -qx 'ConfigurationDirectory=voisu' "$unit"
+grep -qx 'StateDirectory=voisu' "$unit"
+if grep -Eq '^ReadWritePaths=.*%h' "$unit"; then
+    echo "FAIL: voisu.service ReadWritePaths still references a %h home path"; exit 1
+fi
+echo "[evidence] voisu.service declares Configuration/StateDirectory and no %h ReadWritePaths"
+
 # --- cheap --refresh regression: re-sign the staged repo, prove pool bytes are
 #     immutable and apt still updates/installs against the refreshed metadata ---
 echo "== make-apt-repo.sh --refresh (metadata re-sign, pool immutable) =="

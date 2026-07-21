@@ -296,6 +296,16 @@ test -x /usr/bin/voisu
 test -x /usr/bin/voisu-daemon
 test -r /usr/lib/systemd/user/voisu.service
 grep -qx 'ExecStart=/usr/bin/voisu-daemon --systemd' /usr/lib/systemd/user/voisu.service
+# Fresh-home safety: the unit must provision its own config/state dirs. An
+# explicit ReadWritePaths=%h/.config/voisu under ProtectSystem=strict failed
+# systemd's namespace setup (status=226/NAMESPACE) on any home that never created
+# those dirs. ConfigurationDirectory/StateDirectory make systemd create them
+# BEFORE sandbox setup; ReadWritePaths must reference no %h home path.
+grep -qx 'ConfigurationDirectory=voisu' /usr/lib/systemd/user/voisu.service
+grep -qx 'StateDirectory=voisu' /usr/lib/systemd/user/voisu.service
+if grep -Eq '^ReadWritePaths=.*%h' /usr/lib/systemd/user/voisu.service; then
+    printf 'FAIL: voisu.service ReadWritePaths still references a %%h home path\n' >&2; exit 1
+fi
 /usr/bin/voisu --help >/dev/null
 systemctl --user daemon-reload
 
@@ -328,6 +338,11 @@ fi
 
 /usr/bin/voisu service start
 /usr/bin/voisu service status
+# The unit started cleanly on this live session: systemd provisioned the config
+# and state dirs (ConfigurationDirectory/StateDirectory) before the sandbox, so
+# they exist even on a home that never created them by hand.
+test -d "${XDG_CONFIG_HOME:-$HOME/.config}/voisu"
+test -d "${XDG_STATE_HOME:-$HOME/.local/state}/voisu"
 /usr/bin/voisu doctor
 /usr/bin/voisu start
 sleep "${VOISU_RECORDING_SECONDS:-3}"
