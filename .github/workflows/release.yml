@@ -32,7 +32,11 @@ jobs:
     outputs:
       version: ${{ steps.check.outputs.version }}
     steps:
-      - name: Enforce strict v<semver> tag
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Enforce a strict v<semver> tag that lives on main
         id: check
         env:
           TAG_NAME: ${{ github.ref_name }}
@@ -44,8 +48,16 @@ jobs:
             echo "refusing: tag '$TAG_NAME' is not a strict v<major>.<minor>.<patch> release tag" >&2
             exit 1
           fi
+          # DRIVER DECISION: releases come only from main. The tagged commit must
+          # be an ancestor of origin/main; fail closed otherwise.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "refusing: tag commit $GITHUB_SHA is not on origin/main" >&2
+            exit 1
+          fi
           echo "version=${TAG_NAME#v}" >> "$GITHUB_OUTPUT"
-          echo "release tag $TAG_NAME accepted (version ${TAG_NAME#v})"
+          echo "release tag $TAG_NAME accepted (version ${TAG_NAME#v}, on main)"
 
   # --- build the release .deb + binaries + AUR binary tarball ----------------
   build:
@@ -112,10 +124,14 @@ jobs:
           install -m644 packaging/aur/voisu/LICENSE.ring-once_cell-APACHE "$troot/ring/src/polyfill/once_cell/LICENSE-APACHE"
           install -m644 packaging/aur/voisu/LICENSE.ring-once_cell-MIT    "$troot/ring/src/polyfill/once_cell/LICENSE-MIT"
           install -m644 packaging/aur/voisu/LICENSE.ring-fiat            "$troot/ring/third_party/fiat/LICENSE"
-          # Deterministic archive (sorted, pinned owner/mtime) for a stable sha256.
+          # FLAT archive: voisu-bin's PKGBUILD installs voisu/voisu-daemon/units/
+          # LICENSE/ring directly from $srcdir with no versioned subdir, so the
+          # tarball's files must sit at the archive root (not under
+          # voisu-<ver>-x86_64/). Deterministic (sorted, pinned owner/mtime) for a
+          # stable sha256.
           tar --numeric-owner --owner=0 --group=0 --sort=name \
               --mtime="@$(git show -s --format=%ct HEAD)" \
-              -C "$stage" -czf "voisu-${VERSION}-x86_64.tar.gz" "voisu-${VERSION}-x86_64"
+              -C "$troot" -czf "voisu-${VERSION}-x86_64.tar.gz" .
 
           # 3. collect artifacts + checksums.
           mkdir -p dist/release
@@ -144,7 +160,11 @@ jobs:
             image: ubuntu:26.04
           - distro: fedora
             image: fedora:latest
+          # Arch source PKGBUILD (voisu) and the prebuilt PKGBUILD (voisu-bin)
+          # declare a mutual conflict, so they get SEPARATE containers.
           - distro: arch
+            image: archlinux
+          - distro: arch-bin
             image: archlinux
     container:
       image: ${{ matrix.image }}
@@ -153,9 +173,9 @@ jobs:
         run: |
           set -eu
           case "${{ matrix.distro }}" in
-            ubuntu) apt-get update && apt-get install -y --no-install-recommends git ca-certificates ;;
-            fedora) dnf -y install git ca-certificates ;;
-            arch)   pacman -Sy --noconfirm git ca-certificates ;;
+            ubuntu)        apt-get update && apt-get install -y --no-install-recommends git ca-certificates ;;
+            fedora)        dnf -y install git ca-certificates ;;
+            arch|arch-bin) pacman -Sy --noconfirm git ca-certificates ;;
           esac
       - uses: actions/checkout@v4
         with:
@@ -171,9 +191,10 @@ jobs:
         run: |
           set -euo pipefail
           case "${{ matrix.distro }}" in
-            ubuntu) bash packaging/ci/smoke-ubuntu.sh "$(ls dist/release/voisu_*_amd64.deb)" ;;
-            fedora) bash packaging/ci/smoke-fedora.sh ;;
-            arch)   bash packaging/ci/smoke-arch.sh "$VERSION" ;;
+            ubuntu)   bash packaging/ci/smoke-ubuntu.sh "$(ls dist/release/voisu_*_amd64.deb)" ;;
+            fedora)   bash packaging/ci/smoke-fedora.sh ;;
+            arch)     bash packaging/ci/smoke-arch.sh "$VERSION" ;;
+            arch-bin) bash packaging/ci/smoke-arch-bin.sh "$VERSION" "$(ls dist/release/voisu-*-x86_64.tar.gz)" ;;
           esac
 
   # --- publish: apt repo -> gh-pages ----------------------------------------
@@ -267,6 +288,12 @@ jobs:
     needs: [validate, smoke, publish-release]
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Serialize AUR pushes so two release runs can't interleave. The downgrade
+    # guard in aur-publish.sh still runs regardless (concurrency can't stop a
+    # later re-run of an OLDER release's workflow).
+    concurrency:
+      group: voisu-aur-publish
+      cancel-in-progress: false
     container:
       image: archlinux
     steps:

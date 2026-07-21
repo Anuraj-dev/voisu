@@ -95,6 +95,18 @@ echo "== systemd-analyze verify (both user units) =="
 systemd-analyze verify /usr/lib/systemd/user/voisu.service
 systemd-analyze verify /usr/lib/systemd/user/voisu-overlay.service
 
+# --- cheap --refresh regression: re-sign the staged repo, prove pool bytes are
+#     immutable and apt still updates/installs against the refreshed metadata ---
+echo "== make-apt-repo.sh --refresh (metadata re-sign, pool immutable) =="
+before=$(cd "$repo/pool/main/v/voisu" && sha256sum ./* | sort)
+VOISU_APT_GPG_KEY="$keyfpr" "$repo_root/packaging/apt/make-apt-repo.sh" --refresh "$repo"
+after=$(cd "$repo/pool/main/v/voisu" && sha256sum ./* | sort)
+test "$before" = "$after" || { echo "FAIL: --refresh mutated pool bytes"; exit 1; }
+# the refreshed metadata is still a valid, signed repo apt can consume
+apt-get update
+apt-get install --reinstall -y voisu
+echo "[evidence] --refresh kept pool bytes and apt re-installed against refreshed metadata"
+
 # --- lintian on the .deb (clean-enough) ---
 # The three suppressed tags are the ones documented in
 # packaging/deb/lintian-overrides:

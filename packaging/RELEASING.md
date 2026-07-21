@@ -15,7 +15,10 @@ the packaging docs cover the individual channels:
 ```sh
 # 1. Land everything on main; bump crate version if this is a new version.
 #    The tag MUST match the voisu-app crate version: tag v0.1.0 <-> version 0.1.0.
-# 2. Tag the exact release commit and push the tag.
+#    Releases come ONLY from main: validate fails closed if the tagged commit is
+#    not an ancestor of origin/main.
+# 2. Tag the exact release commit ON MAIN and push the tag.
+git checkout main && git pull
 git tag v0.1.0
 git push origin v0.1.0
 ```
@@ -61,10 +64,19 @@ not-yet-published channel.
 |-----|--------|----------------|---------|
 | ubuntu:26.04 | `packaging/ci/smoke-ubuntu.sh` | publishes the built `.deb` into a local apt repo signed with an **ephemeral** key, serves it over local HTTP, adds the repo the documented friend way (fingerprint-pin → `signed-by`), `apt install voisu` with signatures enforced | `voisu --version`, `voisu-daemon --help`, `systemd-analyze verify` on both user units, `lintian` clean-enough |
 | fedora:latest | `packaging/ci/smoke-fedora.sh` | `build-rpm.sh` (non-root) builds the RPM, `dnf install` the main + Overlay subpackage | binaries run, `systemd-analyze verify` both units, `rpm --requires`/file-list checks |
-| archlinux | `packaging/ci/smoke-arch.sh` | `makepkg -si` the **source** PKGBUILD pointed at the tag | `namcap` clean (errors only), binaries run, `systemd-analyze verify` both units |
+| archlinux (arch) | `packaging/ci/smoke-arch.sh` | `makepkg -si` the **source** PKGBUILD pointed at the tag | `namcap` clean (errors only), binaries run, `systemd-analyze verify` both units |
+| archlinux (arch-bin) | `packaging/ci/smoke-arch-bin.sh` | stages voisu-bin exactly as `aur-publish.sh` will (pkgver/sha256/.SRCINFO) but sources the **locally built release tarball**, then `makepkg -si` | proves the tarball layout matches the PKGBUILD's install steps; `namcap` clean, binaries run, `systemd-analyze verify` both units |
 
-The ubuntu leg doubles as an end-to-end test of `make-apt-repo.sh` before any real
-publish.
+The ubuntu leg doubles as an end-to-end test of `make-apt-repo.sh` (including a
+`--refresh` regression: it re-signs the staged repo and asserts the pool bytes are
+unchanged and apt still installs). The arch-bin leg is what makes the **exact
+artifact** shipped to the GitHub Release + AUR fail *here* if the tarball layout is
+wrong, rather than in the first AUR user's terminal. voisu and voisu-bin declare a
+mutual conflict, so the two arch legs run in separate containers.
+
+The release tarball is **flat** — `voisu`, `voisu-daemon`, `voisu-overlay`, the two
+units, `LICENSE` and `ring/` sit at the archive root — because voisu-bin's PKGBUILD
+installs them directly from `$srcdir` with no versioned subdir.
 
 ### Deliberate degradations (accepted, documented here)
 
@@ -152,9 +164,11 @@ Recovery from an expired repo is simply to re-run the refresh (Actions →
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `validate` fails immediately | tag is not strict `vX.Y.Z` | delete the bad tag, re-tag correctly |
+| `validate` fails: "tag commit … is not on origin/main" | tag pushed on a commit that is not an ancestor of `main` (DRIVER DECISION: releases come only from main) | merge the work to main first, then tag the commit on main |
 | `build` fails in build-deb.sh: "release build requires HEAD to be exactly at tag" | tag not on the release commit, or crate version ≠ tag | move the tag to the right commit / align `voisu-app` version with the tag |
 | a `smoke` leg fails | a real packaging regression for that distro | fix the package; the gate did its job — nothing was published |
 | `publish-apt` fails: "already published with DIFFERENT bytes" | re-tagging the same version with new content | published versions are immutable — bump the version (new tag) |
+| `publish-aur` fails: "AUR … is at pkgver … newer than …; will not downgrade" | re-running an OLDER release's publish after a newer one already landed on AUR | expected guard — do nothing; the newer AUR package stands |
 | gh-pages checkout fails | gh-pages branch missing | complete the HITL gh-pages setup |
 | `publish-aur` host-key mismatch | AUR rotated its SSH host key | update the pinned fingerprint in `release.yml` |
 
@@ -165,7 +179,11 @@ Recovery from an expired repo is simply to re-run the refresh (Actions →
 - **A publish job failed after others succeeded**: the publish jobs are
   independent. Re-run only the failed job from the Actions UI. apt re-publish of the
   same bytes is idempotent; `gh release create` will refuse a duplicate tag (delete
-  the release first if you must recreate it); AUR pushes are no-ops when unchanged.
+  the release first if you must recreate it); AUR pushes are no-ops when unchanged and
+  are guarded by `vercmp` against the remote pkgver (an equal version is a no-op, a
+  newer remote hard-fails) so a re-run of an older release can never downgrade AUR.
+  `publish-aur` also runs in a `voisu-aur-publish` concurrency group so two runs
+  cannot interleave.
 - **Need genuinely new content under the same version number**: you cannot — apt and
   the published bytes are immutable per version. Bump the patch version and cut a new
   tag. (A deb-only rebuild of identical source can bump `VOISU_DEB_RELEASE` in the
