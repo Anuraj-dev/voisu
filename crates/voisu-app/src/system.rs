@@ -168,6 +168,41 @@ impl Default for FedoraShortcutPortal {
     }
 }
 
+/// The Global Shortcuts `session_handle_token`. This is DELIBERATELY constant
+/// rather than per-process: xdg-desktop-portal-kde, unable to resolve an
+/// app_id, persists a kglobalaccel component named after this token. A token
+/// that varied per daemon process (e.g. by embedding the PID) presented a new
+/// identity on every start, so KWin had no stored binding for it — it
+/// re-prompted the user for a shortcut and leaked an orphaned
+/// `[token_voisu_session_<pid>]` section into `kglobalshortcutsrc` on every
+/// launch. Per the XDG GlobalShortcuts spec the `session_handle_token` need
+/// only be unique among the app's *concurrently active* sessions, and this
+/// daemon binds at most one Global Shortcuts session per run, so a constant
+/// token is spec-valid and lets the desktop re-resolve the same persistent
+/// binding silently across restarts.
+const SHORTCUT_SESSION_TOKEN: &str = "voisu_session";
+
+/// The portal tokens one shortcut bind cycle constructs. Extracted so the
+/// stable-session-token invariant is testable without a live portal.
+///
+/// `create` and `bind` are request `handle_token`s: they identify in-flight
+/// Request objects and are a *different* mechanism from the session handle
+/// token, so they MUST stay unique per daemon process.
+struct ShortcutBindTokens {
+    session: &'static str,
+    create: String,
+    bind: String,
+}
+
+fn shortcut_bind_tokens() -> ShortcutBindTokens {
+    let unique = std::process::id();
+    ShortcutBindTokens {
+        session: SHORTCUT_SESSION_TOKEN,
+        create: format!("voisu_create_{unique}"),
+        bind: format!("voisu_bind_{unique}"),
+    }
+}
+
 /// The portal request/session handle convention: predictable object paths are
 /// derived from the caller's unique name (`:1.42` -> `1_42`) plus a
 /// caller-chosen token, letting the caller subscribe to the `Response` signal
@@ -297,12 +332,16 @@ impl ShortcutPortal for FedoraShortcutPortal {
             .await
             .map_err(|error| shortcut_error(format!("portal proxy failed: {error}")))?;
 
-            // Tokens are unique per daemon process; the daemon binds at most one
-            // Global Shortcuts session per run.
-            let unique = std::process::id();
-            let session_token = format!("voisu_session_{unique}");
-            let create_token = format!("voisu_create_{unique}");
-            let bind_token = format!("voisu_bind_{unique}");
+            // The session_handle_token is deliberately CONSTANT so the desktop
+            // re-resolves the same persistent binding across restarts (see
+            // SHORTCUT_SESSION_TOKEN). The request handle_tokens stay unique per
+            // daemon process — a different mechanism identifying in-flight
+            // Request objects. The daemon binds at most one session per run.
+            let ShortcutBindTokens {
+                session: session_token,
+                create: create_token,
+                bind: bind_token,
+            } = shortcut_bind_tokens();
             let session_path = format!(
                 "/org/freedesktop/portal/desktop/session/{}/{session_token}",
                 escaped_sender(&connection)?
@@ -311,7 +350,7 @@ impl ShortcutPortal for FedoraShortcutPortal {
             let create_options: std::collections::HashMap<&str, Value<'_>> =
                 std::collections::HashMap::from([
                     ("handle_token", Value::from(create_token.as_str())),
-                    ("session_handle_token", Value::from(session_token.as_str())),
+                    ("session_handle_token", Value::from(session_token)),
                 ]);
             let create_results = portal_request(
                 &connection,
@@ -5232,6 +5271,30 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use voisu_core::{ProviderCoordinator, ProviderStreams};
+
+    #[test]
+    fn shortcut_session_token_is_stable_across_bind_cycles() {
+        // Regression: the session_handle_token names a persistent kglobalaccel
+        // component in xdg-desktop-portal-kde, so it MUST be identical across
+        // separate bind cycles and independent of process identity — otherwise
+        // KWin has no stored binding and re-prompts on every daemon start,
+        // leaking an orphaned [token_voisu_session_<pid>] config section. The
+        // broken code embedded the PID (`voisu_session_{pid}`).
+        let first = shortcut_bind_tokens();
+        let second = shortcut_bind_tokens();
+        assert_eq!(first.session, second.session);
+        assert_eq!(first.session, "voisu_session");
+        assert!(
+            !first.session.contains(&std::process::id().to_string()),
+            "session_handle_token must not embed the PID"
+        );
+
+        // The request handle_tokens are a distinct mechanism identifying
+        // in-flight Request objects and must stay unique per daemon process.
+        let pid = std::process::id().to_string();
+        assert!(first.create.contains(&pid));
+        assert!(first.bind.contains(&pid));
+    }
 
     #[test]
     fn crypto_provider_installs_and_is_idempotent() {
