@@ -212,8 +212,10 @@ jobs:
             packaging/voisu.spec
 
           # Prepend a %changelog entry whose bullets are the merged commits'
-          # subjects. Subjects are read via `git log` INSIDE the shell (never via
-          # ${{ }}), then sanitized: strip a leading bullet dash and cap length.
+          # subjects. Subjects are read via `git log` INSIDE the shell — never
+          # via a GitHub expression, which would also be expanded in this run
+          # block (even in comments) — then sanitized: strip a leading bullet
+          # dash and cap length.
           if [ -n "${RANGE_BASE:-}" ]; then
             rng="${RANGE_BASE}..${SHA}"
           elif git rev-parse -q --verify "${SHA}^" >/dev/null 2>&1; then
