@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.1.0
+Version:        0.1.1
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,5 +163,14 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Tue Jul 21 2026 Voisu maintainers <voisu@example.invalid> - 0.1.1-1
+- Stable Global Shortcuts session identity: the Trigger Key binds once and
+  survives daemon restarts instead of re-prompting every start (PR #76).
+- Ship a desktop entry so portals can resolve a stable app id (PR #76).
+- Provision config/state directories via systemd so a fresh home can start
+  the service (fixes status=226/NAMESPACE on first run, PR #77).
+- voisu doctor: probe the GlobalShortcuts portal interface and surface a
+  failed service unit with a journalctl pointer (PR #77).
+
 * Thu Jul 16 2026 Voisu maintainers <voisu@example.invalid> - 0.1.0-1
 - Fedora release candidate package; exact commit is recorded in Release.
