@@ -537,3 +537,30 @@ adds zero third-party accounts/approval risk and composes directly into ticket 1
 Rejected: Cloudsmith/packagecloud free OSS tier (signup + token + tier-approval dependency).
 Corollaries: published package bytes are immutable (respin ⇒ version bump); support matrix pinned to
 Ubuntu 26.04 amd64 until the Overlay's gtk4-layer-shell floor is resolved (24.04 lacks the package).
+
+## 2026-07-20 — Mid-session secret lookup: bounded retry + a TTL-bounded session cache (GH #69)
+**Why:** A warm daemon (hours of uptime) hit one transient D-Bus/ksecretd hiccup on the
+per-Recording `secret-tool lookup` and hard-failed the whole dictation activation into the loud
+env-var fallback. Live probing showed the incident surfaced through the empty-stderr arm: a genuine
+"no such key" lookup is `exit 1` with EMPTY stderr, which Voisu classifies as definitive `Missing`
+→ the default "Secret storage is unavailable; set VOISU_GROQ_API_KEY…" message (verbatim the message
+in the issue). Two independent mechanisms, each fixing a distinct slice, without touching the
+`secret-tool` boundary (no `keyring` crate — see 2026-07-20 above): **(1)** a small bounded retry on
+the *transient-denial* arm only — a nonzero exit WITH a stderr diagnostic (indistinguishable by
+output from a genuinely locked collection), budget `[100ms, 250ms]` ≈0.35s, honoring the existing
+`VOISU_TEST_KEYRING_RETRY_MS` seam. The empty-stderr `Missing` arm stays definitive and is NEVER
+retried, so the common unconfigured-key and 0600-file-fallback reads add zero latency; the happy path
+(exit 0) never retries. This is the asymmetric opposite of the store path, where empty-stderr =
+"still activating" = retryable. **(2)** a session-scoped, in-process credential cache (one slot per
+provider, `Credential` has no `Debug`, never persisted or logged) so a credential loaded successfully
+on an earlier Recording survives a later transient denial without re-shelling — the exact warm-daemon
+failure mode. Env override still wins over the cache; `diagnose` (doctor) bypasses it for a live read.
+**Invalidation is a TTL (300s), not a per-Recording 401/403 hook:** the hot transcription path runs
+curl with `--fail`, which collapses every 4xx into a generic `Provider` error with no recoverable
+status, so there is no clean in-daemon "the provider rejected this key" signal; surfacing one would
+mean de-hardening the security-reviewed Groq/Deepgram request builders (disproportionate blast radius
+for this fix). The TTL bounds how long a mid-session key rotation is served stale (the daemon re-reads
+once the entry expires) and comfortably outlasts any transient hiccup. An unused `invalidate()` method
+is kept as the seam for a future auth-rejection hook. Rejected: retrying the empty-stderr `Missing`
+arm (penalizes every file-fallback Recording); wiring 401/403 invalidation now (blast radius). Full
+retry/cache semantics and budgets live in `crates/voisu-app/src/system.rs`.

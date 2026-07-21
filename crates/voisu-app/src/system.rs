@@ -660,6 +660,143 @@ fn keyring_retry_backoff() -> Vec<Duration> {
     KEYRING_RETRY_BACKOFF.to_vec()
 }
 
+/// The per-Recording lookup retry budget: two short backoffs, ≈0.35s total. It is
+/// deliberately far smaller than the store budget because the lookup runs on the
+/// dictation hot path — a healthy lookup succeeds on the first attempt and pays
+/// nothing, a transient Secret-Service denial recovers after the first backoff,
+/// and a persistent denial surfaces the loud failure sub-second rather than
+/// hanging the activation.
+const LOOKUP_RETRY_BACKOFF: [Duration; 2] =
+    [Duration::from_millis(100), Duration::from_millis(250)];
+
+/// The lookup retry backoff, overridable to a flat per-step delay (0 = instant)
+/// via the same `VOISU_TEST_KEYRING_RETRY_MS` seam the store path uses.
+fn lookup_retry_backoff() -> Vec<Duration> {
+    if let Some(ms) = std::env::var("VOISU_TEST_KEYRING_RETRY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return vec![Duration::from_millis(ms); LOOKUP_RETRY_BACKOFF.len()];
+    }
+    LOOKUP_RETRY_BACKOFF.to_vec()
+}
+
+/// How long a successfully-loaded credential is reused from the session cache
+/// before the keyring is consulted again. Chosen to comfortably outlast any
+/// transient Secret-Service hiccup (seconds) while bounding how long a
+/// mid-session key rotation can be served stale to a few minutes — the daemon
+/// re-reads the keyring once the entry expires. See docs/decisions.md
+/// (2026-07-20) for why staleness is bounded by a TTL rather than by a
+/// per-Recording 401/403 signal.
+const CREDENTIAL_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// The credential-cache TTL, overridable via `VOISU_TEST_CREDENTIAL_CACHE_TTL_MS`
+/// (0 = never cache, so every load re-reads) so tests can exercise the cache and
+/// its expiry without real waits.
+fn credential_cache_ttl() -> Duration {
+    if let Some(ms) = std::env::var("VOISU_TEST_CREDENTIAL_CACHE_TTL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    CREDENTIAL_CACHE_TTL
+}
+
+/// One cached credential and the instant it was stored, for TTL expiry.
+struct CachedCredential {
+    credential: Credential,
+    stored: Instant,
+}
+
+/// A session-scoped, in-process credential cache: at most one entry per provider,
+/// each stamped with its load time so it expires after a bounded TTL. It lets a
+/// credential that was successfully loaded earlier in the daemon's life survive a
+/// later transient Secret-Service denial without re-shelling to `secret-tool` —
+/// the reported failure mode (a warm daemon hitting one mid-session lookup
+/// hiccup). The cache lives only in process memory: it is never written to disk
+/// or logged, and `Credential` has no `Debug`, so a value cannot leak through it.
+struct CredentialCache {
+    /// One slot per provider, indexed by [`CredentialCache::slot`].
+    slots: Mutex<[Option<CachedCredential>; 2]>,
+}
+
+impl CredentialCache {
+    const fn new() -> Self {
+        Self {
+            slots: Mutex::new([None, None]),
+        }
+    }
+
+    fn slot(provider: Provider) -> usize {
+        match provider {
+            Provider::Deepgram => 0,
+            Provider::Groq => 1,
+        }
+    }
+
+    /// Returns a fresh cached credential, or `None` when absent or expired. An
+    /// expired entry is dropped in passing so a stale credential is never served.
+    fn get(&self, provider: Provider, ttl: Duration) -> Option<Credential> {
+        let mut slots = self.slots.lock().ok()?;
+        let slot = &mut slots[Self::slot(provider)];
+        match slot {
+            Some(entry) if entry.stored.elapsed() < ttl => Some(entry.credential.clone()),
+            Some(_) => {
+                *slot = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn put(&self, provider: Provider, credential: Credential) {
+        if let Ok(mut slots) = self.slots.lock() {
+            slots[Self::slot(provider)] = Some(CachedCredential {
+                credential,
+                stored: Instant::now(),
+            });
+        }
+    }
+
+    /// Drops a provider's entry so the next load re-reads the keyring. Kept for
+    /// on-demand eviction (e.g. a future provider auth-rejection hook); today the
+    /// TTL is the sole staleness bound.
+    #[allow(dead_code)]
+    fn invalidate(&self, provider: Provider) {
+        if let Ok(mut slots) = self.slots.lock() {
+            slots[Self::slot(provider)] = None;
+        }
+    }
+}
+
+/// The daemon-process-wide credential cache. `SecretToolStore` is a unit struct
+/// re-created at each call site, so the cache must be process-global to persist
+/// across a session's Recordings.
+static CREDENTIAL_CACHE: CredentialCache = CredentialCache::new();
+
+fn credential_cache() -> &'static CredentialCache {
+    &CREDENTIAL_CACHE
+}
+
+/// Serves a provider credential from the session cache when a fresh entry exists,
+/// otherwise runs `load`, caches a successful result, and returns it. Only a
+/// successful load is cached — a failed load never poisons the cache — so a
+/// transient denial neither serves nor stores a bad value.
+fn resolve_with_cache(
+    provider: Provider,
+    cache: &CredentialCache,
+    ttl: Duration,
+    load: impl FnOnce() -> Result<Credential, BoundaryError>,
+) -> Result<Credential, BoundaryError> {
+    if let Some(credential) = cache.get(provider, ttl) {
+        return Ok(credential);
+    }
+    let credential = load()?;
+    cache.put(provider, credential.clone());
+    Ok(credential)
+}
+
 /// One attempt at the desktop Secret Service store.
 enum StoreStep {
     Stored,
@@ -667,16 +804,22 @@ enum StoreStep {
     Stop(FallbackReason),
 }
 
-/// One attempt at the desktop Secret Service lookup. The lookup is a single
-/// synchronous D-Bus round trip (activation, if needed, blocks within the one
-/// bounded call), so — unlike the store path — there is no retry variant: the
-/// load resolves immediately, guaranteeing a Recording's first key read is never
-/// delayed by a retry spin.
+/// One attempt at the desktop Secret Service lookup. A transient D-Bus/ksecretd
+/// denial (a nonzero exit WITH a stderr diagnostic) is `Retry`: it is
+/// indistinguishable by output from a genuinely locked collection, so a small
+/// bounded retry lets a momentary hiccup recover within the single load while a
+/// persistent denial still exhausts the budget and surfaces the loud failure.
+/// A clean no-match (nonzero exit, EMPTY stderr) is the OPPOSITE of the store
+/// path: it is definitive absence, never retried, so the common unconfigured-key
+/// and file-fallback reads stay on the fast path.
 enum LoadStep {
     Found(Credential),
     /// The service is reachable but holds no such credential — definitive, so
     /// the caller consults the fallback file rather than retrying.
     Missing,
+    /// A transient denial that a short bounded retry may clear; the reason is the
+    /// terminal classification used once the budget is exhausted.
+    Retry(FallbackReason),
     Stop(FallbackReason),
 }
 
@@ -732,37 +875,43 @@ impl SecretStore for SecretToolStore {
     }
 
     fn load(&mut self, provider: Provider) -> Result<Credential, BoundaryError> {
-        // The env override wins over any stored key, preserving the historic
-        // development/headless path.
+        // The env override wins over any stored key AND over the cache, preserving
+        // the historic development/headless path; it is cheap to read so it is
+        // never cached.
         if let Some(credential) = std::env::var_os(provider.environment_variable()) {
             return Credential::new(credential.to_string_lossy().into_owned());
         }
-        let fallback = FileSecretStore::at_default();
-        match load_primary(provider) {
-            LoadPrimary::Found(credential) => Ok(credential),
-            // Keyring reachable but no key: a prior headless fallback write may
-            // still hold it — reading that plaintext while the keyring is
-            // available is a migration nudge, not a keyring failure.
-            LoadPrimary::Missing => match fallback.read(provider)? {
-                Some(credential) => {
-                    warn_fallback(FallbackNotice::ReadWhileKeyringAvailable);
-                    Ok(credential)
-                }
-                None => Err(BoundaryError::new(
-                    BoundaryKind::SecretStorage,
-                    "no stored credential for provider",
-                )),
-            },
-            // Keyring unreachable: only warn about reading the file when we
-            // actually read one; otherwise surface the keyring's real problem.
-            LoadPrimary::Failed(reason) => match fallback.read(provider)? {
-                Some(credential) => {
-                    warn_fallback(FallbackNotice::Read(reason));
-                    Ok(credential)
-                }
-                None => Err(reason.load_error()),
-            },
-        }
+        // Serve a still-fresh credential from the session cache, so a later
+        // transient Secret-Service denial never re-reaches secret-tool. Only a
+        // successful load is cached; failures fall through and surface loudly.
+        resolve_with_cache(provider, credential_cache(), credential_cache_ttl(), || {
+            let fallback = FileSecretStore::at_default();
+            match load_primary(provider) {
+                LoadPrimary::Found(credential) => Ok(credential),
+                // Keyring reachable but no key: a prior headless fallback write may
+                // still hold it — reading that plaintext while the keyring is
+                // available is a migration nudge, not a keyring failure.
+                LoadPrimary::Missing => match fallback.read(provider)? {
+                    Some(credential) => {
+                        warn_fallback(FallbackNotice::ReadWhileKeyringAvailable);
+                        Ok(credential)
+                    }
+                    None => Err(BoundaryError::new(
+                        BoundaryKind::SecretStorage,
+                        "no stored credential for provider",
+                    )),
+                },
+                // Keyring unreachable: only warn about reading the file when we
+                // actually read one; otherwise surface the keyring's real problem.
+                LoadPrimary::Failed(reason) => match fallback.read(provider)? {
+                    Some(credential) => {
+                        warn_fallback(FallbackNotice::Read(reason));
+                        Ok(credential)
+                    }
+                    None => Err(reason.load_error()),
+                },
+            }
+        })
     }
 
     fn diagnose(&mut self, provider: Provider) -> KeyDiagnosis {
@@ -861,10 +1010,19 @@ fn load_primary(provider: Provider) -> LoadPrimary {
             _ => LoadPrimary::Failed(FallbackReason::Unavailable),
         };
     }
-    match secret_tool_load(provider) {
-        LoadStep::Found(credential) => LoadPrimary::Found(credential),
-        LoadStep::Missing => LoadPrimary::Missing,
-        LoadStep::Stop(reason) => LoadPrimary::Failed(reason),
+    let mut backoff = lookup_retry_backoff().into_iter();
+    loop {
+        match secret_tool_load(provider) {
+            LoadStep::Found(credential) => return LoadPrimary::Found(credential),
+            LoadStep::Missing => return LoadPrimary::Missing,
+            LoadStep::Stop(reason) => return LoadPrimary::Failed(reason),
+            // A transient denial: retry within the small budget, then fall back to
+            // the terminal classification once it is exhausted.
+            LoadStep::Retry(reason) => match backoff.next() {
+                Some(delay) => std::thread::sleep(delay),
+                None => return LoadPrimary::Failed(reason),
+            },
+        }
     }
 }
 
@@ -914,8 +1072,14 @@ fn secret_tool_load(provider: Provider) -> LoadStep {
             Err(_) => LoadStep::Stop(FallbackReason::Locked),
         },
         Ok(outcome) if outcome.stderr.is_empty() => LoadStep::Missing,
-        Ok(_) => LoadStep::Stop(FallbackReason::Locked),
+        // A nonzero exit WITH a stderr diagnostic is the transient-denial shape:
+        // a momentary D-Bus/ksecretd hiccup looks identical to a genuinely locked
+        // collection here, so a short bounded retry lets the hiccup recover while
+        // a real lock still exhausts the budget and stays loud.
+        Ok(_) => LoadStep::Retry(FallbackReason::Locked),
         Err(ProcessError::Unavailable) => LoadStep::Stop(FallbackReason::ToolMissing),
+        // A timeout already consumed the full process deadline; retrying would
+        // multiply the hot-path latency, so it stays terminal.
         Err(ProcessError::TimedOut) => LoadStep::Stop(FallbackReason::Locked),
         // A crashed/anomalous child is not retried (see `secret_tool_store`).
         Err(_) => LoadStep::Stop(FallbackReason::Unavailable),
@@ -5075,6 +5239,94 @@ mod tests {
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
         install_crypto_provider();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    fn credential(value: &str) -> Credential {
+        Credential::new(value.to_owned()).expect("test credential is valid")
+    }
+
+    #[test]
+    fn session_cache_serves_a_second_load_without_re_invoking_the_store() {
+        // The observed failure mode: a warm daemon whose credential was loaded on
+        // an earlier Recording hits a transient denial on a later one. A cache hit
+        // must serve that later load without re-reaching secret-tool at all.
+        let cache = CredentialCache::new();
+        let ttl = Duration::from_secs(300);
+        let calls = std::cell::Cell::new(0_usize);
+        let first = resolve_with_cache(Provider::Groq, &cache, ttl, || {
+            calls.set(calls.get() + 1);
+            Ok(credential("cached-secret"))
+        })
+        .unwrap();
+        let second = resolve_with_cache(Provider::Groq, &cache, ttl, || {
+            calls.set(calls.get() + 1);
+            Ok(credential("cached-secret"))
+        })
+        .unwrap();
+        assert_eq!(first.expose_to_boundary(), "cached-secret");
+        assert_eq!(second.expose_to_boundary(), "cached-secret");
+        assert_eq!(calls.get(), 1, "the second load must be served from the cache");
+    }
+
+    #[test]
+    fn session_cache_re_reads_after_the_ttl_expires() {
+        // A zero TTL means every entry is already stale, so a rotated key is never
+        // served past its bound — each load re-reads.
+        let cache = CredentialCache::new();
+        let ttl = Duration::from_millis(0);
+        let calls = std::cell::Cell::new(0_usize);
+        for _ in 0..2 {
+            resolve_with_cache(Provider::Groq, &cache, ttl, || {
+                calls.set(calls.get() + 1);
+                Ok(credential("fresh-secret"))
+            })
+            .unwrap();
+        }
+        assert_eq!(calls.get(), 2, "an expired entry must be re-read, never served stale");
+    }
+
+    #[test]
+    fn session_cache_invalidation_forces_a_re_read() {
+        let cache = CredentialCache::new();
+        let ttl = Duration::from_secs(300);
+        let calls = std::cell::Cell::new(0_usize);
+        resolve_with_cache(Provider::Groq, &cache, ttl, || {
+            calls.set(calls.get() + 1);
+            Ok(credential("secret"))
+        })
+        .unwrap();
+        cache.invalidate(Provider::Groq);
+        resolve_with_cache(Provider::Groq, &cache, ttl, || {
+            calls.set(calls.get() + 1);
+            Ok(credential("secret"))
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2, "invalidation must drop the cached entry");
+    }
+
+    #[test]
+    fn session_cache_keys_each_provider_independently() {
+        let cache = CredentialCache::new();
+        let ttl = Duration::from_secs(300);
+        let groq = resolve_with_cache(Provider::Groq, &cache, ttl, || Ok(credential("groq-key"))).unwrap();
+        let deepgram =
+            resolve_with_cache(Provider::Deepgram, &cache, ttl, || Ok(credential("deepgram-key"))).unwrap();
+        assert_eq!(groq.expose_to_boundary(), "groq-key");
+        assert_eq!(deepgram.expose_to_boundary(), "deepgram-key", "one provider must not read another's slot");
+    }
+
+    #[test]
+    fn session_cache_does_not_store_a_failed_load() {
+        // A failed load must not poison the cache: the next attempt must retry the
+        // store, not serve a cached error.
+        let cache = CredentialCache::new();
+        let ttl = Duration::from_secs(300);
+        let first = resolve_with_cache(Provider::Groq, &cache, ttl, || {
+            Err(BoundaryError::new(BoundaryKind::SecretStorage, "transient"))
+        });
+        assert!(first.is_err());
+        let second = resolve_with_cache(Provider::Groq, &cache, ttl, || Ok(credential("recovered"))).unwrap();
+        assert_eq!(second.expose_to_boundary(), "recovered", "a failure must not be cached");
     }
 
     /// Fixed Groq request tuning for stream constructor tests: deterministic and
