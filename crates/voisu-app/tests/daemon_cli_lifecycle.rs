@@ -5888,12 +5888,13 @@ exec setsid sleep infinity
 
     daemon.crash();
     assert!(socket_path(runtime.path()).exists());
-    // Generous ceiling (see the reaping note elsewhere): a contended CI core can
-    // lag the parent-death SIGKILL and subreaper wait well past two seconds
-    // without the reaping contract itself failing.
+    // Generous ceiling: the parent-death SIGKILL fires immediately, but a
+    // contended CI core can lag the kill + reparent, and the process may sit as a
+    // not-yet-reaped zombie (see `boundary_process_terminated`). Either dead state
+    // satisfies the daemon's contract; only a still-running process fails.
     let reap_deadline = Instant::now() + Duration::from_secs(15);
     for pid in boundary_pids {
-        while Path::new(&format!("/proc/{pid}")).exists() {
+        while !boundary_process_terminated(pid) {
             assert!(
                 Instant::now() < reap_deadline,
                 "boundary process {pid} survived daemon interruption"
@@ -5968,6 +5969,29 @@ done
     assert_ne!(state, 'Z', "pw-record is a zombie: it was killed by the thread reap");
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
     daemon.terminate();
+}
+
+/// A boundary process counts as terminated once it is either gone from /proc or
+/// has become a zombie (state `Z`).
+///
+/// `PR_SET_PDEATHSIG(SIGKILL)` guarantees the boundary child is KILLED the moment
+/// the daemon dies — that is the whole of the daemon's cleanup contract, and a
+/// SIGKILLed daemon has no way to do more (it no longer exists to `wait()` for
+/// anything). REAPING the resulting zombie is the init/subreaper's job. Under a
+/// normal init — systemd on a real Voisu host, or the developer's login session —
+/// orphans reparent to a reaper and the zombie disappears within milliseconds.
+/// Inside a CI job container whose PID 1 is a non-reaping placeholder (GitHub
+/// Actions runs job containers without an init, so PID 1 is the sleep/tail that
+/// holds the container open and never `wait()`s), the zombie can linger for the
+/// container's whole lifetime. Requiring the /proc entry to vanish would test the
+/// container's init, not the daemon; requiring the process to be dead-or-zombie
+/// tests exactly the contract the daemon owns. A process the daemon failed to
+/// kill would stay Running/Sleeping and is still caught.
+fn boundary_process_terminated(pid: u32) -> bool {
+    match proc_state_and_start(pid) {
+        None => true,
+        Some((state, _)) => state == 'Z',
+    }
 }
 
 /// Reads (state, starttime) for a pid from /proc/<pid>/stat, parsing after the
