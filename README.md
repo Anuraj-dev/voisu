@@ -70,16 +70,21 @@ How you pick the Trigger Key depends on your desktop's portal:
 - **KDE Plasma / GNOME:** a system dialog appears the first time the daemon
   starts — choose the key once and it persists.
 - **Hyprland:** there is no dialog by design. Install
-  `xdg-desktop-portal-hyprland`, then declare the bind in `hyprland.conf`:
+  `xdg-desktop-portal-hyprland`, start the daemon, then read the registered
+  shortcut and declare the bind in `hyprland.conf`:
 
-  ```conf
-  bind = SUPER, D, global, voisu:voisu-toggle
+  ```sh
+  hyprctl globalshortcuts        # shows the exact appid:voisu-toggle string
   ```
 
-  `SUPER, D` is only an example key. After the comma, `voisu` is the app id and
-  `voisu-toggle` is the Trigger Key's shortcut id — keep those exact. Plain
-  wlroots portals do not implement GlobalShortcuts, so the Trigger Key cannot
-  bind without `xdg-desktop-portal-hyprland`.
+  ```conf
+  bind = SUPER, D, global, voisu:voisu-toggle   # use the exact string hyprctl printed
+  ```
+
+  `SUPER, D` is only an example key; the part after `global,` must match
+  `hyprctl globalshortcuts` verbatim (the app-id half can be empty, e.g.
+  `:voisu-toggle`). Plain wlroots portals do not implement GlobalShortcuts, so
+  the Trigger Key cannot bind without `xdg-desktop-portal-hyprland`.
 
 Run `voisu doctor` if the Trigger Key does not respond — it reports a portal
 without a usable GlobalShortcuts interface.

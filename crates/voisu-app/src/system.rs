@@ -1519,7 +1519,7 @@ fn portals_finding() -> ReadinessFinding {
         readiness(
             ReadinessCapability::Portals,
             ReadinessStatus::Warn,
-            "desktop portal responds but exposes no GlobalShortcuts interface; the Trigger Key cannot bind. On Hyprland install xdg-desktop-portal-hyprland and add `bind = SUPER, D, global, voisu:voisu-toggle` to hyprland.conf; plain wlroots portals do not implement GlobalShortcuts",
+            "desktop portal responds but exposes no GlobalShortcuts interface; the Trigger Key cannot bind. Your portal backend does not implement GlobalShortcuts — on Hyprland install xdg-desktop-portal-hyprland and declare the bind in hyprland.conf (see the Trigger Key section in the README)",
         )
     }
 }

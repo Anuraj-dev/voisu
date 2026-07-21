@@ -17,9 +17,10 @@ TimeoutStopSec=60s
 # below exists for a reason — see docs/packaging-fedora.md before tightening.
 NoNewPrivileges=yes
 # Read-only filesystem except the daemon's real write surfaces. The runtime dir
-# (control socket, pw-record scratch) is the only ReadWritePaths entry; config
-# (config.toml, dictionary) and state (history/diagnostics) are provisioned by
-# systemd through ConfigurationDirectory/StateDirectory. systemd creates those
+# (control socket, pw-record scratch, diagnostics/history) is the only
+# ReadWritePaths entry; config (config.toml, dictionary, credentials) and state
+# (the RemoteDesktop restore token) are provisioned by systemd through
+# ConfigurationDirectory/StateDirectory. systemd creates those
 # BEFORE it sets up the mount sandbox and mounts them read-write, so a fresh home
 # that never had ~/.config/voisu can no longer fail namespace setup
 # (status=226/NAMESPACE) the way an explicit ReadWritePaths=%h/.config/voisu did.

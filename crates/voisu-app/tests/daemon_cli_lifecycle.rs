@@ -2637,7 +2637,7 @@ fn doctor_warns_when_the_portal_exposes_no_global_shortcuts() {
     assert!(out.contains("Portals: WARN ("), "{out}");
     assert!(out.contains("no GlobalShortcuts interface"), "{out}");
     assert!(out.contains("xdg-desktop-portal-hyprland"), "{out}");
-    assert!(out.contains("voisu:voisu-toggle"), "{out}");
+    assert!(out.contains("Trigger Key section in the README"), "{out}");
 }
 
 #[test]
