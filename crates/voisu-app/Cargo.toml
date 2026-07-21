@@ -59,6 +59,7 @@ assets = [
     ["target/release/voisu-overlay", "usr/bin/", "755"],
     ["../../packaging/voisu.service", "usr/lib/systemd/user/", "644"],
     ["../../packaging/voisu-overlay.service", "usr/lib/systemd/user/", "644"],
+    ["../../packaging/voisu.desktop", "usr/share/applications/", "644"],
     ["../../packaging/deb/lintian-overrides", "usr/share/lintian/overrides/voisu", "644"],
     ["../../packaging/deb/copyright", "usr/share/doc/voisu/copyright", "644"],
     ["../../packaging/deb/ring/LICENSE", "usr/share/doc/voisu/ring/LICENSE", "644"],

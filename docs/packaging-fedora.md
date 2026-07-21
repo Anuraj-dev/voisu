@@ -126,6 +126,25 @@ The optional Overlay unit runs `/usr/bin/voisu-overlay --supervise`, is owned by
 `Wants=` or `Requires=`. It remains an observer-only process: daemon startup,
 Recording, Transcript production, and Delivery never depend on it.
 
+### Trigger Key re-prompts on every start (leaked shortcut sections)
+
+A daemon built before the stable-session-token fix made KDE's Global Shortcuts
+portal re-prompt for a Trigger Key on every start and leak one dead section per
+start into `~/.config/kglobalshortcutsrc`. Upgrading stops new leaks; prune the
+accumulated ones by hand (the daemon never edits your config):
+
+```sh
+# Inspect what leaked:
+grep -nE '^\[token_voisu_session_|voisu-toggle' ~/.config/kglobalshortcutsrc
+
+# With the daemon stopped, delete every [token_voisu_session_*] section and any
+# stray `voisu-toggle=...` line left under a terminal section (e.g. [Alacritty]),
+# then re-bind the Trigger Key from a fresh daemon start:
+systemctl --user stop voisu.service
+# edit ~/.config/kglobalshortcutsrc, remove those sections/lines, save
+systemctl --user start voisu.service
+```
+
 ### Unit sandboxing
 
 Both user units carry systemd hardening directives (`NoNewPrivileges`,

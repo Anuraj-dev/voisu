@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Voisu
+Comment=Cloud-first dictation for Linux
+Exec=/usr/bin/voisu
+Terminal=false
+NoDisplay=true
+Categories=Utility;Accessibility;

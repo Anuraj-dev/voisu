@@ -104,6 +104,11 @@ package() {
     install -Dm644 packaging/voisu-overlay.service \
         "$pkgdir/usr/lib/systemd/user/voisu-overlay.service"
 
+    # Desktop entry makes a resolvable app_id (voisu) available to portal
+    # backends that support it; the stable session token is the primary fix.
+    install -Dm644 packaging/voisu.desktop \
+        "$pkgdir/usr/share/applications/voisu.desktop"
+
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 
     # ring's license tree, kept at its upstream names/paths so the
