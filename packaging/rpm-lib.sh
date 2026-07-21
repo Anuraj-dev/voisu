@@ -158,7 +158,10 @@ voisu_vendor_and_verify() {
 
     # Ring license texts the spec copies in %prep must exist vendored.
     local lic
-    for lic in ring/LICENSE ring/LICENSE-BoringSSL ring/LICENSE-other-bits; do
+    for lic in ring/LICENSE ring/LICENSE-BoringSSL ring/LICENSE-other-bits \
+               ring/src/polyfill/once_cell/LICENSE-APACHE \
+               ring/src/polyfill/once_cell/LICENSE-MIT \
+               ring/third_party/fiat/LICENSE; do
         if ! test -f "$scratch/vendor/voisu-vendor-${version}/$lic"; then
             printf 'vendored tree is missing %s (spec %%prep copies it into %%license)\n' "$lic" >&2
             return 1

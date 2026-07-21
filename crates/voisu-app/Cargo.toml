@@ -47,9 +47,12 @@ changelog = "../../target/deb/changelog"
 # Explicit assets. Binary sources use the literal `target/release/` prefix so
 # cargo-deb recognizes them as Cargo build products (builds them with the
 # overlay feature and strips them); other sources are relative to this manifest.
-# Layout mirrors the RPM: three binaries to /usr/bin, both user units to
-# /usr/lib/systemd/user, and ring's statically linked license texts + a DEP-5
-# copyright covering Voisu (MIT) and ring (ISC / Apache-2.0).
+# Layout mirrors the RPM and the AUR package: three binaries to /usr/bin, both
+# user units to /usr/lib/systemd/user, and ring's statically linked license
+# texts shipped under their UPSTREAM tree layout (ring/... with the once_cell
+# polyfill and fiat sub-paths) so the cross-references inside ring's own
+# LICENSE manifest resolve, plus a DEP-5 copyright covering Voisu (MIT) and ring
+# (ISC / Apache-2.0 / BSD-3-Clause / MIT).
 assets = [
     ["target/release/voisu", "usr/bin/", "755"],
     ["target/release/voisu-daemon", "usr/bin/", "755"],
@@ -58,9 +61,12 @@ assets = [
     ["../../packaging/voisu-overlay.service", "usr/lib/systemd/user/", "644"],
     ["../../packaging/deb/lintian-overrides", "usr/share/lintian/overrides/voisu", "644"],
     ["../../packaging/deb/copyright", "usr/share/doc/voisu/copyright", "644"],
-    ["../../packaging/deb/LICENSE.ring", "usr/share/doc/voisu/LICENSE.ring", "644"],
-    ["../../packaging/deb/LICENSE.ring-BoringSSL", "usr/share/doc/voisu/LICENSE.ring-BoringSSL", "644"],
-    ["../../packaging/deb/LICENSE.ring-other-bits", "usr/share/doc/voisu/LICENSE.ring-other-bits", "644"],
+    ["../../packaging/deb/ring/LICENSE", "usr/share/doc/voisu/ring/LICENSE", "644"],
+    ["../../packaging/deb/ring/LICENSE-BoringSSL", "usr/share/doc/voisu/ring/LICENSE-BoringSSL", "644"],
+    ["../../packaging/deb/ring/LICENSE-other-bits", "usr/share/doc/voisu/ring/LICENSE-other-bits", "644"],
+    ["../../packaging/deb/ring/src/polyfill/once_cell/LICENSE-APACHE", "usr/share/doc/voisu/ring/src/polyfill/once_cell/LICENSE-APACHE", "644"],
+    ["../../packaging/deb/ring/src/polyfill/once_cell/LICENSE-MIT", "usr/share/doc/voisu/ring/src/polyfill/once_cell/LICENSE-MIT", "644"],
+    ["../../packaging/deb/ring/third_party/fiat/LICENSE", "usr/share/doc/voisu/ring/third_party/fiat/LICENSE", "644"],
     ["../../README.md", "usr/share/doc/voisu/README", "644"],
 ]
 

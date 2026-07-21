@@ -6,18 +6,20 @@ Files: *
 Copyright: 2026 Anuraj Jit Saikia
 License: MIT
 
-Files: packaging/deb/LICENSE.ring
- packaging/deb/LICENSE.ring-other-bits
+Files: packaging/deb/ring/LICENSE
+ packaging/deb/ring/LICENSE-other-bits
 Copyright: 2015-2025 Brian Smith
 License: ISC
 Comment:
  The voisu, voisu-daemon and voisu-overlay binaries statically link the *ring*
  crate for TLS cryptography. New *ring* code is under this ISC-style license.
- LICENSE.ring is the upstream overview file; LICENSE.ring-other-bits carries the
- ISC text. Both are installed as /usr/share/doc/voisu/LICENSE.ring and
- /usr/share/doc/voisu/LICENSE.ring-other-bits.
+ ring's license texts ship under their UPSTREAM tree layout so that the
+ cross-references inside ring's own LICENSE manifest resolve. ring/LICENSE is
+ the upstream overview file; ring/LICENSE-other-bits carries the ISC text. Both
+ are installed as /usr/share/doc/voisu/ring/LICENSE and
+ /usr/share/doc/voisu/ring/LICENSE-other-bits.
 
-Files: packaging/deb/LICENSE.ring-BoringSSL
+Files: packaging/deb/ring/LICENSE-BoringSSL
 Copyright: 2015-2016 Google Inc.
  2009 The Go Authors
  2015 The Chromium Authors
@@ -26,7 +28,26 @@ Comment:
  Code sourced into *ring* from BoringSSL is under the Apache-2.0 license, with
  some third-party components under 3-clause BSD notices (The Go Authors and The
  Chromium Authors). The verbatim upstream text is installed as
- /usr/share/doc/voisu/LICENSE.ring-BoringSSL.
+ /usr/share/doc/voisu/ring/LICENSE-BoringSSL.
+
+Files: packaging/deb/ring/src/polyfill/once_cell/LICENSE-APACHE
+ packaging/deb/ring/src/polyfill/once_cell/LICENSE-MIT
+Copyright: The once_cell project authors
+License: Apache-2.0 or MIT
+Comment:
+ *ring* vendors a polyfill sourced from the once_cell project under
+ src/polyfill/once_cell, dual-licensed Apache-2.0 OR MIT. The verbatim upstream
+ texts are installed as
+ /usr/share/doc/voisu/ring/src/polyfill/once_cell/LICENSE-APACHE and
+ /usr/share/doc/voisu/ring/src/polyfill/once_cell/LICENSE-MIT.
+
+Files: packaging/deb/ring/third_party/fiat/LICENSE
+Copyright: 2015-2020 the fiat-crypto authors
+License: Apache-2.0
+Comment:
+ *ring* vendors field-arithmetic code from the fiat-crypto project under
+ third_party/fiat, licensed Apache-2.0. The verbatim upstream text is installed
+ as /usr/share/doc/voisu/ring/third_party/fiat/LICENSE.
 
 License: MIT
  Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -62,8 +83,9 @@ License: ISC
 
 License: Apache-2.0
  On Debian systems the full text of the Apache License 2.0 can be found in
- /usr/share/common-licenses/Apache-2.0, and the verbatim upstream copy sourced
- with *ring* is installed as /usr/share/doc/voisu/LICENSE.ring-BoringSSL.
+ /usr/share/common-licenses/Apache-2.0, and the verbatim upstream copies sourced
+ with *ring* are installed under /usr/share/doc/voisu/ring/ (LICENSE-BoringSSL,
+ src/polyfill/once_cell/LICENSE-APACHE, and third_party/fiat/LICENSE).
 
 License: BSD-3-clause
  Redistribution and use in source and binary forms, with or without
