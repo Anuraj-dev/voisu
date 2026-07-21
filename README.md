@@ -86,6 +86,14 @@ How you pick the Trigger Key depends on your desktop's portal:
   `:voisu-toggle`). Plain wlroots portals do not implement GlobalShortcuts, so
   the Trigger Key cannot bind without `xdg-desktop-portal-hyprland`.
 
+  Type Delivery does not work on Hyprland: its portal implements no
+  RemoteDesktop interface, which is Voisu's only text-injection path. Use the
+  clipboard instead:
+
+  ```sh
+  voisu delivery clipboard
+  ```
+
 Run `voisu doctor` if the Trigger Key does not respond — it reports a portal
 without a usable GlobalShortcuts interface.
 
