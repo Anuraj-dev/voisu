@@ -13,18 +13,40 @@ the packaging docs cover the individual channels:
 ## TL;DR — cut a release
 
 ```sh
-# 1. Land everything on main; bump crate version if this is a new version.
-#    The tag MUST match the voisu-app crate version: tag v0.1.0 <-> version 0.1.0.
+# 1. Land everything on main. The tree version is ALREADY correct — it is
+#    auto-bumped per merged PR (see "Automatic version bumping" below), so the
+#    voisu-app crate version is whatever the last release-worthy merge set it to.
+#    The tag MUST match that version: tag v0.1.0 <-> version 0.1.0.
 #    Releases come ONLY from main: validate fails closed if the tagged commit is
 #    not an ancestor of origin/main.
-# 2. Tag the exact release commit ON MAIN and push the tag.
+# 2. Tag the exact release commit ON MAIN with the tree's current version and push.
 git checkout main && git pull
-git tag v0.1.0
-git push origin v0.1.0
+git tag "v$(grep -m1 -E '^version = ' crates/voisu-app/Cargo.toml | cut -d'"' -f2)"
+git push origin "v$(grep -m1 -E '^version = ' crates/voisu-app/Cargo.toml | cut -d'"' -f2)"
 ```
 
 That is it. The push triggers `release.yml`. Watch the Actions run; nothing publishes
 until the smoke gate is green.
+
+## Automatic version bumping
+
+You no longer bump the version by hand. `.github/workflows/version-bump.yml` runs on
+every push to `main`: it reads the Conventional Commits merged since the last bump and,
+if any are release-worthy, bumps the version (`feat:` → minor, `fix:`/`perf:` → patch,
+a `!`/`BREAKING CHANGE:` → major) across all four synchronized places — both crate
+`Cargo.toml`s, `packaging/voisu.spec` `Version:` + `%changelog`, and `Cargo.lock` — then
+commits `chore(release): bump version to X.Y.Z` back to `main`. **Docs-only merges
+(only `docs:`/`chore:`/`test:`/`ci:`/`style:`/`refactor:`) do not bump.** The tree is
+therefore always tag-ready; cutting a release is just the tag push above. Any manual
+version edit is pointless — it will be overwritten by the next auto-bump. To force a
+bump without a merge (e.g. to promote a pending patch to a minor), run the workflow from
+the Actions UI with the `bump` input. The workflow never tags and never publishes —
+releasing stays the deliberate manual tag push.
+
+A red `Version bump` run is self-healing: if `main` moved between the run's checkout and
+its final push (race-guard skip or a rejected non-fast-forward push), the commits are not
+lost — the next merge to `main` re-classifies everything since the last
+`chore(release):` marker and bumps accordingly. No manual repair needed.
 
 ## Pipeline stages
 

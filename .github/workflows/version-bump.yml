@@ -1,0 +1,319 @@
+name: Version bump
+
+# Pomo-style per-merge version bumping WITHOUT auto-release. Every merge to main
+# that carries release-worthy Conventional Commits automatically bumps the tree
+# version and commits it, so the tree is always tag-ready. Cutting a release
+# stays a deliberate manual `git push origin v<version>` (see
+# packaging/RELEASING.md) — this workflow never tags and never publishes.
+#
+# The version lives in FOUR synchronized places and they move together here:
+#   1. crates/voisu-app/Cargo.toml   version = "X.Y.Z"
+#   2. crates/voisu-core/Cargo.toml  version = "X.Y.Z" (lockstep)
+#   3. packaging/voisu.spec          Version:        X.Y.Z (column-aligned)
+#   4. Cargo.lock                    (regenerated via `cargo update`)
+# plus a prepended packaging/voisu.spec %changelog entry. The release pipeline's
+# validate stage fails closed if the tag name and the tree version disagree, and
+# packaging/rpm-lib.sh:voisu_derive_version() fails if cargo metadata and the
+# spec Version diverge — so this workflow runs that exact check as a sanity gate.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Force a bump type (bypasses Conventional-Commit detection)'
+        type: choice
+        required: true
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+# Only write access to the repository contents (to push the bump commit).
+permissions:
+  contents: read
+
+# Serialize bump runs so two pushes can never interleave their bump+push; the
+# in-job race guard still aborts cleanly if origin/main advanced meanwhile.
+concurrency:
+  group: voisu-version-bump
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bump:
+    name: Auto-bump tree version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    # Loop guard: never bump on the bot's own bump commit. github-actions[bot]
+    # pushes don't retrigger workflows, but this is belt-and-suspenders and also
+    # covers a manual `chore(release):` push. head_commit is null on
+    # workflow_dispatch, where startsWith(null, ...) is false, so dispatch runs.
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      !startsWith(github.event.head_commit.message, 'chore(release):')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Race guard — checked-out commit must still be origin/main HEAD
+        id: race
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --no-tags origin main
+          head=$(git rev-parse HEAD)
+          tip=$(git rev-parse FETCH_HEAD)
+          if [ "$head" != "$tip" ]; then
+            echo "::notice::origin/main tip ($tip) advanced past the checked-out commit ($head); aborting cleanly without a bump"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "checked-out commit $head is still origin/main HEAD"
+
+      - name: Detect bump type and compute the new version
+        id: detect
+        if: steps.race.outputs.skip != 'true'
+        env:
+          # Untrusted / event-controlled values pass through env, never inlined
+          # into the script via ${{ }} (injection hardening). These are SHAs and
+          # a constrained choice input, but the pattern is applied uniformly.
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          DISPATCH_BUMP: ${{ github.event.inputs.bump }}
+        run: |
+          set -euo pipefail
+
+          # Base of the commit range: the last release marker — the last
+          # chore(release): commit or the last v* tag, whichever is newer.
+          # Deliberately NOT github.event.before: if a prior run was skipped by
+          # the race guard, its commits would vanish from a before-anchored
+          # range and under-bump. Anchoring at the marker is self-healing —
+          # every commit since the last bump is always (re)classified.
+          pick_base() {
+            local a b
+            a=$(git log --grep='^chore(release):' --format='%H' -n 1 2>/dev/null || true)
+            b=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+            [ -n "$b" ] && b=$(git rev-parse "${b}^{commit}" 2>/dev/null || true)
+            if [ -n "$a" ] && [ -n "$b" ]; then
+              # a ancestor of b => b is newer; prefer the newer (tighter) base.
+              if git merge-base --is-ancestor "$a" "$b" 2>/dev/null; then
+                printf '%s' "$b"
+              else
+                printf '%s' "$a"
+              fi
+            else
+              printf '%s' "${a:-$b}"
+            fi
+          }
+
+          base="$(pick_base)"
+          if [ -n "$base" ]; then
+            rng="${base}..${SHA}"
+          elif git rev-parse -q --verify "${SHA}^" >/dev/null 2>&1; then
+            # No release marker anywhere in history: classify only the pushed
+            # head commit — never walk the entire history.
+            rng="${SHA}^..${SHA}"
+          else
+            rng="$SHA"
+          fi
+
+          # level: 0 none, 1 patch, 2 minor, 3 major.
+          level=0
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            case "${DISPATCH_BUMP:-}" in
+              major) level=3 ;;
+              minor) level=2 ;;
+              patch) level=1 ;;
+              *) echo "invalid workflow_dispatch bump input '${DISPATCH_BUMP:-}'" >&2; exit 1 ;;
+            esac
+            echo "workflow_dispatch: forcing bump=${DISPATCH_BUMP}"
+          else
+            # A BREAKING CHANGE: footer anywhere in the range is a major bump.
+            if git log --format='%B' "$rng" | grep -qE '^BREAKING[ -]CHANGE(\(.*\))?:'; then
+              level=3
+            fi
+            # Classify each commit subject by its Conventional Commit type.
+            while IFS= read -r s; do
+              [ -n "$s" ] || continue
+              if printf '%s' "$s" | grep -qE '^[a-z]+(\([^)]+\))?!:'; then
+                l=3                       # type! => breaking => major
+              elif printf '%s' "$s" | grep -qE '^feat(\([^)]+\))?:'; then
+                l=2                       # feat => minor
+              elif printf '%s' "$s" | grep -qE '^(fix|perf)(\([^)]+\))?:'; then
+                l=1                       # fix/perf => patch
+              else
+                l=0                       # docs/chore/test/ci/style/refactor/merges => none
+              fi
+              [ "$l" -gt "$level" ] && level=$l
+            done < <(git log --format='%s' "$rng")
+          fi
+
+          if [ "$level" -eq 0 ]; then
+            echo "no release-worthy commits in ${rng} (only docs/chore/test/ci/style/refactor); skipping version bump"
+            echo "bump_type=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          case "$level" in
+            3) bump=major ;;
+            2) bump=minor ;;
+            1) bump=patch ;;
+          esac
+
+          cur=$(grep -m1 -E '^version = "[0-9]+\.[0-9]+\.[0-9]+"' crates/voisu-app/Cargo.toml \
+                | sed -E 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)".*/\1/')
+          if ! printf '%s' "$cur" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "could not read a clean semver from crates/voisu-app/Cargo.toml (got '$cur')" >&2
+            exit 1
+          fi
+          IFS=. read -r MA MI PA <<< "$cur"
+          case "$bump" in
+            major) MA=$((MA + 1)); MI=0; PA=0 ;;
+            minor) MI=$((MI + 1)); PA=0 ;;
+            patch) PA=$((PA + 1)) ;;
+          esac
+          new="${MA}.${MI}.${PA}"
+          echo "bump=${bump}: ${cur} -> ${new} (range ${rng})"
+          {
+            echo "bump_type=${bump}"
+            echo "new_version=${new}"
+            echo "range_base=${base}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Rewrite all four version locations and prepend the changelog
+        id: apply
+        if: steps.detect.outputs.bump_type != ''
+        env:
+          NEW_VERSION: ${{ steps.detect.outputs.new_version }}
+          RANGE_BASE: ${{ steps.detect.outputs.range_base }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # 1 + 2: the two workspace crate versions (package version starts at
+          # column 0; dependency `version = "..."` specs are indented, untouched).
+          sed -i -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$NEW_VERSION"'"/' \
+            crates/voisu-app/Cargo.toml
+          sed -i -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$NEW_VERSION"'"/' \
+            crates/voisu-core/Cargo.toml
+
+          # 3: spec Version. \1 captures "Version:" plus its exact run of spaces,
+          # so the value column stays aligned regardless of digit count.
+          sed -i -E 's/^(Version:[[:space:]]+)[0-9]+\.[0-9]+\.[0-9]+/\1'"$NEW_VERSION"'/' \
+            packaging/voisu.spec
+
+          # Prepend a %changelog entry whose bullets are the merged commits'
+          # subjects. Subjects are read via `git log` INSIDE the shell (never via
+          # ${{ }}), then sanitized: strip a leading bullet dash and cap length.
+          if [ -n "${RANGE_BASE:-}" ]; then
+            rng="${RANGE_BASE}..${SHA}"
+          elif git rev-parse -q --verify "${SHA}^" >/dev/null 2>&1; then
+            rng="${SHA}^..${SHA}"
+          else
+            rng="$SHA"
+          fi
+          subjects="$RUNNER_TEMP/subjects.txt"
+          entry="$RUNNER_TEMP/changelog_entry.txt"
+          git log --no-merges --format='%s' "$rng" > "$subjects" || true
+
+          {
+            printf '* %s Voisu maintainers <voisu@example.invalid> - %s-1\n' \
+              "$(date -u '+%a %b %d %Y')" "$NEW_VERSION"
+            n=0
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              # strip a leading "- " so a subject that is itself a bullet does
+              # not double up; escape % as %% (rpm macro-expands % in
+              # %changelog at build time); single line; cap to 100 chars.
+              line=$(printf '%s' "$line" | sed -E 's/^-[[:space:]]*//; s/%/%%/g' | tr -d '\r')
+              line=${line:0:100}
+              printf -- '- %s\n' "$line"
+              n=$((n + 1))
+              [ "$n" -ge 20 ] && break
+            done < "$subjects"
+            if [ "$n" -eq 0 ]; then
+              printf -- '- Maintenance release.\n'
+            fi
+          } > "$entry"
+
+          echo "== new changelog entry =="
+          cat "$entry"
+
+          cl=$(grep -n '^%changelog' packaging/voisu.spec | head -n1 | cut -d: -f1)
+          if [ -z "$cl" ]; then
+            echo "packaging/voisu.spec has no %changelog section" >&2
+            exit 1
+          fi
+          {
+            head -n "$cl" packaging/voisu.spec
+            cat "$entry"
+            printf '\n'
+            tail -n +"$((cl + 1))" packaging/voisu.spec
+          } > packaging/voisu.spec.new
+          mv packaging/voisu.spec.new packaging/voisu.spec
+
+          # 4: regenerate the two workspace crates' Cargo.lock version entries.
+          # No --offline: a fresh runner has no crates.io index and offline
+          # resolution exits 101 there (reproduced in review); the runner has
+          # network and only the two path-local workspace crates move.
+          cargo update -p voisu-app -p voisu-core
+
+      - name: Diff whitelist — only the four version files may have changed
+        if: steps.detect.outputs.bump_type != ''
+        run: |
+          set -euo pipefail
+          allowed=$'crates/voisu-app/Cargo.toml\ncrates/voisu-core/Cargo.toml\nCargo.lock\npackaging/voisu.spec'
+          bad=0
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if ! printf '%s\n' "$allowed" | grep -qxF "$f"; then
+              echo "refusing: unexpected change outside the version whitelist: $f" >&2
+              bad=1
+            fi
+          done < <(git diff --name-only)
+          if [ "$bad" -ne 0 ]; then
+            echo "aborting: the bump touched files it must not" >&2
+            git diff --name-only >&2
+            exit 1
+          fi
+          echo "diff whitelist OK:"
+          git diff --name-only
+
+      - name: Sanity gate — cargo metadata and spec Version agree on the new version
+        if: steps.detect.outputs.bump_type != ''
+        env:
+          NEW_VERSION: ${{ steps.detect.outputs.new_version }}
+        run: |
+          set -euo pipefail
+          # Same check the release pipeline runs; proves cargo<->spec sync.
+          got=$(bash -c 'source packaging/rpm-lib.sh && voisu_derive_version .')
+          if [ "$got" != "$NEW_VERSION" ]; then
+            echo "sanity gate FAILED: voisu_derive_version echoed '$got', expected '$NEW_VERSION'" >&2
+            exit 1
+          fi
+          echo "sanity gate OK: derived version is $got"
+
+      - name: Commit and push the bump
+        if: steps.detect.outputs.bump_type != ''
+        env:
+          NEW_VERSION: ${{ steps.detect.outputs.new_version }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add crates/voisu-app/Cargo.toml crates/voisu-core/Cargo.toml \
+                  Cargo.lock packaging/voisu.spec
+          git commit -m "chore(release): bump version to ${NEW_VERSION}"
+          # No tag — tags stay manual and deliberate. A plain push to main; the
+          # bot's push does not retrigger this workflow.
+          git push origin HEAD:main
+          echo "pushed chore(release): bump version to ${NEW_VERSION}"
