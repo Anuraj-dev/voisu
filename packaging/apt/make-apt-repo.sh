@@ -66,6 +66,8 @@ set -euo pipefail
 usage() {
     printf 'usage: VOISU_APT_GPG_KEY=<keyid> %s <repo_dir> <deb> [<deb>...]\n' \
         "$(basename "$0")" >&2
+    printf '       VOISU_APT_GPG_KEY=<keyid> %s --refresh <repo_dir>\n' \
+        "$(basename "$0")" >&2
 }
 
 # The Voisu package-signing key (public fingerprint; safe to embed).
@@ -131,13 +133,36 @@ if ! printf '%s' "$valid_days" | grep -Eq '^[1-9][0-9]*$'; then
 fi
 
 # --- argument parsing ------------------------------------------------------
-if test "$#" -lt 2; then
-    usage
-    exit 1
+# Two modes:
+#   publish:  <repo_dir> <deb>...   add/republish one or more new debs.
+#   refresh:  --refresh <repo_dir>  re-index + re-sign the EXISTING pool with a
+#             fresh Valid-Until and NO new debs. The scheduled apt-refresh
+#             workflow (ticket 14) uses this so the signed Release never expires
+#             between real releases. It adds nothing, prunes nothing and touches
+#             no pool bytes -- only the metadata is regenerated and re-signed,
+#             honouring the published-bytes-immutability invariant.
+refresh=0
+if test "${1:-}" = --refresh; then
+    refresh=1
+    shift
 fi
-repo_dir=$1
-shift
-debs=("$@")
+if test "$refresh" -eq 1; then
+    if test "$#" -ne 1; then
+        usage
+        exit 1
+    fi
+    repo_dir=$1
+    shift
+    debs=()
+else
+    if test "$#" -lt 2; then
+        usage
+        exit 1
+    fi
+    repo_dir=$1
+    shift
+    debs=("$@")
+fi
 
 # --- tool checks (fail closed) ---------------------------------------------
 for tool in apt-ftparchive gpg gzip dpkg-deb dpkg sha256sum stat flock date awk; do
@@ -372,6 +397,11 @@ shopt -u nullglob
 # a failed publish never leaves the still-live index pointing at a deleted .deb.
 declare -a keep_names=() prune_paths=()
 pool_n=${#pool_paths[@]}
+# Refresh mode retains and indexes the ENTIRE existing pool: it publishes nothing
+# and must prune nothing, so the metadata refresh never deletes a published .deb.
+if test "$refresh" -eq 1; then
+    keep=$pool_n
+fi
 sort_idx=()
 for ((i=0; i<pool_n; i++)); do sort_idx+=("$i"); done
 for ((x=0; x<pool_n-1; x++)); do
@@ -542,8 +572,13 @@ for p in "${prune_paths[@]}"; do
 done
 trap - EXIT
 
-printf 'published %d package(s) to %s (keep=%d, valid %d days)\n' \
-    "${#debs[@]}" "$repo_dir" "$keep" "$valid_days"
+if test "$refresh" -eq 1; then
+    printf 'refreshed metadata for %s (re-signed, valid %d days; %d pool package(s) retained)\n' \
+        "$repo_dir" "$valid_days" "$pool_n"
+else
+    printf 'published %d package(s) to %s (keep=%d, valid %d days)\n' \
+        "${#debs[@]}" "$repo_dir" "$keep" "$valid_days"
+fi
 printf 'signed with key %s: %s\n' "$gpg_key" "$dist_rel/{InRelease,Release,Release.gpg}"
 printf 'pool now contains:\n'
 ls -1 "$repo_dir/$pool_rel"

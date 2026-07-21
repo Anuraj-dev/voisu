@@ -1,0 +1,317 @@
+name: Release
+
+# Ticket 14 (GH issue #46). On a strict v<major>.<minor>.<patch> tag push:
+#
+#   validate -> build -> smoke (fedora/ubuntu/arch) -> publish
+#
+# Publishing (apt repo, AUR, GitHub Release) is BLOCKED on the smoke gate: the
+# artifacts are installed through each distro's REAL package-manager path before
+# any live channel is touched. COPR needs nothing here -- its webhook self-
+# triggers on the tag via .github/workflows/copr-trigger.yml.
+#
+# The full flow, secret inventory, failure modes and respin steps are documented
+# in packaging/RELEASING.md.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Least privilege by default (read is enough to checkout); the publish jobs opt
+# into contents: write explicitly.
+permissions:
+  contents: read
+
+jobs:
+  # --- fail closed on anything that is not a strict release tag --------------
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ github.event.deleted == false }}
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Enforce strict v<semver> tag
+        id: check
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Mirror copr-trigger.yml's validation, but FAIL (not no-op) on a
+          # malformed tag so a bad tag can never slip into a publish.
+          if ! printf '%s' "$TAG_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "refusing: tag '$TAG_NAME' is not a strict v<major>.<minor>.<patch> release tag" >&2
+            exit 1
+          fi
+          echo "version=${TAG_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "release tag $TAG_NAME accepted (version ${TAG_NAME#v})"
+
+  # --- build the release .deb + binaries + AUR binary tarball ----------------
+  build:
+    name: Build release artifacts (Ubuntu 26.04)
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # cargo-deb's $auto deps come from dpkg-shlibdeps, which must run on the
+    # target distro; GitHub's ubuntu-latest is 24.04, so build inside 26.04.
+    container:
+      image: ubuntu:26.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Provision Ubuntu 26.04 build toolchain
+        run: |
+          set -euo pipefail
+          sed -i 's/^\(Components: .*\)$/\1 universe multiverse/' /etc/apt/sources.list.d/ubuntu.sources
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config \
+            libgtk-4-dev libgtk4-layer-shell-dev libxkbcommon-dev \
+            dpkg-dev apt-utils gnupg xz-utils
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          . "$HOME/.cargo/env"
+          cargo install cargo-deb --version 3.7.0 --locked
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Build .deb, release binaries and the AUR binary tarball
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          # First tagged build of a version is Debian revision 1; bump on respin.
+          VOISU_DEB_RELEASE: '1'
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # build-deb.sh enforces HEAD == tag; assert the tag is present too.
+          git rev-parse "refs/tags/v${VERSION}^{commit}" >/dev/null
+
+          # 1. release .deb (Debian version <base>-1) built on Ubuntu 26.04.
+          packaging/build-deb.sh
+          deb=$(ls dist/deb/voisu_*_amd64.deb)
+          echo "built $deb"
+
+          # 2. AUR voisu-bin release tarball, per that PKGBUILD's contract. The
+          #    binaries were just produced by build-deb.sh (workspace + overlay).
+          stage=$(mktemp -d)
+          troot="$stage/voisu-${VERSION}-x86_64"
+          mkdir -p "$troot/ring/src/polyfill/once_cell" "$troot/ring/third_party/fiat"
+          install -m755 target/release/voisu         "$troot/voisu"
+          install -m755 target/release/voisu-daemon  "$troot/voisu-daemon"
+          install -m755 target/release/voisu-overlay "$troot/voisu-overlay"
+          strip "$troot/voisu" "$troot/voisu-daemon" "$troot/voisu-overlay"
+          install -m644 packaging/voisu.service         "$troot/voisu.service"
+          install -m644 packaging/voisu-overlay.service "$troot/voisu-overlay.service"
+          install -m644 LICENSE                         "$troot/LICENSE"
+          install -m644 packaging/aur/voisu/LICENSE.ring            "$troot/ring/LICENSE"
+          install -m644 packaging/aur/voisu/LICENSE.ring-BoringSSL  "$troot/ring/LICENSE-BoringSSL"
+          install -m644 packaging/aur/voisu/LICENSE.ring-other-bits "$troot/ring/LICENSE-other-bits"
+          install -m644 packaging/aur/voisu/LICENSE.ring-once_cell-APACHE "$troot/ring/src/polyfill/once_cell/LICENSE-APACHE"
+          install -m644 packaging/aur/voisu/LICENSE.ring-once_cell-MIT    "$troot/ring/src/polyfill/once_cell/LICENSE-MIT"
+          install -m644 packaging/aur/voisu/LICENSE.ring-fiat            "$troot/ring/third_party/fiat/LICENSE"
+          # Deterministic archive (sorted, pinned owner/mtime) for a stable sha256.
+          tar --numeric-owner --owner=0 --group=0 --sort=name \
+              --mtime="@$(git show -s --format=%ct HEAD)" \
+              -C "$stage" -czf "voisu-${VERSION}-x86_64.tar.gz" "voisu-${VERSION}-x86_64"
+
+          # 3. collect artifacts + checksums.
+          mkdir -p dist/release
+          cp "$deb" dist/release/
+          mv "voisu-${VERSION}-x86_64.tar.gz" dist/release/
+          ( cd dist/release && sha256sum voisu_*_amd64.deb voisu-*-x86_64.tar.gz > SHA256SUMS )
+          echo "== release artifacts ==" && cat dist/release/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/release/
+          if-no-files-found: error
+          retention-days: 7
+
+  # --- install-smoke gate: publishing blocks on this ------------------------
+  smoke:
+    name: Install-smoke (${{ matrix.distro }})
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: ubuntu
+            image: ubuntu:26.04
+          - distro: fedora
+            image: fedora:latest
+          - distro: arch
+            image: archlinux
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Bootstrap git for checkout
+        run: |
+          set -eu
+          case "${{ matrix.distro }}" in
+            ubuntu) apt-get update && apt-get install -y --no-install-recommends git ca-certificates ;;
+            fedora) dnf -y install git ca-certificates ;;
+            arch)   pacman -Sy --noconfirm git ca-certificates ;;
+          esac
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/release
+      - name: Run the distro install-smoke
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.distro }}" in
+            ubuntu) bash packaging/ci/smoke-ubuntu.sh "$(ls dist/release/voisu_*_amd64.deb)" ;;
+            fedora) bash packaging/ci/smoke-fedora.sh ;;
+            arch)   bash packaging/ci/smoke-arch.sh "$VERSION" ;;
+          esac
+
+  # --- publish: apt repo -> gh-pages ----------------------------------------
+  publish-apt:
+    name: Publish apt repo (gh-pages)
+    needs: [validate, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    # Serialize every gh-pages write across release + apt-refresh so two runs
+    # never interleave on the branch.
+    concurrency:
+      group: voisu-gh-pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/release
+      - name: Install publisher tooling
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends apt-utils gnupg dpkg-dev coreutils util-linux gzip
+      - name: Publish signed apt repo into the gh-pages worktree
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME=$(mktemp -d); chmod 700 "$GNUPGHOME"
+          # Import the private signing key without exposing it on argv.
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          passfile=$(mktemp); printf '%s' "$GPG_PASSPHRASE" > "$passfile"
+          deb=$(ls "$GITHUB_WORKSPACE"/dist/release/voisu_*_amd64.deb)
+          VOISU_APT_GPG_KEY=4149EE3868B36B6007592966D08BCFDC34125B28 \
+          VOISU_APT_GPG_PASSPHRASE_FILE="$passfile" \
+            packaging/apt/make-apt-repo.sh "$GITHUB_WORKSPACE/gh-pages" "$deb"
+          rm -f "$passfile"
+      - name: Commit and push gh-pages
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/gh-pages"
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no apt metadata changes to push"; exit 0
+          fi
+          git commit -m "apt: publish ${VERSION}"
+          git push origin gh-pages
+
+  # --- publish: GitHub Release with assets -----------------------------------
+  publish-release:
+    name: Publish GitHub Release
+    needs: [validate, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/release
+      - name: Create the Release and attach assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd dist/release
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --generate-notes \
+            voisu_*_amd64.deb voisu-*-x86_64.tar.gz SHA256SUMS
+
+  # --- publish: AUR voisu + voisu-bin ----------------------------------------
+  # Runs AFTER the Release exists so voisu-bin's source asset URL resolves for
+  # anyone who installs immediately.
+  publish-aur:
+    name: Publish AUR packages
+    needs: [validate, smoke, publish-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: archlinux
+    steps:
+      - name: Provision AUR tooling
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed base-devel git openssh pacman-contrib
+          useradd -m builder 2>/dev/null || true
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/release
+      - name: Configure the AUR SSH deploy key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 /home/builder/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > /home/builder/.ssh/id_ed25519
+          chmod 600 /home/builder/.ssh/id_ed25519
+          # Pin AUR's host key by its PUBLISHED ed25519 fingerprint instead of
+          # blind TOFU: fail closed if ssh-keyscan returns anything else.
+          ssh-keyscan -t ed25519 aur.archlinux.org > /home/builder/.ssh/known_hosts 2>/dev/null
+          got=$(ssh-keygen -lf /home/builder/.ssh/known_hosts | awk '{print $2}')
+          exp='SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4'
+          if [ "$got" != "$exp" ]; then
+            echo "AUR host-key fingerprint mismatch: got $got, expected $exp" >&2
+            exit 1
+          fi
+          cat > /home/builder/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            User aur
+            IdentityFile ~/.ssh/id_ed25519
+            IdentitiesOnly yes
+          EOF
+          chown -R builder:builder /home/builder/.ssh
+      - name: Push AUR voisu + voisu-bin
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          tb=$(ls "$GITHUB_WORKSPACE"/dist/release/voisu-*-x86_64.tar.gz)
+          su - builder -c "export HOME=/home/builder && git config --global --add safe.directory '$GITHUB_WORKSPACE' && '$GITHUB_WORKSPACE/packaging/ci/aur-publish.sh' '$VERSION' '$GITHUB_WORKSPACE' '$tb'"
