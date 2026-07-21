@@ -239,7 +239,9 @@
         <div class="code">
           <button class="copy" type="button">copy</button>
 <pre><span class="p">$ </span>sudo dnf copr enable anuraj-dev/voisu
-<span class="p">$ </span>sudo dnf install voisu</pre>
+<span class="p">$ </span>sudo dnf install voisu
+<span class="c"># optional on-screen overlay:</span>
+<span class="p">$ </span>sudo dnf install voisu-overlay</pre>
         </div>
       </div>
 
@@ -291,7 +293,8 @@
     <div class="code">
       <button class="copy" type="button">copy</button>
 <pre><span class="p">$ </span>systemctl --user enable --now voisu.service
-<span class="c"># optional on-screen overlay:</span>
+<span class="p">$ </span>voisu setup
+<span class="c"># optional on-screen overlay (Fedora: install voisu-overlay first):</span>
 <span class="p">$ </span>systemctl --user enable --now voisu-overlay.service</pre>
     </div>
   </section>
