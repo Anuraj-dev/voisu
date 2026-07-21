@@ -9,6 +9,7 @@
 | conventions.md | Stack, run/test commands, naming (ubiquitous language) |
 | packaging-fedora.md | Exact Fedora RPM build, install, upgrade, removal, and smoke procedure |
 | ../packaging/RELEASING.md | Release-pipeline operator runbook: tag → CI stages → channels, secrets, respins |
+| (gh-pages) index.html | Public landing page at anuraj-dev.github.io/voisu — distro-tab install commands; keep minimal per Raja's bar |
 | specs/2026-07-20-overlay-audio-waveform.md | Approved (unimplemented) spec: live bar meter in the Overlay during Recording |
 | release-evidence.md | Ticket 13 evidence matrix: proven tests and host-pending checks |
 | model-benchmark.md | Standing experiment: per-dispatch log comparing codex models (Sol/Terra/Luna) vs Opus as coder/reviewer agents |

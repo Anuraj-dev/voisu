@@ -582,3 +582,38 @@ flattened ring's tree and three files named LICENSE collided, with fiat's Apache
 voisu's own MIT license while rpmbuild exited 0 (reviewer-reproduced). The directory form preserves the
 upstream tree so ring's LICENSE-manifest cross-references resolve. Rejected: %install-staged absolute
 %license paths (more moving parts for the same payload).
+
+## 2026-07-21 — Canonical release URL is anuraj-dev.github.io/voisu (no custom domain)
+**Why:** raja-dev.me is Raja's Vercel-hosted portfolio; a stale GitHub custom-domain claim on the old
+user-site repo was redirecting ALL project pages into Vercel 404s. Raja rejected both raja-dev.me/voisu
+(would bake a domain-renewal dependency into users' sources.list) and a voisu.raja-dev.me CNAME (setup
+for one page not worth it). Cleared the stale claim instead; github.io is durable and needs nothing.
+
+## 2026-07-21 — AUR package repos carry metadata only; publish script strips tarballs
+**Why:** AUR's pre-receive hook hard-rejects blobs >488.28KiB and the updpkgsums-downloaded source
+tarball was being committed (killed the v0.1.0 publish-aur job). Sources belong in source=() URLs.
+Alternative rejected: committing small tarballs "when they fit" — nondeterministic and against AUR norms.
+
+## 2026-07-21 — Deflake policy: root-cause + bounded polling; zombies count as terminated
+**Why:** three release attempts were eaten by timing-sensitive tests. Fixes must name the interleaving
+(taskset -c 0 + CPU-hog repro), replace tight ceilings with generous bounded polls that keep fast-fail
+paths, and never blanket-sleep or #[ignore]. GH job containers have a non-reaping PID 1, so /proc
+existence ≠ alive: state Z is terminated (daemon PDEATHSIG verified correct in podman before loosening
+any assertion). Post-publish, test-only fixes never retag — published bytes are immutable.
+
+## 2026-07-21 — GlobalShortcuts session token is a CONSTANT ("voisu_session"), never per-process
+**Why:** xdg-desktop-portal-kde persists a kglobalaccel component named after the session_handle_token
+when it can't resolve an app_id; a PID-suffixed token presented a new identity every daemon start →
+Trigger Key re-prompt per restart + unbounded kglobalshortcutsrc leak. Spec only requires uniqueness
+among concurrently active sessions and the daemon binds at most one per run. Rejected alternatives:
+KGlobalAccel direct D-Bus (KDE-only), auto-pruning the user's config (never rewrite live user config —
+cleanup is documented, manual). Also ship packaging/voisu.desktop on all channels so a resolvable
+app_id exists where backends support it. Regression test pins the invariant (PR #76).
+
+## 2026-07-21 — Per-user dirs are provisioned by systemd at service start, never at package install
+**Why:** packages install as root into system paths and cannot create ~/.config/voisu for every present
+and future user; ReadWritePaths= on a missing dir under ProtectSystem=strict kills the unit pre-exec
+(226/NAMESPACE — live fresh-Arch failure). ConfigurationDirectory/StateDirectory make systemd create
+the exact dirs config_dir()/state_root() resolve to BEFORE sandbox setup, for every user, on every
+distro, from the one shared unit file. Rejected: documenting a manual mkdir (band-aid over our bug);
+install-time creation (wrong layer). PR #77; smoke legs guard the directive shape.
