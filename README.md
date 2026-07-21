@@ -58,7 +58,8 @@ Enable it for your user:
 
 ```sh
 systemctl --user enable --now voisu.service
-# optional on-screen Overlay:
+voisu setup   # guided wizard: validate and store your provider keys
+# optional on-screen Overlay (on Fedora, install voisu-overlay first):
 systemctl --user enable --now voisu-overlay.service
 ```
 
