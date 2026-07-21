@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Voisu — dictation for Linux</title>
+<meta name="description" content="Voisu is dictation for Linux: press a key, speak, and your words land in the app you're using. Install on Fedora, Arch, or Debian/Ubuntu with one command.">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d0f12'/%3E%3Cg fill='none' stroke='%23f0b429' stroke-width='2.4' stroke-linecap='round'%3E%3Cline x1='8' y1='16' x2='8' y2='16.2'/%3E%3Cline x1='12' y1='12' x2='12' y2='20'/%3E%3Cline x1='16' y1='7' x2='16' y2='25'/%3E%3Cline x1='20' y1='11' x2='20' y2='21'/%3E%3Cline x1='24' y1='14' x2='24' y2='18'/%3E%3C/g%3E%3C/svg%3E">
+
+<style>
+  /* Voisu landing page — self-contained: no external requests, system fonts, dark/light aware. */
+  :root {
+    --mono: ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Code",
+            "Fira Code", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+            Arial, sans-serif;
+
+    --bg:        #0d0f12;
+    --bg-soft:   #14171c;
+    --panel:     #16191f;
+    --panel-2:   #1b1f26;
+    --line:      #262b33;
+    --line-soft: #1f242b;
+    --ink:       #e9e7e1;
+    --ink-dim:   #a7adb6;
+    --ink-faint: #767d87;
+    --amber:     #f0b429;
+    --amber-dim: #c99320;
+    --prompt:    #e0a458;
+    --sel:       rgba(240,180,41,0.22);
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg:        #f7f4ee;
+      --bg-soft:   #efeae1;
+      --panel:     #fffdf8;
+      --panel-2:   #f2ede3;
+      --line:      #ddd6c8;
+      --line-soft: #e6e0d4;
+      --ink:       #1b1d21;
+      --ink-dim:   #55595f;
+      --ink-faint: #82868d;
+      --amber:     #8a5500;
+      --amber-dim: #6f4600;
+      --prompt:    #9a5b00;
+      --sel:       rgba(138,85,0,0.16);
+    }
+  }
+  :root[data-theme="dark"]  { color-scheme: dark; }
+  :root[data-theme="light"] { color-scheme: light; }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    background-image:
+      radial-gradient(110% 70% at 50% -12%, rgba(240,180,41,0.07), transparent 62%);
+    background-attachment: fixed;
+  }
+  ::selection { background: var(--sel); }
+  a { color: inherit; }
+
+  .wrap { max-width: 680px; margin: 0 auto; padding: 0 22px; }
+
+  /* ---- hero ---- */
+  .hero { padding: 76px 0 30px; }
+  .wordmark {
+    font-family: var(--mono); font-weight: 700; font-size: 1.05rem;
+    letter-spacing: .02em; display: inline-flex; align-items: center; gap: 9px;
+    text-decoration: none; color: var(--ink);
+  }
+  .wordmark .dot {
+    width: 9px; height: 9px; border-radius: 50%; background: var(--amber);
+    box-shadow: 0 0 0 0 var(--amber); animation: pulse 2.6s ease-out infinite;
+  }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(240,180,41,0.5); }
+    70%  { box-shadow: 0 0 0 7px rgba(240,180,41,0); }
+    100% { box-shadow: 0 0 0 0 rgba(240,180,41,0); }
+  }
+  @media (prefers-reduced-motion: reduce) { .wordmark .dot { animation: none; } }
+
+  h1 {
+    font-family: var(--mono); font-weight: 700;
+    font-size: clamp(1.7rem, 5.4vw, 2.5rem);
+    line-height: 1.16; letter-spacing: -0.018em;
+    margin: 30px 0 0; max-width: 18ch;
+  }
+  h1 .amber { color: var(--amber); }
+  .promise {
+    font-family: var(--mono); font-size: .9rem; letter-spacing: .04em;
+    color: var(--ink-faint); margin: 16px 0 0;
+  }
+  .promise b { color: var(--amber); font-weight: 700; }
+
+  /* ---- install ---- */
+  .install { padding: 48px 0 8px; }
+  .seg-radio {
+    position: absolute; opacity: 0; width: 1px; height: 1px;
+    pointer-events: none; margin: 0;
+  }
+  .seg {
+    display: flex; gap: 4px; padding: 4px;
+    border: 1px solid var(--line); border-radius: 11px;
+    background: var(--panel); margin-bottom: 18px;
+  }
+  .seg label {
+    flex: 1; text-align: center; cursor: pointer;
+    font-family: var(--mono); font-size: .84rem; font-weight: 600;
+    color: var(--ink-dim); padding: 9px 6px; border-radius: 8px;
+    border: 1px solid transparent; user-select: none;
+    transition: color .12s, background .12s;
+  }
+  .seg label:hover { color: var(--ink); }
+  #t-fedora:checked ~ .seg label[for="t-fedora"],
+  #t-arch:checked   ~ .seg label[for="t-arch"],
+  #t-debian:checked ~ .seg label[for="t-debian"] {
+    color: var(--bg); background: var(--amber);
+    border-color: var(--amber);
+  }
+  #t-fedora:focus-visible ~ .seg label[for="t-fedora"],
+  #t-arch:focus-visible   ~ .seg label[for="t-arch"],
+  #t-debian:focus-visible ~ .seg label[for="t-debian"] {
+    outline: 2px solid var(--amber); outline-offset: 2px;
+  }
+
+  /* Panels: all visible if CSS fails; otherwise only the checked one shows. */
+  #t-fedora:checked ~ .panels .panel[data-d="fedora"],
+  #t-arch:checked   ~ .panels .panel[data-d="arch"],
+  #t-debian:checked ~ .panels .panel[data-d="debian"] { display: block; }
+  .css-tabs .panel { display: none; }
+
+  .meta {
+    font-family: var(--mono); font-size: .78rem; color: var(--ink-faint);
+    margin: 0 0 12px;
+  }
+
+  /* ---- code blocks ---- */
+  .code {
+    position: relative;
+    border: 1px solid var(--line); border-radius: 10px;
+    background: var(--bg-soft); margin: 0 0 12px;
+  }
+  .code pre {
+    margin: 0; padding: 14px 52px 14px 16px; overflow-x: auto;
+    font-family: var(--mono); font-size: .84rem; line-height: 1.8;
+    color: var(--ink); tab-size: 2;
+  }
+  .code pre .c { color: var(--ink-faint); }
+  .code pre .p { color: var(--prompt); user-select: none; }
+  .code .copy {
+    position: absolute; top: 8px; right: 8px;
+    font-family: var(--mono); font-size: .72rem; color: var(--ink-dim);
+    background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 9px; cursor: pointer; line-height: 1;
+  }
+  .code .copy:hover { color: var(--ink); border-color: var(--ink-faint); }
+  .code .copy.ok { color: var(--amber); border-color: var(--amber); }
+
+  .alt {
+    font-family: var(--mono); font-size: .8rem; color: var(--ink-faint);
+    margin: 0 0 4px;
+  }
+  .alt code { color: var(--ink-dim); }
+
+  details {
+    border: 1px solid var(--line-soft); border-radius: 9px;
+    background: var(--panel); padding: 0 14px; margin: 4px 0 0;
+  }
+  details > summary {
+    cursor: pointer; list-style: none; padding: 11px 2px;
+    font-family: var(--mono); font-size: .8rem; color: var(--ink-dim);
+  }
+  details > summary::-webkit-details-marker { display: none; }
+  details > summary::before { content: "› "; color: var(--amber); }
+  details[open] > summary::before { content: "⌄ "; }
+  details[open] > summary { color: var(--ink); }
+  details .code { margin: 4px 0 14px; }
+
+  .fp {
+    font-family: var(--mono); font-size: .76rem; color: var(--ink-faint);
+    line-height: 1.7; margin: 14px 0 0; word-break: break-word;
+  }
+  .fp b { color: var(--ink-dim); font-weight: 600; letter-spacing: .02em; }
+
+  /* ---- after install ---- */
+  .after { padding: 40px 0 0; }
+  .after p {
+    font-family: var(--mono); font-size: .84rem; color: var(--ink-dim);
+    margin: 0 0 12px;
+  }
+
+  /* ---- footer ---- */
+  footer {
+    border-top: 1px solid var(--line); margin-top: 56px;
+    padding: 26px 0 46px; color: var(--ink-faint);
+    font-family: var(--mono); font-size: .78rem;
+  }
+  footer .f-row {
+    display: flex; flex-wrap: wrap; gap: 6px 20px; align-items: center;
+  }
+  footer a { color: var(--ink-dim); text-decoration: none; }
+  footer a:hover { color: var(--ink); }
+  footer .fp-foot { flex-basis: 100%; margin-top: 10px; word-break: break-word; }
+</style>
+</head>
+<body>
+
+<main class="wrap">
+
+  <section class="hero">
+    <a class="wordmark" href="https://github.com/Anuraj-Dev/voisu"><span class="dot"></span>voisu</a>
+    <h1>Press a key, speak, and your words land in the <span class="amber">app you're using</span>.</h1>
+    <p class="promise"><b>Press. Speak. Inserted.</b> — dictation for Linux.</p>
+  </section>
+
+  <section class="install css-tabs">
+    <input class="seg-radio" type="radio" name="distro" id="t-fedora" checked>
+    <input class="seg-radio" type="radio" name="distro" id="t-arch">
+    <input class="seg-radio" type="radio" name="distro" id="t-debian">
+
+    <div class="seg" role="tablist" aria-label="Choose your distribution">
+      <label for="t-fedora">Fedora</label>
+      <label for="t-arch">Arch</label>
+      <label for="t-debian">Debian / Ubuntu</label>
+    </div>
+
+    <div class="panels">
+      <!-- Fedora -->
+      <div class="panel" data-d="fedora">
+        <div class="code">
+          <button class="copy" type="button">copy</button>
+<pre><span class="p">$ </span>sudo dnf copr enable anuraj-dev/voisu
+<span class="p">$ </span>sudo dnf install voisu</pre>
+        </div>
+      </div>
+
+      <!-- Arch -->
+      <div class="panel" data-d="arch">
+        <div class="code">
+          <button class="copy" type="button">copy</button>
+<pre><span class="p">$ </span>yay -S voisu-bin</pre>
+        </div>
+        <p class="alt">Build from source instead: <code>yay -S voisu</code></p>
+      </div>
+
+      <!-- Debian / Ubuntu -->
+      <div class="panel" data-d="debian">
+        <p class="meta">Ubuntu 26.04 LTS · amd64</p>
+        <div class="code">
+          <button class="copy" type="button">copy</button>
+<pre><span class="c"># 1. Add Voisu's signing key.</span>
+<span class="p">$ </span>sudo install -d -m 0755 /etc/apt/keyrings
+<span class="p">$ </span>curl -fsSL https://anuraj-dev.github.io/voisu/voisu-archive-keyring.asc \
+    | sudo tee /etc/apt/keyrings/voisu-archive-keyring.asc &gt;/dev/null
+
+<span class="c"># 2. Add the repository.</span>
+<span class="p">$ </span>echo 'deb [signed-by=/etc/apt/keyrings/voisu-archive-keyring.asc arch=amd64] https://anuraj-dev.github.io/voisu stable main' \
+    | sudo tee /etc/apt/sources.list.d/voisu.list
+
+<span class="c"># 3. Install.</span>
+<span class="p">$ </span>sudo apt-get update &amp;&amp; sudo apt-get install -y voisu</pre>
+        </div>
+        <p class="fp"><b>Signing key fingerprint</b><br>4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28 — should match what you fetched.</p>
+        <details>
+          <summary>Verify the key first</summary>
+          <div class="code">
+            <button class="copy" type="button">copy</button>
+<pre><span class="c"># Fetch the key to a temp file and check its fingerprint before trusting it.</span>
+<span class="p">$ </span>EXPECT=4149EE3868B36B6007592966D08BCFDC34125B28
+<span class="p">$ </span>curl -fsSL https://anuraj-dev.github.io/voisu/voisu-archive-keyring.asc -o /tmp/voisu.asc
+<span class="p">$ </span>gpg --show-keys --with-colons /tmp/voisu.asc \
+    | awk -F: '$1=="fpr"{print $10; exit}'
+<span class="c"># The printed fingerprint must equal $EXPECT before you add the key above.</span></pre>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section class="after">
+    <p>Then enable it for your user:</p>
+    <div class="code">
+      <button class="copy" type="button">copy</button>
+<pre><span class="p">$ </span>systemctl --user enable --now voisu.service
+<span class="c"># optional on-screen overlay:</span>
+<span class="p">$ </span>systemctl --user enable --now voisu-overlay.service</pre>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap f-row">
+    <a href="https://github.com/Anuraj-Dev/voisu">github.com/Anuraj-Dev/voisu</a>
+    <a href="https://github.com/Anuraj-Dev/voisu/blob/main/LICENSE">MIT</a>
+    <span>© 2026 Anuraj Jit Saikia</span>
+    <span class="fp-foot">key · 4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28</span>
+  </div>
+</footer>
+
+<script>
+  // Progressive enhancement only: commands are visible & selectable without JS.
+  document.querySelectorAll('.code .copy').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var pre = btn.parentElement.querySelector('pre');
+      var text = pre.innerText.replace(/^\$ /gm, '');
+      var done = function () {
+        var old = btn.textContent;
+        btn.textContent = 'copied'; btn.classList.add('ok');
+        setTimeout(function () { btn.textContent = old; btn.classList.remove('ok'); }, 1400);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function () {});
+      } else {
+        var r = document.createRange(); r.selectNode(pre);
+        var s = getSelection(); s.removeAllRanges(); s.addRange(r);
+        try { document.execCommand('copy'); done(); } catch (e) {}
+        s.removeAllRanges();
+      }
+    });
+  });
+</script>
+</body>
+</html>
