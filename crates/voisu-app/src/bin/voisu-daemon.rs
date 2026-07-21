@@ -46,7 +46,29 @@ const PROVIDER_DEADLINE: Duration = PROVIDER_COMPLETION_DEADLINE;
 const DEEPGRAM_DISABLED_DIAGNOSTIC: &str = "Deepgram disabled for this Recording";
 static CONTROLLED_DELIVERY_PANICKED: AtomicBool = AtomicBool::new(false);
 
+/// A one- or two-line description of the daemon for `--help`. It is normally
+/// launched by the systemd user service, not invoked directly, so the help is
+/// intentionally brief.
+const DAEMON_HELP: &str = "\
+voisu-daemon — the Voisu dictation daemon (background service).
+It is started by the systemd user service; users interact with `voisu` instead.
+
+usage: voisu-daemon [--systemd|--version|-V|--help|-h]";
+
 fn main() {
+    // The released binary must answer the standard version/help probes with
+    // exit 0 before doing any daemon work (binding the socket, etc.).
+    match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
+        [flag] if flag == "--version" || flag == "-V" => {
+            println!("voisu-daemon {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        [flag] if flag == "--help" || flag == "-h" => {
+            println!("{DAEMON_HELP}");
+            return;
+        }
+        _ => {}
+    }
     voisu_app::system::install_crypto_provider();
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
