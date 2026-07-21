@@ -2204,7 +2204,19 @@ printf '%s\n' "$@" > "$dir/wpctl.args"
             "busctl",
             r#"#!/bin/sh
 dir=$(dirname "$0")
+# Record the last invocation, and a per-subcommand file so a test can assert a
+# specific busctl call even when doctor makes several (status + get-property).
+sub=""
+for a in "$@"; do case "$a" in -*) ;; *) sub="$a"; break;; esac; done
 printf '%s\n' "$@" > "$dir/busctl.args"
+printf '%s\n' "$@" > "$dir/busctl.$sub.args"
+if [ "$sub" = "get-property" ]; then
+  # The GlobalShortcuts version probe. A healthy portal answers with the
+  # interface version; the marker simulates a portal WITHOUT GlobalShortcuts
+  # (plain wlroots), which real busctl reports with a nonzero exit.
+  if [ -e "$dir/busctl.no-global-shortcuts" ]; then trap - EXIT; exit 1; fi
+  printf 'u 1\n'
+fi
 "#,
         );
         write_fake_command(
@@ -2567,6 +2579,9 @@ fn doctor_exposes_actionable_warn_and_fail_outcomes() {
         &[
             ("VOISU_TEST_READINESS", "pipewire=fail,clipboard=warn"),
             ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+            // Pin the unit as not-failed so the daemon message is decided by the
+            // handshake alone, independent of the host's real voisu.service.
+            ("VOISU_TEST_SERVICE_FAILED", "inactive"),
         ],
     );
 
@@ -2574,6 +2589,75 @@ fn doctor_exposes_actionable_warn_and_fail_outcomes() {
     assert!(stdout(&doctor).contains("PipeWire: FAIL (not available; see remediation)\n"));
     assert!(stdout(&doctor).contains("Clipboard: WARN (needs attention; see remediation)\n"));
     assert!(stdout(&doctor).contains("Daemon: FAIL (daemon status handshake failed; start voisu-daemon and run voisu doctor again)\n"));
+}
+
+#[test]
+fn doctor_points_at_the_journal_when_the_service_unit_is_failed() {
+    // A unit that tried to start and failed (e.g. status=226/NAMESPACE on a
+    // fresh home) never answers the handshake; doctor must name the journal
+    // rather than tell the user to "start" a unit that is already failing.
+    let runtime = TempDir::new().unwrap();
+    let doctor = voisu_with_env(
+        runtime.path(),
+        &["doctor"],
+        &[
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "none"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+            ("VOISU_TEST_SERVICE_FAILED", "failed"),
+        ],
+    );
+
+    assert_eq!(doctor.status.code(), Some(4));
+    assert!(
+        stdout(&doctor).contains(
+            "Daemon: FAIL (daemon status handshake failed and systemctl --user reports voisu.service failed; inspect the logs with `journalctl --user -u voisu.service`)\n"
+        ),
+        "{}",
+        stdout(&doctor)
+    );
+}
+
+#[test]
+fn doctor_warns_when_the_portal_exposes_no_global_shortcuts() {
+    // The portal answers `status` but has no GlobalShortcuts interface (plain
+    // wlroots): the Trigger Key cannot bind, so doctor warns with the Hyprland
+    // remediation instead of a bare PASS.
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let commands = FakeCommands::new();
+    commands.touch("busctl.no-global-shortcuts");
+    let doctor = voisu_with_env(
+        runtime.path(),
+        &["doctor"],
+        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+    );
+
+    let out = stdout(&doctor);
+    assert!(out.contains("Portals: WARN ("), "{out}");
+    assert!(out.contains("no GlobalShortcuts interface"), "{out}");
+    assert!(out.contains("xdg-desktop-portal-hyprland"), "{out}");
+    assert!(out.contains("voisu:voisu-toggle"), "{out}");
+}
+
+#[test]
+fn doctor_passes_portals_when_global_shortcuts_are_available() {
+    // The portal answers both `status` and the GlobalShortcuts version probe:
+    // doctor keeps the existing PASS behavior.
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let commands = FakeCommands::new();
+    let doctor = voisu_with_env(
+        runtime.path(),
+        &["doctor"],
+        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+    );
+
+    assert!(
+        stdout(&doctor).contains("Portals: PASS (desktop portal responds)\n"),
+        "{}",
+        stdout(&doctor)
+    );
 }
 
 #[test]
@@ -2591,8 +2675,12 @@ fn doctor_exercises_real_capabilities_instead_of_command_headings_or_socket_conn
     assert_eq!(commands.read("pw-cli.args"), "info\n0\n");
     assert_eq!(commands.read("wpctl.args"), "inspect\n@DEFAULT_AUDIO_SOURCE@\n");
     assert_eq!(
-        commands.read("busctl.args"),
+        commands.read("busctl.status.args"),
         "--user\n--no-pager\nstatus\norg.freedesktop.portal.Desktop\n"
+    );
+    assert_eq!(
+        commands.read("busctl.get-property.args"),
+        "--user\nget-property\norg.freedesktop.portal.Desktop\n/org/freedesktop/portal/desktop\norg.freedesktop.portal.GlobalShortcuts\nversion\n"
     );
     assert!(
         commands
