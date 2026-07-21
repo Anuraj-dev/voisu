@@ -940,6 +940,17 @@ fn bounded_utf8(bytes: Vec<u8>) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "systemctl --user returned invalid output".to_owned())
 }
 
+/// Whether systemd reports `voisu.service` in the failed state. `voisu doctor`
+/// uses this to distinguish a unit that tried to start and failed (point the
+/// user at the journal) from a daemon that was simply never started. `is-failed`
+/// prints the state to stdout ("failed" only when the unit failed); any error
+/// consulting systemd reads as "not known to be failed".
+pub fn service_is_failed() -> bool {
+    systemctl(&["is-failed", UNIT_NAME])
+        .map(|output| output.stdout.trim() == "failed")
+        .unwrap_or(false)
+}
+
 fn systemd_is_active() -> Result<bool, String> {
     Ok(systemd_state()? == "active")
 }

@@ -63,6 +63,40 @@ voisu setup   # guided wizard: validate and store your provider keys
 systemctl --user enable --now voisu-overlay.service
 ```
 
+### Trigger Key by desktop
+
+How you pick the Trigger Key depends on your desktop's portal:
+
+- **KDE Plasma / GNOME:** a system dialog appears the first time the daemon
+  starts — choose the key once and it persists.
+- **Hyprland:** there is no dialog by design. Install
+  `xdg-desktop-portal-hyprland`, start the daemon, then read the registered
+  shortcut and declare the bind in `hyprland.conf`:
+
+  ```sh
+  hyprctl globalshortcuts        # shows the exact appid:voisu-toggle string
+  ```
+
+  ```conf
+  bind = SUPER, D, global, voisu:voisu-toggle   # use the exact string hyprctl printed
+  ```
+
+  `SUPER, D` is only an example key; the part after `global,` must match
+  `hyprctl globalshortcuts` verbatim (the app-id half can be empty, e.g.
+  `:voisu-toggle`). Plain wlroots portals do not implement GlobalShortcuts, so
+  the Trigger Key cannot bind without `xdg-desktop-portal-hyprland`.
+
+  Type Delivery does not work on Hyprland: its portal implements no
+  RemoteDesktop interface, which is Voisu's only text-injection path. Use the
+  clipboard instead:
+
+  ```sh
+  voisu delivery clipboard
+  ```
+
+Run `voisu doctor` if the Trigger Key does not respond — it reports a portal
+without a usable GlobalShortcuts interface.
+
 ## License
 
 Voisu is licensed under the [MIT License](LICENSE).

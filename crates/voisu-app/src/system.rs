@@ -107,13 +107,7 @@ impl ReadinessInspector for FedoraReadiness {
                 "start PipeWire and WirePlumber",
             ),
             microphone_finding(),
-            command_finding(
-                ReadinessCapability::Portals,
-                "busctl",
-                &["--user", "--no-pager", "status", "org.freedesktop.portal.Desktop"],
-                "desktop portal responds",
-                "start xdg-desktop-portal in this desktop session",
-            ),
+            portals_finding(),
             clipboard_finding(),
             secret_service_finding(),
             daemon_finding(),
@@ -1493,6 +1487,66 @@ fn secret_service_finding() -> ReadinessFinding {
     }
 }
 
+/// The Portals readiness check. A portal that does not answer at all fails
+/// closed; a portal that answers but exposes no `GlobalShortcuts` interface
+/// warns with the Hyprland remediation, because plain wlroots portals implement
+/// no GlobalShortcuts and there is no desktop dialog to bind the Trigger Key —
+/// the daemon can never receive an activation there until the user installs
+/// xdg-desktop-portal-hyprland and declares the bind in hyprland.conf. Only a
+/// portal that answers AND exposes GlobalShortcuts passes.
+fn portals_finding() -> ReadinessFinding {
+    let portal_up = run_restricted(
+        "busctl",
+        &["--user", "--no-pager", "status", PORTAL_BUS_NAME],
+        None,
+        false,
+    )
+    .is_ok_and(|outcome| outcome.success);
+    if !portal_up {
+        return readiness(
+            ReadinessCapability::Portals,
+            ReadinessStatus::Fail,
+            "start xdg-desktop-portal in this desktop session",
+        );
+    }
+    if global_shortcuts_available() {
+        readiness(
+            ReadinessCapability::Portals,
+            ReadinessStatus::Pass,
+            "desktop portal responds",
+        )
+    } else {
+        readiness(
+            ReadinessCapability::Portals,
+            ReadinessStatus::Warn,
+            "desktop portal responds but exposes no GlobalShortcuts interface; the Trigger Key cannot bind. Your portal backend does not implement GlobalShortcuts — on Hyprland install xdg-desktop-portal-hyprland and declare the bind in hyprland.conf (see the Trigger Key section in the README)",
+        )
+    }
+}
+
+/// Whether `org.freedesktop.portal.GlobalShortcuts` is exposed on the desktop
+/// portal. Reads its `version` property: the portal answers with the interface
+/// version when it is implemented and fails when it is absent. This mirrors how
+/// the codebase already talks to the portal over the session bus (via busctl),
+/// staying in one subprocess convention rather than opening a second zbus edge
+/// just for a probe.
+fn global_shortcuts_available() -> bool {
+    run_restricted(
+        "busctl",
+        &[
+            "--user",
+            "get-property",
+            PORTAL_BUS_NAME,
+            PORTAL_OBJECT_PATH,
+            GLOBAL_SHORTCUTS_INTERFACE,
+            "version",
+        ],
+        None,
+        false,
+    )
+    .is_ok_and(|outcome| outcome.success)
+}
+
 fn command_finding(
     capability: ReadinessCapability,
     command: &str,
@@ -1510,16 +1564,41 @@ fn command_finding(
 }
 
 fn daemon_finding() -> ReadinessFinding {
-    let result = daemon_status_handshake();
-    readiness(
-        ReadinessCapability::Daemon,
-        if result.is_ok() { ReadinessStatus::Pass } else { ReadinessStatus::Fail },
-        if result.is_ok() {
-            "status handshake succeeds"
-        } else {
-            "daemon status handshake failed; start voisu-daemon and run voisu doctor again"
-        },
-    )
+    if daemon_status_handshake().is_ok() {
+        return readiness(
+            ReadinessCapability::Daemon,
+            ReadinessStatus::Pass,
+            "status handshake succeeds",
+        );
+    }
+    // A daemon that was simply never started reads differently from a unit
+    // systemd tried to run and could not: when the unit is in the failed state
+    // (e.g. a namespace/exec failure that never reaches our handshake), point
+    // the user at the journal rather than telling them to "start" a unit that
+    // is already failing to start.
+    if service_reports_failed() {
+        readiness(
+            ReadinessCapability::Daemon,
+            ReadinessStatus::Fail,
+            "daemon status handshake failed and systemctl --user reports voisu.service failed; inspect the logs with `journalctl --user -u voisu.service`",
+        )
+    } else {
+        readiness(
+            ReadinessCapability::Daemon,
+            ReadinessStatus::Fail,
+            "daemon status handshake failed; start voisu-daemon and run voisu doctor again",
+        )
+    }
+}
+
+/// Whether systemd reports `voisu.service` in the failed state. A dedicated test
+/// seam (`VOISU_TEST_SERVICE_FAILED`) keeps the doctor daemon check hermetic —
+/// tests never depend on the host's real unit state.
+fn service_reports_failed() -> bool {
+    if let Some(value) = std::env::var_os("VOISU_TEST_SERVICE_FAILED") {
+        return matches!(value.to_string_lossy().trim(), "1" | "failed");
+    }
+    crate::service::service_is_failed()
 }
 
 fn daemon_status_handshake() -> Result<(), ()> {
