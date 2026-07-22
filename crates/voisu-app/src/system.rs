@@ -26,7 +26,7 @@ use voisu_core::{
 };
 
 use crate::audio_level::{
-    bands, BandState, LevelRegistry, PcmChunkAssembler, PCM_CHUNK_BYTES,
+    bands, BandState, LevelRegistry, PcmChunkAssembler, SampleDecoder, PCM_CHUNK_BYTES,
 };
 use crate::focus::SharedFocusProbe;
 use crate::process::guard_external_child;
@@ -2523,7 +2523,7 @@ impl AudioCapture for PipeWireCapture {
             let mut buffer = [0_u8; 640];
             let mut assembler = PcmChunkAssembler::default();
             let mut band_state = BandState::default();
-            let mut partial_sample = None;
+            let mut decoder = SampleDecoder::default();
             loop {
                 match stdout.read(&mut buffer) {
                     Ok(0) => {
@@ -2536,19 +2536,13 @@ impl AudioCapture for PipeWireCapture {
                     }
                     Ok(read) => {
                         if let Some(level_ring) = level_ring.as_ref() {
-                            let mut level_bytes = Vec::with_capacity(read + 1);
-                            if let Some(byte) = partial_sample.take() {
-                                level_bytes.push(byte);
+                            let samples = decoder.decode(&buffer[..read]);
+                            // A read that completes no sample pushes no
+                            // frame: an all-zero frame would advance the
+                            // ring sequence and could evict real peaks.
+                            if !samples.is_empty() {
+                                level_ring.push(bands(&samples, &mut band_state));
                             }
-                            level_bytes.extend_from_slice(&buffer[..read]);
-                            if level_bytes.len() % 2 != 0 {
-                                partial_sample = level_bytes.pop();
-                            }
-                            let samples = level_bytes
-                                .chunks_exact(2)
-                                .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
-                                .collect::<Vec<_>>();
-                            level_ring.push(bands(&samples, &mut band_state));
                         }
                         let mut state = reader_state.lock().unwrap();
                         state.received_bytes = state.received_bytes.saturating_add(read);

@@ -3,9 +3,14 @@
 use std::cell::{Cell, RefCell};
 use std::env;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::process::Command as ProcessCommand;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use gtk4 as gtk;
@@ -374,15 +379,14 @@ fn install_surface_feedback(
     let tracker = Rc::new(RefCell::new(PresentationTracker::default()));
     let notify_latch = Rc::new(RefCell::new(RecordingNotifyLatch::default()));
     let level_latch = Rc::new(RefCell::new(LevelPollLatch::default()));
-    let level_source = Rc::new(RefCell::new(None::<gtk::glib::SourceId>));
-    let level_cursor = Rc::new(Cell::new(0_u64));
-    let smoother = Rc::new(RefCell::new(BarSmoother::default()));
+    let level_poll = Rc::new(RefCell::new(None::<(gtk::glib::SourceId, Rc<LevelWorker>)>));
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
         if switched.get() {
             // A genuine surface-creation failure handed feedback to the
             // notification backend; stop driving the retired window.
-            if let Some(source) = level_source.borrow_mut().take() {
+            if let Some((source, worker)) = level_poll.borrow_mut().take() {
                 source.remove();
+                worker.stop();
             }
             return gtk::glib::ControlFlow::Break;
         }
@@ -404,20 +408,20 @@ fn install_surface_feedback(
         render_surface(&window, &label, &meter, &glyph, &capsule, view);
         match level_latch.borrow_mut().observe(signal) {
             LevelPollAction::Arm => {
-                let source = install_level_poll(
+                let worker = Rc::new(LevelWorker::spawn());
+                let source = install_level_drain(
                     meter.clone(),
                     Rc::clone(&rendered_bars),
-                    Rc::clone(&smoother),
-                    Rc::clone(&level_cursor),
+                    Rc::clone(&worker),
                 );
-                *level_source.borrow_mut() = Some(source);
+                *level_poll.borrow_mut() = Some((source, worker));
             }
             LevelPollAction::Disarm => {
-                if let Some(source) = level_source.borrow_mut().take() {
+                if let Some((source, worker)) = level_poll.borrow_mut().take() {
                     source.remove();
+                    worker.stop();
                 }
-                level_cursor.set(0);
-                *rendered_bars.borrow_mut() = smoother.borrow_mut().reset();
+                *rendered_bars.borrow_mut() = [0; 20];
                 meter.queue_draw();
             }
             LevelPollAction::Keep => {}
@@ -437,8 +441,9 @@ fn install_surface_feedback(
             &mut notify_latch.borrow_mut(),
         ) {
             TickAction::Break => {
-                if let Some(source) = level_source.borrow_mut().take() {
+                if let Some((source, worker)) = level_poll.borrow_mut().take() {
                     source.remove();
+                    worker.stop();
                 }
                 gtk::glib::ControlFlow::Break
             }
@@ -693,25 +698,85 @@ fn render_surface(
     window.set_visible(true);
 }
 
-fn install_level_poll(
+/// Cadence of the Level poll on its dedicated worker thread, and of the GTK
+/// drain that repaints from it.
+const LEVEL_POLL_PERIOD: Duration = Duration::from_millis(20);
+/// One absolute deadline for a whole Level round trip — connect, write, and
+/// read together. A skipped frame is invisible; a stalled poll must never be.
+const LEVEL_POLL_DEADLINE: Duration = Duration::from_millis(10);
+/// A Level response is at most 8 frames of ~120 bytes; anything past this
+/// bound is a malformed peer and the poll fails closed.
+const MAX_LEVEL_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// The dedicated Level-poll worker. ALL Level IPC runs on this thread; the
+/// GTK main thread only ever takes the latest smoothed bars nonblockingly,
+/// so a stalled socket backlog or trickling peer can never freeze drawing,
+/// the 200 ms status poll, or timer disarming. The worker owns the stateless
+/// cursor and the BarSmoother: every polled frame passes through the
+/// smoother in order (coalesced peaks survive), and only the newest smoothed
+/// result is published, which keeps the hand-off slot bounded at one value.
+struct LevelWorker {
+    stop: Arc<AtomicBool>,
+    latest: Arc<Mutex<Option<[u8; 20]>>>,
+}
+
+impl LevelWorker {
+    fn spawn() -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let latest = Arc::new(Mutex::new(None));
+        let thread_stop = Arc::clone(&stop);
+        let thread_latest = Arc::clone(&latest);
+        thread::spawn(move || {
+            let mut cursor = 0_u64;
+            let mut smoother = BarSmoother::default();
+            while !thread_stop.load(Ordering::Relaxed) {
+                let bars = match read_levels(cursor, Instant::now() + LEVEL_POLL_DEADLINE) {
+                    Some(frames) => {
+                        if let Some(last) = frames.last() {
+                            cursor = last.seq;
+                        }
+                        smoother.observe_all(frames.into_iter().map(|frame| frame.bands))
+                    }
+                    // Isolation rule: a failed Level poll only decays the
+                    // bars. Daemon liveness belongs to the status poll alone.
+                    None => smoother.observe_failure(),
+                };
+                *thread_latest.lock().unwrap() = Some(bars);
+                thread::sleep(LEVEL_POLL_PERIOD);
+            }
+        });
+        Self { stop, latest }
+    }
+
+    /// Nonblocking: the newest published bars, if any arrived since the last
+    /// take. `try_lock` keeps the GTK thread from ever waiting on the worker.
+    fn take_latest(&self) -> Option<[u8; 20]> {
+        self.latest.try_lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for LevelWorker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// The GTK-side drain: nonblocking channel read plus drawing, nothing else.
+fn install_level_drain(
     meter: gtk::DrawingArea,
     rendered_bars: Rc<RefCell<[u8; 20]>>,
-    smoother: Rc<RefCell<BarSmoother>>,
-    cursor: Rc<Cell<u64>>,
+    worker: Rc<LevelWorker>,
 ) -> gtk::glib::SourceId {
-    gtk::glib::timeout_add_local(Duration::from_millis(20), move || {
-        let levels = match read_levels(cursor.get()) {
-            Some(frames) => {
-                if let Some(last) = frames.last() {
-                    cursor.set(last.seq);
-                }
-                smoother
-                    .borrow_mut()
-                    .observe_all(frames.into_iter().map(|frame| frame.bands))
-            }
-            None => smoother.borrow_mut().observe_failure(),
-        };
-        *rendered_bars.borrow_mut() = levels;
+    gtk::glib::timeout_add_local(LEVEL_POLL_PERIOD, move || {
+        if let Some(bars) = worker.take_latest() {
+            *rendered_bars.borrow_mut() = bars;
+        }
+        // Redraw every tick regardless: this cadence also animates the
+        // record dot's pulse while the bars are unchanged.
         meter.queue_draw();
         gtk::glib::ControlFlow::Continue
     })
@@ -796,18 +861,133 @@ fn read_status() -> Option<Response> {
     serde_json::from_slice(&response).ok()
 }
 
-fn read_levels(after_seq: u64) -> Option<Vec<voisu_core::LevelFrame>> {
-    let mut stream = UnixStream::connect(socket_path().ok()?).ok()?;
-    stream.set_read_timeout(Some(Duration::from_millis(5))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_millis(5))).ok()?;
-    let request = serde_json::to_vec(&Request {
+/// One Level round trip bounded by a single absolute deadline across
+/// connect, write, and read. The socket is nonblocking from creation and
+/// every readiness wait goes through poll(2) with the REMAINING time — a
+/// per-syscall timeout only bounds one syscall, so a trickling peer could
+/// otherwise stretch the round trip far past its budget. Runs only on the
+/// worker thread.
+fn read_levels(after_seq: u64, deadline: Instant) -> Option<Vec<voisu_core::LevelFrame>> {
+    let path = socket_path().ok()?;
+    let mut stream = connect_within(&path, deadline)?;
+    let mut request = serde_json::to_vec(&Request {
         version: PROTOCOL_VERSION,
         command: Command::Level { after_seq },
     })
     .ok()?;
-    stream.write_all(&request).ok()?;
-    stream.write_all(b"\n").ok()?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).ok()?;
+    request.push(b'\n');
+    write_within(&mut stream, &request, deadline)?;
+    let response = read_until_eof_within(&mut stream, deadline)?;
     serde_json::from_slice::<Response>(&response).ok()?.level_frames
+}
+
+/// Nonblocking connect to the daemon socket, bounded by the shared deadline.
+fn connect_within(path: &std::path::Path, deadline: Instant) -> Option<UnixStream> {
+    // SAFETY: socket(2) has no memory preconditions; the raw descriptor is
+    // moved into an OwnedFd immediately, so every early return closes it.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: raw is a freshly created, valid descriptor owned by nothing else.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: sockaddr_un is plain old data; all-zeroes is a valid value.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= address.sun_path.len() {
+        return None;
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    let length = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+    // SAFETY: address is a properly initialized sockaddr_un and length is
+    // within its size.
+    let connected =
+        unsafe { libc::connect(fd.as_raw_fd(), std::ptr::addr_of!(address).cast(), length) };
+    if connected != 0 {
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINPROGRESS) | Some(libc::EAGAIN) => {
+                wait_within(fd.as_raw_fd(), libc::POLLOUT, deadline)?;
+                let mut error: libc::c_int = 0;
+                let mut error_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                // SAFETY: error and error_len are valid out-pointers of the
+                // exact size SO_ERROR writes.
+                let sockopt = unsafe {
+                    libc::getsockopt(
+                        fd.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        std::ptr::addr_of_mut!(error).cast(),
+                        &mut error_len,
+                    )
+                };
+                if sockopt != 0 || error != 0 {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(UnixStream::from(fd))
+}
+
+/// Wait for descriptor readiness until the shared deadline elapses.
+fn wait_within(fd: std::os::fd::RawFd, events: libc::c_short, deadline: Instant) -> Option<()> {
+    loop {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        let mut descriptor = libc::pollfd { fd, events, revents: 0 };
+        let millis = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: descriptor is a valid pollfd for the duration of the call.
+        match unsafe { libc::poll(&mut descriptor, 1, millis) } {
+            1.. => return Some(()),
+            0 => return None,
+            _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+            _ => return None,
+        }
+    }
+}
+
+fn write_within(stream: &mut UnixStream, bytes: &[u8], deadline: Instant) -> Option<()> {
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        match stream.write(remaining) {
+            Ok(0) => return None,
+            Ok(written) => remaining = &remaining[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_within(stream.as_raw_fd(), libc::POLLOUT, deadline)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(())
+}
+
+fn read_until_eof_within(stream: &mut UnixStream, deadline: Instant) -> Option<Vec<u8>> {
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => return Some(response),
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                if response.len() > MAX_LEVEL_RESPONSE_BYTES {
+                    return None;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_within(stream.as_raw_fd(), libc::POLLIN, deadline)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
 }

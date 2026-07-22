@@ -474,7 +474,7 @@ async fn actor_loop(
     let controlled_deadlines = controlled
         || test_mode.as_deref() == Some(std::ffi::OsStr::new("system-boundaries"));
     let mut capture: Option<Box<dyn AudioCapture>> = Some(if controlled {
-        Box::new(ControlledCapture::from_env())
+        Box::new(ControlledCapture::from_env(levels.clone()))
     } else {
         Box::new(PipeWireCapture::new(reaper.clone(), levels.clone()))
     });
@@ -2598,6 +2598,12 @@ struct ControlledCapture {
     chunks: u32,
     chunk_delay: Duration,
     deadline_after_chunks: Option<u32>,
+    /// Deterministic paused Level producer: this many frames, with lead band
+    /// values 10, 20, 30, ..., are pushed once during `begin` — before the
+    /// CLI's start reply — and never again, so Level IPC tests observe a
+    /// stable, ordered frame set with no live-writer race.
+    level_frames: u32,
+    levels: LevelRegistry,
 }
 
 fn env_millis(name: &str) -> Duration {
@@ -2617,7 +2623,7 @@ fn env_millis_or(name: &str, default: Duration) -> Duration {
 }
 
 impl ControlledCapture {
-    fn from_env() -> Self {
+    fn from_env(levels: LevelRegistry) -> Self {
         let chunks = std::env::var("VOISU_TEST_CAPTURE_CHUNKS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -2640,6 +2646,11 @@ impl ControlledCapture {
             deadline_after_chunks: std::env::var("VOISU_TEST_DEADLINE_AFTER_CHUNKS")
                 .ok()
                 .and_then(|value| value.parse().ok()),
+            level_frames: std::env::var("VOISU_TEST_LEVEL_FRAMES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+            levels,
         }
     }
 }
@@ -2651,6 +2662,13 @@ impl AudioCapture for ControlledCapture {
                 BoundaryKind::Capture,
                 "controlled-capture-begin-detail",
             ));
+        }
+        if self.level_frames > 0
+            && let Some(ring) = self.levels.current()
+        {
+            for index in 0..self.level_frames {
+                ring.push([(index as u8).wrapping_add(1).wrapping_mul(10); 20]);
+            }
         }
         let panic_next_chunk = std::mem::take(&mut self.panic_next_chunk_once);
         let fail_finish = self.finish_failures_remaining > 0;
