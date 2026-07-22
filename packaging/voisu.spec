@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.1.1
+Version:        0.2.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,15 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Wed Jul 22 2026 Voisu maintainers <voisu@example.invalid> - 0.2.0-1
+- fix(setup): address masked-echo review findings
+- feat(setup): masked echo and confirmation for interactive key entry
+- chore: move agent-workflow scaffolding out of the public tree
+- docs: log benchmark rows 200-201 (version-bump dispatches)
+- ci: remove literal expression syntax from version-bump run comment
+- ci: address version-bump review — drop --offline, marker-anchored range, %%%% escaping
+- ci: add per-merge automatic version-bump workflow
+
 * Tue Jul 21 2026 Voisu maintainers <voisu@example.invalid> - 0.1.1-1
 - Stable Global Shortcuts session identity: the Trigger Key binds once and
   survives daemon restarts instead of re-prompting every start (PR #76).
