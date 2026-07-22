@@ -539,6 +539,9 @@ pub enum ReadinessStatus {
     Pass,
     Warn,
     Fail,
+    /// A check that does not apply and was deliberately not run (e.g. a disabled
+    /// provider's key). Never a failure.
+    Skip,
 }
 
 impl ReadinessStatus {
@@ -547,6 +550,7 @@ impl ReadinessStatus {
             Self::Pass => "PASS",
             Self::Warn => "WARN",
             Self::Fail => "FAIL",
+            Self::Skip => "SKIP",
         }
     }
 }
@@ -560,6 +564,10 @@ pub enum ReadinessCapability {
     Clipboard,
     SecretStorage,
     Daemon,
+    /// Whether the systemd --user manager carries this session's display
+    /// variables, without which Delivery from the daemon cannot reach the
+    /// server.
+    ServiceEnvironment,
 }
 
 impl ReadinessCapability {
@@ -572,6 +580,7 @@ impl ReadinessCapability {
             Self::Clipboard => "Clipboard",
             Self::SecretStorage => "Secret storage",
             Self::Daemon => "Daemon",
+            Self::ServiceEnvironment => "Service env",
         }
     }
 }

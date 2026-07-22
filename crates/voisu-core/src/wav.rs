@@ -20,6 +20,10 @@ const EXPECTED_FORMAT_PCM: u16 = 1;
 const EXPECTED_CHANNELS: u16 = 1;
 const EXPECTED_SAMPLE_RATE: u32 = 16_000;
 const EXPECTED_BITS_PER_SAMPLE: u16 = 16;
+/// s16 mono at 16 kHz: 2 bytes per frame, one frame per sample.
+const EXPECTED_BLOCK_ALIGN: u16 = 2;
+/// 16000 Hz * 2 bytes/frame.
+const EXPECTED_BYTE_RATE: u32 = 32_000;
 
 /// The outcome of scanning a prefix of a WAV stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,11 +100,18 @@ pub fn scan_wav_pcm(prefix: &[u8]) -> WavScan {
             let channels = u16::from_le_bytes([body[2], body[3]]);
             let sample_rate =
                 u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+            let byte_rate = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+            let block_align = u16::from_le_bytes([body[12], body[13]]);
             let bits_per_sample = u16::from_le_bytes([body[14], body[15]]);
+            // Validate the full frame geometry, not just the headline fields: a
+            // contradictory header (right format/rate but a block align or byte
+            // rate that implies different framing) must not pass.
             if audio_format != EXPECTED_FORMAT_PCM
                 || channels != EXPECTED_CHANNELS
                 || sample_rate != EXPECTED_SAMPLE_RATE
                 || bits_per_sample != EXPECTED_BITS_PER_SAMPLE
+                || block_align != EXPECTED_BLOCK_ALIGN
+                || byte_rate != EXPECTED_BYTE_RATE
             {
                 return WavScan::Invalid(
                     "WAV fmt chunk is not s16 / 16 kHz / mono PCM",
@@ -233,6 +244,55 @@ mod tests {
         header.extend_from_slice(&16u16.to_le_bytes());
         header.extend_from_slice(b"data");
         header.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(scan_wav_pcm(&header), WavScan::Invalid(_)));
+    }
+
+    #[test]
+    fn a_contradictory_block_align_or_byte_rate_is_rejected() {
+        // Headline fields (PCM/mono/16 kHz/16-bit) are correct, but the frame
+        // geometry contradicts them: block align 4 and byte rate 64000 imply a
+        // different framing. This must not pass.
+        let mut header = Vec::new();
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&u32::MAX.to_le_bytes());
+        header.extend_from_slice(b"WAVE");
+        header.extend_from_slice(b"fmt ");
+        header.extend_from_slice(&16u32.to_le_bytes());
+        header.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        header.extend_from_slice(&1u16.to_le_bytes()); // mono
+        header.extend_from_slice(&16_000u32.to_le_bytes()); // 16 kHz
+        header.extend_from_slice(&64_000u32.to_le_bytes()); // byte rate — wrong
+        header.extend_from_slice(&4u16.to_le_bytes()); // block align — wrong
+        header.extend_from_slice(&16u16.to_le_bytes()); // 16-bit
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(scan_wav_pcm(&header), WavScan::Invalid(_)));
+    }
+
+    #[test]
+    fn a_truncated_fmt_chunk_asks_for_more_without_panicking() {
+        // The fmt chunk header claims 16 bytes of body but only 8 have arrived.
+        let mut header = Vec::new();
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&u32::MAX.to_le_bytes());
+        header.extend_from_slice(b"WAVE");
+        header.extend_from_slice(b"fmt ");
+        header.extend_from_slice(&16u32.to_le_bytes());
+        header.extend_from_slice(&1u16.to_le_bytes());
+        header.extend_from_slice(&1u16.to_le_bytes());
+        header.extend_from_slice(&16_000u32.to_le_bytes());
+        assert_eq!(scan_wav_pcm(&header), WavScan::Incomplete);
+    }
+
+    #[test]
+    fn a_fmt_chunk_declaring_a_short_body_is_rejected() {
+        let mut header = Vec::new();
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&u32::MAX.to_le_bytes());
+        header.extend_from_slice(b"WAVE");
+        header.extend_from_slice(b"fmt ");
+        header.extend_from_slice(&12u32.to_le_bytes()); // too short (< 16)
+        header.extend_from_slice(&[0_u8; 12]);
         assert!(matches!(scan_wav_pcm(&header), WavScan::Invalid(_)));
     }
 

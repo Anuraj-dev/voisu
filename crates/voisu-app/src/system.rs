@@ -100,7 +100,7 @@ impl ReadinessInspector for FedoraReadiness {
         if let Some(value) = std::env::var_os("VOISU_TEST_READINESS") {
             return controlled_readiness(&value.to_string_lossy());
         }
-        vec![
+        let mut findings = vec![
             session_finding(),
             pipewire_finding(),
             microphone_finding(),
@@ -108,7 +108,13 @@ impl ReadinessInspector for FedoraReadiness {
             clipboard_finding(),
             secret_service_finding(),
             daemon_finding(),
-        ]
+        ];
+        // Appended only when it can demonstrate a problem, so the common case
+        // stays quiet and the golden table is unaffected.
+        if let Some(finding) = service_display_env_finding() {
+            findings.push(finding);
+        }
+        findings
     }
 }
 
@@ -1366,10 +1372,12 @@ fn provider_authentication_error(error: ProcessError) -> BoundaryError {
 /// Resolve the current display session from the live environment. Detection is
 /// pure logic in `voisu-core`; this only reads the environment for it.
 fn current_session() -> SessionResolution {
+    let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
+    let x11_display = std::env::var("DISPLAY").ok();
     let session_type = std::env::var("XDG_SESSION_TYPE").ok();
     resolve_session(
-        std::env::var_os("WAYLAND_DISPLAY").is_some(),
-        std::env::var_os("DISPLAY").is_some(),
+        wayland_display.as_deref(),
+        x11_display.as_deref(),
         session_type.as_deref(),
     )
 }
@@ -1417,6 +1425,50 @@ fn session_value(resolution: SessionResolution) -> String {
     }
 }
 
+/// Whether the systemd `--user` manager environment advertises `key` with a
+/// non-empty value.
+fn manager_env_has(show_environment: &str, key: &str) -> bool {
+    let prefix = format!("{key}=");
+    show_environment
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .any(|value| !value.is_empty())
+}
+
+/// A doctor diagnosis for the systemd-user-service delivery gap: the daemon runs
+/// under the `--user` manager, and if that manager never imported the graphical
+/// session's display variables, Delivery cannot reach the X/Wayland server even
+/// though the interactive CLI can. Returns a WARN only when the manager clearly
+/// lacks this session's display variable; on an undetermined session, an
+/// unreachable manager, or a manager that already has it, no row is produced.
+fn service_display_env_finding() -> Option<ReadinessFinding> {
+    let needed = match current_session().session {
+        SessionKind::Wayland => "WAYLAND_DISPLAY",
+        SessionKind::X11 => "DISPLAY",
+        SessionKind::Unknown => return None,
+    };
+    let outcome = run_restricted("systemctl", &["--user", "show-environment"], None, true).ok()?;
+    if !outcome.success {
+        return None;
+    }
+    let show_environment = String::from_utf8_lossy(&outcome.stdout);
+    if manager_env_has(&show_environment, needed) {
+        return None;
+    }
+    Some(
+        readiness(
+            ReadinessCapability::ServiceEnvironment,
+            ReadinessStatus::Warn,
+            &format!(
+                "the systemd --user manager has no {needed}, so Delivery from the daemon cannot \
+                 reach the display; run `voisu service restart` from your graphical session (or \
+                 `systemctl --user import-environment {needed}`)"
+            ),
+        )
+        .with_value("missing display env"),
+    )
+}
+
 /// The Session check: which display server this login is running. Both Wayland
 /// and X11 are fully supported, so a cleanly detected session passes; only a
 /// session that cannot be determined warns.
@@ -1430,13 +1482,12 @@ fn session_finding() -> ReadinessFinding {
             "display session detected; the matching clipboard backend is selected at runtime",
         )
         .with_value(value),
-        SessionKind::Unknown => ReadinessFinding::new(
+        SessionKind::Unknown => readiness(
             ReadinessCapability::Session,
             ReadinessStatus::Warn,
-            "could not determine the display session; clipboard Delivery will try Wayland then X11",
+            "could not determine the display session; clipboard Delivery will try Wayland then X11. Log in to a graphical session (Wayland or X11)",
         )
-        .with_value(value)
-        .with_action("log in to a graphical session (Wayland or X11)"),
+        .with_value(value),
     }
 }
 
@@ -1455,19 +1506,43 @@ fn pw_record_version() -> Option<String> {
     (!version.is_empty()).then_some(version)
 }
 
-/// The PipeWire check. Status comes from whether the PipeWire core answers; the
-/// value column carries the detected version and which capture path is in use
-/// (`--raw` headerless PCM, or the WAV-container fallback for PipeWire < 1.1).
+/// The install command for `pw-record` (the recorder), whose package name
+/// differs per distribution. Printed, never run.
+fn pw_record_install_command() -> String {
+    match detect_package_manager() {
+        Some(PackageManager::Apt) => "sudo apt install pipewire-bin".to_owned(),
+        Some(PackageManager::Dnf) => "sudo dnf install pipewire-utils".to_owned(),
+        Some(PackageManager::Pacman) => "sudo pacman -S pipewire".to_owned(),
+        Some(PackageManager::Zypper) => "sudo zypper install pipewire-tools".to_owned(),
+        None => "install pipewire (pw-record) with your package manager".to_owned(),
+    }
+}
+
+/// The PipeWire check. `pw-record` absent is a hard FAIL naming the package —
+/// Voisu cannot capture without it, and a responding pw-cli must not mask that.
+/// Otherwise the status comes from whether the PipeWire core answers, and the
+/// value column carries the detected version and the capture path (`--raw`
+/// headerless PCM, or the WAV-container fallback for PipeWire < 1.1).
 fn pipewire_finding() -> ReadinessFinding {
+    let mode = pw_record_capture_mode();
+    let version = pw_record_version();
+    if mode == PwRecordProbe::Unavailable {
+        return ReadinessFinding::new(
+            ReadinessCapability::PipeWire,
+            ReadinessStatus::Fail,
+            "pw-record is not available, so Voisu cannot capture audio",
+        )
+        .with_value("pw-record missing")
+        .with_action(pw_record_install_command());
+    }
     let responds = run_restricted("pw-cli", &["info", "0"], None, false)
         .is_ok_and(|outcome| outcome.success);
-    let raw = pw_record_supports_raw();
-    let path = if raw { "raw" } else { "WAV fallback" };
-    let value = match pw_record_version() {
+    let path = if mode == PwRecordProbe::Raw { "raw" } else { "WAV fallback" };
+    let value = match version {
         Some(version) => format!("{version} ({path})"),
         None => format!("({path})"),
     };
-    let detail = if raw {
+    let detail = if mode == PwRecordProbe::Raw {
         "PipeWire core responds; pw-record --raw yields headerless PCM"
     } else {
         "PipeWire core responds; pw-record lacks --raw, so the WAV container is unwrapped to PCM"
@@ -1541,12 +1616,13 @@ fn microphone_finding() -> ReadinessFinding {
             ReadinessStatus::Pass,
             "default source available",
         ),
-        Ok(_) => ReadinessFinding::new(
+        // WARN carries no action line (that is reserved for FAIL); the
+        // remediation lives in the reasoning, shown under --verbose.
+        Ok(_) => readiness(
             ReadinessCapability::Microphone,
             ReadinessStatus::Warn,
-            "no default microphone is set",
-        )
-        .with_action("connect a microphone and set it as the default source"),
+            "no default microphone is set; connect one and set it as the default source",
+        ),
         Err(_) => ReadinessFinding::new(
             ReadinessCapability::Microphone,
             ReadinessStatus::Fail,
@@ -1556,92 +1632,168 @@ fn microphone_finding() -> ReadinessFinding {
     }
 }
 
-/// A hand-written `wl-copy` wrapper (from a workaround guide) that precedes the
-/// packaged one on `PATH`. On a Wayland login it silently reroutes the Wayland
-/// clipboard through xclip and breaks it. Detected by a `wl-copy` that resolves
-/// under `$HOME` rather than a system bin.
-fn shadowing_clipboard_wrapper() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let winner = first_on_path("wl-copy")?;
-    winner.starts_with(&home).then_some(winner)
+/// Hand-written clipboard wrappers (from a workaround guide) that precede the
+/// packaged tools on `PATH`. On a Wayland login they silently reroute the
+/// Wayland clipboard through the wrong backend and break it. Detected as a
+/// `wl-copy`/`wl-paste` that resolves under `$HOME` rather than a system bin;
+/// each is reported by its exact path so remediation removes only what shadows.
+fn shadowing_clipboard_wrappers() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    ["wl-copy", "wl-paste"]
+        .into_iter()
+        .filter_map(first_on_path)
+        .filter(|winner| winner.starts_with(&home))
+        .collect()
 }
 
-/// The Clipboard check. It runs the round-trip through the backend that matches
-/// the detected session (`wl-copy`/`wl-paste` on Wayland, `xclip` on X11), and
-/// on failure prescribes the exact install command for the host package manager.
+/// POSIX single-quote a path for a copy-pasteable shell command, quoting only
+/// when the path contains characters a shell would interpret.
+fn shell_quote(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let safe = !text.is_empty()
+        && text
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-/".contains(character));
+    if safe {
+        text.into_owned()
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+}
+
+/// The outcome of round-tripping the clipboard through one backend tool.
+enum ClipboardProbe {
+    /// The round trip worked and the prior clipboard was restored (or there was
+    /// nothing to restore).
+    WorkedRestored,
+    /// The round trip worked but the prior clipboard could not be restored.
+    WorkedNotRestored,
+    /// The tool binary is not installed (its write could not even be spawned).
+    ToolMissing,
+    /// The tool ran but the round trip failed — no reachable display or the
+    /// selection never took.
+    Failed,
+}
+
+/// Round-trip the clipboard through one tool. The probe is WRITTEN first, which
+/// also establishes selection ownership, so a read-back succeeds even on a
+/// previously empty or ownerless clipboard (`xclip -out` errors with no owner).
+/// The prior value is preserved only when the initial read genuinely returned
+/// one; a failed initial read is treated as "empty", never as "unavailable".
+fn probe_clipboard_roundtrip(tool: ClipboardTool) -> ClipboardProbe {
+    let (read_program, read_arguments) = tool.read_command();
+    let (write_program, write_arguments) = tool.write_command();
+
+    let original = match run_restricted(read_program, read_arguments, None, true) {
+        Ok(outcome) if outcome.success => Some(outcome.stdout),
+        _ => None,
+    };
+
+    let probe = format!("voisu-readiness-{}", std::process::id());
+    match run_restricted_serving(write_program, write_arguments, Some(probe.as_bytes())) {
+        Ok(outcome) if outcome.success => {}
+        // A spawn failure is the only definitive "tool is not installed" signal.
+        Err(ProcessError::Unavailable) => return ClipboardProbe::ToolMissing,
+        _ => return ClipboardProbe::Failed,
+    }
+
+    let observed = run_restricted(read_program, read_arguments, None, true)
+        .ok()
+        .filter(|outcome| outcome.success)
+        .map(|outcome| outcome.stdout == probe.as_bytes())
+        .unwrap_or(false);
+    if !observed {
+        return ClipboardProbe::Failed;
+    }
+
+    // Restore the prior value, or clear the probe when there was nothing before.
+    let restore = original.clone().unwrap_or_default();
+    let restored = run_restricted_serving(write_program, write_arguments, Some(&restore))
+        .is_ok_and(|outcome| outcome.success);
+    if original.is_none() || restored {
+        ClipboardProbe::WorkedRestored
+    } else {
+        ClipboardProbe::WorkedNotRestored
+    }
+}
+
+/// The Clipboard check. It round-trips through the backend that matches the
+/// detected session (`wl-copy`/`wl-paste` on Wayland, `xclip` on X11; an Unknown
+/// session tries each in turn), and on failure prescribes the exact install
+/// command for the host package manager.
 fn clipboard_finding() -> ReadinessFinding {
     let resolution = current_session();
-    // A shadowing wrapper is a Wayland-only hazard (harmless on X11).
+    // A shadowing wrapper is a Wayland-only hazard (harmless on X11). Per the
+    // terseness contract the remediation lives in the reasoning (--verbose),
+    // naming only the exact shadowing paths, shell-quoted.
     if resolution.session == SessionKind::Wayland {
-        if let Some(shadow) = shadowing_clipboard_wrapper() {
+        let shadows = shadowing_clipboard_wrappers();
+        if !shadows.is_empty() {
+            let names = shadows
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" and ");
+            let removal = shadows
+                .iter()
+                .map(|path| shell_quote(path))
+                .collect::<Vec<_>>()
+                .join(" ");
             return ReadinessFinding::new(
                 ReadinessCapability::Clipboard,
                 ReadinessStatus::Warn,
                 format!(
-                    "{} shadows the packaged wl-copy and reroutes the Wayland clipboard",
-                    shadow.display()
+                    "{names} shadow the packaged wl-clipboard on PATH and reroute the Wayland \
+                     clipboard through the wrong backend; remove with: rm {removal}"
                 ),
             )
-            .with_value("shadowed wrapper")
-            .with_action("rm ~/.local/bin/wl-copy ~/.local/bin/wl-paste");
+            .with_value("shadowed wrapper");
         }
     }
+
     let candidates = clipboard_candidates(resolution.session);
+    let mut a_tool_was_present = false;
     for tool in candidates {
-        let (read_program, read_arguments) = tool.read_command();
-        let original = match run_restricted(read_program, read_arguments, None, true) {
-            Ok(outcome) if outcome.success => outcome.stdout,
-            // This backend cannot read the clipboard (tool missing or wrong
-            // session); try the next candidate before declaring failure.
-            _ => continue,
-        };
-        let probe = format!("voisu-readiness-{}", std::process::id());
-        let (write_program, write_arguments) = tool.write_command();
-        let copied = run_restricted_serving(write_program, write_arguments, Some(probe.as_bytes()))
-            .is_ok_and(|outcome| outcome.success);
-        let observed = run_restricted(read_program, read_arguments, None, true)
-            .ok()
-            .filter(|outcome| outcome.success)
-            .map(|outcome| outcome.stdout == probe.as_bytes())
-            .unwrap_or(false);
-        let restored = run_restricted_serving(write_program, write_arguments, Some(&original))
-            .is_ok_and(|outcome| outcome.success);
-        return match (copied && observed, restored) {
-            (true, true) => readiness(
-                ReadinessCapability::Clipboard,
-                ReadinessStatus::Pass,
-                "clipboard roundtrip succeeds and the prior clipboard was restored",
-            ),
-            (true, false) => readiness(
-                ReadinessCapability::Clipboard,
-                ReadinessStatus::Warn,
-                "clipboard roundtrip succeeds but the prior clipboard could not be restored",
-            ),
-            _ => ReadinessFinding::new(
-                ReadinessCapability::Clipboard,
-                ReadinessStatus::Fail,
-                "clipboard roundtrip failed",
-            )
-            .with_action(install_instruction(
-                detect_package_manager(),
-                tool.install_package(),
-            )),
-        };
+        match probe_clipboard_roundtrip(*tool) {
+            ClipboardProbe::WorkedRestored => {
+                return readiness(
+                    ReadinessCapability::Clipboard,
+                    ReadinessStatus::Pass,
+                    "clipboard roundtrip succeeds and the prior clipboard was restored",
+                );
+            }
+            ClipboardProbe::WorkedNotRestored => {
+                return readiness(
+                    ReadinessCapability::Clipboard,
+                    ReadinessStatus::Warn,
+                    "clipboard roundtrip succeeds but the prior clipboard could not be restored",
+                );
+            }
+            // Present-but-broken and missing both continue to the next
+            // candidate; only the final message distinguishes them.
+            ClipboardProbe::Failed => {
+                a_tool_was_present = true;
+            }
+            ClipboardProbe::ToolMissing => {}
+        }
     }
-    // No backend for this session could even read the clipboard.
+
     let primary = candidates
         .first()
         .copied()
         .unwrap_or(ClipboardTool::WlClipboard);
-    ReadinessFinding::new(
-        ReadinessCapability::Clipboard,
-        ReadinessStatus::Fail,
-        "no clipboard backend is available for this session",
-    )
-    .with_action(install_instruction(
-        detect_package_manager(),
-        primary.install_package(),
-    ))
+    let detail = if a_tool_was_present {
+        "the clipboard tool ran but the roundtrip failed — no reachable display or selection owner"
+    } else {
+        "no clipboard backend is installed for this session"
+    };
+    ReadinessFinding::new(ReadinessCapability::Clipboard, ReadinessStatus::Fail, detail)
+        .with_action(install_instruction(
+            detect_package_manager(),
+            primary.install_package(),
+        ))
 }
 
 fn secret_service_finding() -> ReadinessFinding {
@@ -1657,12 +1809,11 @@ fn secret_service_finding() -> ReadinessFinding {
             ReadinessStatus::Pass,
             "Secret Service is reachable",
         ),
-        Ok(_) => ReadinessFinding::new(
+        Ok(_) => readiness(
             ReadinessCapability::SecretStorage,
             ReadinessStatus::Warn,
-            "Secret Service reported an error",
-        )
-        .with_action("unlock the keyring or log in to the desktop session"),
+            "Secret Service reported an error; unlock the keyring or log in to the desktop session",
+        ),
         Err(_) => ReadinessFinding::new(
             ReadinessCapability::SecretStorage,
             ReadinessStatus::Fail,
@@ -1706,12 +1857,14 @@ fn portals_finding() -> ReadinessFinding {
         // reasoning moves to --verbose. On a desktop without portal
         // GlobalShortcuts (Cinnamon/X11, plain wlroots) the Trigger Key is bound
         // through a desktop Custom Shortcut running `voisu toggle`.
-        ReadinessFinding::new(
+        // WARN carries no action line; the remediation (install the Hyprland
+        // portal, or bind a desktop Custom Shortcut to `voisu toggle`) is in the
+        // reasoning, shown under --verbose.
+        readiness(
             ReadinessCapability::Portals,
             ReadinessStatus::Warn,
-            "the desktop portal exposes no GlobalShortcuts interface, so Voisu cannot bind the Trigger Key itself; on Hyprland install xdg-desktop-portal-hyprland, and on Cinnamon/X11 bind a desktop Custom Shortcut to run the toggle command",
+            "the desktop portal exposes no GlobalShortcuts interface, so Voisu cannot bind the Trigger Key itself; on Hyprland install xdg-desktop-portal-hyprland, and on Cinnamon/X11 bind a desktop Custom Shortcut to run: voisu toggle",
         )
-        .with_action("bind a desktop shortcut to run: voisu toggle")
     }
 }
 
@@ -1911,6 +2064,17 @@ fn run_restricted_serving(
     arguments: &[&str],
     input: Option<&[u8]>,
 ) -> Result<ProcessOutcome, ProcessError> {
+    run_restricted_serving_within(program, arguments, input, PROCESS_DEADLINE)
+}
+
+/// As [`run_restricted_serving`], but bounded by an explicit deadline so a
+/// shared budget can span several candidate backends (see `clipboard_write`).
+fn run_restricted_serving_within(
+    program: &str,
+    arguments: &[&str],
+    input: Option<&[u8]>,
+    deadline: Duration,
+) -> Result<ProcessOutcome, ProcessError> {
     let started = Instant::now();
     let mut command = restricted_command(program);
     command
@@ -1931,8 +2095,8 @@ fn run_restricted_serving(
         }
         None => None,
     };
-    let status = wait_for_child(&mut child, started, PROCESS_DEADLINE, None);
-    let writer = writer.map(|handle| bounded_join(handle, started, &mut child, PROCESS_DEADLINE));
+    let status = wait_for_child(&mut child, started, deadline, None);
+    let writer = writer.map(|handle| bounded_join(handle, started, &mut child, deadline));
     let status = status?;
     if let Some(writer) = writer {
         match writer {
@@ -2122,35 +2286,60 @@ struct CaptureReaderState {
     error: Option<String>,
 }
 
-/// Whether the host's `pw-record` understands `--raw` (headerless PCM on
-/// stdout). The flag is a *newer* PipeWire option — absent on 1.0.5, which is
-/// what Ubuntu 24.04 LTS ships — so passing it there makes `pw-record` reject
-/// the whole invocation. Probed once by parsing `pw-record --help` and cached
-/// for the process lifetime; a version-number comparison was rejected as
-/// fragile across distro backports. `VOISU_TEST_PW_RECORD_RAW` forces the
-/// answer for hermetic tests.
-fn pw_record_supports_raw() -> bool {
-    static SUPPORTS_RAW: OnceLock<bool> = OnceLock::new();
-    *SUPPORTS_RAW.get_or_init(|| {
+/// The capture mode the host's `pw-record` supports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PwRecordProbe {
+    /// `pw-record` could not be run at all (missing/broken).
+    Unavailable,
+    /// `--raw` is understood: headerless PCM on stdout (PipeWire >= 1.1, Fedora).
+    Raw,
+    /// `--raw` is absent (PipeWire 1.0.5, Ubuntu 24.04): `pw-record` wraps the
+    /// PCM in a WAV container that must be unwrapped.
+    Wav,
+}
+
+/// Probe the host `pw-record` once, caching for the process lifetime. `--raw`
+/// is a *newer* PipeWire option — absent on 1.0.5, what Ubuntu 24.04 LTS ships
+/// — so passing it there makes `pw-record` reject the whole invocation. A
+/// version-number comparison was rejected as fragile across distro backports;
+/// this parses `pw-record --help` for an exact `--raw` option token.
+/// `VOISU_TEST_PW_RECORD_RAW` forces the answer for hermetic tests.
+fn pw_record_capture_mode() -> PwRecordProbe {
+    static MODE: OnceLock<PwRecordProbe> = OnceLock::new();
+    *MODE.get_or_init(|| {
         if let Some(forced) = std::env::var_os("VOISU_TEST_PW_RECORD_RAW") {
-            return forced == "1" || forced.eq_ignore_ascii_case("true");
+            match forced.to_string_lossy().trim() {
+                "0" | "wav" => return PwRecordProbe::Wav,
+                "unavailable" => return PwRecordProbe::Unavailable,
+                // `probe` exercises the real `pw-record --help` parse below
+                // against a fake pw-record; anything else forces the raw path.
+                "probe" => {}
+                _ => return PwRecordProbe::Raw,
+            }
         }
         // `--help` may print to either stream and exit nonzero on some builds;
-        // inspect both regardless of exit status. When it cannot be read at all
-        // (pw-record missing/broken), assume no `--raw`: the WAV path works on
-        // every PipeWire version, so it is the safe default, and a truly absent
-        // pw-record fails capture regardless.
+        // inspect both regardless of exit status. A spawn failure (Err) means
+        // pw-record cannot be run at all.
         match run_restricted("pw-record", &["--help"], None, true) {
             Ok(outcome) => {
-                pw_help_mentions_raw(&outcome.stdout) || pw_help_mentions_raw(&outcome.stderr)
+                if help_advertises_raw(&outcome.stdout) || help_advertises_raw(&outcome.stderr) {
+                    PwRecordProbe::Raw
+                } else {
+                    PwRecordProbe::Wav
+                }
             }
-            Err(_) => false,
+            Err(_) => PwRecordProbe::Unavailable,
         }
     })
 }
 
-fn pw_help_mentions_raw(help: &[u8]) -> bool {
-    String::from_utf8_lossy(help).contains("--raw")
+/// True only when the help text lists `--raw` as an exact option token. Splitting
+/// on option separators (whitespace, `,`, `=`) rejects near-matches like
+/// `--raw-file` and `--rawmode` that a substring search would accept.
+fn help_advertises_raw(help: &[u8]) -> bool {
+    String::from_utf8_lossy(help)
+        .split(|character: char| character.is_whitespace() || character == ',' || character == '=')
+        .any(|token| token == "--raw")
 }
 
 /// Strips the RIFF/WAVE framing from `pw-record` output when the tool lacks
@@ -2227,11 +2416,13 @@ impl<R: Read> Read for WavHeaderStripper<R> {
 
 impl AudioCapture for PipeWireCapture {
     fn begin(&mut self, _recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError> {
-        let raw_supported = pw_record_supports_raw();
-        let mut command = restricted_command("pw-record");
         // `--raw` yields headerless PCM directly (the Fedora path); without it
         // pw-record wraps the same PCM in a WAV container that WavHeaderStripper
-        // unwraps below. The remaining flags are identical on both paths.
+        // unwraps below. The remaining flags are identical on both paths. An
+        // Unavailable probe still takes the WAV path — the spawn below fails
+        // cleanly if pw-record is truly missing.
+        let raw_supported = pw_record_capture_mode() == PwRecordProbe::Raw;
+        let mut command = restricted_command("pw-record");
         if raw_supported {
             command.arg("--raw");
         }
@@ -4218,22 +4409,36 @@ fn terminal_remote_desktop_failure(reason: &str) -> bool {
 
 pub struct WlClipboard;
 
+/// The total budget for the clipboard-write candidate loop: an Unknown session
+/// may try Wayland then X11, and neither a failure nor a timeout on the first
+/// backend may stop the second — but the whole loop stays bounded.
+const CLIPBOARD_WRITE_DEADLINE: Duration = Duration::from_secs(4);
+
 /// Write the Transcript to the clipboard through the backend that matches the
 /// detected session, keeping the resident-serving semantics both stacks need
 /// (`wl-copy` forks a serving child; `xclip` stays resident as the ICCCM
-/// selection owner). Returns which tool succeeded, or the last error.
+/// selection owner). Candidates are tried in order under one shared deadline;
+/// the loop continues past every backend-specific failure — including a timeout
+/// — so an Unknown session still reaches X11 after Wayland fails. Returns which
+/// tool succeeded, or the last error.
 fn clipboard_write(text: &[u8]) -> Result<ClipboardTool, ProcessError> {
     let session = current_session().session;
+    let started = Instant::now();
     let mut last_error = ProcessError::Unavailable;
     for tool in clipboard_candidates(session) {
+        let remaining = CLIPBOARD_WRITE_DEADLINE.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            last_error = ProcessError::TimedOut;
+            break;
+        }
         let (program, arguments) = tool.write_command();
-        match run_restricted_serving(program, arguments, Some(text)) {
+        match run_restricted_serving_within(program, arguments, Some(text), remaining) {
             Ok(outcome) if outcome.success => return Ok(*tool),
-            // A deadline is not a "wrong backend" signal; surface it rather than
-            // masking it behind the next candidate.
-            Err(ProcessError::TimedOut) => return Err(ProcessError::TimedOut),
-            Ok(_) => last_error = ProcessError::Output,
+            // Every backend-specific failure — a wrong session, a missing tool,
+            // even a timeout — falls through to the next candidate rather than
+            // stopping the loop.
             Err(error) => last_error = error,
+            Ok(_) => last_error = ProcessError::Output,
         }
     }
     Err(last_error)
@@ -5669,14 +5874,37 @@ mod tests {
     use voisu_core::{ProviderCoordinator, ProviderStreams};
 
     #[test]
+    fn manager_env_missing_display_is_detected_from_show_environment() {
+        let present = "LANG=en_US.UTF-8\nWAYLAND_DISPLAY=wayland-0\nDISPLAY=:0\n";
+        assert!(manager_env_has(present, "WAYLAND_DISPLAY"));
+        assert!(manager_env_has(present, "DISPLAY"));
+        // Absent, and set-but-empty, both read as missing.
+        let missing = "LANG=en_US.UTF-8\nDISPLAY=\n";
+        assert!(!manager_env_has(missing, "WAYLAND_DISPLAY"));
+        assert!(!manager_env_has(missing, "DISPLAY"));
+    }
+
+    #[test]
     fn pw_help_token_detects_raw_support() {
-        assert!(pw_help_mentions_raw(
+        assert!(help_advertises_raw(
             b"  -a, --raw     RAW mode (no header)\n  -h, --help\n"
         ));
+        // An `=`-attached value form still exposes the exact option token.
+        assert!(help_advertises_raw(b"      --raw=MODE   raw capture\n"));
         // PipeWire 1.0.5-era help never mentions --raw.
-        assert!(!pw_help_mentions_raw(
+        assert!(!help_advertises_raw(
             b"  -R, --remote  Remote daemon\n  -h, --help\n"
         ));
+    }
+
+    #[test]
+    fn pw_help_rejects_raw_near_matches() {
+        // A different option that merely starts with the same letters must not
+        // be mistaken for --raw support.
+        assert!(!help_advertises_raw(b"      --raw-file FILE   write raw to FILE\n"));
+        assert!(!help_advertises_raw(b"      --rawmode        legacy\n"));
+        // Substring inside another word must not match either.
+        assert!(!help_advertises_raw(b"  see the xyz--rawabc note\n"));
     }
 
     fn canonical_wav_with_payload(payload: &[u8]) -> Vec<u8> {

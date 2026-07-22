@@ -25,31 +25,60 @@ pub struct SessionResolution {
     pub xwayland_fallback: bool,
 }
 
-/// Resolve the session from the three facts that decide it: whether a Wayland
-/// display is advertised, whether an X11 display is advertised, and what
-/// `XDG_SESSION_TYPE` claims (if anything). This is the single source of truth
-/// lifted out of the overlay so the clipboard backend, the feedback ladder, and
-/// `doctor` all agree.
+/// Resolve the session from the three facts that decide it: the value (if any)
+/// of the Wayland display variable, the X11 display variable, and
+/// `XDG_SESSION_TYPE`. This is the single source of truth lifted out of the
+/// overlay so the clipboard backend, the feedback ladder, and `doctor` all
+/// agree.
+///
+/// An **empty** variable is treated as absent — a set-but-empty `DISPLAY` names
+/// no endpoint. A session that a variable **declares** but whose display
+/// endpoint is missing resolves to `Unknown`, not to that kind: an X11 service
+/// with `XDG_SESSION_TYPE=x11` but no `DISPLAY` has no X server to reach, so
+/// committing to `xclip` there would fail with no fallback. `Unknown` correctly
+/// makes callers try every backend.
 pub fn resolve_session(
-    wayland_display: bool,
-    x11_display: bool,
+    wayland_display: Option<&str>,
+    x11_display: Option<&str>,
     session_type: Option<&str>,
 ) -> SessionResolution {
-    let declared_wayland =
-        matches!(session_type, Some(value) if value.eq_ignore_ascii_case("wayland"));
-    let xwayland_fallback = declared_wayland && !wayland_display && x11_display;
-    let session = if xwayland_fallback {
+    let wayland = is_present(wayland_display);
+    let x11 = is_present(x11_display);
+    let declared = session_type.filter(|value| !value.is_empty());
+    let declared_wayland = matches!(declared, Some(value) if value.eq_ignore_ascii_case("wayland"));
+    let declared_x11 = matches!(declared, Some(value) if value.eq_ignore_ascii_case("x11"));
+
+    // A declared-Wayland session with no Wayland display but a live X11 one is
+    // presenting through XWayland — an X11 endpoint that is real to reach.
+    let xwayland_fallback = declared_wayland && !wayland && x11;
+
+    let session = if declared_wayland {
+        if wayland {
+            SessionKind::Wayland
+        } else if x11 {
+            SessionKind::X11
+        } else {
+            SessionKind::Unknown
+        }
+    } else if declared_x11 {
+        if x11 {
+            SessionKind::X11
+        } else {
+            SessionKind::Unknown
+        }
+    } else if wayland {
+        SessionKind::Wayland
+    } else if x11 {
         SessionKind::X11
     } else {
-        match session_type {
-            Some(value) if value.eq_ignore_ascii_case("wayland") => SessionKind::Wayland,
-            Some(value) if value.eq_ignore_ascii_case("x11") => SessionKind::X11,
-            _ if wayland_display => SessionKind::Wayland,
-            _ if x11_display => SessionKind::X11,
-            _ => SessionKind::Unknown,
-        }
+        SessionKind::Unknown
     };
     SessionResolution { session, xwayland_fallback }
+}
+
+/// A variable counts as present only when it is set to a non-empty value.
+fn is_present(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
 }
 
 /// A clipboard command-line tool. Kept as a subprocess boundary (never moved
@@ -159,11 +188,11 @@ mod tests {
     #[test]
     fn explicit_session_type_wins_over_display_variables() {
         assert_eq!(
-            resolve_session(true, true, Some("x11")).session,
+            resolve_session(Some(":1"), Some(":0"), Some("x11")).session,
             SessionKind::X11
         );
         assert_eq!(
-            resolve_session(true, true, Some("wayland")).session,
+            resolve_session(Some("wayland-0"), Some(":0"), Some("wayland")).session,
             SessionKind::Wayland
         );
     }
@@ -171,33 +200,54 @@ mod tests {
     #[test]
     fn display_variables_decide_when_session_type_is_unset() {
         assert_eq!(
-            resolve_session(true, false, None).session,
+            resolve_session(Some("wayland-0"), None, None).session,
             SessionKind::Wayland
         );
         assert_eq!(
-            resolve_session(false, true, None).session,
+            resolve_session(None, Some(":0"), None).session,
             SessionKind::X11
         );
         assert_eq!(
-            resolve_session(false, false, None).session,
+            resolve_session(None, None, None).session,
             SessionKind::Unknown
         );
     }
 
     #[test]
     fn declared_wayland_without_a_wayland_display_falls_back_to_x11() {
-        let resolution = resolve_session(false, true, Some("wayland"));
+        let resolution = resolve_session(None, Some(":0"), Some("wayland"));
         assert_eq!(resolution.session, SessionKind::X11);
         assert!(resolution.xwayland_fallback);
     }
 
     #[test]
-    fn contradictory_wayland_claim_without_any_display_is_wayland_not_a_fallback() {
-        // XDG_SESSION_TYPE=wayland but neither display advertised: honor the
-        // claim (Wayland), and it is not an XWayland fallback because no X11
-        // display exists to fall back to.
-        let resolution = resolve_session(false, false, Some("wayland"));
-        assert_eq!(resolution.session, SessionKind::Wayland);
+    fn empty_values_are_treated_as_absent() {
+        // A set-but-empty DISPLAY names no X server; with an empty Wayland
+        // display too, nothing is reachable.
+        assert_eq!(
+            resolve_session(Some(""), Some(""), None).session,
+            SessionKind::Unknown
+        );
+        // Empty Wayland display but a real X11 one is an X11 session.
+        assert_eq!(
+            resolve_session(Some(""), Some(":0"), None).session,
+            SessionKind::X11
+        );
+    }
+
+    #[test]
+    fn a_declared_session_missing_its_display_endpoint_is_unknown() {
+        // XDG_SESSION_TYPE=x11 but no DISPLAY: no X server to reach, so
+        // committing to xclip would fail with no fallback. Unknown makes the
+        // caller try every backend instead.
+        assert_eq!(
+            resolve_session(None, None, Some("x11")).session,
+            SessionKind::Unknown
+        );
+        // XDG_SESSION_TYPE=wayland but neither display advertised: likewise
+        // Unknown, and never an XWayland fallback (no X11 endpoint to use).
+        let resolution = resolve_session(None, None, Some("wayland"));
+        assert_eq!(resolution.session, SessionKind::Unknown);
         assert!(!resolution.xwayland_fallback);
     }
 

@@ -566,6 +566,205 @@ cat > "$dir/clipboard"
 }
 
 #[test]
+fn pw_record_without_raw_emits_a_wav_that_is_stripped_to_pcm_before_the_provider() {
+    // The Ubuntu 24.04 / PipeWire 1.0.5 shape: `pw-record --help` lacks `--raw`,
+    // so the daemon invokes pw-record WITHOUT it and pw-record emits a WAV
+    // container. The capture must unwrap that to headerless PCM before any
+    // provider sees it. Decisive proof: the Deepgram mock captures the streamed
+    // bytes, which must equal the PCM payload exactly — no leading RIFF header.
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        // --help advertises NO --raw (1.0.5-era). The capture invocation emits a
+        // canonical 44-byte WAV header (fmt: PCM/mono/16 kHz/16-bit, byte rate
+        // 32000, block align 2) followed by 64000 position-derived PCM bytes.
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$@" > "$dir/pw-record.args"
+case "$1" in
+  --help)
+    printf 'pw-record - capture to stdout\n  --rate RATE\n  --channels N\n  --format FMT\n  -h, --help  show help\n'
+    exit 0
+    ;;
+esac
+i=0
+while [ "$i" -lt 256 ]; do printf "\\$(printf '%03o' "$i")"; i=$((i + 1)); done > "$dir/pcm-cycle"
+i=0
+while [ "$i" -lt 250 ]; do cat "$dir/pcm-cycle"; i=$((i + 1)); done > "$dir/pcm-full"
+printf 'RIFF'; printf '\377\377\377\377'; printf 'WAVE'
+printf 'fmt '; printf '\020\000\000\000'
+printf '\001\000'; printf '\001\000'
+printf '\200\076\000\000'
+printf '\000\175\000\000'
+printf '\002\000'; printf '\020\000'
+printf 'data'; printf '\377\377\377\377'
+cat "$dir/pcm-full"
+trap 'exit 0' INT TERM
+: > "$dir/pw-record.ready"
+i=0
+while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+cat > /dev/null
+printf '{"text":"hello from Groq"}'
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+cat > "$dir/clipboard"
+"#,
+    );
+    let deepgram_endpoint = spawn_mock_deepgram(
+        commands.path(),
+        MockDeepgramBehavior::Finalize("hello from Deepgram"),
+    );
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            // Run the REAL --raw probe against the fake pw-record (whose --help
+            // lacks --raw), rather than forcing the raw path.
+            ("VOISU_TEST_PW_RECORD_RAW", "probe"),
+            ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
+            ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
+            ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", "https://groq.test/audio/transcriptions"),
+            ("VOISU_RECORDING_DEADLINE_MS", "5000"),
+        ],
+    );
+
+    let started = voisu(runtime.path(), "start");
+    assert!(started.status.success(), "{}", stderr(&started));
+    wait_for_marker(commands.path(), "deepgram.ready");
+    wait_for_marker(commands.path(), "pw-record.ready");
+    let stopped = voisu(runtime.path(), "stop");
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+
+    // No --raw was passed (that is the whole point of the WAV path).
+    let pw_args = fs::read_to_string(commands.path().join("pw-record.args")).unwrap();
+    assert!(!pw_args.contains("--raw"), "pw-record must be invoked without --raw: {pw_args}");
+
+    // The provider received exactly the PCM payload — the 44-byte RIFF/WAVE
+    // header was stripped. A byte-for-byte match rules out both a leaked header
+    // and any corruption of the payload.
+    let expected: Vec<u8> = (0..64000_usize).map(|index| (index % 256) as u8).collect();
+    let received = fs::read(commands.path().join("deepgram.audio")).unwrap();
+    assert!(
+        !received.starts_with(b"RIFF"),
+        "the WAV header must not reach the provider"
+    );
+    assert_eq!(received, expected, "the provider must receive the stripped PCM byte for byte");
+}
+
+#[test]
+fn x11_session_delivers_the_transcript_through_xclip_with_display_credentials() {
+    // On an X11 session the clipboard backend is xclip, not wl-copy, and the
+    // spawned helper must receive DISPLAY and XAUTHORITY (forwarded through the
+    // restricted-command allowlist) or it can never reach the X server.
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    let xauthority = commands.path().join("xauth-test");
+    fs::write(&xauthority, "fake-x-cookie").unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+head -c 6400 /dev/zero | tr '\000' '\001'
+trap 'exit 0' INT TERM
+: > "$dir/pw-record.ready"
+i=0
+while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+cat > /dev/null
+printf '{"text":"hello from Groq"}'
+"#,
+    );
+    // Real xclip -in reads the selection from stdin and forks a resident child
+    // that owns the selection after the parent exits; the fake mirrors that.
+    write_fake_command(
+        commands.path(),
+        "xclip",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$@" > "$dir/xclip.args"
+env | sort > "$dir/xclip.env"
+cat > "$dir/xclip.stdin"
+/usr/bin/sleep 10 &
+"#,
+    );
+    // A wl-copy that records if it is ever called — it must not be, on X11.
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+: > "$dir/wl-copy.invoked"
+cat > /dev/null
+"#,
+    );
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            // An X11 login: session type declared, X display and auth present.
+            ("XDG_SESSION_TYPE", "x11"),
+            ("DISPLAY", ":0"),
+            ("XAUTHORITY", xauthority.to_str().unwrap()),
+            ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", "https://groq.test/audio/transcriptions"),
+            ("VOISU_RECORDING_DEADLINE_MS", "5000"),
+        ],
+    );
+
+    let started = voisu(runtime.path(), "start");
+    assert!(started.status.success(), "{}", stderr(&started));
+    wait_for_marker(commands.path(), "pw-record.ready");
+    let stopped = voisu(runtime.path(), "stop");
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+
+    // The transcript reached xclip on its stdin, with the fixed clipboard argv.
+    assert_eq!(
+        fs::read_to_string(commands.path().join("xclip.stdin")).unwrap(),
+        "hello from Groq"
+    );
+    assert_eq!(
+        fs::read_to_string(commands.path().join("xclip.args")).unwrap(),
+        "-selection\nclipboard\n-in\n"
+    );
+    // DISPLAY and XAUTHORITY were forwarded so the helper can reach the server.
+    let xclip_env = fs::read_to_string(commands.path().join("xclip.env")).unwrap();
+    assert!(xclip_env.contains("DISPLAY=:0"), "{xclip_env}");
+    assert!(
+        xclip_env.contains(&format!("XAUTHORITY={}", xauthority.display())),
+        "{xclip_env}"
+    );
+    // No provider secret leaks into the helper environment.
+    assert!(!xclip_env.contains("VOISU_GROQ_API_KEY="), "{xclip_env}");
+    // wl-copy is the Wayland backend and must never be tried on an X11 session.
+    assert!(
+        !commands.path().join("wl-copy.invoked").exists(),
+        "wl-copy must not be invoked on X11"
+    );
+}
+
+#[test]
 fn dictionary_edits_between_recordings_reach_the_next_deepgram_and_whisper_snapshot() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
@@ -2550,21 +2749,67 @@ fn doctor_reports_each_fedora_capability_through_the_public_cli() {
         .expect("doctor should run");
 
     assert!(doctor.status.success(), "{}", stderr(&doctor));
-    // Golden: one terse line per check (`label  value  STATUS`), no reasoning
-    // paragraphs, no action lines when everything passes. `line` mirrors the
-    // production column widths (15 / 18) so a layout regression is caught.
-    let line = |label: &str, value: &str, status: &str| {
-        format!("{label:<15}{value:<18}{status}\n")
-    };
+    // Golden: one terse line per check (`label  value  STATUS`), including the
+    // Focus guard, no reasoning paragraphs, no action lines when everything
+    // passes. `doctor_line` mirrors the production column widths (15 / 20) and
+    // the two-space gutters so a layout regression is caught.
     let expected = format!(
-        "{}{}{}{}{}{}{}Focus guard: hyprland\n",
-        line("Session", "Wayland (KDE)", "PASS"),
-        line("PipeWire", "1.4.11 (raw)", "PASS"),
-        line("Microphone", "", "PASS"),
-        line("Portals", "", "PASS"),
-        line("Clipboard", "", "PASS"),
-        line("Secret storage", "", "PASS"),
-        line("Daemon", "", "PASS"),
+        "{}{}{}{}{}{}{}{}",
+        doctor_line("Session", "Wayland (KDE)", "PASS"),
+        doctor_line("PipeWire", "1.4.11 (raw)", "PASS"),
+        doctor_line("Microphone", "", "PASS"),
+        doctor_line("Portals", "", "PASS"),
+        doctor_line("Clipboard", "", "PASS"),
+        doctor_line("Secret storage", "", "PASS"),
+        doctor_line("Daemon", "", "PASS"),
+        doctor_line("Focus guard", "hyprland", "PASS"),
+    );
+    assert_eq!(stdout(&doctor), expected);
+}
+
+/// One terse doctor line as the production formatter renders it: label padded to
+/// 15, value padded to 20, two-space gutters, then STATUS.
+fn doctor_line(label: &str, value: &str, status: &str) -> String {
+    format!("{label:<15}  {value:<20}  {status}\n")
+}
+
+#[test]
+fn doctor_golden_covers_every_check_including_focus_and_provider_keys() {
+    // The terseness contract applies to EVERY check, not just the capability
+    // group: the focus guard and both provider-key checks are the same one-line
+    // shape. Provider outcomes are pinned through the test auth seams, so no
+    // network is touched and the whole table is deterministic.
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
+            ("VOISU_TEST_SECRET_STORE", "available"),
+            ("VOISU_TEST_STORED_DEEPGRAM_CREDENTIAL", "deepgram-key"),
+            ("VOISU_TEST_STORED_GROQ_CREDENTIAL", "groq-key"),
+            ("VOISU_TEST_AUTH_DEEPGRAM", "authorized"),
+            ("VOISU_TEST_AUTH_GROQ", "authorized"),
+        ],
+    );
+
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    let expected = format!(
+        "{}{}{}{}{}{}{}{}{}{}",
+        doctor_line("Session", "Wayland (KDE)", "PASS"),
+        doctor_line("PipeWire", "1.4.11 (raw)", "PASS"),
+        doctor_line("Microphone", "", "PASS"),
+        doctor_line("Portals", "", "PASS"),
+        doctor_line("Clipboard", "", "PASS"),
+        doctor_line("Secret storage", "", "PASS"),
+        doctor_line("Daemon", "", "PASS"),
+        doctor_line("Focus guard", "hyprland", "PASS"),
+        doctor_line("Deepgram key", "valid", "PASS"),
+        doctor_line("Groq key", "valid", "PASS"),
     );
     assert_eq!(stdout(&doctor), expected);
 }
@@ -2582,12 +2827,26 @@ fn doctor_explains_that_guarded_delivery_fails_closed_without_a_focus_backend() 
         ],
     );
 
+    // The focus guard is now a structured check like any other: one terse line,
+    // WARN, with the reasoning behind --verbose.
     assert!(
-        stdout(&doctor).contains(
-            "Focus guard: none (guarded Delivery fails closed to the clipboard)\n"
-        ),
+        stdout(&doctor).contains(&doctor_line("Focus guard", "none", "WARN")),
         "{}",
         stdout(&doctor)
+    );
+    let verbose = voisu_with_env(
+        runtime.path(),
+        &["doctor", "--verbose"],
+        &[
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "none"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
+    );
+    assert!(
+        stdout(&verbose).contains("guarded Delivery fails closed to the clipboard"),
+        "{}",
+        stdout(&verbose)
     );
 }
 
@@ -2606,17 +2865,14 @@ fn doctor_exposes_actionable_warn_and_fail_outcomes() {
         ],
     );
 
-    let line = |label: &str, value: &str, status: &str| {
-        format!("{label:<15}{value:<18}{status}\n")
-    };
     assert_eq!(doctor.status.code(), Some(4));
     let output = stdout(&doctor);
     // A FAIL check prints its status line and an indented action line.
-    assert!(output.contains(&line("PipeWire", "1.4.11 (raw)", "FAIL")), "{output}");
+    assert!(output.contains(&doctor_line("PipeWire", "1.4.11 (raw)", "FAIL")), "{output}");
     assert!(output.contains("\n    run the printed remediation command\n"), "{output}");
-    // A WARN with no action prints just the one line.
-    assert!(output.contains(&line("Clipboard", "", "WARN")), "{output}");
-    assert!(output.contains(&line("Daemon", "", "FAIL")), "{output}");
+    // A WARN prints just the one line — no action, even though it has one.
+    assert!(output.contains(&doctor_line("Clipboard", "", "WARN")), "{output}");
+    assert!(output.contains(&doctor_line("Daemon", "", "FAIL")), "{output}");
     assert!(
         output.contains("\n    start voisu-daemon and run voisu doctor again\n"),
         "{output}"
@@ -2643,7 +2899,7 @@ fn doctor_points_at_the_journal_when_the_service_unit_is_failed() {
     assert_eq!(doctor.status.code(), Some(4));
     let output = stdout(&doctor);
     // The terse Daemon FAIL line plus the journal action on its own indented line.
-    assert!(output.contains(&format!("{:<15}{:<18}FAIL\n", "Daemon", "")), "{output}");
+    assert!(output.contains(&doctor_line("Daemon", "", "FAIL")), "{output}");
     assert!(
         output.contains("\n    journalctl --user -u voisu.service\n"),
         "{output}"
@@ -2665,12 +2921,13 @@ fn doctor_warns_when_the_portal_exposes_no_global_shortcuts() {
         &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
     );
 
-    // Terse: the WARN line carries no reasoning, and the remediation is a single
-    // indented action line.
+    // Terse: the WARN line carries no reasoning and no action line (actions are
+    // reserved for FAIL).
     let out = stdout(&doctor);
-    assert!(out.contains(&format!("{:<15}{:<18}WARN\n", "Portals", "")), "{out}");
-    assert!(out.contains("\n    bind a desktop shortcut to run: voisu toggle\n"), "{out}");
-    // The reasoning (GlobalShortcuts / Hyprland) moves behind --verbose.
+    assert!(out.contains(&doctor_line("Portals", "", "WARN")), "{out}");
+    assert!(!out.contains("voisu toggle"), "no action/reasoning on a terse WARN: {out}");
+    // The reasoning (GlobalShortcuts / Hyprland / the toggle recipe) moves behind
+    // --verbose.
     let verbose = voisu_with_env(
         runtime.path(),
         &["doctor", "--verbose"],
@@ -2679,6 +2936,7 @@ fn doctor_warns_when_the_portal_exposes_no_global_shortcuts() {
     let verbose_out = stdout(&verbose);
     assert!(verbose_out.contains("no GlobalShortcuts interface"), "{verbose_out}");
     assert!(verbose_out.contains("xdg-desktop-portal-hyprland"), "{verbose_out}");
+    assert!(verbose_out.contains("voisu toggle"), "{verbose_out}");
 }
 
 #[test]
@@ -2695,7 +2953,7 @@ fn doctor_passes_portals_when_global_shortcuts_are_available() {
     );
 
     assert!(
-        stdout(&doctor).contains(&format!("{:<15}{:<18}PASS\n", "Portals", "")),
+        stdout(&doctor).contains(&doctor_line("Portals", "", "PASS")),
         "{}",
         stdout(&doctor)
     );
@@ -2732,9 +2990,9 @@ fn doctor_exercises_real_capabilities_instead_of_command_headings_or_socket_conn
         fs::read_to_string(commands.bin.path().join("clipboard")).unwrap(),
         "prior clipboard"
     );
-    assert!(stdout(&doctor).contains(&format!("{:<15}{:<18}PASS\n", "Microphone", "")));
-    assert!(stdout(&doctor).contains(&format!("{:<15}{:<18}PASS\n", "Clipboard", "")));
-    assert!(stdout(&doctor).contains(&format!("{:<15}{:<18}PASS\n", "Daemon", "")));
+    assert!(stdout(&doctor).contains(&doctor_line("Microphone", "", "PASS")));
+    assert!(stdout(&doctor).contains(&doctor_line("Clipboard", "", "PASS")));
+    assert!(stdout(&doctor).contains(&doctor_line("Daemon", "", "PASS")));
 }
 
 #[test]
@@ -2754,7 +3012,7 @@ fn doctor_clipboard_passes_while_wl_copy_serves_the_clipboard_past_exit() {
 
     assert!(doctor.status.success(), "{}", stdout(&doctor));
     assert!(
-        stdout(&doctor).contains(&format!("{:<15}{:<18}PASS\n", "Clipboard", "")),
+        stdout(&doctor).contains(&doctor_line("Clipboard", "", "PASS")),
         "{}",
         stdout(&doctor)
     );
@@ -2790,7 +3048,7 @@ fn doctor_reports_a_reachable_secret_service_without_a_match_as_pass() {
             .starts_with("lookup\nvoisu-doctor-probe\n")
     );
     assert!(
-        stdout(&doctor).contains(&format!("{:<15}{:<18}PASS\n", "Secret storage", "")),
+        stdout(&doctor).contains(&doctor_line("Secret storage", "", "PASS")),
         "{}",
         stdout(&doctor)
     );
@@ -2811,14 +3069,25 @@ fn doctor_warns_when_the_secret_service_reports_an_error() {
     );
 
     assert!(
-        stdout(&doctor).contains(&format!("{:<15}{:<18}WARN\n", "Secret storage", "")),
+        stdout(&doctor).contains(&doctor_line("Secret storage", "", "WARN")),
         "{}",
         stdout(&doctor)
     );
+    // No action line on a WARN; the remediation is in the reasoning (--verbose).
     assert!(
-        stdout(&doctor).contains("\n    unlock the keyring or log in to the desktop session\n"),
+        !stdout(&doctor).contains("\n    unlock the keyring"),
         "{}",
         stdout(&doctor)
+    );
+    let verbose = voisu_with_env(
+        runtime.path(),
+        &["doctor", "--verbose"],
+        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+    );
+    assert!(
+        stdout(&verbose).contains("unlock the keyring or log in to the desktop session"),
+        "{}",
+        stdout(&verbose)
     );
 }
 
@@ -2843,8 +3112,8 @@ fn doctor_reports_valid_provider_keys_as_pass() {
     );
 
     assert!(doctor.status.success(), "{}", stderr(&doctor));
-    assert!(stdout(&doctor).contains("Deepgram key: key valid (PASS)"), "{}", stdout(&doctor));
-    assert!(stdout(&doctor).contains("Groq key: key valid (PASS)"), "{}", stdout(&doctor));
+    assert!(stdout(&doctor).contains(&doctor_line("Deepgram key", "valid", "PASS")), "{}", stdout(&doctor));
+    assert!(stdout(&doctor).contains(&doctor_line("Groq key", "valid", "PASS")), "{}", stdout(&doctor));
 }
 
 #[test]
@@ -2868,11 +3137,17 @@ fn doctor_flags_an_invalid_key_as_a_failure_naming_the_fix() {
 
     assert_eq!(doctor.status.code(), Some(4), "an invalid key is a hard failure");
     assert!(
-        stdout(&doctor).contains("Groq key: key invalid — run `voisu setup` (FAIL)"),
+        stdout(&doctor).contains(&doctor_line("Groq key", "invalid", "FAIL")),
         "{}",
         stdout(&doctor)
     );
-    assert!(stdout(&doctor).contains("Deepgram key: SKIP"), "{}", stdout(&doctor));
+    // The fix prints on its own indented action line under the FAIL.
+    assert!(
+        stdout(&doctor).contains("\n    run `voisu setup`\n"),
+        "{}",
+        stdout(&doctor)
+    );
+    assert!(stdout(&doctor).contains(&doctor_line("Deepgram key", "off", "SKIP")), "{}", stdout(&doctor));
 }
 
 #[test]
@@ -2896,11 +3171,15 @@ fn doctor_tells_a_locked_keyring_to_unlock_not_to_run_setup() {
 
     assert!(doctor.status.success(), "a locked keyring is a warning: {}", stderr(&doctor));
     assert!(
-        stdout(&doctor).contains("Groq key: keyring locked — unlock it"),
+        stdout(&doctor).contains(&doctor_line("Groq key", "keyring locked", "WARN")),
         "{}",
         stdout(&doctor)
     );
-    assert!(!stdout(&doctor).contains("Groq key: not configured"), "{}", stdout(&doctor));
+    assert!(
+        !stdout(&doctor).contains(&doctor_line("Groq key", "not configured", "WARN")),
+        "{}",
+        stdout(&doctor)
+    );
 }
 
 #[test]
@@ -2925,12 +3204,12 @@ fn doctor_reports_a_bare_429_as_quota_and_a_missing_key_as_a_warning() {
 
     assert!(doctor.status.success(), "transient states are warnings: {}", stderr(&doctor));
     assert!(
-        stdout(&doctor).contains("Deepgram key: free-tier quota exhausted (WARN)"),
+        stdout(&doctor).contains(&doctor_line("Deepgram key", "quota exhausted", "WARN")),
         "{}",
         stdout(&doctor)
     );
     assert!(
-        stdout(&doctor).contains("Groq key: not configured — run `voisu setup` (WARN)"),
+        stdout(&doctor).contains(&doctor_line("Groq key", "not configured", "WARN")),
         "{}",
         stdout(&doctor)
     );
@@ -2967,7 +3246,7 @@ fn doctor_fails_a_present_but_invalid_env_override_naming_the_variable() {
         stdout(&doctor)
     );
     assert!(
-        !stdout(&doctor).contains("Groq key: key valid (PASS)"),
+        !stdout(&doctor).contains(&doctor_line("Groq key", "valid", "PASS")),
         "the shadowed keyring key must not be reported as effective: {}",
         stdout(&doctor)
     );
@@ -6780,7 +7059,7 @@ fn doctor_daemon_probe_is_bounded_under_a_trickling_peer() {
     );
     assert_eq!(doctor.status.code(), Some(4));
     assert!(
-        stdout(&doctor).contains(&format!("{:<15}{:<18}FAIL\n", "Daemon", "")),
+        stdout(&doctor).contains(&doctor_line("Daemon", "", "FAIL")),
         "{}",
         stdout(&doctor)
     );
@@ -6823,7 +7102,7 @@ fn doctor_daemon_probe_rejects_a_flooding_peer_at_the_response_cap() {
     );
     assert_eq!(doctor.status.code(), Some(4));
     assert!(
-        stdout(&doctor).contains(&format!("{:<15}{:<18}FAIL\n", "Daemon", "")),
+        stdout(&doctor).contains(&doctor_line("Daemon", "", "FAIL")),
         "{}",
         stdout(&doctor)
     );

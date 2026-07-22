@@ -280,7 +280,7 @@ case "$command" in
       rm -f "$pid_file"
     fi
     ;;
-  daemon-reload|enable|reset-failed) ;;
+  daemon-reload|enable|reset-failed|import-environment) ;;
   *) printf 'unexpected systemctl command: %s\n' "$*" >&2; exit 2 ;;
 esac
 "#,

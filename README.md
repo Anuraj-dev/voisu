@@ -94,8 +94,23 @@ How you pick the Trigger Key depends on your desktop's portal:
   voisu delivery clipboard
   ```
 
+- **Cinnamon / X11 (Linux Mint, Ubuntu on X11):** X11 sessions have no portal
+  GlobalShortcuts dialog, so bind the Trigger Key yourself. In *System Settings
+  → Keyboard → Shortcuts → Custom Shortcuts*, add a shortcut that runs:
+
+  ```sh
+  voisu toggle
+  ```
+
+  On X11 the clipboard backend is `xclip`. The `.deb` depends on
+  `wl-clipboard | xclip`, so either satisfies it; on other distributions install
+  `xclip` if `voisu doctor` prescribes it. Feedback on X11 arrives as desktop
+  notifications rather than the on-screen Overlay, which needs Wayland
+  layer-shell.
+
 Run `voisu doctor` if the Trigger Key does not respond — it reports a portal
-without a usable GlobalShortcuts interface.
+without a usable GlobalShortcuts interface, and adds `--verbose` for the full
+reasoning behind each check.
 
 ## License
 
