@@ -9,9 +9,14 @@ use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FeedbackBackend {
+    /// Rung 1: a GTK4 Layer Shell surface (Wayland compositors that advertise
+    /// zwlr_layer_shell_v1).
     LayerShell,
-    RegularSurface,
+    /// Rung 3: an `org.freedesktop.Notifications` desktop notification. Needs
+    /// nothing installed and works on Cinnamon, GNOME, KDE, and XFCE. Rung 2 (a
+    /// plain GTK4 window) is deliberately skipped — see `select_feedback_backend`.
     DesktopNotification,
+    /// Rung 4: journal-only, when no display exists at all.
     JournalLog,
 }
 
@@ -19,7 +24,6 @@ impl FeedbackBackend {
     pub const fn label(self) -> &'static str {
         match self {
             Self::LayerShell => "layer-shell",
-            Self::RegularSurface => "regular-surface",
             Self::DesktopNotification => "desktop-notification",
             Self::JournalLog => "journal-log",
         }
@@ -49,12 +53,10 @@ impl FeedbackDegradation {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SessionKind {
-    Wayland,
-    X11,
-    Unknown,
-}
+// The display-session kind is detected once, in `voisu-core`, so the clipboard
+// backend, the feedback ladder here, and `doctor` all agree. Re-exported so the
+// overlay binary keeps importing it from this module.
+pub use voisu_core::SessionKind;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FeedbackCapabilities {
@@ -97,12 +99,17 @@ pub const fn select_feedback_backend(capabilities: FeedbackCapabilities) -> Feed
             backend: FeedbackBackend::LayerShell,
             degradation: None,
         },
+        // Rung 2 (a plain GTK4 window) is deliberately skipped: it needs GTK4,
+        // which the X11/Cinnamon target lacks, and would not save that host
+        // anyway. Every display session without a Layer Shell surface drops
+        // straight to the desktop-notification rung, which needs nothing
+        // installed and renders on Cinnamon, GNOME, KDE, and XFCE.
         SessionKind::Wayland => FeedbackSelection {
-            backend: FeedbackBackend::RegularSurface,
+            backend: FeedbackBackend::DesktopNotification,
             degradation: Some(FeedbackDegradation::LayerShellUnavailable),
         },
         SessionKind::X11 => FeedbackSelection {
-            backend: FeedbackBackend::RegularSurface,
+            backend: FeedbackBackend::DesktopNotification,
             degradation: Some(if capabilities.xwayland_fallback {
                 FeedbackDegradation::XwaylandFallback
             } else {
@@ -110,7 +117,7 @@ pub const fn select_feedback_backend(capabilities: FeedbackCapabilities) -> Feed
             }),
         },
         SessionKind::Unknown => FeedbackSelection {
-            backend: FeedbackBackend::RegularSurface,
+            backend: FeedbackBackend::DesktopNotification,
             degradation: Some(FeedbackDegradation::UnknownSession),
         },
     }
@@ -194,8 +201,22 @@ mod tests {
             layer_shell_supported: false,
         });
 
-        assert_eq!(selection.backend, FeedbackBackend::RegularSurface);
+        // Rung 2 is skipped: an X11/XWayland session goes to the notification
+        // rung, still naming the XWayland fallback as the cause.
+        assert_eq!(selection.backend, FeedbackBackend::DesktopNotification);
         assert_eq!(selection.degradation, Some(FeedbackDegradation::XwaylandFallback));
+    }
+
+    #[test]
+    fn a_plain_x11_session_uses_the_notification_rung_not_a_gtk_window() {
+        let selection = select_feedback_backend(FeedbackCapabilities {
+            session: SessionKind::X11,
+            display_available: true,
+            xwayland_fallback: false,
+            layer_shell_supported: false,
+        });
+        assert_eq!(selection.backend, FeedbackBackend::DesktopNotification);
+        assert_eq!(selection.degradation, Some(FeedbackDegradation::X11));
     }
 }
 

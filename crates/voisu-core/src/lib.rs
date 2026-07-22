@@ -12,6 +12,15 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+mod session;
+pub use session::{
+    clipboard_candidates, install_instruction, resolve_session, ClipboardTool, PackageManager,
+    SessionKind, SessionResolution, PACKAGE_MANAGERS,
+};
+
+mod wav;
+pub use wav::{scan_wav_pcm, WavScan};
+
 mod diagnostics;
 pub use diagnostics::{
     correlation_id, export_record, is_secret_env_key, redacted_environment, replay_capture,
@@ -530,6 +539,9 @@ pub enum ReadinessStatus {
     Pass,
     Warn,
     Fail,
+    /// A check that does not apply and was deliberately not run (e.g. a disabled
+    /// provider's key). Never a failure.
+    Skip,
 }
 
 impl ReadinessStatus {
@@ -538,37 +550,83 @@ impl ReadinessStatus {
             Self::Pass => "PASS",
             Self::Warn => "WARN",
             Self::Fail => "FAIL",
+            Self::Skip => "SKIP",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadinessCapability {
+    Session,
     PipeWire,
     Microphone,
     Portals,
     Clipboard,
     SecretStorage,
     Daemon,
+    /// Whether the systemd --user manager carries this session's display
+    /// variables, without which Delivery from the daemon cannot reach the
+    /// server.
+    ServiceEnvironment,
 }
 
 impl ReadinessCapability {
     pub fn cli_label(self) -> &'static str {
         match self {
+            Self::Session => "Session",
             Self::PipeWire => "PipeWire",
             Self::Microphone => "Microphone",
             Self::Portals => "Portals",
             Self::Clipboard => "Clipboard",
             Self::SecretStorage => "Secret storage",
             Self::Daemon => "Daemon",
+            Self::ServiceEnvironment => "Service env",
         }
     }
 }
 
+/// A single doctor check. Doctor prints one terse line per finding
+/// (`label  value  STATUS`); `action` is a runnable remediation shown on its own
+/// indented line when present (typically on FAIL), and `detail` is the reasoning
+/// shown only under `--verbose`.
 pub struct ReadinessFinding {
     pub capability: ReadinessCapability,
     pub status: ReadinessStatus,
     pub detail: String,
+    /// The terse value column (e.g. `X11 (Cinnamon)`, `1.0.5`). `None` prints an
+    /// empty column.
+    pub value: Option<String>,
+    /// A runnable remediation, shown indented under the check line. `None` for a
+    /// check that needs no action.
+    pub action: Option<String>,
+}
+
+impl ReadinessFinding {
+    pub fn new(
+        capability: ReadinessCapability,
+        status: ReadinessStatus,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            capability,
+            status,
+            detail: detail.into(),
+            value: None,
+            action: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_value(mut self, value: impl Into<String>) -> Self {
+        self.value = Some(value.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_action(mut self, action: impl Into<String>) -> Self {
+        self.action = Some(action.into());
+        self
+    }
 }
 
 /// Boundary for Fedora desktop capability checks. Production uses thin command

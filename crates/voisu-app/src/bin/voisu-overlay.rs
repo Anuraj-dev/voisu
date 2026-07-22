@@ -91,23 +91,36 @@ fn run_overlay(arguments: &[String]) -> i32 {
         }
     };
 
-    // Do not ask GTK to initialize when no graphical display can exist. A
-    // desktop notification cannot be delivered there; the persistent journal
-    // observer below is the truthful last-resort feedback backend.
+    // No graphical display at all: the persistent journal observer is the
+    // truthful last-resort feedback backend, and GTK is never asked to init.
     let preflight = environment_capabilities(false);
-    let preliminary = select_feedback_backend(preflight);
-    if preliminary.backend == FeedbackBackend::JournalLog {
-        report(preliminary);
-        return if report_only { 0 } else { run_journal_feedback(preliminary) };
+    if !preflight.display_available {
+        let selection = select_feedback_backend(preflight);
+        report(selection);
+        return if report_only { 0 } else { run_journal_feedback(selection) };
     }
 
+    // Only a Wayland session can use Layer Shell (rung 1), and probing that
+    // needs GTK. Every other display session goes straight to the
+    // desktop-notification rung, which talks to org.freedesktop.Notifications
+    // and needs no GTK display — so GTK is never initialized there (an X11 /
+    // Cinnamon host must not be gated behind a GDK init it does not need).
+    if preflight.session != SessionKind::Wayland {
+        let selection = select_feedback_backend(preflight);
+        report(selection);
+        return if report_only { 0 } else { run_notification_feedback(selection) };
+    }
+
+    // A Wayland session: initialize GTK to probe Layer Shell. If GTK/GDK cannot
+    // init, notifications still work over D-Bus, so fall to the notification
+    // rung rather than the journal.
     if let Err(error) = gtk::init() {
         let selection = FeedbackSelection {
-            backend: FeedbackBackend::JournalLog,
-            degradation: Some(FeedbackDegradation::MissingDisplay),
+            backend: FeedbackBackend::DesktopNotification,
+            degradation: Some(FeedbackDegradation::LayerShellUnavailable),
         };
         report_with_error(selection, &error.to_string());
-        return if report_only { 0 } else { run_journal_feedback(selection) };
+        return if report_only { 0 } else { run_notification_feedback(selection) };
     }
 
     let capabilities = environment_capabilities(gtk4_layer_shell::is_supported());
@@ -117,40 +130,46 @@ fn run_overlay(arguments: &[String]) -> i32 {
         return 0;
     }
 
-    let application = gtk::Application::builder()
-        .application_id("org.voisu.Overlay")
-        .build();
-    application.connect_activate(move |application| build_feedback(application, selection));
-    i32::from(application.run())
+    if selection.backend == FeedbackBackend::LayerShell {
+        let application = gtk::Application::builder()
+            .application_id("org.voisu.Overlay")
+            .build();
+        application.connect_activate(move |application| build_feedback(application, selection));
+        return i32::from(application.run());
+    }
+
+    // Wayland without Layer Shell: rung 2 is skipped, so use the notification
+    // rung directly. GTK was initialized only to probe Layer Shell.
+    run_notification_feedback(selection)
 }
 
 /// Inputs collected outside the pure selector. GTK and Layer Shell APIs stay
 /// in this adapter so contract tests need neither a compositor nor a display.
 fn environment_capabilities(layer_shell_supported: bool) -> FeedbackCapabilities {
-    let wayland_display = env::var_os("WAYLAND_DISPLAY").is_some();
-    let x11_display = env::var_os("DISPLAY").is_some();
-    let declared_wayland = matches!(
-        env::var("XDG_SESSION_TYPE").ok().as_deref(),
-        Some(value) if value.eq_ignore_ascii_case("wayland")
+    let wayland_display = env::var("WAYLAND_DISPLAY").ok();
+    let x11_display = env::var("DISPLAY").ok();
+    // Session detection is the single source of truth in voisu-core, shared with
+    // the clipboard backend and doctor; the adapter only gathers the raw facts.
+    // Empty values name no endpoint and count as absent.
+    let session_type = env::var("XDG_SESSION_TYPE").ok();
+    let resolution = voisu_core::resolve_session(
+        wayland_display.as_deref(),
+        x11_display.as_deref(),
+        session_type.as_deref(),
     );
-    let xwayland_fallback = declared_wayland && !wayland_display && x11_display;
-    let session = if xwayland_fallback {
-        SessionKind::X11
-    } else {
-        match env::var("XDG_SESSION_TYPE").ok().as_deref() {
-        Some(value) if value.eq_ignore_ascii_case("wayland") => SessionKind::Wayland,
-        Some(value) if value.eq_ignore_ascii_case("x11") => SessionKind::X11,
-        _ if wayland_display => SessionKind::Wayland,
-        _ if x11_display => SessionKind::X11,
-        _ => SessionKind::Unknown,
-        }
+    let has_wayland = wayland_display.as_deref().is_some_and(|value| !value.is_empty());
+    let has_x11 = x11_display.as_deref().is_some_and(|value| !value.is_empty());
+    let display_available = match resolution.session {
+        SessionKind::Wayland => has_wayland,
+        SessionKind::X11 => has_x11,
+        SessionKind::Unknown => has_wayland || has_x11,
     };
-    let display_available = match session {
-        SessionKind::Wayland => wayland_display,
-        SessionKind::X11 => x11_display,
-        SessionKind::Unknown => wayland_display || x11_display,
-    };
-    FeedbackCapabilities { session, display_available, xwayland_fallback, layer_shell_supported }
+    FeedbackCapabilities {
+        session: resolution.session,
+        display_available,
+        xwayland_fallback: resolution.xwayland_fallback,
+        layer_shell_supported,
+    }
 }
 
 fn report(selection: FeedbackSelection) {
@@ -299,7 +318,9 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
 
 fn install_surface_feedback(
     application: gtk::Application,
-    selection: FeedbackSelection,
+    // Rung 2 is gone, so the only windowed backend is Layer Shell and the
+    // fallback branch below is inert; the selection is no longer consulted here.
+    _selection: FeedbackSelection,
     window: gtk::ApplicationWindow,
     label: gtk::Label,
     meter: gtk::Label,
@@ -307,10 +328,11 @@ fn install_surface_feedback(
     switched: Rc<Cell<bool>>,
 ) {
     let controller = Rc::new(RefCell::new(PresentationController::default()));
-    // Resurfacing and the Recording-start notification are only needed on the
-    // fallback path: a layer-shell surface is kept above by the compositor and
-    // has no "buried window" problem, so its behavior is left untouched.
-    let is_fallback = selection.backend == FeedbackBackend::RegularSurface;
+    // Rung 2 (a plain GTK window) is skipped, so the only windowed backend that
+    // reaches here is Layer Shell, which the compositor keeps above and which
+    // has no "buried window" problem. The resurface/notify fallback behavior is
+    // therefore never needed on this path.
+    let is_fallback = false;
     let tracker = Rc::new(RefCell::new(PresentationTracker::default()));
     let notify_latch = Rc::new(RefCell::new(RecordingNotifyLatch::default()));
     let reduced_motion = gtk::Settings::default()
@@ -375,28 +397,201 @@ fn install_surface_feedback(
     });
 }
 
+/// Drive the desktop-notification rung from a plain (non-GTK) poll loop.
+/// `org.freedesktop.Notifications` needs no GTK display, so this backend never
+/// initializes GTK — the caller reaches it directly for X11/Unknown sessions
+/// and for a Wayland session without Layer Shell.
+fn run_notification_feedback(selection: FeedbackSelection) -> i32 {
+    let notifier = Notifier::start(selection);
+    let mut controller = PresentationController::default();
+    let mut previous_phase = OverlayView::HIDDEN.phase;
+    loop {
+        notification_tick(&mut controller, &mut previous_phase, &notifier);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// The GTK-context notification driver, used only when a Layer Shell surface was
+/// selected but then failed to realize locally. It shares the same `Notifier`;
+/// the glib timeout only hands it the label to show.
 fn install_notification_feedback(application: &gtk::Application) {
     // A notification backend has no window. Keep its GApplication alive for
     // the source lifetime so the polling timeout can actually run.
     let hold = application.hold();
+    let notifier = Notifier::start(FeedbackSelection {
+        backend: FeedbackBackend::DesktopNotification,
+        degradation: Some(FeedbackDegradation::SurfaceCreationFailure),
+    });
     let controller = Rc::new(RefCell::new(PresentationController::default()));
-    let previous = Rc::new(RefCell::new(OverlayView::HIDDEN));
-    let application = application.clone();
+    let previous_phase = Rc::new(RefCell::new(OverlayView::HIDDEN.phase));
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
         let _hold = &hold;
-        let now = Instant::now();
-        let view = match read_status() {
-            Some(response) => controller.borrow_mut().observe(&response, now),
-            None => controller.borrow_mut().observe_unreachable(now),
-        };
-        if view.is_visible() && *previous.borrow() != view {
-            let notification = gtk::gio::Notification::new("Voisu");
-            notification.set_body(Some(view.visible_label));
-            application.send_notification(Some("overlay-feedback"), &notification);
-        }
-        *previous.borrow_mut() = view;
+        notification_tick(
+            &mut controller.borrow_mut(),
+            &mut previous_phase.borrow_mut(),
+            &notifier,
+        );
         gtk::glib::ControlFlow::Continue
     });
+}
+
+/// One poll of the daemon status: on a transition into a visible phase, hand the
+/// new label to the notifier (which fires a desktop notification, or logs the
+/// transition to the journal when the bus is unavailable).
+fn notification_tick(
+    controller: &mut PresentationController,
+    previous_phase: &mut OverlayPhase,
+    notifier: &Notifier,
+) {
+    let now = Instant::now();
+    let view = match read_status() {
+        Some(response) => controller.observe(&response, now),
+        None => controller.observe_unreachable(now),
+    };
+    // Fire only on a PHASE transition into a visible phase. Comparing the whole
+    // view would re-fire on every meter/activity tick within one Recording.
+    if view.is_visible() && *previous_phase != view.phase {
+        notifier.notify(view.visible_label);
+    }
+    *previous_phase = view.phase;
+}
+
+/// The desktop-notification sink. Rung 3 talks to `org.freedesktop.Notifications`
+/// directly over the session bus (not through GNotification): the service is
+/// present on Cinnamon, GNOME, KDE, and XFCE without a registered desktop entry
+/// or D-Bus activation. The zbus connection lives on its own thread with a
+/// contained tokio runtime (the overlay's loops are not tokio); requests cross a
+/// bounded, coalescing channel. If the bus/service is not reachable within a
+/// bounded startup handshake, or a call later fails, the notifier degrades to
+/// logging transitions to the journal — never a silent success.
+struct Notifier {
+    sender: Option<std::sync::mpsc::SyncSender<String>>,
+    selection: FeedbackSelection,
+}
+
+impl Notifier {
+    fn start(selection: FeedbackSelection) -> Self {
+        // Depth-1 so a stalled Notify call cannot make requests accumulate: a
+        // send while one is pending is dropped (the next transition coalesces).
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<String>(1);
+        let (ready_sender, ready_receiver) = std::sync::mpsc::channel::<bool>();
+        let spawned = std::thread::Builder::new()
+            .name("voisu-overlay-notify".to_owned())
+            .spawn(move || {
+                let Ok(runtime) =
+                    tokio::runtime::Builder::new_current_thread().enable_all().build()
+                else {
+                    let _ = ready_sender.send(false);
+                    return;
+                };
+                runtime.block_on(async move {
+                    let connection = match zbus::Connection::session().await {
+                        Ok(connection) => connection,
+                        Err(_) => {
+                            let _ = ready_sender.send(false);
+                            return;
+                        }
+                    };
+                    // Prove the notification SERVICE is reachable, not just the
+                    // bus, before reporting success.
+                    let reachable = notification_service_reachable(&connection).await;
+                    let _ = ready_sender.send(reachable);
+                    if !reachable {
+                        return;
+                    }
+                    let mut replaces_id = 0_u32;
+                    while let Ok(body) = receiver.recv() {
+                        match notify_call(&connection, replaces_id, &body).await {
+                            Ok(id) => replaces_id = id,
+                            // A call failure after a healthy start: fall back to
+                            // the journal for this transition rather than losing it.
+                            Err(()) => journal_transition(selection, &body),
+                        }
+                    }
+                });
+            })
+            .is_ok();
+        // Bounded startup handshake: only claim the bus path once the service has
+        // answered; otherwise degrade to journal logging.
+        let bus_ready = spawned
+            && matches!(
+                ready_receiver.recv_timeout(Duration::from_secs(2)),
+                Ok(true)
+            );
+        if bus_ready {
+            Self { sender: Some(sender), selection }
+        } else {
+            Self { sender: None, selection }
+        }
+    }
+
+    fn notify(&self, label: &str) {
+        match &self.sender {
+            // try_send is non-blocking: a full channel means a request is
+            // already in flight, so this transition coalesces away.
+            Some(sender) => {
+                let _ = sender.try_send(label.to_owned());
+            }
+            None => journal_transition(self.selection, label),
+        }
+    }
+}
+
+/// Log a state transition to the journal (stderr under systemd) — the honest
+/// fallback when the notification bus is unavailable.
+fn journal_transition(selection: FeedbackSelection, label: &str) {
+    eprintln!(
+        "{} degradation=notification-unavailable phase={label}",
+        selection.report_line()
+    );
+}
+
+/// Whether `org.freedesktop.Notifications` answers — a real service probe, not
+/// just a bus connection.
+async fn notification_service_reachable(connection: &zbus::Connection) -> bool {
+    connection
+        .call_method(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            Some("org.freedesktop.Notifications"),
+            "GetServerInformation",
+            &(),
+        )
+        .await
+        .is_ok()
+}
+
+/// Send (or replace) a Voisu desktop notification. Returns the server-assigned
+/// id so the next transition replaces this notification in place rather than
+/// stacking; `Err(())` signals the caller to fall back to the journal.
+async fn notify_call(
+    connection: &zbus::Connection,
+    replaces_id: u32,
+    body: &str,
+) -> Result<u32, ()> {
+    use std::collections::HashMap;
+    use zbus::zvariant::Value;
+
+    let actions: Vec<&str> = Vec::new();
+    let hints: HashMap<&str, Value<'_>> = HashMap::new();
+    // Notify(app_name, replaces_id, app_icon, summary, body, actions, hints,
+    //        expire_timeout) -> u32
+    let arguments = ("Voisu", replaces_id, "", "Voisu", body, actions, hints, 3000_i32);
+    match connection
+        .call_method(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            Some("org.freedesktop.Notifications"),
+            "Notify",
+            &arguments,
+        )
+        .await
+    {
+        // A malformed reply is a failure too: map it to Err so the caller logs
+        // the transition to the journal rather than silently counting success.
+        Ok(reply) => reply.body().deserialize::<u32>().map_err(|_| ()),
+        Err(_) => Err(()),
+    }
 }
 
 fn render_surface(

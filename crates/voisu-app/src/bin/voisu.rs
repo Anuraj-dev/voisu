@@ -25,7 +25,7 @@ const IO_DEADLINE: Duration = Duration::from_secs(2);
 enum CliAction {
     Daemon(Command),
     History { json: bool },
-    Doctor,
+    Doctor { verbose: bool },
     Setup,
     AuthSet(Provider),
     AuthVerify(Provider),
@@ -43,7 +43,7 @@ fn main() -> ExitCode {
     match parse_command() {
         Ok(CliAction::Daemon(command)) => daemon_command(command),
         Ok(CliAction::History { json }) => history_command(json),
-        Ok(CliAction::Doctor) => doctor(),
+        Ok(CliAction::Doctor { verbose }) => doctor(verbose),
         Ok(CliAction::Setup) => setup(),
         Ok(CliAction::AuthSet(provider)) => match credential_from_stdin() {
             Ok(credential) => auth_set(provider, credential),
@@ -243,17 +243,48 @@ fn render_history_pretty(records: &serde_json::Value) -> ExitCode {
 }
 
 
-fn doctor() -> ExitCode {
-    let findings = FedoraReadiness.inspect();
-    let mut has_failure = findings.iter().any(|finding| finding.status == ReadinessStatus::Fail);
-    for finding in findings {
-        println!(
-            "{}: {} ({})",
-            finding.capability.cli_label(),
-            finding.status.cli_label(),
-            finding.detail
-        );
+/// One rendered doctor line: `label  value  STATUS`, with an optional runnable
+/// action (shown indented only on FAIL) and reasoning (shown only under
+/// --verbose). Capability findings, the focus guard, and the provider-key
+/// checks are all reduced to this single shape so the terseness contract holds
+/// for every check, not just the first group.
+struct DoctorRow {
+    label: String,
+    value: Option<String>,
+    status: ReadinessStatus,
+    action: Option<String>,
+    detail: String,
+}
+
+impl DoctorRow {
+    fn new(label: impl Into<String>, status: ReadinessStatus, detail: impl Into<String>) -> Self {
+        Self { label: label.into(), value: None, status, action: None, detail: detail.into() }
     }
+
+    fn value(mut self, value: impl Into<String>) -> Self {
+        self.value = Some(value.into());
+        self
+    }
+
+    fn action(mut self, action: impl Into<String>) -> Self {
+        self.action = Some(action.into());
+        self
+    }
+}
+
+fn doctor(verbose: bool) -> ExitCode {
+    let mut rows: Vec<DoctorRow> = FedoraReadiness
+        .inspect()
+        .into_iter()
+        .map(|finding| DoctorRow {
+            label: finding.capability.cli_label().to_owned(),
+            value: finding.value,
+            status: finding.status,
+            action: finding.action,
+            detail: finding.detail,
+        })
+        .collect();
+
     // One runtime serves both the focus probe and the live per-provider key
     // round trips, so the CLI never needs an ambient async runtime.
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -264,19 +295,19 @@ fn doctor() -> ExitCode {
         .as_ref()
         .map(|runtime| runtime.block_on(voisu_app::focus::detect_focus_backend()))
         .unwrap_or(voisu_app::focus::FocusBackendKind::None);
-    if focus_backend == voisu_app::focus::FocusBackendKind::None {
-        println!("Focus guard: none (guarded Delivery fails closed to the clipboard)");
-    } else {
-        println!("Focus guard: {}", focus_backend.as_str());
-    }
+    rows.push(focus_guard_row(focus_backend));
+
     // The live key checks reach the network; a test that pins other doctor
     // output opts out with VOISU_TEST_SKIP_DOCTOR_KEYS and covers the key
     // classification through dedicated seams instead.
     if std::env::var_os("VOISU_TEST_SKIP_DOCTOR_KEYS").is_none() {
         if let Some(runtime) = runtime.as_ref() {
-            has_failure |= doctor_provider_keys(runtime);
+            rows.extend(provider_key_rows(runtime));
         }
     }
+
+    let has_failure = rows.iter().any(|row| row.status == ReadinessStatus::Fail);
+    print_doctor_rows(&rows, verbose);
     if has_failure {
         ExitCode::from(4)
     } else {
@@ -284,78 +315,160 @@ fn doctor() -> ExitCode {
     }
 }
 
-/// Live per-provider key round trips. A wrong key (401/403) is a hard failure
-/// naming the fix; a missing key, quota, throttle, or unreachable provider is a
-/// warning, since none of those is a definitively bad key. Returns whether any
-/// hard failure was found.
-fn doctor_provider_keys(runtime: &tokio::runtime::Runtime) -> bool {
-    let mut has_failure = false;
+/// Column widths for the terse doctor table: `label  value  STATUS`. Fixed (not
+/// computed) so the layout is deterministic regardless of which checks ran, and
+/// followed by an explicit two-space gutter so a value that overflows its column
+/// can never touch the status ("1.0.5 (WAV fallback)  PASS", never glued).
+const DOCTOR_LABEL_WIDTH: usize = 15;
+const DOCTOR_VALUE_WIDTH: usize = 20;
+
+/// Print every doctor check as one terse line. A runnable action prints on its
+/// own indented line only on FAIL; WARN and SKIP keep to one line, with any
+/// guidance behind --verbose.
+fn print_doctor_rows(rows: &[DoctorRow], verbose: bool) {
+    for row in rows {
+        let value = row.value.as_deref().unwrap_or("");
+        println!(
+            "{:<label$}  {:<value$}  {}",
+            row.label,
+            value,
+            row.status.cli_label(),
+            label = DOCTOR_LABEL_WIDTH,
+            value = DOCTOR_VALUE_WIDTH,
+        );
+        if row.status == ReadinessStatus::Fail {
+            if let Some(action) = &row.action {
+                println!("    {action}");
+            }
+        }
+        if verbose {
+            println!("    ({})", row.detail);
+        }
+    }
+}
+
+fn focus_guard_row(backend: voisu_app::focus::FocusBackendKind) -> DoctorRow {
+    if backend == voisu_app::focus::FocusBackendKind::None {
+        DoctorRow::new(
+            "Focus guard",
+            ReadinessStatus::Warn,
+            "no focus backend; guarded Delivery fails closed to the clipboard",
+        )
+        .value("none")
+    } else {
+        DoctorRow::new(
+            "Focus guard",
+            ReadinessStatus::Pass,
+            "focus backend available for guarded Delivery",
+        )
+        .value(backend.as_str())
+    }
+}
+
+/// Live per-provider key round trips as structured rows. A wrong key (401/403)
+/// is a hard failure naming the fix; a missing key, quota, throttle, or
+/// unreachable provider is a warning, since none of those is a definitively bad
+/// key; a disabled provider is skipped.
+fn provider_key_rows(runtime: &tokio::runtime::Runtime) -> Vec<DoctorRow> {
+    let mut rows = Vec::new();
     let deepgram_enabled = voisu_app::config::deepgram_enabled();
     for provider in [Provider::Deepgram, Provider::Groq] {
-        let label = provider.cli_label();
+        let label = format!("{} key", provider.cli_label());
         if provider == Provider::Deepgram && !deepgram_enabled {
-            println!("{label} key: SKIP (Deepgram is off; run `voisu deepgram on` to enable)");
+            rows.push(
+                DoctorRow::new(
+                    label,
+                    ReadinessStatus::Skip,
+                    "Deepgram is off; run `voisu deepgram on` to enable",
+                )
+                .value("off"),
+            );
             continue;
         }
-        match SecretToolStore.diagnose(provider) {
+        let row = match SecretToolStore.diagnose(provider) {
             KeyDiagnosis::Found { location, credential } => {
                 let status = runtime.block_on(ProviderHttpClient.check(provider, credential));
-                println!(
-                    "{label} key: {} ({})",
-                    status.headline(),
-                    status.readiness().cli_label()
-                );
-                match location {
-                    KeyLocation::PlaintextFile => println!(
-                        "  stored in the plaintext fallback file — run `voisu setup` to migrate it into your keyring"
-                    ),
-                    KeyLocation::EnvOverride => println!(
-                        "  provided by {} (overrides any stored key)",
-                        provider.environment_variable()
-                    ),
-                    KeyLocation::Keyring => {}
-                }
+                let location_note = match location {
+                    KeyLocation::PlaintextFile => {
+                        " — stored in the plaintext fallback file; run `voisu setup` to migrate it into your keyring"
+                    }
+                    KeyLocation::EnvOverride => {
+                        " — provided by the environment override, which wins over any stored key"
+                    }
+                    KeyLocation::Keyring => "",
+                };
+                let value = match status {
+                    ProviderKeyStatus::Valid => "valid",
+                    ProviderKeyStatus::InvalidKey => "invalid",
+                    ProviderKeyStatus::RateLimited => "rate-limited",
+                    ProviderKeyStatus::QuotaExhausted => "quota exhausted",
+                    ProviderKeyStatus::Unreachable => "unreachable",
+                };
+                let mut detail = format!("{}{}", status.headline(), location_note);
+                let mut row = DoctorRow::new(label, status.readiness(), String::new()).value(value);
                 match status {
                     ProviderKeyStatus::InvalidKey => {
-                        has_failure = true;
-                        println!("  {}", provider_free_tier_hint(provider));
+                        detail = format!("{detail}; {}", provider_free_tier_hint(provider));
+                        row = row.action("run `voisu setup`");
                     }
                     ProviderKeyStatus::QuotaExhausted => {
-                        println!("  {}", provider_free_tier_hint(provider));
+                        detail = format!("{detail}; {}", provider_free_tier_hint(provider));
                     }
                     _ => {}
                 }
+                row.detail = detail;
+                row
             }
+            // A present env override always wins at runtime, so a malformed one
+            // shadows every stored key and breaks dictation: a hard failure
+            // naming the variable, never a PASS on the shadowed key.
+            KeyDiagnosis::EnvOverrideInvalid => {
+                let variable = provider.environment_variable();
+                DoctorRow::new(
+                    label,
+                    ReadinessStatus::Fail,
+                    format!(
+                        "{variable} is set but is not a usable key (empty or contains a line \
+                         break) and it overrides any stored key"
+                    ),
+                )
+                .value("env override invalid")
+                .action(format!("unset or fix {variable}"))
+            }
+            KeyDiagnosis::Absent => DoctorRow::new(
+                label,
+                ReadinessStatus::Warn,
+                format!(
+                    "not configured — run `voisu setup`; {}",
+                    provider_free_tier_hint(provider)
+                ),
+            )
+            .value("not configured"),
             // The keyring could not be consulted: steer the user at the real fix
             // (unlock / start / install) rather than telling them to write a
             // plaintext key they may not need to.
-            KeyDiagnosis::Locked => println!(
-                "{label} key: keyring locked — unlock it, or run `voisu setup` to store a key (WARN)"
-            ),
-            KeyDiagnosis::Unavailable => println!(
-                "{label} key: no desktop keyring available — run `voisu setup` to store a key (WARN)"
-            ),
-            KeyDiagnosis::ToolMissing => println!(
-                "{label} key: secret-tool is not installed — install libsecret-tools, or run `voisu setup` (WARN)"
-            ),
-            // A present env override always wins at runtime, so a malformed
-            // one shadows every stored key and breaks dictation: a hard
-            // failure naming the variable, never a PASS on the shadowed key.
-            KeyDiagnosis::EnvOverrideInvalid => {
-                has_failure = true;
-                let variable = provider.environment_variable();
-                println!(
-                    "{label} key: {variable} is set but is not a usable key (empty or contains \
-                     a line break), and it overrides any stored key — unset or fix {variable} (FAIL)"
-                );
-            }
-            KeyDiagnosis::Absent => {
-                println!("{label} key: not configured — run `voisu setup` (WARN)");
-                println!("  {}", provider_free_tier_hint(provider));
-            }
-        }
+            KeyDiagnosis::Locked => DoctorRow::new(
+                label,
+                ReadinessStatus::Warn,
+                "keyring locked — unlock it, or run `voisu setup` to store a key",
+            )
+            .value("keyring locked"),
+            KeyDiagnosis::Unavailable => DoctorRow::new(
+                label,
+                ReadinessStatus::Warn,
+                "no desktop keyring available — run `voisu setup` to store a key",
+            )
+            .value("no keyring"),
+            KeyDiagnosis::ToolMissing => DoctorRow::new(
+                label,
+                ReadinessStatus::Warn,
+                "secret-tool is not installed — install libsecret-tools, or run `voisu setup`",
+            )
+            .value("secret-tool missing"),
+        };
+        rows.push(row);
     }
-    has_failure
+    rows
 }
 
 /// `voisu setup` — the interactive, re-runnable wizard that validates each key
@@ -565,7 +678,10 @@ fn parse_command() -> Result<CliAction, String> {
         [command, path] if command == "replay" => {
             Ok(CliAction::Daemon(Command::Replay(ReplayFixturePath::new(path.clone()))))
         }
-        [command] if command == "doctor" => Ok(CliAction::Doctor),
+        [command] if command == "doctor" => Ok(CliAction::Doctor { verbose: false }),
+        [command, flag] if command == "doctor" && (flag == "--verbose" || flag == "-v") => {
+            Ok(CliAction::Doctor { verbose: true })
+        }
         [command] if command == "setup" => Ok(CliAction::Setup),
         [command] if command == "--help" || command == "-h" || command == "help" => {
             Ok(CliAction::Help)
@@ -645,7 +761,7 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: voisu <setup|start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|delivery|dictionary|service>\n\n  voisu setup  # guided, re-runnable wizard: validate and store your Deepgram and Groq keys\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor  # capability, focus-guard, and live per-key round-trip checks\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu delivery [type|clipboard|guarded]  # choose Transcript Delivery (default type); no argument shows the persisted mode\n  voisu dictionary add <term>\n  voisu dictionary remove <term>\n  voisu dictionary list [--json]\n  voisu service <install|start|stop|restart|status|uninstall>"
+    "usage: voisu <setup|start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|delivery|dictionary|service>\n\n  voisu setup  # guided, re-runnable wizard: validate and store your Deepgram and Groq keys\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor [--verbose]  # capability, focus-guard, and live per-key round-trip checks; --verbose adds the reasoning behind each line\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu delivery [type|clipboard|guarded]  # choose Transcript Delivery (default type); no argument shows the persisted mode\n  voisu dictionary add <term>\n  voisu dictionary remove <term>\n  voisu dictionary list [--json]\n  voisu service <install|start|stop|restart|status|uninstall>"
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {

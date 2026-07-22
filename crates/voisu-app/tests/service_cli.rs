@@ -280,7 +280,7 @@ case "$command" in
       rm -f "$pid_file"
     fi
     ;;
-  daemon-reload|enable|reset-failed) ;;
+  daemon-reload|enable|reset-failed|import-environment) ;;
   *) printf 'unexpected systemctl command: %s\n' "$*" >&2; exit 2 ;;
 esac
 "#,
@@ -885,6 +885,29 @@ fn managed_service_lifecycle_reports_systemd_ownership_and_daemon_ipc() {
     assert!(stopped.status.success(), "{}", stderr(&stopped));
     assert!(stdout(&stopped).contains("systemd user service inactive; daemon IPC unavailable"));
     wait_for_socket(&fixture.runtime, false);
+}
+
+#[test]
+fn service_start_and_restart_import_the_session_display_environment() {
+    // Both start and restart must import the graphical session's display
+    // variables into the --user manager before launching the daemon, so
+    // Delivery can reach the X/Wayland server. The import precedes the daemon
+    // start, so this asserts the systemctl log (timing-independent) and does not
+    // depend on the daemon IPC settling.
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    assert!(fixture.run(&["service", "install"]).status.success());
+    fixture.use_real_managed_daemon();
+    let _ = fixture.run(&["service", "start"]);
+    let _ = fixture.run(&["service", "restart"]);
+
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    let expected =
+        "--user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP";
+    assert_eq!(
+        calls.matches(expected).count(),
+        2,
+        "start and restart must each issue the complete import-environment list:\n{calls}"
+    );
 }
 
 #[test]

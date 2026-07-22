@@ -282,9 +282,28 @@ fn start() -> Result<UserServiceReport, String> {
             DaemonIpc::Unavailable => {}
         }
     }
+    import_session_environment();
     systemctl_required(&["start", UNIT_NAME])?;
     wait_for_managed_daemon()?;
     status()
+}
+
+/// Propagate the graphical session's display variables from this (interactive,
+/// graphically-launched) CLI process into the systemd `--user` manager, so the
+/// daemon it starts can reach the X/Wayland server for Delivery. `systemctl
+/// import-environment` reads the named variables from this process's environment
+/// — which the graphical session populated — and sets them on the manager; they
+/// are not persisted across logins. Best-effort: a failure never blocks the
+/// start, since the daemon still runs and Delivery falls back to the clipboard.
+fn import_session_environment() {
+    let _ = systemctl(&[
+        "import-environment",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XAUTHORITY",
+        "XDG_SESSION_TYPE",
+        "XDG_CURRENT_DESKTOP",
+    ]);
 }
 
 fn stop() -> Result<UserServiceReport, String> {
@@ -356,6 +375,7 @@ fn restart() -> Result<UserServiceReport, String> {
             DaemonIpc::Unavailable => {}
         }
     }
+    import_session_environment();
     systemctl_required(&["restart", UNIT_NAME])?;
     wait_for_managed_daemon()?;
     status()
