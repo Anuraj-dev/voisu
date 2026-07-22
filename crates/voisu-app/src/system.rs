@@ -1442,27 +1442,40 @@ fn manager_env_has(show_environment: &str, key: &str) -> bool {
 /// lacks this session's display variable; on an undetermined session, an
 /// unreachable manager, or a manager that already has it, no row is produced.
 fn service_display_env_finding() -> Option<ReadinessFinding> {
-    let needed = match current_session().session {
-        SessionKind::Wayland => "WAYLAND_DISPLAY",
-        SessionKind::X11 => "DISPLAY",
+    // The variables the daemon's clipboard helper needs for THIS session. The
+    // display endpoint depends on the session; XAUTHORITY is additionally
+    // required whenever this CLI has a non-default one, since without it an X11
+    // helper (xclip, or an XWayland fallback) cannot authenticate to the server.
+    let mut needed: Vec<&str> = match current_session().session {
+        SessionKind::Wayland => vec!["WAYLAND_DISPLAY"],
+        SessionKind::X11 => vec!["DISPLAY"],
         SessionKind::Unknown => return None,
     };
+    if std::env::var("XAUTHORITY").is_ok_and(|value| !value.is_empty()) {
+        needed.push("XAUTHORITY");
+    }
     let outcome = run_restricted("systemctl", &["--user", "show-environment"], None, true).ok()?;
     if !outcome.success {
         return None;
     }
     let show_environment = String::from_utf8_lossy(&outcome.stdout);
-    if manager_env_has(&show_environment, needed) {
+    let missing: Vec<&str> = needed
+        .into_iter()
+        .filter(|key| !manager_env_has(&show_environment, key))
+        .collect();
+    if missing.is_empty() {
         return None;
     }
+    let names = missing.join(", ");
     Some(
         readiness(
             ReadinessCapability::ServiceEnvironment,
             ReadinessStatus::Warn,
             &format!(
-                "the systemd --user manager has no {needed}, so Delivery from the daemon cannot \
-                 reach the display; run `voisu service restart` from your graphical session (or \
-                 `systemctl --user import-environment {needed}`)"
+                "the systemd --user manager is missing {names}, so Delivery from the daemon \
+                 cannot reach or authenticate to the display; run `voisu service restart` from \
+                 your graphical session (or `systemctl --user import-environment {}`)",
+                missing.join(" ")
             ),
         )
         .with_value("missing display env"),
@@ -1606,6 +1619,21 @@ fn controlled_readiness(value: &str) -> Vec<ReadinessFinding> {
             finding.action = action.map(str::to_owned);
         }
     }
+    // The Service-env row is appended by the real inspector only when a problem
+    // is detected, so it is not in the base list. A `service-env=warn` override
+    // synthesizes it here to exercise its formatting and diagnosis hermetically.
+    for override_value in value.split(',') {
+        if let Some(("service-env", "warn")) = override_value.split_once('=') {
+            findings.push(
+                readiness(
+                    ReadinessCapability::ServiceEnvironment,
+                    ReadinessStatus::Warn,
+                    "the systemd --user manager is missing WAYLAND_DISPLAY, XAUTHORITY, so Delivery from the daemon cannot reach or authenticate to the display; run `voisu service restart`",
+                )
+                .with_value("missing display env"),
+            );
+        }
+    }
     findings
 }
 
@@ -1708,14 +1736,19 @@ fn probe_clipboard_roundtrip(tool: ClipboardTool) -> ClipboardProbe {
         return ClipboardProbe::Failed;
     }
 
-    // Restore the prior value, or clear the probe when there was nothing before.
-    let restore = original.clone().unwrap_or_default();
-    let restored = run_restricted_serving(write_program, write_arguments, Some(&restore))
-        .is_ok_and(|outcome| outcome.success);
-    if original.is_none() || restored {
-        ClipboardProbe::WorkedRestored
-    } else {
-        ClipboardProbe::WorkedNotRestored
+    // Restore the prior value only if there genuinely was one; writing an empty
+    // string back would install an empty clipboard owner where none existed.
+    match original {
+        Some(original) => {
+            let restored = run_restricted_serving(write_program, write_arguments, Some(&original))
+                .is_ok_and(|outcome| outcome.success);
+            if restored {
+                ClipboardProbe::WorkedRestored
+            } else {
+                ClipboardProbe::WorkedNotRestored
+            }
+        }
+        None => ClipboardProbe::WorkedRestored,
     }
 }
 
@@ -4417,22 +4450,29 @@ const CLIPBOARD_WRITE_DEADLINE: Duration = Duration::from_secs(4);
 /// Write the Transcript to the clipboard through the backend that matches the
 /// detected session, keeping the resident-serving semantics both stacks need
 /// (`wl-copy` forks a serving child; `xclip` stays resident as the ICCCM
-/// selection owner). Candidates are tried in order under one shared deadline;
-/// the loop continues past every backend-specific failure — including a timeout
-/// — so an Unknown session still reaches X11 after Wayland fails. Returns which
-/// tool succeeded, or the last error.
+/// selection owner). Candidates are tried in order under one shared deadline,
+/// but each attempt gets only a FAIR SLICE of the remaining budget (the rest
+/// divided by the candidates still to try), so a hanging first backend can
+/// never consume the whole deadline and starve the fallback: an Unknown session
+/// still reaches X11 after a Wayland backend times out. Returns which tool
+/// succeeded, or the last error.
 fn clipboard_write(text: &[u8]) -> Result<ClipboardTool, ProcessError> {
     let session = current_session().session;
+    let candidates = clipboard_candidates(session);
     let started = Instant::now();
     let mut last_error = ProcessError::Unavailable;
-    for tool in clipboard_candidates(session) {
+    for (index, tool) in candidates.iter().enumerate() {
         let remaining = CLIPBOARD_WRITE_DEADLINE.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
+        // Divide what is left evenly among the candidates not yet tried (this
+        // one included), so time is reserved for the ones after it.
+        let candidates_left = (candidates.len() - index) as u32;
+        let slice = remaining / candidates_left;
+        if slice.is_zero() {
             last_error = ProcessError::TimedOut;
             break;
         }
         let (program, arguments) = tool.write_command();
-        match run_restricted_serving_within(program, arguments, Some(text), remaining) {
+        match run_restricted_serving_within(program, arguments, Some(text), slice) {
             Ok(outcome) if outcome.success => return Ok(*tool),
             // Every backend-specific failure — a wrong session, a missing tool,
             // even a timeout — falls through to the next candidate rather than

@@ -203,7 +203,7 @@ mod tests {
         // An odd-length LIST chunk exercises the word-alignment pad.
         header.extend_from_slice(b"LIST");
         header.extend_from_slice(&3u32.to_le_bytes());
-        header.extend_from_slice(&[b'I', b'N', b'F']);
+        header.extend_from_slice(b"INF");
         header.push(0); // pad byte
         let list_end = header.len();
         header.extend_from_slice(b"data");

@@ -574,12 +574,33 @@ fn pw_record_without_raw_emits_a_wav_that_is_stripped_to_pcm_before_the_provider
     // bytes, which must equal the PCM payload exactly — no leading RIFF header.
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
+    // The complete WAV stream is built in Rust and written to a fixture file, so
+    // the fake pw-record emits it with a single `cat` — no hundreds of shell
+    // subprocesses racing the production Recording deadline under CI contention.
+    // Canonical 44-byte header (PCM/mono/16 kHz/16-bit, byte rate 32000, block
+    // align 2) followed by 64000 position-derived PCM bytes.
+    let pcm: Vec<u8> = (0..64000_usize).map(|index| (index % 256) as u8).collect();
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&u32::MAX.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&16_000u32.to_le_bytes());
+    wav.extend_from_slice(&32_000u32.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&u32::MAX.to_le_bytes());
+    wav.extend_from_slice(&pcm);
+    fs::write(commands.path().join("wav-fixture"), &wav).unwrap();
     write_fake_command(
         commands.path(),
         "pw-record",
-        // --help advertises NO --raw (1.0.5-era). The capture invocation emits a
-        // canonical 44-byte WAV header (fmt: PCM/mono/16 kHz/16-bit, byte rate
-        // 32000, block align 2) followed by 64000 position-derived PCM bytes.
+        // --help advertises NO --raw (1.0.5-era). The capture invocation emits
+        // the prebuilt WAV fixture directly.
         r#"#!/bin/sh
 dir=$(dirname "$0")
 printf '%s\n' "$@" > "$dir/pw-record.args"
@@ -589,18 +610,7 @@ case "$1" in
     exit 0
     ;;
 esac
-i=0
-while [ "$i" -lt 256 ]; do printf "\\$(printf '%03o' "$i")"; i=$((i + 1)); done > "$dir/pcm-cycle"
-i=0
-while [ "$i" -lt 250 ]; do cat "$dir/pcm-cycle"; i=$((i + 1)); done > "$dir/pcm-full"
-printf 'RIFF'; printf '\377\377\377\377'; printf 'WAVE'
-printf 'fmt '; printf '\020\000\000\000'
-printf '\001\000'; printf '\001\000'
-printf '\200\076\000\000'
-printf '\000\175\000\000'
-printf '\002\000'; printf '\020\000'
-printf 'data'; printf '\377\377\377\377'
-cat "$dir/pcm-full"
+cat "$dir/wav-fixture"
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -657,13 +667,12 @@ cat > "$dir/clipboard"
     // The provider received exactly the PCM payload — the 44-byte RIFF/WAVE
     // header was stripped. A byte-for-byte match rules out both a leaked header
     // and any corruption of the payload.
-    let expected: Vec<u8> = (0..64000_usize).map(|index| (index % 256) as u8).collect();
     let received = fs::read(commands.path().join("deepgram.audio")).unwrap();
     assert!(
         !received.starts_with(b"RIFF"),
         "the WAV header must not reach the provider"
     );
-    assert_eq!(received, expected, "the provider must receive the stripped PCM byte for byte");
+    assert_eq!(received, pcm, "the provider must receive the stripped PCM byte for byte");
 }
 
 #[test]
@@ -696,7 +705,9 @@ printf '{"text":"hello from Groq"}'
 "#,
     );
     // Real xclip -in reads the selection from stdin and forks a resident child
-    // that owns the selection after the parent exits; the fake mirrors that.
+    // that owns the selection after the parent exits; the fake mirrors that with
+    // a marker-gated child (no wall-clock residency) that records its PID and
+    // holds until told to stop, bounded so it can never leak.
     write_fake_command(
         commands.path(),
         "xclip",
@@ -705,7 +716,7 @@ dir=$(dirname "$0")
 printf '%s\n' "$@" > "$dir/xclip.args"
 env | sort > "$dir/xclip.env"
 cat > "$dir/xclip.stdin"
-/usr/bin/sleep 10 &
+XCLIP_DIR="$dir" sh -c 'echo $$ > "$XCLIP_DIR/xclip.child.pid"; i=0; while [ ! -e "$XCLIP_DIR/xclip.stop" ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done' &
 "#,
     );
     // A wl-copy that records if it is ever called — it must not be, on X11.
@@ -761,6 +772,126 @@ cat > /dev/null
     assert!(
         !commands.path().join("wl-copy.invoked").exists(),
         "wl-copy must not be invoked on X11"
+    );
+
+    // The selection owner outlives xclip's own parent (ICCCM requires a resident
+    // owner). Prove the child is still running after delivery returned, then
+    // terminate it via the stop marker and confirm it exits.
+    wait_for_marker(commands.path(), "xclip.child.pid");
+    let child_pid: i32 = fs::read_to_string(commands.path().join("xclip.child.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        process_is_alive(child_pid),
+        "the xclip selection owner must survive its parent's exit"
+    );
+    fs::write(commands.path().join("xclip.stop"), "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_is_alive(child_pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !process_is_alive(child_pid),
+        "the selection owner must terminate on the stop marker"
+    );
+}
+
+/// Whether `pid` names a running process. A zombie (state `Z`) counts as NOT
+/// alive: a non-reaping PID 1 (GitHub Actions job containers) leaves an exited
+/// orphan as a zombie whose `/proc` entry lingers, and that is terminated for
+/// this test's purposes.
+fn process_is_alive(pid: i32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // "pid (comm) state ..." — comm can contain spaces and parens, so read
+        // the state field as the first token after the final ')'.
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .map(|(_, rest)| rest.split_whitespace().next() != Some("Z"))
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+#[test]
+fn unknown_session_falls_back_to_xclip_after_a_hanging_wl_copy() {
+    // In an Unknown session both backends are tried in order. A wl-copy that
+    // hangs must not consume the whole delivery budget: the per-candidate slice
+    // bounds it and delivery still reaches xclip.
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+head -c 6400 /dev/zero | tr '\000' '\001'
+trap 'exit 0' INT TERM
+: > "$dir/pw-record.ready"
+i=0
+while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+cat > /dev/null
+printf '{"text":"hello from Groq"}'
+"#,
+    );
+    // A wl-copy that records it was tried, then hangs (bounded so it cannot leak).
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+: > "$dir/wl-copy.invoked"
+i=0
+while [ "$i" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done
+"#,
+    );
+    // xclip succeeds immediately and records the transcript.
+    write_fake_command(
+        commands.path(),
+        "xclip",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+cat > "$dir/xclip.stdin"
+"#,
+    );
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            // Unknown session: empty display vars read as absent, so the write
+            // loop tries wl-copy then xclip.
+            ("WAYLAND_DISPLAY", ""),
+            ("DISPLAY", ""),
+            ("XDG_SESSION_TYPE", ""),
+            ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", "https://groq.test/audio/transcriptions"),
+            ("VOISU_RECORDING_DEADLINE_MS", "5000"),
+        ],
+    );
+
+    let started = voisu(runtime.path(), "start");
+    assert!(started.status.success(), "{}", stderr(&started));
+    wait_for_marker(commands.path(), "pw-record.ready");
+    let stopped = voisu(runtime.path(), "stop");
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+
+    // wl-copy was attempted first (and hung); xclip received the transcript as
+    // the fallback — the hang did not starve the second candidate.
+    assert!(
+        commands.path().join("wl-copy.invoked").exists(),
+        "the Wayland backend must be attempted first"
+    );
+    assert_eq!(
+        fs::read_to_string(commands.path().join("xclip.stdin")).unwrap(),
+        "hello from Groq"
     );
 }
 
@@ -2447,6 +2578,35 @@ dir=$(dirname "$0")
 cat "$dir/clipboard"
 "#,
         );
+        // A pw-record whose --help advertises --raw, so the capability probe
+        // reports Raw and the PipeWire check PASSes on any host (CI runners have
+        // no real pw-record). It also emits a little PCM so a capture would work.
+        write_fake_command(
+            bin.path(),
+            "pw-record",
+            r#"#!/bin/sh
+case "$1" in
+  --help) printf 'pw-record - capture\n  -a, --raw    RAW mode\n  --rate RATE\n  -h, --help\n'; exit 0 ;;
+esac
+head -c 6400 /dev/zero | tr '\000' '\001'
+"#,
+        );
+        // A systemctl whose `--user show-environment` reports a manager that
+        // already carries the session's display variables, so the doctor
+        // Service-env probe raises no host-dependent warning.
+        write_fake_command(
+            bin.path(),
+            "systemctl",
+            r#"#!/bin/sh
+for argument in "$@"; do
+  if [ "$argument" = "show-environment" ]; then
+    printf 'WAYLAND_DISPLAY=wayland-fake\nDISPLAY=:0\nXAUTHORITY=/run/user/1000/.mutter-Xwaylandauth\n'
+    exit 0
+  fi
+done
+exit 0
+"#,
+        );
         fs::write(bin.path().join("clipboard"), "prior clipboard")
             .expect("initial clipboard should exist");
         Self { bin }
@@ -2774,6 +2934,36 @@ fn doctor_line(label: &str, value: &str, status: &str) -> String {
 }
 
 #[test]
+fn doctor_renders_the_service_env_warning_as_a_terse_row() {
+    // The Service-env diagnosis (systemd --user manager missing the session's
+    // display variables) renders like every other check: one WARN line with a
+    // value, no action line, reasoning behind --verbose. It is not a hard
+    // failure.
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+    let environment = [
+        ("VOISU_TEST_READINESS", "service-env=warn"),
+        ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
+        ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+    ];
+    let doctor = voisu_with_env(runtime.path(), &["doctor"], &environment);
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    assert!(
+        stdout(&doctor).contains(&doctor_line("Service env", "missing display env", "WARN")),
+        "{}",
+        stdout(&doctor)
+    );
+    // No action line on a WARN.
+    assert!(!stdout(&doctor).contains("\n    voisu service restart"), "{}", stdout(&doctor));
+    let verbose = voisu_with_env(runtime.path(), &["doctor", "--verbose"], &environment);
+    assert!(
+        stdout(&verbose).contains("voisu service restart"),
+        "{}",
+        stdout(&verbose)
+    );
+}
+
+#[test]
 fn doctor_golden_covers_every_check_including_focus_and_provider_keys() {
     // The terseness contract applies to EVERY check, not just the capability
     // group: the focus guard and both provider-key checks are the same one-line
@@ -2918,7 +3108,7 @@ fn doctor_warns_when_the_portal_exposes_no_global_shortcuts() {
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
     );
 
     // Terse: the WARN line carries no reasoning and no action line (actions are
@@ -2931,7 +3121,7 @@ fn doctor_warns_when_the_portal_exposes_no_global_shortcuts() {
     let verbose = voisu_with_env(
         runtime.path(),
         &["doctor", "--verbose"],
-        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
     );
     let verbose_out = stdout(&verbose);
     assert!(verbose_out.contains("no GlobalShortcuts interface"), "{verbose_out}");
@@ -2949,7 +3139,7 @@ fn doctor_passes_portals_when_global_shortcuts_are_available() {
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
     );
 
     assert!(
@@ -2967,7 +3157,7 @@ fn doctor_exercises_real_capabilities_instead_of_command_headings_or_socket_conn
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
     );
 
     assert!(doctor.status.success(), "{}", stderr(&doctor));
@@ -3007,7 +3197,7 @@ fn doctor_clipboard_passes_while_wl_copy_serves_the_clipboard_past_exit() {
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
     );
 
     assert!(doctor.status.success(), "{}", stdout(&doctor));
@@ -3038,7 +3228,7 @@ fn doctor_reports_a_reachable_secret_service_without_a_match_as_pass() {
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
     );
 
     assert!(doctor.status.success(), "{}", stderr(&doctor));
@@ -3065,7 +3255,7 @@ fn doctor_warns_when_the_secret_service_reports_an_error() {
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
     );
 
     assert!(
@@ -3082,7 +3272,7 @@ fn doctor_warns_when_the_secret_service_reports_an_error() {
     let verbose = voisu_with_env(
         runtime.path(),
         &["doctor", "--verbose"],
-        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
     );
     assert!(
         stdout(&verbose).contains("unlock the keyring or log in to the desktop session"),

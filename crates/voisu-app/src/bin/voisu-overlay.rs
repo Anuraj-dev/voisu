@@ -404,9 +404,9 @@ fn install_surface_feedback(
 fn run_notification_feedback(selection: FeedbackSelection) -> i32 {
     let notifier = Notifier::start(selection);
     let mut controller = PresentationController::default();
-    let mut previous = OverlayView::HIDDEN;
+    let mut previous_phase = OverlayView::HIDDEN.phase;
     loop {
-        notification_tick(&mut controller, &mut previous, &notifier);
+        notification_tick(&mut controller, &mut previous_phase, &notifier);
         std::thread::sleep(Duration::from_millis(200));
     }
 }
@@ -423,10 +423,14 @@ fn install_notification_feedback(application: &gtk::Application) {
         degradation: Some(FeedbackDegradation::SurfaceCreationFailure),
     });
     let controller = Rc::new(RefCell::new(PresentationController::default()));
-    let previous = Rc::new(RefCell::new(OverlayView::HIDDEN));
+    let previous_phase = Rc::new(RefCell::new(OverlayView::HIDDEN.phase));
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
         let _hold = &hold;
-        notification_tick(&mut controller.borrow_mut(), &mut previous.borrow_mut(), &notifier);
+        notification_tick(
+            &mut controller.borrow_mut(),
+            &mut previous_phase.borrow_mut(),
+            &notifier,
+        );
         gtk::glib::ControlFlow::Continue
     });
 }
@@ -436,7 +440,7 @@ fn install_notification_feedback(application: &gtk::Application) {
 /// transition to the journal when the bus is unavailable).
 fn notification_tick(
     controller: &mut PresentationController,
-    previous: &mut OverlayView,
+    previous_phase: &mut OverlayPhase,
     notifier: &Notifier,
 ) {
     let now = Instant::now();
@@ -444,10 +448,12 @@ fn notification_tick(
         Some(response) => controller.observe(&response, now),
         None => controller.observe_unreachable(now),
     };
-    if view.is_visible() && *previous != view {
+    // Fire only on a PHASE transition into a visible phase. Comparing the whole
+    // view would re-fire on every meter/activity tick within one Recording.
+    if view.is_visible() && *previous_phase != view.phase {
         notifier.notify(view.visible_label);
     }
-    *previous = view;
+    *previous_phase = view.phase;
 }
 
 /// The desktop-notification sink. Rung 3 talks to `org.freedesktop.Notifications`
@@ -581,7 +587,9 @@ async fn notify_call(
         )
         .await
     {
-        Ok(reply) => Ok(reply.body().deserialize::<u32>().unwrap_or(replaces_id)),
+        // A malformed reply is a failure too: map it to Err so the caller logs
+        // the transition to the journal rather than silently counting success.
+        Ok(reply) => reply.body().deserialize::<u32>().map_err(|_| ()),
         Err(_) => Err(()),
     }
 }
