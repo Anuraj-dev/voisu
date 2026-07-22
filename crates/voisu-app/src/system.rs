@@ -25,6 +25,9 @@ use voisu_core::{
     PROTOCOL_VERSION,
 };
 
+use crate::audio_level::{
+    bands, BandState, LevelRegistry, PcmChunkAssembler, PCM_CHUNK_BYTES,
+};
 use crate::focus::SharedFocusProbe;
 use crate::process::guard_external_child;
 use crate::secret_file::{FileSecretStore, RemoveError};
@@ -53,7 +56,6 @@ const MAX_RETAINED_STDERR_BYTES: usize = 4 * 1024;
 const MAX_RETAINED_STDOUT_BYTES: usize = 64 * 1024;
 const PROVIDER_PROCESS_DEADLINE: Duration = Duration::from_secs(14);
 const RECONCILIATION_PROCESS_DEADLINE: Duration = Duration::from_secs(2);
-const PCM_CHUNK_BYTES: usize = 3_200;
 const MIN_RECORDING_BYTES: usize = PCM_CHUNK_BYTES;
 const MAX_RECORDING_BYTES: usize = 16_000 * 2 * 60 * 5;
 /// Recordings at or below this length (120 s of 16 kHz s16le mono) take a
@@ -2304,11 +2306,12 @@ fn wait_for_child(
 
 pub struct PipeWireCapture {
     reaper: ProviderReaper,
+    levels: LevelRegistry,
 }
 
 impl PipeWireCapture {
-    pub fn new(reaper: ProviderReaper) -> Self {
-        Self { reaper }
+    pub fn new(reaper: ProviderReaper, levels: LevelRegistry) -> Self {
+        Self { reaper, levels }
     }
 }
 
@@ -2475,6 +2478,7 @@ impl AudioCapture for PipeWireCapture {
             error: None,
         }));
         let reader_state = Arc::clone(&state);
+        let level_ring = self.levels.current();
         // pw-record MUST be spawned from the reader thread, never from the
         // caller: `guard_external_child` arms PR_SET_PDEATHSIG, and the kernel
         // delivers that signal when the FORKING THREAD exits, not the process.
@@ -2516,18 +2520,42 @@ impl AudioCapture for PipeWireCapture {
                 }
                 return;
             }
-            let mut buffer = vec![0_u8; PCM_CHUNK_BYTES];
+            let mut buffer = [0_u8; 640];
+            let mut assembler = PcmChunkAssembler::default();
+            let mut band_state = BandState::default();
+            let mut partial_sample = None;
             loop {
                 match stdout.read(&mut buffer) {
                     Ok(0) => {
-                        reader_state.lock().unwrap().eof = true;
+                        let mut state = reader_state.lock().unwrap();
+                        if let Some(tail) = assembler.finish() {
+                            state.chunks.push_back(AudioChunk(tail));
+                        }
+                        state.eof = true;
                         return;
                     }
                     Ok(read) => {
+                        if let Some(level_ring) = level_ring.as_ref() {
+                            let mut level_bytes = Vec::with_capacity(read + 1);
+                            if let Some(byte) = partial_sample.take() {
+                                level_bytes.push(byte);
+                            }
+                            level_bytes.extend_from_slice(&buffer[..read]);
+                            if level_bytes.len() % 2 != 0 {
+                                partial_sample = level_bytes.pop();
+                            }
+                            let samples = level_bytes
+                                .chunks_exact(2)
+                                .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
+                                .collect::<Vec<_>>();
+                            level_ring.push(bands(&samples, &mut band_state));
+                        }
                         let mut state = reader_state.lock().unwrap();
                         state.received_bytes = state.received_bytes.saturating_add(read);
                         if state.received_bytes <= MAX_RECORDING_BYTES {
-                            state.chunks.push_back(AudioChunk(buffer[..read].to_vec()));
+                            for chunk in assembler.push(&buffer[..read]) {
+                                state.chunks.push_back(AudioChunk(chunk));
+                            }
                         } else if state.error.is_none() {
                             state.error = Some("Recording exceeded the bounded audio buffer".to_owned());
                         }

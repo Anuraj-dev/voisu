@@ -16,8 +16,9 @@ use voisu_app::feedback::{
     FeedbackDegradation, FeedbackSelection, OverlayRestartPolicy, SessionKind,
 };
 use voisu_app::overlay::{
-    poll_tick, ObservedSignal, OverlayPhase, OverlayView, PresentationController,
-    PresentationTracker, RecordingNotifyLatch, TickAction,
+    phase_glyph, poll_tick, BarSmoother, LevelPollAction, LevelPollLatch, ObservedSignal,
+    OverlayPhase, OverlayView, PresentationController, PresentationTracker, RecordingNotifyLatch,
+    TickAction,
 };
 use voisu_core::{Command, PROTOCOL_VERSION, Request, Response, socket_path};
 
@@ -278,8 +279,32 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     label.add_css_class("state-label");
     label.set_hexpand(true);
     label.set_vexpand(true);
-    let meter = gtk::Label::builder().label("").build();
-    meter.add_css_class("meter");
+    let meter = gtk::DrawingArea::builder()
+        .content_width(150)
+        .content_height(32)
+        .build();
+    // The pre-waveform text glyphs ("⋯" while Processing, "⚠" on Failure) keep
+    // their slot: only the Recording presentation is replaced by the bar meter.
+    let glyph = gtk::Label::builder().label("").build();
+    glyph.add_css_class("meter");
+    let rendered_bars = Rc::new(RefCell::new([0_u8; 20]));
+    let reduced_motion = gtk::Settings::default()
+        .map(|settings| !settings.is_gtk_enable_animations())
+        .unwrap_or(true);
+    let pulse_started = Instant::now();
+    meter.set_draw_func({
+        let rendered_bars = Rc::clone(&rendered_bars);
+        move |_, context, width, height| {
+            draw_meter(
+                context,
+                width,
+                height,
+                &rendered_bars.borrow(),
+                pulse_started,
+                reduced_motion,
+            );
+        }
+    });
     let capsule = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     capsule.set_margin_start(20);
     capsule.set_margin_end(20);
@@ -287,6 +312,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     capsule.set_margin_bottom(12);
     capsule.append(&label);
     capsule.append(&meter);
+    capsule.append(&glyph);
     window.set_child(Some(&capsule));
     window.set_visible(false);
 
@@ -313,7 +339,17 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     // realize probe above runs on that first real show — not on a startup
     // flash. Polling starts immediately so an early Recording is shown without
     // the old 500 ms + 200 ms grace.
-    install_surface_feedback(application.clone(), selection, window, label, meter, capsule, switched);
+    install_surface_feedback(
+        application.clone(),
+        selection,
+        window,
+        label,
+        meter,
+        glyph,
+        rendered_bars,
+        capsule,
+        switched,
+    );
 }
 
 fn install_surface_feedback(
@@ -323,7 +359,9 @@ fn install_surface_feedback(
     _selection: FeedbackSelection,
     window: gtk::ApplicationWindow,
     label: gtk::Label,
-    meter: gtk::Label,
+    meter: gtk::DrawingArea,
+    glyph: gtk::Label,
+    rendered_bars: Rc<RefCell<[u8; 20]>>,
     capsule: gtk::Box,
     switched: Rc<Cell<bool>>,
 ) {
@@ -335,13 +373,17 @@ fn install_surface_feedback(
     let is_fallback = false;
     let tracker = Rc::new(RefCell::new(PresentationTracker::default()));
     let notify_latch = Rc::new(RefCell::new(RecordingNotifyLatch::default()));
-    let reduced_motion = gtk::Settings::default()
-        .map(|settings| !settings.is_gtk_enable_animations())
-        .unwrap_or(true);
+    let level_latch = Rc::new(RefCell::new(LevelPollLatch::default()));
+    let level_source = Rc::new(RefCell::new(None::<gtk::glib::SourceId>));
+    let level_cursor = Rc::new(Cell::new(0_u64));
+    let smoother = Rc::new(RefCell::new(BarSmoother::default()));
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
         if switched.get() {
             // A genuine surface-creation failure handed feedback to the
             // notification backend; stop driving the retired window.
+            if let Some(source) = level_source.borrow_mut().take() {
+                source.remove();
+            }
             return gtk::glib::ControlFlow::Break;
         }
         let now = Instant::now();
@@ -359,7 +401,27 @@ fn install_surface_feedback(
                 ObservedSignal::Unreachable,
             ),
         };
-        render_surface(&window, &label, &meter, &capsule, view, reduced_motion);
+        render_surface(&window, &label, &meter, &glyph, &capsule, view);
+        match level_latch.borrow_mut().observe(signal) {
+            LevelPollAction::Arm => {
+                let source = install_level_poll(
+                    meter.clone(),
+                    Rc::clone(&rendered_bars),
+                    Rc::clone(&smoother),
+                    Rc::clone(&level_cursor),
+                );
+                *level_source.borrow_mut() = Some(source);
+            }
+            LevelPollAction::Disarm => {
+                if let Some(source) = level_source.borrow_mut().take() {
+                    source.remove();
+                }
+                level_cursor.set(0);
+                *rendered_bars.borrow_mut() = smoother.borrow_mut().reset();
+                meter.queue_draw();
+            }
+            LevelPollAction::Keep => {}
+        }
         // render_surface realizes the window on its first real show; the realize
         // callback may have found no surface and handed feedback to the
         // notification backend, setting `switched`. The pure `poll_tick` owns the
@@ -374,7 +436,12 @@ fn install_surface_feedback(
             &mut tracker.borrow_mut(),
             &mut notify_latch.borrow_mut(),
         ) {
-            TickAction::Break => gtk::glib::ControlFlow::Break,
+            TickAction::Break => {
+                if let Some(source) = level_source.borrow_mut().take() {
+                    source.remove();
+                }
+                gtk::glib::ControlFlow::Break
+            }
             TickAction::Continue { resurface, notify } => {
                 // Wayland denies a plain toplevel keep-above; re-present it on
                 // each transition into a visible phase to resurface above
@@ -597,10 +664,10 @@ async fn notify_call(
 fn render_surface(
     window: &gtk::ApplicationWindow,
     label: &gtk::Label,
-    meter: &gtk::Label,
+    meter: &gtk::DrawingArea,
+    glyph: &gtk::Label,
     capsule: &gtk::Box,
     view: OverlayView,
-    reduced_motion: bool,
 ) {
     for class in ["recording", "processing", "success", "failure"] {
         capsule.remove_css_class(class);
@@ -621,23 +688,97 @@ fn render_surface(
     }
     label.set_label(view.visible_label);
     label.update_property(&[gtk::accessible::Property::Description(view.accessible_label)]);
-    meter.set_label(if view.phase == OverlayPhase::Recording {
-        match view.activity {
-            3 => "▂▆█",
-            2 => "▂▅▆",
-            _ => "▂▃▂",
-        }
-    } else if view.phase == OverlayPhase::Processing {
-        "⋯"
-    } else if view.phase == OverlayPhase::Failure {
-        "⚠"
-    } else {
-        ""
-    });
+    meter.set_visible(view.phase == OverlayPhase::Recording);
+    glyph.set_label(phase_glyph(view.phase));
     window.set_visible(true);
-    // No animation source is installed for hidden, Processing, terminal, or
-    // reduced-motion states. Recording activity is status-driven.
-    let _ = view.animation_interval(reduced_motion);
+}
+
+fn install_level_poll(
+    meter: gtk::DrawingArea,
+    rendered_bars: Rc<RefCell<[u8; 20]>>,
+    smoother: Rc<RefCell<BarSmoother>>,
+    cursor: Rc<Cell<u64>>,
+) -> gtk::glib::SourceId {
+    gtk::glib::timeout_add_local(Duration::from_millis(20), move || {
+        let levels = match read_levels(cursor.get()) {
+            Some(frames) => {
+                if let Some(last) = frames.last() {
+                    cursor.set(last.seq);
+                }
+                smoother
+                    .borrow_mut()
+                    .observe_all(frames.into_iter().map(|frame| frame.bands))
+            }
+            None => smoother.borrow_mut().observe_failure(),
+        };
+        *rendered_bars.borrow_mut() = levels;
+        meter.queue_draw();
+        gtk::glib::ControlFlow::Continue
+    })
+}
+
+fn draw_meter(
+    context: &gtk::cairo::Context,
+    width: i32,
+    height: i32,
+    bands: &[u8; 20],
+    pulse_started: Instant,
+    reduced_motion: bool,
+) {
+    let centre = f64::from(height) / 2.0;
+    let pulse = if reduced_motion {
+        0.82
+    } else {
+        0.68 + 0.20 * (pulse_started.elapsed().as_secs_f64() * 2.4).sin()
+    };
+    context.set_source_rgba(0.396, 0.839, 0.627, pulse);
+    context.arc(4.0, centre, 3.2, 0.0, std::f64::consts::TAU);
+    let _ = context.fill();
+
+    let start = 13.0;
+    let gap = 2.0;
+    let bar_width = ((f64::from(width) - start) - gap * 19.0) / 20.0;
+    context.set_source_rgb(0.396, 0.839, 0.627);
+    for (index, level) in bands.iter().enumerate() {
+        let bar_height = 1.5 + f64::from(*level) / 255.0 * (f64::from(height) - 5.0);
+        let x = start + index as f64 * (bar_width + gap);
+        rounded_rectangle(context, x, centre - bar_height / 2.0, bar_width, bar_height);
+        let _ = context.fill();
+    }
+}
+
+fn rounded_rectangle(context: &gtk::cairo::Context, x: f64, y: f64, width: f64, height: f64) {
+    let radius = (width / 2.0).min(height / 2.0);
+    context.new_sub_path();
+    context.arc(
+        x + width - radius,
+        y + radius,
+        radius,
+        -std::f64::consts::FRAC_PI_2,
+        0.0,
+    );
+    context.arc(
+        x + width - radius,
+        y + height - radius,
+        radius,
+        0.0,
+        std::f64::consts::FRAC_PI_2,
+    );
+    context.arc(
+        x + radius,
+        y + height - radius,
+        radius,
+        std::f64::consts::FRAC_PI_2,
+        std::f64::consts::PI,
+    );
+    context.arc(
+        x + radius,
+        y + radius,
+        radius,
+        std::f64::consts::PI,
+        std::f64::consts::PI * 1.5,
+    );
+    context.close_path();
 }
 
 fn read_status() -> Option<Response> {
@@ -653,4 +794,20 @@ fn read_status() -> Option<Response> {
     let mut response = Vec::new();
     stream.read_to_end(&mut response).ok()?;
     serde_json::from_slice(&response).ok()
+}
+
+fn read_levels(after_seq: u64) -> Option<Vec<voisu_core::LevelFrame>> {
+    let mut stream = UnixStream::connect(socket_path().ok()?).ok()?;
+    stream.set_read_timeout(Some(Duration::from_millis(5))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_millis(5))).ok()?;
+    let request = serde_json::to_vec(&Request {
+        version: PROTOCOL_VERSION,
+        command: Command::Level { after_seq },
+    })
+    .ok()?;
+    stream.write_all(&request).ok()?;
+    stream.write_all(b"\n").ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok()?;
+    serde_json::from_slice::<Response>(&response).ok()?.level_frames
 }

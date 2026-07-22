@@ -76,6 +76,9 @@ pub enum Command {
     /// Observer-only status with the most recent terminal event retained.
     /// This is not a lifecycle command and cannot mutate daemon state.
     OverlayStatus,
+    /// Observes audio levels newer than the caller's stateless sequence cursor.
+    /// The daemon answers this directly without entering the lifecycle actor.
+    Level { after_seq: u64 },
     /// Returns the desktop-approved Trigger Key binding for display, or a
     /// notice that no Trigger Key is bound. Never blocks CLI start/stop/toggle.
     Shortcut,
@@ -267,6 +270,14 @@ pub struct Response {
     pub export: Option<DiagnosticExport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_event: Option<OverlayEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level_frames: Option<Vec<LevelFrame>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LevelFrame {
+    pub seq: u64,
+    pub bands: [u8; 20],
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -327,6 +338,7 @@ impl Response {
             history: None,
             export: None,
             overlay_event: None,
+            level_frames: None,
         }
     }
 
@@ -339,6 +351,12 @@ impl Response {
     pub fn with_export(export: DiagnosticExport) -> Self {
         let mut response = Self::success(DaemonState::Idle, "diagnostic export");
         response.export = Some(export);
+        response
+    }
+
+    pub fn with_level_frames(level_frames: Vec<LevelFrame>) -> Self {
+        let mut response = Self::with_evidence(true, None, "audio levels", None);
+        response.level_frames = Some(level_frames);
         response
     }
 }

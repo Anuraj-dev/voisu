@@ -4356,6 +4356,40 @@ fn an_unknown_observer_command_is_rejected_without_disturbing_the_daemon() {
 }
 
 #[test]
+fn level_poll_is_additive_stateless_and_does_not_mutate_the_recording() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start(runtime.path());
+
+    let idle = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"level":{"after_seq":0}}}"#,
+    );
+    assert_eq!(idle["version"], 1, "{idle}");
+    assert_eq!(idle["ok"], true, "{idle}");
+    assert_eq!(idle["level_frames"], serde_json::json!([]), "{idle}");
+    assert!(idle.get("state").is_none() || idle["state"].is_null(), "{idle}");
+
+    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    let first = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"level":{"after_seq":0}}}"#,
+    );
+    let repeated = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"level":{"after_seq":0}}}"#,
+    );
+    assert_eq!(
+        first["level_frames"], repeated["level_frames"],
+        "stateless cursor changed the response"
+    );
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
+}
+
+#[test]
 fn a_restarted_daemon_reuses_the_terminal_id_under_a_distinct_instance_marker() {
     // Each daemon resets its observer id counter to 1, so the first terminal
     // event after a restart reuses the exact id (1) the previous daemon emitted.
