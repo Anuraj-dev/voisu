@@ -258,7 +258,15 @@ case "$command" in
     fi
     ;;
   restart)
-    if active; then kill "$(cat "$pid_file")"; fi
+    # Real systemd serializes restart: the old MainPID must exit before
+    # ExecStart runs. Wait for it, or the fresh daemon can lose the
+    # single-instance lock to the dying one and exit cleanly, leaving the
+    # unit "active" on a dead pid.
+    if active; then
+      kill "$(cat "$pid_file")"
+      i=0
+      while active && test "$i" -lt 100; do i=$((i + 1)); sleep 0.01; done
+    fi
     rm -f "$pid_file"
     "$daemon" >/dev/null 2>&1 &
     printf '%s\n' "$!" > "$pid_file"
