@@ -31,10 +31,17 @@ Trigger Key and Delivery use desktop portals."""
 #   (portals)            -> xdg-desktop-portal   (Trigger Key + Delivery)
 #   pipewire-utils       -> pipewire-bin         (pw-record)
 #   wireplumber          -> wireplumber          (wpctl)
-#   wl-clipboard         -> wl-clipboard         (wl-copy/wl-paste)
+#   wl-clipboard         -> wl-clipboard | xclip (Wayland uses wl-copy/wl-paste;
+#                                                 X11 uses xclip. Either satisfies
+#                                                 the dependency because the code
+#                                                 picks the backend at runtime by
+#                                                 session — a Debian/Ubuntu box may
+#                                                 boot X11 or Wayland at the login
+#                                                 screen. Fedora/Arch keep
+#                                                 wl-clipboard only.)
 #   /usr/bin/secret-tool -> libsecret-tools      (secret-tool binary)
 #   curl                 -> curl                 (provider HTTPS/WSS)
-depends = "$auto, xdg-desktop-portal, pipewire-bin, wireplumber, wl-clipboard, libsecret-tools, curl"
+depends = "$auto, xdg-desktop-portal, pipewire-bin, wireplumber, wl-clipboard | xclip, libsecret-tools, curl"
 # libei is dlopen()'d by SONAME at runtime (an optional auto-type capability),
 # never linked -- so it is Recommends, mirroring the RPM `Recommends: libei`.
 recommends = "libei1"

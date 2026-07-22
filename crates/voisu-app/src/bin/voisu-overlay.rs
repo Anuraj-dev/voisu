@@ -129,28 +129,22 @@ fn run_overlay(arguments: &[String]) -> i32 {
 fn environment_capabilities(layer_shell_supported: bool) -> FeedbackCapabilities {
     let wayland_display = env::var_os("WAYLAND_DISPLAY").is_some();
     let x11_display = env::var_os("DISPLAY").is_some();
-    let declared_wayland = matches!(
-        env::var("XDG_SESSION_TYPE").ok().as_deref(),
-        Some(value) if value.eq_ignore_ascii_case("wayland")
-    );
-    let xwayland_fallback = declared_wayland && !wayland_display && x11_display;
-    let session = if xwayland_fallback {
-        SessionKind::X11
-    } else {
-        match env::var("XDG_SESSION_TYPE").ok().as_deref() {
-        Some(value) if value.eq_ignore_ascii_case("wayland") => SessionKind::Wayland,
-        Some(value) if value.eq_ignore_ascii_case("x11") => SessionKind::X11,
-        _ if wayland_display => SessionKind::Wayland,
-        _ if x11_display => SessionKind::X11,
-        _ => SessionKind::Unknown,
-        }
-    };
-    let display_available = match session {
+    // Session detection is the single source of truth in voisu-core, shared with
+    // the clipboard backend and doctor; the adapter only gathers the raw facts.
+    let session_type = env::var("XDG_SESSION_TYPE").ok();
+    let resolution =
+        voisu_core::resolve_session(wayland_display, x11_display, session_type.as_deref());
+    let display_available = match resolution.session {
         SessionKind::Wayland => wayland_display,
         SessionKind::X11 => x11_display,
         SessionKind::Unknown => wayland_display || x11_display,
     };
-    FeedbackCapabilities { session, display_available, xwayland_fallback, layer_shell_supported }
+    FeedbackCapabilities {
+        session: resolution.session,
+        display_available,
+        xwayland_fallback: resolution.xwayland_fallback,
+        layer_shell_supported,
+    }
 }
 
 fn report(selection: FeedbackSelection) {
@@ -299,7 +293,9 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
 
 fn install_surface_feedback(
     application: gtk::Application,
-    selection: FeedbackSelection,
+    // Rung 2 is gone, so the only windowed backend is Layer Shell and the
+    // fallback branch below is inert; the selection is no longer consulted here.
+    _selection: FeedbackSelection,
     window: gtk::ApplicationWindow,
     label: gtk::Label,
     meter: gtk::Label,
@@ -307,10 +303,11 @@ fn install_surface_feedback(
     switched: Rc<Cell<bool>>,
 ) {
     let controller = Rc::new(RefCell::new(PresentationController::default()));
-    // Resurfacing and the Recording-start notification are only needed on the
-    // fallback path: a layer-shell surface is kept above by the compositor and
-    // has no "buried window" problem, so its behavior is left untouched.
-    let is_fallback = selection.backend == FeedbackBackend::RegularSurface;
+    // Rung 2 (a plain GTK window) is skipped, so the only windowed backend that
+    // reaches here is Layer Shell, which the compositor keeps above and which
+    // has no "buried window" problem. The resurface/notify fallback behavior is
+    // therefore never needed on this path.
+    let is_fallback = false;
     let tracker = Rc::new(RefCell::new(PresentationTracker::default()));
     let notify_latch = Rc::new(RefCell::new(RecordingNotifyLatch::default()));
     let reduced_motion = gtk::Settings::default()
@@ -381,7 +378,14 @@ fn install_notification_feedback(application: &gtk::Application) {
     let hold = application.hold();
     let controller = Rc::new(RefCell::new(PresentationController::default()));
     let previous = Rc::new(RefCell::new(OverlayView::HIDDEN));
-    let application = application.clone();
+    // Rung 3 talks to org.freedesktop.Notifications directly over the session
+    // bus rather than through GNotification: the D-Bus service is present on
+    // Cinnamon, GNOME, KDE, and XFCE without a registered desktop entry or
+    // D-Bus activation, which is exactly what the X11/Cinnamon target lacks.
+    // The zbus connection lives on its own thread with a contained tokio
+    // runtime (the overlay's main loop is glib, not tokio); the poll loop only
+    // hands it the label to show. It reuses the existing zbus dependency.
+    let notifier = spawn_notifier();
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
         let _hold = &hold;
         let now = Instant::now();
@@ -390,13 +394,76 @@ fn install_notification_feedback(application: &gtk::Application) {
             None => controller.borrow_mut().observe_unreachable(now),
         };
         if view.is_visible() && *previous.borrow() != view {
-            let notification = gtk::gio::Notification::new("Voisu");
-            notification.set_body(Some(view.visible_label));
-            application.send_notification(Some("overlay-feedback"), &notification);
+            if let Some(notifier) = notifier.as_ref() {
+                // A closed receiver (bus never came up) just drops the request;
+                // feedback is best-effort and must never break the overlay.
+                let _ = notifier.send(view.visible_label.to_owned());
+            }
         }
         *previous.borrow_mut() = view;
         gtk::glib::ControlFlow::Continue
     });
+}
+
+/// Start the notification worker: a thread owning a contained current-thread
+/// tokio runtime and one session-bus connection, replacing its notification in
+/// place on each request. Returns the request channel, or `None` if the thread
+/// could not be spawned (feedback then degrades silently).
+fn spawn_notifier() -> Option<std::sync::mpsc::Sender<String>> {
+    let (sender, receiver) = std::sync::mpsc::channel::<String>();
+    std::thread::Builder::new()
+        .name("voisu-overlay-notify".to_owned())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                let Ok(connection) = zbus::Connection::session().await else {
+                    return;
+                };
+                let mut replaces_id = 0_u32;
+                // recv blocks this dedicated runtime thread between requests,
+                // which is fine: it runs no other tasks.
+                while let Ok(body) = receiver.recv() {
+                    replaces_id = send_desktop_notification(&connection, replaces_id, &body).await;
+                }
+            });
+        })
+        .ok()?;
+    Some(sender)
+}
+
+/// Send (or replace) a Voisu desktop notification through
+/// org.freedesktop.Notifications. Returns the server-assigned id so the next
+/// transition replaces this notification in place rather than stacking; a bus
+/// error keeps the previous id.
+async fn send_desktop_notification(
+    connection: &zbus::Connection,
+    replaces_id: u32,
+    body: &str,
+) -> u32 {
+    use std::collections::HashMap;
+    use zbus::zvariant::Value;
+
+    let actions: Vec<&str> = Vec::new();
+    let hints: HashMap<&str, Value<'_>> = HashMap::new();
+    // Notify(app_name, replaces_id, app_icon, summary, body, actions, hints,
+    //        expire_timeout) -> u32
+    let arguments = ("Voisu", replaces_id, "", "Voisu", body, actions, hints, 3000_i32);
+    match connection
+        .call_method(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            Some("org.freedesktop.Notifications"),
+            "Notify",
+            &arguments,
+        )
+        .await
+    {
+        Ok(reply) => reply.body().deserialize::<u32>().unwrap_or(replaces_id),
+        Err(_) => replaces_id,
+    }
 }
 
 fn render_surface(

@@ -25,7 +25,7 @@ const IO_DEADLINE: Duration = Duration::from_secs(2);
 enum CliAction {
     Daemon(Command),
     History { json: bool },
-    Doctor,
+    Doctor { verbose: bool },
     Setup,
     AuthSet(Provider),
     AuthVerify(Provider),
@@ -43,7 +43,7 @@ fn main() -> ExitCode {
     match parse_command() {
         Ok(CliAction::Daemon(command)) => daemon_command(command),
         Ok(CliAction::History { json }) => history_command(json),
-        Ok(CliAction::Doctor) => doctor(),
+        Ok(CliAction::Doctor { verbose }) => doctor(verbose),
         Ok(CliAction::Setup) => setup(),
         Ok(CliAction::AuthSet(provider)) => match credential_from_stdin() {
             Ok(credential) => auth_set(provider, credential),
@@ -243,16 +243,32 @@ fn render_history_pretty(records: &serde_json::Value) -> ExitCode {
 }
 
 
-fn doctor() -> ExitCode {
+/// Column widths for the terse doctor table: `label  value  STATUS`. Chosen to
+/// fit the longest label ("Secret storage") and a typical value ("X11 (XWayland)").
+const DOCTOR_LABEL_WIDTH: usize = 15;
+const DOCTOR_VALUE_WIDTH: usize = 18;
+
+fn doctor(verbose: bool) -> ExitCode {
     let findings = FedoraReadiness.inspect();
     let mut has_failure = findings.iter().any(|finding| finding.status == ReadinessStatus::Fail);
-    for finding in findings {
+    // One line per check: `label  value  STATUS`. A remediation action prints on
+    // its own indented line; the reasoning is shown only under --verbose.
+    for finding in &findings {
+        let value = finding.value.as_deref().unwrap_or("");
         println!(
-            "{}: {} ({})",
+            "{:<label$}{:<value$}{}",
             finding.capability.cli_label(),
+            value,
             finding.status.cli_label(),
-            finding.detail
+            label = DOCTOR_LABEL_WIDTH,
+            value = DOCTOR_VALUE_WIDTH,
         );
+        if let Some(action) = &finding.action {
+            println!("    {action}");
+        }
+        if verbose {
+            println!("    ({})", finding.detail);
+        }
     }
     // One runtime serves both the focus probe and the live per-provider key
     // round trips, so the CLI never needs an ambient async runtime.
@@ -565,7 +581,10 @@ fn parse_command() -> Result<CliAction, String> {
         [command, path] if command == "replay" => {
             Ok(CliAction::Daemon(Command::Replay(ReplayFixturePath::new(path.clone()))))
         }
-        [command] if command == "doctor" => Ok(CliAction::Doctor),
+        [command] if command == "doctor" => Ok(CliAction::Doctor { verbose: false }),
+        [command, flag] if command == "doctor" && (flag == "--verbose" || flag == "-v") => {
+            Ok(CliAction::Doctor { verbose: true })
+        }
         [command] if command == "setup" => Ok(CliAction::Setup),
         [command] if command == "--help" || command == "-h" || command == "help" => {
             Ok(CliAction::Help)
@@ -645,7 +664,7 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: voisu <setup|start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|delivery|dictionary|service>\n\n  voisu setup  # guided, re-runnable wizard: validate and store your Deepgram and Groq keys\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor  # capability, focus-guard, and live per-key round-trip checks\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu delivery [type|clipboard|guarded]  # choose Transcript Delivery (default type); no argument shows the persisted mode\n  voisu dictionary add <term>\n  voisu dictionary remove <term>\n  voisu dictionary list [--json]\n  voisu service <install|start|stop|restart|status|uninstall>"
+    "usage: voisu <setup|start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|delivery|dictionary|service>\n\n  voisu setup  # guided, re-runnable wizard: validate and store your Deepgram and Groq keys\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor [--verbose]  # capability, focus-guard, and live per-key round-trip checks; --verbose adds the reasoning behind each line\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu delivery [type|clipboard|guarded]  # choose Transcript Delivery (default type); no argument shows the persisted mode\n  voisu dictionary add <term>\n  voisu dictionary remove <term>\n  voisu dictionary list [--json]\n  voisu service <install|start|stop|restart|status|uninstall>"
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {

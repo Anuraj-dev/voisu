@@ -600,12 +600,12 @@ mod tests {
         let cases = [
             (
                 FeedbackCapabilities { session: SessionKind::X11, display_available: true, xwayland_fallback: false, layer_shell_supported: false },
-                FeedbackBackend::RegularSurface,
+                FeedbackBackend::DesktopNotification,
                 Some(crate::feedback::FeedbackDegradation::X11),
             ),
             (
                 FeedbackCapabilities { session: SessionKind::Wayland, display_available: true, xwayland_fallback: false, layer_shell_supported: false },
-                FeedbackBackend::RegularSurface,
+                FeedbackBackend::DesktopNotification,
                 Some(crate::feedback::FeedbackDegradation::LayerShellUnavailable),
             ),
             (

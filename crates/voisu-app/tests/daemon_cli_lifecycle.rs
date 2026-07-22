@@ -145,6 +145,11 @@ impl Daemon {
         command
             .env("XDG_RUNTIME_DIR", runtime_dir)
             .env("VOISU_TEST_MODE", "controlled")
+            // The fake pw-record stubs emit headerless PCM, matching the --raw
+            // path. Force the capability probe to that path so it neither runs
+            // the stub's --help nor mistakes raw PCM for a WAV container. The
+            // WAV-fallback path is covered by unit tests and a real-host gate.
+            .env("VOISU_TEST_PW_RECORD_RAW", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -188,6 +193,9 @@ impl Daemon {
         let mut command = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"));
         command
             .env("XDG_RUNTIME_DIR", runtime_dir)
+            // The fake pw-record stubs emit headerless PCM; force the --raw
+            // capability path (see start_with_env). Real hosts probe for real.
+            .env("VOISU_TEST_PW_RECORD_RAW", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -2542,10 +2550,23 @@ fn doctor_reports_each_fedora_capability_through_the_public_cli() {
         .expect("doctor should run");
 
     assert!(doctor.status.success(), "{}", stderr(&doctor));
-    assert_eq!(
-        stdout(&doctor),
-        "PipeWire: PASS (PipeWire core responds)\nMicrophone: PASS (default source available)\nPortals: PASS (desktop portal responds)\nClipboard: PASS (clipboard roundtrip succeeds)\nSecret storage: PASS (Secret Service responds)\nDaemon: PASS (status handshake succeeds)\nFocus guard: hyprland\n"
+    // Golden: one terse line per check (`label  value  STATUS`), no reasoning
+    // paragraphs, no action lines when everything passes. `line` mirrors the
+    // production column widths (15 / 18) so a layout regression is caught.
+    let line = |label: &str, value: &str, status: &str| {
+        format!("{label:<15}{value:<18}{status}\n")
+    };
+    let expected = format!(
+        "{}{}{}{}{}{}{}Focus guard: hyprland\n",
+        line("Session", "Wayland (KDE)", "PASS"),
+        line("PipeWire", "1.4.11 (raw)", "PASS"),
+        line("Microphone", "", "PASS"),
+        line("Portals", "", "PASS"),
+        line("Clipboard", "", "PASS"),
+        line("Secret storage", "", "PASS"),
+        line("Daemon", "", "PASS"),
     );
+    assert_eq!(stdout(&doctor), expected);
 }
 
 #[test]
@@ -2585,10 +2606,21 @@ fn doctor_exposes_actionable_warn_and_fail_outcomes() {
         ],
     );
 
+    let line = |label: &str, value: &str, status: &str| {
+        format!("{label:<15}{value:<18}{status}\n")
+    };
     assert_eq!(doctor.status.code(), Some(4));
-    assert!(stdout(&doctor).contains("PipeWire: FAIL (not available; see remediation)\n"));
-    assert!(stdout(&doctor).contains("Clipboard: WARN (needs attention; see remediation)\n"));
-    assert!(stdout(&doctor).contains("Daemon: FAIL (daemon status handshake failed; start voisu-daemon and run voisu doctor again)\n"));
+    let output = stdout(&doctor);
+    // A FAIL check prints its status line and an indented action line.
+    assert!(output.contains(&line("PipeWire", "1.4.11 (raw)", "FAIL")), "{output}");
+    assert!(output.contains("\n    run the printed remediation command\n"), "{output}");
+    // A WARN with no action prints just the one line.
+    assert!(output.contains(&line("Clipboard", "", "WARN")), "{output}");
+    assert!(output.contains(&line("Daemon", "", "FAIL")), "{output}");
+    assert!(
+        output.contains("\n    start voisu-daemon and run voisu doctor again\n"),
+        "{output}"
+    );
 }
 
 #[test]
@@ -2609,12 +2641,12 @@ fn doctor_points_at_the_journal_when_the_service_unit_is_failed() {
     );
 
     assert_eq!(doctor.status.code(), Some(4));
+    let output = stdout(&doctor);
+    // The terse Daemon FAIL line plus the journal action on its own indented line.
+    assert!(output.contains(&format!("{:<15}{:<18}FAIL\n", "Daemon", "")), "{output}");
     assert!(
-        stdout(&doctor).contains(
-            "Daemon: FAIL (daemon status handshake failed and systemctl --user reports voisu.service failed; inspect the logs with `journalctl --user -u voisu.service`)\n"
-        ),
-        "{}",
-        stdout(&doctor)
+        output.contains("\n    journalctl --user -u voisu.service\n"),
+        "{output}"
     );
 }
 
@@ -2633,11 +2665,20 @@ fn doctor_warns_when_the_portal_exposes_no_global_shortcuts() {
         &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
     );
 
+    // Terse: the WARN line carries no reasoning, and the remediation is a single
+    // indented action line.
     let out = stdout(&doctor);
-    assert!(out.contains("Portals: WARN ("), "{out}");
-    assert!(out.contains("no GlobalShortcuts interface"), "{out}");
-    assert!(out.contains("xdg-desktop-portal-hyprland"), "{out}");
-    assert!(out.contains("Trigger Key section in the README"), "{out}");
+    assert!(out.contains(&format!("{:<15}{:<18}WARN\n", "Portals", "")), "{out}");
+    assert!(out.contains("\n    bind a desktop shortcut to run: voisu toggle\n"), "{out}");
+    // The reasoning (GlobalShortcuts / Hyprland) moves behind --verbose.
+    let verbose = voisu_with_env(
+        runtime.path(),
+        &["doctor", "--verbose"],
+        &[("PATH", &commands.path()), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+    );
+    let verbose_out = stdout(&verbose);
+    assert!(verbose_out.contains("no GlobalShortcuts interface"), "{verbose_out}");
+    assert!(verbose_out.contains("xdg-desktop-portal-hyprland"), "{verbose_out}");
 }
 
 #[test]
@@ -2654,7 +2695,7 @@ fn doctor_passes_portals_when_global_shortcuts_are_available() {
     );
 
     assert!(
-        stdout(&doctor).contains("Portals: PASS (desktop portal responds)\n"),
+        stdout(&doctor).contains(&format!("{:<15}{:<18}PASS\n", "Portals", "")),
         "{}",
         stdout(&doctor)
     );
@@ -2691,9 +2732,9 @@ fn doctor_exercises_real_capabilities_instead_of_command_headings_or_socket_conn
         fs::read_to_string(commands.bin.path().join("clipboard")).unwrap(),
         "prior clipboard"
     );
-    assert!(stdout(&doctor).contains("Microphone: PASS (default source available)"));
-    assert!(stdout(&doctor).contains("Clipboard: PASS (clipboard roundtrip succeeds"));
-    assert!(stdout(&doctor).contains("Daemon: PASS (status handshake succeeds)"));
+    assert!(stdout(&doctor).contains(&format!("{:<15}{:<18}PASS\n", "Microphone", "")));
+    assert!(stdout(&doctor).contains(&format!("{:<15}{:<18}PASS\n", "Clipboard", "")));
+    assert!(stdout(&doctor).contains(&format!("{:<15}{:<18}PASS\n", "Daemon", "")));
 }
 
 #[test]
@@ -2713,7 +2754,7 @@ fn doctor_clipboard_passes_while_wl_copy_serves_the_clipboard_past_exit() {
 
     assert!(doctor.status.success(), "{}", stdout(&doctor));
     assert!(
-        stdout(&doctor).contains("Clipboard: PASS (clipboard roundtrip succeeds"),
+        stdout(&doctor).contains(&format!("{:<15}{:<18}PASS\n", "Clipboard", "")),
         "{}",
         stdout(&doctor)
     );
@@ -2749,7 +2790,7 @@ fn doctor_reports_a_reachable_secret_service_without_a_match_as_pass() {
             .starts_with("lookup\nvoisu-doctor-probe\n")
     );
     assert!(
-        stdout(&doctor).contains("Secret storage: PASS (Secret Service is reachable)"),
+        stdout(&doctor).contains(&format!("{:<15}{:<18}PASS\n", "Secret storage", "")),
         "{}",
         stdout(&doctor)
     );
@@ -2770,12 +2811,12 @@ fn doctor_warns_when_the_secret_service_reports_an_error() {
     );
 
     assert!(
-        stdout(&doctor).contains("Secret storage: WARN"),
+        stdout(&doctor).contains(&format!("{:<15}{:<18}WARN\n", "Secret storage", "")),
         "{}",
         stdout(&doctor)
     );
     assert!(
-        stdout(&doctor).contains("unlock the keyring or log in to the desktop session"),
+        stdout(&doctor).contains("\n    unlock the keyring or log in to the desktop session\n"),
         "{}",
         stdout(&doctor)
     );
@@ -6739,7 +6780,7 @@ fn doctor_daemon_probe_is_bounded_under_a_trickling_peer() {
     );
     assert_eq!(doctor.status.code(), Some(4));
     assert!(
-        stdout(&doctor).contains("Daemon: FAIL"),
+        stdout(&doctor).contains(&format!("{:<15}{:<18}FAIL\n", "Daemon", "")),
         "{}",
         stdout(&doctor)
     );
@@ -6782,7 +6823,7 @@ fn doctor_daemon_probe_rejects_a_flooding_peer_at_the_response_cap() {
     );
     assert_eq!(doctor.status.code(), Some(4));
     assert!(
-        stdout(&doctor).contains("Daemon: FAIL"),
+        stdout(&doctor).contains(&format!("{:<15}{:<18}FAIL\n", "Daemon", "")),
         "{}",
         stdout(&doctor)
     );
