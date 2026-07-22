@@ -18,7 +18,6 @@ pub enum OverlayPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OverlayView {
     pub phase: OverlayPhase,
-    pub activity: u8,
     pub visible_label: &'static str,
     pub accessible_label: &'static str,
 }
@@ -26,7 +25,6 @@ pub struct OverlayView {
 impl OverlayView {
     pub const HIDDEN: Self = Self {
         phase: OverlayPhase::Hidden,
-        activity: 0,
         visible_label: "",
         accessible_label: "",
     };
@@ -38,14 +36,11 @@ impl OverlayView {
         match response.state {
             Some(DaemonState::Recording) => Self {
                 phase: OverlayPhase::Recording,
-                activity: response.evidence.as_ref()
-                    .map(|e| e.streamed_chunk_count.min(3) as u8).unwrap_or(1),
                 visible_label: "Recording",
                 accessible_label: "Recording; voice activity visible",
             },
             Some(DaemonState::Processing) => Self {
                 phase: OverlayPhase::Processing,
-                activity: 0,
                 visible_label: "Processing",
                 accessible_label: "Processing Recording",
             },
@@ -55,21 +50,21 @@ impl OverlayView {
 
     pub const fn from_terminal_event(event: &OverlayEvent) -> Self {
         match event.outcome {
-            OverlayOutcome::Delivered => Self { phase: OverlayPhase::Success, activity: 0,
+            OverlayOutcome::Delivered => Self { phase: OverlayPhase::Success,
                 visible_label: "Delivered", accessible_label: "Transcript Delivered" },
             OverlayOutcome::QualityFailure => Self::failure(),
-            _ => Self { phase: OverlayPhase::Failure, activity: 0,
+            _ => Self { phase: OverlayPhase::Failure,
                 visible_label: "Failure", accessible_label: "Recording failed" },
         }
     }
 
     pub const fn success() -> Self {
-        Self { phase: OverlayPhase::Success, activity: 0,
+        Self { phase: OverlayPhase::Success,
             visible_label: "Delivered", accessible_label: "Transcript Delivered" }
     }
 
     pub const fn failure() -> Self {
-        Self { phase: OverlayPhase::Failure, activity: 0,
+        Self { phase: OverlayPhase::Failure,
             visible_label: "Quality Failure", accessible_label: "Quality Failure" }
     }
 
@@ -79,7 +74,6 @@ impl OverlayView {
     pub const fn daemon_unavailable() -> Self {
         Self {
             phase: OverlayPhase::Failure,
-            activity: 0,
             visible_label: "Daemon unavailable",
             accessible_label: "Daemon unavailable; the optional Overlay cannot reach voisu-daemon",
         }
@@ -87,9 +81,16 @@ impl OverlayView {
 
     pub const fn is_visible(self) -> bool { !matches!(self.phase, OverlayPhase::Hidden) }
 
-    pub const fn animation_interval(self, reduced_motion: bool) -> Option<Duration> {
-        if reduced_motion || !matches!(self.phase, OverlayPhase::Recording) { None }
-        else { Some(Duration::from_millis(160)) }
+}
+
+/// The text glyph shown in the capsule's meter slot outside Recording. These
+/// are the pre-waveform glyphs: the live bar meter replaces only the Recording
+/// presentation, so Processing and Failure keep rendering exactly as before.
+pub const fn phase_glyph(phase: OverlayPhase) -> &'static str {
+    match phase {
+        OverlayPhase::Processing => "⋯",
+        OverlayPhase::Failure => "⚠",
+        OverlayPhase::Recording | OverlayPhase::Success | OverlayPhase::Hidden => "",
     }
 }
 
@@ -208,6 +209,89 @@ pub enum ObservedSignal {
     Reachable(OverlayPhase),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LevelPollAction {
+    Arm,
+    Disarm,
+    Keep,
+}
+
+#[derive(Debug, Default)]
+pub struct LevelPollLatch {
+    armed: bool,
+    unreachable_once: bool,
+}
+
+impl LevelPollLatch {
+    pub fn observe(&mut self, signal: ObservedSignal) -> LevelPollAction {
+        match signal {
+            ObservedSignal::Unreachable if self.armed && !self.unreachable_once => {
+                self.unreachable_once = true;
+                LevelPollAction::Keep
+            }
+            ObservedSignal::Unreachable if self.armed => {
+                self.armed = false;
+                self.unreachable_once = false;
+                LevelPollAction::Disarm
+            }
+            ObservedSignal::Unreachable => LevelPollAction::Keep,
+            ObservedSignal::Reachable(OverlayPhase::Recording) if !self.armed => {
+                self.armed = true;
+                self.unreachable_once = false;
+                LevelPollAction::Arm
+            }
+            ObservedSignal::Reachable(OverlayPhase::Recording) => {
+                self.unreachable_once = false;
+                LevelPollAction::Keep
+            }
+            ObservedSignal::Reachable(_) if self.armed => {
+                self.armed = false;
+                self.unreachable_once = false;
+                LevelPollAction::Disarm
+            }
+            ObservedSignal::Reachable(_) => {
+                self.unreachable_once = false;
+                LevelPollAction::Keep
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct BarSmoother {
+    levels: [f32; 20],
+}
+
+impl BarSmoother {
+    pub fn observe(&mut self, bands: [u8; 20]) -> [u8; 20] {
+        for (current, target) in self.levels.iter_mut().zip(bands) {
+            let coefficient = if target as f32 > *current { 0.65 } else { 0.16 };
+            *current += coefficient * (target as f32 - *current);
+        }
+        self.current()
+    }
+
+    pub fn observe_all(&mut self, frames: impl IntoIterator<Item = [u8; 20]>) -> [u8; 20] {
+        for frame in frames {
+            self.observe(frame);
+        }
+        self.current()
+    }
+
+    pub fn observe_failure(&mut self) -> [u8; 20] {
+        self.observe([0; 20])
+    }
+
+    pub fn reset(&mut self) -> [u8; 20] {
+        self.levels = [0.0; 20];
+        self.current()
+    }
+
+    pub fn current(&self) -> [u8; 20] {
+        std::array::from_fn(|index| self.levels[index].round().clamp(0.0, 255.0) as u8)
+    }
+}
+
 /// Edge-latch for the fallback path's secondary "Recording started" desktop
 /// notification. Pure and adapter-free, mirroring `PresentationTracker`.
 ///
@@ -277,6 +361,78 @@ mod tests {
     use super::*;
     use crate::feedback::{select_feedback_backend, FeedbackBackend, FeedbackCapabilities, SessionKind};
     use voisu_core::{DaemonState, OverlayEvent, OverlayOutcome, Response, VersionEnvelope};
+
+    #[test]
+    fn red_bar_smoothing_attacks_quickly_and_releases_monotonically() {
+        let mut smoother = BarSmoother::default();
+        let first = smoother.observe([200; 20]);
+        let second = smoother.observe([200; 20]);
+        assert!(first[0] >= 100 && second[0] > first[0]);
+        let release_one = smoother.observe([0; 20]);
+        let release_two = smoother.observe([0; 20]);
+        assert!(release_one[0] < second[0] && release_two[0] < release_one[0]);
+    }
+
+    #[test]
+    fn red_coalesced_level_frames_preserve_an_intermediate_peak() {
+        let mut coalesced = BarSmoother::default();
+        let result = coalesced.observe_all([[20; 20], [240; 20], [20; 20]]);
+        let mut last_only = BarSmoother::default();
+        let last = last_only.observe([20; 20]);
+        assert!(result[0] > last[0]);
+    }
+
+    #[test]
+    fn red_level_poll_timer_uses_observed_recording_edges() {
+        let mut latch = LevelPollLatch::default();
+        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)), LevelPollAction::Arm);
+        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)), LevelPollAction::Keep);
+        assert_eq!(latch.observe(ObservedSignal::Unreachable), LevelPollAction::Keep);
+        assert_eq!(
+            latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)),
+            LevelPollAction::Keep
+        );
+        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Processing)), LevelPollAction::Disarm);
+        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Hidden)), LevelPollAction::Keep);
+    }
+
+    #[test]
+    fn red_persistent_unreachability_disarms_the_fast_poll_without_a_clock() {
+        let mut latch = LevelPollLatch::default();
+        assert_eq!(
+            latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)),
+            LevelPollAction::Arm
+        );
+        assert_eq!(latch.observe(ObservedSignal::Unreachable), LevelPollAction::Keep);
+        assert_eq!(
+            latch.observe(ObservedSignal::Unreachable),
+            LevelPollAction::Disarm
+        );
+    }
+
+    #[test]
+    fn red_non_recording_phases_keep_their_pre_waveform_glyphs() {
+        // Only the Recording phase changes with the live bar meter; the
+        // Processing and Failure capsules keep the exact text presentation
+        // they had before it (spec 2026-07-20, §1).
+        assert_eq!(phase_glyph(OverlayPhase::Processing), "⋯");
+        assert_eq!(phase_glyph(OverlayPhase::Failure), "⚠");
+        assert_eq!(phase_glyph(OverlayPhase::Recording), "");
+        assert_eq!(phase_glyph(OverlayPhase::Success), "");
+        assert_eq!(phase_glyph(OverlayPhase::Hidden), "");
+    }
+
+    #[test]
+    fn red_a_failed_level_poll_only_decays_bars() {
+        let now = Instant::now();
+        let mut controller = PresentationController::default();
+        let response = overlay_status(DaemonState::Recording, None);
+        assert_eq!(controller.observe(&response, now).phase, OverlayPhase::Recording);
+        let mut smoother = BarSmoother::default();
+        smoother.observe([200; 20]);
+        assert!(smoother.observe_failure()[0] < 200);
+        assert_eq!(controller.observe(&response, now).phase, OverlayPhase::Recording);
+    }
 
     fn event(id: u64, outcome: OverlayOutcome) -> OverlayEvent {
         event_from(0, id, outcome)

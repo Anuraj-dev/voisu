@@ -1,3 +1,4 @@
+pub mod audio_level;
 pub mod config;
 pub mod dictionary;
 pub mod history_view;

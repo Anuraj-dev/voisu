@@ -14,6 +14,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use voisu_app::audio_level::{LevelRegistry, LevelRing};
 use voisu_app::focus::SharedFocusProbe;
 use voisu_app::system::{
     CAPTURE_FINALIZE_DEADLINE, DeepgramProvider, DesktopNotifier, FedoraShortcutPortal,
@@ -155,6 +156,7 @@ async fn run() -> Result<(), String> {
     };
 
     let (actor_tx, actor_rx) = mpsc::channel(64);
+    let levels = LevelRegistry::default();
     // The actor-owned reaper supervises capture and provider-stream cleanup.
     // A clone stays here so shutdown, after the actor has joined, drains any
     // process reap still retained before the Tokio runtime is torn down.
@@ -166,6 +168,7 @@ async fn run() -> Result<(), String> {
         reaper.clone(),
         delivery_mode,
         focus_probe,
+        levels.clone(),
     ));
     // The Global Shortcuts portal listener runs off the actor so a slow or
     // unavailable portal never blocks the IPC surface. Each Trigger Key
@@ -195,9 +198,10 @@ async fn run() -> Result<(), String> {
                     Err(_) => continue,
                 };
                 let actor = actor_tx.clone();
+                let levels = levels.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = serve(stream, actor).await;
+                    let _ = serve(stream, actor, levels).await;
                 });
             }
             signal = tokio::signal::ctrl_c() => {
@@ -374,6 +378,7 @@ struct StartupCompletion {
     deepgram: Box<dyn TranscriptProvider>,
     groq: Box<dyn TranscriptProvider>,
     result: Result<(Box<dyn ActiveCapture>, ProviderStreams), StartFailure>,
+    level_ring: Arc<LevelRing>,
     reply: oneshot::Sender<Response>,
 }
 
@@ -395,6 +400,7 @@ struct ActiveRecording {
     pump: JoinHandle<PumpOutput>,
     chunk_counter: Arc<AtomicU32>,
     first_chunk_ms: Arc<AtomicU64>,
+    level_ring: Arc<LevelRing>,
     started_at: Instant,
     evidence: LifecycleEvidence,
 }
@@ -450,6 +456,7 @@ async fn actor_loop(
     reaper: ProviderReaper,
     delivery_mode: DeliveryMode,
     focus_probe: Option<SharedFocusProbe>,
+    levels: LevelRegistry,
 ) {
     let mut state = ActorState::Idle;
     // Retained only for the observer-facing Status response. It never controls
@@ -467,9 +474,9 @@ async fn actor_loop(
     let controlled_deadlines = controlled
         || test_mode.as_deref() == Some(std::ffi::OsStr::new("system-boundaries"));
     let mut capture: Option<Box<dyn AudioCapture>> = Some(if controlled {
-        Box::new(ControlledCapture::from_env())
+        Box::new(ControlledCapture::from_env(levels.clone()))
     } else {
-        Box::new(PipeWireCapture::new(reaper.clone()))
+        Box::new(PipeWireCapture::new(reaper.clone(), levels.clone()))
     });
     // The persisted (or env-overridden) Deepgram toggle, resolved once at daemon
     // start. Default ON puts the daemon on the reconciled dual-Provider path;
@@ -522,6 +529,9 @@ async fn actor_loop(
                 Command::OverlayStatus => {
                     let response = overlay_status_response(&state, last_overlay_event.as_ref());
                     let _ = reply.send(response);
+                }
+                Command::Level { after_seq } => {
+                    let _ = reply.send(Response::with_level_frames(levels.after(after_seq)));
                 }
                 Command::Shortcut => {
                     let message = match &shortcut_binding {
@@ -676,6 +686,7 @@ async fn actor_loop(
                         deepgram.take().expect("Deepgram adapter is available");
                     let mut current_groq = groq.take().expect("Groq adapter is available");
                     let actor = tx.clone();
+                    let level_ring = levels.begin_recording();
                     tokio::task::spawn_blocking(move || {
                         let result = begin_recording(
                             &mut current_capture,
@@ -689,6 +700,7 @@ async fn actor_loop(
                             deepgram: current_deepgram,
                             groq: current_groq,
                             result,
+                            level_ring,
                             reply,
                         })));
                     });
@@ -754,6 +766,7 @@ async fn actor_loop(
                     deepgram: returned_deepgram,
                     groq: returned_groq,
                     result,
+                    level_ring,
                     reply,
                 } = *started;
                 capture = Some(returned_capture);
@@ -776,6 +789,7 @@ async fn actor_loop(
                 if let Some(correlation) = correlation {
                     match result {
                         Ok((active_capture, streams)) if shutdown_ack.is_some() => {
+                            level_ring.deactivate();
                             // Shutdown arrived while this Recording was starting:
                             // never start the pump. Abort everything the start
                             // sequence produced, off the loop, drain the reaper,
@@ -892,6 +906,7 @@ async fn actor_loop(
                                 pump,
                                 chunk_counter,
                                 first_chunk_ms,
+                                level_ring,
                                 started_at,
                                 evidence,
                             });
@@ -901,6 +916,7 @@ async fn actor_loop(
                             ));
                         }
                         Err(failure) => {
+                            level_ring.deactivate();
                             let recovering =
                                 failure.capture.is_some() || failure.provider_stream.is_some();
                             eprintln!(
@@ -1203,6 +1219,7 @@ fn spawn_recording_processing(
         }
     };
     let mut processing_evidence = recording.evidence.clone();
+    recording.level_ring.deactivate();
     processing_evidence.streamed_chunk_count = recording.chunk_counter.load(Ordering::SeqCst);
     processing_evidence.first_chunk_ms = atomic_millis(&recording.first_chunk_ms);
     let panic_evidence = processing_evidence.clone();
@@ -1650,6 +1667,7 @@ async fn process_recording(
         pump,
         chunk_counter,
         first_chunk_ms,
+        level_ring: _,
         started_at,
         mut evidence,
     } = recording;
@@ -2519,7 +2537,11 @@ async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>) {
     }
 }
 
-async fn serve(stream: UnixStream, actor: mpsc::Sender<ActorMessage>) -> Result<(), String> {
+async fn serve(
+    stream: UnixStream,
+    actor: mpsc::Sender<ActorMessage>,
+    levels: LevelRegistry,
+) -> Result<(), String> {
     let (reader, mut writer) = stream.into_split();
     let mut request = String::new();
     let mut limited = BufReader::new(reader).take(MAX_FRAME_BYTES + 1);
@@ -2543,14 +2565,19 @@ async fn serve(stream: UnixStream, actor: mpsc::Sender<ActorMessage>) -> Result<
     } else {
         let request: Request = serde_json::from_str(&request)
             .map_err(|error| format!("cannot decode CLI command: {error}"))?;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        actor
-            .send(ActorMessage::Command(request.command, reply_tx))
-            .await
-            .map_err(|_| "lifecycle actor is unavailable".to_owned())?;
-        reply_rx
-            .await
-            .map_err(|_| "lifecycle actor dropped its response".to_owned())?
+        match request.command {
+            Command::Level { after_seq } => Response::with_level_frames(levels.after(after_seq)),
+            command => {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                actor
+                    .send(ActorMessage::Command(command, reply_tx))
+                    .await
+                    .map_err(|_| "lifecycle actor is unavailable".to_owned())?;
+                reply_rx
+                    .await
+                    .map_err(|_| "lifecycle actor dropped its response".to_owned())?
+            }
+        }
     };
     let mut encoded = serde_json::to_vec(&response)
         .map_err(|error| format!("cannot encode daemon response: {error}"))?;
@@ -2571,6 +2598,12 @@ struct ControlledCapture {
     chunks: u32,
     chunk_delay: Duration,
     deadline_after_chunks: Option<u32>,
+    /// Deterministic paused Level producer: this many frames, with lead band
+    /// values 10, 20, 30, ..., are pushed once during `begin` — before the
+    /// CLI's start reply — and never again, so Level IPC tests observe a
+    /// stable, ordered frame set with no live-writer race.
+    level_frames: u32,
+    levels: LevelRegistry,
 }
 
 fn env_millis(name: &str) -> Duration {
@@ -2590,7 +2623,7 @@ fn env_millis_or(name: &str, default: Duration) -> Duration {
 }
 
 impl ControlledCapture {
-    fn from_env() -> Self {
+    fn from_env(levels: LevelRegistry) -> Self {
         let chunks = std::env::var("VOISU_TEST_CAPTURE_CHUNKS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -2613,6 +2646,11 @@ impl ControlledCapture {
             deadline_after_chunks: std::env::var("VOISU_TEST_DEADLINE_AFTER_CHUNKS")
                 .ok()
                 .and_then(|value| value.parse().ok()),
+            level_frames: std::env::var("VOISU_TEST_LEVEL_FRAMES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+            levels,
         }
     }
 }
@@ -2624,6 +2662,13 @@ impl AudioCapture for ControlledCapture {
                 BoundaryKind::Capture,
                 "controlled-capture-begin-detail",
             ));
+        }
+        if self.level_frames > 0
+            && let Some(ring) = self.levels.current()
+        {
+            for index in 0..self.level_frames {
+                ring.push([(index as u8).wrapping_add(1).wrapping_mul(10); 20]);
+            }
         }
         let panic_next_chunk = std::mem::take(&mut self.panic_next_chunk_once);
         let fail_finish = self.finish_failures_remaining > 0;

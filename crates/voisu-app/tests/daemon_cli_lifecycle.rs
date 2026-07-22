@@ -4356,6 +4356,86 @@ fn an_unknown_observer_command_is_rejected_without_disturbing_the_daemon() {
 }
 
 #[test]
+fn level_poll_filters_by_cursor_over_deterministic_paused_frames() {
+    let runtime = TempDir::new().unwrap();
+    // The controlled capture pushes exactly three known frames before the
+    // `start` reply and never again — a paused producer, so every assertion
+    // below observes a stable frame set with no live-writer race.
+    let _daemon = Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_LEVEL_FRAMES", "3")]);
+
+    let idle = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"level":{"after_seq":0}}}"#,
+    );
+    assert_eq!(idle["version"], 1, "{idle}");
+    assert_eq!(idle["ok"], true, "{idle}");
+    assert_eq!(idle["level_frames"], serde_json::json!([]), "{idle}");
+    assert!(idle.get("state").is_none() || idle["state"].is_null(), "{idle}");
+
+    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    let first = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"level":{"after_seq":0}}}"#,
+    );
+    let frames = first["level_frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 3, "{first}");
+    let seqs: Vec<u64> = frames
+        .iter()
+        .map(|frame| frame["seq"].as_u64().unwrap())
+        .collect();
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] < pair[1]),
+        "frames must arrive in strictly increasing seq order: {seqs:?}"
+    );
+    let leads: Vec<u64> = frames
+        .iter()
+        .map(|frame| frame["bands"][0].as_u64().unwrap())
+        .collect();
+    assert_eq!(leads, vec![10, 20, 30], "{first}");
+
+    // Stateless cursor: the cursor lives in the request, so replaying the
+    // same request returns the same frames.
+    let repeated = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"level":{"after_seq":0}}}"#,
+    );
+    assert_eq!(
+        first["level_frames"], repeated["level_frames"],
+        "stateless cursor changed the response"
+    );
+
+    // Cursor filtering: only frames strictly newer than the cursor, still in
+    // order; a cursor at the newest frame drains the response empty.
+    let after_first = ipc_request(
+        runtime.path(),
+        &format!(
+            r#"{{"version":1,"command":{{"level":{{"after_seq":{}}}}}}}"#,
+            seqs[0]
+        ),
+    );
+    let tail: Vec<u64> = after_first["level_frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|frame| frame["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(tail, seqs[1..].to_vec(), "{after_first}");
+    let drained = ipc_request(
+        runtime.path(),
+        &format!(
+            r#"{{"version":1,"command":{{"level":{{"after_seq":{}}}}}}}"#,
+            seqs[2]
+        ),
+    );
+    assert_eq!(drained["level_frames"], serde_json::json!([]), "{drained}");
+
+    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
+}
+
+#[test]
 fn a_restarted_daemon_reuses_the_terminal_id_under_a_distinct_instance_marker() {
     // Each daemon resets its observer id counter to 1, so the first terminal
     // event after a restart reuses the exact id (1) the previous daemon emitted.
