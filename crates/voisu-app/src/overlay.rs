@@ -13,6 +13,10 @@ pub enum OverlayPhase {
     Processing,
     Success,
     Failure,
+    /// Terminal "nothing usable was heard" — deliberately NOT Failure: the
+    /// capsule shows calm amber resting bars and a gentle notification, never
+    /// red. Detection stays daemon-side (parked quality-gate decision).
+    NoSpeech,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,7 +56,7 @@ impl OverlayView {
         match event.outcome {
             OverlayOutcome::Delivered => Self { phase: OverlayPhase::Success,
                 visible_label: "Delivered", accessible_label: "Transcript Delivered" },
-            OverlayOutcome::QualityFailure => Self::failure(),
+            OverlayOutcome::QualityFailure => Self::no_speech(),
             _ => Self { phase: OverlayPhase::Failure,
                 visible_label: "Failure", accessible_label: "Recording failed" },
         }
@@ -79,6 +83,30 @@ impl OverlayView {
         }
     }
 
+    /// The gentle no-speech terminal view. `visible_label` is what the
+    /// notification rung speaks, so it is the full sentence, not a status word.
+    pub const fn no_speech() -> Self {
+        Self {
+            phase: OverlayPhase::NoSpeech,
+            visible_label: "Didn't catch any speech",
+            accessible_label: "No speech detected; nothing was delivered",
+        }
+    }
+
+    /// What the GTK capsule's text label shows. Graphics-first phases render
+    /// through the bar meter / glyph instead of words; only phases whose meaning
+    /// text still carries (Failure, daemon-unavailable) keep their label. The
+    /// notification rung keeps using `visible_label` unchanged.
+    pub const fn capsule_text(&self) -> &'static str {
+        match self.phase {
+            OverlayPhase::Recording
+            | OverlayPhase::Processing
+            | OverlayPhase::Success
+            | OverlayPhase::NoSpeech => "",
+            OverlayPhase::Failure | OverlayPhase::Hidden => self.visible_label,
+        }
+    }
+
     pub const fn is_visible(self) -> bool { !matches!(self.phase, OverlayPhase::Hidden) }
 
 }
@@ -90,7 +118,8 @@ pub const fn phase_glyph(phase: OverlayPhase) -> &'static str {
     match phase {
         OverlayPhase::Processing => "⋯",
         OverlayPhase::Failure => "⚠",
-        OverlayPhase::Recording | OverlayPhase::Success | OverlayPhase::Hidden => "",
+        OverlayPhase::Success => "✓",
+        OverlayPhase::Recording | OverlayPhase::NoSpeech | OverlayPhase::Hidden => "",
     }
 }
 
@@ -418,7 +447,7 @@ mod tests {
         assert_eq!(phase_glyph(OverlayPhase::Processing), "⋯");
         assert_eq!(phase_glyph(OverlayPhase::Failure), "⚠");
         assert_eq!(phase_glyph(OverlayPhase::Recording), "");
-        assert_eq!(phase_glyph(OverlayPhase::Success), "");
+        assert_eq!(phase_glyph(OverlayPhase::Success), "✓");
         assert_eq!(phase_glyph(OverlayPhase::Hidden), "");
     }
 
@@ -495,7 +524,7 @@ mod tests {
         let now = Instant::now();
         let stale = event(1, OverlayOutcome::QualityFailure);
         let terminal = overlay_status(DaemonState::Idle, Some(stale.clone()));
-        assert_eq!(controller.observe(&terminal, now).phase, OverlayPhase::Failure);
+        assert_eq!(controller.observe(&terminal, now).phase, OverlayPhase::NoSpeech);
         // The next Recording (with the stale event still retained) overrides the
         // terminal feedback and is driven live from status.
         let recording = overlay_status(DaemonState::Recording, Some(stale.clone()));
@@ -918,5 +947,47 @@ mod tests {
         assert!(policy.record_failure(Duration::from_secs(10)).should_restart());
         assert!(!policy.record_failure(Duration::from_secs(20)).should_restart());
         assert!(policy.record_failure(Duration::from_secs(51)).should_restart());
+    }
+
+    fn sample_event() -> OverlayEvent {
+        event(1, OverlayOutcome::Delivered)
+    }
+
+    fn recording_response() -> Response {
+        overlay_status(DaemonState::Recording, None)
+    }
+
+    fn processing_response() -> Response {
+        overlay_status(DaemonState::Processing, None)
+    }
+
+    #[test]
+    fn quality_failure_maps_to_no_speech_view() {
+        let event = OverlayEvent { outcome: OverlayOutcome::QualityFailure, ..sample_event() };
+        let view = OverlayView::from_terminal_event(&event);
+        assert_eq!(view.phase, OverlayPhase::NoSpeech);
+        assert_eq!(view.visible_label, "Didn't catch any speech");
+        assert_eq!(view.accessible_label, "No speech detected; nothing was delivered");
+    }
+
+    #[test]
+    fn capsule_text_is_empty_for_graphics_first_phases() {
+        assert_eq!(OverlayView::from_response(&recording_response()).capsule_text(), "");
+        assert_eq!(OverlayView::from_response(&processing_response()).capsule_text(), "");
+        assert_eq!(OverlayView::success().capsule_text(), "");
+        // Text-bearing phases keep their words on the capsule.
+        assert_eq!(OverlayView::daemon_unavailable().capsule_text(), "Daemon unavailable");
+        assert_eq!(OverlayView::no_speech().capsule_text(), "");
+        // The notification rung still gets full labels everywhere.
+        assert_eq!(OverlayView::from_response(&recording_response()).visible_label, "Recording");
+        assert_eq!(OverlayView::success().visible_label, "Delivered");
+    }
+
+    #[test]
+    fn success_glyph_is_a_checkmark_and_no_speech_has_none() {
+        assert_eq!(phase_glyph(OverlayPhase::Success), "✓");
+        assert_eq!(phase_glyph(OverlayPhase::NoSpeech), "");
+        assert_eq!(phase_glyph(OverlayPhase::Failure), "⚠");
+        assert_eq!(phase_glyph(OverlayPhase::Processing), "⋯");
     }
 }
