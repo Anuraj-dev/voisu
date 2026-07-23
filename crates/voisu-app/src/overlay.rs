@@ -350,14 +350,42 @@ impl RecordingNotifyLatch {
     }
 }
 
+/// Edge-latch for the "Didn't catch any speech" desktop notification. Unlike
+/// `RecordingNotifyLatch` (fallback-path only), this fires on BOTH windowed
+/// paths: the amber capsule shows WHAT happened, the notification explains it,
+/// and on layer-shell the capsule alone can be missed at the screen edge.
+/// Same blip rule: `Unreachable` leaves the latch untouched.
+#[derive(Debug, Default)]
+pub struct NoSpeechNotifyLatch {
+    latched: bool,
+}
+
+impl NoSpeechNotifyLatch {
+    pub fn observe(&mut self, signal: ObservedSignal) -> bool {
+        match signal {
+            ObservedSignal::Unreachable => false,
+            ObservedSignal::Reachable(OverlayPhase::NoSpeech) => {
+                let fire = !self.latched;
+                self.latched = true;
+                fire
+            }
+            ObservedSignal::Reachable(_) => {
+                self.latched = false;
+                false
+            }
+        }
+    }
+}
+
 /// The outcome of one fallback-path poll tick, decided purely so the adapter's
 /// side effects (`window.present()`, `send_notification`) stay a thin match.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TickAction {
     /// Stop driving the window this tick and break the poll loop.
     Break,
-    /// Keep polling; `resurface`/`notify` say which side effects to run.
-    Continue { resurface: bool, notify: bool },
+    /// Keep polling; `resurface`/`notify`/`notify_no_speech` say which side
+    /// effects to run.
+    Continue { resurface: bool, notify: bool, notify_no_speech: bool },
 }
 
 /// Pure decision for a single poll tick, owning the ordering the adapter relied
@@ -373,16 +401,18 @@ pub fn poll_tick(
     signal: ObservedSignal,
     tracker: &mut PresentationTracker,
     notify_latch: &mut RecordingNotifyLatch,
+    no_speech_latch: &mut NoSpeechNotifyLatch,
 ) -> TickAction {
     if switched_after_render {
         return TickAction::Break;
     }
+    let notify_no_speech = no_speech_latch.observe(signal);
     if !is_fallback {
-        return TickAction::Continue { resurface: false, notify: false };
+        return TickAction::Continue { resurface: false, notify: false, notify_no_speech };
     }
     let resurface = tracker.observe(view);
     let notify = notify_latch.observe(signal);
-    TickAction::Continue { resurface, notify }
+    TickAction::Continue { resurface, notify, notify_no_speech }
 }
 
 #[cfg(test)]
@@ -890,6 +920,7 @@ mod tests {
         let recording = OverlayView::from_response(&overlay_status(DaemonState::Recording, None));
         let mut tracker = PresentationTracker::default();
         let mut latch = RecordingNotifyLatch::default();
+        let mut no_speech_latch = NoSpeechNotifyLatch::default();
         // Prime both to a known state: tracker's last_phase = Recording, latch latched.
         assert!(tracker.observe(recording));
         assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)));
@@ -904,6 +935,7 @@ mod tests {
             ObservedSignal::Reachable(OverlayPhase::Hidden),
             &mut tracker,
             &mut latch,
+            &mut no_speech_latch,
         );
         assert_eq!(action, TickAction::Break);
 
@@ -924,17 +956,56 @@ mod tests {
         let signal = ObservedSignal::Reachable(OverlayPhase::Recording);
         let mut tracker = PresentationTracker::default();
         let mut latch = RecordingNotifyLatch::default();
+        let mut no_speech_latch = NoSpeechNotifyLatch::default();
         assert_eq!(
-            poll_tick(false, true, recording, signal, &mut tracker, &mut latch),
-            TickAction::Continue { resurface: true, notify: true },
+            poll_tick(false, true, recording, signal, &mut tracker, &mut latch, &mut no_speech_latch),
+            TickAction::Continue { resurface: true, notify: true, notify_no_speech: false },
         );
         // The layer-shell (non-fallback) path never resurfaces or notifies here.
         let mut tracker = PresentationTracker::default();
         let mut latch = RecordingNotifyLatch::default();
+        let mut no_speech_latch = NoSpeechNotifyLatch::default();
         assert_eq!(
-            poll_tick(false, false, recording, signal, &mut tracker, &mut latch),
-            TickAction::Continue { resurface: false, notify: false },
+            poll_tick(false, false, recording, signal, &mut tracker, &mut latch, &mut no_speech_latch),
+            TickAction::Continue { resurface: false, notify: false, notify_no_speech: false },
         );
+    }
+
+    #[test]
+    fn no_speech_latch_fires_once_per_no_speech_episode() {
+        let mut latch = NoSpeechNotifyLatch::default();
+        assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::NoSpeech)));
+        // Level-triggered repeats during the terminal linger stay silent.
+        assert!(!latch.observe(ObservedSignal::Reachable(OverlayPhase::NoSpeech)));
+        // An unreachable blip must not re-arm.
+        assert!(!latch.observe(ObservedSignal::Unreachable));
+        assert!(!latch.observe(ObservedSignal::Reachable(OverlayPhase::NoSpeech)));
+        // A different reachable phase re-arms for the next episode.
+        assert!(!latch.observe(ObservedSignal::Reachable(OverlayPhase::Hidden)));
+        assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::NoSpeech)));
+    }
+
+    #[test]
+    fn poll_tick_reports_no_speech_even_on_the_layer_shell_path() {
+        let mut tracker = PresentationTracker::default();
+        let mut notify_latch = RecordingNotifyLatch::default();
+        let mut no_speech_latch = NoSpeechNotifyLatch::default();
+        let view = OverlayView::no_speech();
+        // is_fallback == false is the layer-shell path: recording-notify stays
+        // fallback-only, but the no-speech explanation must fire on BOTH paths.
+        let action = poll_tick(
+            false, false, view,
+            ObservedSignal::Reachable(OverlayPhase::NoSpeech),
+            &mut tracker, &mut notify_latch, &mut no_speech_latch,
+        );
+        assert_eq!(action, TickAction::Continue { resurface: false, notify: false, notify_no_speech: true });
+        // Break still wins over everything and consumes no latch state.
+        let action = poll_tick(
+            true, false, view,
+            ObservedSignal::Reachable(OverlayPhase::NoSpeech),
+            &mut tracker, &mut notify_latch, &mut no_speech_latch,
+        );
+        assert_eq!(action, TickAction::Break);
     }
 
     #[test]

@@ -21,9 +21,9 @@ use voisu_app::feedback::{
     FeedbackDegradation, FeedbackSelection, OverlayRestartPolicy, SessionKind,
 };
 use voisu_app::overlay::{
-    phase_glyph, poll_tick, BarSmoother, LevelPollAction, LevelPollLatch, ObservedSignal,
-    OverlayPhase, OverlayView, PresentationController, PresentationTracker, RecordingNotifyLatch,
-    TickAction,
+    phase_glyph, poll_tick, BarSmoother, LevelPollAction, LevelPollLatch, NoSpeechNotifyLatch,
+    ObservedSignal, OverlayPhase, OverlayView, PresentationController, PresentationTracker,
+    RecordingNotifyLatch, TickAction,
 };
 use voisu_core::{Command, PROTOCOL_VERSION, Request, Response, socket_path};
 
@@ -213,6 +213,7 @@ const fn overlay_phase_label(phase: OverlayPhase) -> &'static str {
         OverlayPhase::Processing => "processing",
         OverlayPhase::Success => "success",
         OverlayPhase::Failure => "failure",
+        OverlayPhase::NoSpeech => "no_speech",
     }
 }
 
@@ -378,6 +379,7 @@ fn install_surface_feedback(
     let is_fallback = false;
     let tracker = Rc::new(RefCell::new(PresentationTracker::default()));
     let notify_latch = Rc::new(RefCell::new(RecordingNotifyLatch::default()));
+    let no_speech_latch = Rc::new(RefCell::new(NoSpeechNotifyLatch::default()));
     let level_latch = Rc::new(RefCell::new(LevelPollLatch::default()));
     let level_poll = Rc::new(RefCell::new(None::<(gtk::glib::SourceId, Rc<LevelWorker>)>));
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
@@ -439,6 +441,7 @@ fn install_surface_feedback(
             signal,
             &mut tracker.borrow_mut(),
             &mut notify_latch.borrow_mut(),
+            &mut no_speech_latch.borrow_mut(),
         ) {
             TickAction::Break => {
                 if let Some((source, worker)) = level_poll.borrow_mut().take() {
@@ -447,7 +450,7 @@ fn install_surface_feedback(
                 }
                 gtk::glib::ControlFlow::Break
             }
-            TickAction::Continue { resurface, notify } => {
+            TickAction::Continue { resurface, notify, notify_no_speech: _ } => {
                 // Wayland denies a plain toplevel keep-above; re-present it on
                 // each transition into a visible phase to resurface above
                 // occluders.
@@ -682,7 +685,7 @@ fn render_surface(
         OverlayPhase::Processing => "processing",
         OverlayPhase::Success => "success",
         OverlayPhase::Failure => "failure",
-        OverlayPhase::Hidden => "",
+        OverlayPhase::Hidden | OverlayPhase::NoSpeech => "",
     };
     if !class.is_empty() {
         capsule.add_css_class(class);
