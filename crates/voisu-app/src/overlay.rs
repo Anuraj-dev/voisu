@@ -1249,15 +1249,61 @@ mod tests {
     }
 
     #[test]
-    fn interpolate_bands_endpoints_track_first_and_last_band() {
-        let bands: [u8; 20] = std::array::from_fn(|i| (i * 13) as u8);
+    fn interpolate_bands_endpoints_are_exactly_the_clamped_bands() {
+        // For count 44, the first sample position is (0.5/44)*20 - 0.5 < 0 and the
+        // last is (43.5/44)*20 - 0.5 > 19, so both clamp onto band 0 / band 19 and
+        // the endpoints equal the first/last band EXACTLY (no half-band slack).
+        let bands: [u8; 20] = std::array::from_fn(|i| (i * 13) as u8); // 0..=247
         let out = interpolate_bands(&bands, VISUAL_BAR_COUNT);
-        // First/last sample positions sit inside band 0 and band 19 respectively
-        // (clamped), so the endpoints hug the first and last band values.
-        assert!((out[0] - f64::from(bands[0])).abs() < 20.0, "start near first band");
+        assert!((out[0] - 0.0).abs() < 1e-9, "first bar hugs band 0 exactly");
         assert!(
-            (out[VISUAL_BAR_COUNT - 1] - f64::from(bands[19])).abs() < 20.0,
-            "end near last band"
+            (out[VISUAL_BAR_COUNT - 1] - 247.0).abs() < 1e-9,
+            "last bar hugs band 19 exactly"
         );
+    }
+
+    #[test]
+    fn interpolate_bands_lerps_interior_44_bar_values_exactly() {
+        // Sentinel: a single spike at band 10 so the exact lerp weights are legible.
+        let mut bands = [0u8; 20];
+        bands[10] = 255;
+        let out = interpolate_bands(&bands, VISUAL_BAR_COUNT);
+        // Visual bar 22: pos = (22.5/44)*20 - 0.5 = 107/11 = 9.7272..., so it lerps
+        // band 9 (0) -> band 10 (255) with frac 8/11 -> 255 * 8/11 = 2040/11.
+        assert!(
+            (out[22] - 2040.0 / 11.0).abs() < 1e-9,
+            "bar 22 = {}, want 2040/11",
+            out[22]
+        );
+        // Visual bar 23: pos = (23.5/44)*20 - 0.5 = 112/11 = 10.1818..., lerps
+        // band 10 (255) -> band 11 (0) with frac 2/11 -> 255 * 9/11 = 2295/11.
+        assert!(
+            (out[23] - 2295.0 / 11.0).abs() < 1e-9,
+            "bar 23 = {}, want 2295/11",
+            out[23]
+        );
+    }
+
+    #[test]
+    fn sweep_brightness_moves_across_the_44_bar_row() {
+        // Reduced motion is uniform and time-independent at the visual count too.
+        for index in [0, 22, 43] {
+            assert!((sweep_brightness(index, VISUAL_BAR_COUNT, 0.3, true) - 0.6).abs() < 1e-9);
+            assert!((sweep_brightness(index, VISUAL_BAR_COUNT, 5.3, true) - 0.6).abs() < 1e-9);
+        }
+        // Full motion: bump enters on the left early and reaches the right late.
+        let early_left = sweep_brightness(4, VISUAL_BAR_COUNT, 0.15, false);
+        let early_right = sweep_brightness(39, VISUAL_BAR_COUNT, 0.15, false);
+        assert!(early_left > early_right, "early in the pass the bump is on the left");
+        let late_left = sweep_brightness(4, VISUAL_BAR_COUNT, 1.05, false);
+        let late_right = sweep_brightness(39, VISUAL_BAR_COUNT, 1.05, false);
+        assert!(late_right > late_left, "late in the pass the bump is on the right");
+        // Stays in the sane display range across the whole 44-bar row.
+        for index in 0..VISUAL_BAR_COUNT {
+            for t in [0.0, 0.4, 0.8, 1.19] {
+                let b = sweep_brightness(index, VISUAL_BAR_COUNT, t, false);
+                assert!((0.25..=1.0).contains(&b), "b={b} at index={index} t={t}");
+            }
+        }
     }
 }

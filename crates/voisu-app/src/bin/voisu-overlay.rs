@@ -325,10 +325,14 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         }
     });
     let capsule = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    capsule.set_margin_start(20);
-    capsule.set_margin_end(20);
-    capsule.set_margin_top(12);
-    capsule.set_margin_bottom(12);
+    // The capsule must BE the 280x64 pill, not a smaller box floated inside it.
+    // GTK widget margins sit OUTSIDE the styled background, so set_margin_* would
+    // shrink the drawn pill to ~240x40 and let peak bars bleed past its rounded
+    // corners. Fill the whole window instead and push the interior spacing inward
+    // with CSS `padding` (which GTK paints INSIDE the background) — see the CSS
+    // below. Result: capsule 280x64 (radius 32), meter interior 264x40.
+    capsule.set_hexpand(true);
+    capsule.set_vexpand(true);
     capsule.append(&label);
     capsule.append(&meter);
     capsule.append(&glyph);
@@ -338,7 +342,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     let css = gtk::CssProvider::new();
     css.load_from_data(
         "window.background { background: transparent; }
-         .capsule { background: rgba(23, 25, 29, 0.96); border-radius: 32px; }
+         .capsule { background: rgba(23, 25, 29, 0.96); border-radius: 32px; padding: 12px 8px; }
          .capsule .state-label, .capsule .meter { color: #F4F5F7; font-size: 11pt; font-weight: 600; }
          .capsule.processing .state-label, .capsule.processing .meter { color: #8FB4FF; }
          .capsule.success .state-label, .capsule.success .meter { color: #65D6A0; font-size: 14pt; }
@@ -859,21 +863,35 @@ fn draw_meter(
     let gap = 2.0;
     let count = VISUAL_BAR_COUNT;
     let bar_width = (f64::from(width) - gap * (count - 1) as f64) / count as f64;
-    // Resample the 20 IPC bands up to the 44 visual bars (Recording only; the
-    // resting phases draw a flat floor). Rounded to u8 to keep
-    // `recording_bar_height`'s existing signature — the difference is sub-pixel.
-    let levels = interpolate_bands(bands, count);
+    // Corner-fit proof (no explicit clip needed): the 264x40 meter sits inside
+    // the 280x64 capsule (radius 32) at 8px horizontal / 12px vertical padding,
+    // both centred on the window's mid-line (y=32). The tightest point is the
+    // first/last bar's outer edge at window x=8 (or x=272), 24px from the corner
+    // arc's centre; there the pill's half-height is sqrt(32^2 - 24^2) ~= 21.2px,
+    // so the pill spans ~42.3px vertically vs a 38px max bar (19px each side).
+    // 19 < 21.2, so even a full-height peak bar stays inside the rounded corner.
+    let elapsed = sweep_started.elapsed().as_secs_f64();
+    // Only the Recording phase reads per-bar levels; the resting phases draw a
+    // flat floor, so skip the interpolation allocation entirely for them.
+    // Rounded to u8 to keep `recording_bar_height`'s signature — sub-pixel diff.
+    let levels =
+        matches!(phase, OverlayPhase::Recording).then(|| interpolate_bands(bands, count));
     for index in 0..count {
         let (bar_height, alpha, colour) = match phase {
             OverlayPhase::Recording => (
-                recording_bar_height(levels[index].round().clamp(0.0, 255.0) as u8, drawable),
+                recording_bar_height(
+                    levels.as_ref().expect("levels present for Recording")[index]
+                        .round()
+                        .clamp(0.0, 255.0) as u8,
+                    drawable,
+                ),
                 edge_falloff_alpha(index, count),
                 (0.949, 0.949, 0.949), // #F2F2F2
             ),
             OverlayPhase::Processing => (
                 resting_floor(drawable),
                 edge_falloff_alpha(index, count)
-                    * sweep_brightness(index, count, sweep_started.elapsed().as_secs_f64(), reduced_motion),
+                    * sweep_brightness(index, count, elapsed, reduced_motion),
                 (0.949, 0.949, 0.949),
             ),
             OverlayPhase::NoSpeech => (
