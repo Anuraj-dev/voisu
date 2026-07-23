@@ -1117,7 +1117,7 @@ mod tests {
         let first = edge_falloff_alpha(0, 20);
         let mid = edge_falloff_alpha(10, 20);
         let last = edge_falloff_alpha(19, 20);
-        assert!(first < 0.55 && first >= 0.45, "outer bar should be ~0.45–0.55, got {first}");
+        assert!((0.45..0.55).contains(&first), "outer bar should be ~0.45–0.55, got {first}");
         assert!((first - last).abs() < 0.05, "falloff must be symmetric");
         assert!(mid > 0.97, "center bar should be ~full opacity, got {mid}");
         // Monotone from edge to center — no ripples in the ramp.
