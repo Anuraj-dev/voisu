@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.5.0
+Version:        0.6.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,10 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Thu Jul 23 2026 Voisu maintainers <voisu@example.invalid> - 0.6.0-1
+- fix(overlay): capsule fills the window, skip idle interpolation, lock 44-bar math
+- feat(overlay): 44-bar meter with taller drawable
+
 * Thu Jul 23 2026 Voisu maintainers <voisu@example.invalid> - 0.5.0-1
 - fix(overlay): keep accessible description reachable when the label is hidden
 - docs(overlay): update phase_glyph doc to graphics-first behavior
