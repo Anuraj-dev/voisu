@@ -111,9 +111,9 @@ impl OverlayView {
 
 }
 
-/// The text glyph shown in the capsule's meter slot outside Recording. These
-/// are the pre-waveform glyphs: the live bar meter replaces only the Recording
-/// presentation, so Processing and Failure keep rendering exactly as before.
+/// The text glyph shown in the capsule's glyph slot. Graphics-first phases
+/// (Recording's live bars, Processing's light sweep, NoSpeech's amber floor)
+/// carry no glyph; only Success ("✓") and Failure ("⚠") keep one.
 pub const fn phase_glyph(phase: OverlayPhase) -> &'static str {
     match phase {
         OverlayPhase::Failure => "⚠",
