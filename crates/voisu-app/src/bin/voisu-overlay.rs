@@ -21,9 +21,10 @@ use voisu_app::feedback::{
     FeedbackDegradation, FeedbackSelection, OverlayRestartPolicy, SessionKind,
 };
 use voisu_app::overlay::{
-    phase_glyph, poll_tick, BarSmoother, LevelPollAction, LevelPollLatch, ObservedSignal,
-    OverlayPhase, OverlayView, PresentationController, PresentationTracker, RecordingNotifyLatch,
-    TickAction,
+    edge_falloff_alpha, phase_glyph, poll_tick, recording_bar_height, resting_floor,
+    sweep_brightness, BarSmoother, LevelPollAction, LevelPollLatch, NoSpeechNotifyLatch,
+    ObservedSignal, OverlayPhase, OverlayView, PresentationController, PresentationTracker,
+    RecordingNotifyLatch, TickAction,
 };
 use voisu_core::{Command, PROTOCOL_VERSION, Request, Response, socket_path};
 
@@ -213,6 +214,7 @@ const fn overlay_phase_label(phase: OverlayPhase) -> &'static str {
         OverlayPhase::Processing => "processing",
         OverlayPhase::Success => "success",
         OverlayPhase::Failure => "failure",
+        OverlayPhase::NoSpeech => "no_speech",
     }
 }
 
@@ -285,27 +287,38 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     label.set_hexpand(true);
     label.set_vexpand(true);
     let meter = gtk::DrawingArea::builder()
-        .content_width(150)
         .content_height(32)
         .build();
-    // The pre-waveform text glyphs ("⋯" while Processing, "⚠" on Failure) keep
-    // their slot: only the Recording presentation is replaced by the bar meter.
+    // Graphics-first phases (Recording/Processing/NoSpeech) hide the label and
+    // glyph widgets entirely (see render_surface), so the meter is the only
+    // visible child and must be free to fill the whole capsule interior
+    // instead of a fixed 150px slot.
+    meter.set_hexpand(true);
+    meter.set_halign(gtk::Align::Fill);
+    // The pre-waveform glyph slot ("⚠" on Failure, "✓" on Success). It is
+    // hidden whenever empty (see render_surface) and centers itself when it
+    // is the capsule's only visible child.
     let glyph = gtk::Label::builder().label("").build();
     glyph.add_css_class("meter");
+    glyph.set_hexpand(true);
+    glyph.set_halign(gtk::Align::Center);
     let rendered_bars = Rc::new(RefCell::new([0_u8; 20]));
     let reduced_motion = gtk::Settings::default()
         .map(|settings| !settings.is_gtk_enable_animations())
         .unwrap_or(true);
-    let pulse_started = Instant::now();
+    let sweep_started = Instant::now();
+    let rendered_phase = Rc::new(Cell::new(OverlayPhase::Hidden));
     meter.set_draw_func({
         let rendered_bars = Rc::clone(&rendered_bars);
+        let rendered_phase = Rc::clone(&rendered_phase);
         move |_, context, width, height| {
             draw_meter(
                 context,
                 width,
                 height,
                 &rendered_bars.borrow(),
-                pulse_started,
+                rendered_phase.get(),
+                sweep_started,
                 reduced_motion,
             );
         }
@@ -326,10 +339,11 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         "window.background { background: transparent; }
          .capsule { background: rgba(23, 25, 29, 0.96); border-radius: 32px; }
          .capsule .state-label, .capsule .meter { color: #F4F5F7; font-size: 11pt; font-weight: 600; }
-         .capsule.recording .state-label, .capsule.recording .meter { color: #65D6A0; }
          .capsule.processing .state-label, .capsule.processing .meter { color: #8FB4FF; }
-         .capsule.success .state-label, .capsule.success .meter { color: #B8E986; }
-         .capsule.failure .state-label, .capsule.failure .meter { color: #FF8A8A; }",
+         .capsule.success .state-label, .capsule.success .meter { color: #65D6A0; font-size: 14pt; }
+         .capsule.failure { border: 1px solid rgba(255, 138, 138, 0.9); box-shadow: 0 0 8px rgba(255, 138, 138, 0.35); }
+         .capsule.failure .state-label, .capsule.failure .meter { color: #FF8A8A; }
+         .capsule.nospeech .state-label, .capsule.nospeech .meter { color: #FFB454; }",
     );
     capsule.add_css_class("capsule");
     gtk::style_context_add_provider_for_display(
@@ -352,6 +366,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         meter,
         glyph,
         rendered_bars,
+        rendered_phase,
         capsule,
         switched,
     );
@@ -367,6 +382,7 @@ fn install_surface_feedback(
     meter: gtk::DrawingArea,
     glyph: gtk::Label,
     rendered_bars: Rc<RefCell<[u8; 20]>>,
+    rendered_phase: Rc<Cell<OverlayPhase>>,
     capsule: gtk::Box,
     switched: Rc<Cell<bool>>,
 ) {
@@ -378,6 +394,7 @@ fn install_surface_feedback(
     let is_fallback = false;
     let tracker = Rc::new(RefCell::new(PresentationTracker::default()));
     let notify_latch = Rc::new(RefCell::new(RecordingNotifyLatch::default()));
+    let no_speech_latch = Rc::new(RefCell::new(NoSpeechNotifyLatch::default()));
     let level_latch = Rc::new(RefCell::new(LevelPollLatch::default()));
     let level_poll = Rc::new(RefCell::new(None::<(gtk::glib::SourceId, Rc<LevelWorker>)>));
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
@@ -405,7 +422,10 @@ fn install_surface_feedback(
                 ObservedSignal::Unreachable,
             ),
         };
-        render_surface(&window, &label, &meter, &glyph, &capsule, view);
+        render_surface(&window, &label, &meter, &glyph, &capsule, &rendered_phase, view);
+        if view.phase == OverlayPhase::Processing {
+            meter.queue_draw();
+        }
         match level_latch.borrow_mut().observe(signal) {
             LevelPollAction::Arm => {
                 let worker = Rc::new(LevelWorker::spawn());
@@ -439,6 +459,7 @@ fn install_surface_feedback(
             signal,
             &mut tracker.borrow_mut(),
             &mut notify_latch.borrow_mut(),
+            &mut no_speech_latch.borrow_mut(),
         ) {
             TickAction::Break => {
                 if let Some((source, worker)) = level_poll.borrow_mut().take() {
@@ -447,7 +468,7 @@ fn install_surface_feedback(
                 }
                 gtk::glib::ControlFlow::Break
             }
-            TickAction::Continue { resurface, notify } => {
+            TickAction::Continue { resurface, notify, notify_no_speech } => {
                 // Wayland denies a plain toplevel keep-above; re-present it on
                 // each transition into a visible phase to resurface above
                 // occluders.
@@ -463,6 +484,11 @@ fn install_surface_feedback(
                     notification.set_body(Some(view.visible_label));
                     application.send_notification(Some("overlay-recording"), &notification);
                 }
+                if notify_no_speech {
+                    let notification = gtk::gio::Notification::new("Voisu");
+                    notification.set_body(Some(OverlayView::no_speech().visible_label));
+                    application.send_notification(Some("overlay-nospeech"), &notification);
+                }
                 gtk::glib::ControlFlow::Continue
             }
         }
@@ -477,8 +503,9 @@ fn run_notification_feedback(selection: FeedbackSelection) -> i32 {
     let notifier = Notifier::start(selection);
     let mut controller = PresentationController::default();
     let mut previous_phase = OverlayView::HIDDEN.phase;
+    let mut no_speech_latch = NoSpeechNotifyLatch::default();
     loop {
-        notification_tick(&mut controller, &mut previous_phase, &notifier);
+        notification_tick(&mut controller, &mut previous_phase, &mut no_speech_latch, &notifier);
         std::thread::sleep(Duration::from_millis(200));
     }
 }
@@ -496,11 +523,13 @@ fn install_notification_feedback(application: &gtk::Application) {
     });
     let controller = Rc::new(RefCell::new(PresentationController::default()));
     let previous_phase = Rc::new(RefCell::new(OverlayView::HIDDEN.phase));
+    let no_speech_latch = Rc::new(RefCell::new(NoSpeechNotifyLatch::default()));
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
         let _hold = &hold;
         notification_tick(
             &mut controller.borrow_mut(),
             &mut previous_phase.borrow_mut(),
+            &mut no_speech_latch.borrow_mut(),
             &notifier,
         );
         gtk::glib::ControlFlow::Continue
@@ -509,20 +538,36 @@ fn install_notification_feedback(application: &gtk::Application) {
 
 /// One poll of the daemon status: on a transition into a visible phase, hand the
 /// new label to the notifier (which fires a desktop notification, or logs the
-/// transition to the journal when the bus is unavailable).
+/// transition to the journal when the bus is unavailable). NoSpeech is gated
+/// through `NoSpeechNotifyLatch` instead of the plain phase-transition check:
+/// a retained NoSpeech capsule can span an unreachable blip that recovers
+/// before the terminal window expires, which would otherwise look like two
+/// separate transitions into NoSpeech and fire a duplicate notification for
+/// one episode. The latch fires once per episode and does not re-arm on an
+/// `Unreachable` observation.
 fn notification_tick(
     controller: &mut PresentationController,
     previous_phase: &mut OverlayPhase,
+    no_speech_latch: &mut NoSpeechNotifyLatch,
     notifier: &Notifier,
 ) {
     let now = Instant::now();
-    let view = match read_status() {
-        Some(response) => controller.observe(&response, now),
-        None => controller.observe_unreachable(now),
+    let (view, signal) = match read_status() {
+        Some(response) => {
+            let view = controller.observe(&response, now);
+            (view, ObservedSignal::Reachable(view.phase))
+        }
+        None => (controller.observe_unreachable(now), ObservedSignal::Unreachable),
     };
-    // Fire only on a PHASE transition into a visible phase. Comparing the whole
-    // view would re-fire on every meter/activity tick within one Recording.
-    if view.is_visible() && *previous_phase != view.phase {
+    let fire_no_speech = no_speech_latch.observe(signal);
+    if view.phase == OverlayPhase::NoSpeech {
+        if fire_no_speech {
+            notifier.notify(view.visible_label);
+        }
+    } else if view.is_visible() && *previous_phase != view.phase {
+        // Fire only on a PHASE transition into a visible phase. Comparing the
+        // whole view would re-fire on every meter/activity tick within one
+        // Recording.
         notifier.notify(view.visible_label);
     }
     *previous_phase = view.phase;
@@ -672,9 +717,10 @@ fn render_surface(
     meter: &gtk::DrawingArea,
     glyph: &gtk::Label,
     capsule: &gtk::Box,
+    rendered_phase: &Cell<OverlayPhase>,
     view: OverlayView,
 ) {
-    for class in ["recording", "processing", "success", "failure"] {
+    for class in ["recording", "processing", "success", "failure", "nospeech"] {
         capsule.remove_css_class(class);
     }
     let class = match view.phase {
@@ -682,20 +728,35 @@ fn render_surface(
         OverlayPhase::Processing => "processing",
         OverlayPhase::Success => "success",
         OverlayPhase::Failure => "failure",
+        OverlayPhase::NoSpeech => "nospeech",
         OverlayPhase::Hidden => "",
     };
     if !class.is_empty() {
         capsule.add_css_class(class);
     }
+    rendered_phase.set(view.phase);
     if view.phase == OverlayPhase::Hidden {
         window.set_visible(false);
         return;
     }
-    label.set_label(view.visible_label);
-    label.update_property(&[gtk::accessible::Property::Description(view.accessible_label)]);
-    meter.set_visible(view.phase == OverlayPhase::Recording);
-    glyph.set_label(phase_glyph(view.phase));
+    let text = view.capsule_text();
+    label.set_label(text);
+    label.set_visible(!text.is_empty());
+    // The accessible description lives on the capsule box, not the label: the
+    // label is hidden for every graphics-first phase (Recording/Processing/
+    // Success/NoSpeech), and a hidden widget is excluded from assistive
+    // presentation. The capsule is visible in every non-Hidden phase, so it
+    // is the one widget that can always carry the announcement.
+    capsule.update_property(&[gtk::accessible::Property::Description(view.accessible_label)]);
+    meter.set_visible(matches!(
+        view.phase,
+        OverlayPhase::Recording | OverlayPhase::Processing | OverlayPhase::NoSpeech
+    ));
+    let glyph_text = phase_glyph(view.phase);
+    glyph.set_label(glyph_text);
+    glyph.set_visible(!glyph_text.is_empty());
     window.set_visible(true);
+    meter.queue_draw();
 }
 
 /// Cadence of the Level poll on its dedicated worker thread, and of the GTK
@@ -775,8 +836,8 @@ fn install_level_drain(
         if let Some(bars) = worker.take_latest() {
             *rendered_bars.borrow_mut() = bars;
         }
-        // Redraw every tick regardless: this cadence also animates the
-        // record dot's pulse while the bars are unchanged.
+        // Redraw every tick regardless: keeps the meter live even on a tick
+        // where the worker published no new bars.
         meter.queue_draw();
         gtk::glib::ControlFlow::Continue
     })
@@ -787,26 +848,37 @@ fn draw_meter(
     width: i32,
     height: i32,
     bands: &[u8; 20],
-    pulse_started: Instant,
+    phase: OverlayPhase,
+    sweep_started: Instant,
     reduced_motion: bool,
 ) {
     let centre = f64::from(height) / 2.0;
-    let pulse = if reduced_motion {
-        0.82
-    } else {
-        0.68 + 0.20 * (pulse_started.elapsed().as_secs_f64() * 2.4).sin()
-    };
-    context.set_source_rgba(0.396, 0.839, 0.627, pulse);
-    context.arc(4.0, centre, 3.2, 0.0, std::f64::consts::TAU);
-    let _ = context.fill();
-
-    let start = 13.0;
+    let drawable = f64::from(height) - 5.0;
     let gap = 2.0;
-    let bar_width = ((f64::from(width) - start) - gap * 19.0) / 20.0;
-    context.set_source_rgb(0.396, 0.839, 0.627);
+    let bar_width = (f64::from(width) - gap * 19.0) / 20.0;
     for (index, level) in bands.iter().enumerate() {
-        let bar_height = 1.5 + f64::from(*level) / 255.0 * (f64::from(height) - 5.0);
-        let x = start + index as f64 * (bar_width + gap);
+        let (bar_height, alpha, colour) = match phase {
+            OverlayPhase::Recording => (
+                recording_bar_height(*level, drawable),
+                edge_falloff_alpha(index, 20),
+                (0.949, 0.949, 0.949), // #F2F2F2
+            ),
+            OverlayPhase::Processing => (
+                resting_floor(drawable),
+                edge_falloff_alpha(index, 20)
+                    * sweep_brightness(index, 20, sweep_started.elapsed().as_secs_f64(), reduced_motion),
+                (0.949, 0.949, 0.949),
+            ),
+            OverlayPhase::NoSpeech => (
+                resting_floor(drawable),
+                edge_falloff_alpha(index, 20),
+                (1.0, 0.706, 0.329), // #FFB454
+            ),
+            // Meter is hidden in every other phase; draw nothing defensively.
+            _ => return,
+        };
+        let x = index as f64 * (bar_width + gap);
+        context.set_source_rgba(colour.0, colour.1, colour.2, alpha);
         rounded_rectangle(context, x, centre - bar_height / 2.0, bar_width, bar_height);
         let _ = context.fill();
     }

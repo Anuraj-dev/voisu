@@ -13,6 +13,10 @@ pub enum OverlayPhase {
     Processing,
     Success,
     Failure,
+    /// Terminal "nothing usable was heard" — deliberately NOT Failure: the
+    /// capsule shows calm amber resting bars and a gentle notification, never
+    /// red. Detection stays daemon-side (parked quality-gate decision).
+    NoSpeech,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,7 +56,7 @@ impl OverlayView {
         match event.outcome {
             OverlayOutcome::Delivered => Self { phase: OverlayPhase::Success,
                 visible_label: "Delivered", accessible_label: "Transcript Delivered" },
-            OverlayOutcome::QualityFailure => Self::failure(),
+            OverlayOutcome::QualityFailure => Self::no_speech(),
             _ => Self { phase: OverlayPhase::Failure,
                 visible_label: "Failure", accessible_label: "Recording failed" },
         }
@@ -79,18 +83,45 @@ impl OverlayView {
         }
     }
 
+    /// The gentle no-speech terminal view. `visible_label` is what the
+    /// notification rung speaks, so it is the full sentence, not a status word.
+    pub const fn no_speech() -> Self {
+        Self {
+            phase: OverlayPhase::NoSpeech,
+            visible_label: "Didn't catch any speech",
+            accessible_label: "No speech detected; nothing was delivered",
+        }
+    }
+
+    /// What the GTK capsule's text label shows. Graphics-first phases render
+    /// through the bar meter / glyph instead of words; only phases whose meaning
+    /// text still carries (Failure, daemon-unavailable) keep their label. The
+    /// notification rung keeps using `visible_label` unchanged.
+    pub const fn capsule_text(&self) -> &'static str {
+        match self.phase {
+            OverlayPhase::Recording
+            | OverlayPhase::Processing
+            | OverlayPhase::Success
+            | OverlayPhase::NoSpeech => "",
+            OverlayPhase::Failure | OverlayPhase::Hidden => self.visible_label,
+        }
+    }
+
     pub const fn is_visible(self) -> bool { !matches!(self.phase, OverlayPhase::Hidden) }
 
 }
 
-/// The text glyph shown in the capsule's meter slot outside Recording. These
-/// are the pre-waveform glyphs: the live bar meter replaces only the Recording
-/// presentation, so Processing and Failure keep rendering exactly as before.
+/// The text glyph shown in the capsule's glyph slot. Graphics-first phases
+/// (Recording's live bars, Processing's light sweep, NoSpeech's amber floor)
+/// carry no glyph; only Success ("✓") and Failure ("⚠") keep one.
 pub const fn phase_glyph(phase: OverlayPhase) -> &'static str {
     match phase {
-        OverlayPhase::Processing => "⋯",
         OverlayPhase::Failure => "⚠",
-        OverlayPhase::Recording | OverlayPhase::Success | OverlayPhase::Hidden => "",
+        OverlayPhase::Success => "✓",
+        OverlayPhase::Recording
+        | OverlayPhase::Processing
+        | OverlayPhase::NoSpeech
+        | OverlayPhase::Hidden => "",
     }
 }
 
@@ -292,6 +323,56 @@ impl BarSmoother {
     }
 }
 
+// ---- Waveform drawing math (pure; the cairo adapter in the bin consumes it) ----
+
+/// Spec floor for the edge-falloff ramp: outermost bars sit at ~45% opacity.
+const EDGE_FALLOFF_MIN: f64 = 0.45;
+/// One full left→right pass of the Processing light sweep.
+const SWEEP_PERIOD_SECS: f64 = 1.2;
+/// Sweep bump width in bar units (gaussian sigma).
+const SWEEP_SIGMA_BARS: f64 = 2.0;
+/// Resting-bar brightness away from the sweep bump, and the uniform
+/// reduced-motion brightness. Chosen so the sweep reads as light passing
+/// through visible bars, not bars blinking on from black.
+const SWEEP_BASE_BRIGHTNESS: f64 = 0.35;
+const SWEEP_REDUCED_MOTION_BRIGHTNESS: f64 = 0.6;
+
+/// Per-bar opacity: a half-sine ramp from `EDGE_FALLOFF_MIN` at the row's ends
+/// to 1.0 at its center, so the waveform fades out softly instead of stopping.
+pub fn edge_falloff_alpha(index: usize, count: usize) -> f64 {
+    let position = (index as f64 + 0.5) / count as f64;
+    EDGE_FALLOFF_MIN + (1.0 - EDGE_FALLOFF_MIN) * (std::f64::consts::PI * position).sin()
+}
+
+/// Silence baseline: 10% of the drawable height, never below the old 1.5px
+/// minimum. A dotted resting line reads "listening", a flatline reads "dead".
+pub fn resting_floor(drawable_height: f64) -> f64 {
+    (0.10 * drawable_height).max(1.5)
+}
+
+/// Recording bar height: level 0 rests exactly on the floor, level 255 fills
+/// the drawable height, linear in between.
+pub fn recording_bar_height(level: u8, drawable_height: f64) -> f64 {
+    let floor = resting_floor(drawable_height);
+    floor + f64::from(level) / 255.0 * (drawable_height - floor)
+}
+
+/// Processing light-sweep brightness for one bar. A gaussian bump travels
+/// left→right across the row every `SWEEP_PERIOD_SECS`, entering from before
+/// bar 0 and exiting past the last bar so the loop has no visible snap.
+/// Reduced motion: uniform raised brightness, no movement.
+pub fn sweep_brightness(index: usize, count: usize, elapsed_secs: f64, reduced_motion: bool) -> f64 {
+    if reduced_motion {
+        return SWEEP_REDUCED_MOTION_BRIGHTNESS;
+    }
+    let progress = (elapsed_secs.rem_euclid(SWEEP_PERIOD_SECS)) / SWEEP_PERIOD_SECS;
+    let travel = count as f64 + 6.0 * SWEEP_SIGMA_BARS;
+    let position = progress * travel - 3.0 * SWEEP_SIGMA_BARS;
+    let distance = index as f64 + 0.5 - position;
+    let bump = (-distance * distance / (2.0 * SWEEP_SIGMA_BARS * SWEEP_SIGMA_BARS)).exp();
+    SWEEP_BASE_BRIGHTNESS + (1.0 - SWEEP_BASE_BRIGHTNESS) * bump
+}
+
 /// Edge-latch for the fallback path's secondary "Recording started" desktop
 /// notification. Pure and adapter-free, mirroring `PresentationTracker`.
 ///
@@ -321,14 +402,42 @@ impl RecordingNotifyLatch {
     }
 }
 
+/// Edge-latch for the "Didn't catch any speech" desktop notification. Unlike
+/// `RecordingNotifyLatch` (fallback-path only), this fires on BOTH windowed
+/// paths: the amber capsule shows WHAT happened, the notification explains it,
+/// and on layer-shell the capsule alone can be missed at the screen edge.
+/// Same blip rule: `Unreachable` leaves the latch untouched.
+#[derive(Debug, Default)]
+pub struct NoSpeechNotifyLatch {
+    latched: bool,
+}
+
+impl NoSpeechNotifyLatch {
+    pub fn observe(&mut self, signal: ObservedSignal) -> bool {
+        match signal {
+            ObservedSignal::Unreachable => false,
+            ObservedSignal::Reachable(OverlayPhase::NoSpeech) => {
+                let fire = !self.latched;
+                self.latched = true;
+                fire
+            }
+            ObservedSignal::Reachable(_) => {
+                self.latched = false;
+                false
+            }
+        }
+    }
+}
+
 /// The outcome of one fallback-path poll tick, decided purely so the adapter's
 /// side effects (`window.present()`, `send_notification`) stay a thin match.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TickAction {
     /// Stop driving the window this tick and break the poll loop.
     Break,
-    /// Keep polling; `resurface`/`notify` say which side effects to run.
-    Continue { resurface: bool, notify: bool },
+    /// Keep polling; `resurface`/`notify`/`notify_no_speech` say which side
+    /// effects to run.
+    Continue { resurface: bool, notify: bool, notify_no_speech: bool },
 }
 
 /// Pure decision for a single poll tick, owning the ordering the adapter relied
@@ -344,16 +453,18 @@ pub fn poll_tick(
     signal: ObservedSignal,
     tracker: &mut PresentationTracker,
     notify_latch: &mut RecordingNotifyLatch,
+    no_speech_latch: &mut NoSpeechNotifyLatch,
 ) -> TickAction {
     if switched_after_render {
         return TickAction::Break;
     }
+    let notify_no_speech = no_speech_latch.observe(signal);
     if !is_fallback {
-        return TickAction::Continue { resurface: false, notify: false };
+        return TickAction::Continue { resurface: false, notify: false, notify_no_speech };
     }
     let resurface = tracker.observe(view);
     let notify = notify_latch.observe(signal);
-    TickAction::Continue { resurface, notify }
+    TickAction::Continue { resurface, notify, notify_no_speech }
 }
 
 #[cfg(test)]
@@ -412,13 +523,14 @@ mod tests {
 
     #[test]
     fn red_non_recording_phases_keep_their_pre_waveform_glyphs() {
-        // Only the Recording phase changes with the live bar meter; the
-        // Processing and Failure capsules keep the exact text presentation
-        // they had before it (spec 2026-07-20, §1).
-        assert_eq!(phase_glyph(OverlayPhase::Processing), "⋯");
+        // Recording and Processing are both graphics-only (no glyph): the
+        // live bar meter carries Recording, and the light sweep carries
+        // Processing with no text or glyph (spec 2026-07-23, graphics-first
+        // redesign). Failure and Success keep their glyphs.
+        assert_eq!(phase_glyph(OverlayPhase::Processing), "");
         assert_eq!(phase_glyph(OverlayPhase::Failure), "⚠");
         assert_eq!(phase_glyph(OverlayPhase::Recording), "");
-        assert_eq!(phase_glyph(OverlayPhase::Success), "");
+        assert_eq!(phase_glyph(OverlayPhase::Success), "✓");
         assert_eq!(phase_glyph(OverlayPhase::Hidden), "");
     }
 
@@ -495,7 +607,7 @@ mod tests {
         let now = Instant::now();
         let stale = event(1, OverlayOutcome::QualityFailure);
         let terminal = overlay_status(DaemonState::Idle, Some(stale.clone()));
-        assert_eq!(controller.observe(&terminal, now).phase, OverlayPhase::Failure);
+        assert_eq!(controller.observe(&terminal, now).phase, OverlayPhase::NoSpeech);
         // The next Recording (with the stale event still retained) overrides the
         // terminal feedback and is driven live from status.
         let recording = overlay_status(DaemonState::Recording, Some(stale.clone()));
@@ -861,6 +973,7 @@ mod tests {
         let recording = OverlayView::from_response(&overlay_status(DaemonState::Recording, None));
         let mut tracker = PresentationTracker::default();
         let mut latch = RecordingNotifyLatch::default();
+        let mut no_speech_latch = NoSpeechNotifyLatch::default();
         // Prime both to a known state: tracker's last_phase = Recording, latch latched.
         assert!(tracker.observe(recording));
         assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)));
@@ -875,6 +988,7 @@ mod tests {
             ObservedSignal::Reachable(OverlayPhase::Hidden),
             &mut tracker,
             &mut latch,
+            &mut no_speech_latch,
         );
         assert_eq!(action, TickAction::Break);
 
@@ -895,17 +1009,73 @@ mod tests {
         let signal = ObservedSignal::Reachable(OverlayPhase::Recording);
         let mut tracker = PresentationTracker::default();
         let mut latch = RecordingNotifyLatch::default();
+        let mut no_speech_latch = NoSpeechNotifyLatch::default();
         assert_eq!(
-            poll_tick(false, true, recording, signal, &mut tracker, &mut latch),
-            TickAction::Continue { resurface: true, notify: true },
+            poll_tick(false, true, recording, signal, &mut tracker, &mut latch, &mut no_speech_latch),
+            TickAction::Continue { resurface: true, notify: true, notify_no_speech: false },
         );
         // The layer-shell (non-fallback) path never resurfaces or notifies here.
         let mut tracker = PresentationTracker::default();
         let mut latch = RecordingNotifyLatch::default();
+        let mut no_speech_latch = NoSpeechNotifyLatch::default();
         assert_eq!(
-            poll_tick(false, false, recording, signal, &mut tracker, &mut latch),
-            TickAction::Continue { resurface: false, notify: false },
+            poll_tick(false, false, recording, signal, &mut tracker, &mut latch, &mut no_speech_latch),
+            TickAction::Continue { resurface: false, notify: false, notify_no_speech: false },
         );
+    }
+
+    #[test]
+    fn no_speech_latch_fires_once_per_no_speech_episode() {
+        let mut latch = NoSpeechNotifyLatch::default();
+        assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::NoSpeech)));
+        // Level-triggered repeats during the terminal linger stay silent.
+        assert!(!latch.observe(ObservedSignal::Reachable(OverlayPhase::NoSpeech)));
+        // An unreachable blip must not re-arm.
+        assert!(!latch.observe(ObservedSignal::Unreachable));
+        assert!(!latch.observe(ObservedSignal::Reachable(OverlayPhase::NoSpeech)));
+        // A different reachable phase re-arms for the next episode.
+        assert!(!latch.observe(ObservedSignal::Reachable(OverlayPhase::Hidden)));
+        assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::NoSpeech)));
+    }
+
+    /// The desktop-notification fallback rung (voisu-overlay.rs's
+    /// `notification_tick`) drives its no-speech decision through this same
+    /// latch instead of a plain phase-transition check, precisely so a
+    /// retained NoSpeech episode that survives one unreachable poll blip does
+    /// not read as two separate transitions and fire twice.
+    #[test]
+    fn no_speech_latch_does_not_double_fire_across_an_unreachable_blip_mid_episode() {
+        let mut latch = NoSpeechNotifyLatch::default();
+        assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::NoSpeech)));
+        // Daemon becomes briefly unreachable while the terminal capsule is
+        // still lingering on-screen from the first observation.
+        assert!(!latch.observe(ObservedSignal::Unreachable));
+        // Daemon recovers before the terminal window expires: NoSpeech is
+        // observed again for what is still the SAME episode. Must stay silent.
+        assert!(!latch.observe(ObservedSignal::Reachable(OverlayPhase::NoSpeech)));
+    }
+
+    #[test]
+    fn poll_tick_reports_no_speech_even_on_the_layer_shell_path() {
+        let mut tracker = PresentationTracker::default();
+        let mut notify_latch = RecordingNotifyLatch::default();
+        let mut no_speech_latch = NoSpeechNotifyLatch::default();
+        let view = OverlayView::no_speech();
+        // is_fallback == false is the layer-shell path: recording-notify stays
+        // fallback-only, but the no-speech explanation must fire on BOTH paths.
+        let action = poll_tick(
+            false, false, view,
+            ObservedSignal::Reachable(OverlayPhase::NoSpeech),
+            &mut tracker, &mut notify_latch, &mut no_speech_latch,
+        );
+        assert_eq!(action, TickAction::Continue { resurface: false, notify: false, notify_no_speech: true });
+        // Break still wins over everything and consumes no latch state.
+        let action = poll_tick(
+            true, false, view,
+            ObservedSignal::Reachable(OverlayPhase::NoSpeech),
+            &mut tracker, &mut notify_latch, &mut no_speech_latch,
+        );
+        assert_eq!(action, TickAction::Break);
     }
 
     #[test]
@@ -918,5 +1088,96 @@ mod tests {
         assert!(policy.record_failure(Duration::from_secs(10)).should_restart());
         assert!(!policy.record_failure(Duration::from_secs(20)).should_restart());
         assert!(policy.record_failure(Duration::from_secs(51)).should_restart());
+    }
+
+    fn sample_event() -> OverlayEvent {
+        event(1, OverlayOutcome::Delivered)
+    }
+
+    fn recording_response() -> Response {
+        overlay_status(DaemonState::Recording, None)
+    }
+
+    fn processing_response() -> Response {
+        overlay_status(DaemonState::Processing, None)
+    }
+
+    #[test]
+    fn quality_failure_maps_to_no_speech_view() {
+        let event = OverlayEvent { outcome: OverlayOutcome::QualityFailure, ..sample_event() };
+        let view = OverlayView::from_terminal_event(&event);
+        assert_eq!(view.phase, OverlayPhase::NoSpeech);
+        assert_eq!(view.visible_label, "Didn't catch any speech");
+        assert_eq!(view.accessible_label, "No speech detected; nothing was delivered");
+    }
+
+    #[test]
+    fn capsule_text_is_empty_for_graphics_first_phases() {
+        assert_eq!(OverlayView::from_response(&recording_response()).capsule_text(), "");
+        assert_eq!(OverlayView::from_response(&processing_response()).capsule_text(), "");
+        assert_eq!(OverlayView::success().capsule_text(), "");
+        // Text-bearing phases keep their words on the capsule.
+        assert_eq!(OverlayView::daemon_unavailable().capsule_text(), "Daemon unavailable");
+        assert_eq!(OverlayView::no_speech().capsule_text(), "");
+        // The notification rung still gets full labels everywhere.
+        assert_eq!(OverlayView::from_response(&recording_response()).visible_label, "Recording");
+        assert_eq!(OverlayView::success().visible_label, "Delivered");
+    }
+
+    #[test]
+    fn success_glyph_is_a_checkmark_and_no_speech_has_none() {
+        assert_eq!(phase_glyph(OverlayPhase::Success), "✓");
+        assert_eq!(phase_glyph(OverlayPhase::NoSpeech), "");
+        assert_eq!(phase_glyph(OverlayPhase::Failure), "⚠");
+        assert_eq!(phase_glyph(OverlayPhase::Processing), "");
+    }
+
+    #[test]
+    fn edge_falloff_is_dim_at_the_ends_and_full_at_center() {
+        let first = edge_falloff_alpha(0, 20);
+        let mid = edge_falloff_alpha(10, 20);
+        let last = edge_falloff_alpha(19, 20);
+        assert!((0.45..0.55).contains(&first), "outer bar should be ~0.45–0.55, got {first}");
+        assert!((first - last).abs() < 0.05, "falloff must be symmetric");
+        assert!(mid > 0.97, "center bar should be ~full opacity, got {mid}");
+        // Monotone from edge to center — no ripples in the ramp.
+        for i in 0..9 {
+            assert!(edge_falloff_alpha(i, 20) <= edge_falloff_alpha(i + 1, 20) + 1e-9);
+        }
+    }
+
+    #[test]
+    fn resting_floor_reads_as_a_dotted_baseline_not_a_flatline() {
+        let floor = resting_floor(27.0); // 32px meter minus the 5px inset
+        assert!((floor - 2.7).abs() < 1e-9, "floor is 10% of drawable height");
+        assert!(resting_floor(10.0) >= 1.5, "floor never collapses below the old 1.5px minimum");
+        // Silence (level 0) sits exactly on the floor; full level fills the height.
+        assert!((recording_bar_height(0, 27.0) - floor).abs() < 1e-9);
+        assert!((recording_bar_height(255, 27.0) - 27.0).abs() < 1e-9);
+        // Monotone in level.
+        assert!(recording_bar_height(80, 27.0) < recording_bar_height(200, 27.0));
+    }
+
+    #[test]
+    fn sweep_brightness_moves_and_respects_reduced_motion() {
+        // Reduced motion: uniform raised brightness, time-independent.
+        for index in [0, 7, 19] {
+            assert!((sweep_brightness(index, 20, 0.3, true) - 0.6).abs() < 1e-9);
+            assert!((sweep_brightness(index, 20, 5.3, true) - 0.6).abs() < 1e-9);
+        }
+        // Full motion: brightness peaks near the sweep position and the peak moves.
+        let early_left = sweep_brightness(2, 20, 0.15, false);
+        let early_right = sweep_brightness(17, 20, 0.15, false);
+        assert!(early_left > early_right, "early in the pass the bump is on the left");
+        let late_left = sweep_brightness(2, 20, 1.05, false);
+        let late_right = sweep_brightness(17, 20, 1.05, false);
+        assert!(late_right > late_left, "late in the pass the bump is on the right");
+        // Everything stays in a sane [0.25, 1.0] display range.
+        for index in 0..20 {
+            for t in [0.0, 0.4, 0.8, 1.19] {
+                let b = sweep_brightness(index, 20, t, false);
+                assert!((0.25..=1.0).contains(&b), "b={b} at index={index} t={t}");
+            }
+        }
     }
 }
