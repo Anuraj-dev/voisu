@@ -325,17 +325,49 @@ impl BarSmoother {
 
 // ---- Waveform drawing math (pure; the cairo adapter in the bin consumes it) ----
 
+/// Number of bars actually drawn in the meter row. The IPC contract carries
+/// exactly 20 frequency bands (`[u8; 20]`, see `LevelFrame`); the extra visual
+/// bars are synthesised in the draw code by linear interpolation between those
+/// 20 bands (`interpolate_bands`) so the waveform reads as denser and more
+/// reactive without changing the wire format.
+pub const VISUAL_BAR_COUNT: usize = 44;
+
 /// Spec floor for the edge-falloff ramp: outermost bars sit at ~45% opacity.
 const EDGE_FALLOFF_MIN: f64 = 0.45;
 /// One full left→right pass of the Processing light sweep.
 const SWEEP_PERIOD_SECS: f64 = 1.2;
-/// Sweep bump width in bar units (gaussian sigma).
-const SWEEP_SIGMA_BARS: f64 = 2.0;
+/// Sweep bump width in bar units (gaussian sigma). Chosen relative to the
+/// 44-bar visual row: at 2.2× the density of the old 20-bar row (44/20), the
+/// sigma is scaled by the same factor (2.0 × 44/20 = 4.4) so the light-sweep
+/// bump keeps the same VISUAL width on screen.
+const SWEEP_SIGMA_BARS: f64 = 4.4;
 /// Resting-bar brightness away from the sweep bump, and the uniform
 /// reduced-motion brightness. Chosen so the sweep reads as light passing
 /// through visible bars, not bars blinking on from black.
 const SWEEP_BASE_BRIGHTNESS: f64 = 0.35;
 const SWEEP_REDUCED_MOTION_BRIGHTNESS: f64 = 0.6;
+
+/// Resample the 20 IPC bands up (or down) to `count` visual levels by linear
+/// interpolation, returning levels in `0.0..=255.0`. For visual bar `i` the
+/// sample position in band space is `(i + 0.5) / count * 20 - 0.5`; the two
+/// neighbouring band indices are clamped to `0..=19` and lerped. `count == 20`
+/// returns the bands unchanged (as f64).
+pub fn interpolate_bands(bands: &[u8; 20], count: usize) -> Vec<f64> {
+    if count == 20 {
+        return bands.iter().map(|&b| f64::from(b)).collect();
+    }
+    (0..count)
+        .map(|i| {
+            let pos = (i as f64 + 0.5) / count as f64 * 20.0 - 0.5;
+            let lo = pos.floor().clamp(0.0, 19.0) as usize;
+            let hi = pos.ceil().clamp(0.0, 19.0) as usize;
+            let lo_v = f64::from(bands[lo]);
+            let hi_v = f64::from(bands[hi]);
+            let frac = (pos - lo as f64).clamp(0.0, 1.0);
+            lo_v + (hi_v - lo_v) * frac
+        })
+        .collect()
+}
 
 /// Per-bar opacity: a half-sine ramp from `EDGE_FALLOFF_MIN` at the row's ends
 /// to 1.0 at its center, so the waveform fades out softly instead of stopping.
@@ -1148,14 +1180,14 @@ mod tests {
 
     #[test]
     fn resting_floor_reads_as_a_dotted_baseline_not_a_flatline() {
-        let floor = resting_floor(27.0); // 32px meter minus the 5px inset
-        assert!((floor - 2.7).abs() < 1e-9, "floor is 10% of drawable height");
+        let floor = resting_floor(38.0); // 40px meter minus the 2px inset
+        assert!((floor - 3.8).abs() < 1e-9, "floor is 10% of drawable height");
         assert!(resting_floor(10.0) >= 1.5, "floor never collapses below the old 1.5px minimum");
         // Silence (level 0) sits exactly on the floor; full level fills the height.
-        assert!((recording_bar_height(0, 27.0) - floor).abs() < 1e-9);
-        assert!((recording_bar_height(255, 27.0) - 27.0).abs() < 1e-9);
+        assert!((recording_bar_height(0, 38.0) - floor).abs() < 1e-9);
+        assert!((recording_bar_height(255, 38.0) - 38.0).abs() < 1e-9);
         // Monotone in level.
-        assert!(recording_bar_height(80, 27.0) < recording_bar_height(200, 27.0));
+        assert!(recording_bar_height(80, 38.0) < recording_bar_height(200, 38.0));
     }
 
     #[test]
@@ -1179,5 +1211,53 @@ mod tests {
                 assert!((0.25..=1.0).contains(&b), "b={b} at index={index} t={t}");
             }
         }
+    }
+
+    #[test]
+    fn interpolate_bands_length_matches_count() {
+        let bands = [7u8; 20];
+        assert_eq!(interpolate_bands(&bands, VISUAL_BAR_COUNT).len(), VISUAL_BAR_COUNT);
+        assert_eq!(interpolate_bands(&bands, 44).len(), 44);
+        assert_eq!(interpolate_bands(&bands, 20).len(), 20);
+    }
+
+    #[test]
+    fn interpolate_bands_is_identity_at_count_20() {
+        let bands: [u8; 20] = std::array::from_fn(|i| (i * 13 % 256) as u8);
+        let out = interpolate_bands(&bands, 20);
+        for (i, &b) in bands.iter().enumerate() {
+            assert!((out[i] - f64::from(b)).abs() < 1e-9, "identity broke at {i}");
+        }
+    }
+
+    #[test]
+    fn interpolate_bands_stays_in_range() {
+        let bands: [u8; 20] = std::array::from_fn(|i| ((i * 37 + 11) % 256) as u8);
+        for &v in &interpolate_bands(&bands, VISUAL_BAR_COUNT) {
+            assert!((0.0..=255.0).contains(&v), "out of range: {v}");
+        }
+    }
+
+    #[test]
+    fn interpolate_bands_preserves_monotonic_ramp() {
+        // A monotonically increasing input must stay monotonic after resampling.
+        let bands: [u8; 20] = std::array::from_fn(|i| (i * 13) as u8); // 0,13,...,247
+        let out = interpolate_bands(&bands, VISUAL_BAR_COUNT);
+        for w in out.windows(2) {
+            assert!(w[1] >= w[0] - 1e-9, "ramp not monotonic: {} -> {}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn interpolate_bands_endpoints_track_first_and_last_band() {
+        let bands: [u8; 20] = std::array::from_fn(|i| (i * 13) as u8);
+        let out = interpolate_bands(&bands, VISUAL_BAR_COUNT);
+        // First/last sample positions sit inside band 0 and band 19 respectively
+        // (clamped), so the endpoints hug the first and last band values.
+        assert!((out[0] - f64::from(bands[0])).abs() < 20.0, "start near first band");
+        assert!(
+            (out[VISUAL_BAR_COUNT - 1] - f64::from(bands[19])).abs() < 20.0,
+            "end near last band"
+        );
     }
 }

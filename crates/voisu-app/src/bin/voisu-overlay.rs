@@ -21,8 +21,9 @@ use voisu_app::feedback::{
     FeedbackDegradation, FeedbackSelection, OverlayRestartPolicy, SessionKind,
 };
 use voisu_app::overlay::{
-    edge_falloff_alpha, phase_glyph, poll_tick, recording_bar_height, resting_floor,
-    sweep_brightness, BarSmoother, LevelPollAction, LevelPollLatch, NoSpeechNotifyLatch,
+    edge_falloff_alpha, interpolate_bands, phase_glyph, poll_tick, recording_bar_height,
+    resting_floor, sweep_brightness, BarSmoother, LevelPollAction, LevelPollLatch,
+    NoSpeechNotifyLatch, VISUAL_BAR_COUNT,
     ObservedSignal, OverlayPhase, OverlayView, PresentationController, PresentationTracker,
     RecordingNotifyLatch, TickAction,
 };
@@ -287,7 +288,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     label.set_hexpand(true);
     label.set_vexpand(true);
     let meter = gtk::DrawingArea::builder()
-        .content_height(32)
+        .content_height(40)
         .build();
     // Graphics-first phases (Recording/Processing/NoSpeech) hide the label and
     // glyph widgets entirely (see render_surface), so the meter is the only
@@ -853,25 +854,31 @@ fn draw_meter(
     reduced_motion: bool,
 ) {
     let centre = f64::from(height) / 2.0;
-    let drawable = f64::from(height) - 5.0;
+    // content_height 40 minus a 2px inset -> 38px drawable (floor 3.8, max swing 34.2).
+    let drawable = f64::from(height) - 2.0;
     let gap = 2.0;
-    let bar_width = (f64::from(width) - gap * 19.0) / 20.0;
-    for (index, level) in bands.iter().enumerate() {
+    let count = VISUAL_BAR_COUNT;
+    let bar_width = (f64::from(width) - gap * (count - 1) as f64) / count as f64;
+    // Resample the 20 IPC bands up to the 44 visual bars (Recording only; the
+    // resting phases draw a flat floor). Rounded to u8 to keep
+    // `recording_bar_height`'s existing signature — the difference is sub-pixel.
+    let levels = interpolate_bands(bands, count);
+    for index in 0..count {
         let (bar_height, alpha, colour) = match phase {
             OverlayPhase::Recording => (
-                recording_bar_height(*level, drawable),
-                edge_falloff_alpha(index, 20),
+                recording_bar_height(levels[index].round().clamp(0.0, 255.0) as u8, drawable),
+                edge_falloff_alpha(index, count),
                 (0.949, 0.949, 0.949), // #F2F2F2
             ),
             OverlayPhase::Processing => (
                 resting_floor(drawable),
-                edge_falloff_alpha(index, 20)
-                    * sweep_brightness(index, 20, sweep_started.elapsed().as_secs_f64(), reduced_motion),
+                edge_falloff_alpha(index, count)
+                    * sweep_brightness(index, count, sweep_started.elapsed().as_secs_f64(), reduced_motion),
                 (0.949, 0.949, 0.949),
             ),
             OverlayPhase::NoSpeech => (
                 resting_floor(drawable),
-                edge_falloff_alpha(index, 20),
+                edge_falloff_alpha(index, count),
                 (1.0, 0.706, 0.329), // #FFB454
             ),
             // Meter is hidden in every other phase; draw nothing defensively.
