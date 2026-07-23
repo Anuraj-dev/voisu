@@ -287,13 +287,21 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     label.set_hexpand(true);
     label.set_vexpand(true);
     let meter = gtk::DrawingArea::builder()
-        .content_width(150)
         .content_height(32)
         .build();
-    // The pre-waveform text glyphs ("⋯" while Processing, "⚠" on Failure) keep
-    // their slot: only the Recording presentation is replaced by the bar meter.
+    // Graphics-first phases (Recording/Processing/NoSpeech) hide the label and
+    // glyph widgets entirely (see render_surface), so the meter is the only
+    // visible child and must be free to fill the whole capsule interior
+    // instead of a fixed 150px slot.
+    meter.set_hexpand(true);
+    meter.set_halign(gtk::Align::Fill);
+    // The pre-waveform glyph slot ("⚠" on Failure, "✓" on Success). It is
+    // hidden whenever empty (see render_surface) and centers itself when it
+    // is the capsule's only visible child.
     let glyph = gtk::Label::builder().label("").build();
     glyph.add_css_class("meter");
+    glyph.set_hexpand(true);
+    glyph.set_halign(gtk::Align::Center);
     let rendered_bars = Rc::new(RefCell::new([0_u8; 20]));
     let reduced_motion = gtk::Settings::default()
         .map(|settings| !settings.is_gtk_enable_animations())
@@ -495,8 +503,9 @@ fn run_notification_feedback(selection: FeedbackSelection) -> i32 {
     let notifier = Notifier::start(selection);
     let mut controller = PresentationController::default();
     let mut previous_phase = OverlayView::HIDDEN.phase;
+    let mut no_speech_latch = NoSpeechNotifyLatch::default();
     loop {
-        notification_tick(&mut controller, &mut previous_phase, &notifier);
+        notification_tick(&mut controller, &mut previous_phase, &mut no_speech_latch, &notifier);
         std::thread::sleep(Duration::from_millis(200));
     }
 }
@@ -514,11 +523,13 @@ fn install_notification_feedback(application: &gtk::Application) {
     });
     let controller = Rc::new(RefCell::new(PresentationController::default()));
     let previous_phase = Rc::new(RefCell::new(OverlayView::HIDDEN.phase));
+    let no_speech_latch = Rc::new(RefCell::new(NoSpeechNotifyLatch::default()));
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
         let _hold = &hold;
         notification_tick(
             &mut controller.borrow_mut(),
             &mut previous_phase.borrow_mut(),
+            &mut no_speech_latch.borrow_mut(),
             &notifier,
         );
         gtk::glib::ControlFlow::Continue
@@ -527,20 +538,36 @@ fn install_notification_feedback(application: &gtk::Application) {
 
 /// One poll of the daemon status: on a transition into a visible phase, hand the
 /// new label to the notifier (which fires a desktop notification, or logs the
-/// transition to the journal when the bus is unavailable).
+/// transition to the journal when the bus is unavailable). NoSpeech is gated
+/// through `NoSpeechNotifyLatch` instead of the plain phase-transition check:
+/// a retained NoSpeech capsule can span an unreachable blip that recovers
+/// before the terminal window expires, which would otherwise look like two
+/// separate transitions into NoSpeech and fire a duplicate notification for
+/// one episode. The latch fires once per episode and does not re-arm on an
+/// `Unreachable` observation.
 fn notification_tick(
     controller: &mut PresentationController,
     previous_phase: &mut OverlayPhase,
+    no_speech_latch: &mut NoSpeechNotifyLatch,
     notifier: &Notifier,
 ) {
     let now = Instant::now();
-    let view = match read_status() {
-        Some(response) => controller.observe(&response, now),
-        None => controller.observe_unreachable(now),
+    let (view, signal) = match read_status() {
+        Some(response) => {
+            let view = controller.observe(&response, now);
+            (view, ObservedSignal::Reachable(view.phase))
+        }
+        None => (controller.observe_unreachable(now), ObservedSignal::Unreachable),
     };
-    // Fire only on a PHASE transition into a visible phase. Comparing the whole
-    // view would re-fire on every meter/activity tick within one Recording.
-    if view.is_visible() && *previous_phase != view.phase {
+    let fire_no_speech = no_speech_latch.observe(signal);
+    if view.phase == OverlayPhase::NoSpeech {
+        if fire_no_speech {
+            notifier.notify(view.visible_label);
+        }
+    } else if view.is_visible() && *previous_phase != view.phase {
+        // Fire only on a PHASE transition into a visible phase. Comparing the
+        // whole view would re-fire on every meter/activity tick within one
+        // Recording.
         notifier.notify(view.visible_label);
     }
     *previous_phase = view.phase;
@@ -712,13 +739,17 @@ fn render_surface(
         window.set_visible(false);
         return;
     }
-    label.set_label(view.capsule_text());
+    let text = view.capsule_text();
+    label.set_label(text);
+    label.set_visible(!text.is_empty());
     label.update_property(&[gtk::accessible::Property::Description(view.accessible_label)]);
     meter.set_visible(matches!(
         view.phase,
         OverlayPhase::Recording | OverlayPhase::Processing | OverlayPhase::NoSpeech
     ));
-    glyph.set_label(phase_glyph(view.phase));
+    let glyph_text = phase_glyph(view.phase);
+    glyph.set_label(glyph_text);
+    glyph.set_visible(!glyph_text.is_empty());
     window.set_visible(true);
     meter.queue_draw();
 }

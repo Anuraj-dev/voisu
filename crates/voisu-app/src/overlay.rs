@@ -116,10 +116,12 @@ impl OverlayView {
 /// presentation, so Processing and Failure keep rendering exactly as before.
 pub const fn phase_glyph(phase: OverlayPhase) -> &'static str {
     match phase {
-        OverlayPhase::Processing => "⋯",
         OverlayPhase::Failure => "⚠",
         OverlayPhase::Success => "✓",
-        OverlayPhase::Recording | OverlayPhase::NoSpeech | OverlayPhase::Hidden => "",
+        OverlayPhase::Recording
+        | OverlayPhase::Processing
+        | OverlayPhase::NoSpeech
+        | OverlayPhase::Hidden => "",
     }
 }
 
@@ -521,10 +523,11 @@ mod tests {
 
     #[test]
     fn red_non_recording_phases_keep_their_pre_waveform_glyphs() {
-        // Only the Recording phase changes with the live bar meter; the
-        // Processing and Failure capsules keep the exact text presentation
-        // they had before it (spec 2026-07-20, §1).
-        assert_eq!(phase_glyph(OverlayPhase::Processing), "⋯");
+        // Recording and Processing are both graphics-only (no glyph): the
+        // live bar meter carries Recording, and the light sweep carries
+        // Processing with no text or glyph (spec 2026-07-23, graphics-first
+        // redesign). Failure and Success keep their glyphs.
+        assert_eq!(phase_glyph(OverlayPhase::Processing), "");
         assert_eq!(phase_glyph(OverlayPhase::Failure), "⚠");
         assert_eq!(phase_glyph(OverlayPhase::Recording), "");
         assert_eq!(phase_glyph(OverlayPhase::Success), "✓");
@@ -1035,6 +1038,23 @@ mod tests {
         assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::NoSpeech)));
     }
 
+    /// The desktop-notification fallback rung (voisu-overlay.rs's
+    /// `notification_tick`) drives its no-speech decision through this same
+    /// latch instead of a plain phase-transition check, precisely so a
+    /// retained NoSpeech episode that survives one unreachable poll blip does
+    /// not read as two separate transitions and fire twice.
+    #[test]
+    fn no_speech_latch_does_not_double_fire_across_an_unreachable_blip_mid_episode() {
+        let mut latch = NoSpeechNotifyLatch::default();
+        assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::NoSpeech)));
+        // Daemon becomes briefly unreachable while the terminal capsule is
+        // still lingering on-screen from the first observation.
+        assert!(!latch.observe(ObservedSignal::Unreachable));
+        // Daemon recovers before the terminal window expires: NoSpeech is
+        // observed again for what is still the SAME episode. Must stay silent.
+        assert!(!latch.observe(ObservedSignal::Reachable(OverlayPhase::NoSpeech)));
+    }
+
     #[test]
     fn poll_tick_reports_no_speech_even_on_the_layer_shell_path() {
         let mut tracker = PresentationTracker::default();
@@ -1109,7 +1129,7 @@ mod tests {
         assert_eq!(phase_glyph(OverlayPhase::Success), "✓");
         assert_eq!(phase_glyph(OverlayPhase::NoSpeech), "");
         assert_eq!(phase_glyph(OverlayPhase::Failure), "⚠");
-        assert_eq!(phase_glyph(OverlayPhase::Processing), "⋯");
+        assert_eq!(phase_glyph(OverlayPhase::Processing), "");
     }
 
     #[test]
