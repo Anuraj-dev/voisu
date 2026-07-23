@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.4.1
+Version:        0.5.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,16 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Thu Jul 23 2026 Voisu maintainers <voisu@example.invalid> - 0.5.0-1
+- fix(overlay): keep accessible description reachable when the label is hidden
+- docs(overlay): update phase_glyph doc to graphics-first behavior
+- fix(overlay): Processing has no glyph, graphics-only capsule fills full width, dedupe fallback no-sp
+- test(overlay): satisfy clippy manual_range_contains in falloff assertion
+- feat(overlay): text-free capsule — white waveform, light sweep, check, red edge, amber no-speech
+- feat(overlay): pure drawing math for falloff, resting floor, light sweep
+- feat(overlay): no-speech notification latch, fires on all windowed paths
+- feat(overlay): add NoSpeech phase and text-free capsule labels
+
 * Wed Jul 22 2026 Voisu maintainers <voisu@example.invalid> - 0.4.1-1
 - fix(tests): serialize restart in the fake systemctl stub
 

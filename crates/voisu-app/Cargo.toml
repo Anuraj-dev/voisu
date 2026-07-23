@@ -1,6 +1,6 @@
 [package]
 name = "voisu-app"
-version = "0.4.1"
+version = "0.5.0"
 description = "Cloud-first Linux dictation for Wayland"
 edition.workspace = true
 license.workspace = true
