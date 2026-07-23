@@ -21,7 +21,8 @@ use voisu_app::feedback::{
     FeedbackDegradation, FeedbackSelection, OverlayRestartPolicy, SessionKind,
 };
 use voisu_app::overlay::{
-    phase_glyph, poll_tick, BarSmoother, LevelPollAction, LevelPollLatch, NoSpeechNotifyLatch,
+    edge_falloff_alpha, phase_glyph, poll_tick, recording_bar_height, resting_floor,
+    sweep_brightness, BarSmoother, LevelPollAction, LevelPollLatch, NoSpeechNotifyLatch,
     ObservedSignal, OverlayPhase, OverlayView, PresentationController, PresentationTracker,
     RecordingNotifyLatch, TickAction,
 };
@@ -297,16 +298,19 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     let reduced_motion = gtk::Settings::default()
         .map(|settings| !settings.is_gtk_enable_animations())
         .unwrap_or(true);
-    let pulse_started = Instant::now();
+    let sweep_started = Instant::now();
+    let rendered_phase = Rc::new(Cell::new(OverlayPhase::Hidden));
     meter.set_draw_func({
         let rendered_bars = Rc::clone(&rendered_bars);
+        let rendered_phase = Rc::clone(&rendered_phase);
         move |_, context, width, height| {
             draw_meter(
                 context,
                 width,
                 height,
                 &rendered_bars.borrow(),
-                pulse_started,
+                rendered_phase.get(),
+                sweep_started,
                 reduced_motion,
             );
         }
@@ -327,10 +331,11 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         "window.background { background: transparent; }
          .capsule { background: rgba(23, 25, 29, 0.96); border-radius: 32px; }
          .capsule .state-label, .capsule .meter { color: #F4F5F7; font-size: 11pt; font-weight: 600; }
-         .capsule.recording .state-label, .capsule.recording .meter { color: #65D6A0; }
          .capsule.processing .state-label, .capsule.processing .meter { color: #8FB4FF; }
-         .capsule.success .state-label, .capsule.success .meter { color: #B8E986; }
-         .capsule.failure .state-label, .capsule.failure .meter { color: #FF8A8A; }",
+         .capsule.success .state-label, .capsule.success .meter { color: #65D6A0; font-size: 14pt; }
+         .capsule.failure { border: 1px solid rgba(255, 138, 138, 0.9); box-shadow: 0 0 8px rgba(255, 138, 138, 0.35); }
+         .capsule.failure .state-label, .capsule.failure .meter { color: #FF8A8A; }
+         .capsule.nospeech .state-label, .capsule.nospeech .meter { color: #FFB454; }",
     );
     capsule.add_css_class("capsule");
     gtk::style_context_add_provider_for_display(
@@ -353,6 +358,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         meter,
         glyph,
         rendered_bars,
+        rendered_phase,
         capsule,
         switched,
     );
@@ -368,6 +374,7 @@ fn install_surface_feedback(
     meter: gtk::DrawingArea,
     glyph: gtk::Label,
     rendered_bars: Rc<RefCell<[u8; 20]>>,
+    rendered_phase: Rc<Cell<OverlayPhase>>,
     capsule: gtk::Box,
     switched: Rc<Cell<bool>>,
 ) {
@@ -407,7 +414,10 @@ fn install_surface_feedback(
                 ObservedSignal::Unreachable,
             ),
         };
-        render_surface(&window, &label, &meter, &glyph, &capsule, view);
+        render_surface(&window, &label, &meter, &glyph, &capsule, &rendered_phase, view);
+        if view.phase == OverlayPhase::Processing {
+            meter.queue_draw();
+        }
         match level_latch.borrow_mut().observe(signal) {
             LevelPollAction::Arm => {
                 let worker = Rc::new(LevelWorker::spawn());
@@ -450,7 +460,7 @@ fn install_surface_feedback(
                 }
                 gtk::glib::ControlFlow::Break
             }
-            TickAction::Continue { resurface, notify, notify_no_speech: _ } => {
+            TickAction::Continue { resurface, notify, notify_no_speech } => {
                 // Wayland denies a plain toplevel keep-above; re-present it on
                 // each transition into a visible phase to resurface above
                 // occluders.
@@ -465,6 +475,11 @@ fn install_surface_feedback(
                     let notification = gtk::gio::Notification::new("Voisu");
                     notification.set_body(Some(view.visible_label));
                     application.send_notification(Some("overlay-recording"), &notification);
+                }
+                if notify_no_speech {
+                    let notification = gtk::gio::Notification::new("Voisu");
+                    notification.set_body(Some(OverlayView::no_speech().visible_label));
+                    application.send_notification(Some("overlay-nospeech"), &notification);
                 }
                 gtk::glib::ControlFlow::Continue
             }
@@ -675,9 +690,10 @@ fn render_surface(
     meter: &gtk::DrawingArea,
     glyph: &gtk::Label,
     capsule: &gtk::Box,
+    rendered_phase: &Cell<OverlayPhase>,
     view: OverlayView,
 ) {
-    for class in ["recording", "processing", "success", "failure"] {
+    for class in ["recording", "processing", "success", "failure", "nospeech"] {
         capsule.remove_css_class(class);
     }
     let class = match view.phase {
@@ -685,20 +701,26 @@ fn render_surface(
         OverlayPhase::Processing => "processing",
         OverlayPhase::Success => "success",
         OverlayPhase::Failure => "failure",
-        OverlayPhase::Hidden | OverlayPhase::NoSpeech => "",
+        OverlayPhase::NoSpeech => "nospeech",
+        OverlayPhase::Hidden => "",
     };
     if !class.is_empty() {
         capsule.add_css_class(class);
     }
+    rendered_phase.set(view.phase);
     if view.phase == OverlayPhase::Hidden {
         window.set_visible(false);
         return;
     }
-    label.set_label(view.visible_label);
+    label.set_label(view.capsule_text());
     label.update_property(&[gtk::accessible::Property::Description(view.accessible_label)]);
-    meter.set_visible(view.phase == OverlayPhase::Recording);
+    meter.set_visible(matches!(
+        view.phase,
+        OverlayPhase::Recording | OverlayPhase::Processing | OverlayPhase::NoSpeech
+    ));
     glyph.set_label(phase_glyph(view.phase));
     window.set_visible(true);
+    meter.queue_draw();
 }
 
 /// Cadence of the Level poll on its dedicated worker thread, and of the GTK
@@ -778,8 +800,8 @@ fn install_level_drain(
         if let Some(bars) = worker.take_latest() {
             *rendered_bars.borrow_mut() = bars;
         }
-        // Redraw every tick regardless: this cadence also animates the
-        // record dot's pulse while the bars are unchanged.
+        // Redraw every tick regardless: keeps the meter live even on a tick
+        // where the worker published no new bars.
         meter.queue_draw();
         gtk::glib::ControlFlow::Continue
     })
@@ -790,26 +812,37 @@ fn draw_meter(
     width: i32,
     height: i32,
     bands: &[u8; 20],
-    pulse_started: Instant,
+    phase: OverlayPhase,
+    sweep_started: Instant,
     reduced_motion: bool,
 ) {
     let centre = f64::from(height) / 2.0;
-    let pulse = if reduced_motion {
-        0.82
-    } else {
-        0.68 + 0.20 * (pulse_started.elapsed().as_secs_f64() * 2.4).sin()
-    };
-    context.set_source_rgba(0.396, 0.839, 0.627, pulse);
-    context.arc(4.0, centre, 3.2, 0.0, std::f64::consts::TAU);
-    let _ = context.fill();
-
-    let start = 13.0;
+    let drawable = f64::from(height) - 5.0;
     let gap = 2.0;
-    let bar_width = ((f64::from(width) - start) - gap * 19.0) / 20.0;
-    context.set_source_rgb(0.396, 0.839, 0.627);
+    let bar_width = (f64::from(width) - gap * 19.0) / 20.0;
     for (index, level) in bands.iter().enumerate() {
-        let bar_height = 1.5 + f64::from(*level) / 255.0 * (f64::from(height) - 5.0);
-        let x = start + index as f64 * (bar_width + gap);
+        let (bar_height, alpha, colour) = match phase {
+            OverlayPhase::Recording => (
+                recording_bar_height(*level, drawable),
+                edge_falloff_alpha(index, 20),
+                (0.949, 0.949, 0.949), // #F2F2F2
+            ),
+            OverlayPhase::Processing => (
+                resting_floor(drawable),
+                edge_falloff_alpha(index, 20)
+                    * sweep_brightness(index, 20, sweep_started.elapsed().as_secs_f64(), reduced_motion),
+                (0.949, 0.949, 0.949),
+            ),
+            OverlayPhase::NoSpeech => (
+                resting_floor(drawable),
+                edge_falloff_alpha(index, 20),
+                (1.0, 0.706, 0.329), // #FFB454
+            ),
+            // Meter is hidden in every other phase; draw nothing defensively.
+            _ => return,
+        };
+        let x = index as f64 * (bar_width + gap);
+        context.set_source_rgba(colour.0, colour.1, colour.2, alpha);
         rounded_rectangle(context, x, centre - bar_height / 2.0, bar_width, bar_height);
         let _ = context.fill();
     }
