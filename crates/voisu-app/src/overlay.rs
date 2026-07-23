@@ -321,6 +321,56 @@ impl BarSmoother {
     }
 }
 
+// ---- Waveform drawing math (pure; the cairo adapter in the bin consumes it) ----
+
+/// Spec floor for the edge-falloff ramp: outermost bars sit at ~45% opacity.
+const EDGE_FALLOFF_MIN: f64 = 0.45;
+/// One full left→right pass of the Processing light sweep.
+const SWEEP_PERIOD_SECS: f64 = 1.2;
+/// Sweep bump width in bar units (gaussian sigma).
+const SWEEP_SIGMA_BARS: f64 = 2.0;
+/// Resting-bar brightness away from the sweep bump, and the uniform
+/// reduced-motion brightness. Chosen so the sweep reads as light passing
+/// through visible bars, not bars blinking on from black.
+const SWEEP_BASE_BRIGHTNESS: f64 = 0.35;
+const SWEEP_REDUCED_MOTION_BRIGHTNESS: f64 = 0.6;
+
+/// Per-bar opacity: a half-sine ramp from `EDGE_FALLOFF_MIN` at the row's ends
+/// to 1.0 at its center, so the waveform fades out softly instead of stopping.
+pub fn edge_falloff_alpha(index: usize, count: usize) -> f64 {
+    let position = (index as f64 + 0.5) / count as f64;
+    EDGE_FALLOFF_MIN + (1.0 - EDGE_FALLOFF_MIN) * (std::f64::consts::PI * position).sin()
+}
+
+/// Silence baseline: 10% of the drawable height, never below the old 1.5px
+/// minimum. A dotted resting line reads "listening", a flatline reads "dead".
+pub fn resting_floor(drawable_height: f64) -> f64 {
+    (0.10 * drawable_height).max(1.5)
+}
+
+/// Recording bar height: level 0 rests exactly on the floor, level 255 fills
+/// the drawable height, linear in between.
+pub fn recording_bar_height(level: u8, drawable_height: f64) -> f64 {
+    let floor = resting_floor(drawable_height);
+    floor + f64::from(level) / 255.0 * (drawable_height - floor)
+}
+
+/// Processing light-sweep brightness for one bar. A gaussian bump travels
+/// left→right across the row every `SWEEP_PERIOD_SECS`, entering from before
+/// bar 0 and exiting past the last bar so the loop has no visible snap.
+/// Reduced motion: uniform raised brightness, no movement.
+pub fn sweep_brightness(index: usize, count: usize, elapsed_secs: f64, reduced_motion: bool) -> f64 {
+    if reduced_motion {
+        return SWEEP_REDUCED_MOTION_BRIGHTNESS;
+    }
+    let progress = (elapsed_secs.rem_euclid(SWEEP_PERIOD_SECS)) / SWEEP_PERIOD_SECS;
+    let travel = count as f64 + 6.0 * SWEEP_SIGMA_BARS;
+    let position = progress * travel - 3.0 * SWEEP_SIGMA_BARS;
+    let distance = index as f64 + 0.5 - position;
+    let bump = (-distance * distance / (2.0 * SWEEP_SIGMA_BARS * SWEEP_SIGMA_BARS)).exp();
+    SWEEP_BASE_BRIGHTNESS + (1.0 - SWEEP_BASE_BRIGHTNESS) * bump
+}
+
 /// Edge-latch for the fallback path's secondary "Recording started" desktop
 /// notification. Pure and adapter-free, mirroring `PresentationTracker`.
 ///
@@ -1060,5 +1110,54 @@ mod tests {
         assert_eq!(phase_glyph(OverlayPhase::NoSpeech), "");
         assert_eq!(phase_glyph(OverlayPhase::Failure), "⚠");
         assert_eq!(phase_glyph(OverlayPhase::Processing), "⋯");
+    }
+
+    #[test]
+    fn edge_falloff_is_dim_at_the_ends_and_full_at_center() {
+        let first = edge_falloff_alpha(0, 20);
+        let mid = edge_falloff_alpha(10, 20);
+        let last = edge_falloff_alpha(19, 20);
+        assert!(first < 0.55 && first >= 0.45, "outer bar should be ~0.45–0.55, got {first}");
+        assert!((first - last).abs() < 0.05, "falloff must be symmetric");
+        assert!(mid > 0.97, "center bar should be ~full opacity, got {mid}");
+        // Monotone from edge to center — no ripples in the ramp.
+        for i in 0..9 {
+            assert!(edge_falloff_alpha(i, 20) <= edge_falloff_alpha(i + 1, 20) + 1e-9);
+        }
+    }
+
+    #[test]
+    fn resting_floor_reads_as_a_dotted_baseline_not_a_flatline() {
+        let floor = resting_floor(27.0); // 32px meter minus the 5px inset
+        assert!((floor - 2.7).abs() < 1e-9, "floor is 10% of drawable height");
+        assert!(resting_floor(10.0) >= 1.5, "floor never collapses below the old 1.5px minimum");
+        // Silence (level 0) sits exactly on the floor; full level fills the height.
+        assert!((recording_bar_height(0, 27.0) - floor).abs() < 1e-9);
+        assert!((recording_bar_height(255, 27.0) - 27.0).abs() < 1e-9);
+        // Monotone in level.
+        assert!(recording_bar_height(80, 27.0) < recording_bar_height(200, 27.0));
+    }
+
+    #[test]
+    fn sweep_brightness_moves_and_respects_reduced_motion() {
+        // Reduced motion: uniform raised brightness, time-independent.
+        for index in [0, 7, 19] {
+            assert!((sweep_brightness(index, 20, 0.3, true) - 0.6).abs() < 1e-9);
+            assert!((sweep_brightness(index, 20, 5.3, true) - 0.6).abs() < 1e-9);
+        }
+        // Full motion: brightness peaks near the sweep position and the peak moves.
+        let early_left = sweep_brightness(2, 20, 0.15, false);
+        let early_right = sweep_brightness(17, 20, 0.15, false);
+        assert!(early_left > early_right, "early in the pass the bump is on the left");
+        let late_left = sweep_brightness(2, 20, 1.05, false);
+        let late_right = sweep_brightness(17, 20, 1.05, false);
+        assert!(late_right > late_left, "late in the pass the bump is on the right");
+        // Everything stays in a sane [0.25, 1.0] display range.
+        for index in 0..20 {
+            for t in [0.0, 0.4, 0.8, 1.19] {
+                let b = sweep_brightness(index, 20, t, false);
+                assert!((0.25..=1.0).contains(&b), "b={b} at index={index} t={t}");
+            }
+        }
     }
 }
