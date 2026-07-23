@@ -742,7 +742,12 @@ fn render_surface(
     let text = view.capsule_text();
     label.set_label(text);
     label.set_visible(!text.is_empty());
-    label.update_property(&[gtk::accessible::Property::Description(view.accessible_label)]);
+    // The accessible description lives on the capsule box, not the label: the
+    // label is hidden for every graphics-first phase (Recording/Processing/
+    // Success/NoSpeech), and a hidden widget is excluded from assistive
+    // presentation. The capsule is visible in every non-Hidden phase, so it
+    // is the one widget that can always carry the announcement.
+    capsule.update_property(&[gtk::accessible::Property::Description(view.accessible_label)]);
     meter.set_visible(matches!(
         view.phase,
         OverlayPhase::Recording | OverlayPhase::Processing | OverlayPhase::NoSpeech
