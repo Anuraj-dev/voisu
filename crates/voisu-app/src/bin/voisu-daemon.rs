@@ -3179,6 +3179,7 @@ mod tests {
             vec![Provider::Groq],
             evidence,
             None,
+            false,
             actor,
             Arc::clone(&diagnostics),
             ProviderReaper::new(),
