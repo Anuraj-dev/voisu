@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use voisu_app::audio_level::{LevelRegistry, LevelRing};
 use voisu_app::focus::SharedFocusProbe;
+use voisu_app::journal::recording_journal_line;
 use voisu_app::system::{
     CAPTURE_FINALIZE_DEADLINE, DeepgramProvider, DesktopNotifier, FedoraShortcutPortal,
     GroqProvider, GuardedDelivery, MergeResultValidator, PROCESSING_RESPONSE_DEADLINE,
@@ -1113,6 +1114,18 @@ async fn actor_loop(
                     state = ActorState::Idle;
                     let response = match completed.result {
                         Ok(()) => {
+                            // The journal is the only diagnostic surface that
+                            // outlives the retention ring, so the healthy path
+                            // reports its per-stage timings there too — not just
+                            // the failing one.
+                            eprintln!(
+                                "{}",
+                                recording_journal_line(
+                                    completed.id,
+                                    &completed.evidence,
+                                    None
+                                )
+                            );
                             let response = Response::with_evidence(
                             true,
                             Some(DaemonState::Idle),
@@ -1145,7 +1158,18 @@ async fn actor_loop(
                             response
                         }
                         Err(error) => {
-                            eprintln!("Recording {}: {}", completed.id, error.diagnostic());
+                            // Same line as always — `Recording <id>: <diagnostic>`
+                            // is preserved verbatim as the prefix — now carrying
+                            // the per-stage timings a failure needs to be
+                            // diagnosed after the fact.
+                            eprintln!(
+                                "{}",
+                                recording_journal_line(
+                                    completed.id,
+                                    &completed.evidence,
+                                    Some(error.diagnostic())
+                                )
+                            );
                             let response = Response::with_evidence(
                                 false,
                                 Some(DaemonState::Idle),
