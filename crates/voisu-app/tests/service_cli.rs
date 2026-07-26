@@ -351,7 +351,10 @@ fn stderr(output: &Output) -> String {
 }
 
 fn wait_for_socket(runtime: &Path, present: bool) {
-    let socket = runtime.join("voisu/v1/daemon.sock");
+    let socket = runtime.join(format!(
+        "voisu/v{}/daemon.sock",
+        voisu_core::PROTOCOL_VERSION
+    ));
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         if socket.exists() == present {
