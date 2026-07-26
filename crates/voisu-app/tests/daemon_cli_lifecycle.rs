@@ -7122,13 +7122,13 @@ fn failed_recording_kills_its_in_flight_groq_request_before_the_next_recording()
     let commands = TempDir::new().unwrap();
     // More than the full-audio limit (~120 s) of PCM so the Recording crosses
     // into pre-streamed chunking and a bounded Groq chunk request goes in
-    // flight during the Recording; then keep recording until the configured
-    // Recording Deadline fails it.
+    // flight during the Recording. A later production capture-boundary read
+    // error then fails it.
     write_fake_command(
         commands.path(),
         "pw-record",
         r#"#!/bin/sh
-head -c 4000000 /dev/zero | tr '\000' '\001'
+head -c 8000000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 i=0
 while [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
@@ -7156,19 +7156,20 @@ while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
         runtime.path(),
         &[
             ("PATH", &path),
+            ("VOISU_TEST_MODE", "system-boundaries"),
+            ("VOISU_TEST_CAPTURE_READ_ERROR_AFTER_BYTES", "8000000"),
             ("VOISU_GROQ_API_KEY", "controlled-secret"),
             (
                 "VOISU_GROQ_TRANSCRIPTION_URL",
                 "http://127.0.0.1:9/audio/transcriptions",
             ),
-            ("VOISU_RECORDING_DEADLINE_MS", "2500"),
         ],
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
     wait_for_marker(commands.path(), "curl.start");
 
-    // The Recording Deadline fails the Recording while the request is in
+    // The capture read error fails the Recording while the request is in
     // flight; the abort must kill the request's subprocess, not merely abort
     // the tokio task that awaits it (a detached blocking curl would keep
     // running for up to 14s, overlapping the next Recording).
@@ -7325,6 +7326,8 @@ printf '{"text":"unused Groq Source Transcript"}'
         runtime.path(),
         &[
             ("PATH", &path),
+            ("VOISU_TEST_MODE", "system-boundaries"),
+            ("VOISU_TEST_CAPTURE_READ_ERROR_AFTER_BYTES", "64000"),
             ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
             ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
             ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
@@ -7332,7 +7335,6 @@ printf '{"text":"unused Groq Source Transcript"}'
                 "VOISU_GROQ_TRANSCRIPTION_URL",
                 "https://groq.test/audio/transcriptions",
             ),
-            ("VOISU_RECORDING_DEADLINE_MS", "500"),
         ],
     );
 
