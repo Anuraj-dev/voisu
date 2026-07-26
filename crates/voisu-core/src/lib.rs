@@ -1101,7 +1101,14 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             if let Some(failure) = quality_failure_reason(&merge_result.0, &sources) {
                 let reason = failure.reason();
                 if failure.is_contraction() {
-                    return Ok(contraction_source_fallback(deepgram, groq, reason, true, false));
+                    return Ok(contraction_source_fallback(
+                        deepgram,
+                        groq,
+                        &merge_result.0,
+                        reason,
+                        true,
+                        false,
+                    ));
                 }
                 return self
                     .repair_candidate(&sources, merge_result, reason, true)
@@ -1200,6 +1207,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                     return Ok(contraction_source_fallback(
                         deepgram,
                         groq,
+                        &repaired.0,
                         repair_reason,
                         reconciliation_requested,
                         true,
@@ -1224,33 +1232,35 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
     }
 }
 
-fn cross_supported_word_count(words: &[String], other: &[String]) -> usize {
-    let other_words: HashSet<&str> = other.iter().map(String::as_str).collect();
-    words
-        .iter()
-        .filter(|word| other_words.contains(word.as_str()))
-        .count()
-}
-
 fn contraction_source_fallback(
     deepgram: &SourceTranscript,
     groq: &SourceTranscript,
+    merge_text: &str,
     reason: String,
     reconciliation_requested: bool,
     recovery_attempted: bool,
 ) -> TranscriptDecision {
-    let deepgram_words = normalized_words(&deepgram.text);
-    let groq_words = normalized_words(&groq.text);
-    let deepgram_supported = cross_supported_word_count(&deepgram_words, &groq_words);
-    let groq_supported = cross_supported_word_count(&groq_words, &deepgram_words);
-    let source = if deepgram_supported > groq_supported {
-        deepgram
-    } else if groq_supported > deepgram_supported {
+    let source = if deepgram.text.trim().is_empty() && !groq.text.trim().is_empty() {
         groq
-    } else if deepgram_words.len() < groq_words.len() {
+    } else if groq.text.trim().is_empty() && !deepgram.text.trim().is_empty() {
         deepgram
     } else {
-        groq
+        let deepgram_words = normalized_words(&deepgram.text);
+        let groq_words = normalized_words(&groq.text);
+        if deepgram_words.len() == groq_words.len() {
+            groq
+        } else {
+            let (shorter, longer) = if deepgram_words.len() < groq_words.len() {
+                (deepgram, groq)
+            } else {
+                (groq, deepgram)
+            };
+            if source_similarity(merge_text, &shorter.text) >= 0.85 {
+                shorter
+            } else {
+                longer
+            }
+        }
     };
     TranscriptDecision {
         transcript: Transcript(source.text.trim().to_owned()),
@@ -1259,8 +1269,7 @@ fn contraction_source_fallback(
             Provider::Groq => TranscriptSelection::SourceGroq,
         },
         validation_reason:
-            "Source Transcript with the strongest cross-source support selected after merge contraction"
-                .to_owned(),
+            "Source Transcript selected using merge corroboration after merge contraction".to_owned(),
         fallback_reason: Some(reason),
         reconciliation_requested,
         recovery_attempted,
