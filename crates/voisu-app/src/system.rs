@@ -61,7 +61,6 @@ const MIN_RECORDING_BYTES: usize = PCM_CHUNK_BYTES;
 /// The one configured maximum for a Recording. Both capture's retained PCM
 /// buffer and its default Deadline derive from this value.
 const MAX_RECORDING_DURATION: Duration = Duration::from_secs(600);
-const MAX_RECORDING_BYTES: usize = 16_000 * 2 * MAX_RECORDING_DURATION.as_secs() as usize;
 /// Recordings at or below this length (120 s of 16 kHz s16le mono) take a
 /// single full-audio Groq request at finalize: no pre-streamed chunks, no
 /// seams, full context for Whisper. Only Recordings that grow past this switch
@@ -2457,6 +2456,9 @@ impl<R: Read> Read for WavHeaderStripper<R> {
 
 impl AudioCapture for PipeWireCapture {
     fn begin(&mut self, _recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError> {
+        let maximum =
+            resolve_recording_maximum(std::env::var("VOISU_RECORDING_DEADLINE_MS").ok());
+        let pcm_byte_cap = maximum.pcm_byte_cap;
         // `--raw` yields headerless PCM directly (the Fedora path); without it
         // pw-record wraps the same PCM in a WAV container that WavHeaderStripper
         // unwraps below. The remaining flags are identical on both paths. An
@@ -2552,7 +2554,7 @@ impl AudioCapture for PipeWireCapture {
                         }
                         let mut state = reader_state.lock().unwrap();
                         state.received_bytes = state.received_bytes.saturating_add(read);
-                        if state.received_bytes <= MAX_RECORDING_BYTES {
+                        if state.received_bytes <= pcm_byte_cap {
                             for chunk in assembler.push(&buffer[..read]) {
                                 state.chunks.push_back(AudioChunk(chunk));
                             }
@@ -2584,8 +2586,6 @@ impl AudioCapture for PipeWireCapture {
         let stderr_reader = thread::spawn(move || {
             read_capped(&mut stderr, MAX_RETAINED_STDERR_BYTES).unwrap_or_default()
         });
-        let deadline =
-            resolve_recording_deadline(std::env::var("VOISU_RECORDING_DEADLINE_MS").ok());
         Ok(Box::new(PipeWireActiveCapture {
             child: Some(child),
             state,
@@ -2595,7 +2595,7 @@ impl AudioCapture for PipeWireCapture {
             reaper: self.reaper.clone(),
             pcm: Vec::new(),
             started: Instant::now(),
-            deadline,
+            deadline: maximum.deadline,
         }))
     }
 }
@@ -2610,11 +2610,23 @@ const DEFAULT_RECORDING_DEADLINE: Duration = MAX_RECORDING_DURATION;
 /// Resolve the Recording Deadline from the raw `VOISU_RECORDING_DEADLINE_MS`
 /// value. A parseable, non-zero millisecond count wins; anything else — absent,
 /// unparseable, or zero — uses [`DEFAULT_RECORDING_DEADLINE`].
-fn resolve_recording_deadline(raw: Option<String>) -> Duration {
-    raw.and_then(|value| value.parse::<u64>().ok())
+struct RecordingMaximum {
+    deadline: Duration,
+    pcm_byte_cap: usize,
+}
+
+fn resolve_recording_maximum(raw: Option<String>) -> RecordingMaximum {
+    let deadline = raw.and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
         .filter(|value| !value.is_zero())
-        .unwrap_or(DEFAULT_RECORDING_DEADLINE)
+        .unwrap_or(DEFAULT_RECORDING_DEADLINE);
+    let pcm_byte_cap = deadline
+        .as_millis()
+        .saturating_mul(16_000 * 2)
+        .checked_div(1_000)
+        .unwrap_or_default()
+        .min(usize::MAX as u128) as usize;
+    RecordingMaximum { deadline, pcm_byte_cap }
 }
 
 struct PipeWireActiveCapture {
@@ -7660,7 +7672,7 @@ mod tests {
         // With no override the Recording Deadline must be generous enough that a
         // routine multi-minute Recording is never killed. Sixty seconds was the
         // old, wrong default that discarded audio before providers ever saw it.
-        let default = resolve_recording_deadline(None);
+        let default = resolve_recording_maximum(None).deadline;
         assert_eq!(default, Duration::from_secs(600));
         assert!(
             default > Duration::from_secs(60),
@@ -7669,20 +7681,27 @@ mod tests {
 
         // A parseable, non-zero override still wins; junk and zero fall back.
         assert_eq!(
-            resolve_recording_deadline(Some("5000".to_owned())),
+            resolve_recording_maximum(Some("5000".to_owned())).deadline,
             Duration::from_millis(5000)
         );
-        assert_eq!(resolve_recording_deadline(Some("0".to_owned())), default);
-        assert_eq!(resolve_recording_deadline(Some("nonsense".to_owned())), default);
+        assert_eq!(resolve_recording_maximum(Some("0".to_owned())).deadline, default);
+        assert_eq!(
+            resolve_recording_maximum(Some("nonsense".to_owned())).deadline,
+            default
+        );
     }
 
     #[test]
-    fn recording_buffer_matches_the_default_deadline_at_pcm_format() {
-        let default = resolve_recording_deadline(None);
+    fn configured_recording_maximum_drives_deadline_and_pcm_byte_cap() {
+        let configured = resolve_recording_maximum(Some("5000".to_owned()));
         assert_eq!(
-            MAX_RECORDING_BYTES,
-            16_000 * 2 * usize::try_from(default.as_secs()).unwrap(),
-            "the buffer and default Recording Deadline must use the same maximum duration"
+            configured.deadline,
+            Duration::from_millis(5000),
+            "the configured maximum must set the per-Recording Deadline"
+        );
+        assert_eq!(
+            configured.pcm_byte_cap, 16_000 * 2 * 5,
+            "the same configured maximum must set the per-Recording PCM byte cap"
         );
     }
 
