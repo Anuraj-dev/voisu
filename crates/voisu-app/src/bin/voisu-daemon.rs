@@ -26,8 +26,9 @@ use voisu_app::system::{
 use voisu_app::config::DeliveryMode;
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
-    CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonState, DeliveryAdapter, DeliveryMethod,
-    DeliveryOutcome, DiagnosticRecord, DiagnosticStore, LifecycleEvidence, LifecycleStage,
+    CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonState, DeliveryAdapter,
+    DeliveryMethod, DeliveryOutcome, DiagnosticPage, DiagnosticRecord, DiagnosticStore,
+    LifecycleEvidence, LifecycleStage,
     OverlayEvent, OverlayOutcome,
     MergeResult, PROTOCOL_VERSION, Provider,
     ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream, ProviderStreams,
@@ -39,6 +40,7 @@ use voisu_core::{
 };
 
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
+const DIAGNOSTIC_PAGE_BYTES: usize = 64 * 1024;
 const IO_DEADLINE: Duration = CAPTURE_FINALIZE_DEADLINE;
 const MAX_CONNECTIONS: usize = 32;
 const PROVIDER_DEADLINE: Duration = PROVIDER_COMPLETION_DEADLINE;
@@ -2670,7 +2672,55 @@ async fn serve(
             }
         }
     };
-    let mut encoded = serde_json::to_vec(&response)
+    write_response(&mut writer, response).await
+}
+
+async fn write_response(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    mut response: Response,
+) -> Result<(), String> {
+    let diagnostic = if let Some(history) = response.history.take() {
+        Some(
+            serde_json::to_string(&history)
+                .map_err(|error| format!("cannot encode diagnostic history: {error}"))?,
+        )
+    } else if let Some(export) = response.export.take() {
+        Some(
+            serde_json::to_string(&export)
+                .map_err(|error| format!("cannot encode diagnostic export: {error}"))?,
+        )
+    } else {
+        None
+    };
+
+    let Some(payload) = diagnostic else {
+        return write_response_frame(writer, &response).await;
+    };
+
+    let mut start = 0;
+    let mut sequence = 0;
+    while start < payload.len() {
+        let mut end = (start + DIAGNOSTIC_PAGE_BYTES).min(payload.len());
+        while !payload.is_char_boundary(end) {
+            end -= 1;
+        }
+        response.diagnostic_page = Some(DiagnosticPage {
+            sequence,
+            last: end == payload.len(),
+            payload: payload[start..end].to_owned(),
+        });
+        write_response_frame(writer, &response).await?;
+        start = end;
+        sequence += 1;
+    }
+    Ok(())
+}
+
+async fn write_response_frame(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    response: &Response,
+) -> Result<(), String> {
+    let mut encoded = serde_json::to_vec(response)
         .map_err(|error| format!("cannot encode daemon response: {error}"))?;
     encoded.push(b'\n');
     timeout(IO_DEADLINE, writer.write_all(&encoded))

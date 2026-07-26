@@ -2884,9 +2884,34 @@ fn ipc_request(runtime_dir: &Path, request: &str) -> Value {
     let mut stream = UnixStream::connect(socket_path(runtime_dir)).unwrap();
     stream.write_all(request.as_bytes()).unwrap();
     stream.write_all(b"\n").unwrap();
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).unwrap();
-    serde_json::from_str(&response).unwrap()
+    let mut reader = BufReader::new(stream);
+    let mut payload = String::new();
+    let mut expected_sequence = 0;
+    loop {
+        let mut frame = String::new();
+        reader.read_line(&mut frame).unwrap();
+        let mut response: Value = serde_json::from_str(&frame).unwrap();
+        let Some(page) = response.get_mut("diagnostic_page").map(Value::take) else {
+            return response;
+        };
+        assert_eq!(page["sequence"], expected_sequence);
+        expected_sequence += 1;
+        payload.push_str(page["payload"].as_str().unwrap());
+        if page["last"] != true {
+            continue;
+        }
+        response
+            .as_object_mut()
+            .unwrap()
+            .remove("diagnostic_page");
+        let field = if request.contains(r#""command":"history""#) {
+            "history"
+        } else {
+            "export"
+        };
+        response[field] = serde_json::from_str(&payload).unwrap();
+        return response;
+    }
 }
 
 fn wait_until_missing(path: &Path) {
@@ -8193,6 +8218,47 @@ fn seed_full_diagnostic_ring(runtime_dir: &Path) -> usize {
     encoded.len()
 }
 
+fn seed_diagnostic_larger_than_the_old_response_ceiling(
+    runtime_dir: &Path,
+) -> (usize, usize, String) {
+    let voisu_dir = runtime_dir.join("voisu");
+    let version_dir = voisu_dir.join(format!("v{PROTOCOL_VERSION}"));
+    let diagnostics = version_dir.join("diagnostics");
+    fs::create_dir_all(&diagnostics).unwrap();
+    for directory in [&voisu_dir, &version_dir, &diagnostics] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let old_response_ceiling = 4
+        * 3
+        * voisu_core::MAX_STORED_TEXT
+        * voisu_core::DEFAULT_MAX_RECORDS;
+    let record_count = voisu_core::DEFAULT_MAX_RECORDS + 1;
+    let diagnostic_bytes = old_response_ceiling / record_count + 1;
+    let now = voisu_core::unix_millis_now();
+    let records: Vec<_> = (0..record_count)
+        .map(|index| {
+            let correlation_id = format!("seed-beyond-old-ceiling-{index}");
+            let mut record = voisu_core::DiagnosticRecord::new(correlation_id, index as u64 + 1);
+            record.recorded_at_unix_ms = now - (record_count - index) as u64;
+            record.provider_failures.push(voisu_core::ProviderFailure::new(
+                voisu_core::Provider::Groq,
+                voisu_core::ProviderFailureStage::Completion,
+                "x".repeat(diagnostic_bytes),
+            ));
+            record
+        })
+        .collect();
+    let correlation_id = records.last().unwrap().correlation_id.clone();
+    let encoded = serde_json::to_vec(&records).unwrap();
+    assert!(
+        encoded.len() > old_response_ceiling,
+        "fixture must exceed the removed response ceiling"
+    );
+    fs::write(diagnostics.join("history.json"), &encoded).unwrap();
+    (encoded.len(), record_count, correlation_id)
+}
+
 #[test]
 fn a_delivered_recording_reports_its_per_stage_timings_to_the_journal() {
     // The success path used to log NOTHING, so the healthy path's latency was
@@ -8320,6 +8386,54 @@ fn a_full_diagnostic_ring_round_trips_through_cli_history_json() {
         records[voisu_core::DEFAULT_MAX_RECORDS - 1]["correlation_id"],
         "seed-0",
         "the oldest retained record must survive to the end of the frame"
+    );
+}
+
+#[test]
+fn diagnostic_paging_serves_history_and_export_beyond_the_old_response_ceiling() {
+    let runtime = TempDir::new().unwrap();
+    let (payload_bytes, record_count, correlation_id) =
+        seed_diagnostic_larger_than_the_old_response_ceiling(runtime.path());
+    let max_records = record_count.to_string();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_DIAGNOSTIC_MAX_RECORDS", &max_records)],
+    );
+
+    let history = voisu_with_env(runtime.path(), &["history", "--json"], &[]);
+    let export = voisu_with_env(runtime.path(), &["export", &correlation_id], &[]);
+
+    assert!(
+        history.status.success(),
+        "paged history must serve a {payload_bytes}-byte retained snapshot: {}",
+        stderr(&history)
+    );
+    assert!(
+        export.status.success(),
+        "paged export must serve a record beyond the old response ceiling: {}",
+        stderr(&export)
+    );
+
+    let history: Value =
+        serde_json::from_str(&stdout(&history)).expect("history remains one complete JSON value");
+    let export: Value =
+        serde_json::from_str(&stdout(&export)).expect("export remains one complete JSON value");
+    assert_eq!(history.as_array().unwrap().len(), record_count);
+    assert_eq!(history[0]["correlation_id"], correlation_id);
+    assert_eq!(export["record"]["correlation_id"], correlation_id);
+    let diagnostic_bytes = (4
+        * 3
+        * voisu_core::MAX_STORED_TEXT
+        * voisu_core::DEFAULT_MAX_RECORDS)
+        / record_count
+        + 1;
+    assert_eq!(
+        history[0]["provider_failures"][0]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .len(),
+        diagnostic_bytes,
+        "each unbounded diagnostic must arrive intact"
     );
 }
 

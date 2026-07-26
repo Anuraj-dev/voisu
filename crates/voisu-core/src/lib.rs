@@ -271,9 +271,23 @@ pub struct Response {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export: Option<DiagnosticExport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_page: Option<DiagnosticPage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_event: Option<OverlayEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level_frames: Option<Vec<LevelFrame>>,
+}
+
+/// One transport page of a serialized diagnostic history or export.
+///
+/// Pages are zero-based and contiguous. `payload` is a byte-for-byte UTF-8
+/// fragment of the command's complete JSON value; concatenating payloads
+/// through the page with `last = true` reconstructs that value.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DiagnosticPage {
+    pub sequence: u64,
+    pub last: bool,
+    pub payload: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -339,6 +353,7 @@ impl Response {
             evidence,
             history: None,
             export: None,
+            diagnostic_page: None,
             overlay_event: None,
             level_frames: None,
         }

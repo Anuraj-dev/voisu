@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -7,7 +7,7 @@ use voisu_core::{
     BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, ExportCorrelationId,
     KeyDiagnosis, KeyLocation, PROTOCOL_VERSION, Provider, ProviderAuthenticator, ProviderKeyStatus,
     ReadinessInspector, ReadinessStatus, ReplayFixturePath, Request, Response, SecretStore,
-    VersionEnvelope, DEFAULT_MAX_RECORDS, MAX_STORED_TEXT, provider_free_tier_hint, socket_path,
+    VersionEnvelope, provider_free_tier_hint, socket_path,
 };
 use voisu_app::service::{UserServiceAction, manage_user_service};
 use voisu_app::system::{
@@ -15,21 +15,6 @@ use voisu_app::system::{
 };
 use voisu_app::config::DeliveryMode;
 
-// History and export responses carry bounded local diagnostics, so the CLI
-// accepts a larger response frame than the tiny command replies. The bound is
-// DERIVED from the retention policy rather than guessed, so raising retention
-// can never silently outgrow the frame that carries it: every retained record
-// can hold two Source Transcripts plus a final Transcript, each clamped to
-// `MAX_STORED_TEXT`, and JSON structure plus escaping inflate that text. Four
-// frame bytes per byte of clamped text covers the structure and ordinary
-// escaping with room to spare, while keeping the frame bounded — the guard's
-// whole purpose. A worst-case full ring measures ~4.8 MiB against this bound.
-const MAX_STORED_TEXTS_PER_RECORD: u64 = 3;
-const RESPONSE_BYTES_PER_STORED_BYTE: u64 = 4;
-const MAX_RESPONSE_BYTES: u64 = RESPONSE_BYTES_PER_STORED_BYTE
-    * MAX_STORED_TEXTS_PER_RECORD
-    * MAX_STORED_TEXT as u64
-    * DEFAULT_MAX_RECORDS as u64;
 const IO_DEADLINE: Duration = Duration::from_secs(2);
 /// `history` and `export` read the bounded local diagnostic store rather than
 /// answering from memory: at a full ring the daemon parses the retained history
@@ -39,10 +24,11 @@ const IO_DEADLINE: Duration = Duration::from_secs(2);
 /// build — so these two commands get their own budget instead of sharing the
 /// tiny-reply one. Still bounded: a wedged daemon fails, it does not hang.
 const DIAGNOSTIC_RESPONSE_DEADLINE: Duration = Duration::from_secs(15);
-/// Frame reads are chunked at this size. A diagnostic response is megabytes, and
-/// draining it a kilobyte at a time both multiplies syscalls and leaves the
-/// daemon blocked on its own bounded write.
-const RESPONSE_READ_CHUNK_BYTES: usize = 64 * 1024;
+#[derive(Clone, Copy)]
+enum DiagnosticResponseKind {
+    History,
+    Export,
+}
 
 enum CliAction {
     Daemon(Command),
@@ -118,10 +104,15 @@ fn send_command(command: Command) -> Result<Response, ExitCode> {
     // A replay drives the same provider/validation boundaries as Stop, so it
     // shares the longer processing budget. `history` and `export` read the
     // bounded diagnostic store instead, which has its own budget.
-    let response_deadline = match command {
+    let response_deadline = match &command {
         Command::Stop | Command::Toggle | Command::Replay(_) => PROCESSING_RESPONSE_DEADLINE,
         Command::History | Command::Export(_) => DIAGNOSTIC_RESPONSE_DEADLINE,
         _ => IO_DEADLINE,
+    };
+    let diagnostic_kind = match &command {
+        Command::History => Some(DiagnosticResponseKind::History),
+        Command::Export(_) => Some(DiagnosticResponseKind::Export),
+        _ => None,
     };
     let request = Request {
         version: PROTOCOL_VERSION,
@@ -130,26 +121,13 @@ fn send_command(command: Command) -> Result<Response, ExitCode> {
     if serde_json::to_writer(&mut stream, &request).is_err() || stream.write_all(b"\n").is_err() {
         return Err(fail(1, "failed to send command to daemon"));
     }
-    let response = match read_response_frame(&mut stream, response_deadline) {
-        Ok(response) => response,
-        Err(message) => return Err(fail(1, &message)),
-    };
-    let envelope: VersionEnvelope = match serde_json::from_str(&response) {
-        Ok(envelope) => envelope,
-        Err(_) => return Err(fail(1, "daemon returned an invalid response")),
-    };
-    if envelope.version != PROTOCOL_VERSION {
-        return Err(fail(
-            5,
-            &format!(
-                "IPC protocol mismatch: daemon uses {}, CLI uses {}",
-                envelope.version, PROTOCOL_VERSION
-            ),
-        ));
-    }
-    match serde_json::from_str(&response) {
+    match read_response(
+        &mut BufReader::new(stream),
+        response_deadline,
+        diagnostic_kind,
+    ) {
         Ok(response) => Ok(response),
-        Err(_) => Err(fail(1, "daemon returned an invalid response")),
+        Err((code, message)) => Err(fail(code, &message)),
     }
 }
 
@@ -637,31 +615,31 @@ fn block_on<T>(future: BoundaryFuture<'_, T>) -> Result<T, BoundaryError> {
         .block_on(future)
 }
 
-fn read_response_frame(stream: &mut UnixStream, deadline: Duration) -> Result<String, String> {
+fn read_response_frame(
+    stream: &mut BufReader<UnixStream>,
+    deadline: Duration,
+) -> Result<String, String> {
     let started = Instant::now();
     let mut response = Vec::new();
-    let mut buffer = vec![0_u8; RESPONSE_READ_CHUNK_BYTES];
     loop {
         let remaining = deadline
             .checked_sub(started.elapsed())
             .filter(|remaining| !remaining.is_zero())
             .ok_or_else(|| "daemon response deadline elapsed".to_owned())?;
         stream
+            .get_ref()
             .set_read_timeout(Some(remaining))
             .map_err(|_| "failed to configure daemon connection deadline".to_owned())?;
-        match stream.read(&mut buffer) {
-            Ok(0) => return Err("daemon response frame is incomplete".to_owned()),
-            Ok(read) => {
-                response.extend_from_slice(&buffer[..read]);
-                if response.len() as u64 > MAX_RESPONSE_BYTES {
-                    return Err("daemon response frame is too large".to_owned());
-                }
-                if response.ends_with(b"\n") {
+        match stream.fill_buf() {
+            Ok([]) => return Err("daemon response frame is incomplete".to_owned()),
+            Ok(available) => {
+                let frame_end = available.iter().position(|byte| *byte == b'\n');
+                let consumed = frame_end.map_or(available.len(), |position| position + 1);
+                response.extend_from_slice(&available[..consumed]);
+                stream.consume(consumed);
+                if frame_end.is_some() {
                     return String::from_utf8(response)
                         .map_err(|_| "daemon returned an invalid response".to_owned());
-                }
-                if response.contains(&b'\n') {
-                    return Err("daemon response frame is malformed".to_owned());
                 }
             }
             Err(error)
@@ -675,6 +653,66 @@ fn read_response_frame(stream: &mut UnixStream, deadline: Duration) -> Result<St
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return Err("failed to read daemon response".to_owned()),
         }
+    }
+}
+
+fn read_response(
+    stream: &mut BufReader<UnixStream>,
+    deadline: Duration,
+    diagnostic_kind: Option<DiagnosticResponseKind>,
+) -> Result<Response, (u8, String)> {
+    let started = Instant::now();
+    let mut payload = String::new();
+    let mut expected_sequence = 0;
+    loop {
+        let remaining = deadline
+            .checked_sub(started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| (1, "daemon response deadline elapsed".to_owned()))?;
+        let frame = read_response_frame(stream, remaining).map_err(|message| (1, message))?;
+        let envelope: VersionEnvelope = serde_json::from_str(&frame)
+            .map_err(|_| (1, "daemon returned an invalid response".to_owned()))?;
+        if envelope.version != PROTOCOL_VERSION {
+            return Err((
+                5,
+                format!(
+                    "IPC protocol mismatch: daemon uses {}, CLI uses {}",
+                    envelope.version, PROTOCOL_VERSION
+                ),
+            ));
+        }
+        let mut response: Response = serde_json::from_str(&frame)
+            .map_err(|_| (1, "daemon returned an invalid response".to_owned()))?;
+        let Some(page) = response.diagnostic_page.take() else {
+            if expected_sequence == 0 {
+                return Ok(response);
+            }
+            return Err((1, "daemon returned an incomplete diagnostic response".to_owned()));
+        };
+        let Some(kind) = diagnostic_kind else {
+            return Err((1, "daemon returned an unexpected diagnostic page".to_owned()));
+        };
+        if page.sequence != expected_sequence {
+            return Err((1, "daemon returned diagnostic pages out of order".to_owned()));
+        }
+        expected_sequence += 1;
+        payload.push_str(&page.payload);
+        if !page.last {
+            continue;
+        }
+        match kind {
+            DiagnosticResponseKind::History => {
+                response.history = Some(serde_json::from_str(&payload).map_err(|_| {
+                    (1, "daemon returned an invalid diagnostic history".to_owned())
+                })?);
+            }
+            DiagnosticResponseKind::Export => {
+                response.export = Some(serde_json::from_str(&payload).map_err(|_| {
+                    (1, "daemon returned an invalid diagnostic export".to_owned())
+                })?);
+            }
+        }
+        return Ok(response);
     }
 }
 
