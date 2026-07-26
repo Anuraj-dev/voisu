@@ -6044,6 +6044,51 @@ fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
 }
 
 #[test]
+fn deadline_at_the_buffer_ceiling_delivers_retained_audio_as_truncated() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
+            ("VOISU_TEST_DEADLINE_AFTER_CHUNKS", "2"),
+            ("VOISU_TEST_BUFFER_CAP_AFTER_CHUNKS", "2"),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Keep the deadline-limited dictation.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "Keep the deadline-limited dictation.",
+            ),
+        ],
+    );
+
+    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    wait_for_status(runtime.path(), "idle\n");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    assert_eq!(
+        record["final_transcript"],
+        "Keep the deadline-limited dictation.",
+        "{history}"
+    );
+    assert_eq!(record["delivery_count"], 1, "{history}");
+    assert_eq!(
+        record["truncated_by"], "recording_deadline",
+        "{history}"
+    );
+
+    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(observed["overlay_event"]["outcome"], "delivered", "{observed}");
+    assert_eq!(
+        observed["overlay_event"]["message"],
+        "Delivered, but the Recording was truncated; check the end",
+        "{observed}"
+    );
+}
+
+#[test]
 fn synthetic_pcm_past_the_buffer_cap_delivers_a_non_empty_transcript() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start_with_env(

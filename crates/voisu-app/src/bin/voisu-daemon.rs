@@ -412,6 +412,7 @@ struct PumpOutput {
     capture: Box<dyn ActiveCapture>,
     providers: ProviderCoordinator,
     stream_error: Option<BoundaryError>,
+    capture_limit: Option<CaptureLimit>,
 }
 
 enum ActorState {
@@ -1618,6 +1619,7 @@ async fn capture_pump(
     actor: mpsc::Sender<ActorMessage>,
 ) -> PumpOutput {
     let mut stream_error = None;
+    let mut capture_limit = None;
     loop {
         tokio::select! {
             biased;
@@ -1649,7 +1651,11 @@ async fn capture_pump(
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    stream_error = Some(error);
+                    if error.kind() == BoundaryKind::RecordingDeadline {
+                        capture_limit = Some(CaptureLimit::RecordingDeadline);
+                    } else {
+                        stream_error = Some(error);
+                    }
                     break;
                 }
             },
@@ -1660,6 +1666,7 @@ async fn capture_pump(
         capture,
         providers,
         stream_error,
+        capture_limit,
     }
 }
 
@@ -1690,6 +1697,7 @@ async fn process_recording(
         mut capture,
         providers,
         stream_error,
+        capture_limit,
     } = match pump {
         Ok(output) => output,
         Err(join_error) => {
@@ -1746,6 +1754,10 @@ async fn process_recording(
                 evidence.stages.push(LifecycleStage::CaptureAborted);
                 return Err(abort_recording_work(capture, providers, error).await);
             }
+        };
+        let audio = match capture_limit {
+            Some(limit) => audio.with_truncation(limit),
+            None => audio,
         };
         evidence.truncated_by = audio.truncated_by();
         evidence.capture_finalized_ms = Some(elapsed_millis(started_at));

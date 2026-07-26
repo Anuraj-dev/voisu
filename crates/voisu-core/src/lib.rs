@@ -510,6 +510,11 @@ impl CapturedAudio {
         }
     }
 
+    pub fn with_truncation(mut self, limit: CaptureLimit) -> Self {
+        self.truncated_by = Some(limit);
+        self
+    }
+
     pub fn empty() -> Self {
         Self::new(Vec::new())
     }
