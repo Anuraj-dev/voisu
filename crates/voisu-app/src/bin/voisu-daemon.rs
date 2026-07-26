@@ -18,9 +18,10 @@ use voisu_app::audio_level::{LevelRegistry, LevelRing};
 use voisu_app::focus::SharedFocusProbe;
 use voisu_app::journal::recording_journal_lines;
 use voisu_app::system::{
-    CAPTURE_FINALIZE_DEADLINE, DeepgramProvider, DesktopNotifier, FedoraShortcutPortal,
-    GroqProvider, GuardedDelivery, MergeResultValidator, PROCESSING_RESPONSE_DEADLINE,
-    PROVIDER_COMPLETION_DEADLINE, PipeWireCapture, PortalClipboardDelivery, ProviderReaper,
+    CAPTURE_FINALIZE_DEADLINE, DIAGNOSTIC_RESPONSE_DEADLINE, DeepgramProvider,
+    DesktopNotifier, FedoraShortcutPortal, GroqProvider, GuardedDelivery, MergeResultValidator,
+    PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture,
+    PortalClipboardDelivery, ProviderReaper,
     RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
 use voisu_app::config::DeliveryMode;
@@ -2644,18 +2645,22 @@ async fn serve(
     }
     let envelope: VersionEnvelope = serde_json::from_str(&request)
         .map_err(|error| format!("cannot decode protocol envelope: {error}"))?;
-    let response = if envelope.version != PROTOCOL_VERSION {
-        Response::rejected(
-            None,
-            format!(
-                "unsupported protocol version {}; expected {PROTOCOL_VERSION}",
-                envelope.version
+    let (response, write_deadline) = if envelope.version != PROTOCOL_VERSION {
+        (
+            Response::rejected(
+                None,
+                format!(
+                    "unsupported protocol version {}; expected {PROTOCOL_VERSION}",
+                    envelope.version
+                ),
             ),
+            IO_DEADLINE,
         )
     } else {
         let request: Request = serde_json::from_str(&request)
             .map_err(|error| format!("cannot decode CLI command: {error}"))?;
-        match request.command {
+        let write_deadline = command_write_deadline(&request.command);
+        let response = match request.command {
             Command::Level { after_seq } => Response::with_level_frames(levels.after(after_seq)),
             command => {
                 let (reply_tx, reply_rx) = oneshot::channel();
@@ -2667,15 +2672,18 @@ async fn serve(
                     .await
                     .map_err(|_| "lifecycle actor dropped its response".to_owned())?
             }
-        }
+        };
+        (response, write_deadline)
     };
-    write_response(&mut writer, response).await
+    write_response(&mut writer, response, write_deadline).await
 }
 
 async fn write_response(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     mut response: Response,
+    write_deadline: Duration,
 ) -> Result<(), String> {
+    let write_started = Instant::now();
     let diagnostic = if let Some(history) = response.history.take() {
         Some(
             serde_json::to_string(&history)
@@ -2691,7 +2699,7 @@ async fn write_response(
     };
 
     let Some(payload) = diagnostic else {
-        return write_response_frame(writer, &response).await;
+        return write_response_frame(writer, &response, write_started, write_deadline).await;
     };
 
     let mut start = 0;
@@ -2706,21 +2714,34 @@ async fn write_response(
             last: end == payload.len(),
             payload: payload[start..end].to_owned(),
         });
-        write_response_frame(writer, &response).await?;
+        write_response_frame(writer, &response, write_started, write_deadline).await?;
         start = end;
         sequence += 1;
     }
     Ok(())
 }
 
+fn command_write_deadline(command: &Command) -> Duration {
+    match command {
+        Command::History | Command::Export(_) => DIAGNOSTIC_RESPONSE_DEADLINE,
+        _ => IO_DEADLINE,
+    }
+}
+
 async fn write_response_frame(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     response: &Response,
+    write_started: Instant,
+    write_deadline: Duration,
 ) -> Result<(), String> {
     let mut encoded = serde_json::to_vec(response)
         .map_err(|error| format!("cannot encode daemon response: {error}"))?;
     encoded.push(b'\n');
-    timeout(IO_DEADLINE, writer.write_all(&encoded))
+    let remaining = write_deadline
+        .checked_sub(write_started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "CLI write deadline elapsed".to_owned())?;
+    timeout(remaining, writer.write_all(&encoded))
         .await
         .map_err(|_| "CLI write deadline elapsed".to_owned())?
         .map_err(|error| format!("cannot write daemon response: {error}"))
@@ -3257,6 +3278,22 @@ impl DeliveryAdapter for ControlledDelivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_commands_use_the_diagnostic_write_deadline() {
+        assert_eq!(
+            command_write_deadline(&Command::History),
+            DIAGNOSTIC_RESPONSE_DEADLINE
+        );
+        assert_eq!(
+            command_write_deadline(&Command::Export(
+                voisu_core::ExportCorrelationId::new("rec-1"),
+            )),
+            DIAGNOSTIC_RESPONSE_DEADLINE
+        );
+        assert_eq!(command_write_deadline(&Command::Status), IO_DEADLINE);
+        assert_ne!(DIAGNOSTIC_RESPONSE_DEADLINE, IO_DEADLINE);
+    }
 
     #[tokio::test]
     async fn processing_panic_records_only_the_configured_providers() {

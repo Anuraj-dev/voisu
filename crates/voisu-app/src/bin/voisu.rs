@@ -11,19 +11,12 @@ use voisu_core::{
 };
 use voisu_app::service::{UserServiceAction, manage_user_service};
 use voisu_app::system::{
-    FedoraReadiness, PROCESSING_RESPONSE_DEADLINE, ProviderHttpClient, SecretToolStore,
+    DIAGNOSTIC_RESPONSE_DEADLINE, FedoraReadiness, PROCESSING_RESPONSE_DEADLINE,
+    ProviderHttpClient, SecretToolStore,
 };
 use voisu_app::config::DeliveryMode;
 
 const IO_DEADLINE: Duration = Duration::from_secs(2);
-/// `history` and `export` read the bounded local diagnostic store rather than
-/// answering from memory: at a full ring the daemon parses the retained history
-/// off disk, prunes it, rewrites it, and only then transfers a multi-megabyte
-/// frame. That legitimately takes far longer than a status ping's milliseconds
-/// — a worst-case full ring measures around two seconds in an unoptimized
-/// build — so these two commands get their own budget instead of sharing the
-/// tiny-reply one. Still bounded: a wedged daemon fails, it does not hang.
-const DIAGNOSTIC_RESPONSE_DEADLINE: Duration = Duration::from_secs(15);
 #[derive(Clone, Copy)]
 enum DiagnosticResponseKind {
     History,

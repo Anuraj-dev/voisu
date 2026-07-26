@@ -51,6 +51,8 @@ pub const PROCESSING_RESPONSE_DEADLINE: Duration = Duration::from_secs(
         + RECONCILIATION_DEADLINE.as_secs() * 2
         + 1,
 );
+/// End-to-end budget shared by both sides of a paged history/export transfer.
+pub const DIAGNOSTIC_RESPONSE_DEADLINE: Duration = Duration::from_secs(15);
 const PROCESS_POLL: Duration = Duration::from_millis(10);
 const MAX_DAEMON_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_RETAINED_STDERR_BYTES: usize = 4 * 1024;
