@@ -208,7 +208,7 @@ command=${2:-}
 # applied to the daemon's pid file -- otherwise restarting the Overlay would
 # restart the daemon.
 case "$command" in
-  start|restart|stop)
+  start|restart|try-restart|stop)
     if test -n "${3:-}" && test "${3:-}" != "voisu.service"; then exit 0; fi
     ;;
 esac
@@ -1060,10 +1060,9 @@ fn overlay_disable_failure_does_not_fail_daemon_service_uninstall() {
 }
 
 #[test]
-fn service_restart_restarts_the_optional_overlay_service_too() {
-    // After an update the packaged overlay binary is replaced on disk, but the
-    // old process keeps running until its unit is restarted. `service restart`
-    // restarted only voisu.service, so the user was left on a stale Overlay.
+fn service_restart_try_restarts_only_an_active_optional_overlay() {
+    // `try-restart` refreshes an active Overlay after an update without starting
+    // one the user deliberately stopped or disabled.
     let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
     assert!(fixture.run(&["service", "install"]).status.success());
     fixture.use_real_managed_daemon();
@@ -1085,7 +1084,14 @@ fn service_restart_restarts_the_optional_overlay_service_too() {
     );
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
     assert!(calls.contains("--user restart voisu.service"), "{calls}");
-    assert!(calls.contains("--user restart voisu-overlay.service"), "{calls}");
+    assert!(
+        calls.contains("--user try-restart voisu-overlay.service"),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("--user restart voisu-overlay.service"),
+        "a stopped Overlay must not be started by daemon restart: {calls}"
+    );
 }
 
 #[test]
@@ -1132,7 +1138,10 @@ fn service_restart_succeeds_when_the_optional_overlay_unit_is_invalid() {
     );
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
     assert!(calls.contains("--user restart voisu.service"), "{calls}");
-    assert!(!calls.contains("--user restart voisu-overlay.service"), "{calls}");
+    assert!(
+        !calls.contains("--user try-restart voisu-overlay.service"),
+        "{calls}"
+    );
 }
 
 #[test]
@@ -1155,7 +1164,10 @@ fn overlay_restart_failure_does_not_fail_the_daemon_service_restart() {
     );
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
     assert!(calls.contains("--user restart voisu.service"), "{calls}");
-    assert!(calls.contains("--user restart voisu-overlay.service"), "{calls}");
+    assert!(
+        calls.contains("--user try-restart voisu-overlay.service"),
+        "{calls}"
+    );
 }
 
 #[test]
