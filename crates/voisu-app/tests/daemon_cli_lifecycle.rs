@@ -2881,6 +2881,10 @@ fn wait_for_portal_capture(commands: &Path) {
 }
 
 fn ipc_request(runtime_dir: &Path, request: &str) -> Value {
+    ipc_request_with_page_count(runtime_dir, request).0
+}
+
+fn ipc_request_with_page_count(runtime_dir: &Path, request: &str) -> (Value, usize) {
     let mut stream = UnixStream::connect(socket_path(runtime_dir)).unwrap();
     stream.write_all(request.as_bytes()).unwrap();
     stream.write_all(b"\n").unwrap();
@@ -2892,7 +2896,7 @@ fn ipc_request(runtime_dir: &Path, request: &str) -> Value {
         reader.read_line(&mut frame).unwrap();
         let mut response: Value = serde_json::from_str(&frame).unwrap();
         let Some(page) = response.get_mut("diagnostic_page").map(Value::take) else {
-            return response;
+            return (response, expected_sequence);
         };
         assert_eq!(page["sequence"], expected_sequence);
         expected_sequence += 1;
@@ -2910,7 +2914,7 @@ fn ipc_request(runtime_dir: &Path, request: &str) -> Value {
             "export"
         };
         response[field] = serde_json::from_str(&payload).unwrap();
-        return response;
+        return (response, expected_sequence);
     }
 }
 
@@ -8169,12 +8173,10 @@ fn cli_history_renders_the_complete_bounded_records() {
     assert_eq!(record["delivery_count"], 1);
 }
 
-/// Seeds the daemon's diagnostic store with a COMPLETELY full ring at the
-/// structural worst case: `DEFAULT_MAX_RECORDS` records, each carrying two
-/// Source Transcripts and a final Transcript at the `MAX_STORED_TEXT` clamp.
-/// That is the largest history the retention policy can ever hold, and so the
-/// largest `history` response the IPC can ever be asked to carry. Returns the
-/// on-disk payload size so a test can report what it actually exercised.
+/// Seeds the daemon's diagnostic store to the default count bound, with two
+/// Source Transcripts and a final Transcript at the `MAX_STORED_TEXT` clamp in
+/// every record. Returns the on-disk payload size so the test reports the exact
+/// default-policy fixture it exercised.
 fn seed_full_diagnostic_ring(runtime_dir: &Path) -> usize {
     let voisu_dir = runtime_dir.join("voisu");
     let version_dir = voisu_dir.join(format!("v{PROTOCOL_VERSION}"));
@@ -8295,14 +8297,17 @@ fn a_delivered_recording_reports_its_per_stage_timings_to_the_journal() {
         "release_to_text_ms=",
     ] {
         assert!(line.contains(key), "the journal line must carry {key}: {line}");
+        assert!(
+            !line.contains(&format!("{key}-")),
+            "the delivered path must log the measurement, not an absent marker: {line}"
+        );
     }
 }
 
 #[test]
 fn a_failed_recording_keeps_its_journal_message_and_gains_the_timings() {
-    // The failure line's historical `Recording <id>: <diagnostic>` prefix is
-    // load-bearing: a fourteen-day journal corpus parses it. It must survive
-    // byte-for-byte while gaining the trailing timings.
+    // The historical `Recording <id>: <diagnostic>` line is load-bearing for
+    // existing journal parsers; timings must be emitted beside it, not inside it.
     let runtime = TempDir::new().unwrap();
     let daemon = Daemon::start_with_env(
         runtime.path(),
@@ -8340,11 +8345,9 @@ fn a_failed_recording_keeps_its_journal_message_and_gains_the_timings() {
 
 #[test]
 fn a_full_diagnostic_ring_round_trips_through_cli_history_json() {
-    // HARD GATE on the retention raise: `voisu history --json` reads the ring
-    // over a single IPC response frame, so a larger ring must not break the very
-    // command that reads it. This seeds the structural worst case the retention
-    // policy permits — every record's stored text at the clamp — and requires
-    // the CLI to print it back INTACT, not truncated and not rejected.
+    // HARD GATE on the default retention raise: `voisu history --json` must
+    // reconstruct the complete default-bound ring. Every clamped stored-text
+    // field must reach the CLI intact, not truncated or rejected.
     let runtime = TempDir::new().unwrap();
     let payload_bytes = seed_full_diagnostic_ring(runtime.path());
     let _daemon = Daemon::start(runtime.path());
@@ -8394,6 +8397,16 @@ fn diagnostic_paging_serves_history_and_export_beyond_the_old_response_ceiling()
     let _daemon = Daemon::start_with_env(
         runtime.path(),
         &[("VOISU_DIAGNOSTIC_MAX_RECORDS", &max_records)],
+    );
+
+    let (protocol_history, page_count) = ipc_request_with_page_count(
+        runtime.path(),
+        r#"{"version":1,"command":"history"}"#,
+    );
+    assert!(page_count > 1, "the oversized snapshot must use multiple pages");
+    assert_eq!(
+        protocol_history["history"].as_array().unwrap().len(),
+        record_count
     );
 
     let history = voisu_with_env(runtime.path(), &["history", "--json"], &[]);
@@ -8477,8 +8490,8 @@ fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
     assert!(
         journal
             .lines()
-            .any(|line| line.starts_with("Recording 1: ") && !line.contains("outcome=")),
-        "the startup failure keeps a separate human-readable line: {journal}"
+            .any(|line| line == "Recording 1: controlled-provider-start-detail"),
+        "the startup failure keeps its exact human-readable diagnostic line: {journal}"
     );
 }
 
