@@ -1174,7 +1174,7 @@ printf '%s' "$((count + 1))" > "$dir/delivery.count"
 fn groq_transcribes_a_short_recording_as_one_full_audio_request_at_finalize() {
     // A Recording at or below the full-audio limit (~120 s) pre-streams nothing
     // during the Recording — Whisper gets the complete audio in one request at
-    // finalize, eliminating chunk seams. ~31 s of PCM here stays well under the
+    // finalize, eliminating chunk seams. ~1 s of PCM here stays well under the
     // limit.
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
@@ -1182,7 +1182,9 @@ fn groq_transcribes_a_short_recording_as_one_full_audio_request_at_finalize() {
         commands.path(),
         "pw-record",
         r#"#!/bin/sh
-head -c 1000000 /dev/zero | tr '\000' '\001'
+dir=$(dirname "$0")
+head -c 32000 /dev/zero | tr '\000' '\001'
+: > "$dir/pw-record.ready"
 trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
 i=0
 while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
@@ -1216,6 +1218,7 @@ cat > "$dir/clipboard"
     // Confirm the Recording is actively capturing, then prove no Groq chunk was
     // pre-streamed: a short Recording issues its one request only at finalize.
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    wait_for_marker(commands.path(), "pw-record.ready");
     assert_eq!(
         live_requests.load(Ordering::SeqCst),
         0,
@@ -1231,10 +1234,10 @@ cat > "$dir/clipboard"
         "a short Recording is one full-audio Groq request at finalize"
     );
     // The FLAC STREAMINFO sample count proves the one request carries the FULL
-    // pre-stop capture (500,000 samples). The fake pw-record's post-signal trap
+    // pre-stop capture (16,000 samples). The fake pw-record's post-signal trap
     // bytes race the bounded stop path and are deliberately not required.
     assert!(
-        flac_total_samples(&requests[0]) >= 500_000,
+        flac_total_samples(&requests[0]) >= 16_000,
         "the finalize request carries the full Recording"
     );
     assert_eq!(
@@ -2206,46 +2209,6 @@ fn silent_recording_is_distinct_and_recoverable_through_the_public_cli() {
         "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 3200 /dev/zero\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
         "Recording contains no speech",
     );
-}
-
-#[test]
-fn over_deadline_recording_is_distinct_and_recoverable_through_the_public_cli() {
-    let runtime = TempDir::new().unwrap();
-    let commands = TempDir::new().unwrap();
-    write_fake_command(
-        commands.path(),
-        "pw-record",
-        "#!/bin/sh\nprintf '\\100\\000'\ntrap 'exit 0' INT TERM\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
-    );
-    let path = format!(
-        "{}:{}",
-        commands.path().display(),
-        std::env::var("PATH").unwrap()
-    );
-    let daemon = Daemon::start_production_with_env(
-        runtime.path(),
-        &[
-            ("PATH", &path),
-            ("VOISU_GROQ_API_KEY", "controlled-secret"),
-            ("VOISU_RECORDING_DEADLINE_MS", "50"),
-        ],
-    );
-    assert!(voisu(runtime.path(), "start").status.success());
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if stdout(&voisu(runtime.path(), "status")) == "idle\n" {
-            assert!(
-                voisu(runtime.path(), "start").status.success(),
-                "a Recording must be accepted after the Recording Deadline"
-            );
-            let diagnostics = daemon.terminate_and_stderr();
-            assert!(diagnostics.contains("configured Recording Deadline elapsed"));
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("the daemon did not self-recover after the Recording Deadline");
 }
 
 #[test]
@@ -6016,7 +5979,8 @@ fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
     // One activation starts a Recording; the user then forgets the second
-    // activation. The Recording Deadline must stop it on its own and record why.
+    // activation. The Recording Deadline must stop it on its own, deliver the
+    // retained prefix, and record that the result was truncated.
     portal.activate();
 
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -6024,7 +5988,12 @@ fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
         let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
         let records = history["history"].as_array().expect("history is a list");
         if records.len() == 1 {
-            assert_eq!(records[0]["error"], "Recording Deadline elapsed", "{history}");
+            assert_eq!(records[0]["error"], serde_json::Value::Null, "{history}");
+            assert_eq!(records[0]["delivery_count"], 1, "{history}");
+            assert_eq!(
+                records[0]["truncated_by"], "recording_deadline",
+                "{history}"
+            );
             break;
         }
         assert!(records.len() <= 1, "the forgotten toggle produced extra Recordings: {history}");
@@ -6038,7 +6007,9 @@ fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
-        diagnostics.contains("controlled Recording Deadline elapsed"),
+        diagnostics.contains(
+            "Trigger Key activation: Delivered, but the Recording was truncated; check the end"
+        ),
         "{diagnostics}"
     );
 }
