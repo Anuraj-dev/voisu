@@ -2388,12 +2388,14 @@ fn read_capture_stream(
                     }
                 }
                 let mut state = reader_state.lock().unwrap();
+                let retained = read.min(pcm_byte_cap.saturating_sub(state.received_bytes));
                 state.received_bytes = state.received_bytes.saturating_add(read);
-                if state.received_bytes <= pcm_byte_cap {
-                    for chunk in assembler.push(&buffer[..read]) {
+                if retained > 0 {
+                    for chunk in assembler.push(&buffer[..retained]) {
                         state.chunks.push_back(AudioChunk(chunk));
                     }
-                } else {
+                }
+                if retained < read {
                     state.buffer_cap_reached = true;
                 }
             }
@@ -6455,12 +6457,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipewire_buffer_cap_drains_emitted_chunks_into_the_returned_pcm() {
+    async fn pipewire_buffer_cap_retains_the_exact_sample_aligned_prefix() {
         let mut emitted_pcm = Vec::new();
         for sample in 0_i16..3_520 {
             emitted_pcm.extend_from_slice(&(sample.saturating_add(64)).to_le_bytes());
         }
-        let retained_pcm = emitted_pcm[..PCM_CHUNK_BYTES * 2].to_vec();
+        let pcm_byte_cap = resolve_recording_maximum(Some("199".to_owned())).pcm_byte_cap;
+        assert_eq!(pcm_byte_cap, 6_368);
+        let retained_pcm = emitted_pcm[..pcm_byte_cap].to_vec();
         let state = Arc::new(Mutex::new(CaptureReaderState {
             chunks: VecDeque::new(),
             received_bytes: 0,
@@ -6473,7 +6477,7 @@ mod tests {
             std::io::Cursor::new(emitted_pcm),
             Arc::clone(&state),
             None,
-            retained_pcm.len(),
+            pcm_byte_cap,
         );
         assert_eq!(
             state.lock().unwrap().chunks.len(),
