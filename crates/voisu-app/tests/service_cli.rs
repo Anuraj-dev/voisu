@@ -1078,8 +1078,8 @@ fn service_restart_try_restarts_only_an_active_optional_overlay() {
         stdout(&restarted)
     );
     assert!(
-        stdout(&restarted).contains("optional Overlay service restarted"),
-        "restart must report that the Overlay was included: {}",
+        stdout(&restarted).contains("optional Overlay service try-restart completed"),
+        "restart must report the non-starting Overlay action accurately: {}",
         stdout(&restarted)
     );
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();

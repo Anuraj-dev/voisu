@@ -31,7 +31,9 @@ pub use diagnostics::{
     EXPORT_ENV_ALLOWLIST, MAX_STORED_TEXT, REDACTED,
 };
 
-pub const PROTOCOL_VERSION: u32 = 1;
+// Version 2 adds paged diagnostic responses. A version-1 client would otherwise
+// accept only the first page as a successful but empty history/export response.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 pub fn runtime_dir() -> Result<PathBuf, String> {
     let path = PathBuf::from(

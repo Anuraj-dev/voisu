@@ -149,7 +149,7 @@ fn manage_optional_overlay(action: OptionalOverlayAction) -> Option<String> {
                 &["try-restart", OVERLAY_UNIT_NAME],
                 "optional Overlay service was not restarted",
             )],
-            "optional Overlay service restarted",
+            "optional Overlay service try-restart completed",
         ),
         OptionalOverlayAction::Disable => (
             &[(

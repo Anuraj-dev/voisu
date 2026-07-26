@@ -25,7 +25,7 @@ use voisu_app::system::{
     RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
 
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = voisu_core::PROTOCOL_VERSION;
 
 fn flac_total_samples(request: &[u8]) -> u64 {
     let flac = request
@@ -166,15 +166,18 @@ impl Daemon {
         // still caught promptly by the try_wait() branch below, so the wide
         // ceiling only ever costs time on a genuinely slow-but-healthy start.
         let deadline = Instant::now() + Duration::from_secs(20);
+        let mut last_status_error = String::new();
         while Instant::now() < deadline {
-            if socket_path(runtime_dir).exists()
-                && voisu(runtime_dir, "status").status.success()
-            {
-                return Self {
-                    child,
-                    _provider_stub: None,
-                    _config_dir: config_dir,
-                };
+            if socket_path(runtime_dir).exists() {
+                let status = voisu(runtime_dir, "status");
+                if status.status.success() {
+                    return Self {
+                        child,
+                        _provider_stub: None,
+                        _config_dir: config_dir,
+                    };
+                }
+                last_status_error = stderr(&status);
             }
             if let Some(status) = child.try_wait().expect("daemon status should be readable") {
                 let mut diagnostics = String::new();
@@ -185,7 +188,7 @@ impl Daemon {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        panic!("daemon did not bind its socket");
+        panic!("daemon did not become reachable: {last_status_error}");
     }
 
     fn start_production_with_env(runtime_dir: &Path, environment: &[(&str, &str)]) -> Self {
@@ -1087,7 +1090,7 @@ cat > "$dir/clipboard"
 
     assert!(voisu(runtime.path(), "start").status.success());
     wait_for_marker(commands.path(), "pw-record.ready");
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1);
     assert_eq!(
@@ -1169,7 +1172,7 @@ printf '%s' "$((count + 1))" > "$dir/delivery.count"
             fs::remove_file(commands.path().join("pw-record.ready")).ok();
             assert!(voisu(runtime.path(), "start").status.success(), "{failure}");
             wait_for_marker(commands.path(), "pw-record.ready");
-            let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+            let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
             assert_eq!(stopped["ok"], true, "{failure}: {stopped}");
             assert_eq!(stopped["evidence"]["delivery_count"], 1, "{failure}: {stopped}");
             assert_eq!(
@@ -1997,7 +2000,7 @@ fn live_fedora_full_workflow_recovers_the_next_recording_after_daemon_interrupti
         assert!(run(&["start"]).status.success());
         eprintln!("Speak now; the live recovery Recording lasts three seconds");
         thread::sleep(Duration::from_secs(3));
-        let stopped = ipc_request(&runtime, r#"{"version":1,"command":"stop"}"#);
+        let stopped = ipc_request(&runtime, r#"{"version":2,"command":"stop"}"#);
         assert_eq!(stopped["ok"], true, "{stopped}");
         assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
         assert_eq!(
@@ -2336,7 +2339,7 @@ fn capture_pump_panic_fails_the_recording_and_the_next_recording_succeeds() {
     assert_eq!(failed.status.code(), Some(4));
     assert_eq!(stderr(&failed), "Recording capture failed\n");
 
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let failures = history["history"][0]["provider_failures"]
         .as_array()
         .expect("pump panic must account for both providers");
@@ -2365,7 +2368,7 @@ fn processing_task_panic_records_aborted_unknown_outcomes_and_rebuilds_adapters(
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let record = &history["history"][0];
     assert!(
         !record["stages"]
@@ -2886,6 +2889,9 @@ fn ipc_request(runtime_dir: &Path, request: &str) -> Value {
 
 fn ipc_request_with_page_count(runtime_dir: &Path, request: &str) -> (Value, usize) {
     let mut stream = UnixStream::connect(socket_path(runtime_dir)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
     stream.write_all(request.as_bytes()).unwrap();
     stream.write_all(b"\n").unwrap();
     let mut reader = BufReader::new(stream);
@@ -4228,7 +4234,7 @@ fn status_distinguishes_daemon_unavailable_from_idle() {
     assert_eq!(stdout(&idle), "idle\n");
 }
 
-const OVERLAY_STATUS: &str = r#"{"version":1,"command":"overlaystatus"}"#;
+const OVERLAY_STATUS: &str = r#"{"version":2,"command":"overlaystatus"}"#;
 
 #[test]
 fn overlay_status_carries_the_delivered_event_while_lifecycle_responses_do_not() {
@@ -4246,7 +4252,7 @@ fn overlay_status_carries_the_delivered_event_while_lifecycle_responses_do_not()
 
     // The lifecycle Stop response must NOT carry the observer payload; the
     // terminal outcome reaches the Overlay only through OverlayStatus.
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert!(
         stopped.get("overlay_event").is_none(),
@@ -4270,7 +4276,7 @@ fn overlay_status_reports_a_startup_failure_without_touching_lifecycle_responses
     let _daemon =
         Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_PROVIDER_START_FAILURE", "1")]);
 
-    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    let started = ipc_request(runtime.path(), r#"{"version":2,"command":"start"}"#);
     assert_eq!(started["ok"], false, "{started}");
     assert!(
         started.get("overlay_event").is_none(),
@@ -4304,7 +4310,7 @@ fn overlay_status_classifies_a_guardrail_quality_failure() {
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], false, "{stopped}");
     assert_eq!(stopped["message"], "Transcript failed quality validation");
     assert!(stopped.get("overlay_event").is_none(), "{stopped}");
@@ -4320,7 +4326,7 @@ fn overlay_status_classifies_a_non_guardrail_capture_failure() {
         Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_CAPTURE_FINISH_FAILURE", "1")]);
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], false, "{stopped}");
     assert_eq!(stopped["message"], "Recording capture failed");
     assert!(stopped.get("overlay_event").is_none(), "{stopped}");
@@ -4352,7 +4358,7 @@ fn saturating_observers_stuck_mid_frame_never_perturb_recording_delivery_or_the_
     for _ in 0..(MAX_DAEMON_CONNECTIONS - 2) {
         let mut trickle = UnixStream::connect(&path).unwrap();
         // A valid prefix of an OverlayStatus request, deliberately unterminated.
-        trickle.write_all(br#"{"version":1,"command":"overlay"#).unwrap();
+        trickle.write_all(br#"{"version":2,"command":"overlay"#).unwrap();
         trickle.flush().unwrap();
         stuck.push(trickle);
     }
@@ -4365,7 +4371,7 @@ fn saturating_observers_stuck_mid_frame_never_perturb_recording_delivery_or_the_
     assert!(responsive.elapsed() < Duration::from_secs(1), "status stalled under saturation");
 
     // Delivery completes exactly once despite the stuck observers.
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
 
@@ -4374,7 +4380,7 @@ fn saturating_observers_stuck_mid_frame_never_perturb_recording_delivery_or_the_
 
     // The next Recording is fully usable while the observers are still stuck.
     assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
-    let next = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let next = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(next["ok"], true, "{next}");
     assert_eq!(next["evidence"]["delivery_count"], 1, "{next}");
 
@@ -4392,7 +4398,7 @@ fn an_unknown_observer_command_is_rejected_without_disturbing_the_daemon() {
 
     let mut stream = UnixStream::connect(&path).unwrap();
     stream
-        .write_all(br#"{"version":1,"command":"observerpush"}"#)
+        .write_all(br#"{"version":2,"command":"observerpush"}"#)
         .unwrap();
     stream.write_all(b"\n").unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -4413,7 +4419,7 @@ fn level_poll_filters_by_cursor_over_deterministic_paused_frames() {
 
     let idle = ipc_request(
         runtime.path(),
-        r#"{"version":1,"command":{"level":{"after_seq":0}}}"#,
+        r#"{"version":2,"command":{"level":{"after_seq":0}}}"#,
     );
     assert_eq!(idle["version"], 1, "{idle}");
     assert_eq!(idle["ok"], true, "{idle}");
@@ -4423,7 +4429,7 @@ fn level_poll_filters_by_cursor_over_deterministic_paused_frames() {
     assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
     let first = ipc_request(
         runtime.path(),
-        r#"{"version":1,"command":{"level":{"after_seq":0}}}"#,
+        r#"{"version":2,"command":{"level":{"after_seq":0}}}"#,
     );
     let frames = first["level_frames"].as_array().unwrap();
     assert_eq!(frames.len(), 3, "{first}");
@@ -4445,7 +4451,7 @@ fn level_poll_filters_by_cursor_over_deterministic_paused_frames() {
     // same request returns the same frames.
     let repeated = ipc_request(
         runtime.path(),
-        r#"{"version":1,"command":{"level":{"after_seq":0}}}"#,
+        r#"{"version":2,"command":{"level":{"after_seq":0}}}"#,
     );
     assert_eq!(
         first["level_frames"], repeated["level_frames"],
@@ -4457,7 +4463,7 @@ fn level_poll_filters_by_cursor_over_deterministic_paused_frames() {
     let after_first = ipc_request(
         runtime.path(),
         &format!(
-            r#"{{"version":1,"command":{{"level":{{"after_seq":{}}}}}}}"#,
+            r#"{{"version":2,"command":{{"level":{{"after_seq":{}}}}}}}"#,
             seqs[0]
         ),
     );
@@ -4471,14 +4477,14 @@ fn level_poll_filters_by_cursor_over_deterministic_paused_frames() {
     let drained = ipc_request(
         runtime.path(),
         &format!(
-            r#"{{"version":1,"command":{{"level":{{"after_seq":{}}}}}}}"#,
+            r#"{{"version":2,"command":{{"level":{{"after_seq":{}}}}}}}"#,
             seqs[2]
         ),
     );
     assert_eq!(drained["level_frames"], serde_json::json!([]), "{drained}");
 
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
 }
@@ -4494,7 +4500,7 @@ fn a_restarted_daemon_reuses_the_terminal_id_under_a_distinct_instance_marker() 
     let daemon = Daemon::start(runtime.path());
     assert!(voisu(runtime.path(), "start").status.success());
     assert_eq!(
-        ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#)["ok"],
+        ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#)["ok"],
         true
     );
     let first = ipc_request(runtime.path(), OVERLAY_STATUS);
@@ -4507,7 +4513,7 @@ fn a_restarted_daemon_reuses_the_terminal_id_under_a_distinct_instance_marker() 
     let _restarted = Daemon::start(runtime.path());
     assert!(voisu(runtime.path(), "start").status.success());
     assert_eq!(
-        ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#)["ok"],
+        ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#)["ok"],
         true
     );
     let second = ipc_request(runtime.path(), OVERLAY_STATUS);
@@ -4576,7 +4582,7 @@ fn stop_completes_recording_and_delivery_then_returns_to_idle() {
 
     let stop = ipc_request(
         runtime.path(),
-        r#"{"version":1,"command":"stop"}"#,
+        r#"{"version":2,"command":"stop"}"#,
     );
     assert_eq!(stop["ok"], true);
     assert_eq!(
@@ -4617,7 +4623,7 @@ fn unavailable_direct_delivery_reports_that_the_transcript_is_on_the_clipboard()
         stdout(&stopped),
         "Direct Delivery unavailable; Transcript is on the clipboard\n"
     );
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let record = &history["history"][0];
     assert_eq!(record["delivery_method"], "clipboard_fallback", "{history}");
     assert_eq!(record["delivery_fallback_reason"], "permission denied", "{history}");
@@ -4633,7 +4639,7 @@ fn one_valid_source_transcript_delivers_once_when_the_other_provider_fails() {
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1);
     assert_eq!(
@@ -4662,7 +4668,7 @@ fn near_identical_source_transcripts_skip_reconciliation_and_deliver_once() {
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
 
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1);
@@ -4700,7 +4706,7 @@ fn material_disagreement_reconciles_with_recorded_selection_and_validation() {
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
 
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1);
@@ -4735,7 +4741,7 @@ fn unsafe_merge_result_is_repaired_once_before_delivery() {
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
 
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1);
@@ -4762,7 +4768,7 @@ fn failed_recovery_falls_back_to_clean_source_and_delivers_once() {
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
 
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1);
@@ -4799,7 +4805,7 @@ fn failed_recovery_reports_quality_failure_when_neither_source_is_safe() {
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
 
     assert_eq!(stopped["ok"], false, "{stopped}");
     assert_eq!(stopped["message"], "Transcript failed quality validation");
@@ -4886,7 +4892,7 @@ rm -f "$config"
 
     assert!(voisu(runtime.path(), "start").status.success());
     wait_for_marker(commands.path(), "pw-record.ready");
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
 
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1);
@@ -4995,7 +5001,7 @@ fi
     assert!(voisu(runtime.path(), "start").status.success());
     wait_for_marker(commands.path(), "pw-record.ready");
     fs::write(commands.path().join("secret-tool.slow"), b"").unwrap();
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
 
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(
@@ -5026,7 +5032,7 @@ fn provider_deadline_releases_the_valid_source_without_waiting_for_the_slow_prov
 
     assert!(voisu(runtime.path(), "start").status.success());
     let started = Instant::now();
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert!(
         started.elapsed() < Duration::from_secs(1),
@@ -5091,7 +5097,7 @@ printf '{"text":"Groq wins"}'
 
     assert!(voisu(runtime.path(), "start").status.success());
     wait_for_marker(commands.path(), "deepgram.ready");
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(
         stopped["evidence"]["source_transcript_providers"],
@@ -5157,7 +5163,7 @@ printf '{"text":"Groq wins"}'
 
     assert!(voisu(runtime.path(), "start").status.success());
     wait_for_marker(commands.path(), "deepgram.ready");
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(
         stopped["evidence"]["source_transcript_providers"],
@@ -5182,7 +5188,7 @@ fn reordered_provider_completions_are_attributed_and_delivered_once_with_timings
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1);
     assert_eq!(
@@ -5948,7 +5954,7 @@ fn trigger_key_first_activation_starts_and_next_activation_stops_the_recording()
     wait_for_status(runtime.path(), "idle\n");
 
     // The Recording that the Trigger Key drove delivered exactly once.
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let records = history["history"].as_array().expect("history is a list");
     assert_eq!(records.len(), 1, "{history}");
     assert_eq!(records[0]["delivery_count"], 1, "{history}");
@@ -5973,7 +5979,7 @@ fn sigterm_during_an_active_recording_completes_the_recording_before_exit() {
     // The interrupted Recording's outcome was persisted before exit; a fresh
     // daemon over the same runtime directory serves the retained history.
     let _daemon = Daemon::start(runtime.path());
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let records = history["history"].as_array().expect("history is a list");
     assert_eq!(records.len(), 1, "{history}");
     assert_eq!(records[0]["delivery_count"], 1, "{history}");
@@ -5983,14 +5989,20 @@ fn sigterm_during_an_active_recording_completes_the_recording_before_exit() {
 #[test]
 fn sigterm_while_a_recording_is_starting_persists_a_correlated_record() {
     let runtime = TempDir::new().unwrap();
-    // Provider start stalls hold the Recording in its start sequence long
-    // enough for the SIGTERM to arrive while it is still Starting.
-    let daemon = Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_START_STALL_MS", "700")]);
+    let start_marker = runtime.path().join("provider-starting");
+    let start_marker_env = start_marker.to_string_lossy().into_owned();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_START_STALL_MS", "700"),
+            ("VOISU_TEST_START_MARKER", &start_marker_env),
+        ],
+    );
 
     let runtime_dir = runtime.path().to_path_buf();
     let start = thread::spawn(move || voisu(&runtime_dir, "start"));
-    thread::sleep(Duration::from_millis(150));
-    daemon.terminate();
+    wait_for_marker(runtime.path(), "provider-starting");
+    let journal = daemon.terminate_and_stderr();
 
     // The start that shutdown interrupted is rejected like any other Recording
     // outcome: with the shutdown reason and never a started Recording.
@@ -6005,15 +6017,24 @@ fn sigterm_while_a_recording_is_starting_persists_a_correlated_record() {
     // The interrupted start persisted a correlated diagnostic record before the
     // daemon exited; a fresh daemon over the same runtime directory serves it.
     let _daemon = Daemon::start(runtime.path());
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let records = history["history"].as_array().expect("history is a list");
     assert_eq!(records.len(), 1, "{history}");
     assert_eq!(records[0]["error"], "daemon is shutting down", "{history}");
+    let correlation_id = records[0]["correlation_id"]
+        .as_str()
+        .filter(|correlation| !correlation.is_empty())
+        .expect("the interrupted start keeps its correlation ID");
     assert!(
-        records[0]["correlation_id"]
-            .as_str()
-            .is_some_and(|correlation| !correlation.is_empty()),
-        "{history}"
+        journal.lines().any(|line| {
+            line
+                == format!(
+                    "Recording 1: outcome=error correlation_id={correlation_id} \
+                     first_chunk_ms=- capture_finalized_ms=- provider_timings_ms=- \
+                     release_to_text_ms=-"
+                )
+        }),
+        "shutdown during startup must emit structured timings: {journal}"
     );
 }
 
@@ -6036,7 +6057,7 @@ fn concurrent_trigger_key_activations_cannot_overlap_recordings() {
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
         let records = history["history"].as_array().unwrap();
         if records.len() == 2
             && records.iter().all(|record| record["delivery_count"] == 1)
@@ -6077,7 +6098,7 @@ fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
 
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
         let records = history["history"].as_array().expect("history is a list");
         if records.len() == 1 {
             assert_eq!(records[0]["error"], serde_json::Value::Null, "{history}");
@@ -6797,7 +6818,14 @@ fn protocol_version_mismatches_are_rejected_by_daemon_and_cli() {
     assert_eq!(response["ok"], false);
     assert_eq!(
         response["message"],
-        "unsupported protocol version 999; expected 1"
+        "unsupported protocol version 999; expected 2"
+    );
+
+    let legacy = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(legacy["ok"], false);
+    assert_eq!(
+        legacy["message"],
+        "unsupported protocol version 1; expected 2"
     );
 
     drop(daemon);
@@ -6824,7 +6852,7 @@ fn protocol_version_mismatches_are_rejected_by_daemon_and_cli() {
     assert!(!status.status.success());
     assert_eq!(
         stderr(&status),
-        "IPC protocol mismatch: daemon uses 999, CLI uses 1\n"
+        "IPC protocol mismatch: daemon uses 999, CLI uses 2\n"
     );
 }
 
@@ -6840,7 +6868,7 @@ fn incompatible_payload_is_rejected_as_a_protocol_mismatch_from_its_envelope() {
     assert_eq!(response["ok"], false);
     assert_eq!(
         response["message"],
-        "unsupported protocol version 999; expected 1"
+        "unsupported protocol version 999; expected 2"
     );
 }
 
@@ -7123,7 +7151,7 @@ fn live_chunks_flow_to_providers_during_the_recording_not_only_after_stop() {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut streamed_during = 0_u64;
     while Instant::now() < deadline {
-        let status = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+        let status = ipc_request(runtime.path(), r#"{"version":2,"command":"status"}"#);
         if status["state"] == "recording" {
             let count = status["evidence"]["streamed_chunk_count"].as_u64().unwrap_or(0);
             if count > 0 {
@@ -7138,7 +7166,7 @@ fn live_chunks_flow_to_providers_during_the_recording_not_only_after_stop() {
         "chunks must flow to providers during the Recording, not only after stop"
     );
 
-    let stop = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stop = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stop["ok"], true, "{stop}");
     assert!(
         stop["evidence"]["streamed_chunk_count"].as_u64().unwrap() >= streamed_during,
@@ -7561,11 +7589,11 @@ fn repeated_failures_never_deliver_and_the_next_recording_delivers_once() {
     }
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let recovered = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let recovered = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(recovered["ok"], true, "{recovered}");
     assert_eq!(recovered["evidence"]["delivery_count"], 1, "{recovered}");
 
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let delivery_counts: Vec<u64> = history["history"]
         .as_array()
         .unwrap()
@@ -7608,7 +7636,7 @@ fn cli_termination_during_stop_cannot_abandon_the_daemon_or_duplicate_delivery()
     let _ = stop.wait();
 
     wait_for_status(runtime.path(), "idle\n");
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let records = history["history"].as_array().unwrap();
     assert_eq!(records.len(), 1, "{history}");
     assert_eq!(records[0]["delivery_count"], 1, "{history}");
@@ -7855,7 +7883,7 @@ fn cli_reports_version_mismatch_from_the_envelope_even_for_incompatible_payloads
     assert!(!status.status.success());
     assert_eq!(
         stderr(&status),
-        "IPC protocol mismatch: daemon uses 999, CLI uses 1\n"
+        "IPC protocol mismatch: daemon uses 999, CLI uses 2\n"
     );
 }
 
@@ -7866,7 +7894,7 @@ fn oversized_and_slow_frames_do_not_block_or_kill_the_daemon() {
     let path = socket_path(runtime.path());
 
     let mut slow = UnixStream::connect(&path).unwrap();
-    slow.write_all(b"{\"version\":1").unwrap();
+    slow.write_all(b"{\"version\":2").unwrap();
     let status_started = Instant::now();
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
     assert!(status_started.elapsed() < Duration::from_millis(250));
@@ -7926,7 +7954,7 @@ fn completed_recording_is_correlated_in_local_history_and_export_redacts_secrets
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     let correlation_id = stopped["evidence"]["correlation_id"]
         .as_str()
@@ -7936,7 +7964,7 @@ fn completed_recording_is_correlated_in_local_history_and_export_redacts_secrets
 
     // History exposes the Recording, its Source Transcripts, final Transcript,
     // timing, and decision reasons, joined by the same correlation id.
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let records = history["history"].as_array().expect("history is a list");
     assert_eq!(records.len(), 1, "one completed Recording is retained: {history}");
     let record = &records[0];
@@ -7948,7 +7976,7 @@ fn completed_recording_is_correlated_in_local_history_and_export_redacts_secrets
 
     // Export redacts the credential, keeps relevant config, and drops unrelated env.
     let export_request = format!(
-        r#"{{"version":1,"command":{{"export":"{correlation_id}"}}}}"#
+        r#"{{"version":2,"command":{{"export":"{correlation_id}"}}}}"#
     );
     let export = ipc_request(runtime.path(), &export_request);
     assert_eq!(export["ok"], true, "{export}");
@@ -7973,10 +8001,10 @@ fn raw_audio_is_absent_from_diagnostics_without_debug_capture() {
     let _daemon = Daemon::start(runtime.path());
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
 
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let record = &history["history"][0];
     assert!(record["debug_audio"].is_null(), "no debug audio without opt-in: {record}");
     assert_eq!(
@@ -7992,10 +8020,10 @@ fn debug_capture_persists_audio_with_recorded_expiry() {
     let _daemon = Daemon::start_with_env(runtime.path(), &[("VOISU_DEBUG_CAPTURE", "1")]);
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
 
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let debug_audio = &history["history"][0]["debug_audio"];
     assert!(debug_audio.is_object(), "debug capture records audio: {history}");
     let expires = debug_audio["expires_at_unix_ms"].as_u64().unwrap();
@@ -8017,12 +8045,12 @@ fn expired_debug_audio_is_cleaned_up_safely() {
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
 
     // A zero TTL expires immediately; the next history read must remove the file
     // and detach it from the record without failing.
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     assert!(history["history"][0]["debug_audio"].is_null(), "expired audio is detached: {history}");
     assert_eq!(
         pcm_file_count(&diagnostics_audio_dir(runtime.path())),
@@ -8054,7 +8082,7 @@ fn fixed_fixture_replays_through_provider_and_validation_boundaries() {
 
     let replayed = ipc_request(
         runtime.path(),
-        r#"{"version":1,"command":{"replay":"dictation.pcm"}}"#,
+        r#"{"version":2,"command":{"replay":"dictation.pcm"}}"#,
     );
     assert_eq!(replayed["ok"], true, "{replayed}");
     assert_eq!(
@@ -8072,7 +8100,7 @@ fn replay_of_a_missing_fixture_is_rejected_and_leaves_the_daemon_reusable() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start(runtime.path());
 
-    let request = r#"{"version":1,"command":{"replay":"nonexistent.pcm"}}"#;
+    let request = r#"{"version":2,"command":{"replay":"nonexistent.pcm"}}"#;
     let replayed = ipc_request(runtime.path(), request);
     assert_eq!(replayed["ok"], false, "{replayed}");
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
@@ -8091,7 +8119,7 @@ fn replay_rejects_a_symlink_planted_inside_the_fixture_directory() {
 
     let replayed = ipc_request(
         runtime.path(),
-        r#"{"version":1,"command":{"replay":"innocent.pcm"}}"#,
+        r#"{"version":2,"command":{"replay":"innocent.pcm"}}"#,
     );
     assert_eq!(replayed["ok"], false, "O_NOFOLLOW must refuse the symlink: {replayed}");
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
@@ -8110,7 +8138,7 @@ fn replay_rejects_a_fifo_without_wedging_the_daemon() {
     let started = Instant::now();
     let replayed = ipc_request(
         runtime.path(),
-        r#"{"version":1,"command":{"replay":"pipe.pcm"}}"#,
+        r#"{"version":2,"command":{"replay":"pipe.pcm"}}"#,
     );
     assert_eq!(replayed["ok"], false, "a FIFO is not a regular file: {replayed}");
     assert!(started.elapsed() < Duration::from_secs(2), "the open must not block");
@@ -8131,14 +8159,14 @@ fn replay_partial_provider_start_failure_aborts_the_started_stream_and_recovers(
 
     let replayed = ipc_request(
         runtime.path(),
-        r#"{"version":1,"command":{"replay":"dictation.pcm"}}"#,
+        r#"{"version":2,"command":{"replay":"dictation.pcm"}}"#,
     );
     assert_eq!(replayed["ok"], false, "{replayed}");
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
     // The failure was one-shot; the daemon is fully reusable afterwards.
     let retried = ipc_request(
         runtime.path(),
-        r#"{"version":1,"command":{"replay":"dictation.pcm"}}"#,
+        r#"{"version":2,"command":{"replay":"dictation.pcm"}}"#,
     );
     assert_eq!(retried["ok"], true, "{retried}");
 }
@@ -8154,7 +8182,7 @@ fn cli_history_renders_the_complete_bounded_records() {
         ],
     );
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
 
     // `--json` is the byte-compatible raw-records escape hatch; the default
@@ -8222,7 +8250,7 @@ fn seed_full_diagnostic_ring(runtime_dir: &Path) -> usize {
 
 fn seed_diagnostic_larger_than_the_old_response_ceiling(
     runtime_dir: &Path,
-) -> (usize, usize, String) {
+) -> (usize, usize, usize, String) {
     let voisu_dir = runtime_dir.join("voisu");
     let version_dir = voisu_dir.join(format!("v{PROTOCOL_VERSION}"));
     let diagnostics = version_dir.join("diagnostics");
@@ -8236,7 +8264,8 @@ fn seed_diagnostic_larger_than_the_old_response_ceiling(
         * voisu_core::MAX_STORED_TEXT
         * voisu_core::DEFAULT_MAX_RECORDS;
     let record_count = voisu_core::DEFAULT_MAX_RECORDS + 1;
-    let diagnostic_bytes = old_response_ceiling / record_count + 1;
+    let diagnostic = "é".repeat(old_response_ceiling / record_count / 2 + 1);
+    let diagnostic_bytes = diagnostic.len();
     let now = voisu_core::unix_millis_now();
     let records: Vec<_> = (0..record_count)
         .map(|index| {
@@ -8246,7 +8275,7 @@ fn seed_diagnostic_larger_than_the_old_response_ceiling(
             record.provider_failures.push(voisu_core::ProviderFailure::new(
                 voisu_core::Provider::Groq,
                 voisu_core::ProviderFailureStage::Completion,
-                "x".repeat(diagnostic_bytes),
+                diagnostic.clone(),
             ));
             record
         })
@@ -8258,7 +8287,7 @@ fn seed_diagnostic_larger_than_the_old_response_ceiling(
         "fixture must exceed the removed response ceiling"
     );
     fs::write(diagnostics.join("history.json"), &encoded).unwrap();
-    (encoded.len(), record_count, correlation_id)
+    (encoded.len(), record_count, diagnostic_bytes, correlation_id)
 }
 
 #[test]
@@ -8276,7 +8305,7 @@ fn a_delivered_recording_reports_its_per_stage_timings_to_the_journal() {
         ],
     );
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
 
     let journal = daemon.terminate_and_stderr();
@@ -8314,7 +8343,7 @@ fn a_failed_recording_keeps_its_journal_message_and_gains_the_timings() {
         &[("VOISU_TEST_PROVIDER_COMPLETE_FAILURE", "both")],
     );
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], false, "{stopped}");
 
     let journal = daemon.terminate_and_stderr();
@@ -8391,7 +8420,7 @@ fn a_full_diagnostic_ring_round_trips_through_cli_history_json() {
 #[test]
 fn diagnostic_paging_serves_history_and_export_beyond_the_old_response_ceiling() {
     let runtime = TempDir::new().unwrap();
-    let (payload_bytes, record_count, correlation_id) =
+    let (payload_bytes, record_count, diagnostic_bytes, correlation_id) =
         seed_diagnostic_larger_than_the_old_response_ceiling(runtime.path());
     let max_records = record_count.to_string();
     let _daemon = Daemon::start_with_env(
@@ -8401,12 +8430,24 @@ fn diagnostic_paging_serves_history_and_export_beyond_the_old_response_ceiling()
 
     let (protocol_history, page_count) = ipc_request_with_page_count(
         runtime.path(),
-        r#"{"version":1,"command":"history"}"#,
+        r#"{"version":2,"command":"history"}"#,
     );
     assert!(page_count > 1, "the oversized snapshot must use multiple pages");
     assert_eq!(
         protocol_history["history"].as_array().unwrap().len(),
         record_count
+    );
+    let export_request =
+        format!(r#"{{"version":2,"command":{{"export":"{correlation_id}"}}}}"#);
+    let (protocol_export, export_page_count) =
+        ipc_request_with_page_count(runtime.path(), &export_request);
+    assert!(
+        export_page_count > 1,
+        "the oversized export must use multiple pages"
+    );
+    assert_eq!(
+        protocol_export["export"]["record"]["correlation_id"],
+        correlation_id
     );
 
     let history = voisu_with_env(runtime.path(), &["history", "--json"], &[]);
@@ -8430,19 +8471,17 @@ fn diagnostic_paging_serves_history_and_export_beyond_the_old_response_ceiling()
     assert_eq!(history.as_array().unwrap().len(), record_count);
     assert_eq!(history[0]["correlation_id"], correlation_id);
     assert_eq!(export["record"]["correlation_id"], correlation_id);
-    let diagnostic_bytes = (4
-        * 3
-        * voisu_core::MAX_STORED_TEXT
-        * voisu_core::DEFAULT_MAX_RECORDS)
-        / record_count
-        + 1;
+    let diagnostic = history[0]["provider_failures"][0]["diagnostic"]
+        .as_str()
+        .unwrap();
     assert_eq!(
-        history[0]["provider_failures"][0]["diagnostic"]
-            .as_str()
-            .unwrap()
-            .len(),
+        diagnostic.len(),
         diagnostic_bytes,
         "each unbounded diagnostic must arrive intact"
+    );
+    assert!(
+        diagnostic.chars().all(|character| character == 'é'),
+        "UTF-8 text must survive page boundaries intact"
     );
 }
 
@@ -8454,7 +8493,7 @@ fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
         &[("VOISU_TEST_PROVIDER_START_FAILURE", "1")],
     );
 
-    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    let started = ipc_request(runtime.path(), r#"{"version":2,"command":"start"}"#);
     assert_eq!(started["ok"], false, "{started}");
     let correlation_id = started["evidence"]["correlation_id"]
         .as_str()
@@ -8462,7 +8501,7 @@ fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
         .to_owned();
     assert!(correlation_id.starts_with("rec-"), "{correlation_id}");
 
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     assert!(
         history["history"]
             .as_array()
@@ -8488,10 +8527,13 @@ fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
         )
     );
     assert!(
-        journal
-            .lines()
-            .any(|line| line == "Recording 1: controlled-provider-start-detail"),
-        "the startup failure keeps its exact human-readable diagnostic line: {journal}"
+        journal.lines().any(|line| {
+            line
+                == format!(
+                    "Recording 1 [{correlation_id}]: controlled-provider-start-detail"
+                )
+        }),
+        "the startup failure keeps its exact historical diagnostic line: {journal}"
     );
 }
 
@@ -8511,10 +8553,10 @@ fn partial_provider_completion_failure_is_recorded_in_history() {
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "the surviving provider still delivers: {stopped}");
 
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let record = &history["history"].as_array().expect("history is a list")[0];
     let failures = record["provider_failures"]
         .as_array()
@@ -8539,10 +8581,10 @@ fn all_providers_failing_records_every_failure_in_history() {
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], false, "no Source Transcript was produced: {stopped}");
 
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let record = &history["history"].as_array().expect("history is a list")[0];
     let failures = record["provider_failures"]
         .as_array()
@@ -8569,12 +8611,12 @@ fn provider_start_failure_records_both_providers_in_history() {
         &[("VOISU_TEST_PROVIDER_START_FAILURE", "1")],
     );
 
-    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    let started = ipc_request(runtime.path(), r#"{"version":2,"command":"start"}"#);
     assert_eq!(started["ok"], false, "{started}");
 
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
         let found = history["history"].as_array().unwrap().iter().any(|record| {
             record["provider_failures"]
                 .as_array()
@@ -8611,12 +8653,12 @@ fn capture_begin_failure_records_every_provider_as_not_started() {
         &[("VOISU_TEST_CAPTURE_BEGIN_FAILURE", "1")],
     );
 
-    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    let started = ipc_request(runtime.path(), r#"{"version":2,"command":"start"}"#);
     assert_eq!(started["ok"], false, "{started}");
 
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
         let found = history["history"].as_array().unwrap().iter().any(|record| {
             record["provider_failures"]
                 .as_array()
@@ -8652,12 +8694,12 @@ fn deepgram_start_failure_records_unreached_groq_as_not_started() {
         &[("VOISU_TEST_PROVIDER_START_FAILURE", "deepgram")],
     );
 
-    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    let started = ipc_request(runtime.path(), r#"{"version":2,"command":"start"}"#);
     assert_eq!(started["ok"], false, "{started}");
 
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
         let found = history["history"].as_array().unwrap().iter().any(|record| {
             record["provider_failures"]
                 .as_array()
@@ -8693,10 +8735,10 @@ fn capture_finalization_failure_records_all_providers_in_history() {
         &[("VOISU_TEST_CAPTURE_FINISH_FAILURE", "1")],
     );
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], false, "capture finalization failed: {stopped}");
 
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let record = &history["history"].as_array().expect("history is a list")[0];
     let failures = record["provider_failures"]
         .as_array()
@@ -8716,7 +8758,7 @@ fn export_of_an_unknown_correlation_id_is_rejected() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start(runtime.path());
 
-    let export = ipc_request(runtime.path(), r#"{"version":1,"command":{"export":"rec-does-not-exist"}}"#);
+    let export = ipc_request(runtime.path(), r#"{"version":2,"command":{"export":"rec-does-not-exist"}}"#);
     assert_eq!(export["ok"], false, "{export}");
 }
 
@@ -8731,7 +8773,7 @@ fn replay_rejects_arbitrary_files_outside_the_approved_fixture_directory() {
     let _daemon = Daemon::start(runtime.path());
 
     let request = format!(
-        r#"{{"version":1,"command":{{"replay":"{}"}}}}"#,
+        r#"{{"version":2,"command":{{"replay":"{}"}}}}"#,
         key_path.display()
     );
     let replayed = ipc_request(runtime.path(), &request);
@@ -8754,13 +8796,13 @@ fn export_scrubs_a_secret_spoken_into_the_transcript_itself() {
         ],
     );
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     let correlation_id = stopped["evidence"]["correlation_id"].as_str().unwrap().to_owned();
 
     let export = ipc_request(
         runtime.path(),
-        &format!(r#"{{"version":1,"command":{{"export":"{correlation_id}"}}}}"#),
+        &format!(r#"{{"version":2,"command":{{"export":"{correlation_id}"}}}}"#),
     );
     assert_eq!(export["ok"], true, "{export}");
     assert!(
@@ -8783,7 +8825,7 @@ fn recovery_diagnostics_carry_the_recordings_correlation_id() {
         ],
     );
 
-    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    let started = ipc_request(runtime.path(), r#"{"version":2,"command":"start"}"#);
     assert_eq!(started["ok"], false, "{started}");
     let correlation_id = started["evidence"]["correlation_id"].as_str().unwrap().to_owned();
     // Let the recovery aborts run and log before draining stderr.
@@ -8821,12 +8863,12 @@ fn a_disabled_deepgram_runs_groq_only_and_records_the_disabled_diagnostic() {
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["transcript_selection"], "source_groq");
     assert_eq!(stopped["evidence"]["reconciliation_requested"], false);
 
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let record = &history["history"][0];
     let sources = record["source_transcripts"].as_array().unwrap();
     assert_eq!(sources.len(), 1, "only Groq contributes a Source Transcript: {history}");
@@ -8874,12 +8916,12 @@ fn a_failed_groq_only_recording_still_records_deepgram_as_not_started() {
         // Drives the synchronous failures (completion, capture-finalization); a
         // streaming failure aborts mid-Recording and may already have returned
         // the daemon to Idle, so the record is polled for below regardless.
-        let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+        let stopped = ipc_request(runtime.path(), r#"{"version":2,"command":"stop"}"#);
         assert_eq!(stopped["ok"], false, "{failure:?} must fail the Recording: {stopped}");
 
         let deadline = Instant::now() + Duration::from_secs(3);
         let record = loop {
-            let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+            let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
             if history["history"].as_array().is_some_and(|records| !records.is_empty()) {
                 break history["history"][0].clone();
             }
@@ -8922,7 +8964,7 @@ fn a_disabled_deepgram_processing_panic_still_records_deepgram_as_not_started() 
     let failed = voisu(runtime.path(), "stop");
     assert_eq!(failed.status.code(), Some(4), "{}", stderr(&failed));
 
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let record = &history["history"][0];
     let failures = record["provider_failures"].as_array().unwrap();
     let deepgram: Vec<_> = failures
@@ -9149,7 +9191,7 @@ cat > "$dir/clipboard"
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
         "clipboard-only Transcript"
     );
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history = ipc_request(runtime.path(), r#"{"version":2,"command":"history"}"#);
     let record = &history["history"][0];
     assert_eq!(record["delivery_method"], "clipboard_fallback", "{history}");
     assert_eq!(

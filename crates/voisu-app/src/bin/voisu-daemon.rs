@@ -851,6 +851,13 @@ async fn actor_loop(
                                 ],
                             );
                             evidence.recovery_attempted = true;
+                            let journal = recording_journal_lines(
+                                id,
+                                &evidence,
+                                Some("daemon is shutting down"),
+                            );
+                            eprintln!("{}", journal.human);
+                            eprintln!("{}", journal.structured);
                             let _ = reply.send(Response::with_evidence(
                                 false,
                                 Some(DaemonState::Idle),
@@ -952,7 +959,10 @@ async fn actor_loop(
                                 &evidence,
                                 Some(failure.error.diagnostic()),
                             );
-                            eprintln!("{}", journal.human);
+                            eprintln!(
+                                "Recording {id} [{correlation}]: {}",
+                                failure.error.diagnostic()
+                            );
                             eprintln!("{}", journal.structured);
                             // A startup failure is correlated and retained like
                             // any other Recording outcome: its record persists
@@ -3014,6 +3024,7 @@ struct ControlledProvider {
     /// Blocking stall inside `start`, holding the Recording in Starting long
     /// enough for tests to interleave a shutdown with the start sequence.
     start_stall: Duration,
+    start_marker: Option<PathBuf>,
     fail_start_once: bool,
     fail_abort: bool,
     fail_complete: bool,
@@ -3061,6 +3072,7 @@ impl ControlledProvider {
             delay,
             send_stall,
             start_stall: env_millis("VOISU_TEST_START_STALL_MS"),
+            start_marker: std::env::var_os("VOISU_TEST_START_MARKER").map(PathBuf::from),
             fail_start_once,
             fail_abort,
             fail_complete,
@@ -3072,6 +3084,9 @@ impl ControlledProvider {
 impl TranscriptProvider for ControlledProvider {
     fn start(&mut self, _recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError> {
         if !self.start_stall.is_zero() {
+            if let Some(marker) = &self.start_marker {
+                fs::write(marker, b"starting").expect("controlled start marker must be writable");
+            }
             // `start` runs inside the actor's `begin_recording` blocking task,
             // so a blocking sleep is the faithful stand-in for a slow adapter.
             std::thread::sleep(self.start_stall);
