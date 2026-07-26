@@ -963,6 +963,10 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         }
     }
 
+    pub fn set_dictionary_terms(&mut self, dictionary_terms: Vec<String>) {
+        self.dictionary_terms = dictionary_terms;
+    }
+
     pub async fn decide(
         &mut self,
         mut sources: Vec<SourceTranscript>,
@@ -973,14 +977,25 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             sources.iter().find(|source| source.provider == Provider::Groq),
         ) {
             if source_similarity(&deepgram.text, &groq.text) >= 0.85 {
-                let (winner, evidence) = near_identical_selection(
-                    &deepgram.text,
-                    &groq.text,
-                    &self.dictionary_terms,
-                );
-                let selected = match winner {
-                    GateWinner::Left => deepgram,
-                    GateWinner::Right => groq,
+                let lexically_identical =
+                    normalized_words(&deepgram.text) == normalized_words(&groq.text);
+                let (selected, evidence) = if lexically_identical {
+                    let (winner, evidence) = near_identical_selection(
+                        &deepgram.text,
+                        &groq.text,
+                        &self.dictionary_terms,
+                    );
+                    let selected = match winner {
+                        GateWinner::Left => deepgram,
+                        GateWinner::Right => groq,
+                    };
+                    (selected, evidence)
+                } else {
+                    (
+                        groq,
+                        "lexically different near-identical Source Transcripts; defaulted to Groq without formatting comparison"
+                            .to_owned(),
+                    )
                 };
                 if let Some(reason) = source_quality_failure_reason(&selected.text, &sources) {
                     return self
@@ -1086,7 +1101,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             if let Some(failure) = quality_failure_reason(&merge_result.0, &sources) {
                 let reason = failure.reason();
                 if failure.is_contraction() {
-                    return Ok(longer_source_fallback(deepgram, groq, reason, true, false));
+                    return Ok(contraction_source_fallback(deepgram, groq, reason, true, false));
                 }
                 return self
                     .repair_candidate(&sources, merge_result, reason, true)
@@ -1171,10 +1186,29 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 }
             }
         };
-        if let Some(repair_reason) = source_quality_failure_reason(&repaired.0, sources) {
+        if let Some(failure) = quality_failure_reason(&repaired.0, sources) {
+            let repair_reason = format!("recovery produced {}", failure.reason());
+            if failure.is_contraction() {
+                if let (Some(deepgram), Some(groq)) = (
+                    sources
+                        .iter()
+                        .find(|source| source.provider == Provider::Deepgram),
+                    sources
+                        .iter()
+                        .find(|source| source.provider == Provider::Groq),
+                ) {
+                    return Ok(contraction_source_fallback(
+                        deepgram,
+                        groq,
+                        repair_reason,
+                        reconciliation_requested,
+                        true,
+                    ));
+                }
+            }
             return clean_source_fallback(
                 sources,
-                format!("recovery produced {repair_reason}"),
+                repair_reason,
                 reconciliation_requested,
                 true,
             );
@@ -1190,16 +1224,30 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
     }
 }
 
-fn longer_source_fallback(
+fn cross_supported_word_count(words: &[String], other: &[String]) -> usize {
+    let other_words: HashSet<&str> = other.iter().map(String::as_str).collect();
+    words
+        .iter()
+        .filter(|word| other_words.contains(word.as_str()))
+        .count()
+}
+
+fn contraction_source_fallback(
     deepgram: &SourceTranscript,
     groq: &SourceTranscript,
     reason: String,
     reconciliation_requested: bool,
     recovery_attempted: bool,
 ) -> TranscriptDecision {
-    let source = if normalized_words(&deepgram.text).len()
-        > normalized_words(&groq.text).len()
-    {
+    let deepgram_words = normalized_words(&deepgram.text);
+    let groq_words = normalized_words(&groq.text);
+    let deepgram_supported = cross_supported_word_count(&deepgram_words, &groq_words);
+    let groq_supported = cross_supported_word_count(&groq_words, &deepgram_words);
+    let source = if deepgram_supported > groq_supported {
+        deepgram
+    } else if groq_supported > deepgram_supported {
+        groq
+    } else if deepgram_words.len() < groq_words.len() {
         deepgram
     } else {
         groq
@@ -1210,7 +1258,9 @@ fn longer_source_fallback(
             Provider::Deepgram => TranscriptSelection::SourceDeepgram,
             Provider::Groq => TranscriptSelection::SourceGroq,
         },
-        validation_reason: "longer Source Transcript selected after merge contraction".to_owned(),
+        validation_reason:
+            "Source Transcript with the strongest cross-source support selected after merge contraction"
+                .to_owned(),
         fallback_reason: Some(reason),
         reconciliation_requested,
         recovery_attempted,
@@ -2438,6 +2488,8 @@ fn duration_millis(duration: Duration) -> u64 {
 }
 
 pub trait TranscriptValidator: Send {
+    fn set_dictionary_terms(&mut self, _dictionary_terms: Vec<String>) {}
+
     fn validate(
         &mut self,
         sources: Vec<SourceTranscript>,
@@ -2445,6 +2497,10 @@ pub trait TranscriptValidator: Send {
 }
 
 impl<M: ReconciliationModel> TranscriptValidator for TranscriptDecisionPipeline<M> {
+    fn set_dictionary_terms(&mut self, dictionary_terms: Vec<String>) {
+        TranscriptDecisionPipeline::set_dictionary_terms(self, dictionary_terms);
+    }
+
     fn validate(
         &mut self,
         sources: Vec<SourceTranscript>,

@@ -896,7 +896,7 @@ cat > "$dir/xclip.stdin"
 }
 
 #[test]
-fn dictionary_edits_between_recordings_reach_the_next_deepgram_and_whisper_snapshot() {
+fn dictionary_edits_between_recordings_reach_providers_and_the_comparator() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
     let config = TempDir::new().unwrap();
@@ -918,10 +918,13 @@ fn dictionary_edits_between_recordings_reach_the_next_deepgram_and_whisper_snaps
     );
     let deepgram_endpoint = spawn_mock_deepgram(
         commands.path(),
-        MockDeepgramBehavior::Finalize("hello from Deepgram"),
+        MockDeepgramBehavior::Finalize("The FriendName account is ready."),
     );
     let (groq_endpoint, groq_requests, _groq_live_requests, groq_server) =
-        local_groq_chunk_server(vec!["hello from Groq", "hello from Groq"]);
+        local_groq_chunk_server(vec![
+            "The friendname account is ready.",
+            "The friendname account is ready.",
+        ]);
     let path = format!(
         "{}:{}",
         commands.path().display(),
@@ -949,6 +952,16 @@ fn dictionary_edits_between_recordings_reach_the_next_deepgram_and_whisper_snaps
     assert!(
         !first_handshake.contains("friendname"),
         "the first Recording predates the edit: {first_handshake}"
+    );
+    let first_history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(
+        first_history["history"][0]["final_transcript"],
+        "The friendname account is ready.",
+        "without the user term the comparator keeps the Groq default: {first_history}"
+    );
+    assert_eq!(
+        first_history["history"][0]["selection"],
+        "near_identical_groq"
     );
     fs::remove_file(commands.path().join("deepgram.closed")).unwrap();
     // Clear the first Recording's readiness marker so the wait before the next
@@ -992,6 +1005,16 @@ fn dictionary_edits_between_recordings_reach_the_next_deepgram_and_whisper_snaps
         encoded_keyterm_bytes <= voisu_app::dictionary::DEEPGRAM_KEYTERM_TOKEN_BUDGET,
         "percent-encoding only expands terms, so this also proves the raw keyterms fit: \
          {second_handshake}"
+    );
+    let second_history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(
+        second_history["history"][0]["final_transcript"],
+        "The FriendName account is ready.",
+        "the second Recording's comparator must use the edited snapshot: {second_history}"
+    );
+    assert_eq!(
+        second_history["history"][0]["selection"],
+        "source_deepgram"
     );
 
     let requests = groq_requests.recv_timeout(Duration::from_secs(3)).unwrap();
