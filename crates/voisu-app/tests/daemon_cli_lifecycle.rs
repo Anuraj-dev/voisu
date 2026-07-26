@@ -6076,6 +6076,34 @@ fn synthetic_pcm_past_the_buffer_cap_delivers_a_non_empty_transcript() {
 }
 
 #[test]
+fn buffer_truncation_is_diagnosed_and_warns_through_the_delivered_outcome() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
+            ("VOISU_TEST_BUFFER_CAP_AFTER_CHUNKS", "2"),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Keep the retained audio."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Keep the retained audio."),
+        ],
+    );
+
+    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    wait_for_status(runtime.path(), "idle\n");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(history["history"][0]["truncated_by"], "buffer", "{history}");
+
+    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(observed["overlay_event"]["outcome"], "delivered", "{observed}");
+    assert_eq!(
+        observed["overlay_event"]["message"],
+        "Delivered, but the Recording was truncated; check the end",
+        "{observed}"
+    );
+}
+
+#[test]
 fn trigger_key_permission_denial_leaves_cli_control_usable() {
     let runtime = TempDir::new().unwrap();
     // The controlled desktop refuses the BindShortcuts request over the bus.

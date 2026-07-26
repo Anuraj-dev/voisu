@@ -1077,6 +1077,8 @@ async fn actor_loop(
                 }
             }
             ActorMessage::Completed(completed) => {
+                let truncated = completed.evidence.truncated_by.is_some();
+                let delivery_method = completed.evidence.delivery_method;
                 validator = Some(completed.validator);
                 delivery = Some(completed.delivery);
                 if matches!(&state, ActorState::Processing(evidence) if evidence.recording_id == completed.id)
@@ -1092,9 +1094,12 @@ async fn actor_loop(
                             let response = Response::with_evidence(
                             true,
                             Some(DaemonState::Idle),
-                            match completed.evidence.delivery_method {
+                            match delivery_method {
                                 Some(DeliveryMethod::ClipboardFallback) => {
                                     "Direct Delivery unavailable; Transcript is on the clipboard"
+                                }
+                                _ if truncated => {
+                                    "Delivered, but the Recording was truncated; check the end"
                                 }
                                 _ => "Transcript submitted through the compositor; preserved on the clipboard",
                             },
@@ -1105,7 +1110,11 @@ async fn actor_loop(
                                 &mut last_overlay_event,
                                 daemon_instance,
                                 OverlayOutcome::Delivered,
-                                "Delivered".to_owned(),
+                                if truncated {
+                                    "Delivered, but the Recording was truncated; check the end".to_owned()
+                                } else {
+                                    "Delivered".to_owned()
+                                },
                             );
                             response
                         }
@@ -1355,6 +1364,7 @@ fn base_evidence(
         source_transcript_providers: Vec::new(),
         first_chunk_ms: None,
         capture_finalized_ms: None,
+        truncated_by: None,
         provider_timings_ms: Vec::new(),
         release_to_text_ms: None,
         transcript_selection: None,
@@ -1737,6 +1747,7 @@ async fn process_recording(
                 return Err(abort_recording_work(capture, providers, error).await);
             }
         };
+        evidence.truncated_by = audio.truncated_by();
         evidence.capture_finalized_ms = Some(elapsed_millis(started_at));
         evidence.stages.push(LifecycleStage::CaptureFinalized);
         if debug_capture {
@@ -2046,6 +2057,7 @@ fn diagnostic_record(
     record.delivery_fallback_reason = evidence.delivery_fallback_reason.clone();
     record.first_chunk_ms = evidence.first_chunk_ms;
     record.capture_finalized_ms = evidence.capture_finalized_ms;
+    record.truncated_by = evidence.truncated_by;
     record.provider_timings_ms = evidence.provider_timings_ms.clone();
     record.release_to_text_ms = evidence.release_to_text_ms;
     record.error = error.map(|error| error.public_message().to_owned());

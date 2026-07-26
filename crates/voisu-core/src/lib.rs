@@ -183,6 +183,8 @@ pub struct LifecycleEvidence {
     pub first_chunk_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_finalized_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated_by: Option<CaptureLimit>,
     #[serde(default)]
     pub provider_timings_ms: Vec<ProviderTiming>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -480,7 +482,8 @@ pub type BoundaryFuture<'a, T> =
 #[derive(Clone, Debug)]
 pub struct AudioChunk(pub Vec<u8>);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CaptureLimit {
     Buffer,
     RecordingDeadline,
