@@ -438,6 +438,7 @@ struct Completion {
     validator: Box<dyn TranscriptValidator>,
     delivery: Box<dyn DeliveryAdapter>,
     reply: Option<oneshot::Sender<Response>>,
+    publish_trigger_outcome: bool,
 }
 
 /// The adapters and Recording outcome returned through the processing task's
@@ -728,6 +729,7 @@ async fn actor_loop(
                                 focus_probe.clone(),
                                 configured_providers.clone(),
                                 Some(reply),
+                                false,
                                 tx.clone(),
                                 reaper.clone(),
                             ) {
@@ -1071,6 +1073,7 @@ async fn actor_loop(
                             focus_probe.clone(),
                             configured_providers.clone(),
                             None,
+                            true,
                             tx.clone(),
                             reaper.clone(),
                         );
@@ -1137,7 +1140,9 @@ async fn actor_loop(
                             response
                         }
                     };
-                    if let Some(reply) = completed.reply {
+                    if completed.publish_trigger_outcome {
+                        eprintln!("Trigger Key activation: {}", response.message);
+                    } else if let Some(reply) = completed.reply {
                         let _ = reply.send(response);
                     }
                 }
@@ -1163,6 +1168,7 @@ async fn actor_loop(
                             focus_probe.clone(),
                             configured_providers.clone(),
                             None,
+                            false,
                             tx.clone(),
                             reaper.clone(),
                         );
@@ -1210,6 +1216,7 @@ fn spawn_recording_processing(
     focus_probe: Option<SharedFocusProbe>,
     configured_providers: Vec<Provider>,
     reply: Option<oneshot::Sender<Response>>,
+    publish_trigger_outcome: bool,
     actor: mpsc::Sender<ActorMessage>,
     reaper: ProviderReaper,
 ) -> Result<(), (Box<Response>, Option<oneshot::Sender<Response>>)> {
@@ -1251,6 +1258,7 @@ fn spawn_recording_processing(
         configured_providers,
         panic_evidence,
         reply,
+        publish_trigger_outcome,
         actor,
         diagnostics,
         reaper,
@@ -1866,6 +1874,7 @@ async fn supervise_recording(
     configured_providers: Vec<Provider>,
     panic_evidence: LifecycleEvidence,
     reply: Option<oneshot::Sender<Response>>,
+    publish_trigger_outcome: bool,
     actor: mpsc::Sender<ActorMessage>,
     diagnostics: Arc<DiagnosticStore>,
     reaper: ProviderReaper,
@@ -1934,6 +1943,7 @@ async fn supervise_recording(
             validator: recording.validator,
             delivery: recording.delivery,
             reply,
+            publish_trigger_outcome,
         })))
         .await;
 }

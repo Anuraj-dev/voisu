@@ -6191,28 +6191,45 @@ fn provider_stream_error_aborts_instead_of_delivering_retained_audio() {
 #[test]
 fn self_terminating_recording_publishes_a_terminal_outcome_and_operator_line() {
     let runtime = TempDir::new().unwrap();
+    let portal = MockPortal::start();
     let daemon = Daemon::start_with_env(
         runtime.path(),
         &[
+            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
             ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
             ("VOISU_TEST_DEADLINE_AFTER_CHUNKS", "2"),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Keep the deadline-limited Trigger Key dictation.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "Keep the deadline-limited Trigger Key dictation.",
+            ),
         ],
     );
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
-    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    portal.activate();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        if history["history"].as_array().is_some_and(|records| records.len() == 1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the self-terminating Trigger Key Recording never completed: {history}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     wait_for_status(runtime.path(), "idle\n");
-
-    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
-    assert_eq!(observed["overlay_event"]["outcome"], "recording_deadline", "{observed}");
-    assert_eq!(
-        observed["overlay_event"]["message"],
-        "Recording Deadline elapsed",
-        "{observed}"
-    );
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
-        diagnostics.contains("Recording 1: controlled Recording Deadline elapsed"),
+        diagnostics.contains(
+            "Trigger Key activation: Delivered, but the Recording was truncated; check the end"
+        ),
         "{diagnostics}"
     );
 }
