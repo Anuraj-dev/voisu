@@ -1,31 +1,19 @@
-//! The operator-facing journal line a finished Recording emits.
+//! The operator-facing journal lines a finished Recording emits.
 //!
-//! Voisu already measures `first_chunk_ms`, `capture_finalized_ms`,
-//! `provider_timings_ms`, and `release_to_text_ms` for every Recording and
-//! carries them into the local diagnostic record. The journal — which survives
-//! restarts, updates, and the diagnostic ring's retention bound — saw none of
-//! them: the success path logged nothing at all and the failure path logged only
-//! its boundary diagnostic. This module renders those already-measured values as
-//! one stable, machine-parseable line so an operator can compute percentiles
-//! from `journalctl` output without hand-editing log text.
-//!
-//! Shape, identical on both paths:
+//! The first line preserves the historical human-readable message verbatim. The
+//! second is a stable, timing-only machine record; it never interpolates the
+//! diagnostic, so multiline or unusually long boundary output cannot split or
+//! displace its keys.
 //!
 //! ```text
-//! Recording <id>: <message> outcome=<ok|error> correlation_id=<id> \
+//! Recording <id>: <message>
+//! Recording <id>: outcome=<ok|error> correlation_id=<id> \
 //!   first_chunk_ms=<ms> capture_finalized_ms=<ms> \
 //!   provider_timings_ms=<provider>:<ms>[,<provider>:<ms>] release_to_text_ms=<ms>
 //! ```
 //!
-//! The failure path's `<message>` is EXACTLY the boundary diagnostic the daemon
-//! has always printed, and the `Recording <id>: <diagnostic>` prefix is
-//! byte-identical to the historical line — a fourteen-day journal corpus parses
-//! the same way, and only gains trailing `key=value` pairs. The success path,
-//! which previously printed nothing, uses the fixed message `delivered`.
-//!
-//! Every key is always present. A value Voisu did not measure for that Recording
-//! renders as [`ABSENT`] rather than being omitted, so a parser can rely on the
-//! key set without inspecting the outcome.
+//! Every structured key is always present. A value Voisu did not measure for
+//! that Recording renders as [`ABSENT`] rather than being omitted.
 
 use voisu_core::{LifecycleEvidence, Provider, ProviderTiming};
 
@@ -37,28 +25,35 @@ pub const ABSENT: &str = "-";
 /// carries the boundary diagnostic here instead.
 pub const DELIVERED_MESSAGE: &str = "delivered";
 
-/// Renders one Recording's journal line. `diagnostic` is `None` for a Recording
-/// that delivered and `Some(boundary_diagnostic)` for one that failed; the
-/// failure text is emitted verbatim so the historical line shape is preserved.
-pub fn recording_journal_line(
+#[derive(Debug, Eq, PartialEq)]
+pub struct RecordingJournalLines {
+    pub human: String,
+    pub structured: String,
+}
+
+/// Renders the historical human line and the separate timing-only machine line.
+pub fn recording_journal_lines(
     recording_id: u64,
     evidence: &LifecycleEvidence,
     diagnostic: Option<&str>,
-) -> String {
+) -> RecordingJournalLines {
     let (message, outcome) = match diagnostic {
         Some(diagnostic) => (diagnostic, "error"),
         None => (DELIVERED_MESSAGE, "ok"),
     };
-    format!(
-        "Recording {recording_id}: {message} outcome={outcome} correlation_id={} \
-         first_chunk_ms={} capture_finalized_ms={} provider_timings_ms={} \
-         release_to_text_ms={}",
-        render_correlation_id(&evidence.correlation_id),
-        render_millis(evidence.first_chunk_ms),
-        render_millis(evidence.capture_finalized_ms),
-        render_provider_timings(&evidence.provider_timings_ms),
-        render_millis(evidence.release_to_text_ms),
-    )
+    RecordingJournalLines {
+        human: format!("Recording {recording_id}: {message}"),
+        structured: format!(
+            "Recording {recording_id}: outcome={outcome} correlation_id={} \
+             first_chunk_ms={} capture_finalized_ms={} provider_timings_ms={} \
+             release_to_text_ms={}",
+            render_correlation_id(&evidence.correlation_id),
+            render_millis(evidence.first_chunk_ms),
+            render_millis(evidence.capture_finalized_ms),
+            render_provider_timings(&evidence.provider_timings_ms),
+            render_millis(evidence.release_to_text_ms),
+        ),
+    }
 }
 
 /// A correlation ID is daemon-generated and space-free, but an empty one (an
@@ -138,30 +133,31 @@ mod tests {
     }
 
     #[test]
-    fn a_delivered_recording_renders_every_measured_stage_as_key_values() {
+    fn a_delivered_recording_renders_human_and_structured_lines() {
+        let lines = recording_journal_lines(7, &evidence(), None);
+        assert_eq!(lines.human, "Recording 7: delivered");
         assert_eq!(
-            recording_journal_line(7, &evidence(), None),
-            "Recording 7: delivered outcome=ok correlation_id=rec-4242-7-1700000000000 \
+            lines.structured,
+            "Recording 7: outcome=ok correlation_id=rec-4242-7-1700000000000 \
              first_chunk_ms=118 capture_finalized_ms=842 \
              provider_timings_ms=deepgram:412,groq:640 release_to_text_ms=1311"
         );
     }
 
     #[test]
-    fn a_failed_recording_keeps_the_historical_prefix_and_gains_the_timings() {
-        // The fourteen-day journal corpus parses `Recording <id>: <diagnostic>`.
-        // That prefix must stay byte-identical; the timings are appended only.
-        let line = recording_journal_line(7, &evidence(), Some("Provider Deadline elapsed"));
-        assert!(
-            line.starts_with("Recording 7: Provider Deadline elapsed"),
-            "the historical failure line must survive verbatim as a prefix: {line}"
+    fn a_failed_recording_keeps_the_historical_line_and_gains_the_timings() {
+        let lines =
+            recording_journal_lines(7, &evidence(), Some("Provider Deadline elapsed"));
+        assert_eq!(
+            lines.human,
+            "Recording 7: Provider Deadline elapsed",
+            "the historical failure line must survive verbatim"
         );
         assert_eq!(
-            line,
-            "Recording 7: Provider Deadline elapsed outcome=error \
-             correlation_id=rec-4242-7-1700000000000 first_chunk_ms=118 \
-             capture_finalized_ms=842 provider_timings_ms=deepgram:412,groq:640 \
-             release_to_text_ms=1311"
+            lines.structured,
+            "Recording 7: outcome=error correlation_id=rec-4242-7-1700000000000 \
+             first_chunk_ms=118 capture_finalized_ms=842 \
+             provider_timings_ms=deepgram:412,groq:640 release_to_text_ms=1311"
         );
     }
 
@@ -175,11 +171,36 @@ mod tests {
         evidence.release_to_text_ms = None;
 
         assert_eq!(
-            recording_journal_line(9, &evidence, Some("capture ended without audio")),
-            "Recording 9: capture ended without audio outcome=error correlation_id=- \
-             first_chunk_ms=- capture_finalized_ms=- provider_timings_ms=- \
-             release_to_text_ms=-"
+            recording_journal_lines(9, &evidence, Some("capture ended without audio")),
+            RecordingJournalLines {
+                human: "Recording 9: capture ended without audio".to_owned(),
+                structured: "Recording 9: outcome=error correlation_id=- first_chunk_ms=- \
+                             capture_finalized_ms=- provider_timings_ms=- \
+                             release_to_text_ms=-"
+                    .to_owned(),
+            }
         );
+    }
+
+    #[test]
+    fn multiline_diagnostic_cannot_split_or_displace_the_structured_line() {
+        let lines = recording_journal_lines(
+            7,
+            &evidence(),
+            Some("pw-record failed\nALSA device disappeared"),
+        );
+        assert_eq!(
+            lines.human,
+            "Recording 7: pw-record failed\nALSA device disappeared"
+        );
+        assert_eq!(
+            lines.structured,
+            "Recording 7: outcome=error correlation_id=rec-4242-7-1700000000000 \
+             first_chunk_ms=118 capture_finalized_ms=842 \
+             provider_timings_ms=deepgram:412,groq:640 release_to_text_ms=1311"
+        );
+        assert!(!lines.structured.contains("pw-record"));
+        assert!(!lines.structured.contains('\n'));
     }
 
     #[test]
@@ -196,18 +217,21 @@ mod tests {
             "release_to_text_ms=",
         ];
         for diagnostic in [None, Some("boundary failed")] {
-            let line = recording_journal_line(1, &evidence(), diagnostic);
+            let lines = recording_journal_lines(1, &evidence(), diagnostic);
             for key in KEYS {
                 assert_eq!(
-                    line.matches(key).count(),
+                    lines.structured.matches(key).count(),
                     1,
-                    "{key} must appear exactly once in {line}"
+                    "{key} must appear exactly once in {}",
+                    lines.structured
+                );
+                assert!(
+                    !lines.human.contains(key),
+                    "the human line must not carry structured keys: {}",
+                    lines.human
                 );
             }
-            assert!(
-                !line.contains('\n'),
-                "a journal record must be a single line: {line}"
-            );
+            assert!(!lines.structured.contains('\n'));
         }
     }
 }

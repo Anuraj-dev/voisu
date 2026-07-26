@@ -8282,7 +8282,11 @@ fn a_delivered_recording_reports_its_per_stage_timings_to_the_journal() {
         .lines()
         .find(|line| line.contains("outcome=ok"))
         .unwrap_or_else(|| panic!("a delivered Recording must log its timings: {journal}"));
-    assert!(line.starts_with("Recording 1: delivered outcome=ok"), "{line}");
+    assert!(line.starts_with("Recording 1: outcome=ok"), "{line}");
+    assert!(
+        journal.lines().any(|line| line == "Recording 1: delivered"),
+        "the human-readable delivered line must remain separate: {journal}"
+    );
     assert!(line.contains("correlation_id=rec-"), "{line}");
     for key in [
         "first_chunk_ms=",
@@ -8314,22 +8318,14 @@ fn a_failed_recording_keeps_its_journal_message_and_gains_the_timings() {
         .find(|line| line.contains("outcome=error"))
         .unwrap_or_else(|| panic!("a failed Recording must log its timings: {journal}"));
     assert!(
-        line.starts_with("Recording 1: "),
-        "the historical failure prefix must be preserved: {line}"
+        line.starts_with("Recording 1: outcome=error"),
+        "the structured line must contain no diagnostic text: {line}"
     );
-    // The boundary diagnostic itself, verbatim and FIRST — the timings are
-    // appended after it, never in place of it.
     assert!(
-        line.starts_with("Recording 1: controlled-provider-completion-detail"),
-        "the existing diagnostic text must be carried through unchanged: {line}"
-    );
-    let message = line
-        .strip_prefix("Recording 1: ")
-        .and_then(|rest| rest.split(" outcome=error").next())
-        .expect("the diagnostic message precedes the timings");
-    assert!(
-        !message.is_empty(),
-        "the diagnostic message must not be replaced by the timings: {line}"
+        journal
+            .lines()
+            .any(|line| line.starts_with("Recording 1: controlled-provider-completion-detail")),
+        "the existing diagnostic line must be carried through unchanged: {journal}"
     );
     for key in [
         "correlation_id=",
