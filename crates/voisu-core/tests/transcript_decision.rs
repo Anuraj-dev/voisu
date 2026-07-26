@@ -246,6 +246,39 @@ async fn near_identical_lexical_difference_keeps_the_groq_default() {
 }
 
 #[tokio::test]
+async fn padding_cannot_win_on_formatting_signal_alone() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+    let faithful = "Please review the final transcript before delivery and confirm every spoken detail remains accurate for the completed dictation in the desktop history.";
+    let padded = format!("{} Okay. Okay.", faithful.trim_end_matches('.'));
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: padded,
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: faithful.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, faithful);
+    assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(decision.validation_reason.contains("lexically different"));
+    assert!(!decision.validation_reason.contains("one-sided formatting evidence"));
+}
+
+#[tokio::test]
 async fn near_identical_source_transcripts_select_capitalised_sentence_starts() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut pipeline = TranscriptDecisionPipeline::new(
