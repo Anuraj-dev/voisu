@@ -6104,6 +6104,46 @@ fn buffer_truncation_is_diagnosed_and_warns_through_the_delivered_outcome() {
 }
 
 #[test]
+fn provider_stream_error_aborts_instead_of_delivering_retained_audio() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
+            ("VOISU_TEST_PROVIDER_SEND_FAILURE", "groq"),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Do not deliver this audio."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Do not deliver this audio."),
+        ],
+    );
+
+    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    wait_for_status(runtime.path(), "idle\n");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    assert!(record["final_transcript"].is_null(), "{history}");
+    assert_eq!(record["delivery_count"], 0, "{history}");
+    assert_eq!(record["truncated_by"], serde_json::Value::Null, "{history}");
+    assert!(
+        record["stages"]
+            .as_array()
+            .is_some_and(|stages| stages.iter().any(|stage| stage == "capture_aborted")),
+        "{history}"
+    );
+    assert!(
+        record["provider_failures"].as_array().is_some_and(|failures| {
+            failures.iter().any(|failure| {
+                failure["provider"] == "groq" && failure["stage"] == "streaming"
+            })
+        }),
+        "{history}"
+    );
+
+    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(observed["overlay_event"]["outcome"], "provider_failure", "{observed}");
+}
+
+#[test]
 fn trigger_key_permission_denial_leaves_cli_control_usable() {
     let runtime = TempDir::new().unwrap();
     // The controlled desktop refuses the BindShortcuts request over the bus.
