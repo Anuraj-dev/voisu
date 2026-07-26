@@ -6149,19 +6149,66 @@ fn buffer_truncation_is_diagnosed_and_warns_through_the_delivered_outcome() {
 }
 
 #[test]
-fn provider_stream_error_aborts_instead_of_delivering_retained_audio() {
+fn capture_boundary_read_error_aborts_without_delivery_or_truncation() {
     let runtime = TempDir::new().unwrap();
-    let _daemon = Daemon::start_with_env(
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+head -c 6400 /dev/zero | tr '\000' '\100'
+trap 'exit 0' INT TERM
+while :; do sleep 0.01; done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+: > "$dir/provider.called"
+exit 1
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+: > "$dir/delivery.called"
+exit 1
+"#,
+    );
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let _daemon = Daemon::start_production_with_env(
         runtime.path(),
         &[
-            ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
-            ("VOISU_TEST_PROVIDER_SEND_FAILURE", "groq"),
-            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Do not deliver this audio."),
-            ("VOISU_TEST_GROQ_TRANSCRIPT", "Do not deliver this audio."),
+            ("PATH", &path),
+            ("VOISU_TEST_MODE", "system-boundaries"),
+            ("VOISU_TEST_PW_RECORD_RAW", "raw"),
+            ("VOISU_TEST_CAPTURE_READ_ERROR_AFTER_BYTES", "3200"),
+            ("VOISU_DISABLE_DEEPGRAM", "1"),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
         ],
     );
 
     assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        if history["history"].as_array().is_some_and(|records| records.len() == 1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the capture read failure never completed: {history}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     wait_for_status(runtime.path(), "idle\n");
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
@@ -6176,16 +6223,15 @@ fn provider_stream_error_aborts_instead_of_delivering_retained_audio() {
         "{history}"
     );
     assert!(
-        record["provider_failures"].as_array().is_some_and(|failures| {
-            failures.iter().any(|failure| {
-                failure["provider"] == "groq" && failure["stage"] == "streaming"
-            })
-        }),
+        record["provider_failures"]
+            .as_array()
+            .is_some_and(|failures| failures.iter().all(|failure| {
+                matches!(failure["stage"].as_str(), Some("aborted" | "not_started"))
+            })),
         "{history}"
     );
-
-    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
-    assert_eq!(observed["overlay_event"]["outcome"], "provider_failure", "{observed}");
+    assert!(!commands.path().join("provider.called").exists());
+    assert!(!commands.path().join("delivery.called").exists());
 }
 
 #[test]

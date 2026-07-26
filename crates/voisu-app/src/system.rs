@@ -2326,6 +2326,37 @@ struct CaptureReaderState {
     buffer_cap_reached: bool,
 }
 
+struct InjectedCaptureReadFailure<R> {
+    inner: R,
+    bytes_before_failure: usize,
+}
+
+impl<R: Read> Read for InjectedCaptureReadFailure<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if self.bytes_before_failure == 0 {
+            return Err(std::io::Error::other(
+                "controlled production capture read failure",
+            ));
+        }
+        let maximum = output.len().min(self.bytes_before_failure);
+        let read = self.inner.read(&mut output[..maximum])?;
+        self.bytes_before_failure = self.bytes_before_failure.saturating_sub(read);
+        Ok(read)
+    }
+}
+
+fn injected_capture_read_failure_after_bytes() -> Option<usize> {
+    (std::env::var_os("VOISU_TEST_MODE").as_deref()
+        == Some(std::ffi::OsStr::new("system-boundaries")))
+    .then(|| {
+        std::env::var("VOISU_TEST_CAPTURE_READ_ERROR_AFTER_BYTES")
+            .ok()?
+            .parse()
+            .ok()
+    })
+    .flatten()
+}
+
 fn read_capture_stream(
     mut stdout: impl Read,
     reader_state: Arc<Mutex<CaptureReaderState>>,
@@ -2578,6 +2609,14 @@ impl AudioCapture for PipeWireCapture {
             } else {
                 Box::new(WavHeaderStripper::new(stdout))
             };
+            let stdout: Box<dyn Read + Send> =
+                match injected_capture_read_failure_after_bytes() {
+                    Some(bytes_before_failure) => Box::new(InjectedCaptureReadFailure {
+                        inner: stdout,
+                        bytes_before_failure,
+                    }),
+                    None => stdout,
+                };
             if let Err(returned) = handoff_tx.send(Ok((child, stderr))) {
                 // begin() is blocked on recv, so this only happens if it
                 // panicked; reclaim the child rather than leaking it.
