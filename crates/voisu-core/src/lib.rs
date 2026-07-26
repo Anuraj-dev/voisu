@@ -2213,11 +2213,69 @@ fn script_count(text: &str) -> usize {
 
 fn normalized_words(text: &str) -> Vec<String> {
     text.split_whitespace()
-        .map(|word| {
-            word.chars()
-                .filter(|character| character.is_alphanumeric())
+        .flat_map(|word| {
+            let word = word
+                .chars()
+                .filter_map(|character| match character {
+                    '\u{2019}' => Some('\''),
+                    character if character.is_alphanumeric() || character == '\'' => {
+                        Some(character)
+                    }
+                    _ => None,
+                })
                 .flat_map(char::to_lowercase)
-                .collect::<String>()
+                .collect::<String>();
+            let expansion: &[&str] = match word.as_str() {
+                "aren't" => &["are", "not"],
+                "can't" => &["can", "not"],
+                "couldn't" => &["could", "not"],
+                "didn't" => &["did", "not"],
+                "doesn't" => &["does", "not"],
+                "don't" => &["do", "not"],
+                "hadn't" => &["had", "not"],
+                "hasn't" => &["has", "not"],
+                "haven't" => &["have", "not"],
+                "needn't" => &["need", "not"],
+                "isn't" => &["is", "not"],
+                "let's" => &["let", "us"],
+                "mustn't" => &["must", "not"],
+                "shan't" => &["shall", "not"],
+                "shouldn't" => &["should", "not"],
+                "they're" => &["they", "are"],
+                "wasn't" => &["was", "not"],
+                "we're" => &["we", "are"],
+                "weren't" => &["were", "not"],
+                "won't" => &["will", "not"],
+                "wouldn't" => &["would", "not"],
+                "you're" => &["you", "are"],
+                "i'm" => &["i", "am"],
+                "he's" => &["he", "is"],
+                "she's" => &["she", "is"],
+                "it's" => &["it", "is"],
+                "that's" => &["that", "is"],
+                "there's" => &["there", "is"],
+                "here's" => &["here", "is"],
+                "what's" => &["what", "is"],
+                "where's" => &["where", "is"],
+                "who's" => &["who", "is"],
+                "how's" => &["how", "is"],
+                "i've" => &["i", "have"],
+                "we've" => &["we", "have"],
+                "they've" => &["they", "have"],
+                "you've" => &["you", "have"],
+                "i'll" => &["i", "will"],
+                "we'll" => &["we", "will"],
+                "they'll" => &["they", "will"],
+                "you'll" => &["you", "will"],
+                "i'd" => &["i", "would"],
+                "he'd" => &["he", "would"],
+                "she'd" => &["she", "would"],
+                "we'd" => &["we", "would"],
+                "they'd" => &["they", "would"],
+                "you'd" => &["you", "would"],
+                _ => return vec![word.replace('\'', "")],
+            };
+            expansion.iter().map(|part| (*part).to_owned()).collect()
         })
         .filter(|word| !word.is_empty())
         .collect()

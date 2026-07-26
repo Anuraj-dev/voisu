@@ -750,6 +750,39 @@ async fn legitimate_merge_at_the_contraction_floor_is_delivered() {
 }
 
 #[tokio::test]
+async fn linguistic_contractions_do_not_trigger_the_merge_contraction_guard() {
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let merge = "We're planning the release and they're reviewing it today.";
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::clone(&kinds),
+            text: merge.to_owned(),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "We are planning the release and they are reviewing it today."
+                    .to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "They plan today's rollout while we review the release schedule together."
+                    .to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, merge);
+    assert_eq!(decision.selection, TranscriptSelection::Reconciled);
+    assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
+}
+
+#[tokio::test]
 async fn observed_production_contraction_ratios_are_rejected() {
     let shared: Vec<String> = (0..80).map(|index| format!("shared{index}")).collect();
     let deepgram_words = shared
