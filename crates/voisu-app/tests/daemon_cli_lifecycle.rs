@@ -6235,6 +6235,54 @@ fn self_terminating_recording_publishes_a_terminal_outcome_and_operator_line() {
 }
 
 #[test]
+fn clipboard_fallback_preserves_delivery_info_and_warns_of_truncation() {
+    let runtime = TempDir::new().unwrap();
+    let portal = MockPortal::start();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
+            ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
+            ("VOISU_TEST_BUFFER_CAP_AFTER_CHUNKS", "2"),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Keep the fallback-delivered dictation.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "Keep the fallback-delivered dictation.",
+            ),
+            ("VOISU_TEST_DELIVERY_FALLBACK", "permission denied"),
+        ],
+    );
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    portal.activate();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        if history["history"].as_array().is_some_and(|records| records.len() == 1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the truncated Trigger Key Recording never completed: {history}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_status(runtime.path(), "idle\n");
+
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains(
+            "Trigger Key activation: Direct Delivery unavailable; Transcript is on the clipboard, \
+             but the Recording was truncated; check the end"
+        ),
+        "{diagnostics}"
+    );
+}
+
+#[test]
 fn trigger_key_permission_denial_leaves_cli_control_usable() {
     let runtime = TempDir::new().unwrap();
     // The controlled desktop refuses the BindShortcuts request over the bus.

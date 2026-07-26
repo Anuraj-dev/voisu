@@ -1098,11 +1098,15 @@ async fn actor_loop(
                             let response = Response::with_evidence(
                             true,
                             Some(DaemonState::Idle),
-                            match delivery_method {
-                                Some(DeliveryMethod::ClipboardFallback) => {
+                            match (delivery_method, truncated) {
+                                (Some(DeliveryMethod::ClipboardFallback), true) => {
+                                    "Direct Delivery unavailable; Transcript is on the clipboard, \
+                                     but the Recording was truncated; check the end"
+                                }
+                                (Some(DeliveryMethod::ClipboardFallback), false) => {
                                     "Direct Delivery unavailable; Transcript is on the clipboard"
                                 }
-                                _ if truncated => {
+                                (_, true) => {
                                     "Delivered, but the Recording was truncated; check the end"
                                 }
                                 _ => "Transcript submitted through the compositor; preserved on the clipboard",
