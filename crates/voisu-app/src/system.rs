@@ -2326,6 +2326,65 @@ struct CaptureReaderState {
     buffer_cap_reached: bool,
 }
 
+fn read_capture_stream(
+    mut stdout: impl Read,
+    reader_state: Arc<Mutex<CaptureReaderState>>,
+    level_ring: Option<Arc<crate::audio_level::LevelRing>>,
+    pcm_byte_cap: usize,
+) {
+    let mut buffer = [0_u8; 640];
+    let mut assembler = PcmChunkAssembler::default();
+    let mut band_state = BandState::default();
+    let mut decoder = SampleDecoder::default();
+    loop {
+        match stdout.read(&mut buffer) {
+            Ok(0) => {
+                let mut state = reader_state.lock().unwrap();
+                if let Some(tail) = assembler.finish() {
+                    state.chunks.push_back(AudioChunk(tail));
+                }
+                state.eof = true;
+                return;
+            }
+            Ok(read) => {
+                if let Some(level_ring) = level_ring.as_ref() {
+                    let samples = decoder.decode(&buffer[..read]);
+                    // A read that completes no sample pushes no frame: an
+                    // all-zero frame would advance the ring sequence and could
+                    // evict real peaks.
+                    if !samples.is_empty() {
+                        level_ring.push(bands(&samples, &mut band_state));
+                    }
+                }
+                let mut state = reader_state.lock().unwrap();
+                state.received_bytes = state.received_bytes.saturating_add(read);
+                if state.received_bytes <= pcm_byte_cap {
+                    for chunk in assembler.push(&buffer[..read]) {
+                        state.chunks.push_back(AudioChunk(chunk));
+                    }
+                } else {
+                    state.buffer_cap_reached = true;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                let mut state = reader_state.lock().unwrap();
+                // A WAV-container format/boundary problem carries a specific,
+                // actionable message; anything else is the generic read
+                // failure.
+                state.error = Some(match error.kind() {
+                    std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
+                        error.to_string()
+                    }
+                    _ => "pw-record audio read failed".to_owned(),
+                });
+                state.eof = true;
+                return;
+            }
+        }
+    }
+}
+
 /// The capture mode the host's `pw-record` supports.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PwRecordProbe {
@@ -2514,7 +2573,7 @@ impl AudioCapture for PipeWireCapture {
             };
             // Headerless PCM (`--raw`) is read straight through; a WAV container
             // (no `--raw`) is unwrapped to its PCM payload first.
-            let mut stdout: Box<dyn Read + Send> = if raw_supported {
+            let stdout: Box<dyn Read + Send> = if raw_supported {
                 Box::new(stdout)
             } else {
                 Box::new(WavHeaderStripper::new(stdout))
@@ -2528,56 +2587,7 @@ impl AudioCapture for PipeWireCapture {
                 }
                 return;
             }
-            let mut buffer = [0_u8; 640];
-            let mut assembler = PcmChunkAssembler::default();
-            let mut band_state = BandState::default();
-            let mut decoder = SampleDecoder::default();
-            loop {
-                match stdout.read(&mut buffer) {
-                    Ok(0) => {
-                        let mut state = reader_state.lock().unwrap();
-                        if let Some(tail) = assembler.finish() {
-                            state.chunks.push_back(AudioChunk(tail));
-                        }
-                        state.eof = true;
-                        return;
-                    }
-                    Ok(read) => {
-                        if let Some(level_ring) = level_ring.as_ref() {
-                            let samples = decoder.decode(&buffer[..read]);
-                            // A read that completes no sample pushes no
-                            // frame: an all-zero frame would advance the
-                            // ring sequence and could evict real peaks.
-                            if !samples.is_empty() {
-                                level_ring.push(bands(&samples, &mut band_state));
-                            }
-                        }
-                        let mut state = reader_state.lock().unwrap();
-                        state.received_bytes = state.received_bytes.saturating_add(read);
-                        if state.received_bytes <= pcm_byte_cap {
-                            for chunk in assembler.push(&buffer[..read]) {
-                                state.chunks.push_back(AudioChunk(chunk));
-                            }
-                        } else {
-                            state.buffer_cap_reached = true;
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(error) => {
-                        let mut state = reader_state.lock().unwrap();
-                        // A WAV-container format/boundary problem carries a
-                        // specific, actionable message; anything else is the
-                        // generic read failure.
-                        state.error = Some(match error.kind() {
-                            std::io::ErrorKind::InvalidData
-                            | std::io::ErrorKind::UnexpectedEof => error.to_string(),
-                            _ => "pw-record audio read failed".to_owned(),
-                        });
-                        state.eof = true;
-                        return;
-                    }
-                }
-            }
+            read_capture_stream(stdout, reader_state, level_ring, pcm_byte_cap);
         });
         let (child, mut stderr) = handoff_rx
             .recv()
@@ -6403,6 +6413,56 @@ mod tests {
             cleanup_done.load(Ordering::SeqCst),
             "draining must await the blocking capture cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn pipewire_buffer_cap_drains_emitted_chunks_into_the_returned_pcm() {
+        let mut emitted_pcm = Vec::new();
+        for sample in 0_i16..3_520 {
+            emitted_pcm.extend_from_slice(&(sample.saturating_add(64)).to_le_bytes());
+        }
+        let retained_pcm = emitted_pcm[..PCM_CHUNK_BYTES * 2].to_vec();
+        let state = Arc::new(Mutex::new(CaptureReaderState {
+            chunks: VecDeque::new(),
+            received_bytes: 0,
+            eof: false,
+            error: None,
+            buffer_cap_reached: false,
+        }));
+
+        read_capture_stream(
+            std::io::Cursor::new(emitted_pcm),
+            Arc::clone(&state),
+            None,
+            retained_pcm.len(),
+        );
+        assert_eq!(
+            state.lock().unwrap().chunks.len(),
+            2,
+            "the production reader must emit both complete chunks before reporting the cap"
+        );
+
+        let mut capture = PipeWireActiveCapture {
+            child: None,
+            state,
+            reader: None,
+            stderr_reader: None,
+            cleanup: Some(tokio::spawn(async { Ok(Vec::new()) })),
+            reaper: ProviderReaper::new(),
+            pcm: Vec::new(),
+            started: Instant::now(),
+            deadline: DEFAULT_RECORDING_DEADLINE,
+        };
+        let first = capture
+            .next_chunk()
+            .await
+            .expect("the first queued chunk is readable")
+            .expect("the first queued chunk exists");
+        assert_eq!(first.0, retained_pcm[..PCM_CHUNK_BYTES]);
+
+        let audio = capture.finish().await.expect("cap-hit audio finalizes");
+        assert_eq!(audio.pcm_s16le_mono_16khz(), retained_pcm);
+        assert_eq!(audio.truncated_by(), Some(CaptureLimit::Buffer));
     }
 
     #[tokio::test]
