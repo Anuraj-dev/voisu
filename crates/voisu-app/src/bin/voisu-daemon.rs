@@ -944,10 +944,16 @@ async fn actor_loop(
                             level_ring.deactivate();
                             let recovering =
                                 failure.capture.is_some() || failure.provider_stream.is_some();
-                            eprintln!(
-                                "Recording {id} [{correlation}]: {}",
-                                failure.error.diagnostic()
+                            let mut evidence =
+                                base_evidence(id, correlation.clone(), Vec::new());
+                            evidence.recovery_attempted = recovering;
+                            let journal = recording_journal_lines(
+                                id,
+                                &evidence,
+                                Some(failure.error.diagnostic()),
                             );
+                            eprintln!("{}", journal.human);
+                            eprintln!("{}", journal.structured);
                             // A startup failure is correlated and retained like
                             // any other Recording outcome: its record persists
                             // locally and the rejection carries the correlated
@@ -1007,9 +1013,6 @@ async fn actor_loop(
                                     "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
                                 );
                             }
-                            let mut evidence =
-                                base_evidence(id, correlation.clone(), Vec::new());
-                            evidence.recovery_attempted = recovering;
                             let response = Response::with_evidence(
                                 false,
                                 Some(DaemonState::Idle),

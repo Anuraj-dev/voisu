@@ -8436,7 +8436,7 @@ fn diagnostic_paging_serves_history_and_export_beyond_the_old_response_ceiling()
 #[test]
 fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
     let runtime = TempDir::new().unwrap();
-    let _daemon = Daemon::start_with_env(
+    let daemon = Daemon::start_with_env(
         runtime.path(),
         &[("VOISU_TEST_PROVIDER_START_FAILURE", "1")],
     );
@@ -8449,26 +8449,37 @@ fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
         .to_owned();
     assert!(correlation_id.starts_with("rec-"), "{correlation_id}");
 
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
-        let found = history["history"]
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert!(
+        history["history"]
             .as_array()
             .unwrap()
             .iter()
             .any(|record| {
                 record["correlation_id"] == correlation_id.as_str()
                     && record["error"].is_string()
-            });
-        if found {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the startup failure must be retained with its correlation ID: {history}"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+            }),
+        "the startup failure is retained before its response is sent: {history}"
+    );
+
+    let journal = daemon.terminate_and_stderr();
+    let structured = journal
+        .lines()
+        .find(|line| line.contains("outcome=error"))
+        .unwrap_or_else(|| panic!("a startup failure must emit structured timings: {journal}"));
+    assert_eq!(
+        structured,
+        format!(
+            "Recording 1: outcome=error correlation_id={correlation_id} first_chunk_ms=- \
+             capture_finalized_ms=- provider_timings_ms=- release_to_text_ms=-"
+        )
+    );
+    assert!(
+        journal
+            .lines()
+            .any(|line| line.starts_with("Recording 1: ") && !line.contains("outcome=")),
+        "the startup failure keeps a separate human-readable line: {journal}"
+    );
 }
 
 #[test]
