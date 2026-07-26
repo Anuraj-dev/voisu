@@ -7,7 +7,7 @@ use voisu_core::{
     BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, ExportCorrelationId,
     KeyDiagnosis, KeyLocation, PROTOCOL_VERSION, Provider, ProviderAuthenticator, ProviderKeyStatus,
     ReadinessInspector, ReadinessStatus, ReplayFixturePath, Request, Response, SecretStore,
-    VersionEnvelope, provider_free_tier_hint, socket_path,
+    VersionEnvelope, DEFAULT_MAX_RECORDS, MAX_STORED_TEXT, provider_free_tier_hint, socket_path,
 };
 use voisu_app::service::{UserServiceAction, manage_user_service};
 use voisu_app::system::{
@@ -16,11 +16,33 @@ use voisu_app::system::{
 use voisu_app::config::DeliveryMode;
 
 // History and export responses carry bounded local diagnostics, so the CLI
-// accepts a larger response frame than the tiny command replies. The bound
-// comfortably covers the full retained history: bounded record count times the
-// clamped transcript sizes.
-const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+// accepts a larger response frame than the tiny command replies. The bound is
+// DERIVED from the retention policy rather than guessed, so raising retention
+// can never silently outgrow the frame that carries it: every retained record
+// can hold two Source Transcripts plus a final Transcript, each clamped to
+// `MAX_STORED_TEXT`, and JSON structure plus escaping inflate that text. Four
+// frame bytes per byte of clamped text covers the structure and ordinary
+// escaping with room to spare, while keeping the frame bounded — the guard's
+// whole purpose. A worst-case full ring measures ~4.8 MiB against this bound.
+const MAX_STORED_TEXTS_PER_RECORD: u64 = 3;
+const RESPONSE_BYTES_PER_STORED_BYTE: u64 = 4;
+const MAX_RESPONSE_BYTES: u64 = RESPONSE_BYTES_PER_STORED_BYTE
+    * MAX_STORED_TEXTS_PER_RECORD
+    * MAX_STORED_TEXT as u64
+    * DEFAULT_MAX_RECORDS as u64;
 const IO_DEADLINE: Duration = Duration::from_secs(2);
+/// `history` and `export` read the bounded local diagnostic store rather than
+/// answering from memory: at a full ring the daemon parses the retained history
+/// off disk, prunes it, rewrites it, and only then transfers a multi-megabyte
+/// frame. That legitimately takes far longer than a status ping's milliseconds
+/// — a worst-case full ring measures around two seconds in an unoptimized
+/// build — so these two commands get their own budget instead of sharing the
+/// tiny-reply one. Still bounded: a wedged daemon fails, it does not hang.
+const DIAGNOSTIC_RESPONSE_DEADLINE: Duration = Duration::from_secs(15);
+/// Frame reads are chunked at this size. A diagnostic response is megabytes, and
+/// draining it a kilobyte at a time both multiplies syscalls and leaves the
+/// daemon blocked on its own bounded write.
+const RESPONSE_READ_CHUNK_BYTES: usize = 64 * 1024;
 
 enum CliAction {
     Daemon(Command),
@@ -94,14 +116,12 @@ fn send_command(command: Command) -> Result<Response, ExitCode> {
     }
 
     // A replay drives the same provider/validation boundaries as Stop, so it
-    // shares the longer processing budget.
-    let response_deadline = if matches!(
-        command,
-        Command::Stop | Command::Toggle | Command::Replay(_)
-    ) {
-        PROCESSING_RESPONSE_DEADLINE
-    } else {
-        IO_DEADLINE
+    // shares the longer processing budget. `history` and `export` read the
+    // bounded diagnostic store instead, which has its own budget.
+    let response_deadline = match command {
+        Command::Stop | Command::Toggle | Command::Replay(_) => PROCESSING_RESPONSE_DEADLINE,
+        Command::History | Command::Export(_) => DIAGNOSTIC_RESPONSE_DEADLINE,
+        _ => IO_DEADLINE,
     };
     let request = Request {
         version: PROTOCOL_VERSION,
@@ -620,7 +640,7 @@ fn block_on<T>(future: BoundaryFuture<'_, T>) -> Result<T, BoundaryError> {
 fn read_response_frame(stream: &mut UnixStream, deadline: Duration) -> Result<String, String> {
     let started = Instant::now();
     let mut response = Vec::new();
-    let mut buffer = [0_u8; 1024];
+    let mut buffer = vec![0_u8; RESPONSE_READ_CHUNK_BYTES];
     loop {
         let remaining = deadline
             .checked_sub(started.elapsed())

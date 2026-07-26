@@ -32,9 +32,17 @@ use crate::{
 pub const MAX_STORED_TEXT: usize = 8 * 1024;
 
 /// The default number of most-recent Recordings retained in local history.
-pub const DEFAULT_MAX_RECORDS: usize = 20;
-/// The default maximum age of a retained diagnostic record.
-pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+///
+/// Both retention bounds are sized for a week of dictation, and they only work
+/// together: at the observed ~36 Recordings a day the age bound prunes first, so
+/// a larger count alone would leave the ring plateaued near a single day's
+/// worth. Sized so a week at that rate (~252) is bounded but a week at a lighter
+/// rate is retained whole.
+pub const DEFAULT_MAX_RECORDS: usize = 200;
+/// The default maximum age of a retained diagnostic record — one week, so this
+/// week's latency can be compared against last week's. Raised in step with
+/// [`DEFAULT_MAX_RECORDS`]; see that constant for why neither moves alone.
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 /// The default time-to-live for an explicitly captured debug audio file.
 pub const DEFAULT_DEBUG_AUDIO_TTL: Duration = Duration::from_secs(3600);
 

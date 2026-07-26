@@ -8144,6 +8144,185 @@ fn cli_history_renders_the_complete_bounded_records() {
     assert_eq!(record["delivery_count"], 1);
 }
 
+/// Seeds the daemon's diagnostic store with a COMPLETELY full ring at the
+/// structural worst case: `DEFAULT_MAX_RECORDS` records, each carrying two
+/// Source Transcripts and a final Transcript at the `MAX_STORED_TEXT` clamp.
+/// That is the largest history the retention policy can ever hold, and so the
+/// largest `history` response the IPC can ever be asked to carry. Returns the
+/// on-disk payload size so a test can report what it actually exercised.
+fn seed_full_diagnostic_ring(runtime_dir: &Path) -> usize {
+    let voisu_dir = runtime_dir.join("voisu");
+    let version_dir = voisu_dir.join(format!("v{PROTOCOL_VERSION}"));
+    let diagnostics = version_dir.join("diagnostics");
+    fs::create_dir_all(&diagnostics).unwrap();
+    // The daemon refuses to start unless every runtime path component is 0700.
+    for directory in [&voisu_dir, &version_dir, &diagnostics] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let text = "s".repeat(voisu_core::MAX_STORED_TEXT);
+    let now = voisu_core::unix_millis_now();
+    let records: Vec<voisu_core::DiagnosticRecord> = (0..voisu_core::DEFAULT_MAX_RECORDS)
+        .map(|index| {
+            let index = u64::try_from(index).unwrap();
+            let mut record =
+                voisu_core::DiagnosticRecord::new(format!("seed-{index}"), index);
+            // Seconds apart and well inside the age bound, so the ring is full
+            // by COUNT and pruning cannot drop any of it.
+            record.recorded_at_unix_ms = now - (voisu_core::DEFAULT_MAX_RECORDS as u64 - index);
+            record.source_transcripts = vec![
+                voisu_core::SourceTranscriptRecord {
+                    provider: voisu_core::Provider::Deepgram,
+                    text: text.clone(),
+                },
+                voisu_core::SourceTranscriptRecord {
+                    provider: voisu_core::Provider::Groq,
+                    text: text.clone(),
+                },
+            ];
+            record.set_final_transcript(text.clone());
+            record.first_chunk_ms = Some(100 + index);
+            record.capture_finalized_ms = Some(800 + index);
+            record.release_to_text_ms = Some(1_300 + index);
+            record
+        })
+        .collect();
+
+    let encoded = serde_json::to_vec(&records).unwrap();
+    fs::write(diagnostics.join("history.json"), &encoded).unwrap();
+    encoded.len()
+}
+
+#[test]
+fn a_delivered_recording_reports_its_per_stage_timings_to_the_journal() {
+    // The success path used to log NOTHING, so the healthy path's latency was
+    // unmeasurable once the retention ring pruned it. It must now emit the same
+    // key=value timing line the failure path does. (The exact format is pinned
+    // by the unit tests on the formatting function; this pins the WIRING.)
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Measure the healthy path."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Measure the healthy path"),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+
+    let journal = daemon.terminate_and_stderr();
+    let line = journal
+        .lines()
+        .find(|line| line.contains("outcome=ok"))
+        .unwrap_or_else(|| panic!("a delivered Recording must log its timings: {journal}"));
+    assert!(line.starts_with("Recording 1: delivered outcome=ok"), "{line}");
+    assert!(line.contains("correlation_id=rec-"), "{line}");
+    for key in [
+        "first_chunk_ms=",
+        "capture_finalized_ms=",
+        "provider_timings_ms=",
+        "release_to_text_ms=",
+    ] {
+        assert!(line.contains(key), "the journal line must carry {key}: {line}");
+    }
+}
+
+#[test]
+fn a_failed_recording_keeps_its_journal_message_and_gains_the_timings() {
+    // The failure line's historical `Recording <id>: <diagnostic>` prefix is
+    // load-bearing: a fourteen-day journal corpus parses it. It must survive
+    // byte-for-byte while gaining the trailing timings.
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_PROVIDER_COMPLETE_FAILURE", "both")],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], false, "{stopped}");
+
+    let journal = daemon.terminate_and_stderr();
+    let line = journal
+        .lines()
+        .find(|line| line.contains("outcome=error"))
+        .unwrap_or_else(|| panic!("a failed Recording must log its timings: {journal}"));
+    assert!(
+        line.starts_with("Recording 1: "),
+        "the historical failure prefix must be preserved: {line}"
+    );
+    // The boundary diagnostic itself, verbatim and FIRST — the timings are
+    // appended after it, never in place of it.
+    assert!(
+        line.starts_with("Recording 1: controlled-provider-completion-detail"),
+        "the existing diagnostic text must be carried through unchanged: {line}"
+    );
+    let message = line
+        .strip_prefix("Recording 1: ")
+        .and_then(|rest| rest.split(" outcome=error").next())
+        .expect("the diagnostic message precedes the timings");
+    assert!(
+        !message.is_empty(),
+        "the diagnostic message must not be replaced by the timings: {line}"
+    );
+    for key in [
+        "correlation_id=",
+        "first_chunk_ms=",
+        "capture_finalized_ms=",
+        "provider_timings_ms=",
+        "release_to_text_ms=",
+    ] {
+        assert!(line.contains(key), "the journal line must carry {key}: {line}");
+    }
+}
+
+#[test]
+fn a_full_diagnostic_ring_round_trips_through_cli_history_json() {
+    // HARD GATE on the retention raise: `voisu history --json` reads the ring
+    // over a single IPC response frame, so a larger ring must not break the very
+    // command that reads it. This seeds the structural worst case the retention
+    // policy permits — every record's stored text at the clamp — and requires
+    // the CLI to print it back INTACT, not truncated and not rejected.
+    let runtime = TempDir::new().unwrap();
+    let payload_bytes = seed_full_diagnostic_ring(runtime.path());
+    let _daemon = Daemon::start(runtime.path());
+
+    let output = voisu_with_env(runtime.path(), &["history", "--json"], &[]);
+    assert!(
+        output.status.success(),
+        "a full ring must survive the IPC response frame ({payload_bytes} bytes on disk): {}",
+        stderr(&output)
+    );
+    let records: Value = serde_json::from_str(&stdout(&output))
+        .expect("voisu history --json prints structured JSON at a full ring");
+    let records = records.as_array().expect("history is a list");
+    assert_eq!(
+        records.len(),
+        voisu_core::DEFAULT_MAX_RECORDS,
+        "every retained record must reach the CLI, not a truncated prefix"
+    );
+    // Newest first, and the newest record's stored text arrives whole.
+    assert_eq!(
+        records[0]["correlation_id"],
+        format!("seed-{}", voisu_core::DEFAULT_MAX_RECORDS - 1)
+    );
+    assert_eq!(
+        records[0]["final_transcript"].as_str().unwrap().len(),
+        voisu_core::MAX_STORED_TEXT,
+        "a clamped final Transcript must round-trip without truncation"
+    );
+    assert_eq!(
+        records[0]["source_transcripts"][1]["text"].as_str().unwrap().len(),
+        voisu_core::MAX_STORED_TEXT,
+        "a clamped Source Transcript must round-trip without truncation"
+    );
+    assert_eq!(
+        records[voisu_core::DEFAULT_MAX_RECORDS - 1]["correlation_id"],
+        "seed-0",
+        "the oldest retained record must survive to the end of the frame"
+    );
+}
+
 #[test]
 fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
     let runtime = TempDir::new().unwrap();

@@ -3,7 +3,8 @@ use std::time::Duration;
 use tempfile::TempDir;
 use voisu_core::{
     correlation_id, export_record, replay_capture, unix_millis_now, AudioChunk, BoundaryFuture,
-    CapturedAudio, DebugAudioRecord, DiagnosticRecord, DiagnosticStore, LifecycleStage, Provider,
+    CapturedAudio, DebugAudioRecord, DiagnosticRecord, DiagnosticStore, LifecycleStage,
+    DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS, Provider,
     ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream, ProviderStreams,
     RetentionPolicy, SourceTranscript, Transcript, TranscriptDecision, TranscriptSelection,
     TranscriptValidator, REDACTED,
@@ -49,6 +50,101 @@ fn retention_expires_records_past_the_age_bound() {
     let outcome = policy.prune(records, now);
     let kept: Vec<u64> = outcome.kept.iter().map(|record| record.recording_id).collect();
     assert_eq!(kept, vec![2], "only the fresh record survives the age bound");
+}
+
+#[test]
+fn default_retention_fills_the_count_bound_from_a_week_of_recordings() {
+    // Both bounds must move together. Raising the count alone achieves nothing:
+    // the age bound prunes FIRST, so at the observed ~36 Recordings a day a 24 h
+    // age bound plateaus the ring near 36 and the count bound is never reached.
+    // This pins the count at >= 200 AND the age at >= 7 days, and then proves
+    // the consequence: feeding a week of Recordings in, the count bound — not
+    // the age bound — is what trims, and >= 200 records are retained spanning
+    // far more than a day. Time is injected, never slept on.
+    assert!(
+        DEFAULT_MAX_RECORDS >= 200,
+        "the count bound must retain at least 200 Recordings, got {DEFAULT_MAX_RECORDS}"
+    );
+    assert!(
+        DEFAULT_MAX_AGE >= Duration::from_secs(7 * 24 * 3600),
+        "the age bound must retain at least seven days, got {DEFAULT_MAX_AGE:?}"
+    );
+
+    let policy = RetentionPolicy::default();
+    let now: u64 = 40 * 24 * 3600 * 1000;
+    let interval_ms: u64 = 24 * 3600 * 1000 / 36;
+    let week_count: u64 = 7 * 36;
+    // A week of Recordings at ~36 a day, oldest first.
+    let week: Vec<DiagnosticRecord> = (0..week_count)
+        .map(|index| record_at(index, now - (week_count - 1 - index) * interval_ms))
+        .collect();
+
+    let outcome = policy.prune(week, now);
+    let kept: Vec<u64> = outcome.kept.iter().map(|record| record.recording_id).collect();
+    assert_eq!(
+        kept.len(),
+        DEFAULT_MAX_RECORDS,
+        "the ring must fill to its count bound instead of plateauing at a day's worth"
+    );
+    assert!(kept.len() >= 200, "at least 200 records are retained");
+    let expected: Vec<u64> =
+        (week_count - u64::try_from(DEFAULT_MAX_RECORDS).unwrap()..week_count).collect();
+    assert_eq!(kept, expected, "the newest records are the ones retained");
+
+    let oldest_kept_age_ms = (week_count - 1 - kept[0]) * interval_ms;
+    assert!(
+        oldest_kept_age_ms > 24 * 3600 * 1000,
+        "the retained window must reach past a single day, got {oldest_kept_age_ms} ms"
+    );
+}
+
+#[test]
+fn default_retention_prunes_past_the_age_bound_and_keeps_everything_newer() {
+    // Pins the age bound in absolute days AND on its exact edge: an eight-day
+    // record is pruned, a six-day record survives, and a record one millisecond
+    // past the bound is dropped while one exactly on it is kept. `prune` takes
+    // `now_ms`, so this is wall-clock independent — no sleep, no scheduling
+    // assumption.
+    let policy = RetentionPolicy::default();
+    let now: u64 = 100 * 24 * 3600 * 1000;
+    let day: u64 = 24 * 3600 * 1000;
+    let age_ms = u64::try_from(DEFAULT_MAX_AGE.as_millis()).unwrap();
+    let records = vec![
+        record_at(1, now - 8 * day),
+        record_at(2, now - age_ms - 1),
+        record_at(3, now - age_ms),
+        record_at(4, now - 6 * day),
+        record_at(5, now - day),
+        record_at(6, now),
+    ];
+
+    let outcome = policy.prune(records, now);
+    let kept: Vec<u64> = outcome.kept.iter().map(|record| record.recording_id).collect();
+    assert_eq!(
+        kept,
+        vec![3, 4, 5, 6],
+        "records past the age bound are pruned and everything newer — including a \
+         six-day-old Recording — is kept"
+    );
+}
+
+#[test]
+fn default_retention_still_caps_the_ring_at_the_count_bound() {
+    // The count bound remains the ceiling once the age bound stops pruning: one
+    // record beyond it drops the oldest, so the ring never grows without limit
+    // even when a user records far more than a week's worth inside the week.
+    let policy = RetentionPolicy::default();
+    let now: u64 = 100 * 24 * 3600 * 1000;
+    let overfull: Vec<DiagnosticRecord> = (0..u64::try_from(DEFAULT_MAX_RECORDS).unwrap() + 1)
+        .map(|index| record_at(index, now - 1_000))
+        .collect();
+
+    let outcome = policy.prune(overfull, now);
+    assert_eq!(outcome.kept.len(), DEFAULT_MAX_RECORDS);
+    assert_eq!(
+        outcome.kept[0].recording_id, 1,
+        "the oldest record beyond the count bound is the one dropped"
+    );
 }
 
 #[test]
