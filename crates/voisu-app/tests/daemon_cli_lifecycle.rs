@@ -4616,7 +4616,7 @@ fn near_identical_source_transcripts_skip_reconciliation_and_deliver_once() {
         stopped["evidence"]["validation_reason"]
             .as_str()
             .unwrap()
-            .contains("sentence punctuation density"),
+            .contains("sentence punctuation boundaries"),
         "{stopped}"
     );
     assert_eq!(stopped["evidence"]["reconciliation_requested"], false);

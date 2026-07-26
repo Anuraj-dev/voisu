@@ -1086,7 +1086,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             if let Some(failure) = quality_failure_reason(&merge_result.0, &sources) {
                 let reason = failure.reason();
                 if failure.is_contraction() {
-                    return longer_source_fallback(&sources, reason, true, false);
+                    return Ok(longer_source_fallback(deepgram, groq, reason, true, false));
                 }
                 return self
                     .repair_candidate(&sources, merge_result, reason, true)
@@ -1191,38 +1191,30 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
 }
 
 fn longer_source_fallback(
-    sources: &[SourceTranscript],
+    deepgram: &SourceTranscript,
+    groq: &SourceTranscript,
     reason: String,
     reconciliation_requested: bool,
     recovery_attempted: bool,
-) -> Result<TranscriptDecision, BoundaryError> {
-    let source = sources
-        .iter()
-        .filter(|source| {
-            source_quality_failure_reason(&source.text, std::slice::from_ref(*source)).is_none()
-        })
-        .max_by_key(|source| normalized_words(&source.text).len())
-        .ok_or_else(|| {
-            let validation_reason = format!("{reason}; neither Source Transcript is safe");
-            BoundaryError::new(BoundaryKind::Validation, validation_reason.clone())
-                .with_transcript_failure(TranscriptFailureEvidence {
-                    validation_reason,
-                    fallback_reason: Some(reason.clone()),
-                    reconciliation_requested,
-                    recovery_attempted,
-                })
-        })?;
-    Ok(TranscriptDecision {
+) -> TranscriptDecision {
+    let source = if normalized_words(&deepgram.text).len()
+        > normalized_words(&groq.text).len()
+    {
+        deepgram
+    } else {
+        groq
+    };
+    TranscriptDecision {
         transcript: Transcript(source.text.trim().to_owned()),
         selection: match source.provider {
             Provider::Deepgram => TranscriptSelection::SourceDeepgram,
             Provider::Groq => TranscriptSelection::SourceGroq,
         },
-        validation_reason: "longer Source Transcript passed validation".to_owned(),
+        validation_reason: "longer Source Transcript selected after merge contraction".to_owned(),
         fallback_reason: Some(reason),
         reconciliation_requested,
         recovery_attempted,
-    })
+    }
 }
 
 fn clean_source_fallback(
@@ -1765,12 +1757,11 @@ fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
     None
 }
 
-const CAPITALISATION_DENSITY_MARGIN: f64 = 0.05;
-const SENTENCE_PUNCTUATION_DENSITY_MARGIN: f64 = 0.02;
-
 struct FormattingEvidence {
-    capitalisation_density: f64,
-    sentence_punctuation_density: f64,
+    capitalised_sentence_starts: usize,
+    sentence_starts: usize,
+    all_caps: bool,
+    sentence_punctuation_boundaries: usize,
     dictionary_matches: usize,
 }
 
@@ -1784,23 +1775,26 @@ fn near_identical_selection(
     let mut left_signals = 0;
     let mut right_signals = 0;
 
-    if left_evidence.capitalisation_density - right_evidence.capitalisation_density
-        >= CAPITALISATION_DENSITY_MARGIN
-    {
+    let capitalisation_score = |evidence: &FormattingEvidence| {
+        if evidence.all_caps || evidence.sentence_starts == 0 {
+            0.0
+        } else {
+            evidence.capitalised_sentence_starts as f64 / evidence.sentence_starts as f64
+        }
+    };
+    let left_capitalisation = capitalisation_score(&left_evidence);
+    let right_capitalisation = capitalisation_score(&right_evidence);
+    if left_capitalisation > right_capitalisation {
         left_signals += 1;
-    } else if right_evidence.capitalisation_density - left_evidence.capitalisation_density
-        >= CAPITALISATION_DENSITY_MARGIN
-    {
+    } else if right_capitalisation > left_capitalisation {
         right_signals += 1;
     }
-    if left_evidence.sentence_punctuation_density
-        - right_evidence.sentence_punctuation_density
-        >= SENTENCE_PUNCTUATION_DENSITY_MARGIN
+    if left_evidence.sentence_punctuation_boundaries
+        > right_evidence.sentence_punctuation_boundaries
     {
         left_signals += 1;
-    } else if right_evidence.sentence_punctuation_density
-        - left_evidence.sentence_punctuation_density
-        >= SENTENCE_PUNCTUATION_DENSITY_MARGIN
+    } else if right_evidence.sentence_punctuation_boundaries
+        > left_evidence.sentence_punctuation_boundaries
     {
         right_signals += 1;
     }
@@ -1811,11 +1805,15 @@ fn near_identical_selection(
     }
 
     let measurements = format!(
-        "capitalisation density {:.3} vs {:.3}, sentence punctuation density {:.3} vs {:.3}, dictionary matches {} vs {}",
-        left_evidence.capitalisation_density,
-        right_evidence.capitalisation_density,
-        left_evidence.sentence_punctuation_density,
-        right_evidence.sentence_punctuation_density,
+        "capitalised sentence starts {}/{}{} vs {}/{}{}, sentence punctuation boundaries {} vs {}, dictionary matches {} vs {}",
+        left_evidence.capitalised_sentence_starts,
+        left_evidence.sentence_starts,
+        if left_evidence.all_caps { " (all-caps)" } else { "" },
+        right_evidence.capitalised_sentence_starts,
+        right_evidence.sentence_starts,
+        if right_evidence.all_caps { " (all-caps)" } else { "" },
+        left_evidence.sentence_punctuation_boundaries,
+        right_evidence.sentence_punctuation_boundaries,
         left_evidence.dictionary_matches,
         right_evidence.dictionary_matches,
     );
@@ -1837,48 +1835,90 @@ fn near_identical_selection(
 }
 
 fn formatting_evidence(text: &str, dictionary_terms: &[String]) -> FormattingEvidence {
+    let (capitalised_sentence_starts, sentence_starts) = sentence_start_capitalisation(text);
     let alphabetic = text.chars().filter(|character| character.is_alphabetic()).count();
-    let uppercase = text.chars().filter(|character| character.is_uppercase()).count();
-    let words = normalized_words(text).len();
+    let lowercase = text.chars().filter(|character| character.is_lowercase()).count();
     FormattingEvidence {
-        capitalisation_density: if alphabetic == 0 {
-            0.0
-        } else {
-            uppercase as f64 / alphabetic as f64
-        },
-        sentence_punctuation_density: if words == 0 {
-            0.0
-        } else {
-            text.chars()
-                .filter(|character| matches!(character, '.' | '?' | '!'))
-                .count() as f64
-                / words as f64
-        },
-        dictionary_matches: dictionary_terms
-            .iter()
-            .map(|term| count_exact_term_matches(text, term))
-            .sum(),
+        capitalised_sentence_starts,
+        sentence_starts,
+        all_caps: alphabetic >= 4 && lowercase == 0,
+        sentence_punctuation_boundaries: sentence_punctuation_boundaries(text),
+        dictionary_matches: distinct_nonoverlapping_dictionary_matches(text, dictionary_terms),
     }
 }
 
-fn count_exact_term_matches(text: &str, term: &str) -> usize {
-    if term.is_empty() {
-        return 0;
+fn sentence_punctuation_boundaries(text: &str) -> usize {
+    let mut boundaries = 0;
+    let mut in_boundary = false;
+    for character in text.chars() {
+        if matches!(character, '.' | '?' | '!') {
+            if !in_boundary {
+                boundaries += 1;
+                in_boundary = true;
+            }
+        } else {
+            in_boundary = false;
+        }
     }
-    text.match_indices(term)
-        .filter(|(start, matched)| {
-            let before_is_boundary = text[..*start]
-                .chars()
-                .next_back()
-                .is_none_or(|character| !character.is_alphanumeric());
-            let end = *start + matched.len();
-            let after_is_boundary = text[end..]
-                .chars()
-                .next()
-                .is_none_or(|character| !character.is_alphanumeric());
-            before_is_boundary && after_is_boundary
+    boundaries
+}
+
+fn sentence_start_capitalisation(text: &str) -> (usize, usize) {
+    let mut at_sentence_start = true;
+    let mut capitalised = 0;
+    let mut total = 0;
+    for character in text.chars() {
+        if character.is_alphabetic() && at_sentence_start {
+            total += 1;
+            if character.is_uppercase() {
+                capitalised += 1;
+            }
+            at_sentence_start = false;
+        } else if matches!(character, '.' | '?' | '!') {
+            at_sentence_start = true;
+        }
+    }
+    (capitalised, total)
+}
+
+fn distinct_nonoverlapping_dictionary_matches(text: &str, terms: &[String]) -> usize {
+    let mut candidates: Vec<(&str, usize, usize)> = terms
+        .iter()
+        .map(String::as_str)
+        .filter(|term| !term.is_empty())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .flat_map(|term| {
+            text.match_indices(term).filter_map(move |(start, matched)| {
+                let before_is_boundary = text[..start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|character| !character.is_alphanumeric());
+                let end = start + matched.len();
+                let after_is_boundary = text[end..]
+                    .chars()
+                    .next()
+                    .is_none_or(|character| !character.is_alphanumeric());
+                (before_is_boundary && after_is_boundary).then_some((term, start, end))
+            })
         })
-        .count()
+        .collect();
+    candidates.sort_by_key(|(term, start, _)| (std::cmp::Reverse(term.len()), *start));
+
+    let mut selected_terms = HashSet::new();
+    let mut selected_spans: Vec<(usize, usize)> = Vec::new();
+    for (term, start, end) in candidates {
+        if selected_terms.contains(term)
+            || selected_spans
+                .iter()
+                .any(|(selected_start, selected_end)| start < *selected_end && *selected_start < end)
+        {
+            continue;
+        }
+        selected_terms.insert(term);
+        selected_spans.push((start, end));
+    }
+    selected_terms.len()
 }
 
 fn source_similarity(left: &str, right: &str) -> f64 {
@@ -1898,7 +1938,11 @@ const MERGE_CONTRACTION_RATIO_FLOOR: f64 = 0.90;
 
 enum QualityFailure {
     Other(&'static str),
-    Contraction { ratio: f64 },
+    Contraction {
+        ratio: f64,
+        candidate_words: usize,
+        source_words: usize,
+    },
 }
 
 impl QualityFailure {
@@ -1909,8 +1953,12 @@ impl QualityFailure {
     fn reason(&self) -> String {
         match self {
             Self::Other(reason) => (*reason).to_owned(),
-            Self::Contraction { ratio } => format!(
-                "suspicious contraction ratio {ratio:.2} below {MERGE_CONTRACTION_RATIO_FLOOR:.2}"
+            Self::Contraction {
+                ratio,
+                candidate_words,
+                source_words,
+            } => format!(
+                "suspicious contraction ratio {ratio:.4} below {MERGE_CONTRACTION_RATIO_FLOOR:.2} ({candidate_words} candidate words, {source_words} longest-source words)"
             ),
         }
     }
@@ -1996,6 +2044,8 @@ fn quality_failure_reason(
         if sources.len() >= 2 && contraction_ratio < MERGE_CONTRACTION_RATIO_FLOOR {
             return Some(QualityFailure::Contraction {
                 ratio: contraction_ratio,
+                candidate_words,
+                source_words,
             });
         }
         if candidate_words > source_words.saturating_mul(2).saturating_add(8) {
