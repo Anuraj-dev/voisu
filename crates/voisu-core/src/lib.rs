@@ -1101,14 +1101,14 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             if let Some(failure) = quality_failure_reason(&merge_result.0, &sources) {
                 let reason = failure.reason();
                 if failure.is_contraction() {
-                    return Ok(contraction_source_fallback(
+                    return contraction_source_fallback(
                         deepgram,
                         groq,
                         &merge_result.0,
                         reason,
                         true,
                         false,
-                    ));
+                    );
                 }
                 return self
                     .repair_candidate(&sources, merge_result, reason, true)
@@ -1204,14 +1204,14 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                         .iter()
                         .find(|source| source.provider == Provider::Groq),
                 ) {
-                    return Ok(contraction_source_fallback(
+                    return contraction_source_fallback(
                         deepgram,
                         groq,
                         &repaired.0,
                         repair_reason,
                         reconciliation_requested,
                         true,
-                    ));
+                    );
                 }
             }
             return clean_source_fallback(
@@ -1239,30 +1239,39 @@ fn contraction_source_fallback(
     reason: String,
     reconciliation_requested: bool,
     recovery_attempted: bool,
-) -> TranscriptDecision {
-    let source = if deepgram.text.trim().is_empty() && !groq.text.trim().is_empty() {
-        groq
-    } else if groq.text.trim().is_empty() && !deepgram.text.trim().is_empty() {
-        deepgram
-    } else {
-        let deepgram_words = normalized_words(&deepgram.text);
-        let groq_words = normalized_words(&groq.text);
-        if deepgram_words.len() == groq_words.len() {
-            groq
-        } else {
-            let (shorter, longer) = if deepgram_words.len() < groq_words.len() {
-                (deepgram, groq)
+) -> Result<TranscriptDecision, BoundaryError> {
+    let sources = [deepgram, groq];
+    let safe = quality_safe_sources(sources);
+    let source = match safe.as_slice() {
+        [] => None,
+        [only] => Some(*only),
+        [left, right, ..] => {
+            let left_words = normalized_words(&left.text);
+            let right_words = normalized_words(&right.text);
+            Some(if left_words.len() == right_words.len() {
+                *right
             } else {
-                (groq, deepgram)
-            };
-            if source_similarity(merge_text, &shorter.text) >= 0.85 {
-                shorter
-            } else {
-                longer
-            }
+                let (shorter, longer) = if left_words.len() < right_words.len() {
+                    (*left, *right)
+                } else {
+                    (*right, *left)
+                };
+                if source_similarity(merge_text, &shorter.text) >= 0.85 {
+                    shorter
+                } else {
+                    longer
+                }
+            })
         }
     };
-    TranscriptDecision {
+    let source = source.ok_or_else(|| {
+        source_fallback_refusal(
+            &reason,
+            reconciliation_requested,
+            recovery_attempted,
+        )
+    })?;
+    Ok(TranscriptDecision {
         transcript: Transcript(source.text.trim().to_owned()),
         selection: match source.provider {
             Provider::Deepgram => TranscriptSelection::SourceDeepgram,
@@ -1273,7 +1282,7 @@ fn contraction_source_fallback(
         fallback_reason: Some(reason),
         reconciliation_requested,
         recovery_attempted,
-    }
+    })
 }
 
 fn clean_source_fallback(
@@ -1286,12 +1295,7 @@ fn clean_source_fallback(
     // comparator the divergence gate uses — never a fixed provider preference,
     // and never an intrinsic score alone, which a fluent unique-word salad can
     // inflate past accurate repetitive dictation.
-    let safe: Vec<&SourceTranscript> = sources
-        .iter()
-        .filter(|source| {
-            source_quality_failure_reason(&source.text, std::slice::from_ref(*source)).is_none()
-        })
-        .collect();
+    let safe = quality_safe_sources(sources);
     let source = match safe.as_slice() {
         [] => None,
         [only] => Some(*only),
@@ -1307,20 +1311,13 @@ fn clean_source_fallback(
             },
         ),
     };
-    let source = source
-        .ok_or_else(|| {
-            let validation_reason = format!("{reason}; neither Source Transcript is safe");
-            BoundaryError::new(
-                BoundaryKind::Validation,
-                validation_reason.clone(),
-            )
-            .with_transcript_failure(TranscriptFailureEvidence {
-                validation_reason,
-                fallback_reason: Some(reason.clone()),
-                reconciliation_requested,
-                recovery_attempted,
-            })
-        })?;
+    let source = source.ok_or_else(|| {
+        source_fallback_refusal(
+            &reason,
+            reconciliation_requested,
+            recovery_attempted,
+        )
+    })?;
     Ok(TranscriptDecision {
         transcript: Transcript(source.text.trim().to_owned()),
         selection: match source.provider {
@@ -1332,6 +1329,32 @@ fn clean_source_fallback(
         reconciliation_requested,
         recovery_attempted,
     })
+}
+
+fn quality_safe_sources<'a>(
+    sources: impl IntoIterator<Item = &'a SourceTranscript>,
+) -> Vec<&'a SourceTranscript> {
+    sources
+        .into_iter()
+        .filter(|source| {
+            source_quality_failure_reason(&source.text, std::slice::from_ref(source)).is_none()
+        })
+        .collect()
+}
+
+fn source_fallback_refusal(
+    reason: &str,
+    reconciliation_requested: bool,
+    recovery_attempted: bool,
+) -> BoundaryError {
+    let validation_reason = format!("{reason}; neither Source Transcript is safe");
+    BoundaryError::new(BoundaryKind::Validation, validation_reason.clone())
+        .with_transcript_failure(TranscriptFailureEvidence {
+            validation_reason,
+            fallback_reason: Some(reason.to_owned()),
+            reconciliation_requested,
+            recovery_attempted,
+        })
 }
 
 /// A Source Transcript shorter than roughly a third of the other's length is a
