@@ -348,6 +348,36 @@ async fn near_identical_all_caps_does_not_beat_sentence_case() {
 }
 
 #[tokio::test]
+async fn excess_sentence_boundaries_do_not_beat_correct_punctuation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+    let faithful = "Hello there, I am here.";
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Hello. There. I. Am. Here.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: faithful.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, faithful);
+    assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn near_identical_long_prose_prefers_initial_capital_and_final_period() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut pipeline = TranscriptDecisionPipeline::new(

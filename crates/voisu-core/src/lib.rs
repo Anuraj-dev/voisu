@@ -1924,7 +1924,7 @@ fn formatting_evidence(text: &str, dictionary_terms: &[String]) -> FormattingEvi
         capitalised_sentence_starts,
         sentence_starts,
         all_caps: alphabetic >= 4 && lowercase == 0,
-        sentence_punctuation_boundaries: sentence_punctuation_boundaries(text),
+        sentence_punctuation_boundaries: sentence_boundary_credit(text),
         dictionary_matches: distinct_nonoverlapping_dictionary_matches(text, dictionary_terms),
     }
 }
@@ -1943,6 +1943,14 @@ fn sentence_punctuation_boundaries(text: &str) -> usize {
         }
     }
     boundaries
+}
+
+fn sentence_boundary_credit(text: &str) -> usize {
+    // Past roughly one boundary per six words, more punctuation is more likely
+    // over-segmentation than evidence of better sentence structure. Saturate
+    // there so a period after every word cannot manufacture a winning signal.
+    let plausible_boundaries = normalized_words(text).len().div_ceil(6).max(1);
+    sentence_punctuation_boundaries(text).min(plausible_boundaries)
 }
 
 fn sentence_start_capitalisation(text: &str) -> (usize, usize) {
