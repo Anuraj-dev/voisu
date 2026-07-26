@@ -4421,7 +4421,7 @@ fn level_poll_filters_by_cursor_over_deterministic_paused_frames() {
         runtime.path(),
         r#"{"version":2,"command":{"level":{"after_seq":0}}}"#,
     );
-    assert_eq!(idle["version"], 1, "{idle}");
+    assert_eq!(idle["version"], PROTOCOL_VERSION, "{idle}");
     assert_eq!(idle["ok"], true, "{idle}");
     assert_eq!(idle["level_frames"], serde_json::json!([]), "{idle}");
     assert!(idle.get("state").is_none() || idle["state"].is_null(), "{idle}");
