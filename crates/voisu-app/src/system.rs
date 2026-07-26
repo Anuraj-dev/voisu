@@ -58,7 +58,10 @@ const MAX_RETAINED_STDOUT_BYTES: usize = 64 * 1024;
 const PROVIDER_PROCESS_DEADLINE: Duration = Duration::from_secs(14);
 const RECONCILIATION_PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 const MIN_RECORDING_BYTES: usize = PCM_CHUNK_BYTES;
-const MAX_RECORDING_BYTES: usize = 16_000 * 2 * 60 * 5;
+/// The one configured maximum for a Recording. Both capture's retained PCM
+/// buffer and its default Deadline derive from this value.
+const MAX_RECORDING_DURATION: Duration = Duration::from_secs(600);
+const MAX_RECORDING_BYTES: usize = 16_000 * 2 * MAX_RECORDING_DURATION.as_secs() as usize;
 /// Recordings at or below this length (120 s of 16 kHz s16le mono) take a
 /// single full-audio Groq request at finalize: no pre-streamed chunks, no
 /// seams, full context for Whisper. Only Recordings that grow past this switch
@@ -2602,7 +2605,7 @@ impl AudioCapture for PipeWireCapture {
 /// exists for exactly those), so the default must be generous; a stuck or
 /// forgotten Recording is still bounded. `VOISU_RECORDING_DEADLINE_MS`
 /// overrides it, and a zero override falls back to this default.
-const DEFAULT_RECORDING_DEADLINE: Duration = Duration::from_secs(600);
+const DEFAULT_RECORDING_DEADLINE: Duration = MAX_RECORDING_DURATION;
 
 /// Resolve the Recording Deadline from the raw `VOISU_RECORDING_DEADLINE_MS`
 /// value. A parseable, non-zero millisecond count wins; anything else — absent,
@@ -6355,6 +6358,7 @@ mod tests {
                 received_bytes: 0,
                 eof: true,
                 error: None,
+                buffer_cap_reached: false,
             })),
             reader: None,
             stderr_reader: None,
@@ -6414,6 +6418,7 @@ mod tests {
                 received_bytes: 0,
                 eof: true,
                 error: None,
+                buffer_cap_reached: false,
             })),
             reader: None,
             stderr_reader: None,
@@ -7669,6 +7674,16 @@ mod tests {
         );
         assert_eq!(resolve_recording_deadline(Some("0".to_owned())), default);
         assert_eq!(resolve_recording_deadline(Some("nonsense".to_owned())), default);
+    }
+
+    #[test]
+    fn recording_buffer_matches_the_default_deadline_at_pcm_format() {
+        let default = resolve_recording_deadline(None);
+        assert_eq!(
+            MAX_RECORDING_BYTES,
+            16_000 * 2 * usize::try_from(default.as_secs()).unwrap(),
+            "the buffer and default Recording Deadline must use the same maximum duration"
+        );
     }
 
     #[test]
