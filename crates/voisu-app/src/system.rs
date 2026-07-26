@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 use voisu_core::{
     clipboard_candidates, install_instruction, resolve_session, scan_wav_pcm, socket_path,
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture,
-    BoundaryKind, CancelRegistry, CapturedAudio, ClipboardTool, Command as DaemonCommand, Credential,
-    DeliveryAdapter, DeliveryOutcome, KeyDiagnosis, KeyLocation, PackageManager, Provider,
+    BoundaryKind, CancelRegistry, CaptureLimit, CapturedAudio, ClipboardTool,
+    Command as DaemonCommand, Credential, DeliveryAdapter, DeliveryOutcome, KeyDiagnosis,
+    KeyLocation, PackageManager, Provider,
     ProviderAuthenticator, ProviderKeyStatus, ProviderStream, ReadinessCapability, ReadinessFinding,
     MergeResult, ReadinessInspector, ReadinessStatus, ReconciliationKind, ReconciliationModel,
     Request, Response, SecretStore, SessionKind, SessionResolution, ShortcutPortal, ShortcutSession,
@@ -2320,6 +2321,7 @@ struct CaptureReaderState {
     received_bytes: usize,
     eof: bool,
     error: Option<String>,
+    buffer_cap_reached: bool,
 }
 
 /// The capture mode the host's `pw-record` supports.
@@ -2476,6 +2478,7 @@ impl AudioCapture for PipeWireCapture {
             received_bytes: 0,
             eof: false,
             error: None,
+            buffer_cap_reached: false,
         }));
         let reader_state = Arc::clone(&state);
         let level_ring = self.levels.current();
@@ -2550,8 +2553,8 @@ impl AudioCapture for PipeWireCapture {
                             for chunk in assembler.push(&buffer[..read]) {
                                 state.chunks.push_back(AudioChunk(chunk));
                             }
-                        } else if state.error.is_none() {
-                            state.error = Some("Recording exceeded the bounded audio buffer".to_owned());
+                        } else {
+                            state.buffer_cap_reached = true;
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -2749,7 +2752,10 @@ impl ActiveCapture for PipeWireActiveCapture {
                     if let Some(error) = state.error.clone() {
                         return Err(BoundaryError::new(BoundaryKind::Capture, error));
                     }
-                    (state.chunks.pop_front(), state.eof)
+                    (
+                        state.chunks.pop_front(),
+                        state.eof || state.buffer_cap_reached,
+                    )
                 };
                 match next {
                     (Some(chunk), _) => {
@@ -2771,7 +2777,12 @@ impl ActiveCapture for PipeWireActiveCapture {
                 return Err(BoundaryError::new(BoundaryKind::Capture, error));
             }
             self.validate_audio()?;
-            Ok(CapturedAudio::new(std::mem::take(&mut self.pcm)))
+            let pcm = std::mem::take(&mut self.pcm);
+            if self.state.lock().unwrap().buffer_cap_reached {
+                Ok(CapturedAudio::truncated(pcm, CaptureLimit::Buffer))
+            } else {
+                Ok(CapturedAudio::new(pcm))
+            }
         })
     }
 

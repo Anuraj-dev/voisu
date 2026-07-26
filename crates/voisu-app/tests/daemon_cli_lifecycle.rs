@@ -6044,6 +6044,38 @@ fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
 }
 
 #[test]
+fn synthetic_pcm_past_the_buffer_cap_delivers_a_non_empty_transcript() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
+            ("VOISU_TEST_BUFFER_CAP_AFTER_CHUNKS", "2"),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Retain the captured dictation.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "Retain the captured dictation.",
+            ),
+        ],
+    );
+
+    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    wait_for_status(runtime.path(), "idle\n");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    assert_eq!(
+        record["final_transcript"],
+        "Retain the captured dictation.",
+        "{history}"
+    );
+    assert_eq!(record["delivery_count"], 1, "{history}");
+}
+
+#[test]
 fn trigger_key_permission_denial_leaves_cli_control_usable() {
     let runtime = TempDir::new().unwrap();
     // The controlled desktop refuses the BindShortcuts request over the bus.

@@ -25,7 +25,7 @@ use voisu_app::system::{
 use voisu_app::config::DeliveryMode;
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
-    CancelRegistry, CapturedAudio, Command, DaemonState, DeliveryAdapter, DeliveryMethod,
+    CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonState, DeliveryAdapter, DeliveryMethod,
     DeliveryOutcome, DiagnosticRecord, DiagnosticStore, LifecycleEvidence, LifecycleStage,
     OverlayEvent, OverlayOutcome,
     MergeResult, PROTOCOL_VERSION, Provider,
@@ -2598,6 +2598,7 @@ struct ControlledCapture {
     chunks: u32,
     chunk_delay: Duration,
     deadline_after_chunks: Option<u32>,
+    buffer_cap_after_chunks: Option<u32>,
     /// Deterministic paused Level producer: this many frames, with lead band
     /// values 10, 20, 30, ..., are pushed once during `begin` — before the
     /// CLI's start reply — and never again, so Level IPC tests observe a
@@ -2646,6 +2647,9 @@ impl ControlledCapture {
             deadline_after_chunks: std::env::var("VOISU_TEST_DEADLINE_AFTER_CHUNKS")
                 .ok()
                 .and_then(|value| value.parse().ok()),
+            buffer_cap_after_chunks: std::env::var("VOISU_TEST_BUFFER_CAP_AFTER_CHUNKS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
             level_frames: std::env::var("VOISU_TEST_LEVEL_FRAMES")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -2683,7 +2687,9 @@ impl AudioCapture for ControlledCapture {
             remaining_chunks: self.chunks,
             chunk_delay: self.chunk_delay,
             deadline_after_chunks: self.deadline_after_chunks,
+            buffer_cap_after_chunks: self.buffer_cap_after_chunks,
             chunks_emitted: 0,
+            buffer_cap_reached: false,
         }))
     }
 }
@@ -2697,7 +2703,9 @@ struct ControlledActiveCapture {
     remaining_chunks: u32,
     chunk_delay: Duration,
     deadline_after_chunks: Option<u32>,
+    buffer_cap_after_chunks: Option<u32>,
     chunks_emitted: u32,
+    buffer_cap_reached: bool,
 }
 
 impl ActiveCapture for ControlledActiveCapture {
@@ -2717,6 +2725,12 @@ impl ActiveCapture for ControlledActiveCapture {
                     BoundaryKind::RecordingDeadline,
                     "controlled Recording Deadline elapsed",
                 ));
+            }
+            if let Some(limit) = self.buffer_cap_after_chunks
+                && self.chunks_emitted >= limit
+            {
+                self.buffer_cap_reached = true;
+                return Ok(None);
             }
             if self.remaining_chunks == 0 {
                 std::future::pending::<()>().await;
@@ -2747,6 +2761,11 @@ impl ActiveCapture for ControlledActiveCapture {
                 Err(BoundaryError::new(
                     BoundaryKind::Capture,
                     "controlled-secret-capture-detail",
+                ))
+            } else if self.buffer_cap_reached {
+                Ok(CapturedAudio::truncated(
+                    vec![1_u8; 3_200],
+                    CaptureLimit::Buffer,
                 ))
             } else {
                 Ok(CapturedAudio::new(vec![1_u8; 3_200]))
