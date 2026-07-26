@@ -6144,6 +6144,35 @@ fn provider_stream_error_aborts_instead_of_delivering_retained_audio() {
 }
 
 #[test]
+fn self_terminating_recording_publishes_a_terminal_outcome_and_operator_line() {
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
+            ("VOISU_TEST_DEADLINE_AFTER_CHUNKS", "2"),
+        ],
+    );
+
+    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    wait_for_status(runtime.path(), "idle\n");
+
+    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(observed["overlay_event"]["outcome"], "recording_deadline", "{observed}");
+    assert_eq!(
+        observed["overlay_event"]["message"],
+        "Recording Deadline elapsed",
+        "{observed}"
+    );
+
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains("Recording 1: controlled Recording Deadline elapsed"),
+        "{diagnostics}"
+    );
+}
+
+#[test]
 fn trigger_key_permission_denial_leaves_cli_control_usable() {
     let runtime = TempDir::new().unwrap();
     // The controlled desktop refuses the BindShortcuts request over the bus.
