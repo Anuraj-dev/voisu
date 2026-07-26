@@ -424,18 +424,18 @@ async fn repeated_dictionary_term_does_not_manufacture_a_winning_signal() {
         Duration::from_millis(50),
         vec!["Voisu".to_owned()],
     );
-    let groq = "Voisu voisu handles the final transcript for careful review after every completed dictation.";
+    let deepgram = "Voisu Voisu handles the final transcript for careful review after every completed dictation.";
+    let groq = deepgram.replacen("Voisu Voisu", "Voisu voisu", 1);
 
     let decision = pipeline
         .decide(vec![
             SourceTranscript {
                 provider: Provider::Deepgram,
-                text: "Voisu Voisu handles the final transcript for careful review after every completed dictation."
-                    .to_owned(),
+                text: deepgram.to_owned(),
             },
             SourceTranscript {
                 provider: Provider::Groq,
-                text: groq.to_owned(),
+                text: groq.clone(),
             },
         ])
         .await
@@ -459,6 +459,7 @@ async fn overlapping_dictionary_terms_count_the_canonical_span_once() {
     );
     let deepgram =
         "Claude Code reviews the final transcript before the desktop application delivers it.";
+    let groq = deepgram.to_lowercase();
 
     let decision = pipeline
         .decide(vec![
@@ -468,8 +469,7 @@ async fn overlapping_dictionary_terms_count_the_canonical_span_once() {
             },
             SourceTranscript {
                 provider: Provider::Groq,
-                text: "claude code reviews the final transcript before the desktop application delivers it."
-                    .to_owned(),
+                text: groq,
             },
         ])
         .await
