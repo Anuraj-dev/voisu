@@ -939,11 +939,28 @@ pub struct TranscriptDecision {
 pub struct TranscriptDecisionPipeline<M> {
     model: M,
     deadline: Duration,
+    dictionary_terms: Vec<String>,
 }
 
 impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
     pub fn new(model: M, deadline: Duration) -> Self {
-        Self { model, deadline }
+        Self {
+            model,
+            deadline,
+            dictionary_terms: Vec::new(),
+        }
+    }
+
+    pub fn with_dictionary_terms(
+        model: M,
+        deadline: Duration,
+        dictionary_terms: Vec<String>,
+    ) -> Self {
+        Self {
+            model,
+            deadline,
+            dictionary_terms,
+        }
     }
 
     pub async fn decide(
@@ -956,21 +973,34 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             sources.iter().find(|source| source.provider == Provider::Groq),
         ) {
             if source_similarity(&deepgram.text, &groq.text) >= 0.85 {
-                if let Some(reason) = quality_failure_reason(&groq.text, &sources) {
+                let (winner, evidence) = near_identical_selection(
+                    &deepgram.text,
+                    &groq.text,
+                    &self.dictionary_terms,
+                );
+                let selected = match winner {
+                    GateWinner::Left => deepgram,
+                    GateWinner::Right => groq,
+                };
+                if let Some(reason) = source_quality_failure_reason(&selected.text, &sources) {
                     return self
                         .repair_candidate(
                             &sources,
-                            MergeResult(groq.text.trim().to_owned()),
+                            MergeResult(selected.text.trim().to_owned()),
                             reason,
                             false,
                         )
                         .await;
                 }
                 return Ok(TranscriptDecision {
-                    transcript: Transcript(groq.text.trim().to_owned()),
-                    selection: TranscriptSelection::NearIdenticalGroq,
-                    validation_reason: "near-identical Source Transcripts passed validation"
-                        .to_owned(),
+                    transcript: Transcript(selected.text.trim().to_owned()),
+                    selection: match selected.provider {
+                        Provider::Deepgram => TranscriptSelection::SourceDeepgram,
+                        Provider::Groq => TranscriptSelection::NearIdenticalGroq,
+                    },
+                    validation_reason: format!(
+                        "near-identical Source Transcripts passed validation; {evidence}"
+                    ),
                     fallback_reason: None,
                     reconciliation_requested: false,
                     recovery_attempted: false,
@@ -995,7 +1025,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                     GateWinner::Left => deepgram,
                     GateWinner::Right => groq,
                 };
-                if quality_failure_reason(&winner.text, &sources).is_none() {
+                if source_quality_failure_reason(&winner.text, &sources).is_none() {
                     return Ok(TranscriptDecision {
                         transcript: Transcript(winner.text.trim().to_owned()),
                         selection: match winner.provider {
@@ -1053,7 +1083,11 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                     }
                 }
             };
-            if let Some(reason) = quality_failure_reason(&merge_result.0, &sources) {
+            if let Some(failure) = quality_failure_reason(&merge_result.0, &sources) {
+                let reason = failure.reason();
+                if failure.is_contraction() {
+                    return longer_source_fallback(&sources, reason, true, false);
+                }
                 return self
                     .repair_candidate(&sources, merge_result, reason, true)
                     .await;
@@ -1071,7 +1105,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         let source = sources.first().ok_or_else(|| {
             BoundaryError::new(BoundaryKind::Validation, "no Source Transcript")
         })?;
-        if let Some(reason) = quality_failure_reason(&source.text, &sources) {
+        if let Some(reason) = source_quality_failure_reason(&source.text, &sources) {
             return self
                 .repair_candidate(
                     &sources,
@@ -1098,7 +1132,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         &mut self,
         sources: &[SourceTranscript],
         candidate: MergeResult,
-        reason: &'static str,
+        reason: String,
         reconciliation_requested: bool,
     ) -> Result<TranscriptDecision, BoundaryError> {
         let repaired = {
@@ -1137,7 +1171,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 }
             }
         };
-        if let Some(repair_reason) = quality_failure_reason(&repaired.0, sources) {
+        if let Some(repair_reason) = source_quality_failure_reason(&repaired.0, sources) {
             return clean_source_fallback(
                 sources,
                 format!("recovery produced {repair_reason}"),
@@ -1156,6 +1190,41 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
     }
 }
 
+fn longer_source_fallback(
+    sources: &[SourceTranscript],
+    reason: String,
+    reconciliation_requested: bool,
+    recovery_attempted: bool,
+) -> Result<TranscriptDecision, BoundaryError> {
+    let source = sources
+        .iter()
+        .filter(|source| {
+            source_quality_failure_reason(&source.text, std::slice::from_ref(*source)).is_none()
+        })
+        .max_by_key(|source| normalized_words(&source.text).len())
+        .ok_or_else(|| {
+            let validation_reason = format!("{reason}; neither Source Transcript is safe");
+            BoundaryError::new(BoundaryKind::Validation, validation_reason.clone())
+                .with_transcript_failure(TranscriptFailureEvidence {
+                    validation_reason,
+                    fallback_reason: Some(reason.clone()),
+                    reconciliation_requested,
+                    recovery_attempted,
+                })
+        })?;
+    Ok(TranscriptDecision {
+        transcript: Transcript(source.text.trim().to_owned()),
+        selection: match source.provider {
+            Provider::Deepgram => TranscriptSelection::SourceDeepgram,
+            Provider::Groq => TranscriptSelection::SourceGroq,
+        },
+        validation_reason: "longer Source Transcript passed validation".to_owned(),
+        fallback_reason: Some(reason),
+        reconciliation_requested,
+        recovery_attempted,
+    })
+}
+
 fn clean_source_fallback(
     sources: &[SourceTranscript],
     reason: String,
@@ -1169,7 +1238,7 @@ fn clean_source_fallback(
     let safe: Vec<&SourceTranscript> = sources
         .iter()
         .filter(|source| {
-            quality_failure_reason(&source.text, std::slice::from_ref(*source)).is_none()
+            source_quality_failure_reason(&source.text, std::slice::from_ref(*source)).is_none()
         })
         .collect();
     let source = match safe.as_slice() {
@@ -1696,6 +1765,122 @@ fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
     None
 }
 
+const CAPITALISATION_DENSITY_MARGIN: f64 = 0.05;
+const SENTENCE_PUNCTUATION_DENSITY_MARGIN: f64 = 0.02;
+
+struct FormattingEvidence {
+    capitalisation_density: f64,
+    sentence_punctuation_density: f64,
+    dictionary_matches: usize,
+}
+
+fn near_identical_selection(
+    left: &str,
+    right: &str,
+    dictionary_terms: &[String],
+) -> (GateWinner, String) {
+    let left_evidence = formatting_evidence(left, dictionary_terms);
+    let right_evidence = formatting_evidence(right, dictionary_terms);
+    let mut left_signals = 0;
+    let mut right_signals = 0;
+
+    if left_evidence.capitalisation_density - right_evidence.capitalisation_density
+        >= CAPITALISATION_DENSITY_MARGIN
+    {
+        left_signals += 1;
+    } else if right_evidence.capitalisation_density - left_evidence.capitalisation_density
+        >= CAPITALISATION_DENSITY_MARGIN
+    {
+        right_signals += 1;
+    }
+    if left_evidence.sentence_punctuation_density
+        - right_evidence.sentence_punctuation_density
+        >= SENTENCE_PUNCTUATION_DENSITY_MARGIN
+    {
+        left_signals += 1;
+    } else if right_evidence.sentence_punctuation_density
+        - left_evidence.sentence_punctuation_density
+        >= SENTENCE_PUNCTUATION_DENSITY_MARGIN
+    {
+        right_signals += 1;
+    }
+    if left_evidence.dictionary_matches > right_evidence.dictionary_matches {
+        left_signals += 1;
+    } else if right_evidence.dictionary_matches > left_evidence.dictionary_matches {
+        right_signals += 1;
+    }
+
+    let measurements = format!(
+        "capitalisation density {:.3} vs {:.3}, sentence punctuation density {:.3} vs {:.3}, dictionary matches {} vs {}",
+        left_evidence.capitalisation_density,
+        right_evidence.capitalisation_density,
+        left_evidence.sentence_punctuation_density,
+        right_evidence.sentence_punctuation_density,
+        left_evidence.dictionary_matches,
+        right_evidence.dictionary_matches,
+    );
+    if left_signals > 0 && right_signals == 0 {
+        (
+            GateWinner::Left,
+            format!(
+                "selected Deepgram on one-sided formatting evidence ({measurements})"
+            ),
+        )
+    } else {
+        (
+            GateWinner::Right,
+            format!(
+                "defaulted to Groq because formatting evidence was not one-sided ({measurements})"
+            ),
+        )
+    }
+}
+
+fn formatting_evidence(text: &str, dictionary_terms: &[String]) -> FormattingEvidence {
+    let alphabetic = text.chars().filter(|character| character.is_alphabetic()).count();
+    let uppercase = text.chars().filter(|character| character.is_uppercase()).count();
+    let words = normalized_words(text).len();
+    FormattingEvidence {
+        capitalisation_density: if alphabetic == 0 {
+            0.0
+        } else {
+            uppercase as f64 / alphabetic as f64
+        },
+        sentence_punctuation_density: if words == 0 {
+            0.0
+        } else {
+            text.chars()
+                .filter(|character| matches!(character, '.' | '?' | '!'))
+                .count() as f64
+                / words as f64
+        },
+        dictionary_matches: dictionary_terms
+            .iter()
+            .map(|term| count_exact_term_matches(text, term))
+            .sum(),
+    }
+}
+
+fn count_exact_term_matches(text: &str, term: &str) -> usize {
+    if term.is_empty() {
+        return 0;
+    }
+    text.match_indices(term)
+        .filter(|(start, matched)| {
+            let before_is_boundary = text[..*start]
+                .chars()
+                .next_back()
+                .is_none_or(|character| !character.is_alphanumeric());
+            let end = *start + matched.len();
+            let after_is_boundary = text[end..]
+                .chars()
+                .next()
+                .is_none_or(|character| !character.is_alphanumeric());
+            before_is_boundary && after_is_boundary
+        })
+        .count()
+}
+
 fn source_similarity(left: &str, right: &str) -> f64 {
     let left = normalized_words(left);
     let right = normalized_words(right);
@@ -1706,13 +1891,51 @@ fn source_similarity(left: &str, right: &str) -> f64 {
     1.0 - word_edit_distance(&left, &right) as f64 / longest as f64
 }
 
+/// The worst observed silent contraction retained 87% of the longest source.
+/// Rejecting below 90% catches all four production cases (77–87%) while an
+/// exact 90% merge remains valid.
+const MERGE_CONTRACTION_RATIO_FLOOR: f64 = 0.90;
+
+enum QualityFailure {
+    Other(&'static str),
+    Contraction { ratio: f64 },
+}
+
+impl QualityFailure {
+    fn is_contraction(&self) -> bool {
+        matches!(self, Self::Contraction { .. })
+    }
+
+    fn reason(&self) -> String {
+        match self {
+            Self::Other(reason) => (*reason).to_owned(),
+            Self::Contraction { ratio } => format!(
+                "suspicious contraction ratio {ratio:.2} below {MERGE_CONTRACTION_RATIO_FLOOR:.2}"
+            ),
+        }
+    }
+}
+
+fn source_quality_failure_reason(
+    candidate: &str,
+    sources: &[SourceTranscript],
+) -> Option<String> {
+    quality_failure_reason(candidate, sources).and_then(|failure| {
+        if failure.is_contraction() {
+            None
+        } else {
+            Some(failure.reason())
+        }
+    })
+}
+
 fn quality_failure_reason(
     candidate: &str,
     sources: &[SourceTranscript],
-) -> Option<&'static str> {
+) -> Option<QualityFailure> {
     let trimmed = candidate.trim();
     if trimmed.is_empty() || trimmed.contains('\0') || trimmed.len() > 100_000 {
-        return Some("invalid candidate text");
+        return Some(QualityFailure::Other("invalid candidate text"));
     }
     let lower = trimmed.to_lowercase();
     const PROMPT_ARTIFACTS: [&str; 8] = [
@@ -1729,7 +1952,7 @@ fn quality_failure_reason(
         .iter()
         .any(|artifact| lower.contains(artifact))
     {
-        return Some("prompt artifact");
+        return Some(QualityFailure::Other("prompt artifact"));
     }
     const META_REASONING: [&str; 6] = [
         "i think the user said",
@@ -1740,7 +1963,7 @@ fn quality_failure_reason(
         "based on the source",
     ];
     if META_REASONING.iter().any(|artifact| lower.contains(artifact)) {
-        return Some("meta-reasoning");
+        return Some(QualityFailure::Other("meta-reasoning"));
     }
     const HALLUCINATED_SUFFIXES: [&str; 5] = [
         "thank you for watching",
@@ -1753,14 +1976,14 @@ fn quality_failure_reason(
         .iter()
         .any(|suffix| lower.contains(suffix))
     {
-        return Some("hallucinated suffix");
+        return Some(QualityFailure::Other("hallucinated suffix"));
     }
     if script_count(trimmed) >= 3
         || trimmed
             .split_whitespace()
             .any(token_mixes_confusable_scripts)
     {
-        return Some("mixed-script garbage");
+        return Some(QualityFailure::Other("mixed-script garbage"));
     }
     let source_words = sources
         .iter()
@@ -1768,8 +1991,16 @@ fn quality_failure_reason(
         .max()
         .unwrap_or(0);
     let candidate_words = normalized_words(trimmed).len();
-    if source_words > 0 && candidate_words > source_words.saturating_mul(2).saturating_add(8) {
-        return Some("suspicious expansion");
+    if source_words > 0 {
+        let contraction_ratio = candidate_words as f64 / source_words as f64;
+        if sources.len() >= 2 && contraction_ratio < MERGE_CONTRACTION_RATIO_FLOOR {
+            return Some(QualityFailure::Contraction {
+                ratio: contraction_ratio,
+            });
+        }
+        if candidate_words > source_words.saturating_mul(2).saturating_add(8) {
+            return Some(QualityFailure::Other("suspicious expansion"));
+        }
     }
     None
 }

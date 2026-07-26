@@ -4610,7 +4610,14 @@ fn near_identical_source_transcripts_skip_reconciliation_and_deliver_once() {
     assert_eq!(stopped["evidence"]["delivery_count"], 1);
     assert_eq!(
         stopped["evidence"]["transcript_selection"],
-        "near_identical_groq"
+        "source_deepgram"
+    );
+    assert!(
+        stopped["evidence"]["validation_reason"]
+            .as_str()
+            .unwrap()
+            .contains("sentence punctuation density"),
+        "{stopped}"
     );
     assert_eq!(stopped["evidence"]["reconciliation_requested"], false);
     assert_eq!(stopped["evidence"]["recovery_attempted"], false);
@@ -7876,7 +7883,7 @@ fn completed_recording_is_correlated_in_local_history_and_export_redacts_secrets
     assert_eq!(records.len(), 1, "one completed Recording is retained: {history}");
     let record = &records[0];
     assert_eq!(record["correlation_id"], correlation_id);
-    assert_eq!(record["final_transcript"], "Ship the release on Friday");
+    assert_eq!(record["final_transcript"], "Ship the release on Friday.");
     assert_eq!(record["source_transcripts"].as_array().unwrap().len(), 2);
     assert!(record["validation_reason"].is_string());
     assert!(record["provider_timings_ms"].is_array());
@@ -7996,7 +8003,7 @@ fn fixed_fixture_replays_through_provider_and_validation_boundaries() {
         replayed["evidence"]["source_transcript_providers"],
         serde_json::json!(["deepgram", "groq"])
     );
-    assert_eq!(replayed["evidence"]["transcript_selection"], "near_identical_groq");
+    assert_eq!(replayed["evidence"]["transcript_selection"], "source_deepgram");
     // The daemon stays reusable after a replay: a real Recording still works.
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
@@ -8101,7 +8108,7 @@ fn cli_history_renders_the_complete_bounded_records() {
         .expect("voisu history --json prints structured JSON");
     let record = &records[0];
     assert!(record["correlation_id"].as_str().unwrap().starts_with("rec-"));
-    assert_eq!(record["final_transcript"], "Render the full record");
+    assert_eq!(record["final_transcript"], "Render the full record.");
     assert_eq!(record["source_transcripts"].as_array().unwrap().len(), 2);
     assert!(record["validation_reason"].is_string());
     assert!(record["provider_timings_ms"].is_array());

@@ -3069,9 +3069,10 @@ impl ControlledValidator {
             RECONCILIATION_DEADLINE
         };
         Self {
-            pipeline: TranscriptDecisionPipeline::new(
+            pipeline: TranscriptDecisionPipeline::with_dictionary_terms(
                 ControlledReconciliationModel::from_env(),
                 deadline,
+                voisu_app::dictionary::merged_terms(),
             ),
         }
     }

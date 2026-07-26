@@ -4152,9 +4152,10 @@ pub struct MergeResultValidator {
 impl MergeResultValidator {
     pub fn new() -> Self {
         Self {
-            pipeline: TranscriptDecisionPipeline::new(
+            pipeline: TranscriptDecisionPipeline::with_dictionary_terms(
                 GroqReconciliationModel,
                 RECONCILIATION_DEADLINE,
+                crate::dictionary::merged_terms(),
             ),
         }
     }

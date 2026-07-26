@@ -193,18 +193,221 @@ async fn near_identical_source_transcripts_select_groq_without_reconciliation() 
             },
             SourceTranscript {
                 provider: Provider::Groq,
-                text: "Schedule the review for Tuesday morning".to_owned(),
+                text: "Schedule the review for Tuesday morning.".to_owned(),
             },
         ])
         .await
         .unwrap();
 
-    assert_eq!(decision.transcript.0, "Schedule the review for Tuesday morning");
+    assert_eq!(decision.transcript.0, "Schedule the review for Tuesday morning.");
     assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
+    assert!(decision.validation_reason.contains("defaulted to Groq"));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(!decision.reconciliation_requested);
     assert!(!decision.recovery_attempted);
     assert!(decision.fallback_reason.is_none());
+}
+
+#[tokio::test]
+async fn near_identical_source_transcripts_select_the_clearly_better_formatted_text() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+    let deepgram = "Voisu preserves every spoken word. Please review the final transcript before delivery.";
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: deepgram.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "voisu preserves every spoken word please review the final transcript before delivery"
+                    .to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, deepgram);
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(decision.validation_reason.contains("capitalisation"));
+    assert!(decision.validation_reason.contains("sentence punctuation"));
+}
+
+#[tokio::test]
+async fn near_identical_source_transcripts_prefer_an_exact_dictionary_term_match() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::with_dictionary_terms(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+        vec!["Voisu".to_owned()],
+    );
+    let deepgram = "Voisu handles the final transcript while the desktop application keeps the recording history available for careful review after every completed dictation.";
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: deepgram.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "voice so handles the final transcript while the desktop application keeps the recording history available for careful review after every completed dictation."
+                    .to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, deepgram);
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(decision.validation_reason.contains("dictionary matches 1 vs 0"));
+}
+
+#[tokio::test]
+async fn drastically_shorter_merge_falls_back_to_the_longer_source() {
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let deepgram = "Book the conference room for Tuesday afternoon and invite the entire design review team today.";
+    let groq = "Schedule the conference room on Wednesday morning and invite the platform review group.";
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::clone(&kinds),
+            text: "Book the room Tuesday.".to_owned(),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: deepgram.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: groq.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, deepgram);
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert!(decision.reconciliation_requested);
+    assert!(!decision.recovery_attempted);
+    let reason = decision
+        .fallback_reason
+        .expect("a rejected contraction records its measured ratio");
+    assert!(reason.contains("contraction ratio 0.27"), "unexpected reason: {reason}");
+    assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
+}
+
+#[tokio::test]
+async fn legitimate_merge_at_the_contraction_floor_is_delivered() {
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let shared: Vec<String> = (0..80).map(|index| format!("shared{index}")).collect();
+    let deepgram = shared
+        .iter()
+        .cloned()
+        .chain((80..100).map(|index| format!("deepgram{index}")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let groq = shared
+        .iter()
+        .cloned()
+        .chain((80..100).map(|index| format!("groq{index}")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let merge = deepgram
+        .split_whitespace()
+        .take(90)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::clone(&kinds),
+            text: merge.clone(),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: deepgram,
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: groq,
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, merge);
+    assert_eq!(decision.selection, TranscriptSelection::Reconciled);
+    assert!(decision.fallback_reason.is_none());
+    assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
+}
+
+#[tokio::test]
+async fn observed_production_contraction_ratios_are_rejected() {
+    let shared: Vec<String> = (0..80).map(|index| format!("shared{index}")).collect();
+    let deepgram_words = shared
+        .iter()
+        .cloned()
+        .chain((80..100).map(|index| format!("deepgram{index}")))
+        .collect::<Vec<_>>();
+    let groq_words = shared
+        .iter()
+        .cloned()
+        .chain((80..100).map(|index| format!("groq{index}")))
+        .collect::<Vec<_>>();
+    let deepgram = deepgram_words.join(" ");
+    let groq = groq_words.join(" ");
+
+    for (candidate_words, expected_ratio) in [(87, "0.87"), (79, "0.79"), (79, "0.79"), (77, "0.77")] {
+        let mut pipeline = TranscriptDecisionPipeline::new(
+            SuccessfulModel {
+                kinds: Arc::new(Mutex::new(Vec::new())),
+                text: deepgram_words[..candidate_words].join(" "),
+            },
+            Duration::from_millis(50),
+        );
+
+        let decision = pipeline
+            .decide(vec![
+                SourceTranscript {
+                    provider: Provider::Deepgram,
+                    text: deepgram.clone(),
+                },
+                SourceTranscript {
+                    provider: Provider::Groq,
+                    text: groq.clone(),
+                },
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(decision.transcript.0.split_whitespace().count(), 100);
+        assert!(!decision.recovery_attempted);
+        let reason = decision.fallback_reason.expect("contraction records its ratio");
+        assert!(
+            reason.contains(&format!("contraction ratio {expected_ratio}")),
+            "candidate with {candidate_words} words recorded unexpected reason: {reason}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -499,7 +702,7 @@ async fn repeated_command_dictation_is_not_discarded_as_degenerate() {
     let mut pipeline = TranscriptDecisionPipeline::new(
         SuccessfulModel {
             kinds: Arc::clone(&kinds),
-            text: "Start stop reset start stop reset start stop reset.".to_owned(),
+            text: "Start stop reset start stop reset start stop reset while the quiet village square waits before sunrise.".to_owned(),
         },
         Duration::from_millis(50),
     );
@@ -617,7 +820,7 @@ async fn genuine_repeated_commands_with_one_shared_word_are_not_discarded_as_sto
     let mut pipeline = TranscriptDecisionPipeline::new(
         SuccessfulModel {
             kinds: Arc::clone(&kinds),
-            text: "Start stop reset pause the cluster.".to_owned(),
+            text: "Start stop reset pause start stop reset pause start stop reset pause while the cluster restarts gracefully.".to_owned(),
         },
         Duration::from_millis(50),
     );
@@ -861,7 +1064,7 @@ async fn legitimate_repetitive_jargon_is_not_flagged_degenerate() {
     let mut pipeline = TranscriptDecisionPipeline::new(
         SuccessfulModel {
             kinds: Arc::clone(&kinds),
-            text: "The kubelet restarts the pod.".to_owned(),
+            text: "The kubelet restarts the pod and the scheduler reschedules it onto another node while Redis keeps the session token available for the gateway.".to_owned(),
         },
         Duration::from_millis(50),
     );
