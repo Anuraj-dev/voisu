@@ -1509,6 +1509,48 @@ async fn clean_source_fallback_selects_by_quality_not_a_fixed_provider() {
     assert!(decision.fallback_reason.unwrap().contains("cloud reconciliation failed"));
 }
 
+/// A provider transcribing silence or noise can return punctuation only
+/// ("..."), which normalises to ZERO words while passing every text-shaped
+/// guard. Such a pair skips the divergence gate's garbage verdicts entirely
+/// (`fewer == 0` returns None before they are computed), so the fallback
+/// arms must never treat the wordless side as a deliverable Source
+/// Transcript: typing "..." into the user's window while the sibling heard
+/// actual words hands the user nothing at all. Before the fix, the fallback's
+/// one-sided garbage tier did exactly that — the filler loop was garbage, the
+/// wordless side was not, and the dots were delivered.
+#[tokio::test]
+async fn a_wordless_source_transcript_is_never_delivered_over_heard_words() {
+    let deepgram = "Yeah, yeah, yeah, yeah, yeah, yeah, yeah.";
+    let mut pipeline =
+        TranscriptDecisionPipeline::new(FailingReconcileModel, Duration::from_millis(50));
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: deepgram.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "...".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(decision.transcript.0, deepgram);
+    assert!(decision.reconciliation_requested);
+    assert!(
+        decision
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("cloud reconciliation failed")),
+        "{:?}",
+        decision.fallback_reason
+    );
+}
+
 #[tokio::test]
 async fn unique_word_salad_with_no_cross_agreement_is_gated_and_dictation_wins() {
     // §3.4: a fluent all-unique-word salad shares NO content words with the
