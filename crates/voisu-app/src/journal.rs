@@ -1,9 +1,12 @@
 //! The operator-facing journal lines a finished Recording emits.
 //!
-//! The first line preserves the historical human-readable message verbatim. The
-//! second is a stable, timing-only machine record; it never interpolates the
-//! diagnostic, so multiline or unusually long boundary output cannot split or
-//! displace its keys.
+//! The first line preserves the historical human-readable message, with control
+//! characters escaped so the message cannot end the entry (journald splits the
+//! daemon's stderr on `\n`, and the boundary diagnostic carries a subprocess's
+//! own stderr — see [`escape_control`]). The second is a stable, timing-only
+//! machine record; it never interpolates the diagnostic, so multiline or
+//! unusually long boundary output cannot split or displace its keys, nor forge
+//! a record of its own.
 //!
 //! ```text
 //! Recording <id>: <message>
@@ -42,7 +45,7 @@ pub fn recording_journal_lines(
         None => (DELIVERED_MESSAGE, "ok"),
     };
     RecordingJournalLines {
-        human: format!("Recording {recording_id}: {message}"),
+        human: format!("Recording {recording_id}: {}", escape_control(message)),
         structured: format!(
             "Recording {recording_id}: outcome={outcome} correlation_id={} \
              first_chunk_ms={} capture_finalized_ms={} provider_timings_ms={} \
@@ -54,6 +57,40 @@ pub fn recording_journal_lines(
             render_millis(evidence.release_to_text_ms),
         ),
     }
+}
+
+/// Escapes the control characters that would otherwise let a boundary
+/// diagnostic forge a journal entry.
+///
+/// journald splits the daemon's stderr stream into entries on `\n`, and the
+/// boundary diagnostic is not Voisu's text: `capture_process_error` embeds a
+/// subprocess's stderr verbatim. A `pw-record` whose stderr contained
+/// `\nRecording 7: outcome=ok correlation_id=… release_to_text_ms=…` would
+/// therefore produce a journal entry byte-identical to a genuine structured
+/// record, and an operator computing percentiles by grepping `outcome=` would
+/// silently ingest fabricated data points.
+///
+/// The message itself is preserved — spec §4 fixes the message text, and
+/// escaping a control byte is not changing the message. The escape is lossless
+/// and reversible, so the historical detail is still fully readable; it just
+/// cannot end the entry any more.
+fn escape_control(message: &str) -> std::borrow::Cow<'_, str> {
+    if !message.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(message);
+    }
+    let mut escaped = String::with_capacity(message.len() + 8);
+    for character in message.chars() {
+        match character {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            control if control.is_control() => {
+                escaped.push_str(&format!("\\u{{{:04x}}}", control as u32));
+            }
+            plain => escaped.push(plain),
+        }
+    }
+    std::borrow::Cow::Owned(escaped)
 }
 
 /// A correlation ID is daemon-generated and space-free, but an empty one (an
@@ -189,9 +226,17 @@ mod tests {
             &evidence(),
             Some("pw-record failed\nALSA device disappeared"),
         );
+        // journald splits the daemon's stderr on `\n`, so a raw newline here
+        // would make the boundary detail its own journal entry. The message is
+        // unchanged; only the control byte is escaped, losslessly.
         assert_eq!(
             lines.human,
-            "Recording 7: pw-record failed\nALSA device disappeared"
+            "Recording 7: pw-record failed\\nALSA device disappeared"
+        );
+        assert!(
+            !lines.human.contains('\n'),
+            "the human line must stay one journal entry: {}",
+            lines.human
         );
         assert_eq!(
             lines.structured,
@@ -201,6 +246,71 @@ mod tests {
         );
         assert!(!lines.structured.contains("pw-record"));
         assert!(!lines.structured.contains('\n'));
+    }
+
+    #[test]
+    fn a_diagnostic_cannot_forge_a_structured_journal_line() {
+        // `capture_process_error` embeds a subprocess's stderr verbatim in the
+        // boundary diagnostic. journald splits stderr on `\n`, so an embedded
+        // newline does not wrap the human line — it STARTS A NEW JOURNAL ENTRY
+        // whose text the subprocess fully controls. An operator, or a script
+        // computing percentiles by grepping `outcome=`, would then ingest a
+        // fabricated data point it cannot tell from a genuine record.
+        let forged = "Recording 7: outcome=ok correlation_id=rec-forged \
+                      first_chunk_ms=1 capture_finalized_ms=1 \
+                      provider_timings_ms=deepgram:1 release_to_text_ms=1";
+        let lines =
+            recording_journal_lines(7, &evidence(), Some(&format!("pw-record failed\n{forged}")));
+
+        assert_eq!(
+            lines.human.lines().count(),
+            1,
+            "a diagnostic must never produce a second journal entry: {}",
+            lines.human
+        );
+        assert!(
+            !lines.human.contains('\n') && !lines.human.contains('\r'),
+            "no entry separator may survive into the human line: {}",
+            lines.human
+        );
+        // The forged text stays readable — it is escaped, not censored — but it
+        // is now unambiguously part of the human line's message.
+        assert_eq!(
+            lines.human,
+            format!("Recording 7: pw-record failed\\n{forged}")
+        );
+        assert!(
+            lines
+                .human
+                .starts_with("Recording 7: pw-record failed\\nRecording 7: outcome=ok"),
+            "{}",
+            lines.human
+        );
+    }
+
+    #[test]
+    fn every_control_character_in_a_diagnostic_is_escaped_onto_one_line() {
+        let lines =
+            recording_journal_lines(3, &evidence(), Some("carriage\rtab\tnull\u{0}bell\u{7}"));
+        assert_eq!(
+            lines.human,
+            "Recording 3: carriage\\rtab\\tnull\\u{0000}bell\\u{0007}"
+        );
+        assert!(
+            !lines.human.chars().any(char::is_control),
+            "no control byte may reach the journal: {:?}",
+            lines.human
+        );
+    }
+
+    #[test]
+    fn a_diagnostic_without_control_characters_is_passed_through_untouched() {
+        let lines = recording_journal_lines(4, &evidence(), Some(r"C:\path\not\escaped"));
+        assert_eq!(
+            lines.human,
+            r"Recording 4: C:\path\not\escaped",
+            "escaping must not rewrite backslashes that are already literal text"
+        );
     }
 
     #[test]
