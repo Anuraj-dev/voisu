@@ -1187,22 +1187,44 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 }
             }
         };
-        // The merge contraction floor is deliberately NOT applied here: repair's
-        // entire job is to DELETE unsafe text, so a correct repair is shorter
-        // than the sources it was derived from. Measuring it against the longest
-        // Source Transcript turns every successful repair of a short dictation
-        // into a refusal — and when the offending phrase is in both sources
-        // (e.g. the ordinary speech "the user said", which the meta-reasoning
-        // guard lists), the source fallback has nothing safe left and the
-        // dictation is lost. The floor belongs to the reconcile-merge output,
-        // which is expected to preserve everything both providers heard.
-        if let Some(reason) = non_contraction_quality_failure_reason(&repaired.0, sources) {
+        let failure = quality_failure_reason(&repaired.0, sources);
+        if let Some(failure) = &failure {
+            if !failure.is_contraction() {
+                return clean_source_fallback(
+                    sources,
+                    format!("recovery produced {}", failure.reason()),
+                    reconciliation_requested,
+                    true,
+                );
+            }
+        }
+        if !is_source_derived(&repaired.0, sources) {
             return clean_source_fallback(
                 sources,
-                format!("recovery produced {reason}"),
+                "recovery produced words no Source Transcript contains".to_owned(),
                 reconciliation_requested,
                 true,
             );
+        }
+        if let Some(failure) = failure {
+            // The repair contracted past the merge floor. It is built out of
+            // words the providers heard and is otherwise clean, so it is still
+            // the user's speech — but a complete Source Transcript carries more
+            // of it, and preferring one is exactly what the floor is for.
+            //
+            // The floor decides PREFERENCE, not delivery. When the offending
+            // text was in both Source Transcripts, neither is safe and this
+            // repair is all that is left of the Recording; refusing it there
+            // was the round-1 P0. So a failure to find a clean source hands the
+            // repair over rather than losing the dictation.
+            if let Ok(decision) = clean_source_fallback(
+                sources,
+                format!("recovery produced {}", failure.reason()),
+                reconciliation_requested,
+                true,
+            ) {
+                return Ok(decision);
+            }
         }
         Ok(TranscriptDecision {
             transcript: Transcript(repaired.0.trim().to_owned()),
@@ -1893,8 +1915,6 @@ struct FormattingEvidence {
 struct FormattingComparison {
     left_signals: usize,
     right_signals: usize,
-    left_dictionary_matches: usize,
-    right_dictionary_matches: usize,
     measurements: String,
 }
 
@@ -1902,12 +1922,6 @@ impl FormattingComparison {
     /// True when one side won at least one signal and the other won none.
     fn favours_left(&self) -> bool {
         self.left_signals > 0 && self.right_signals == 0
-    }
-
-    /// How many more distinct dictionary terms the left side spelled correctly.
-    fn left_dictionary_advantage(&self) -> usize {
-        self.left_dictionary_matches
-            .saturating_sub(self.right_dictionary_matches)
     }
 }
 
@@ -1951,9 +1965,13 @@ fn near_identical_selection(
 /// (matches are distinct and non-overlapping). So it may also decide when the
 /// lengths differ — including when the winner is SHORTER, which is exactly the
 /// "Voisu" / "voice so" case, where the loser's extra word is not extra speech
-/// but the same word misheard as two. That licence is bounded: the winner may
-/// give up at most one word per extra term it got right. Anything beyond that
-/// is a provider that heard less, and the standing Groq default holds.
+/// but the same word misheard as two.
+///
+/// That licence is structural, not numeric. A word budget ("one extra word per
+/// extra term") cannot express it: "Voisu" heard as "voice so" and a dropped
+/// "not" three words from the term produce the identical 1-versus-1 arithmetic
+/// and opposite meanings, so any budget that admits the first admits handing
+/// the user "do deploy" when they said "do not deploy".
 fn lexically_different_selection(
     left: &str,
     right: &str,
@@ -1982,17 +2000,71 @@ fn lexically_different_selection(
             ),
         );
     }
-    let advantage = comparison.left_dictionary_advantage();
-    let deficit = right_words.saturating_sub(left_words);
-    if advantage > 0 && deficit <= advantage {
+    if let Some(term) = misheard_dictionary_term(left, right, dictionary_terms) {
         return (
             GateWinner::Left,
             format!(
-                "lexically different Source Transcripts; selected Deepgram on {advantage} dictionary term(s) Groq missed ({measurements})"
+                "lexically different Source Transcripts; selected Deepgram because their only difference is the dictionary term \"{term}\", which Groq misheard ({measurements})"
             ),
         );
     }
-    groq_default("without length-sensitive formatting comparison across texts of different lengths")
+    groq_default("because the Source Transcripts differ by more than a misheard dictionary term")
+}
+
+/// The dictionary term whose misrecognition is the ONLY lexical difference
+/// between two near-identical Source Transcripts, if there is one.
+///
+/// Two conditions, both structural, both computed over the normalised word
+/// sequences:
+///
+/// 1. The words the left text has and the right text lacks are exactly one
+///    dictionary term. Nothing else may be surplus — that is what stops a
+///    padded transcript from riding a length-sensitive formatting win.
+/// 2. The words the right text has and the left text lacks, run together, sound
+///    like that term. A term split into ordinary words is what a misrecognition
+///    looks like ("voisu" heard as "voice so"); a dropped "not" is not, however
+///    close to the term it sits.
+///
+/// Together they say: the two providers heard the same words, and one of them
+/// spelled the user's term while the other spelled it as noise. Every other
+/// difference — a word one provider lost, a word the other invented — fails
+/// them, and the standing Groq default holds.
+fn misheard_dictionary_term<'terms>(
+    left: &str,
+    right: &str,
+    dictionary_terms: &'terms [String],
+) -> Option<&'terms str> {
+    let left_words = normalized_words(left);
+    let right_words = normalized_words(right);
+    let left_only = surplus_words(&left_words, &right_words);
+    let right_only = surplus_words(&right_words, &left_words).concat();
+    dictionary_terms.iter().find(|term| {
+        let term_words = normalized_words(term);
+        !term_words.is_empty()
+            && left_only == term_words
+            && words_sound_alike(&right_only, &term_words.concat())
+    }).map(String::as_str)
+}
+
+/// The words `words` holds that `other` does not, as a multiset difference in
+/// `words` order: a word cancels one occurrence on the other side, so a
+/// repeated word is surplus exactly as often as it is repeated.
+fn surplus_words(words: &[String], other: &[String]) -> Vec<String> {
+    let mut available: HashMap<&str, usize> = HashMap::new();
+    for word in other {
+        *available.entry(word.as_str()).or_default() += 1;
+    }
+    words
+        .iter()
+        .filter(|word| match available.get_mut(word.as_str()) {
+            Some(remaining) if *remaining > 0 => {
+                *remaining -= 1;
+                false
+            }
+            _ => true,
+        })
+        .cloned()
+        .collect()
 }
 
 fn compare_formatting(
@@ -2050,8 +2122,6 @@ fn compare_formatting(
     FormattingComparison {
         left_signals,
         right_signals,
-        left_dictionary_matches: left_evidence.dictionary_matches,
-        right_dictionary_matches: right_evidence.dictionary_matches,
         measurements,
     }
 }
@@ -2215,6 +2285,32 @@ fn non_contraction_quality_failure_reason(
     })
 }
 
+/// Whether every content word of a candidate is a word some Source Transcript
+/// actually contains.
+///
+/// This is the guard the length bounds cannot be: repair asks a safety-tuned
+/// model to rebuild an unsafe candidate USING ONLY the Source Transcripts, and
+/// such a model may instead decline — "I can't help with that." is short,
+/// clean, single-script, and trips nothing, yet it is not the user's speech.
+/// Derivation catches it by its one distinguishing property: its vocabulary is
+/// the model's, not the providers'. It is also the reason a repair may shrink
+/// without limit, which no ratio can allow — deleting a hallucinated tail or
+/// collapsing a repetition loop removes most of the words but invents none.
+///
+/// Stopwords are exempt. A repair that closes the gap left by a deleted span
+/// may need a connective, and no refusal is recognisable by its function words.
+fn is_source_derived(candidate: &str, sources: &[SourceTranscript]) -> bool {
+    let source_words: Vec<String> = sources
+        .iter()
+        .flat_map(|source| normalized_words(&source.text))
+        .collect();
+    let vocabulary = distinct_content_words(&source_words);
+    normalized_words(candidate)
+        .iter()
+        .filter(|word| !is_stopword(word))
+        .all(|word| vocabulary.contains(word.as_str()))
+}
+
 fn quality_failure_reason(
     candidate: &str,
     sources: &[SourceTranscript],
@@ -2224,10 +2320,18 @@ fn quality_failure_reason(
         return Some(QualityFailure::Other("invalid candidate text"));
     }
     let lower = trimmed.to_lowercase();
-    const PROMPT_ARTIFACTS: [&str; 8] = [
+    // Injection markers, matched anywhere: an instruction smuggled into the
+    // audio is unsafe wherever it lands, and none of these is ordinary speech —
+    // they are imperative instruction forms, colon-terminated role labels, or
+    // markup no speaker utters. The one entry that WAS ordinary speech,
+    // "system prompt", is gone: "let us change the system prompt" is a sentence
+    // this product's users dictate, and routing it into repair mangles or loses
+    // it. Nothing is lost by its removal — a model leaking its instructions
+    // emits the instructions, not the label, and the shapes that do leak
+    // ("System:", "<|system|>", "### instruction") are still listed.
+    const PROMPT_ARTIFACTS: [&str; 7] = [
         "ignore previous instructions",
         "ignore all instructions",
-        "system prompt",
         "system:",
         "assistant:",
         "<|system|>",
@@ -2240,6 +2344,19 @@ fn quality_failure_reason(
     {
         return Some(QualityFailure::Other("prompt artifact"));
     }
+    // Meta-reasoning is a model narrating its own task, and a model that leaks
+    // it leaks it as a PREAMBLE. The same words are ordinary English inside a
+    // sentence: "Right, so the user said the deployment failed last night" is
+    // speech, and as a bare substring "the user said" routed that dictation
+    // into repair, where the round-1 floor could refuse it outright. These
+    // markers therefore count only at the very start of the text, after any
+    // leading markup a model may wrap them in — the one position a leaked
+    // preamble always occupies.
+    //
+    // The residual is a leak that begins mid-text. That is the cheap direction:
+    // it hands the user a visible sentence to delete, whereas the false
+    // positive it replaces could cost the whole dictation. (Injection is the
+    // other list; nothing here is unsafe text, only untidy text.)
     const META_REASONING: [&str; 6] = [
         "i think the user said",
         "the user said",
@@ -2248,9 +2365,19 @@ fn quality_failure_reason(
         "here is the reconciled",
         "based on the source",
     ];
-    if META_REASONING.iter().any(|artifact| lower.contains(artifact)) {
+    let preamble = lower.trim_start_matches(|character: char| !character.is_alphanumeric());
+    if META_REASONING
+        .iter()
+        .any(|artifact| preamble.starts_with(artifact))
+    {
         return Some(QualityFailure::Other("meta-reasoning"));
     }
+    // Left as bare substrings deliberately. These are the archetypal ASR
+    // outro hallucinations, learned from captioned video, and unlike "the user
+    // said" none is unremarkable dictation. A false positive here also costs
+    // far less: the phrase is repaired away and the rest of the dictation is
+    // still delivered, because the repair path no longer refuses a text it
+    // shortened.
     const HALLUCINATED_SUFFIXES: [&str; 5] = [
         "thank you for watching",
         "thanks for watching",
