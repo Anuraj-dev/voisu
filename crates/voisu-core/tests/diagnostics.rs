@@ -16,6 +16,150 @@ fn record_at(id: u64, recorded_at_unix_ms: u64) -> DiagnosticRecord {
     record
 }
 
+/// The store's on-disk log, for tests that assert on how it is written rather
+/// than on what it contains.
+fn history_file(store_dir: &std::path::Path) -> std::path::PathBuf {
+    store_dir.join("history.jsonl")
+}
+
+/// A whole-log rewrite renames a fresh temp file into place, so it always lands
+/// on a new inode; an append writes into the file already there and keeps its
+/// inode. That makes the inode an exact witness for which path a store operation
+/// took — no clocks, no sleeps, nothing timing-dependent.
+fn history_inode(store_dir: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(history_file(store_dir)).unwrap().ino()
+}
+
+fn history_len(store_dir: &std::path::Path) -> u64 {
+    std::fs::metadata(history_file(store_dir)).unwrap().len()
+}
+
+#[test]
+fn a_read_does_not_rewrite_a_history_it_did_not_prune() {
+    // `Command::History` runs load-prune-rewrite-fsync INLINE in the lifecycle
+    // actor, so a concurrent `voisu stop` queues behind it — measured at ~250 ms
+    // at the default retention on a real disk once the store moved off tmpfs. A
+    // read that prunes nothing has nothing to write, and must not write.
+    let dir = TempDir::new().unwrap();
+    let store_dir = dir.path().join("diag");
+    let store = DiagnosticStore::open(store_dir.clone(), RetentionPolicy::default()).unwrap();
+    store
+        .record(DiagnosticRecord::new("corr-read".to_owned(), 1))
+        .unwrap();
+
+    let before_inode = history_inode(&store_dir);
+    let before_len = history_len(&store_dir);
+    for _ in 0..3 {
+        assert_eq!(store.history().unwrap().len(), 1);
+    }
+
+    assert_eq!(
+        history_inode(&store_dir),
+        before_inode,
+        "a read that pruned nothing must not rewrite the log"
+    );
+    assert_eq!(history_len(&store_dir), before_len);
+}
+
+#[test]
+fn a_recording_appends_its_record_instead_of_rewriting_the_whole_log() {
+    // The rewrite's cost scales with the ENTIRE retained history, not with the
+    // record being added: ~250 ms per dictation at the default retention on a
+    // real disk, on the completion path of every Recording.
+    let dir = TempDir::new().unwrap();
+    let store_dir = dir.path().join("diag");
+    let store = DiagnosticStore::open(store_dir.clone(), RetentionPolicy::default()).unwrap();
+    store
+        .record(DiagnosticRecord::new("corr-1".to_owned(), 1))
+        .unwrap();
+
+    let before_inode = history_inode(&store_dir);
+    let before_len = history_len(&store_dir);
+    store
+        .record(DiagnosticRecord::new("corr-2".to_owned(), 2))
+        .unwrap();
+
+    assert_eq!(
+        history_inode(&store_dir),
+        before_inode,
+        "an append must write into the existing log, not rename a rewrite over it"
+    );
+    assert!(
+        history_len(&store_dir) > before_len,
+        "the appended record must still reach the log"
+    );
+    let kept = store.history().unwrap();
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept[0].correlation_id, "corr-2", "newest first");
+
+    // The inode assertions above are not vacuous: once the log drifts past its
+    // compaction slack a record DOES rewrite it, and that path lands on a new
+    // inode. The slack floor is 8, so a one-record policy compacts at the tenth.
+    let pruning = DiagnosticStore::open(
+        store_dir.clone(),
+        RetentionPolicy {
+            max_records: 1,
+            ..RetentionPolicy::default()
+        },
+    )
+    .unwrap();
+    let before_inode = history_inode(&store_dir);
+    let mut compacted_at = None;
+    for id in 3..12u64 {
+        pruning
+            .record(DiagnosticRecord::new(format!("corr-{id}"), id))
+            .unwrap();
+        if compacted_at.is_none() && history_inode(&store_dir) != before_inode {
+            compacted_at = Some(id);
+        }
+    }
+    assert_eq!(
+        compacted_at,
+        Some(10),
+        "the log must be compacted exactly once the slack is exceeded, not every record"
+    );
+    assert_eq!(
+        pruning.history().unwrap().len(),
+        1,
+        "a drifted log still reads back as the retained set"
+    );
+}
+
+#[test]
+fn a_torn_final_line_costs_one_record_not_the_whole_history() {
+    // A crash partway through an append leaves the final line incomplete. Every
+    // record written whole must survive: one truncated JSON value would be
+    // unparseable and take the entire ring with it.
+    use std::io::Write;
+    let dir = TempDir::new().unwrap();
+    let store_dir = dir.path().join("diag");
+    let store = DiagnosticStore::open(store_dir.clone(), RetentionPolicy::default()).unwrap();
+    store
+        .record(DiagnosticRecord::new("corr-1".to_owned(), 1))
+        .unwrap();
+    store
+        .record(DiagnosticRecord::new("corr-2".to_owned(), 2))
+        .unwrap();
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(history_file(&store_dir))
+        .unwrap();
+    file.write_all(br#"{"correlation_id":"corr-3","recording_i"#)
+        .unwrap();
+    drop(file);
+
+    let kept = store.history().unwrap();
+    assert_eq!(
+        kept.len(),
+        2,
+        "a torn tail must cost only the record it tore, not the history"
+    );
+    assert_eq!(kept[0].correlation_id, "corr-2");
+    assert_eq!(kept[1].correlation_id, "corr-1");
+}
+
 #[test]
 fn correlation_id_is_unique_and_carries_the_recording_id() {
     let first = correlation_id(7);
@@ -611,18 +755,28 @@ fn export_allowlist_passes_the_groq_model_name_through() {
 fn a_preplanted_colliding_temp_file_does_not_lose_the_record() {
     let dir = TempDir::new().unwrap();
     let store_dir = dir.path().join("diag");
-    let store = DiagnosticStore::open(store_dir.clone(), RetentionPolicy::default()).unwrap();
+    // A count bound of one, so the SECOND record prunes the first and forces the
+    // atomic whole-log rewrite — the only path that uses a temp file. A record
+    // that prunes nothing is appended in place and never touches one.
+    let policy = RetentionPolicy {
+        max_records: 1,
+        ..RetentionPolicy::default()
+    };
+    let store = DiagnosticStore::open(store_dir.clone(), policy).unwrap();
+    store
+        .record(DiagnosticRecord::new("corr-first".to_owned(), 1))
+        .unwrap();
     // Adversarial: crash leftovers after PID reuse occupy the first temp names
     // this store would pick.
     for nonce in 0..3 {
         std::fs::write(
-            store_dir.join(format!("history.json.tmp.{}.{nonce}", std::process::id())),
+            store_dir.join(format!("history.jsonl.tmp.{}.{nonce}", std::process::id())),
             b"stale",
         )
         .unwrap();
     }
     store
-        .record(DiagnosticRecord::new("corr-collide".to_owned(), 1))
+        .record(DiagnosticRecord::new("corr-collide".to_owned(), 2))
         .expect("a temp-name collision must retry, not fail");
     assert!(
         store.find("corr-collide").unwrap().is_some(),
@@ -637,7 +791,7 @@ fn a_preplanted_colliding_temp_file_does_not_lose_the_record() {
             entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| name.starts_with("history.json.tmp."))
+                .is_some_and(|name| name.starts_with("history.jsonl.tmp."))
         })
         .count();
     assert_eq!(leftovers, 0, "stale temp files are purged at startup");
@@ -678,13 +832,20 @@ fn sanitize_url_rejects_malformed_hosts_and_invalid_ports() {
 fn startup_cleanup_survives_all_temp_name_candidates_being_preplanted() {
     let dir = TempDir::new().unwrap();
     let store_dir = dir.path().join("diag");
-    let store = DiagnosticStore::open(store_dir.clone(), RetentionPolicy::default()).unwrap();
+    let policy = RetentionPolicy {
+        max_records: 1,
+        ..RetentionPolicy::default()
+    };
+    let store = DiagnosticStore::open(store_dir.clone(), policy).unwrap();
+    store
+        .record(DiagnosticRecord::new("corr-before-purge".to_owned(), 1))
+        .unwrap();
     // Adversarial: every one of the 32 bounded temp-name candidates is already
     // occupied by crash leftovers. Cleanup must purge them BEFORE any history
     // rewrite, or the rewrite exhausts its retries and cleanup fails.
     for nonce in 0..32 {
         std::fs::write(
-            store_dir.join(format!("history.json.tmp.{}.{nonce}", std::process::id())),
+            store_dir.join(format!("history.jsonl.tmp.{}.{nonce}", std::process::id())),
             b"stale",
         )
         .unwrap();
@@ -692,8 +853,10 @@ fn startup_cleanup_survives_all_temp_name_candidates_being_preplanted() {
     store
         .cleanup_expired()
         .expect("cleanup must purge stale temp files before rewriting history");
+    // Prunes the earlier record, so this one needs the rewrite path and its
+    // temp file.
     store
-        .record(DiagnosticRecord::new("corr-after-purge".to_owned(), 1))
+        .record(DiagnosticRecord::new("corr-after-purge".to_owned(), 2))
         .unwrap();
     assert!(
         store.find("corr-after-purge").unwrap().is_some(),

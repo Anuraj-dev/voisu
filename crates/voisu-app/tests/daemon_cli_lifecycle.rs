@@ -8305,6 +8305,18 @@ fn seeded_diagnostics_dir(runtime_dir: &Path) -> PathBuf {
     diagnostics
 }
 
+/// Writes a seeded history in the store's on-disk shape: one JSON record per
+/// line, in append (chronological) order. Returns the bytes written.
+fn write_seeded_history(diagnostics: &Path, records: &[voisu_core::DiagnosticRecord]) -> usize {
+    let mut encoded = Vec::new();
+    for record in records {
+        serde_json::to_writer(&mut encoded, record).unwrap();
+        encoded.push(b'\n');
+    }
+    fs::write(diagnostics.join("history.jsonl"), &encoded).unwrap();
+    encoded.len()
+}
+
 /// Seeds the daemon's diagnostic store to the default count bound, with two
 /// Source Transcripts and a final Transcript at the `MAX_STORED_TEXT` clamp in
 /// every record. Returns the on-disk payload size so the test reports the exact
@@ -8340,9 +8352,7 @@ fn seed_full_diagnostic_ring(runtime_dir: &Path) -> usize {
         })
         .collect();
 
-    let encoded = serde_json::to_vec(&records).unwrap();
-    fs::write(diagnostics.join("history.json"), &encoded).unwrap();
-    encoded.len()
+    write_seeded_history(&diagnostics, &records)
 }
 
 /// Mirrors the daemon's private `DIAGNOSTIC_PAGE_BYTES`. Kept as a test-local
@@ -8390,19 +8400,24 @@ fn seed_diagnostic_beyond_one_page(runtime_dir: &Path) -> (usize, usize, usize, 
         })
         .collect();
     let correlation_id = records.last().unwrap().correlation_id.clone();
-    let encoded = serde_json::to_vec(&records).unwrap();
+
+    // The daemon pages the SERIALIZED RESPONSE, which is a JSON array, not the
+    // line-delimited on-disk log — so the page-boundary property is checked
+    // against the array encoding even though the store is seeded as JSONL.
+    let payload = serde_json::to_vec(&records).unwrap();
     assert!(
-        encoded.len() > DIAGNOSTIC_PAGE_BYTES,
+        payload.len() > DIAGNOSTIC_PAGE_BYTES,
         "the fixture must not fit in a single page"
     );
-    let text = std::str::from_utf8(&encoded).unwrap();
+    let text = std::str::from_utf8(&payload).unwrap();
     assert!(
-        (1..encoded.len().div_ceil(DIAGNOSTIC_PAGE_BYTES))
+        (1..payload.len().div_ceil(DIAGNOSTIC_PAGE_BYTES))
             .any(|page| !text.is_char_boundary(page * DIAGNOSTIC_PAGE_BYTES)),
         "the fixture must put at least one page boundary inside a multi-byte character"
     );
-    fs::write(diagnostics.join("history.json"), &encoded).unwrap();
-    (encoded.len(), record_count, diagnostic_bytes, correlation_id)
+
+    let on_disk = write_seeded_history(&diagnostics, &records);
+    (on_disk, record_count, diagnostic_bytes, correlation_id)
 }
 
 #[test]

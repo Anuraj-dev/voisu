@@ -49,6 +49,19 @@ pub const DEFAULT_DEBUG_AUDIO_TTL: Duration = Duration::from_secs(3600);
 /// The masking placeholder a diagnostic export writes in place of any secret.
 pub const REDACTED: &str = "<redacted>";
 
+/// The retained history: one JSON record per line, in append order.
+///
+/// Line-delimited rather than a single JSON array so a completed Recording can
+/// append its record without rewriting the ring. At the default retention on a
+/// real disk that rewrite costs ~250 ms per dictation, all of it proportional to
+/// the retained history rather than to the one record being added. It also
+/// bounds crash damage: a torn final line loses one record, where a torn single
+/// JSON value is unparseable and loses everything.
+const HISTORY_FILE: &str = "history.jsonl";
+/// Prefix of the temp files [`DiagnosticStore::write_all`] renames into place.
+/// Startup sweeps these, so it has to stay in step with the history file name.
+const HISTORY_TEMP_PREFIX: &str = "history.jsonl.tmp.";
+
 /// Milliseconds since the Unix epoch, saturating to 0 before the epoch.
 pub fn unix_millis_now() -> u64 {
     SystemTime::now()
@@ -608,7 +621,7 @@ impl DiagnosticStore {
     }
 
     fn history_file(&self) -> PathBuf {
-        self.dir.join("history.json")
+        self.dir.join(HISTORY_FILE)
     }
 
     fn lock_store(&self) -> MutexGuard<'_, ()> {
@@ -618,16 +631,57 @@ impl DiagnosticStore {
     fn load_raw(&self) -> Vec<DiagnosticRecord> {
         // A missing or corrupt history file yields an empty history rather than
         // failing the daemon: local diagnostics must never block a Recording.
-        match fs::read(self.history_file()) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => Vec::new(),
-        }
+        //
+        // Line-delimited, so an unreadable line costs only that record. A crash
+        // during the append below can leave a torn final line; skipping it keeps
+        // every record that was completely written, where a single-value file
+        // would have to discard the whole ring.
+        let Ok(bytes) = fs::read(self.history_file()) else {
+            return Vec::new();
+        };
+        bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_slice(line).ok())
+            .collect()
     }
 
+    /// Appends one record to the log without rewriting what is already there.
+    ///
+    /// This is the whole reason the history is line-delimited. Rewriting the
+    /// full ring on the completion path of every dictation costs, at the default
+    /// retention on a real disk, ~250 ms per Recording — the serialize, the
+    /// write and the fsync all scale with the ENTIRE retained history rather
+    /// than with the one record being added. An append is bounded by the record.
+    fn append(&self, record: &DiagnosticRecord) -> io::Result<()> {
+        let mut encoded = serde_json::to_vec(record)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        // `to_vec` escapes any newline inside a string, so a serialized record
+        // is always exactly one line and can never split the log.
+        debug_assert!(!encoded.contains(&b'\n'));
+        encoded.push(b'\n');
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(self.history_file())?;
+        file.write_all(&encoded)?;
+        // `sync_data`, not `sync_all`: the file's size is the only metadata that
+        // matters here and a data sync carries it, so this does not pay for an
+        // inode flush the history does not need.
+        file.sync_data()
+    }
+
+    /// Rewrites the whole log atomically. Used only when pruning actually
+    /// removed something, so the common append path never pays for it.
     fn write_all(&self, records: &[DiagnosticRecord]) -> io::Result<()> {
         const TEMP_CREATE_ATTEMPTS: u32 = 32;
-        let encoded = serde_json::to_vec(records)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut encoded = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut encoded, record)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            encoded.push(b'\n');
+        }
         // A unique, exclusively created temp file per write: O_EXCL refuses to
         // follow a pre-planted symlink at the temp path and the descriptor is
         // created 0600 rather than trusting pre-existing permissions. A name
@@ -637,7 +691,7 @@ impl DiagnosticStore {
         let (temp, mut file) = 'created: {
             for _ in 0..TEMP_CREATE_ATTEMPTS {
                 let temp = self.dir.join(format!(
-                    "history.json.tmp.{}.{}",
+                    "{HISTORY_TEMP_PREFIX}{}.{}",
                     std::process::id(),
                     self.temp_counter.fetch_add(1, Ordering::Relaxed)
                 ));
@@ -680,10 +734,23 @@ impl DiagnosticStore {
         }
     }
 
-    /// Prunes, removes expired audio, and persists the retained records in
-    /// chronological (append) order, then returns them newest first for reading.
-    /// Callers must hold the store lock.
-    fn prune_and_persist(&self, records: Vec<DiagnosticRecord>) -> io::Result<Vec<DiagnosticRecord>> {
+    /// Prunes in memory, removes expired debug audio, and returns the retained
+    /// records newest first. Writes nothing.
+    ///
+    /// Pruning on every load is what lets the log carry records the policy has
+    /// already expired: they are dropped here, so no reader can ever see one,
+    /// and the log only has to be rewritten when it has drifted far enough to be
+    /// worth the cost. Callers must hold the store lock.
+    fn prune_in_memory(&self, records: Vec<DiagnosticRecord>) -> Vec<DiagnosticRecord> {
+        let outcome = self.policy.prune(records, unix_millis_now());
+        self.remove_audio(&outcome.expired_audio);
+        let mut newest_first = outcome.kept;
+        newest_first.reverse();
+        newest_first
+    }
+
+    /// Rewrites the log to exactly the retained set. Callers must hold the lock.
+    fn compact(&self, records: Vec<DiagnosticRecord>) -> io::Result<Vec<DiagnosticRecord>> {
         let outcome = self.policy.prune(records, unix_millis_now());
         self.remove_audio(&outcome.expired_audio);
         self.write_all(&outcome.kept)?;
@@ -692,23 +759,51 @@ impl DiagnosticStore {
         Ok(newest_first)
     }
 
+    /// How far the log may drift past the retained record count before a write
+    /// compacts it.
+    ///
+    /// Without slack there is no amortization at all at the steady state this
+    /// retention policy is designed for: once the ring is full, EVERY Recording
+    /// pushes the count over the bound, so every Recording would prune one
+    /// record and rewrite the whole log — measured at ~250 ms per dictation at
+    /// the default retention on a real disk. Compacting once per slack
+    /// Recordings instead makes that ~5 ms amortized. The cost is a log bounded
+    /// at `max_records + slack` rather than `max_records`; readers are
+    /// unaffected, because every load prunes before returning.
+    fn compaction_slack(&self) -> usize {
+        (self.policy.max_records / 4).max(8)
+    }
+
     /// Appends a completed Recording's record, prunes to the retention policy,
     /// removes any now-expired debug audio, and returns the retained history
     /// (newest first).
     pub fn record(&self, record: DiagnosticRecord) -> io::Result<Vec<DiagnosticRecord>> {
         let _guard = self.lock_store();
         let mut records = self.load_raw();
+        let drifted = records.len() + 1 > self.policy.max_records + self.compaction_slack();
         records.push(record);
-        self.prune_and_persist(records)
+        if drifted {
+            return self.compact(records);
+        }
+        // Appending the record as given, not the pruned copy: the log is allowed
+        // to hold more than the policy retains, and the next load prunes it.
+        self.append(records.last().expect("the record was just pushed"))?;
+        Ok(self.prune_in_memory(records))
     }
 
     /// Returns the retained history (newest first), pruning stale records and
     /// expired debug audio as a side effect so a reader never sees an entry the
     /// retention policy has already expired.
+    ///
+    /// Reads do not write. `Command::History` runs this INLINE in the lifecycle
+    /// actor, so a concurrent `voisu stop` queues behind it; making it rewrite
+    /// and fsync the whole log put ~250 ms at the default retention in front of
+    /// that Stop for no gain, since pruning in memory already hides every
+    /// expired record.
     pub fn history(&self) -> io::Result<Vec<DiagnosticRecord>> {
         let _guard = self.lock_store();
         let records = self.load_raw();
-        self.prune_and_persist(records)
+        Ok(self.prune_in_memory(records))
     }
 
     /// Finds one Recording's record by its correlation ID, after pruning.
@@ -735,14 +830,23 @@ impl DiagnosticStore {
                     if entry
                         .file_name()
                         .to_str()
-                        .is_some_and(|name| name.starts_with("history.json.tmp."))
+                        .is_some_and(|name| name.starts_with(HISTORY_TEMP_PREFIX))
                     {
                         let _ = fs::remove_file(entry.path());
                     }
                 }
             }
         }
-        let kept = self.history()?;
+        // Startup is the one place a whole-log rewrite is free, so compact here.
+        // Runtime never rewrites unless the log has drifted past its slack, so
+        // records that aged out between runs would otherwise sit on disk being
+        // re-read and re-pruned on every load until enough new Recordings
+        // arrived to trigger a compaction.
+        let kept = {
+            let _guard = self.lock_store();
+            let records = self.load_raw();
+            self.compact(records)?
+        };
         let _guard = self.lock_store();
         let referenced: Vec<&str> = kept
             .iter()
