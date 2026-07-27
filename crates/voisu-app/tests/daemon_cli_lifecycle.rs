@@ -6865,6 +6865,91 @@ fn incompatible_payload_is_rejected_as_a_protocol_mismatch_from_its_envelope() {
     );
 }
 
+/// The CLI's response ceiling, mirrored from `voisu.rs`. Both are derived from
+/// the retention policy, so a change to either bound has to be a deliberate
+/// change to both.
+const MAX_RESPONSE_BYTES: usize =
+    voisu_core::DEFAULT_MAX_RECORDS * 4 * voisu_core::MAX_STORED_TEXT + 4 * 1024 * 1024;
+
+/// Binds a fake daemon at the real socket path that answers one connection with
+/// whatever `respond` writes, so a CLI-side bound can be exercised without a
+/// real daemon having to produce the payload that trips it.
+fn fake_daemon<F>(runtime_dir: &Path, respond: F) -> thread::JoinHandle<()>
+where
+    F: FnOnce(&mut UnixStream) + Send + 'static,
+{
+    let path = socket_path(runtime_dir);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(&path).unwrap();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        assert!(!request.is_empty());
+        respond(&mut stream);
+    })
+}
+
+#[test]
+fn an_unbounded_paged_payload_is_refused_instead_of_buffered() {
+    // Paging DELETED the CLI's response ceiling rather than raising it, leaving
+    // the accumulated payload answerable only to the 15 s diagnostic deadline —
+    // which on a local Unix socket permits gigabytes. A daemon that never sends
+    // a last page must be cut off at the bound, not followed.
+    let runtime = TempDir::new().unwrap();
+    let page = "a".repeat(64 * 1024);
+    let daemon = fake_daemon(runtime.path(), move |stream| {
+        // Enough pages to pass the ceiling with room to spare. `last` is never
+        // set, so nothing but the bound can stop this.
+        for sequence in 0..(MAX_RESPONSE_BYTES / page.len() + 8) {
+            let frame = format!(
+                "{{\"version\":1,\"ok\":true,\"state\":\"idle\",\"message\":\"\",\
+                 \"diagnostic_page\":{{\"sequence\":{sequence},\"last\":false,\
+                 \"payload\":\"{page}\"}}}}\n"
+            );
+            // A broken pipe is the expected end: the CLI gives up mid-stream.
+            if stream.write_all(frame.as_bytes()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let history = voisu_with_env(runtime.path(), &["history", "--json"], &[]);
+    let _ = daemon.join();
+    assert!(!history.status.success());
+    assert_eq!(stderr(&history), "daemon response frame is too large\n");
+    assert_eq!(
+        history.stdout.len(),
+        0,
+        "a refused response must print nothing"
+    );
+}
+
+#[test]
+fn an_oversized_single_frame_is_refused_while_it_streams() {
+    // The non-paged path needs its own ceiling: a response that never contains
+    // a newline would otherwise be buffered whole before anything rejected it.
+    let runtime = TempDir::new().unwrap();
+    let chunk = "b".repeat(64 * 1024);
+    let daemon = fake_daemon(runtime.path(), move |stream| {
+        if stream.write_all(b"{\"version\":1,\"ok\":true,\"message\":\"").is_err() {
+            return;
+        }
+        for _ in 0..(MAX_RESPONSE_BYTES / chunk.len() + 8) {
+            if stream.write_all(chunk.as_bytes()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let status = voisu(runtime.path(), "status");
+    let _ = daemon.join();
+    assert!(!status.status.success());
+    assert_eq!(stderr(&status), "daemon response frame is too large\n");
+}
+
 #[test]
 fn sigterm_cleans_up_and_a_crash_leaves_a_safely_recoverable_socket() {
     let runtime = TempDir::new().unwrap();

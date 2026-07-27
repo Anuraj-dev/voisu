@@ -16,6 +16,20 @@ use voisu_app::system::{
 };
 use voisu_app::config::DeliveryMode;
 
+/// The most response the CLI will buffer — per transport frame, and in total
+/// across the pages of one diagnostic payload.
+///
+/// Derived from the retention policy rather than picked: every retained record
+/// can hold two Source Transcripts and one final Transcript at the stored-text
+/// clamp, so the retained transcript budget is `DEFAULT_MAX_RECORDS * 3 *
+/// MAX_STORED_TEXT`. This allows a fourth clamp's worth per record for JSON
+/// escaping and the record's fixed fields, plus a flat four mebibytes of slack
+/// for provider-failure diagnostics, which the store does not clamp. Paging
+/// removed the previous bound rather than raising it, leaving the CLI's memory
+/// use answerable only to the 15 s diagnostic deadline — which on a local Unix
+/// socket permits gigabytes.
+const MAX_RESPONSE_BYTES: usize =
+    voisu_core::DEFAULT_MAX_RECORDS * 4 * voisu_core::MAX_STORED_TEXT + 4 * 1024 * 1024;
 const IO_DEADLINE: Duration = Duration::from_secs(2);
 #[derive(Clone, Copy)]
 enum DiagnosticResponseKind {
@@ -616,6 +630,7 @@ fn block_on<T>(future: BoundaryFuture<'_, T>) -> Result<T, BoundaryError> {
 fn read_response_frame(
     stream: &mut BufReader<UnixStream>,
     deadline: Duration,
+    budget: usize,
 ) -> Result<String, String> {
     let started = Instant::now();
     let mut response = Vec::new();
@@ -635,6 +650,12 @@ fn read_response_frame(
                 let consumed = frame_end.map_or(available.len(), |position| position + 1);
                 response.extend_from_slice(&available[..consumed]);
                 stream.consume(consumed);
+                // Checked against what has been buffered SO FAR, so an oversized
+                // frame is refused while it streams rather than after the CLI
+                // has already allocated all of it.
+                if response.len() > budget {
+                    return Err("daemon response frame is too large".to_owned());
+                }
                 if frame_end.is_some() {
                     return String::from_utf8(response)
                         .map_err(|_| "daemon returned an invalid response".to_owned());
@@ -667,7 +688,12 @@ fn read_response(
             .checked_sub(started.elapsed())
             .filter(|remaining| !remaining.is_zero())
             .ok_or_else(|| (1, "daemon response deadline elapsed".to_owned()))?;
-        let frame = read_response_frame(stream, remaining).map_err(|message| (1, message))?;
+        // The remaining budget, not a fresh one per frame: a paged payload is
+        // one logical response, so the ceiling has to bound the accumulation
+        // across pages, not just each page in isolation.
+        let budget = MAX_RESPONSE_BYTES.saturating_sub(payload.len());
+        let frame =
+            read_response_frame(stream, remaining, budget).map_err(|message| (1, message))?;
         let envelope: VersionEnvelope = serde_json::from_str(&frame)
             .map_err(|_| (1, "daemon returned an invalid response".to_owned()))?;
         if envelope.version != PROTOCOL_VERSION {
