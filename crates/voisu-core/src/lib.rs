@@ -2188,26 +2188,27 @@ fn sentence_boundary_credit(text: &str) -> usize {
     sentence_punctuation_boundaries(text).min(plausible_boundaries)
 }
 
-/// The text's final sentence — everything after the last sentence terminator
-/// that ends a word — with leading non-alphanumerics trimmed. A '.' inside a
-/// token ("amara.org", "otter.ai") does not end a sentence, so an outro
-/// carrying a dotted attribution still reads as one final sentence. A text
-/// with no terminator is itself the final sentence.
-fn final_sentence(text: &str) -> &str {
+/// The tail of the text from each sentence start — the whole (end-trimmed)
+/// text, then the remainder after every sentence terminator that ends a word —
+/// each with leading non-alphanumerics trimmed. A '.' inside a token
+/// ("amara.org", "otter.ai") does not end a sentence, so an outro carrying a
+/// dotted attribution still reads as one sentence; a '.' swallowed by a
+/// closing quote does not either, which is why callers must not rely on
+/// boundaries alone to find a trailing artifact.
+fn sentence_tails(text: &str) -> impl Iterator<Item = &str> {
     let trimmed = text.trim_end_matches(|character: char| !character.is_alphanumeric());
-    let start = trimmed
-        .char_indices()
-        .filter(|&(index, character)| {
-            matches!(character, '.' | '?' | '!')
+    std::iter::once(0)
+        .chain(trimmed.char_indices().filter_map(|(index, character)| {
+            (matches!(character, '.' | '?' | '!')
                 && trimmed[index + character.len_utf8()..]
                     .chars()
                     .next()
-                    .is_some_and(char::is_whitespace)
+                    .is_some_and(char::is_whitespace))
+            .then_some(index + character.len_utf8())
+        }))
+        .map(move |start| {
+            trimmed[start..].trim_start_matches(|character: char| !character.is_alphanumeric())
         })
-        .map(|(index, character)| index + character.len_utf8())
-        .next_back()
-        .unwrap_or(0);
-    trimmed[start..].trim_start_matches(|character: char| !character.is_alphanumeric())
 }
 
 fn sentence_start_capitalisation(text: &str) -> (usize, usize) {
@@ -2347,25 +2348,34 @@ fn non_contraction_quality_failure_reason(
 /// Stopwords are exempt. A repair that closes the gap left by a deleted span
 /// may need a connective, and no refusal is recognisable by its function words.
 ///
-/// A candidate with NO content words at all is not derived. Derivation is
-/// positive evidence — at least one content word the providers actually heard —
-/// and an all-stopword text offers none. The refusal shapes make this the
-/// load-bearing half of the guard: "I can't do that." and "I won't do that."
-/// normalise to pure stopwords ("can't" expands to "can not"), so a vacuous
-/// pass here would type a model's refusal as the user's dictation.
+/// A candidate with NO content words cannot use that exemption — an empty
+/// content set vacuously passing is how "I can't do that." (pure stopwords
+/// once "can't" expands to "can not") was once typed as the user's dictation.
+/// But a real dictation can be all stopwords too ("Yes, I can do that."), and
+/// refusing it would lose a dictation to a guard. So an all-stopword
+/// candidate is held to the strictest form of the same question: EVERY word,
+/// stopwords included, must be one some provider actually heard. The user's
+/// own words survive that; a refusal's vocabulary, against sources that never
+/// said "i"/"can"/"do"/"that", does not.
 fn is_source_derived(candidate: &str, sources: &[SourceTranscript]) -> bool {
     let source_words: Vec<String> = sources
         .iter()
         .flat_map(|source| normalized_words(&source.text))
         .collect();
-    let vocabulary = distinct_content_words(&source_words);
     let candidate_words = normalized_words(candidate);
-    let mut content_words = candidate_words
+    let content_words: Vec<&String> = candidate_words
         .iter()
         .filter(|word| !is_stopword(word))
-        .peekable();
-    content_words.peek().is_some()
-        && content_words.all(|word| vocabulary.contains(word.as_str()))
+        .collect();
+    if content_words.is_empty() {
+        let heard: HashSet<&str> = source_words.iter().map(String::as_str).collect();
+        return !candidate_words.is_empty()
+            && candidate_words.iter().all(|word| heard.contains(word.as_str()));
+    }
+    let vocabulary = distinct_content_words(&source_words);
+    content_words
+        .into_iter()
+        .all(|word| vocabulary.contains(word.as_str()))
 }
 
 fn quality_failure_reason(
@@ -2432,12 +2442,16 @@ fn quality_failure_reason(
         return Some(QualityFailure::Other("meta-reasoning"));
     }
     // The archetypal ASR outro hallucinations, learned from captioned video.
-    // All five are TAIL artifacts — a model appends them as their own closing
-    // sentence — so, symmetrically with the meta-reasoning preamble anchor,
-    // they count only when they begin the text's final sentence. The same
-    // words mid-sentence are ordinary dictation ("...and the recording was
-    // transcribed by Whisper."), and a false positive costs a detour through
-    // repair that can shorten or lose real speech.
+    // All five are appended artifacts, never mid-sentence speech, so they
+    // count when they begin a sentence or end the text. Both anchors are
+    // needed: sentence starts alone miss a provider that omits punctuation
+    // entirely (spec §1 records Groq at zero punctuation, leaving the outro
+    // with no sentence of its own), and the text's end alone misses an outro
+    // followed by a second outro sentence ("Thanks for watching! Please
+    // subscribe..."). The same words mid-sentence are ordinary dictation
+    // ("...and the recording was transcribed by Whisper."), and a false
+    // positive costs a detour through repair that can shorten or lose real
+    // speech. Each of those placements is pinned by a test.
     const HALLUCINATED_SUFFIXES: [&str; 5] = [
         "thank you for watching",
         "thanks for watching",
@@ -2445,11 +2459,11 @@ fn quality_failure_reason(
         "subtitles by",
         "transcribed by",
     ];
-    let outro = final_sentence(&lower);
-    if HALLUCINATED_SUFFIXES
-        .iter()
-        .any(|suffix| outro.starts_with(suffix))
-    {
+    let tail = lower.trim_end_matches(|character: char| !character.is_alphanumeric());
+    if HALLUCINATED_SUFFIXES.iter().any(|suffix| {
+        tail.ends_with(suffix)
+            || sentence_tails(&lower).any(|sentence| sentence.starts_with(suffix))
+    }) {
         return Some(QualityFailure::Other("hallucinated suffix"));
     }
     if script_count(trimmed) >= 3

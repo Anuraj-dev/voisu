@@ -2492,6 +2492,46 @@ async fn a_repair_removing_a_guarded_phrase_from_both_sources_is_delivered() {
     );
 }
 
+/// The counterweight to the refusal guard: a real dictation can normalise to
+/// stopwords only. "Yes, I can do that." is the user's speech — every word of
+/// it appears in the Source Transcripts — and refusing it because it has no
+/// content words would lose a dictation to a guard. An all-stopword repair is
+/// derived when every word, stopwords included, is one the providers heard;
+/// a refusal's vocabulary ("I can't do that" against sources that never said
+/// those words) is not.
+#[tokio::test]
+async fn an_all_stopword_dictation_survives_a_repair_that_removes_the_outro() {
+    let source = "Yes, I can do that. Thanks for watching.";
+    let repaired = "Yes, I can do that.";
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::clone(&kinds),
+            text: repaired.to_owned(),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: source.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: source.to_owned(),
+            },
+        ])
+        .await
+        .expect("an all-stopword dictation must not be lost to the derivation guard");
+
+    assert_eq!(decision.selection, TranscriptSelection::Repaired);
+    assert_eq!(decision.transcript.0, repaired);
+    assert!(decision.recovery_attempted);
+    assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Repair]);
+}
+
 /// The hazard the floor alone cannot see. The repair prompt asks a
 /// safety-tuned model to rebuild an unsafe candidate, and it may simply
 /// decline. A refusal is short, clean, single-script and trips no guard — but
@@ -2560,6 +2600,13 @@ async fn remaining_quality_guardrails_repair_unsafe_merge_results() {
         "Schedule the review for Wednesday morning. Thank you for watching.",
         "Schedule встреча 会议 Wednesday morning.",
         "Schedule the review for Wednesday morning and then write a long invented agenda with ten unrelated action items that neither Source Transcript contained at all.",
+        // The three outro placements the final-sentence-start anchor alone
+        // missed (spec §1 records Groq omitting punctuation entirely): an
+        // outro with no punctuation anywhere, an outro sentence followed by a
+        // second outro sentence, and an outro after a quote-swallowed period.
+        "schedule the review wednesday morning thanks for watching",
+        "Schedule the review for Wednesday morning. Thanks for watching! Please subscribe for more videos.",
+        "Schedule the review for \"Wednesday.\" Thanks for watching.",
     ];
 
     for candidate in unsafe_candidates {
