@@ -7988,11 +7988,15 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_hundred_millisecond_override_still_permits_a_deliverable_recording() {
+    fn a_sub_hundred_millisecond_override_floors_the_retained_pcm_cap() {
         // 50 ms derives a 1_600-byte cap, below the minimum a Recording needs to
-        // pass validate_audio — the cap alone would turn every hit into total
-        // loss, the defect this ticket exists to remove. The floor keeps the
-        // shortest configurable Recording deliverable.
+        // pass validate_audio, which would make the byte cap — not the Deadline
+        // — the enforcer that ends the Recording, at a length that can only fail.
+        // The floor bounds the cap from below so the cap never describes less
+        // than a deliverable Recording. It does NOT make a 50 ms Recording
+        // deliverable: with a real microphone the Deadline still stops the pump
+        // after ~1_600 bytes and validate_audio still rejects it as
+        // TooShortRecording. Only the cap's floor is pinned here.
         let tiny = resolve_recording_maximum(Some("50".to_owned()));
         assert_eq!(tiny.deadline, Duration::from_millis(50));
         assert_eq!(
