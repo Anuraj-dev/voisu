@@ -7971,19 +7971,10 @@ mod tests {
         );
         // Nothing is said when nothing was ignored — including at exactly the
         // ceiling, which is honoured in full.
-        assert_eq!(
-            recording_deadline_override_notice(Some("600000".to_owned())),
-            None
-        );
-        assert_eq!(
-            recording_deadline_override_notice(Some("5000".to_owned())),
-            None
-        );
+        assert_eq!(recording_deadline_override_notice(Some("600000".to_owned())), None);
+        assert_eq!(recording_deadline_override_notice(Some("5000".to_owned())), None);
         assert_eq!(recording_deadline_override_notice(None), None);
-        assert_eq!(
-            recording_deadline_override_notice(Some("not-a-number".to_owned())),
-            None
-        );
+        assert_eq!(recording_deadline_override_notice(Some("not-a-number".to_owned())), None);
         assert_eq!(recording_deadline_override_notice(Some("0".to_owned())), None);
     }
 
