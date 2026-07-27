@@ -1365,13 +1365,29 @@ fn clean_source_fallback(
     })
 }
 
+/// The Source Transcripts a fallback may deliver: individually clean under
+/// the non-contraction guards AND carrying at least one normalised word.
+///
+/// The wordless exclusion is what keeps every fallback arm inside the
+/// divergence gate's guarantees. A source that normalises to zero words
+/// ("...", stray punctuation from silence) passes every text-shaped guard,
+/// yet no word-level evidence can judge it — the gate never computes garbage
+/// verdicts for such a pair, so a wordless side reaching a fallback
+/// comparison can win it precisely by being unjudgeable, typing "..." into
+/// the user's window as if the dictation succeeded. Pinned by
+/// `a_wordless_source_transcript_is_never_delivered_over_heard_words` and
+/// `an_unsafe_source_beside_a_wordless_sibling_is_refused_not_replaced_with_dots`.
 fn quality_safe_sources<'a>(
     sources: impl IntoIterator<Item = &'a SourceTranscript>,
 ) -> Vec<&'a SourceTranscript> {
     sources
         .into_iter()
         .filter(|source| {
-            non_contraction_quality_failure_reason(&source.text, std::slice::from_ref(source))
+            !normalized_words(&source.text).is_empty()
+                && non_contraction_quality_failure_reason(
+                    &source.text,
+                    std::slice::from_ref(source),
+                )
                 .is_none()
         })
         .collect()
@@ -1844,7 +1860,32 @@ fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
     let fewer = left_words.len().min(right_words.len());
     let more = left_words.len().max(right_words.len());
     if fewer == 0 {
-        return None;
+        if more == 0 {
+            // Both wordless: nothing to select and nothing to divide by.
+            // (`decide` never sends this pair — two wordless texts are
+            // similarity 1.0 and take the near-identical path — the guard
+            // keeps this function total over its own inputs.)
+            return None;
+        }
+        // Exactly one side is wordless: punctuation from silence or noise.
+        // It is not a transcript — no verdict below can judge a side with no
+        // words, and a merge with it is a merge with a stub — so select the
+        // only side that heard words before any tier that a wordless side
+        // cannot take part in. Even degenerate filler is more of the
+        // Recording than nothing. Pinned by
+        // `a_wordless_source_transcript_is_never_delivered_over_heard_words`
+        // and its companion tests.
+        let winner = if left_words.is_empty() {
+            GateWinner::Right
+        } else {
+            GateWinner::Left
+        };
+        return Some(QualityGate {
+            winner,
+            reason:
+                "catastrophically divergent (one Source Transcript is wordless); selected the only Source Transcript with words"
+                    .to_owned(),
+        });
     }
     let left_content = distinct_content_words(&left_words);
     let right_content = distinct_content_words(&right_words);
