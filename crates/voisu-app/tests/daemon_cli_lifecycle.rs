@@ -7369,7 +7369,16 @@ printf '{"text":"unused Groq Source Transcript"}'
 
     assert!(voisu(runtime.path(), "start").status.success());
     wait_for_marker(commands.path(), "deepgram.ready");
-    let idle_deadline = Instant::now() + Duration::from_secs(5);
+    // The budget starts at deepgram.ready, which the first burst writes a full
+    // second before the injected failure can fire, so the deliberate pause
+    // spends ~1 s of it before recovery even begins (measured: 1.03 s from
+    // deepgram.ready to idle on an idle host). What remains has to cover a
+    // bounded capture abort (PROCESS_DEADLINE, 2 s) plus
+    // reaper.drain_to_completion (RECOVERY_ABORT_DEADLINE, 2 s) plus the
+    // websocket close, so 5 s left the worst case with no headroom. 8 s matches
+    // the sibling Groq test above and costs nothing on a healthy host: the poll
+    // returns as soon as idle is observed.
+    let idle_deadline = Instant::now() + Duration::from_secs(8);
     while stdout(&voisu(runtime.path(), "status")) != "idle\n" {
         assert!(
             Instant::now() < idle_deadline,
