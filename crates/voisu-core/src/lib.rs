@@ -997,7 +997,9 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                             .to_owned(),
                     )
                 };
-                if let Some(reason) = source_quality_failure_reason(&selected.text, &sources) {
+                if let Some(reason) =
+                    non_contraction_quality_failure_reason(&selected.text, &sources)
+                {
                     return self
                         .repair_candidate(
                             &sources,
@@ -1040,7 +1042,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                     GateWinner::Left => deepgram,
                     GateWinner::Right => groq,
                 };
-                if source_quality_failure_reason(&winner.text, &sources).is_none() {
+                if non_contraction_quality_failure_reason(&winner.text, &sources).is_none() {
                     return Ok(TranscriptDecision {
                         transcript: Transcript(winner.text.trim().to_owned()),
                         selection: match winner.provider {
@@ -1101,14 +1103,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             if let Some(failure) = quality_failure_reason(&merge_result.0, &sources) {
                 let reason = failure.reason();
                 if failure.is_contraction() {
-                    return contraction_source_fallback(
-                        deepgram,
-                        groq,
-                        &merge_result.0,
-                        reason,
-                        true,
-                        false,
-                    );
+                    return contraction_source_fallback(deepgram, groq, reason, true, false);
                 }
                 return self
                     .repair_candidate(&sources, merge_result, reason, true)
@@ -1127,7 +1122,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         let source = sources.first().ok_or_else(|| {
             BoundaryError::new(BoundaryKind::Validation, "no Source Transcript")
         })?;
-        if let Some(reason) = source_quality_failure_reason(&source.text, &sources) {
+        if let Some(reason) = non_contraction_quality_failure_reason(&source.text, &sources) {
             return self
                 .repair_candidate(
                     &sources,
@@ -1193,30 +1188,19 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 }
             }
         };
-        if let Some(failure) = quality_failure_reason(&repaired.0, sources) {
-            let repair_reason = format!("recovery produced {}", failure.reason());
-            if failure.is_contraction() {
-                if let (Some(deepgram), Some(groq)) = (
-                    sources
-                        .iter()
-                        .find(|source| source.provider == Provider::Deepgram),
-                    sources
-                        .iter()
-                        .find(|source| source.provider == Provider::Groq),
-                ) {
-                    return contraction_source_fallback(
-                        deepgram,
-                        groq,
-                        &repaired.0,
-                        repair_reason,
-                        reconciliation_requested,
-                        true,
-                    );
-                }
-            }
+        // The merge contraction floor is deliberately NOT applied here: repair's
+        // entire job is to DELETE unsafe text, so a correct repair is shorter
+        // than the sources it was derived from. Measuring it against the longest
+        // Source Transcript turns every successful repair of a short dictation
+        // into a refusal — and when the offending phrase is in both sources
+        // (e.g. the ordinary speech "the user said", which the meta-reasoning
+        // guard lists), the source fallback has nothing safe left and the
+        // dictation is lost. The floor belongs to the reconcile-merge output,
+        // which is expected to preserve everything both providers heard.
+        if let Some(reason) = non_contraction_quality_failure_reason(&repaired.0, sources) {
             return clean_source_fallback(
                 sources,
-                repair_reason,
+                format!("recovery produced {reason}"),
                 reconciliation_requested,
                 true,
             );
@@ -1232,10 +1216,21 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
     }
 }
 
+/// Delivers a Source Transcript after the merge was rejected for contracting.
+///
+/// The rejected merge is deliberately NOT consulted. The guard has just
+/// declared it untrustworthy for having deleted words, so using it to arbitrate
+/// which source to deliver is circular — and when the merge simply reproduced
+/// the shorter source (a provider that truncated its tail), the "corroboration"
+/// is guaranteed and the guard hands over exactly the contraction it rejected.
+///
+/// So the LONGER Source Transcript wins by default: the user must never receive
+/// less than one provider heard. The single exception is padding — a source
+/// that is longer only because it repeats what it already said heard no more
+/// than its sibling, and losing that surplus loses nothing.
 fn contraction_source_fallback(
     deepgram: &SourceTranscript,
     groq: &SourceTranscript,
-    merge_text: &str,
     reason: String,
     reconciliation_requested: bool,
     recovery_attempted: bool,
@@ -1248,18 +1243,19 @@ fn contraction_source_fallback(
         [left, right, ..] => {
             let left_words = normalized_words(&left.text);
             let right_words = normalized_words(&right.text);
-            Some(if left_words.len() == right_words.len() {
-                *right
-            } else {
-                let (shorter, longer) = if left_words.len() < right_words.len() {
-                    (*left, *right)
-                } else {
-                    (*right, *left)
-                };
-                if source_similarity(merge_text, &shorter.text) >= 0.85 {
-                    shorter
-                } else {
-                    longer
+            let left_padded = surplus_is_self_repetition(&left_words, &right_words);
+            let right_padded = surplus_is_self_repetition(&right_words, &left_words);
+            Some(match (left_padded, right_padded) {
+                (true, false) => *right,
+                (false, true) => *left,
+                // Neither side is padding (or both are): deliver the longer
+                // text. An exact tie keeps Groq, the standing default.
+                _ => {
+                    if left_words.len() > right_words.len() {
+                        *left
+                    } else {
+                        *right
+                    }
                 }
             })
         }
@@ -1278,7 +1274,7 @@ fn contraction_source_fallback(
             Provider::Groq => TranscriptSelection::SourceGroq,
         },
         validation_reason:
-            "Source Transcript selected using merge corroboration after merge contraction".to_owned(),
+            "longer Source Transcript delivered after merge contraction".to_owned(),
         fallback_reason: Some(reason),
         reconciliation_requested,
         recovery_attempted,
@@ -1337,7 +1333,8 @@ fn quality_safe_sources<'a>(
     sources
         .into_iter()
         .filter(|source| {
-            source_quality_failure_reason(&source.text, std::slice::from_ref(source)).is_none()
+            non_contraction_quality_failure_reason(&source.text, std::slice::from_ref(source))
+                .is_none()
         })
         .collect()
 }
@@ -1473,6 +1470,52 @@ fn is_repetition_loop(words: &[String]) -> bool {
     content_count >= MIN_REPETITION_CONTENT
         && distinct_content >= MIN_LOOP_VOCABULARY
         && (distinct_content as f64) < CONTENT_REPETITION_FLOOR * content_count as f64
+}
+
+/// True when everything `candidate` says beyond `other` is `candidate` saying
+/// again what it already said — padding, not speech the other side missed.
+///
+/// The surplus is the multiset of candidate words `other` cannot account for,
+/// so it is order-insensitive: a reordered but equally complete sibling leaves
+/// no surplus. The surplus counts as padding only when ALL of these hold:
+/// - it carries at least `MIN_REPETITION_CONTENT` content words, below which
+///   the shape says nothing (and the few words at stake are worth keeping);
+/// - it introduces no content word the candidate did not already use in its
+///   corroborated part — one genuinely new word means real speech was heard;
+/// - it is itself a repetition loop by the same `CONTENT_REPETITION_FLOOR` the
+///   garbage gate uses.
+///
+/// The conjunction is deliberately strict, because the cost of a false positive
+/// is delivering less than a provider heard. A tail one provider caught and the
+/// other truncated brings new content words, or is not internally repetitive,
+/// and so survives every clause.
+fn surplus_is_self_repetition(candidate: &[String], other: &[String]) -> bool {
+    let mut budget: HashMap<&str, usize> = HashMap::new();
+    for word in other {
+        *budget.entry(word.as_str()).or_default() += 1;
+    }
+    let mut surplus: Vec<&str> = Vec::new();
+    for word in candidate {
+        match budget.get_mut(word.as_str()) {
+            Some(remaining) if *remaining > 0 => *remaining -= 1,
+            _ => surplus.push(word.as_str()),
+        }
+    }
+    let content: Vec<&str> = surplus
+        .into_iter()
+        .filter(|word| !is_stopword(word))
+        .collect();
+    if content.len() < MIN_REPETITION_CONTENT {
+        return false;
+    }
+    let distinct: HashSet<&str> = content.iter().copied().collect();
+    // A word `other` never used cannot have been corroborated earlier in the
+    // candidate either, because every corroborated occurrence was matched
+    // against `other`'s budget. So an unknown word here is new content.
+    if distinct.iter().any(|word| !budget.contains_key(word)) {
+        return false;
+    }
+    (distinct.len() as f64) < CONTENT_REPETITION_FLOOR * content.len() as f64
 }
 
 /// The single garbage verdict for one side of a disagreeing pair, judged by
@@ -2054,7 +2097,15 @@ impl QualityFailure {
     }
 }
 
-fn source_quality_failure_reason(
+/// Every quality guard EXCEPT the merge contraction floor.
+///
+/// The floor exists to catch a reconcile merge that silently summarises the two
+/// Source Transcripts, and it is measured against the LONGEST source. That
+/// comparison is meaningful only for the merge output. It is meaningless — and
+/// harmful — for text that is legitimately shorter than the sources: a Source
+/// Transcript is not a merge of its sibling, and a repair exists precisely to
+/// delete unsafe spans from a candidate.
+fn non_contraction_quality_failure_reason(
     candidate: &str,
     sources: &[SourceTranscript],
 ) -> Option<String> {
