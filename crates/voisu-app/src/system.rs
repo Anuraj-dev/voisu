@@ -2667,16 +2667,28 @@ struct RecordingMaximum {
 }
 
 fn resolve_recording_maximum(raw: Option<String>) -> RecordingMaximum {
-    let deadline = raw.and_then(|value| value.parse::<u64>().ok())
+    let deadline = raw
+        .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
         .filter(|value| !value.is_zero())
-        .unwrap_or(DEFAULT_RECORDING_DEADLINE);
-    let pcm_byte_cap = deadline
+        .unwrap_or(DEFAULT_RECORDING_DEADLINE)
+        // MAX_RECORDING_DURATION is an absolute ceiling, not merely a default.
+        // An operator override may only shorten a Recording: retained PCM is
+        // held in memory, so an unclamped override (say an hour) would grow the
+        // buffer without bound. Clamping the deadline — the single value both
+        // enforcers derive from — keeps them from diverging.
+        .min(MAX_RECORDING_DURATION);
+    let derived_cap = deadline
         .as_millis()
         .saturating_mul(16_000 * 2)
         .checked_div(1_000)
         .unwrap_or_default()
         .min(usize::MAX as u128) as usize;
+    // A deadline under 100 ms derives a cap below the minimum deliverable
+    // Recording, so the cap alone would turn every hit into TooShortRecording —
+    // total loss, the exact defect this ticket exists to remove. The floor costs
+    // nothing at any realistic deadline.
+    let pcm_byte_cap = derived_cap.max(MIN_RECORDING_BYTES);
     RecordingMaximum { deadline, pcm_byte_cap }
 }
 
@@ -6509,6 +6521,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pipewire_recording_deadline_retains_every_queued_byte() {
+        // The Recording Deadline — not the byte cap — is the enforcer that fires
+        // in production: wall clock from begin() always beats a byte counter fed
+        // by a real-time microphone. next_chunk reports it WITHOUT popping the
+        // queue, so the audio the user already spoke survives only because
+        // finish() drains the queue AFTER stop_child joins the reader. That
+        // coupling is the whole delivery guarantee on this path; this test pins
+        // both halves of it.
+        let mut spoken_pcm = Vec::new();
+        let state = Arc::new(Mutex::new(CaptureReaderState {
+            chunks: VecDeque::new(),
+            received_bytes: 0,
+            eof: false,
+            error: None,
+            buffer_cap_reached: false,
+        }));
+        for chunk in 0..2_usize {
+            let pcm: Vec<u8> = (0..PCM_CHUNK_BYTES)
+                .map(|byte| ((byte + chunk) % 251) as u8)
+                .collect();
+            spoken_pcm.extend_from_slice(&pcm);
+            state.lock().unwrap().chunks.push_back(AudioChunk(pcm));
+        }
+        // pw-record's reader thread flushes its final assembled chunk as it
+        // reaches EOF, which stop_child's bounded join awaits: the tail reaches
+        // the queue during finish(), not before it. Draining before the join
+        // would leave this chunk behind.
+        let tail: Vec<u8> = (0..PCM_CHUNK_BYTES).map(|byte| (byte % 97) as u8).collect();
+        spoken_pcm.extend_from_slice(&tail);
+        let tail_state = Arc::clone(&state);
+        let cleanup = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            tail_state.lock().unwrap().chunks.push_back(AudioChunk(tail));
+            Ok(Vec::new())
+        });
+
+        let mut capture = PipeWireActiveCapture {
+            child: None,
+            state,
+            reader: None,
+            stderr_reader: None,
+            cleanup: Some(cleanup),
+            reaper: ProviderReaper::new(),
+            pcm: Vec::new(),
+            started: Instant::now(),
+            deadline: Duration::from_millis(1),
+        };
+        // Elapse the Deadline while audio is still queued: the shape of a user
+        // who dictated past the maximum and never released the Trigger Key.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let error = capture
+            .next_chunk()
+            .await
+            .expect_err("the elapsed Recording Deadline stops the pump");
+        assert_eq!(error.kind(), BoundaryKind::RecordingDeadline);
+        assert_eq!(
+            capture.state.lock().unwrap().chunks.len(),
+            2,
+            "the Deadline must report without consuming the audio it hands to finish()"
+        );
+
+        let audio = capture
+            .finish()
+            .await
+            .expect("deadline-hit audio finalizes instead of failing");
+        assert_eq!(
+            audio.pcm_s16le_mono_16khz(),
+            spoken_pcm,
+            "every queued byte the user spoke must survive the Recording Deadline"
+        );
+    }
+
+    #[tokio::test]
     async fn dropped_capture_before_stop_retains_child_cleanup_until_reaper_drain() {
         // capture_pump can panic or be cancelled while still owning a live
         // pw-record before stop_child ever runs: child is Some, cleanup is None.
@@ -7805,6 +7891,42 @@ mod tests {
         assert_eq!(
             configured.pcm_byte_cap, 16_000 * 2 * 5,
             "the same configured maximum must set the per-Recording PCM byte cap"
+        );
+    }
+
+    #[test]
+    fn an_override_cannot_raise_the_recording_maximum_past_the_absolute_ceiling() {
+        // Retained PCM lives in memory, so MAX_RECORDING_DURATION has to be a
+        // real ceiling and not merely the default: an operator asking for an
+        // hour must not be handed an hour's worth of buffer.
+        let overreaching = resolve_recording_maximum(Some("3600000".to_owned()));
+        assert_eq!(
+            overreaching.deadline, MAX_RECORDING_DURATION,
+            "an over-long override must clamp to the one bounded maximum"
+        );
+        assert_eq!(
+            overreaching.pcm_byte_cap,
+            16_000 * 2 * MAX_RECORDING_DURATION.as_secs() as usize,
+            "the clamped deadline must bound the retained PCM cap too"
+        );
+        // Shortening still works — the clamp is a ceiling, not a pin.
+        assert_eq!(
+            resolve_recording_maximum(Some("5000".to_owned())).deadline,
+            Duration::from_millis(5000)
+        );
+    }
+
+    #[test]
+    fn a_sub_hundred_millisecond_override_still_permits_a_deliverable_recording() {
+        // 50 ms derives a 1_600-byte cap, below the minimum a Recording needs to
+        // pass validate_audio — the cap alone would turn every hit into total
+        // loss, the defect this ticket exists to remove. The floor keeps the
+        // shortest configurable Recording deliverable.
+        let tiny = resolve_recording_maximum(Some("50".to_owned()));
+        assert_eq!(tiny.deadline, Duration::from_millis(50));
+        assert_eq!(
+            tiny.pcm_byte_cap, MIN_RECORDING_BYTES,
+            "the retained-PCM cap must never fall below a deliverable Recording"
         );
     }
 
