@@ -144,6 +144,10 @@ impl Daemon {
         let mut command = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"));
         command
             .env("XDG_RUNTIME_DIR", runtime_dir)
+            // The diagnostics store is durable state now, so every test daemon
+            // needs its own state root or they would all share (and clobber)
+            // the developer's real ~/.local/state/voisu.
+            .env("XDG_STATE_HOME", state_home(runtime_dir))
             .env("VOISU_TEST_MODE", "controlled")
             // The fake pw-record stubs emit headerless PCM, matching the --raw
             // path. Force the capability probe to that path so it neither runs
@@ -196,6 +200,10 @@ impl Daemon {
         let mut command = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"));
         command
             .env("XDG_RUNTIME_DIR", runtime_dir)
+            // The diagnostics store is durable state now, so every test daemon
+            // needs its own state root or they would all share (and clobber)
+            // the developer's real ~/.local/state/voisu.
+            .env("XDG_STATE_HOME", state_home(runtime_dir))
             // The fake pw-record stubs emit headerless PCM; force the --raw
             // capability path (see start_with_env). Real hosts probe for real.
             .env("VOISU_TEST_PW_RECORD_RAW", "1")
@@ -7158,6 +7166,7 @@ fn single_instance_rejection_preserves_the_live_daemon_and_cleanup_owns_one_inod
 
     let second = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"))
         .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_STATE_HOME", state_home(runtime.path()))
         .output()
         .unwrap();
     assert!(!second.status.success());
@@ -7999,12 +8008,20 @@ fn oversized_and_slow_frames_do_not_block_or_kill_the_daemon() {
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 }
 
+/// The per-test `XDG_STATE_HOME`. The diagnostics store is durable state, so
+/// every test daemon gets its own state root instead of sharing the developer's
+/// real `~/.local/state/voisu`.
+fn state_home(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join("state")
+}
+
+/// Where the daemon opens its diagnostics store, given a test's runtime dir.
+fn diagnostics_dir(runtime_dir: &Path) -> PathBuf {
+    state_home(runtime_dir).join("voisu").join("diagnostics")
+}
+
 fn diagnostics_audio_dir(runtime_dir: &Path) -> PathBuf {
-    runtime_dir
-        .join("voisu")
-        .join(format!("v{PROTOCOL_VERSION}"))
-        .join("diagnostics")
-        .join("audio")
+    diagnostics_dir(runtime_dir).join("audio")
 }
 
 fn pcm_file_count(dir: &Path) -> usize {
@@ -8138,11 +8155,7 @@ fn expired_debug_audio_is_cleaned_up_safely() {
 }
 
 fn fixture_dir(runtime_dir: &Path) -> PathBuf {
-    runtime_dir
-        .join("voisu")
-        .join(format!("v{PROTOCOL_VERSION}"))
-        .join("diagnostics")
-        .join("fixtures")
+    diagnostics_dir(runtime_dir).join("fixtures")
 }
 
 #[test]
@@ -8280,14 +8293,13 @@ fn cli_history_renders_the_complete_bounded_records() {
 }
 
 /// Creates (and hardens) the private diagnostics directory a seeded fixture
-/// writes into, at the same location the daemon opens its store from. The
-/// daemon refuses to start unless every component it owns is 0700.
+/// writes into, at the same location the daemon opens its store from. The daemon
+/// refuses to start unless every component it owns is 0700.
 fn seeded_diagnostics_dir(runtime_dir: &Path) -> PathBuf {
-    let voisu_dir = runtime_dir.join("voisu");
-    let version_dir = voisu_dir.join(format!("v{PROTOCOL_VERSION}"));
-    let diagnostics = version_dir.join("diagnostics");
+    let voisu_dir = state_home(runtime_dir).join("voisu");
+    let diagnostics = voisu_dir.join("diagnostics");
     fs::create_dir_all(&diagnostics).unwrap();
-    for directory in [&voisu_dir, &version_dir, &diagnostics] {
+    for directory in [&voisu_dir, &diagnostics] {
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
     }
     diagnostics
@@ -8473,6 +8485,68 @@ fn a_failed_recording_keeps_its_journal_message_and_gains_the_timings() {
     ] {
         assert!(line.contains(key), "the journal line must carry {key}: {line}");
     }
+}
+
+#[test]
+fn diagnostics_are_retained_in_the_private_durable_state_directory() {
+    // XDG_RUNTIME_DIR is tmpfs that logind removes with the user's last session,
+    // so a retention policy measured in DAYS cannot be honoured there — the
+    // effective retention was "since last login". The store belongs in the
+    // durable state directory the daemon unit already provisions, and it must be
+    // exactly as private there as it was under the runtime directory.
+    let runtime = TempDir::new().unwrap();
+    // Nothing pre-creates it: the daemon has to come up against a state
+    // directory that does not exist yet.
+    assert!(
+        !state_home(runtime.path()).exists(),
+        "the fixture must not pre-create the state root"
+    );
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Retain this dictation."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Retain this dictation"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+
+    let store = diagnostics_dir(runtime.path());
+    assert!(
+        store.is_dir(),
+        "the store must be opened at {}",
+        store.display()
+    );
+    assert!(
+        !runtime
+            .path()
+            .join("voisu")
+            .join(format!("v{PROTOCOL_VERSION}"))
+            .join("diagnostics")
+            .exists(),
+        "nothing may be retained under the runtime directory any more"
+    );
+    for directory in [
+        state_home(runtime.path()).join("voisu"),
+        store.clone(),
+        store.join("audio"),
+        store.join("fixtures"),
+    ] {
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "{} must stay 0700 at the durable location",
+            directory.display()
+        );
+    }
+
+    // The record really is readable from there, not merely written somewhere.
+    let output = voisu_with_env(runtime.path(), &["history", "--json"], &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let records: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(records[0]["final_transcript"], "Retain this dictation");
 }
 
 #[test]

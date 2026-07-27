@@ -65,6 +65,32 @@ pub fn runtime_dir() -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Voisu's durable per-user state directory: `$XDG_STATE_HOME/voisu`, falling
+/// back to `~/.local/state/voisu`.
+///
+/// Unlike [`runtime_dir`], this survives logout and reboot. `systemd-logind`
+/// removes `/run/user/$UID` when the user's last session ends, so anything kept
+/// under the runtime directory has an effective lifetime of "since last login" —
+/// a retention policy measured in days cannot be honoured there. The daemon unit
+/// already provisions this location (`StateDirectory=voisu`).
+///
+/// Returning the path does not make it safe to write to: the caller creates it
+/// private and verifies ownership, exactly as the runtime directory is checked
+/// before anything is written there.
+pub fn state_dir() -> Result<PathBuf, String> {
+    let root = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".local/state"))
+        })
+        .ok_or_else(|| "neither XDG_STATE_HOME nor HOME names an absolute path".to_owned())?;
+    Ok(root.join("voisu"))
+}
+
 pub fn socket_path() -> Result<PathBuf, String> {
     Ok(runtime_dir()?
         .join("voisu")

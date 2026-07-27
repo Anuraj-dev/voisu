@@ -133,12 +133,16 @@ async fn run() -> Result<(), String> {
         inode: metadata.ino(),
     };
 
-    // Correlated local diagnostics live under the already-hardened private
-    // runtime directory and never leave the local machine. Startup cleanup
-    // removes any debug audio or over-retention records a previous run left.
+    // Correlated local diagnostics live in the private DURABLE state directory
+    // and never leave the local machine. Not the runtime directory: logind
+    // removes /run/user/$UID with the user's last session, which would cap a
+    // retention policy measured in days at "since last login" and silently make
+    // week-over-week latency comparison impossible. Startup cleanup removes any
+    // debug audio or over-retention records a previous run left.
     let retention = RetentionPolicy::from_env();
+    let state = create_private_state_dir()?;
     let diagnostics = Arc::new(
-        DiagnosticStore::open(parent.join("diagnostics"), retention)
+        DiagnosticStore::open(state.join("diagnostics"), retention)
             .map_err(|error| format!("cannot open diagnostics store: {error}"))?,
     );
     if let Err(error) = diagnostics.cleanup_expired() {
@@ -290,6 +294,49 @@ fn create_private_runtime_dirs(parent: &Path) -> Result<(), String> {
         return Err("unexpected daemon runtime directory".to_owned());
     }
     Ok(())
+}
+
+/// Creates Voisu's durable state directory and holds it to the same privacy
+/// contract the runtime directory has: a real directory (never a symlink), owned
+/// by this user, mode 0700.
+///
+/// The XDG state ROOT is shared ground — other applications keep their state
+/// beside Voisu's — so it is only created, with the process umask, and never
+/// re-permissioned. Only Voisu's own directory below it is locked down.
+/// `DiagnosticStore::open` then applies the identical check to the store and its
+/// audio and fixture subdirectories, so moving the store off tmpfs does not
+/// weaken the hardening it had there.
+fn create_private_state_dir() -> Result<PathBuf, String> {
+    let dir = voisu_core::state_dir()?;
+    let root = dir
+        .parent()
+        .ok_or_else(|| "state directory has no parent".to_owned())?;
+    fs::create_dir_all(root)
+        .map_err(|error| format!("cannot create state root {}: {error}", root.display()))?;
+    match fs::symlink_metadata(&dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(format!("unsafe state path: {}", dir.display()));
+            }
+            // SAFETY: geteuid has no preconditions and does not mutate memory.
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(format!(
+                    "state directory is not owned by the current user: {}",
+                    dir.display()
+                ));
+            }
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("cannot secure state directory: {error}"))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|error| format!("cannot create private state directory: {error}"))?;
+        }
+        Err(error) => return Err(format!("cannot inspect state directory: {error}")),
+    }
+    Ok(dir)
 }
 
 struct SingleInstance(File);

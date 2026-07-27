@@ -960,6 +960,9 @@ fn a_manual_daemon_is_reported_and_service_start_does_not_create_a_crash_loop() 
     let mut manual = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"));
     manual
         .env("XDG_RUNTIME_DIR", &fixture.runtime)
+        // Durable diagnostics state: keep this daemon out of the developer's
+        // real ~/.local/state/voisu.
+        .env("XDG_STATE_HOME", fixture.runtime.join("state"))
         .env("VOISU_DISABLE_SHORTCUTS", "1")
         .env("VOISU_DISABLE_DIRECT_DELIVERY", "1")
         .env("VOISU_TEST_MODE", "controlled");
@@ -985,6 +988,9 @@ fn a_systemd_launched_duplicate_exits_cleanly_while_the_manual_daemon_remains_re
     let mut manual = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"));
     manual
         .env("XDG_RUNTIME_DIR", &fixture.runtime)
+        // Durable diagnostics state: keep this daemon out of the developer's
+        // real ~/.local/state/voisu.
+        .env("XDG_STATE_HOME", fixture.runtime.join("state"))
         .env("VOISU_DISABLE_SHORTCUTS", "1")
         .env("VOISU_DISABLE_DIRECT_DELIVERY", "1")
         .env("VOISU_TEST_MODE", "controlled");
@@ -995,6 +1001,7 @@ fn a_systemd_launched_duplicate_exits_cleanly_while_the_manual_daemon_remains_re
     let duplicate = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"))
         .arg("--systemd")
         .env("XDG_RUNTIME_DIR", &fixture.runtime)
+        .env("XDG_STATE_HOME", fixture.runtime.join("state"))
         .output()
         .unwrap();
     assert!(duplicate.status.success(), "{}", stderr(&duplicate));
