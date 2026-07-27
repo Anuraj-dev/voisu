@@ -174,6 +174,10 @@ fn render_record(index: usize, record: &Value, style: &RenderStyle) -> String {
         lines.push_str("  ");
         lines.push_str(&style.paint(&tag, Ansi::Yellow));
     }
+    if let Some(tag) = truncation_tag(record) {
+        lines.push_str("  ");
+        lines.push_str(&style.paint(&tag, Ansi::Yellow));
+    }
     lines.push('\n');
 
     // Selection + delivered Transcript, or the failure status with a one-line
@@ -330,6 +334,19 @@ fn delivery_tag(record: &Value) -> Option<String> {
         Some("clipboard_fallback") => Some("(clipboard fallback)".to_owned()),
         _ if count == 0 => Some("(not delivered)".to_owned()),
         _ => None,
+    }
+}
+
+/// A short caveat when a cap stopped the Recording before the user did, naming
+/// the cap that fired. Without it a truncated dictation is indistinguishable
+/// from a short one after the fact — the operator surface for story 6. Shown
+/// whether or not a Transcript was delivered: a truncated Recording that then
+/// failed is exactly the case worth spotting.
+fn truncation_tag(record: &Value) -> Option<String> {
+    match str_field(record, "truncated_by")? {
+        "buffer" => Some("(truncated: bounded buffer)".to_owned()),
+        "recording_deadline" => Some("(truncated: Recording Deadline)".to_owned()),
+        _ => Some("(truncated)".to_owned()),
     }
 }
 
@@ -522,6 +539,49 @@ mod tests {
         assert!(out.contains("Groq: \"Render the full record\""), "{out}");
         assert!(out.contains("Deepgram ok 1620ms"), "{out}");
         assert!(out.contains("Groq ok 1450ms"), "{out}");
+    }
+
+    #[test]
+    fn truncated_records_name_the_cap_that_fired() {
+        let deadline = render_one(json!({
+            "recorded_at_unix_ms": NOW - 1000,
+            "final_transcript": "the dictation up to the limit",
+            "selection": "source_groq",
+            "capture_finalized_ms": 900,
+            "release_to_text_ms": 1100,
+            "delivery_count": 1,
+            "delivery_method": "compositor_submitted",
+            "truncated_by": "recording_deadline"
+        }));
+        assert!(
+            deadline.contains("(truncated: Recording Deadline)"),
+            "{deadline}"
+        );
+
+        let buffer = render_one(json!({
+            "recorded_at_unix_ms": NOW - 1000,
+            "final_transcript": "the dictation up to the limit",
+            "selection": "source_groq",
+            "capture_finalized_ms": 900,
+            "release_to_text_ms": 1100,
+            "delivery_count": 1,
+            "delivery_method": "compositor_submitted",
+            "truncated_by": "buffer"
+        }));
+        assert!(buffer.contains("(truncated: bounded buffer)"), "{buffer}");
+
+        // An untruncated Recording of the same shape must stay unmarked, so the
+        // tag distinguishes a capped dictation from a merely short one.
+        let complete = render_one(json!({
+            "recorded_at_unix_ms": NOW - 1000,
+            "final_transcript": "the dictation up to the limit",
+            "selection": "source_groq",
+            "capture_finalized_ms": 900,
+            "release_to_text_ms": 1100,
+            "delivery_count": 1,
+            "delivery_method": "compositor_submitted"
+        }));
+        assert!(!complete.contains("truncated"), "{complete}");
     }
 
     #[test]

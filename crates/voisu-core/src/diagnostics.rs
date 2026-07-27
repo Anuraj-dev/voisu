@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BoundaryError, CapturedAudio, DeliveryMethod, LifecycleStage, Provider, ProviderCoordinator,
+    BoundaryError, CaptureLimit, CapturedAudio, DeliveryMethod, LifecycleStage, Provider, ProviderCoordinator,
     ProviderFailure, ProviderTiming, SourceTranscript, TranscriptDecision, TranscriptSelection,
     TranscriptValidator,
 };
@@ -147,6 +147,8 @@ pub struct DiagnosticRecord {
     pub first_chunk_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_finalized_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated_by: Option<CaptureLimit>,
     #[serde(default)]
     pub provider_timings_ms: Vec<ProviderTiming>,
     /// Every configured provider that failed or was absent for this Recording,
@@ -185,6 +187,7 @@ impl DiagnosticRecord {
             delivery_fallback_reason: None,
             first_chunk_ms: None,
             capture_finalized_ms: None,
+            truncated_by: None,
             provider_timings_ms: Vec::new(),
             provider_failures: Vec::new(),
             release_to_text_ms: None,

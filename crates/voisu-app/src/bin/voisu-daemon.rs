@@ -25,7 +25,7 @@ use voisu_app::system::{
 use voisu_app::config::DeliveryMode;
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
-    CancelRegistry, CapturedAudio, Command, DaemonState, DeliveryAdapter, DeliveryMethod,
+    CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonState, DeliveryAdapter, DeliveryMethod,
     DeliveryOutcome, DiagnosticRecord, DiagnosticStore, LifecycleEvidence, LifecycleStage,
     OverlayEvent, OverlayOutcome,
     MergeResult, PROTOCOL_VERSION, Provider,
@@ -139,6 +139,16 @@ async fn run() -> Result<(), String> {
     );
     if let Err(error) = diagnostics.cleanup_expired() {
         eprintln!("diagnostics cleanup failed: {error}");
+    }
+
+    // An over-long VOISU_RECORDING_DEADLINE_MS is clamped to the one bounded
+    // maximum. Say so once here rather than at the clamp itself, which runs on
+    // every Recording: an operator who configured a longer maximum must learn
+    // the real limit from the journal, not from being stopped by it.
+    if let Some(notice) = voisu_app::system::recording_deadline_override_notice(
+        std::env::var("VOISU_RECORDING_DEADLINE_MS").ok(),
+    ) {
+        eprintln!("{notice}");
     }
 
     let delivery_mode = voisu_app::config::delivery_mode();
@@ -412,6 +422,7 @@ struct PumpOutput {
     capture: Box<dyn ActiveCapture>,
     providers: ProviderCoordinator,
     stream_error: Option<BoundaryError>,
+    capture_limit: Option<CaptureLimit>,
 }
 
 enum ActorState {
@@ -437,6 +448,7 @@ struct Completion {
     validator: Box<dyn TranscriptValidator>,
     delivery: Box<dyn DeliveryAdapter>,
     reply: Option<oneshot::Sender<Response>>,
+    publish_terminal_outcome: bool,
 }
 
 /// The adapters and Recording outcome returned through the processing task's
@@ -727,6 +739,7 @@ async fn actor_loop(
                                 focus_probe.clone(),
                                 configured_providers.clone(),
                                 Some(reply),
+                                false,
                                 tx.clone(),
                                 reaper.clone(),
                             ) {
@@ -1070,6 +1083,7 @@ async fn actor_loop(
                             focus_probe.clone(),
                             configured_providers.clone(),
                             None,
+                            true,
                             tx.clone(),
                             reaper.clone(),
                         );
@@ -1077,6 +1091,8 @@ async fn actor_loop(
                 }
             }
             ActorMessage::Completed(completed) => {
+                let truncated = completed.evidence.truncated_by.is_some();
+                let delivery_method = completed.evidence.delivery_method;
                 validator = Some(completed.validator);
                 delivery = Some(completed.delivery);
                 if matches!(&state, ActorState::Processing(evidence) if evidence.recording_id == completed.id)
@@ -1092,9 +1108,16 @@ async fn actor_loop(
                             let response = Response::with_evidence(
                             true,
                             Some(DaemonState::Idle),
-                            match completed.evidence.delivery_method {
-                                Some(DeliveryMethod::ClipboardFallback) => {
+                            match (delivery_method, truncated) {
+                                (Some(DeliveryMethod::ClipboardFallback), true) => {
+                                    "Direct Delivery unavailable; Transcript is on the clipboard, \
+                                     but the Recording was truncated; check the end"
+                                }
+                                (Some(DeliveryMethod::ClipboardFallback), false) => {
                                     "Direct Delivery unavailable; Transcript is on the clipboard"
+                                }
+                                (_, true) => {
+                                    "Delivered, but the Recording was truncated; check the end"
                                 }
                                 _ => "Transcript submitted through the compositor; preserved on the clipboard",
                             },
@@ -1105,7 +1128,11 @@ async fn actor_loop(
                                 &mut last_overlay_event,
                                 daemon_instance,
                                 OverlayOutcome::Delivered,
-                                "Delivered".to_owned(),
+                                if truncated {
+                                    "Delivered, but the Recording was truncated; check the end".to_owned()
+                                } else {
+                                    "Delivered".to_owned()
+                                },
                             );
                             response
                         }
@@ -1127,6 +1154,19 @@ async fn actor_loop(
                             response
                         }
                     };
+                    // A Recording that ended without a waiting client — the
+                    // Recording Deadline or the bounded buffer stopped it — has
+                    // nowhere to report its terminal outcome but the journal.
+                    // The line is origin-neutral: the same self-termination
+                    // happens to a `voisu start` a user never stopped, so it
+                    // reuses the operator's `Recording {id}:` prefix rather than
+                    // claiming a Trigger Key that may never have been pressed.
+                    if completed.publish_terminal_outcome {
+                        eprintln!("Recording {}: {}", completed.id, response.message);
+                    }
+                    // Publishing and replying are independent: a call site that
+                    // asks for both must not silently drop the client's channel
+                    // and leave it with a bare RecvError.
                     if let Some(reply) = completed.reply {
                         let _ = reply.send(response);
                     }
@@ -1153,6 +1193,7 @@ async fn actor_loop(
                             focus_probe.clone(),
                             configured_providers.clone(),
                             None,
+                            false,
                             tx.clone(),
                             reaper.clone(),
                         );
@@ -1200,6 +1241,7 @@ fn spawn_recording_processing(
     focus_probe: Option<SharedFocusProbe>,
     configured_providers: Vec<Provider>,
     reply: Option<oneshot::Sender<Response>>,
+    publish_terminal_outcome: bool,
     actor: mpsc::Sender<ActorMessage>,
     reaper: ProviderReaper,
 ) -> Result<(), (Box<Response>, Option<oneshot::Sender<Response>>)> {
@@ -1241,6 +1283,7 @@ fn spawn_recording_processing(
         configured_providers,
         panic_evidence,
         reply,
+        publish_terminal_outcome,
         actor,
         diagnostics,
         reaper,
@@ -1355,6 +1398,7 @@ fn base_evidence(
         source_transcript_providers: Vec::new(),
         first_chunk_ms: None,
         capture_finalized_ms: None,
+        truncated_by: None,
         provider_timings_ms: Vec::new(),
         release_to_text_ms: None,
         transcript_selection: None,
@@ -1608,6 +1652,7 @@ async fn capture_pump(
     actor: mpsc::Sender<ActorMessage>,
 ) -> PumpOutput {
     let mut stream_error = None;
+    let mut capture_limit = None;
     loop {
         tokio::select! {
             biased;
@@ -1639,7 +1684,11 @@ async fn capture_pump(
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    stream_error = Some(error);
+                    if error.kind() == BoundaryKind::RecordingDeadline {
+                        capture_limit = Some(CaptureLimit::RecordingDeadline);
+                    } else {
+                        stream_error = Some(error);
+                    }
                     break;
                 }
             },
@@ -1650,6 +1699,7 @@ async fn capture_pump(
         capture,
         providers,
         stream_error,
+        capture_limit,
     }
 }
 
@@ -1680,6 +1730,7 @@ async fn process_recording(
         mut capture,
         providers,
         stream_error,
+        capture_limit,
     } = match pump {
         Ok(output) => output,
         Err(join_error) => {
@@ -1737,6 +1788,11 @@ async fn process_recording(
                 return Err(abort_recording_work(capture, providers, error).await);
             }
         };
+        let audio = match capture_limit {
+            Some(limit) => audio.with_truncation(limit),
+            None => audio,
+        };
+        evidence.truncated_by = audio.truncated_by();
         evidence.capture_finalized_ms = Some(elapsed_millis(started_at));
         evidence.stages.push(LifecycleStage::CaptureFinalized);
         if debug_capture {
@@ -1843,6 +1899,7 @@ async fn supervise_recording(
     configured_providers: Vec<Provider>,
     panic_evidence: LifecycleEvidence,
     reply: Option<oneshot::Sender<Response>>,
+    publish_terminal_outcome: bool,
     actor: mpsc::Sender<ActorMessage>,
     diagnostics: Arc<DiagnosticStore>,
     reaper: ProviderReaper,
@@ -1911,6 +1968,7 @@ async fn supervise_recording(
             validator: recording.validator,
             delivery: recording.delivery,
             reply,
+            publish_terminal_outcome,
         })))
         .await;
 }
@@ -2046,6 +2104,7 @@ fn diagnostic_record(
     record.delivery_fallback_reason = evidence.delivery_fallback_reason.clone();
     record.first_chunk_ms = evidence.first_chunk_ms;
     record.capture_finalized_ms = evidence.capture_finalized_ms;
+    record.truncated_by = evidence.truncated_by;
     record.provider_timings_ms = evidence.provider_timings_ms.clone();
     record.release_to_text_ms = evidence.release_to_text_ms;
     record.error = error.map(|error| error.public_message().to_owned());
@@ -2598,6 +2657,7 @@ struct ControlledCapture {
     chunks: u32,
     chunk_delay: Duration,
     deadline_after_chunks: Option<u32>,
+    buffer_cap_after_chunks: Option<u32>,
     /// Deterministic paused Level producer: this many frames, with lead band
     /// values 10, 20, 30, ..., are pushed once during `begin` — before the
     /// CLI's start reply — and never again, so Level IPC tests observe a
@@ -2646,6 +2706,9 @@ impl ControlledCapture {
             deadline_after_chunks: std::env::var("VOISU_TEST_DEADLINE_AFTER_CHUNKS")
                 .ok()
                 .and_then(|value| value.parse().ok()),
+            buffer_cap_after_chunks: std::env::var("VOISU_TEST_BUFFER_CAP_AFTER_CHUNKS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
             level_frames: std::env::var("VOISU_TEST_LEVEL_FRAMES")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -2683,7 +2746,9 @@ impl AudioCapture for ControlledCapture {
             remaining_chunks: self.chunks,
             chunk_delay: self.chunk_delay,
             deadline_after_chunks: self.deadline_after_chunks,
+            buffer_cap_after_chunks: self.buffer_cap_after_chunks,
             chunks_emitted: 0,
+            buffer_cap_reached: false,
         }))
     }
 }
@@ -2697,7 +2762,9 @@ struct ControlledActiveCapture {
     remaining_chunks: u32,
     chunk_delay: Duration,
     deadline_after_chunks: Option<u32>,
+    buffer_cap_after_chunks: Option<u32>,
     chunks_emitted: u32,
+    buffer_cap_reached: bool,
 }
 
 impl ActiveCapture for ControlledActiveCapture {
@@ -2717,6 +2784,12 @@ impl ActiveCapture for ControlledActiveCapture {
                     BoundaryKind::RecordingDeadline,
                     "controlled Recording Deadline elapsed",
                 ));
+            }
+            if let Some(limit) = self.buffer_cap_after_chunks
+                && self.chunks_emitted >= limit
+            {
+                self.buffer_cap_reached = true;
+                return Ok(None);
             }
             if self.remaining_chunks == 0 {
                 std::future::pending::<()>().await;
@@ -2747,6 +2820,11 @@ impl ActiveCapture for ControlledActiveCapture {
                 Err(BoundaryError::new(
                     BoundaryKind::Capture,
                     "controlled-secret-capture-detail",
+                ))
+            } else if self.buffer_cap_reached {
+                Ok(CapturedAudio::truncated(
+                    vec![1_u8; 3_200],
+                    CaptureLimit::Buffer,
                 ))
             } else {
                 Ok(CapturedAudio::new(vec![1_u8; 3_200]))
@@ -3122,6 +3200,7 @@ mod tests {
             vec![Provider::Groq],
             evidence,
             None,
+            false,
             actor,
             Arc::clone(&diagnostics),
             ProviderReaper::new(),

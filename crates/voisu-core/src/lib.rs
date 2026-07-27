@@ -183,6 +183,8 @@ pub struct LifecycleEvidence {
     pub first_chunk_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_finalized_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated_by: Option<CaptureLimit>,
     #[serde(default)]
     pub provider_timings_ms: Vec<ProviderTiming>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -480,16 +482,37 @@ pub type BoundaryFuture<'a, T> =
 #[derive(Clone, Debug)]
 pub struct AudioChunk(pub Vec<u8>);
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureLimit {
+    Buffer,
+    RecordingDeadline,
+}
+
 #[derive(Clone, Debug)]
 pub struct CapturedAudio {
     pcm_s16le_mono_16khz: Vec<u8>,
+    truncated_by: Option<CaptureLimit>,
 }
 
 impl CapturedAudio {
     pub fn new(pcm_s16le_mono_16khz: Vec<u8>) -> Self {
         Self {
             pcm_s16le_mono_16khz,
+            truncated_by: None,
         }
+    }
+
+    pub fn truncated(pcm_s16le_mono_16khz: Vec<u8>, limit: CaptureLimit) -> Self {
+        Self {
+            pcm_s16le_mono_16khz,
+            truncated_by: Some(limit),
+        }
+    }
+
+    pub fn with_truncation(mut self, limit: CaptureLimit) -> Self {
+        self.truncated_by = Some(limit);
+        self
     }
 
     pub fn empty() -> Self {
@@ -498,6 +521,10 @@ impl CapturedAudio {
 
     pub fn pcm_s16le_mono_16khz(&self) -> &[u8] {
         &self.pcm_s16le_mono_16khz
+    }
+
+    pub fn truncated_by(&self) -> Option<CaptureLimit> {
+        self.truncated_by
     }
 }
 

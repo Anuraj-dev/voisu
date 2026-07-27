@@ -1174,7 +1174,7 @@ printf '%s' "$((count + 1))" > "$dir/delivery.count"
 fn groq_transcribes_a_short_recording_as_one_full_audio_request_at_finalize() {
     // A Recording at or below the full-audio limit (~120 s) pre-streams nothing
     // during the Recording — Whisper gets the complete audio in one request at
-    // finalize, eliminating chunk seams. ~31 s of PCM here stays well under the
+    // finalize, eliminating chunk seams. ~1 s of PCM here stays well under the
     // limit.
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
@@ -1182,7 +1182,9 @@ fn groq_transcribes_a_short_recording_as_one_full_audio_request_at_finalize() {
         commands.path(),
         "pw-record",
         r#"#!/bin/sh
-head -c 1000000 /dev/zero | tr '\000' '\001'
+dir=$(dirname "$0")
+head -c 32000 /dev/zero | tr '\000' '\001'
+: > "$dir/pw-record.ready"
 trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
 i=0
 while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
@@ -1216,6 +1218,7 @@ cat > "$dir/clipboard"
     // Confirm the Recording is actively capturing, then prove no Groq chunk was
     // pre-streamed: a short Recording issues its one request only at finalize.
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    wait_for_marker(commands.path(), "pw-record.ready");
     assert_eq!(
         live_requests.load(Ordering::SeqCst),
         0,
@@ -1231,10 +1234,10 @@ cat > "$dir/clipboard"
         "a short Recording is one full-audio Groq request at finalize"
     );
     // The FLAC STREAMINFO sample count proves the one request carries the FULL
-    // pre-stop capture (500,000 samples). The fake pw-record's post-signal trap
+    // pre-stop capture (16,000 samples). The fake pw-record's post-signal trap
     // bytes race the bounded stop path and are deliberately not required.
     assert!(
-        flac_total_samples(&requests[0]) >= 500_000,
+        flac_total_samples(&requests[0]) >= 16_000,
         "the finalize request carries the full Recording"
     );
     assert_eq!(
@@ -1666,6 +1669,33 @@ fn production_capture_death_mid_recording_self_recovers_without_stop() {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("the daemon did not recover after pw-record died");
+}
+
+#[test]
+fn an_over_long_recording_maximum_override_is_reported_at_startup() {
+    // The daemon clamps an over-long VOISU_RECORDING_DEADLINE_MS to the one
+    // bounded maximum. An operator who asked for twenty minutes and was never
+    // told they get ten would meet that limit only by being cut off at it —
+    // the same complaint the bounded maximum exists to answer, moved to the
+    // configuration surface. One startup line, before any Recording.
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(commands.path(), "pw-record", "#!/bin/sh\nsleep 0\n");
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_RECORDING_DEADLINE_MS", "1200000"),
+        ],
+    );
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains("VOISU_RECORDING_DEADLINE_MS=1200000 ms")
+            && diagnostics.contains("Recordings stop at 600 s"),
+        "a clamped override must name both the request and the enforced maximum: {diagnostics}"
+    );
 }
 
 #[test]
@@ -2206,46 +2236,6 @@ fn silent_recording_is_distinct_and_recoverable_through_the_public_cli() {
         "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 3200 /dev/zero\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
         "Recording contains no speech",
     );
-}
-
-#[test]
-fn over_deadline_recording_is_distinct_and_recoverable_through_the_public_cli() {
-    let runtime = TempDir::new().unwrap();
-    let commands = TempDir::new().unwrap();
-    write_fake_command(
-        commands.path(),
-        "pw-record",
-        "#!/bin/sh\nprintf '\\100\\000'\ntrap 'exit 0' INT TERM\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
-    );
-    let path = format!(
-        "{}:{}",
-        commands.path().display(),
-        std::env::var("PATH").unwrap()
-    );
-    let daemon = Daemon::start_production_with_env(
-        runtime.path(),
-        &[
-            ("PATH", &path),
-            ("VOISU_GROQ_API_KEY", "controlled-secret"),
-            ("VOISU_RECORDING_DEADLINE_MS", "50"),
-        ],
-    );
-    assert!(voisu(runtime.path(), "start").status.success());
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if stdout(&voisu(runtime.path(), "status")) == "idle\n" {
-            assert!(
-                voisu(runtime.path(), "start").status.success(),
-                "a Recording must be accepted after the Recording Deadline"
-            );
-            let diagnostics = daemon.terminate_and_stderr();
-            assert!(diagnostics.contains("configured Recording Deadline elapsed"));
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("the daemon did not self-recover after the Recording Deadline");
 }
 
 #[test]
@@ -6016,7 +6006,8 @@ fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
     // One activation starts a Recording; the user then forgets the second
-    // activation. The Recording Deadline must stop it on its own and record why.
+    // activation. The Recording Deadline must stop it on its own, deliver the
+    // retained prefix, and record that the result was truncated.
     portal.activate();
 
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -6024,7 +6015,12 @@ fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
         let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
         let records = history["history"].as_array().expect("history is a list");
         if records.len() == 1 {
-            assert_eq!(records[0]["error"], "Recording Deadline elapsed", "{history}");
+            assert_eq!(records[0]["error"], serde_json::Value::Null, "{history}");
+            assert_eq!(records[0]["delivery_count"], 1, "{history}");
+            assert_eq!(
+                records[0]["truncated_by"], "recording_deadline",
+                "{history}"
+            );
             break;
         }
         assert!(records.len() <= 1, "the forgotten toggle produced extra Recordings: {history}");
@@ -6038,7 +6034,306 @@ fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
-        diagnostics.contains("controlled Recording Deadline elapsed"),
+        diagnostics
+            .contains("Recording 1: Delivered, but the Recording was truncated; check the end"),
+        "{diagnostics}"
+    );
+}
+
+#[test]
+fn deadline_at_the_buffer_ceiling_delivers_retained_audio_as_truncated() {
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
+            ("VOISU_TEST_DEADLINE_AFTER_CHUNKS", "2"),
+            ("VOISU_TEST_BUFFER_CAP_AFTER_CHUNKS", "2"),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Keep the deadline-limited dictation.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "Keep the deadline-limited dictation.",
+            ),
+        ],
+    );
+
+    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    wait_for_status(runtime.path(), "idle\n");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    assert_eq!(
+        record["final_transcript"],
+        "Keep the deadline-limited dictation.",
+        "{history}"
+    );
+    assert_eq!(record["delivery_count"], 1, "{history}");
+    assert_eq!(
+        record["truncated_by"], "recording_deadline",
+        "{history}"
+    );
+
+    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(observed["overlay_event"]["outcome"], "delivered", "{observed}");
+    assert_eq!(
+        observed["overlay_event"]["message"],
+        "Delivered, but the Recording was truncated; check the end",
+        "{observed}"
+    );
+
+    // This Recording began at the CLI and no Trigger Key was ever pressed, so
+    // the self-termination line must not attribute it to one: the operator
+    // pairs each Recording with its activation lines when diagnosing a report.
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics
+            .contains("Recording 1: Delivered, but the Recording was truncated; check the end"),
+        "{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("Trigger Key activation"),
+        "a CLI-started Recording must never be logged as a Trigger Key activation: {diagnostics}"
+    );
+}
+
+#[test]
+fn synthetic_pcm_past_the_buffer_cap_delivers_a_non_empty_transcript() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
+            ("VOISU_TEST_BUFFER_CAP_AFTER_CHUNKS", "2"),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Retain the captured dictation.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "Retain the captured dictation.",
+            ),
+        ],
+    );
+
+    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    wait_for_status(runtime.path(), "idle\n");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    assert_eq!(
+        record["final_transcript"],
+        "Retain the captured dictation.",
+        "{history}"
+    );
+    assert_eq!(record["delivery_count"], 1, "{history}");
+}
+
+#[test]
+fn buffer_truncation_is_diagnosed_and_warns_through_the_delivered_outcome() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
+            ("VOISU_TEST_BUFFER_CAP_AFTER_CHUNKS", "2"),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Keep the retained audio."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Keep the retained audio."),
+        ],
+    );
+
+    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    wait_for_status(runtime.path(), "idle\n");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(history["history"][0]["truncated_by"], "buffer", "{history}");
+
+    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(observed["overlay_event"]["outcome"], "delivered", "{observed}");
+    assert_eq!(
+        observed["overlay_event"]["message"],
+        "Delivered, but the Recording was truncated; check the end",
+        "{observed}"
+    );
+}
+
+#[test]
+fn capture_boundary_read_error_aborts_without_delivery_or_truncation() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+head -c 6400 /dev/zero | tr '\000' '\100'
+trap 'exit 0' INT TERM
+while :; do sleep 0.01; done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+: > "$dir/provider.called"
+exit 1
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+: > "$dir/delivery.called"
+exit 1
+"#,
+    );
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_TEST_MODE", "system-boundaries"),
+            ("VOISU_TEST_PW_RECORD_RAW", "raw"),
+            ("VOISU_TEST_CAPTURE_READ_ERROR_AFTER_BYTES", "3200"),
+            ("VOISU_DISABLE_DEEPGRAM", "1"),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
+        ],
+    );
+
+    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        if history["history"].as_array().is_some_and(|records| records.len() == 1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the capture read failure never completed: {history}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_status(runtime.path(), "idle\n");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    assert!(record["final_transcript"].is_null(), "{history}");
+    assert_eq!(record["delivery_count"], 0, "{history}");
+    assert_eq!(record["truncated_by"], serde_json::Value::Null, "{history}");
+    assert!(
+        record["stages"]
+            .as_array()
+            .is_some_and(|stages| stages.iter().any(|stage| stage == "capture_aborted")),
+        "{history}"
+    );
+    assert!(
+        record["provider_failures"]
+            .as_array()
+            .is_some_and(|failures| failures.iter().all(|failure| {
+                matches!(failure["stage"].as_str(), Some("aborted" | "not_started"))
+            })),
+        "{history}"
+    );
+    assert!(!commands.path().join("provider.called").exists());
+    assert!(!commands.path().join("delivery.called").exists());
+}
+
+#[test]
+fn self_terminating_recording_publishes_a_terminal_outcome_and_operator_line() {
+    let runtime = TempDir::new().unwrap();
+    let portal = MockPortal::start();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
+            ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
+            ("VOISU_TEST_DEADLINE_AFTER_CHUNKS", "2"),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Keep the deadline-limited Trigger Key dictation.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "Keep the deadline-limited Trigger Key dictation.",
+            ),
+        ],
+    );
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    portal.activate();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        if history["history"].as_array().is_some_and(|records| records.len() == 1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the self-terminating Trigger Key Recording never completed: {history}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_status(runtime.path(), "idle\n");
+
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics
+            .contains("Recording 1: Delivered, but the Recording was truncated; check the end"),
+        "{diagnostics}"
+    );
+}
+
+#[test]
+fn clipboard_fallback_preserves_delivery_info_and_warns_of_truncation() {
+    let runtime = TempDir::new().unwrap();
+    let portal = MockPortal::start();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("DBUS_SESSION_BUS_ADDRESS", portal.address()),
+            ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
+            ("VOISU_TEST_BUFFER_CAP_AFTER_CHUNKS", "2"),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Keep the fallback-delivered dictation.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "Keep the fallback-delivered dictation.",
+            ),
+            ("VOISU_TEST_DELIVERY_FALLBACK", "permission denied"),
+        ],
+    );
+    wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
+
+    portal.activate();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        if history["history"].as_array().is_some_and(|records| records.len() == 1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the truncated Trigger Key Recording never completed: {history}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_status(runtime.path(), "idle\n");
+
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains(
+            "Recording 1: Direct Delivery unavailable; Transcript is on the clipboard, \
+             but the Recording was truncated; check the end"
+        ),
         "{diagnostics}"
     );
 }
@@ -6866,13 +7161,23 @@ fn failed_recording_kills_its_in_flight_groq_request_before_the_next_recording()
     let commands = TempDir::new().unwrap();
     // More than the full-audio limit (~120 s) of PCM so the Recording crosses
     // into pre-streamed chunking and a bounded Groq chunk request goes in
-    // flight during the Recording; then keep recording until the configured
-    // Recording Deadline fails it.
+    // flight during the Recording. A later production capture-boundary read
+    // error then fails it.
+    //
+    // The PCM is emitted in two bursts. The injected read error fires the
+    // instant the daemon has consumed all 8_000_000 bytes, and the capture
+    // reader has no backpressure — it drains the pipe as fast as the kernel
+    // allows. Emitting everything at once would leave the ordering "chunk
+    // request started BEFORE the failure" resting on microseconds. The first
+    // burst alone (7_900_000 bytes, ~4 minutes) crosses the 120 s chunking
+    // threshold, so curl.start is provably created during the pause.
     write_fake_command(
         commands.path(),
         "pw-record",
         r#"#!/bin/sh
-head -c 4000000 /dev/zero | tr '\000' '\001'
+head -c 7900000 /dev/zero | tr '\000' '\001'
+sleep 1
+head -c 100000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 i=0
 while [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
@@ -6900,19 +7205,20 @@ while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
         runtime.path(),
         &[
             ("PATH", &path),
+            ("VOISU_TEST_MODE", "system-boundaries"),
+            ("VOISU_TEST_CAPTURE_READ_ERROR_AFTER_BYTES", "8000000"),
             ("VOISU_GROQ_API_KEY", "controlled-secret"),
             (
                 "VOISU_GROQ_TRANSCRIPTION_URL",
                 "http://127.0.0.1:9/audio/transcriptions",
             ),
-            ("VOISU_RECORDING_DEADLINE_MS", "2500"),
         ],
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
     wait_for_marker(commands.path(), "curl.start");
 
-    // The Recording Deadline fails the Recording while the request is in
+    // The capture read error fails the Recording while the request is in
     // flight; the abort must kill the request's subprocess, not merely abort
     // the tokio task that awaits it (a detached blocking curl would keep
     // running for up to 14s, overlapping the next Recording).
@@ -7038,11 +7344,18 @@ while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
 fn failed_recording_closes_its_deepgram_stream_before_the_next_recording() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
+    // Two bursts with a pause between them: the injected read error fires the
+    // instant the daemon has consumed all 64_000 bytes, and the capture reader
+    // drains the pipe with no backpressure. The pause guarantees the Deepgram
+    // stream is provably up (deepgram.ready written) before the failure can
+    // fire, instead of leaving that ordering to microseconds.
     write_fake_command(
         commands.path(),
         "pw-record",
         r#"#!/bin/sh
-head -c 64000 /dev/zero | tr '\000' '\001'
+head -c 32000 /dev/zero | tr '\000' '\001'
+sleep 1
+head -c 32000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 i=0
 while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
@@ -7069,6 +7382,8 @@ printf '{"text":"unused Groq Source Transcript"}'
         runtime.path(),
         &[
             ("PATH", &path),
+            ("VOISU_TEST_MODE", "system-boundaries"),
+            ("VOISU_TEST_CAPTURE_READ_ERROR_AFTER_BYTES", "64000"),
             ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
             ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
             ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
@@ -7076,13 +7391,21 @@ printf '{"text":"unused Groq Source Transcript"}'
                 "VOISU_GROQ_TRANSCRIPTION_URL",
                 "https://groq.test/audio/transcriptions",
             ),
-            ("VOISU_RECORDING_DEADLINE_MS", "500"),
         ],
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
     wait_for_marker(commands.path(), "deepgram.ready");
-    let idle_deadline = Instant::now() + Duration::from_secs(5);
+    // The budget starts at deepgram.ready, which the first burst writes a full
+    // second before the injected failure can fire, so the deliberate pause
+    // spends ~1 s of it before recovery even begins (measured: 1.03 s from
+    // deepgram.ready to idle on an idle host). What remains has to cover a
+    // bounded capture abort (PROCESS_DEADLINE, 2 s) plus
+    // reaper.drain_to_completion (RECOVERY_ABORT_DEADLINE, 2 s) plus the
+    // websocket close, so 5 s left the worst case with no headroom. 8 s matches
+    // the sibling Groq test above and costs nothing on a healthy host: the poll
+    // returns as soon as idle is observed.
+    let idle_deadline = Instant::now() + Duration::from_secs(8);
     while stdout(&voisu(runtime.path(), "status")) != "idle\n" {
         assert!(
             Instant::now() < idle_deadline,
