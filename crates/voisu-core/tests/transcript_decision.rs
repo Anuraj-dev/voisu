@@ -365,6 +365,48 @@ async fn a_dictionary_term_may_not_pay_for_a_dropped_negation() {
     );
 }
 
+/// The harder shape of the same defect: the dropped negation sits right beside
+/// a genuine misrecognition of the dictionary term, so the surplus on the
+/// winning side IS exactly the term. Only the second half of the structural
+/// test catches it — the words the loser has instead must sound like the term
+/// run together, and "not voice so" does not.
+#[tokio::test]
+async fn a_misheard_dictionary_term_may_not_smuggle_out_an_adjacent_negation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::with_dictionary_terms(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+        vec!["Voisu".to_owned()],
+    );
+    let groq = "Please do not deploy voice so to production after all integration tests pass and the release is signed off by the team lead.";
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Please do deploy Voisu to production after all integration tests pass and the release is signed off by the team lead."
+                    .to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: groq.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, groq);
+    assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        decision.transcript.0.contains("do not deploy"),
+        "the negation must survive: {}",
+        decision.transcript.0
+    );
+}
+
 /// The widened gate must not reopen the hole the narrowing existed to close: a
 /// padded transcript manufactures a sentence-punctuation boundary out of text
 /// the other provider never heard. Length-sensitive signals may not decide
