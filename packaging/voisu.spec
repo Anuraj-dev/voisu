@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.6.0
+Version:        0.7.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,28 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Mon Jul 27 2026 Voisu maintainers <voisu@example.invalid> - 0.7.0-1
+- style(capture): keep the one-line notice assertions as rustfmt writes them
+- refactor(daemon): rename publish_trigger_outcome to publish_terminal_outcome
+- test(capture): name what the byte-cap floor actually pins
+- feat(daemon): tell the operator when a Recording maximum override is clamped
+- test(daemon): restore the recovery headroom the deepgram pause consumed
+- test(capture): order the deadline-retention test instead of racing it
+- fix(daemon): log self-terminated Recordings origin-neutrally
+- feat(history): mark truncated Recordings and name the cap that fired
+- fix(capture): clamp the Recording maximum and pin deadline retention
+- fix(capture): retain partial reads at byte cap
+- test(capture): keep fatal cleanup regressions
+- test(capture): align recoverable deadline regressions
+- test(daemon): pass outcome publication intent
+- test(capture): inject production read failure
+- test(capture): exercise production cap drain
+- fix(delivery): warn on truncated clipboard fallback
+- fix(daemon): publish self-termination outcome
+- fix(capture): unify configured recording ceilings
+- fix(capture): retain audio at recording deadline
+- test(daemon): retain self-termination outcome
+
 * Thu Jul 23 2026 Voisu maintainers <voisu@example.invalid> - 0.6.0-1
 - fix(overlay): capsule fills the window, skip idle interpolation, lock 44-bar math
 - feat(overlay): 44-bar meter with taller drawable
