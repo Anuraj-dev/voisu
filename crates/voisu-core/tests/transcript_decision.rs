@@ -407,6 +407,93 @@ async fn a_misheard_dictionary_term_may_not_smuggle_out_an_adjacent_negation() {
     );
 }
 
+/// Finding-A regression: a dictionary term long enough that the round-3 rule
+/// admitted the drop. The old licence measured the loser's surplus — WITH the
+/// dropped word inside it — against a third of its own length, so a dropped
+/// "not" rode a 9-character term ("notpravahcli" is 3 edits from "pravahcli",
+/// under the 4 the 12-character concatenation buys). The existing `Voisu`
+/// fixture passed only because 5 characters buy no such slack. The difference
+/// here is two separate sites (a dropped word AND a split term), which is not
+/// one misheard span, so the Groq default must hold and the negation survive.
+#[tokio::test]
+async fn a_long_dictionary_term_may_not_absorb_a_dropped_negation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::with_dictionary_terms(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+        vec!["pravah-cli".to_owned()],
+    );
+    let groq = "Please do not deploy pravah cli to production after all the integration tests pass and the release notes are ready for the team.";
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Please do deploy pravah-cli to production after all the integration tests pass and the release notes are ready for the team."
+                    .to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: groq.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, groq);
+    assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        decision.transcript.0.contains("do not deploy"),
+        "the negation must survive: {}",
+        decision.transcript.0
+    );
+}
+
+/// Finding-B regression: equal word counts are no proof of equal content. Here
+/// Deepgram drops "not" and pads "tonight", so the counts tie at 15 while the
+/// meaning is inverted — and a dictionary match hands Deepgram the formatting
+/// win. Equal counts with the difference spread across two sites is not one
+/// misheard span, so the Groq default must hold and the negation survive.
+#[tokio::test]
+async fn equal_word_counts_may_not_pay_for_a_dropped_negation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::with_dictionary_terms(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+        vec!["Voisu".to_owned()],
+    );
+    let groq = "Please do not deploy voisu to production after all the integration tests have finished running.";
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Please do deploy Voisu to production after all the integration tests have finished running tonight."
+                    .to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: groq.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, groq);
+    assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        decision.transcript.0.contains("do not deploy"),
+        "the negation must survive: {}",
+        decision.transcript.0
+    );
+}
+
 /// The widened gate must not reopen the hole the narrowing existed to close: a
 /// padded transcript manufactures a sentence-punctuation boundary out of text
 /// the other provider never heard. Length-sensitive signals may not decide
