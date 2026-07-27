@@ -6544,33 +6544,26 @@ mod tests {
             spoken_pcm.extend_from_slice(&pcm);
             state.lock().unwrap().chunks.push_back(AudioChunk(pcm));
         }
-        // pw-record's reader thread flushes its final assembled chunk as it
-        // reaches EOF, which stop_child's bounded join awaits: the tail reaches
-        // the queue during finish(), not before it. Draining before the join
-        // would leave this chunk behind.
-        let tail: Vec<u8> = (0..PCM_CHUNK_BYTES).map(|byte| (byte % 97) as u8).collect();
-        spoken_pcm.extend_from_slice(&tail);
-        let tail_state = Arc::clone(&state);
-        let cleanup = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            tail_state.lock().unwrap().chunks.push_back(AudioChunk(tail));
-            Ok(Vec::new())
-        });
-
         let mut capture = PipeWireActiveCapture {
             child: None,
             state,
             reader: None,
             stderr_reader: None,
-            cleanup: Some(cleanup),
+            // The tail-pushing cleanup is installed further down, after the
+            // Deadline has been reported: nothing may run concurrently with the
+            // queue-length assertion below, so it cannot observe a late tail.
+            cleanup: None,
             reaper: ProviderReaper::new(),
             pcm: Vec::new(),
-            started: Instant::now(),
+            // A start backdated past the Deadline is the shape of a user who
+            // dictated past the maximum and never released the Trigger Key. It
+            // elapses structurally rather than by sleeping, so the report below
+            // rests on no timing margin at all.
+            started: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("the monotonic clock is at least a second past boot"),
             deadline: Duration::from_millis(1),
         };
-        // Elapse the Deadline while audio is still queued: the shape of a user
-        // who dictated past the maximum and never released the Trigger Key.
-        tokio::time::sleep(Duration::from_millis(20)).await;
 
         let error = capture
             .next_chunk()
@@ -6582,6 +6575,22 @@ mod tests {
             2,
             "the Deadline must report without consuming the audio it hands to finish()"
         );
+
+        // pw-record's reader thread flushes its final assembled chunk as it
+        // reaches EOF, which stop_child's bounded join awaits: the tail reaches
+        // the queue during finish(), not before it. Draining before the join
+        // would leave this chunk behind. The 25 ms sleep is load-bearing — it
+        // holds the tail out of the queue for the whole window a wrongly-early
+        // drain_chunks would run in, so a swapped ordering fails instead of
+        // passing on a coincidence.
+        let tail: Vec<u8> = (0..PCM_CHUNK_BYTES).map(|byte| (byte % 97) as u8).collect();
+        spoken_pcm.extend_from_slice(&tail);
+        let tail_state = Arc::clone(&capture.state);
+        capture.cleanup = Some(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            tail_state.lock().unwrap().chunks.push_back(AudioChunk(tail));
+            Ok(Vec::new())
+        }));
 
         let audio = capture
             .finish()
