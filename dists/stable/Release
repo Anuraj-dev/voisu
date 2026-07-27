@@ -1,9 +1,9 @@
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Thu, 23 Jul 2026 15:03:14 +0000
+Date: Mon, 27 Jul 2026 07:55:20 +0000
 Acquire-By-Hash: yes
-Valid-Until: Sat, 22 Aug 2026 15:03:14 +0000
+Valid-Until: Wed, 26 Aug 2026 07:55:20 +0000
 Description: Voisu apt repository
 Label: Voisu
 Origin: Voisu

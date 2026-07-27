@@ -4,9 +4,9 @@ Hash: SHA512
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Thu, 23 Jul 2026 15:03:14 +0000
+Date: Mon, 27 Jul 2026 07:55:20 +0000
 Acquire-By-Hash: yes
-Valid-Until: Sat, 22 Aug 2026 15:03:14 +0000
+Valid-Until: Wed, 26 Aug 2026 07:55:20 +0000
 Description: Voisu apt repository
 Label: Voisu
 Origin: Voisu
@@ -25,8 +25,8 @@ SHA512:
  fca290721cbcf1b60def10c0b25f244bc6b64aad3dc2407c808d15afb352799909941f5ebda9d1a67274339560de28e818b662b4c33b6368eaeef5131fb52eec             1202 main/binary-amd64/Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iHUEARYKAB0WIQRBSe44aLNrYAdZKWbQi8/cNBJbKAUCamItMgAKCRDQi8/cNBJb
-KDDLAQD/kqahCFta9Ti6WrTzjCHA4SkPAkEKPC2fKFBfPb0hwgEAuOT+KRdETTOX
-pH2GNbmfCuF/UmC/C1eDlAjSV46h1Qg=
-=EI1s
+iHUEARYKAB0WIQRBSe44aLNrYAdZKWbQi8/cNBJbKAUCamcO6AAKCRDQi8/cNBJb
+KKDOAP47H1n/hfbfynCryD05NrbhtZJrzjGx8FgSwfqlf3YpmQD+IFT2FlShjXNf
+ISDLUsLKRXmMYcSisCBNpDpzEOTl2QE=
+=/hGq
 -----END PGP SIGNATURE-----
