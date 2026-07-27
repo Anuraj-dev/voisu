@@ -2162,6 +2162,28 @@ fn sentence_boundary_credit(text: &str) -> usize {
     sentence_punctuation_boundaries(text).min(plausible_boundaries)
 }
 
+/// The text's final sentence — everything after the last sentence terminator
+/// that ends a word — with leading non-alphanumerics trimmed. A '.' inside a
+/// token ("amara.org", "otter.ai") does not end a sentence, so an outro
+/// carrying a dotted attribution still reads as one final sentence. A text
+/// with no terminator is itself the final sentence.
+fn final_sentence(text: &str) -> &str {
+    let trimmed = text.trim_end_matches(|character: char| !character.is_alphanumeric());
+    let start = trimmed
+        .char_indices()
+        .filter(|&(index, character)| {
+            matches!(character, '.' | '?' | '!')
+                && trimmed[index + character.len_utf8()..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_whitespace)
+        })
+        .map(|(index, character)| index + character.len_utf8())
+        .next_back()
+        .unwrap_or(0);
+    trimmed[start..].trim_start_matches(|character: char| !character.is_alphanumeric())
+}
+
 fn sentence_start_capitalisation(text: &str) -> (usize, usize) {
     let mut at_sentence_start = true;
     let mut capitalised = 0;
@@ -2335,9 +2357,11 @@ fn quality_failure_reason(
     // markup no speaker utters. The one entry that WAS ordinary speech,
     // "system prompt", is gone: "let us change the system prompt" is a sentence
     // this product's users dictate, and routing it into repair mangles or loses
-    // it. Nothing is lost by its removal — a model leaking its instructions
-    // emits the instructions, not the label, and the shapes that do leak
-    // ("System:", "<|system|>", "### instruction") are still listed.
+    // it. The removal does forfeit one leak shape — a model prefacing its leak
+    // with the label, "Here is the system prompt: ..." — which no surviving
+    // marker catches. That trade is deliberate: the false positive cost whole
+    // dictations, while the forfeited catch only lets a labelled leak reach
+    // the user as visible text to delete.
     const PROMPT_ARTIFACTS: [&str; 7] = [
         "ignore previous instructions",
         "ignore all instructions",
@@ -2381,12 +2405,13 @@ fn quality_failure_reason(
     {
         return Some(QualityFailure::Other("meta-reasoning"));
     }
-    // Left as bare substrings deliberately. These are the archetypal ASR
-    // outro hallucinations, learned from captioned video, and unlike "the user
-    // said" none is unremarkable dictation. A false positive here also costs
-    // far less: the phrase is repaired away and the rest of the dictation is
-    // still delivered, because the repair path no longer refuses a text it
-    // shortened.
+    // The archetypal ASR outro hallucinations, learned from captioned video.
+    // All five are TAIL artifacts — a model appends them as their own closing
+    // sentence — so, symmetrically with the meta-reasoning preamble anchor,
+    // they count only when they begin the text's final sentence. The same
+    // words mid-sentence are ordinary dictation ("...and the recording was
+    // transcribed by Whisper."), and a false positive costs a detour through
+    // repair that can shorten or lose real speech.
     const HALLUCINATED_SUFFIXES: [&str; 5] = [
         "thank you for watching",
         "thanks for watching",
@@ -2394,9 +2419,10 @@ fn quality_failure_reason(
         "subtitles by",
         "transcribed by",
     ];
+    let outro = final_sentence(&lower);
     if HALLUCINATED_SUFFIXES
         .iter()
-        .any(|suffix| lower.contains(suffix))
+        .any(|suffix| outro.starts_with(suffix))
     {
         return Some(QualityFailure::Other("hallucinated suffix"));
     }

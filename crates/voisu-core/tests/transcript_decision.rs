@@ -2205,6 +2205,42 @@ async fn ordinary_speech_containing_a_meta_reasoning_phrase_is_delivered_unrepai
     assert!(!decision.recovery_attempted);
 }
 
+/// The same scrutiny applied to the outro list: all five hallucinated
+/// suffixes are tail artifacts an ASR model APPENDS as their own closing
+/// sentence, so they count only when they start the text's final sentence.
+/// The same words mid-sentence are ordinary dictation — a user describing
+/// their own tooling says "transcribed by" without leaking anything.
+#[tokio::test]
+async fn dictation_mentioning_transcribed_by_mid_sentence_is_delivered_unrepaired() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+    let spoken = "The demo went well and the recording was transcribed by Whisper.";
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: spoken.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: spoken.to_owned(),
+            },
+        ])
+        .await
+        .expect("ordinary speech must never be treated as a hallucinated outro");
+
+    assert_eq!(decision.transcript.0, spoken);
+    assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(!decision.recovery_attempted);
+}
+
 /// The same scrutiny applied to the injection list: "system prompt" is what
 /// this product's own users dictate all day, and it is not an instruction
 /// smuggled into the audio.
