@@ -2297,12 +2297,11 @@ async fn a_contracted_repair_loses_to_a_clean_source_transcript() {
         .await
         .unwrap();
 
-    let expected = match decision.selection {
-        TranscriptSelection::SourceDeepgram => deepgram,
-        TranscriptSelection::SourceGroq => groq,
-        other => panic!("a contracted repair must not be delivered over a clean source: {other:?}"),
-    };
-    assert_eq!(decision.transcript.0, expected);
+    // Spec §4: a rejected contraction downgrades to the LONGER Source
+    // Transcript — Deepgram's fifteen words beat Groq's fourteen. Which source
+    // arrives is pinned, not merely that some source does.
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(decision.transcript.0, deepgram);
     assert!(decision.recovery_attempted);
     assert!(
         decision
@@ -2319,6 +2318,11 @@ async fn a_contracted_repair_loses_to_a_clean_source_transcript() {
 /// outro, so neither Source Transcript is safe and the repair is all the user
 /// has left. It contracts — removing the outro is why — and it is delivered
 /// anyway. A user must never lose a dictation to a guard.
+///
+/// Delivery must not be silent about the contraction: an operator tuning the
+/// floor from real data (spec story 6) needs the measured ratio in the
+/// diagnostic record, and this fall-through — a contracted repair actually
+/// handed to the user — is the case they most need to see.
 #[tokio::test]
 async fn a_repair_removing_a_guarded_phrase_from_both_sources_is_delivered() {
     let source = "Right, so the deployment failed last night. Thanks for watching.";
@@ -2350,6 +2354,21 @@ async fn a_repair_removing_a_guarded_phrase_from_both_sources_is_delivered() {
     assert_eq!(decision.transcript.0, repaired);
     assert!(decision.recovery_attempted);
     assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Repair]);
+    // 7 repaired words over 10 source words: the delivered contraction and its
+    // measured ratio must be on the record, not discarded.
+    assert!(
+        decision
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("suspicious contraction ratio 0.7000")),
+        "{:?}",
+        decision.fallback_reason
+    );
+    assert!(
+        decision.validation_reason.contains("delivered a contracted repair"),
+        "{}",
+        decision.validation_reason
+    );
 }
 
 /// The hazard the floor alone cannot see. The repair prompt asks a
@@ -2359,38 +2378,58 @@ async fn a_repair_removing_a_guarded_phrase_from_both_sources_is_delivered() {
 /// Source Transcript. Neither source is safe here, so there is nothing to fall
 /// back to and the Recording is refused: that is the hallucination path doing
 /// its job, and it is the only path allowed to refuse.
+///
+/// The refusal shapes cover both halves of the guard: "help" is a content word
+/// no source contains, while "I can't do that." and its variants normalise to
+/// stopwords ONLY — the shape that once slipped through because an empty
+/// content set vacuously counted as source-derived. No single-word change to
+/// the mock can dodge both halves.
 #[tokio::test]
 async fn a_refusal_shaped_repair_is_never_delivered() {
-    let kinds = Arc::new(Mutex::new(Vec::new()));
-    let mut pipeline = TranscriptDecisionPipeline::new(
-        SuccessfulModel {
-            kinds: Arc::clone(&kinds),
-            text: "I can't help with that.".to_owned(),
-        },
-        Duration::from_millis(50),
-    );
+    let refusals = [
+        "I can't help with that.",
+        "I can't do that.",
+        "I won't do that.",
+        "I will not do that.",
+    ];
     let source = "Right, so the deployment failed last night. Thanks for watching.";
 
-    let error = pipeline
-        .decide(vec![
-            SourceTranscript {
-                provider: Provider::Deepgram,
-                text: source.to_owned(),
+    for refusal in refusals {
+        let kinds = Arc::new(Mutex::new(Vec::new()));
+        let mut pipeline = TranscriptDecisionPipeline::new(
+            SuccessfulModel {
+                kinds: Arc::clone(&kinds),
+                text: refusal.to_owned(),
             },
-            SourceTranscript {
-                provider: Provider::Groq,
-                text: source.to_owned(),
-            },
-        ])
-        .await
-        .expect_err("a model refusal must never be typed as the user's dictation");
+            Duration::from_millis(50),
+        );
 
-    assert_eq!(error.public_message(), "Transcript failed quality validation");
-    assert!(
-        error.diagnostic().contains("no Source Transcript contains"),
-        "{}",
-        error.diagnostic()
-    );
+        let error = match pipeline
+            .decide(vec![
+                SourceTranscript {
+                    provider: Provider::Deepgram,
+                    text: source.to_owned(),
+                },
+                SourceTranscript {
+                    provider: Provider::Groq,
+                    text: source.to_owned(),
+                },
+            ])
+            .await
+        {
+            Err(error) => error,
+            Ok(decision) => panic!(
+                "a model refusal must never be typed as the user's dictation: {refusal:?} was delivered as {:?}",
+                decision.transcript.0
+            ),
+        };
+        assert_eq!(error.public_message(), "Transcript failed quality validation");
+        assert!(
+            error.diagnostic().contains("no Source Transcript contains"),
+            "{refusal}: {}",
+            error.diagnostic()
+        );
+    }
 }
 
 #[tokio::test]

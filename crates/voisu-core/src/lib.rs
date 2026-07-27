@@ -1104,7 +1104,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             if let Some(failure) = quality_failure_reason(&merge_result.0, &sources) {
                 let reason = failure.reason();
                 if failure.is_contraction() {
-                    return contraction_source_fallback(deepgram, groq, reason, true, false);
+                    return contraction_source_fallback(&sources, reason, true, false);
                 }
                 return self
                     .repair_candidate(&sources, merge_result, reason, true)
@@ -1212,14 +1212,20 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             // The repair contracted past the merge floor. It is built out of
             // words the providers heard and is otherwise clean, so it is still
             // the user's speech — but a complete Source Transcript carries more
-            // of it, and preferring one is exactly what the floor is for.
+            // of it, and preferring one is exactly what the floor is for. The
+            // fallback follows the spec's contraction rule: the LONGER Source
+            // Transcript, the user never receiving less than one provider
+            // heard.
             //
             // The floor decides PREFERENCE, not delivery. When the offending
             // text was in both Source Transcripts, neither is safe and this
             // repair is all that is left of the Recording; refusing it there
             // was the round-1 P0. So a failure to find a clean source hands the
-            // repair over rather than losing the dictation.
-            if let Ok(decision) = clean_source_fallback(
+            // repair over rather than losing the dictation — with the measured
+            // contraction on the diagnostic record, because a silently
+            // delivered précis is the case an operator tuning the floor most
+            // needs to see.
+            if let Ok(decision) = contraction_source_fallback(
                 sources,
                 format!("recovery produced {}", failure.reason()),
                 reconciliation_requested,
@@ -1227,6 +1233,16 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             ) {
                 return Ok(decision);
             }
+            return Ok(TranscriptDecision {
+                transcript: Transcript(repaired.0.trim().to_owned()),
+                selection: TranscriptSelection::Repaired,
+                validation_reason: format!(
+                    "repaired {reason}; delivered a contracted repair because neither Source Transcript is clean"
+                ),
+                fallback_reason: Some(failure.reason()),
+                reconciliation_requested,
+                recovery_attempted: true,
+            });
         }
         Ok(TranscriptDecision {
             transcript: Transcript(repaired.0.trim().to_owned()),
@@ -1239,9 +1255,10 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
     }
 }
 
-/// Delivers a Source Transcript after the merge was rejected for contracting.
+/// Delivers a Source Transcript after a merge or repair was rejected for
+/// contracting.
 ///
-/// The rejected merge is deliberately NOT consulted. The guard has just
+/// The rejected candidate is deliberately NOT consulted. The guard has just
 /// declared it untrustworthy for having deleted words, so using it to arbitrate
 /// which source to deliver is circular — and when the merge simply reproduced
 /// the shorter source (a provider that truncated its tail), the "corroboration"
@@ -1252,13 +1269,11 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
 /// that is longer only because it repeats what it already said heard no more
 /// than its sibling, and losing that surplus loses nothing.
 fn contraction_source_fallback(
-    deepgram: &SourceTranscript,
-    groq: &SourceTranscript,
+    sources: &[SourceTranscript],
     reason: String,
     reconciliation_requested: bool,
     recovery_attempted: bool,
 ) -> Result<TranscriptDecision, BoundaryError> {
-    let sources = [deepgram, groq];
     let safe = quality_safe_sources(sources);
     let source = match safe.as_slice() {
         [] => None,
@@ -1297,7 +1312,7 @@ fn contraction_source_fallback(
             Provider::Groq => TranscriptSelection::SourceGroq,
         },
         validation_reason:
-            "longer Source Transcript delivered after merge contraction".to_owned(),
+            "longer Source Transcript delivered after a rejected contraction".to_owned(),
         fallback_reason: Some(reason),
         reconciliation_requested,
         recovery_attempted,
@@ -2283,16 +2298,26 @@ fn non_contraction_quality_failure_reason(
 ///
 /// Stopwords are exempt. A repair that closes the gap left by a deleted span
 /// may need a connective, and no refusal is recognisable by its function words.
+///
+/// A candidate with NO content words at all is not derived. Derivation is
+/// positive evidence — at least one content word the providers actually heard —
+/// and an all-stopword text offers none. The refusal shapes make this the
+/// load-bearing half of the guard: "I can't do that." and "I won't do that."
+/// normalise to pure stopwords ("can't" expands to "can not"), so a vacuous
+/// pass here would type a model's refusal as the user's dictation.
 fn is_source_derived(candidate: &str, sources: &[SourceTranscript]) -> bool {
     let source_words: Vec<String> = sources
         .iter()
         .flat_map(|source| normalized_words(&source.text))
         .collect();
     let vocabulary = distinct_content_words(&source_words);
-    normalized_words(candidate)
+    let candidate_words = normalized_words(candidate);
+    let mut content_words = candidate_words
         .iter()
         .filter(|word| !is_stopword(word))
-        .all(|word| vocabulary.contains(word.as_str()))
+        .peekable();
+    content_words.peek().is_some()
+        && content_words.all(|word| vocabulary.contains(word.as_str()))
 }
 
 fn quality_failure_reason(
