@@ -31,9 +31,13 @@ pub use diagnostics::{
     EXPORT_ENV_ALLOWLIST, MAX_STORED_TEXT, REDACTED,
 };
 
-// Version 2 adds paged diagnostic responses. A version-1 client would otherwise
-// accept only the first page as a successful but empty history/export response.
-pub const PROTOCOL_VERSION: u32 = 2;
+// Paged diagnostic responses are negotiated per REQUEST (see `Request::paged`),
+// never by protocol version. The version is interpolated into the socket path,
+// the single-instance lock, and the store directory, so bumping it partitions
+// the whole namespace and an already-running older daemon becomes unreachable
+// instead of reporting a mismatch. A purely additive, defaulted wire field costs
+// nothing in either skew direction and keeps one namespace.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 pub fn runtime_dir() -> Result<PathBuf, String> {
     let path = PathBuf::from(
@@ -150,6 +154,43 @@ pub struct VersionEnvelope {
 pub struct Request {
     pub version: u32,
     pub command: Command,
+    /// Asks the daemon to split a large diagnostic history or export across
+    /// contiguous [`DiagnosticPage`] frames rather than one frame.
+    ///
+    /// Purely additive and defaulted: a client that predates paging omits the
+    /// field and is served the single-frame response it has always received, so
+    /// paging needs no protocol version bump in either skew direction. Only
+    /// `history` and `export` ever produce pages; every other command answers in
+    /// one frame regardless.
+    #[serde(default, skip_serializing_if = "is_not_set")]
+    pub paged: bool,
+}
+
+/// `skip_serializing_if` for an optional boolean flag: an unset flag is omitted
+/// so a request that does not use paging is byte-identical to one from a client
+/// that has never heard of it.
+fn is_not_set(value: &bool) -> bool {
+    !*value
+}
+
+impl Request {
+    /// A request answered in a single response frame.
+    pub fn new(command: Command) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            command,
+            paged: false,
+        }
+    }
+
+    /// A request whose diagnostic payload may be split across pages.
+    pub fn paged(command: Command) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            command,
+            paged: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

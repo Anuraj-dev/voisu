@@ -107,9 +107,14 @@ fn send_command(command: Command) -> Result<Response, ExitCode> {
         Command::Export(_) => Some(DiagnosticResponseKind::Export),
         _ => None,
     };
-    let request = Request {
-        version: PROTOCOL_VERSION,
-        command,
+    // Only a diagnostic command can outgrow one frame, and only this CLI can
+    // reassemble pages, so paging is asked for per request rather than assumed.
+    // A daemon that predates paging ignores the field and answers in one frame,
+    // which `read_response` still accepts.
+    let request = if diagnostic_kind.is_some() {
+        Request::paged(command)
+    } else {
+        Request::new(command)
     };
     if serde_json::to_writer(&mut stream, &request).is_err() || stream.write_all(b"\n").is_err() {
         return Err(fail(1, "failed to send command to daemon"));

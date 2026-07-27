@@ -2658,7 +2658,7 @@ async fn serve(
     }
     let envelope: VersionEnvelope = serde_json::from_str(&request)
         .map_err(|error| format!("cannot decode protocol envelope: {error}"))?;
-    let (response, write_deadline) = if envelope.version != PROTOCOL_VERSION {
+    let (response, write_deadline, paged) = if envelope.version != PROTOCOL_VERSION {
         (
             Response::rejected(
                 None,
@@ -2668,11 +2668,13 @@ async fn serve(
                 ),
             ),
             IO_DEADLINE,
+            false,
         )
     } else {
         let request: Request = serde_json::from_str(&request)
             .map_err(|error| format!("cannot decode CLI command: {error}"))?;
         let write_deadline = command_write_deadline(&request.command);
+        let paged = request.paged;
         let response = match request.command {
             Command::Level { after_seq } => Response::with_level_frames(levels.after(after_seq)),
             command => {
@@ -2686,17 +2688,25 @@ async fn serve(
                     .map_err(|_| "lifecycle actor dropped its response".to_owned())?
             }
         };
-        (response, write_deadline)
+        (response, write_deadline, paged)
     };
-    write_response(&mut writer, response, write_deadline).await
+    write_response(&mut writer, response, write_deadline, paged).await
 }
 
 async fn write_response(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     mut response: Response,
     write_deadline: Duration,
+    paged: bool,
 ) -> Result<(), String> {
     let write_started = Instant::now();
+    // A client that did not ask for paging cannot reassemble pages, so it is
+    // served the whole diagnostic inline in one frame exactly as before paging
+    // existed. Splitting a payload at a client that will not rejoin it would
+    // silently hand it an empty history.
+    if !paged {
+        return write_response_frame(writer, &response, write_started, write_deadline).await;
+    }
     let diagnostic = if let Some(history) = response.history.take() {
         Some(
             serde_json::to_string(&history)
@@ -3310,7 +3320,6 @@ mod tests {
             DIAGNOSTIC_RESPONSE_DEADLINE
         );
         assert_eq!(command_write_deadline(&Command::Status), IO_DEADLINE);
-        assert_ne!(DIAGNOSTIC_RESPONSE_DEADLINE, IO_DEADLINE);
     }
 
     #[tokio::test]

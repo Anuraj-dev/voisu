@@ -1043,10 +1043,7 @@ fn probe_daemon() -> DaemonIpc {
     {
         return DaemonIpc::Unavailable;
     }
-    let request = Request {
-        version: PROTOCOL_VERSION,
-        command: Command::Status,
-    };
+    let request = Request::new(Command::Status);
     if serde_json::to_writer(&mut stream, &request).is_err() || stream.write_all(b"\n").is_err() {
         return DaemonIpc::Unavailable;
     }

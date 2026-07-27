@@ -1980,8 +1980,7 @@ fn daemon_status_handshake() -> Result<(), ()> {
     // an oversized frame can never be fully buffered before the cap is checked.
     let started = Instant::now();
     stream.set_write_timeout(Some(PROCESS_DEADLINE)).map_err(|_| ())?;
-    serde_json::to_writer(&mut stream, &Request { version: PROTOCOL_VERSION, command: DaemonCommand::Status })
-        .map_err(|_| ())?;
+    serde_json::to_writer(&mut stream, &Request::new(DaemonCommand::Status)).map_err(|_| ())?;
     stream.write_all(b"\n").map_err(|_| ())?;
     let response = read_bounded_frame(&mut stream, started)?;
     let envelope: VersionEnvelope = serde_json::from_str(&response).map_err(|_| ())?;
