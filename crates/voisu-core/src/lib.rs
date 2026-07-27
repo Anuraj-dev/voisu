@@ -983,8 +983,8 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 // signals; texts that differ in words are decided by
                 // `lexically_different_selection`, which lets evidence overturn
                 // the Groq default only when the whole difference is a single
-                // misheard span, so no formatting win can change the words the
-                // user is handed.
+                // misheard span that is symmetric (one word for one) or whose
+                // single word is a dictionary term.
                 let (winner, evidence) = if lexically_identical {
                     near_identical_selection(&deepgram.text, &groq.text, &self.dictionary_terms)
                 } else {
@@ -1972,16 +1972,18 @@ fn near_identical_selection(
 /// Groq default ONLY when the whole lexical difference is a single misheard
 /// span (`single_misheard_span`) — the texts are word-for-word identical
 /// outside one contiguous, positionally aligned window where one provider
-/// heard a span one way and the other another. Delivering either side then
-/// renders every word the user spoke; the evidence merely picks the rendering.
+/// heard a span one way and the other another, and the window itself is safe
+/// to re-render: symmetric (one word for one, so no word can appear or
+/// disappear) or vouched for by the user's own dictionary.
 ///
-/// Everything else keeps the default. A word only one side has ("not", a
-/// padded "Okay. Okay.") makes one span empty; a difference spread across two
-/// sites (a dropped negation beside a split term) widens the window past a
-/// single mishearing; unrelated words in the window fail the sound-alike
-/// check. In each of those shapes the sides genuinely differ in CONTENT, and
-/// no amount of capitalisation, punctuation, or dictionary spelling may hand
-/// the user different words than the standing default would.
+/// Everything else keeps the default: an insertion beside identical
+/// neighbours leaves one span empty; a difference spread across two sites (a
+/// dropped negation away from a split term) widens the window past a single
+/// mishearing; an asymmetric window without a dictionary term is exactly
+/// where a word appears or disappears, whatever the character distances say.
+/// Each rejection sentence above is pinned by a test in
+/// `transcript_decision.rs`; do not restate a stronger claim here without
+/// writing the test for it first.
 fn lexically_different_selection(
     left: &str,
     right: &str,
@@ -2002,7 +2004,9 @@ fn lexically_different_selection(
     }
     let left_words = normalized_words(left);
     let right_words = normalized_words(right);
-    let Some((left_span, right_span)) = single_misheard_span(&left_words, &right_words) else {
+    let Some((left_span, right_span)) =
+        single_misheard_span(&left_words, &right_words, dictionary_terms)
+    else {
         return groq_default("because the Source Transcripts differ by more than one misheard span");
     };
     let length_note = if left_words.len() == right_words.len() {
@@ -2033,18 +2037,25 @@ fn lexically_different_selection(
 /// 2. One span is exactly one word and neither exceeds two. A mishearing of a
 ///    single heard span is one word for one ("dictation"/"dictations"), one
 ///    split into two ("voisu"/"voice so"), or two joined into one. A wider
-///    window is not one mishearing but different speech — this is what stops
-///    an extra real word from riding a genuine split ("pravah cli debug"
-///    against "pravah-cli" is a three-word span, rejected before any
-///    character arithmetic can be gamed).
-/// 3. Run together, the spans sound alike (`words_sound_alike`). Within the
-///    shape-capped window this cannot be stretched by adding material — rule 2
-///    already forbids it — so the residual it admits is the genuine homophone
-///    ("notify"/"not modify"), where either choice risks the meaning and the
-///    default is no safer than the evidence.
+///    window is not one mishearing but different speech ("pravah cli debug"
+///    against "pravah-cli" is a three-word span, rejected on shape).
+/// 3. An ASYMMETRIC window (one word against two) must have a dictionary term
+///    as its single word. One-for-one is structurally safe — both sides fill
+///    the same slot, so no word can appear or disappear, only be rendered
+///    differently. One-against-two is exactly where a word appears or
+///    disappears, and no character-distance arithmetic is evidence about
+///    which: a short word beside a long one costs ~its own length in edits
+///    but buys a third of it back in budget, which is how round 4 handed out
+///    "differences" for "no difference". Only the user's own dictionary can
+///    vouch that the single word IS the span the loser split into pieces.
+/// 4. Run together, the spans sound alike (`words_sound_alike`). After rules
+///    2 and 3 this is a quality filter, not a safety guard: it rejects
+///    unrelated substitutions ("today"/"yesterday"), and for the shapes it
+///    admits either side renders the same slot.
 fn single_misheard_span<'words>(
     left: &'words [String],
     right: &'words [String],
+    dictionary_terms: &[String],
 ) -> Option<(&'words [String], &'words [String])> {
     let prefix = left
         .iter()
@@ -2061,9 +2072,24 @@ fn single_misheard_span<'words>(
     let right_span = &right[prefix..right.len() - suffix];
     let spans_shaped_like_one_mishearing = left_span.len().min(right_span.len()) == 1
         && left_span.len().max(right_span.len()) <= 2;
-    (spans_shaped_like_one_mishearing
-        && words_sound_alike(&left_span.concat(), &right_span.concat()))
-    .then_some((left_span, right_span))
+    if !spans_shaped_like_one_mishearing {
+        return None;
+    }
+    if left_span.len() != right_span.len() {
+        let single_word = if left_span.len() == 1 {
+            &left_span[0]
+        } else {
+            &right_span[0]
+        };
+        let is_dictionary_term = dictionary_terms
+            .iter()
+            .any(|term| normalized_words(term).concat() == *single_word);
+        if !is_dictionary_term {
+            return None;
+        }
+    }
+    words_sound_alike(&left_span.concat(), &right_span.concat())
+        .then_some((left_span, right_span))
 }
 
 fn compare_formatting(

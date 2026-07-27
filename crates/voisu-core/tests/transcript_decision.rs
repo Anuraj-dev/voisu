@@ -494,6 +494,91 @@ async fn equal_word_counts_may_not_pay_for_a_dropped_negation() {
     );
 }
 
+/// Round-5 P0 regression: an asymmetric (one-word-versus-two) span is exactly
+/// where a word appears or disappears, and a character-distance budget is not
+/// evidence about which. "differences" is 3 edits from "nodifference" under a
+/// threshold of 4, so the round-4 rule handed the user "differences" when they
+/// said "no difference" — on formatting evidence alone, the exact production
+/// profile the spec records (Groq with zero caps and zero punctuation). An
+/// asymmetric span may be preferred ONLY when its single word is a dictionary
+/// term; no term is involved here, so the Groq default must hold.
+#[tokio::test]
+async fn an_asymmetric_span_without_a_dictionary_term_keeps_the_groq_default() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+    let groq = "we found no difference in latency between the two builds the dashboard should show the same numbers after the next deploy";
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "We found differences in latency between the two builds. The dashboard should show the same numbers after the next deploy."
+                    .to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: groq.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, groq);
+    assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        decision.transcript.0.contains("no difference"),
+        "the negation must survive: {}",
+        decision.transcript.0
+    );
+}
+
+/// The mirrored direction of the same P0: a two-versus-one span can INSERT a
+/// negation the user never spoke. "notinclude" is 4 edits from "included"
+/// under a threshold of 4, so the round-4 rule delivered "should not include"
+/// for a user who said "should included". The single-word side ("included")
+/// is no dictionary term, so the Groq default must hold.
+#[tokio::test]
+async fn an_asymmetric_span_may_not_insert_a_negation_the_user_never_spoke() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+    let groq = "the report should included the older metrics from last quarter send it tonight";
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "The report should not include the older metrics from last quarter. Send it tonight."
+                    .to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: groq.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, groq);
+    assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        !decision.transcript.0.contains("not include"),
+        "a negation the user never spoke must not be inserted: {}",
+        decision.transcript.0
+    );
+}
+
 /// The widened gate must not reopen the hole the narrowing existed to close: a
 /// padded transcript manufactures a sentence-punctuation boundary out of text
 /// the other provider never heard. Length-sensitive signals may not decide
