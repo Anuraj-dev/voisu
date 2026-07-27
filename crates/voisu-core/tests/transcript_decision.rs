@@ -278,6 +278,133 @@ async fn padding_cannot_win_on_formatting_signal_alone() {
     assert!(!decision.validation_reason.contains("one-sided formatting evidence"));
 }
 
+/// The spec's own motivating case (recording 21): Deepgram spelled the product
+/// term, Groq split it into two ordinary words. The texts are not word-for-word
+/// equal, so before the widening the user was handed "voice so" every time. The
+/// dictionary term is what makes the shorter text the safe one here — Groq's
+/// extra word is not extra speech, it is the same word misheard as two.
+#[tokio::test]
+async fn a_dictionary_term_wins_against_a_two_word_misrecognition() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::with_dictionary_terms(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+        vec!["Voisu".to_owned()],
+    );
+    let deepgram =
+        "The Voisu desktop application preserves every spoken word while the final transcript stays available for careful review.";
+    let groq =
+        "The voice so desktop application preserves every spoken word while the final transcript stays available for careful review.";
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: deepgram.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: groq.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, deepgram);
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        decision.validation_reason.contains("dictionary matches 1 vs 0"),
+        "{}",
+        decision.validation_reason
+    );
+}
+
+/// The widened gate must not reopen the hole the narrowing existed to close: a
+/// padded transcript manufactures a sentence-punctuation boundary out of text
+/// the other provider never heard. Length-sensitive signals may not decide
+/// across different lengths, and an equal dictionary count is no advantage.
+#[tokio::test]
+async fn padding_cannot_win_under_the_widened_lexical_gate() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::with_dictionary_terms(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+        vec!["Voisu".to_owned()],
+    );
+    let faithful = "Please review the Voisu transcript before delivery and confirm every spoken detail remains accurate for the completed dictation in the desktop history.";
+    let padded = format!("{} Okay. Okay.", faithful.trim_end_matches('.'));
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: padded.clone(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: faithful.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, faithful);
+    assert_ne!(decision.transcript.0, padded);
+    assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        decision.validation_reason.contains("dictionary matches 1 vs 1"),
+        "{}",
+        decision.validation_reason
+    );
+    assert!(!decision.validation_reason.contains("one-sided formatting evidence"));
+}
+
+/// Equal-length lexically different texts are safe for the full comparator:
+/// neither side can have padded, so a formatting win costs the user no words.
+#[tokio::test]
+async fn equal_length_lexical_difference_is_decided_on_formatting() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+    let deepgram =
+        "Please review the final transcript before delivery and confirm every spoken detail remains accurate for the completed dictation.";
+    let groq =
+        "please review the final transcript before delivery and confirm every spoken detail remains accurate for the completed dictations";
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: deepgram.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: groq.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, deepgram);
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        decision.validation_reason.contains("equal length"),
+        "{}",
+        decision.validation_reason
+    );
+}
+
 #[tokio::test]
 async fn near_identical_source_transcripts_select_capitalised_sentence_starts() {
     let calls = Arc::new(AtomicUsize::new(0));

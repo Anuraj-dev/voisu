@@ -979,23 +979,22 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             if source_similarity(&deepgram.text, &groq.text) >= 0.85 {
                 let lexically_identical =
                     normalized_words(&deepgram.text) == normalized_words(&groq.text);
-                let (selected, evidence) = if lexically_identical {
-                    let (winner, evidence) = near_identical_selection(
+                // Word-for-word equal texts are decided on all three formatting
+                // signals; texts that differ in words are decided by the
+                // narrower rule in `lexically_different_selection`, which never
+                // lets a length-sensitive signal hand over fewer words.
+                let (winner, evidence) = if lexically_identical {
+                    near_identical_selection(&deepgram.text, &groq.text, &self.dictionary_terms)
+                } else {
+                    lexically_different_selection(
                         &deepgram.text,
                         &groq.text,
                         &self.dictionary_terms,
-                    );
-                    let selected = match winner {
-                        GateWinner::Left => deepgram,
-                        GateWinner::Right => groq,
-                    };
-                    (selected, evidence)
-                } else {
-                    (
-                        groq,
-                        "lexically different near-identical Source Transcripts; defaulted to Groq without formatting comparison"
-                            .to_owned(),
                     )
+                };
+                let selected = match winner {
+                    GateWinner::Left => deepgram,
+                    GateWinner::Right => groq,
                 };
                 if let Some(reason) =
                     non_contraction_quality_failure_reason(&selected.text, &sources)
@@ -1890,11 +1889,117 @@ struct FormattingEvidence {
     dictionary_matches: usize,
 }
 
+/// The outcome of comparing two Source Transcripts on formatting evidence.
+struct FormattingComparison {
+    left_signals: usize,
+    right_signals: usize,
+    left_dictionary_matches: usize,
+    right_dictionary_matches: usize,
+    measurements: String,
+}
+
+impl FormattingComparison {
+    /// True when one side won at least one signal and the other won none.
+    fn favours_left(&self) -> bool {
+        self.left_signals > 0 && self.right_signals == 0
+    }
+
+    /// How many more distinct dictionary terms the left side spelled correctly.
+    fn left_dictionary_advantage(&self) -> usize {
+        self.left_dictionary_matches
+            .saturating_sub(self.right_dictionary_matches)
+    }
+}
+
 fn near_identical_selection(
     left: &str,
     right: &str,
     dictionary_terms: &[String],
 ) -> (GateWinner, String) {
+    let comparison = compare_formatting(left, right, dictionary_terms);
+    let measurements = &comparison.measurements;
+    if comparison.favours_left() {
+        (
+            GateWinner::Left,
+            format!("selected Deepgram on one-sided formatting evidence ({measurements})"),
+        )
+    } else {
+        (
+            GateWinner::Right,
+            format!(
+                "defaulted to Groq because formatting evidence was not one-sided ({measurements})"
+            ),
+        )
+    }
+}
+
+/// B2 for near-identical Source Transcripts that are NOT word-for-word equal
+/// after normalisation — the shape the spec's own motivating case has: Deepgram
+/// "Voisu" against Groq "voice so".
+///
+/// Two of the three signals are length-sensitive. Capitalised sentence starts
+/// and sentence-punctuation boundaries both grow with the amount of text, so
+/// across texts that differ in words they measure quantity as much as quality:
+/// a transcript padded with an uncorroborated "Okay. Okay." manufactures a
+/// punctuation boundary out of nothing and wins on it. They may therefore
+/// decide only when the two sides are the same length, where neither can have
+/// padded and delivering either loses no words.
+///
+/// A dictionary match is different in kind. It is positive evidence that one
+/// provider spelled a known term correctly where the other did not, it cannot
+/// be manufactured by adding filler, and repeating the term does not inflate it
+/// (matches are distinct and non-overlapping). So it may also decide when the
+/// lengths differ — including when the winner is SHORTER, which is exactly the
+/// "Voisu" / "voice so" case, where the loser's extra word is not extra speech
+/// but the same word misheard as two. That licence is bounded: the winner may
+/// give up at most one word per extra term it got right. Anything beyond that
+/// is a provider that heard less, and the standing Groq default holds.
+fn lexically_different_selection(
+    left: &str,
+    right: &str,
+    dictionary_terms: &[String],
+) -> (GateWinner, String) {
+    let comparison = compare_formatting(left, right, dictionary_terms);
+    let measurements = &comparison.measurements;
+    let groq_default = |why: &str| {
+        (
+            GateWinner::Right,
+            format!(
+                "lexically different near-identical Source Transcripts; defaulted to Groq {why} ({measurements})"
+            ),
+        )
+    };
+    if !comparison.favours_left() {
+        return groq_default("because formatting evidence was not one-sided");
+    }
+    let left_words = normalized_words(left).len();
+    let right_words = normalized_words(right).len();
+    if left_words == right_words {
+        return (
+            GateWinner::Left,
+            format!(
+                "lexically different Source Transcripts of equal length; selected Deepgram on one-sided formatting evidence ({measurements})"
+            ),
+        );
+    }
+    let advantage = comparison.left_dictionary_advantage();
+    let deficit = right_words.saturating_sub(left_words);
+    if advantage > 0 && deficit <= advantage {
+        return (
+            GateWinner::Left,
+            format!(
+                "lexically different Source Transcripts; selected Deepgram on {advantage} dictionary term(s) Groq missed ({measurements})"
+            ),
+        );
+    }
+    groq_default("without length-sensitive formatting comparison across texts of different lengths")
+}
+
+fn compare_formatting(
+    left: &str,
+    right: &str,
+    dictionary_terms: &[String],
+) -> FormattingComparison {
     let left_evidence = formatting_evidence(left, dictionary_terms);
     let right_evidence = formatting_evidence(right, dictionary_terms);
     let mut left_signals = 0;
@@ -1942,20 +2047,12 @@ fn near_identical_selection(
         left_evidence.dictionary_matches,
         right_evidence.dictionary_matches,
     );
-    if left_signals > 0 && right_signals == 0 {
-        (
-            GateWinner::Left,
-            format!(
-                "selected Deepgram on one-sided formatting evidence ({measurements})"
-            ),
-        )
-    } else {
-        (
-            GateWinner::Right,
-            format!(
-                "defaulted to Groq because formatting evidence was not one-sided ({measurements})"
-            ),
-        )
+    FormattingComparison {
+        left_signals,
+        right_signals,
+        left_dictionary_matches: left_evidence.dictionary_matches,
+        right_dictionary_matches: right_evidence.dictionary_matches,
+        measurements,
     }
 }
 
