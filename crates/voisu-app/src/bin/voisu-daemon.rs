@@ -1144,9 +1144,20 @@ async fn actor_loop(
                             response
                         }
                     };
+                    // A Recording that ended without a waiting client — the
+                    // Recording Deadline or the bounded buffer stopped it — has
+                    // nowhere to report its terminal outcome but the journal.
+                    // The line is origin-neutral: the same self-termination
+                    // happens to a `voisu start` a user never stopped, so it
+                    // reuses the operator's `Recording {id}:` prefix rather than
+                    // claiming a Trigger Key that may never have been pressed.
                     if completed.publish_trigger_outcome {
-                        eprintln!("Trigger Key activation: {}", response.message);
-                    } else if let Some(reply) = completed.reply {
+                        eprintln!("Recording {}: {}", completed.id, response.message);
+                    }
+                    // Publishing and replying are independent: a call site that
+                    // asks for both must not silently drop the client's channel
+                    // and leave it with a bare RecvError.
+                    if let Some(reply) = completed.reply {
                         let _ = reply.send(response);
                     }
                 }

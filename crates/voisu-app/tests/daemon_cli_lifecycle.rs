@@ -6007,9 +6007,8 @@ fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
-        diagnostics.contains(
-            "Trigger Key activation: Delivered, but the Recording was truncated; check the end"
-        ),
+        diagnostics
+            .contains("Recording 1: Delivered, but the Recording was truncated; check the end"),
         "{diagnostics}"
     );
 }
@@ -6017,7 +6016,7 @@ fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
 #[test]
 fn deadline_at_the_buffer_ceiling_delivers_retained_audio_as_truncated() {
     let runtime = TempDir::new().unwrap();
-    let _daemon = Daemon::start_with_env(
+    let daemon = Daemon::start_with_env(
         runtime.path(),
         &[
             ("VOISU_TEST_CAPTURE_CHUNKS", "10"),
@@ -6056,6 +6055,20 @@ fn deadline_at_the_buffer_ceiling_delivers_retained_audio_as_truncated() {
         observed["overlay_event"]["message"],
         "Delivered, but the Recording was truncated; check the end",
         "{observed}"
+    );
+
+    // This Recording began at the CLI and no Trigger Key was ever pressed, so
+    // the self-termination line must not attribute it to one: the operator
+    // pairs each Recording with its activation lines when diagnosing a report.
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics
+            .contains("Recording 1: Delivered, but the Recording was truncated; check the end"),
+        "{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("Trigger Key activation"),
+        "a CLI-started Recording must never be logged as a Trigger Key activation: {diagnostics}"
     );
 }
 
@@ -6244,9 +6257,8 @@ fn self_terminating_recording_publishes_a_terminal_outcome_and_operator_line() {
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
-        diagnostics.contains(
-            "Trigger Key activation: Delivered, but the Recording was truncated; check the end"
-        ),
+        diagnostics
+            .contains("Recording 1: Delivered, but the Recording was truncated; check the end"),
         "{diagnostics}"
     );
 }
@@ -6292,7 +6304,7 @@ fn clipboard_fallback_preserves_delivery_info_and_warns_of_truncation() {
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
         diagnostics.contains(
-            "Trigger Key activation: Direct Delivery unavailable; Transcript is on the clipboard, \
+            "Recording 1: Direct Delivery unavailable; Transcript is on the clipboard, \
              but the Recording was truncated; check the end"
         ),
         "{diagnostics}"
@@ -7124,11 +7136,21 @@ fn failed_recording_kills_its_in_flight_groq_request_before_the_next_recording()
     // into pre-streamed chunking and a bounded Groq chunk request goes in
     // flight during the Recording. A later production capture-boundary read
     // error then fails it.
+    //
+    // The PCM is emitted in two bursts. The injected read error fires the
+    // instant the daemon has consumed all 8_000_000 bytes, and the capture
+    // reader has no backpressure — it drains the pipe as fast as the kernel
+    // allows. Emitting everything at once would leave the ordering "chunk
+    // request started BEFORE the failure" resting on microseconds. The first
+    // burst alone (7_900_000 bytes, ~4 minutes) crosses the 120 s chunking
+    // threshold, so curl.start is provably created during the pause.
     write_fake_command(
         commands.path(),
         "pw-record",
         r#"#!/bin/sh
-head -c 8000000 /dev/zero | tr '\000' '\001'
+head -c 7900000 /dev/zero | tr '\000' '\001'
+sleep 1
+head -c 100000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 i=0
 while [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
@@ -7295,11 +7317,18 @@ while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
 fn failed_recording_closes_its_deepgram_stream_before_the_next_recording() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
+    // Two bursts with a pause between them: the injected read error fires the
+    // instant the daemon has consumed all 64_000 bytes, and the capture reader
+    // drains the pipe with no backpressure. The pause guarantees the Deepgram
+    // stream is provably up (deepgram.ready written) before the failure can
+    // fire, instead of leaving that ordering to microseconds.
     write_fake_command(
         commands.path(),
         "pw-record",
         r#"#!/bin/sh
-head -c 64000 /dev/zero | tr '\000' '\001'
+head -c 32000 /dev/zero | tr '\000' '\001'
+sleep 1
+head -c 32000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 i=0
 while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
