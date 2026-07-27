@@ -141,6 +141,16 @@ async fn run() -> Result<(), String> {
         eprintln!("diagnostics cleanup failed: {error}");
     }
 
+    // An over-long VOISU_RECORDING_DEADLINE_MS is clamped to the one bounded
+    // maximum. Say so once here rather than at the clamp itself, which runs on
+    // every Recording: an operator who configured a longer maximum must learn
+    // the real limit from the journal, not from being stopped by it.
+    if let Some(notice) = voisu_app::system::recording_deadline_override_notice(
+        std::env::var("VOISU_RECORDING_DEADLINE_MS").ok(),
+    ) {
+        eprintln!("{notice}");
+    }
+
     let delivery_mode = voisu_app::config::delivery_mode();
     let controlled = std::env::var_os("VOISU_TEST_MODE").as_deref()
         == Some(std::ffi::OsStr::new("controlled"));

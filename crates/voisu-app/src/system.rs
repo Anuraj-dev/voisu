@@ -2654,23 +2654,56 @@ impl AudioCapture for PipeWireCapture {
 /// Default ceiling on a single Recording before the Recording Deadline stops
 /// it. Recordings routinely run past two minutes (the provider chunking path
 /// exists for exactly those), so the default must be generous; a stuck or
-/// forgotten Recording is still bounded. `VOISU_RECORDING_DEADLINE_MS`
-/// overrides it, and a zero override falls back to this default.
+/// forgotten Recording is still bounded. `VOISU_RECORDING_DEADLINE_MS` may
+/// shorten it but never lengthen it: [`MAX_RECORDING_DURATION`] is an absolute
+/// ceiling, not merely this default.
 const DEFAULT_RECORDING_DEADLINE: Duration = MAX_RECORDING_DURATION;
 
-/// Resolve the Recording Deadline from the raw `VOISU_RECORDING_DEADLINE_MS`
-/// value. A parseable, non-zero millisecond count wins; anything else — absent,
-/// unparseable, or zero — uses [`DEFAULT_RECORDING_DEADLINE`].
+/// The one resolved maximum for a Recording: the wall-clock Deadline, and the
+/// retained-PCM byte cap derived from it.
 struct RecordingMaximum {
     deadline: Duration,
     pcm_byte_cap: usize,
 }
 
-fn resolve_recording_maximum(raw: Option<String>) -> RecordingMaximum {
-    let deadline = raw
-        .and_then(|value| value.parse::<u64>().ok())
+/// Parse the raw `VOISU_RECORDING_DEADLINE_MS` value. A parseable, non-zero
+/// millisecond count is an override; anything else — absent, unparseable, or
+/// zero — is `None`. Shared, so the resolver and the startup notice can never
+/// disagree about what counts as an override.
+fn parse_recording_deadline_override(raw: Option<String>) -> Option<Duration> {
+    raw.and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
         .filter(|value| !value.is_zero())
+}
+
+/// One-shot startup diagnostic for an override longer than the absolute
+/// ceiling. The resolver shortens it silently — correct, but an operator who
+/// configured twenty minutes and is stopped at ten would otherwise meet a limit
+/// they were never told about. `None` when there is nothing to say. This
+/// belongs at startup rather than in the resolver, which runs on every
+/// Recording and would repeat the line per Recording.
+pub fn recording_deadline_override_notice(raw: Option<String>) -> Option<String> {
+    let requested = parse_recording_deadline_override(raw)?;
+    (requested > MAX_RECORDING_DURATION).then(|| {
+        format!(
+            "VOISU_RECORDING_DEADLINE_MS={} ms exceeds the {} s maximum Recording length; \
+             Recordings stop at {} s",
+            requested.as_millis(),
+            MAX_RECORDING_DURATION.as_secs(),
+            MAX_RECORDING_DURATION.as_secs(),
+        )
+    })
+}
+
+/// Resolve the Recording maximum from the raw `VOISU_RECORDING_DEADLINE_MS`
+/// value. An override wins up to [`MAX_RECORDING_DURATION`]; absent, zero or
+/// unparseable uses [`DEFAULT_RECORDING_DEADLINE`], and an over-long override
+/// is clamped to the ceiling. The byte cap is derived from the resolved
+/// Deadline so the two enforcers cannot diverge, then floored at
+/// [`MIN_RECORDING_BYTES`] — the floor only ever raises the cap, so it can
+/// never make the cap fire before the Deadline.
+fn resolve_recording_maximum(raw: Option<String>) -> RecordingMaximum {
+    let deadline = parse_recording_deadline_override(raw)
         .unwrap_or(DEFAULT_RECORDING_DEADLINE)
         // MAX_RECORDING_DURATION is an absolute ceiling, not merely a default.
         // An operator override may only shorten a Recording: retained PCM is
@@ -7923,6 +7956,35 @@ mod tests {
             resolve_recording_maximum(Some("5000".to_owned())).deadline,
             Duration::from_millis(5000)
         );
+    }
+
+    #[test]
+    fn a_clamped_override_is_reported_to_the_operator_and_a_respected_one_is_not() {
+        // A configured maximum that is quietly ignored is the same complaint as
+        // being cut off at an unannounced limit, just moved to the config
+        // surface: the operator must be told the number they will actually get.
+        let notice = recording_deadline_override_notice(Some("1200000".to_owned()))
+            .expect("an over-long override must be reported");
+        assert!(
+            notice.contains("1200000 ms") && notice.contains("600 s"),
+            "the notice must name both what was asked for and what is enforced: {notice}"
+        );
+        // Nothing is said when nothing was ignored — including at exactly the
+        // ceiling, which is honoured in full.
+        assert_eq!(
+            recording_deadline_override_notice(Some("600000".to_owned())),
+            None
+        );
+        assert_eq!(
+            recording_deadline_override_notice(Some("5000".to_owned())),
+            None
+        );
+        assert_eq!(recording_deadline_override_notice(None), None);
+        assert_eq!(
+            recording_deadline_override_notice(Some("not-a-number".to_owned())),
+            None
+        );
+        assert_eq!(recording_deadline_override_notice(Some("0".to_owned())), None);
     }
 
     #[test]

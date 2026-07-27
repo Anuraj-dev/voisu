@@ -1672,6 +1672,33 @@ fn production_capture_death_mid_recording_self_recovers_without_stop() {
 }
 
 #[test]
+fn an_over_long_recording_maximum_override_is_reported_at_startup() {
+    // The daemon clamps an over-long VOISU_RECORDING_DEADLINE_MS to the one
+    // bounded maximum. An operator who asked for twenty minutes and was never
+    // told they get ten would meet that limit only by being cut off at it —
+    // the same complaint the bounded maximum exists to answer, moved to the
+    // configuration surface. One startup line, before any Recording.
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(commands.path(), "pw-record", "#!/bin/sh\nsleep 0\n");
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_RECORDING_DEADLINE_MS", "1200000"),
+        ],
+    );
+    let diagnostics = daemon.terminate_and_stderr();
+    assert!(
+        diagnostics.contains("VOISU_RECORDING_DEADLINE_MS=1200000 ms")
+            && diagnostics.contains("Recordings stop at 600 s"),
+        "a clamped override must name both the request and the enforced maximum: {diagnostics}"
+    );
+}
+
+#[test]
 // Acceptance proof for PipeWire recovery that already existed on `main`; no
 // Ticket 10 production algorithm is claimed by this test.
 fn microphone_disappearance_and_reconnection_leave_the_next_recording_usable() {
