@@ -2600,12 +2600,14 @@ async fn remaining_quality_guardrails_repair_unsafe_merge_results() {
         "Schedule the review for Wednesday morning. Thank you for watching.",
         "Schedule встреча 会议 Wednesday morning.",
         "Schedule the review for Wednesday morning and then write a long invented agenda with ten unrelated action items that neither Source Transcript contained at all.",
-        // The three outro placements the final-sentence-start anchor alone
-        // missed (spec §1 records Groq omitting punctuation entirely): an
-        // outro with no punctuation anywhere, an outro sentence followed by a
-        // second outro sentence, and an outro after a quote-swallowed period.
+        // The outro placements the final-sentence-start anchor alone missed
+        // (spec §1 records Groq omitting punctuation entirely), each caught
+        // by one half of the anchored pair: an outro with no punctuation
+        // anywhere and an outro after a quote-swallowed period (the text
+        // ends with the marker), and a final outro sentence following an
+        // earlier one (the marker begins the final sentence).
         "schedule the review wednesday morning thanks for watching",
-        "Schedule the review for Wednesday morning. Thanks for watching! Please subscribe for more videos.",
+        "Schedule the review for Wednesday morning. Thanks for watching! Like and subscribe.",
         "Schedule the review for \"Wednesday.\" Thanks for watching.",
     ];
 

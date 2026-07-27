@@ -2188,27 +2188,28 @@ fn sentence_boundary_credit(text: &str) -> usize {
     sentence_punctuation_boundaries(text).min(plausible_boundaries)
 }
 
-/// The tail of the text from each sentence start — the whole (end-trimmed)
-/// text, then the remainder after every sentence terminator that ends a word —
-/// each with leading non-alphanumerics trimmed. A '.' inside a token
-/// ("amara.org", "otter.ai") does not end a sentence, so an outro carrying a
-/// dotted attribution still reads as one sentence; a '.' swallowed by a
-/// closing quote does not either, which is why callers must not rely on
-/// boundaries alone to find a trailing artifact.
-fn sentence_tails(text: &str) -> impl Iterator<Item = &str> {
+/// The text's final sentence — everything after the last sentence terminator
+/// that ends a word — with leading non-alphanumerics trimmed. A '.' inside a
+/// token ("amara.org", "otter.ai") does not end a sentence, so an outro
+/// carrying a dotted attribution still reads as one final sentence; a '.'
+/// swallowed by a closing quote does not either, which is why callers must
+/// not rely on sentence boundaries alone to find a trailing artifact. A text
+/// with no terminator is itself the final sentence.
+fn final_sentence(text: &str) -> &str {
     let trimmed = text.trim_end_matches(|character: char| !character.is_alphanumeric());
-    std::iter::once(0)
-        .chain(trimmed.char_indices().filter_map(|(index, character)| {
-            (matches!(character, '.' | '?' | '!')
+    let start = trimmed
+        .char_indices()
+        .filter(|&(index, character)| {
+            matches!(character, '.' | '?' | '!')
                 && trimmed[index + character.len_utf8()..]
                     .chars()
                     .next()
-                    .is_some_and(char::is_whitespace))
-            .then_some(index + character.len_utf8())
-        }))
-        .map(move |start| {
-            trimmed[start..].trim_start_matches(|character: char| !character.is_alphanumeric())
+                    .is_some_and(char::is_whitespace)
         })
+        .map(|(index, character)| index + character.len_utf8())
+        .next_back()
+        .unwrap_or(0);
+    trimmed[start..].trim_start_matches(|character: char| !character.is_alphanumeric())
 }
 
 fn sentence_start_capitalisation(text: &str) -> (usize, usize) {
@@ -2442,16 +2443,19 @@ fn quality_failure_reason(
         return Some(QualityFailure::Other("meta-reasoning"));
     }
     // The archetypal ASR outro hallucinations, learned from captioned video.
-    // All five are appended artifacts, never mid-sentence speech, so they
-    // count when they begin a sentence or end the text. Both anchors are
-    // needed: sentence starts alone miss a provider that omits punctuation
-    // entirely (spec §1 records Groq at zero punctuation, leaving the outro
-    // with no sentence of its own), and the text's end alone misses an outro
-    // followed by a second outro sentence ("Thanks for watching! Please
-    // subscribe..."). The same words mid-sentence are ordinary dictation
-    // ("...and the recording was transcribed by Whisper."), and a false
-    // positive costs a detour through repair that can shorten or lose real
-    // speech. Each of those placements is pinned by a test.
+    // All five are appended tail artifacts, so they count when they begin the
+    // text's FINAL sentence or end the text. Both anchors are needed: the
+    // sentence anchor alone misses a provider that omits punctuation entirely
+    // (spec §1 records Groq at zero punctuation, leaving the outro with no
+    // sentence of its own) and a period swallowed by a closing quote, while
+    // the end anchor alone misses an outro whose attribution or second outro
+    // sentence follows it. The anchors stay at the tail deliberately: the
+    // same words mid-sentence are ordinary dictation ("...and the recording
+    // was transcribed by Whisper."), and a false positive routes real speech
+    // into repair — the one path allowed to refuse delivery — so a missed
+    // outro (visible junk the user can delete) is the cheaper direction.
+    // Each anchored placement and the mid-sentence exemption is pinned by a
+    // test.
     const HALLUCINATED_SUFFIXES: [&str; 5] = [
         "thank you for watching",
         "thanks for watching",
@@ -2460,10 +2464,11 @@ fn quality_failure_reason(
         "transcribed by",
     ];
     let tail = lower.trim_end_matches(|character: char| !character.is_alphanumeric());
-    if HALLUCINATED_SUFFIXES.iter().any(|suffix| {
-        tail.ends_with(suffix)
-            || sentence_tails(&lower).any(|sentence| sentence.starts_with(suffix))
-    }) {
+    let outro = final_sentence(&lower);
+    if HALLUCINATED_SUFFIXES
+        .iter()
+        .any(|suffix| outro.starts_with(suffix) || tail.ends_with(suffix))
+    {
         return Some(QualityFailure::Other("hallucinated suffix"));
     }
     if script_count(trimmed) >= 3
