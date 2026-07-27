@@ -2038,12 +2038,15 @@ fn misheard_dictionary_term<'terms>(
     let right_words = normalized_words(right);
     let left_only = surplus_words(&left_words, &right_words);
     let right_only = surplus_words(&right_words, &left_words).concat();
-    dictionary_terms.iter().find(|term| {
-        let term_words = normalized_words(term);
-        !term_words.is_empty()
-            && left_only == term_words
-            && words_sound_alike(&right_only, &term_words.concat())
-    }).map(String::as_str)
+    dictionary_terms
+        .iter()
+        .find(|term| {
+            let term_words = normalized_words(term);
+            !term_words.is_empty()
+                && left_only == term_words
+                && words_sound_alike(&right_only, &term_words.concat())
+        })
+        .map(String::as_str)
 }
 
 /// The words `words` holds that `other` does not, as a multiset difference in
