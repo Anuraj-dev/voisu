@@ -16,7 +16,8 @@ use voisu_core::{
     clipboard_candidates, install_instruction, resolve_session, scan_wav_pcm, socket_path,
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture,
     BoundaryKind, CancelRegistry, CaptureLimit, CapturedAudio, ClipboardTool,
-    Command as DaemonCommand, Credential, DeliveryAdapter, DeliveryOutcome, KeyDiagnosis,
+    Command as DaemonCommand, Credential, DeadlineClock, DeliveryAdapter, DeliveryOutcome,
+    KeyDiagnosis,
     KeyLocation, PackageManager, Provider,
     ProviderAuthenticator, ProviderKeyStatus, ProviderStream, ReadinessCapability, ReadinessFinding,
     MergeResult, ReadinessInspector, ReadinessStatus, ReconciliationKind, ReconciliationModel,
@@ -2698,14 +2699,14 @@ pub fn recording_deadline_override_notice(raw: Option<String>) -> Option<String>
     })
 }
 
-/// The Recording Deadline this process will enforce, resolved exactly the way
-/// capture resolves it (same function, same environment). The daemon reports
-/// the remaining headroom against this so the Overlay can warn before the cut.
+/// The Deadline a capture implementation resolves for ITSELF at `begin()`,
+/// through the one resolver every enforcer shares.
 ///
-/// Read-only: this decides nothing and stops nothing. Capture still enforces
-/// the Deadline against its own start instant — this is the one ceiling being
-/// reported, not a second one being applied.
-pub fn recording_deadline() -> Duration {
+/// Only a capture may call this, and only to stamp its own
+/// [`DeadlineClock`] — the observer path reads that clock back off the capture
+/// rather than re-resolving here, so there is never a second answer to compare
+/// against the running one.
+pub fn capture_deadline() -> Duration {
     resolve_recording_maximum(std::env::var("VOISU_RECORDING_DEADLINE_MS").ok()).deadline
 }
 
@@ -2863,6 +2864,12 @@ fn stop_child_blocking(
 }
 
 impl ActiveCapture for PipeWireActiveCapture {
+    fn deadline_clock(&self) -> DeadlineClock {
+        // The same pair `next_chunk` enforces against, one field read apart —
+        // there is no second resolution and no second clock to disagree.
+        DeadlineClock { started: self.started, deadline: self.deadline }
+    }
+
     fn next_chunk(&mut self) -> BoundaryFuture<'_, Option<AudioChunk>> {
         Box::pin(async move {
             loop {

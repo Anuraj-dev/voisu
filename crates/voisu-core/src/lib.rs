@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -2677,7 +2677,32 @@ pub trait AudioCapture: Send {
     fn begin(&mut self, recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError>;
 }
 
+/// The Recording Deadline clock a capture is enforcing: the instant it began
+/// and the Deadline it resolved for itself. Read once at start so the observer
+/// path can report headroom against the SAME clock that will stop the
+/// Recording — anything stamped later (provider start can block on the
+/// keyring) would report headroom the enforcer does not agree with.
+///
+/// Reporting only. Nothing outside the capture may enforce, shorten, or
+/// second-guess this pair.
+#[derive(Clone, Copy, Debug)]
+pub struct DeadlineClock {
+    pub started: Instant,
+    pub deadline: Duration,
+}
+
+impl DeadlineClock {
+    /// Headroom left at `now`, saturating: a Recording already past its
+    /// Deadline (the stop is in flight) has none rather than wrapping.
+    pub fn remaining(&self, now: Instant) -> Duration {
+        self.deadline.saturating_sub(now.saturating_duration_since(self.started))
+    }
+}
+
 pub trait ActiveCapture: Send {
+    /// The Deadline clock this capture will enforce. The capture is the only
+    /// owner of that truth, so it is the only thing allowed to answer.
+    fn deadline_clock(&self) -> DeadlineClock;
     /// Yields the next live audio chunk for this Recording, or `None` once the
     /// capture has no further chunks to stream before it is finished.
     fn next_chunk(&mut self) -> BoundaryFuture<'_, Option<AudioChunk>>;

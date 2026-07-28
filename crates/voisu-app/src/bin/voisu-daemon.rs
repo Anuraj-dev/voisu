@@ -27,7 +27,8 @@ use voisu_app::system::{
 use voisu_app::config::DeliveryMode;
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
-    CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonState, DeliveryAdapter,
+    CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonState, DeadlineClock,
+    DeliveryAdapter,
     DeliveryMethod, DeliveryOutcome, DiagnosticPage, DiagnosticRecord, DiagnosticStore,
     LifecycleEvidence, LifecycleStage,
     OverlayEvent, OverlayOutcome,
@@ -477,11 +478,11 @@ struct ActiveRecording {
     first_chunk_ms: Arc<AtomicU64>,
     level_ring: Arc<LevelRing>,
     started_at: Instant,
-    /// The Recording Deadline resolved for this Recording, kept only so the
-    /// observer path can report remaining headroom. Capture enforces the
-    /// Deadline itself against its own start instant; nothing here stops
-    /// anything.
-    deadline: Duration,
+    /// The capture's OWN Deadline clock, read from the capture at start. Not
+    /// `started_at`: that is stamped after the providers start, and provider
+    /// start can block on the keyring for an unbounded time, which would make
+    /// every warning late by exactly that stall. Reporting only.
+    deadline_clock: DeadlineClock,
     evidence: LifecycleEvidence,
 }
 
@@ -1006,6 +1007,11 @@ async fn actor_loop(
                             });
                         }
                         Ok((active_capture, streams)) => {
+                            // Read the capture's own Deadline clock BEFORE the
+                            // capture is handed to the pump. It was stamped in
+                            // begin(), so it already accounts for whatever the
+                            // provider start cost — including a stalled keyring.
+                            let deadline_clock = active_capture.deadline_clock();
                             let evidence = base_evidence(
                                 id,
                                 correlation,
@@ -1083,7 +1089,7 @@ async fn actor_loop(
                                 first_chunk_ms,
                                 level_ring,
                                 started_at,
-                                deadline: voisu_app::system::recording_deadline(),
+                                deadline_clock,
                                 evidence,
                             });
                             let _ = reply.send(Response::success(
@@ -1529,8 +1535,8 @@ fn status_response_with_feedback(state: &ActorState) -> Response {
     if let ActorState::Recording(recording) = state {
         response.recording_remaining_ms = Some(
             recording
-                .deadline
-                .saturating_sub(recording.started_at.elapsed())
+                .deadline_clock
+                .remaining(Instant::now())
                 .as_millis()
                 .min(u64::MAX as u128) as u64,
         );
@@ -1923,7 +1929,7 @@ async fn process_recording(
         first_chunk_ms,
         level_ring: _,
         started_at,
-        deadline: _,
+        deadline_clock: _,
         mut evidence,
     } = recording;
     let _ = stop_tx.send(());
@@ -3069,6 +3075,12 @@ impl AudioCapture for ControlledCapture {
         self.finish_failures_remaining = self.finish_failures_remaining.saturating_sub(1);
         let recording_outcome = self.recording_outcome_once.take();
         Ok(Box::new(ControlledActiveCapture {
+            // Stamped here, in begin(), exactly where the real capture stamps
+            // its own — so the double exercises the same reporting path.
+            deadline_clock: DeadlineClock {
+                started: Instant::now(),
+                deadline: voisu_app::system::capture_deadline(),
+            },
             panic_next_chunk,
             fail_finish,
             recording_outcome,
@@ -3085,6 +3097,10 @@ impl AudioCapture for ControlledCapture {
 }
 
 struct ControlledActiveCapture {
+    /// The controlled double counts chunks rather than watching a clock, but it
+    /// still owns a real one so the observer path has the same single source of
+    /// truth it has in production.
+    deadline_clock: DeadlineClock,
     panic_next_chunk: bool,
     fail_finish: bool,
     recording_outcome: Option<String>,
@@ -3099,6 +3115,10 @@ struct ControlledActiveCapture {
 }
 
 impl ActiveCapture for ControlledActiveCapture {
+    fn deadline_clock(&self) -> DeadlineClock {
+        self.deadline_clock
+    }
+
     fn next_chunk(&mut self) -> BoundaryFuture<'_, Option<AudioChunk>> {
         Box::pin(async move {
             if std::mem::take(&mut self.panic_next_chunk) {
