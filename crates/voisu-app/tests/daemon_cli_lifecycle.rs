@@ -9740,3 +9740,57 @@ cat > "$dir/clipboard"
     daemon.terminate();
     server.join().unwrap();
 }
+
+/// The Overlay warns the user before the Recording Deadline cuts them off, and
+/// it can only do that if the observer path actually reports the headroom left.
+/// The headroom must also follow the RESOLVED Deadline, not the 600 s default:
+/// this daemon runs with a 300 s override, so a reply above that would mean the
+/// warnings were being computed against a limit nobody is enforcing.
+#[test]
+fn status_reports_the_remaining_recording_headroom_only_while_recording() {
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_RECORDING_DEADLINE_MS", "300000"),
+            ("VOISU_TEST_CAPTURE_CHUNKS", "8"),
+            ("VOISU_TEST_CHUNK_DELAY_MS", "40"),
+        ],
+    );
+
+    let idle = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+    assert_eq!(idle["state"], "idle", "{idle}");
+    assert!(
+        idle["recording_remaining_ms"].is_null(),
+        "an idle daemon has no Recording to report headroom for: {idle}"
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut observed = None;
+    while Instant::now() < deadline {
+        let status = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+        if status["state"] == "recording"
+            && let Some(remaining) = status["recording_remaining_ms"].as_u64()
+        {
+            observed = Some(remaining);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let remaining = observed.expect("a live Recording must report its remaining headroom");
+    assert!(
+        remaining > 0 && remaining <= 300_000,
+        "headroom must track the resolved 300 s Deadline, got {remaining} ms"
+    );
+
+    let stop = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stop["ok"], true, "{stop}");
+    let after = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+    assert!(
+        after["recording_remaining_ms"].is_null(),
+        "headroom must disappear with the Recording it belonged to: {after}"
+    );
+
+    daemon.terminate();
+}
