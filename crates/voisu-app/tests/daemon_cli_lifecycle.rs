@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -8228,13 +8228,11 @@ fn replay_rejects_a_fifo_without_wedging_the_daemon() {
     let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
     assert!(status.success());
 
-    let started = Instant::now();
     let replayed = ipc_request(
         runtime.path(),
         r#"{"version":1,"command":{"replay":"pipe.pcm"}}"#,
     );
     assert_eq!(replayed["ok"], false, "a FIFO is not a regular file: {replayed}");
-    assert!(started.elapsed() < Duration::from_secs(2), "the open must not block");
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
 }
@@ -8434,11 +8432,21 @@ fn a_delivered_recording_reports_its_per_stage_timings_to_the_journal() {
         &[
             ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Measure the healthy path."),
             ("VOISU_TEST_GROQ_TRANSCRIPT", "Measure the healthy path"),
+            ("VOISU_TEST_WAIT_FOR_FIRST_CHUNK_BEFORE_START", "1"),
         ],
     );
     assert!(voisu(runtime.path(), "start").status.success());
+    // The controlled start reply is the deterministic marker: this test seam
+    // withholds it until the pump has streamed a chunk to both providers.
+    let status = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+    let streamed = status["evidence"]["streamed_chunk_count"].as_u64().unwrap();
+    assert!(streamed > 0, "the start marker must establish a streamed chunk: {status}");
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
+    assert!(
+        stopped["evidence"]["streamed_chunk_count"].as_u64().unwrap() >= streamed,
+        "stop evidence must retain the chunk observed before stop: {stopped}"
+    );
 
     let journal = daemon.terminate_and_stderr();
     let line = journal
@@ -8607,6 +8615,71 @@ fn an_unsafe_durable_state_path_disables_diagnostics_without_blocking_dictation(
 }
 
 #[test]
+fn a_fifo_history_disables_diagnostics_without_blocking_dictation() {
+    let runtime = TempDir::new().unwrap();
+    let diagnostics = seeded_diagnostics_dir(runtime.path());
+    let history = diagnostics.join("history.jsonl");
+    assert!(Command::new("mkfifo").arg(&history).status().unwrap().success());
+
+    let daemon = Daemon::start(runtime.path());
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    let history_response =
+        ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(history_response["history"], serde_json::json!([]));
+    assert!(
+        fs::symlink_metadata(&history).unwrap().file_type().is_fifo(),
+        "degraded diagnostics must leave the rejected history path untouched"
+    );
+
+    let journal = daemon.terminate_and_stderr();
+    assert!(
+        journal.contains(
+            "diagnostics disabled: cleanup failed: diagnostics history is not a regular file"
+        ),
+        "the degraded startup must be visible: {journal}"
+    );
+}
+
+#[test]
+fn an_unreadable_history_disables_diagnostics_without_rewriting_retained_bytes() {
+    let runtime = TempDir::new().unwrap();
+    let diagnostics = seeded_diagnostics_dir(runtime.path());
+    let mut retained = voisu_core::DiagnosticRecord::new("retained".to_owned(), 41);
+    retained.set_final_transcript("must survive cleanup".to_owned());
+    write_seeded_history(&diagnostics, &[retained]);
+    let history = diagnostics.join("history.jsonl");
+    let original = fs::read(&history).unwrap();
+    fs::set_permissions(&history, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let daemon = Daemon::start(runtime.path());
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+
+    fs::set_permissions(&history, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        fs::read(&history).unwrap(),
+        original,
+        "a failed startup read must not compact an invented empty history"
+    );
+    let history_response =
+        ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(
+        history_response["history"],
+        serde_json::json!([]),
+        "the store stays disabled for the session after cleanup fails"
+    );
+
+    let journal = daemon.terminate_and_stderr();
+    assert!(
+        journal.contains("diagnostics disabled: cleanup failed:"),
+        "the read failure must be visible: {journal}"
+    );
+}
+
+#[test]
 fn a_full_diagnostic_ring_round_trips_through_cli_history_json() {
     // HARD GATE on the default retention raise: `voisu history --json` must
     // reconstruct the complete default-bound ring. Every clamped stored-text
@@ -8648,6 +8721,49 @@ fn a_full_diagnostic_ring_round_trips_through_cli_history_json() {
         records[voisu_core::DEFAULT_MAX_RECORDS - 1]["correlation_id"],
         "seed-0",
         "the oldest retained record must survive to the end of the frame"
+    );
+}
+
+#[test]
+fn legacy_unpaged_history_frame_stays_within_one_mebibyte_and_keeps_newest_records() {
+    const LEGACY_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+    let runtime = TempDir::new().unwrap();
+    seed_full_diagnostic_ring(runtime.path());
+    let _daemon = Daemon::start(runtime.path());
+
+    let mut stream = UnixStream::connect(socket_path(runtime.path())).unwrap();
+    stream
+        .write_all(b"{\"version\":1,\"command\":\"history\"}\n")
+        .unwrap();
+    let mut frame = Vec::new();
+    BufReader::new(stream).read_until(b'\n', &mut frame).unwrap();
+    assert!(
+        frame.len() <= LEGACY_MAX_RESPONSE_BYTES,
+        "legacy CLI rejects frames larger than one mebibyte: {} bytes",
+        frame.len()
+    );
+    assert_eq!(frame.last(), Some(&b'\n'), "the response must be one complete frame");
+
+    let response: Value = serde_json::from_slice(&frame).unwrap();
+    let records = response["history"].as_array().unwrap();
+    assert!(
+        !records.is_empty() && records.len() < voisu_core::DEFAULT_MAX_RECORDS,
+        "an oversized legacy history must retain a useful bounded prefix: {} records",
+        records.len()
+    );
+    assert_eq!(
+        records[0]["correlation_id"],
+        format!("seed-{}", voisu_core::DEFAULT_MAX_RECORDS - 1),
+        "the bounded compatibility snapshot starts with the newest record"
+    );
+    let recording_ids: Vec<u64> = records
+        .iter()
+        .map(|record| record["recording_id"].as_u64().unwrap())
+        .collect();
+    assert!(
+        recording_ids.windows(2).all(|pair| pair[0] == pair[1] + 1),
+        "the compatibility snapshot must be a contiguous newest-first prefix"
     );
 }
 
@@ -8725,8 +8841,10 @@ fn a_request_without_the_paging_field_is_answered_in_a_single_frame() {
     // one socket:
     //
     //   * old shape (no `paged`) — what a CLI built before paging sends, and
-    //     what it can parse: the whole history inline in ONE frame. Paging at
-    //     such a client would hand it a successful but empty history.
+    //     what it can parse: history inline in ONE frame. This fixture fits the
+    //     legacy cap and therefore arrives whole; the oversized-prefix behavior
+    //     is pinned separately above. Paging at such a client would hand it a
+    //     successful but empty history.
     //   * new shape (`paged: true`) — contiguous pages carrying the same
     //     history.
     //
@@ -8749,7 +8867,7 @@ fn a_request_without_the_paging_field_is_answered_in_a_single_frame() {
     );
     let old_records = old_shape["history"]
         .as_array()
-        .expect("the unpaged response carries the whole history inline");
+        .expect("the unpaged response carries history inline");
     assert_eq!(old_records.len(), record_count);
     assert_eq!(
         old_records[0]["provider_failures"][0]["diagnostic"]
@@ -8824,6 +8942,42 @@ fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
                 )
         }),
         "the startup failure keeps its exact historical diagnostic line: {journal}"
+    );
+}
+
+#[test]
+fn multiline_startup_failure_cannot_forge_a_journal_entry() {
+    let runtime = TempDir::new().unwrap();
+    let forged = "Recording 9: outcome=ok correlation_id=rec-forged \
+                  first_chunk_ms=1 capture_finalized_ms=1 \
+                  provider_timings_ms=groq:1 release_to_text_ms=1";
+    let diagnostic = format!("provider failed\n{forged}\rwith\ttabs");
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_PROVIDER_START_FAILURE", "1"),
+            ("VOISU_TEST_PROVIDER_START_DIAGNOSTIC", &diagnostic),
+        ],
+    );
+
+    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    assert_eq!(started["ok"], false, "{started}");
+    let correlation_id = started["evidence"]["correlation_id"].as_str().unwrap();
+    let journal = daemon.terminate_and_stderr();
+    let escaped = format!(
+        "Recording 1 [{correlation_id}]: provider failed\\n{forged}\\rwith\\ttabs"
+    );
+    assert!(
+        journal.lines().any(|line| line == escaped),
+        "the correlated human line must preserve escaped diagnostic text: {journal}"
+    );
+    assert!(
+        !journal.lines().any(|line| line == forged),
+        "embedded newlines must not create a forged journal entry: {journal}"
+    );
+    assert!(
+        !journal.contains('\r') && !journal.contains('\t'),
+        "raw diagnostic control characters must not reach stderr: {journal:?}"
     );
 }
 

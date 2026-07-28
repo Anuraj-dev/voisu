@@ -10,7 +10,7 @@
 //! cleanup can remove expired captures safely.
 
 use std::collections::BTreeMap;
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -593,6 +593,8 @@ pub struct DiagnosticStore {
     policy: RetentionPolicy,
     lock: Mutex<()>,
     temp_counter: AtomicU64,
+    #[cfg(test)]
+    directory_sync_attempts: AtomicU64,
 }
 
 impl DiagnosticStore {
@@ -605,6 +607,8 @@ impl DiagnosticStore {
             policy,
             lock: Mutex::new(()),
             temp_counter: AtomicU64::new(0),
+            #[cfg(test)]
+            directory_sync_attempts: AtomicU64::new(0),
         };
         create_private_dir(&store.audio_dir())?;
         create_private_dir(&store.fixture_dir())?;
@@ -628,22 +632,80 @@ impl DiagnosticStore {
         self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn load_raw(&self) -> Vec<DiagnosticRecord> {
-        // A missing or corrupt history file yields an empty history rather than
-        // failing the daemon: local diagnostics must never block a Recording.
+    fn load_raw(&self) -> io::Result<Vec<DiagnosticRecord>> {
+        // Only a missing history is an empty history. Any other open/read error
+        // is propagated so no caller can mistake unavailable durable state for
+        // an empty snapshot and compact that fiction over the retained log.
         //
         // Line-delimited, so an unreadable line costs only that record. A crash
         // during the append below can leave a torn final line; skipping it keeps
         // every record that was completely written, where a single-value file
         // would have to discard the whole ring.
-        let Ok(bytes) = fs::read(self.history_file()) else {
-            return Vec::new();
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(self.history_file())
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
         };
-        bytes
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "diagnostics history is not a regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
             .filter_map(|line| serde_json::from_slice(line).ok())
-            .collect()
+            .collect())
+    }
+
+    fn open_append_file(&self) -> io::Result<(File, bool)> {
+        let path = self.history_file();
+        match OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(&path)
+        {
+            Ok(file) => Ok((file, true)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                    .open(path)?;
+                if !file.metadata()?.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "diagnostics history is not a regular file",
+                    ));
+                }
+                Ok((file, false))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Makes a newly-created or atomically replaced directory entry durable.
+    ///
+    /// The record itself is already safely on disk when this runs. Directory
+    /// syncing is therefore best-effort: an unusual filesystem that refuses a
+    /// directory fsync must not turn observability into a delivery failure.
+    fn sync_directory_best_effort(&self, operation: &str) {
+        #[cfg(test)]
+        self.directory_sync_attempts.fetch_add(1, Ordering::Relaxed);
+        let result = File::open(&self.dir).and_then(|directory| directory.sync_all());
+        if let Err(error) = result {
+            eprintln!("diagnostics directory sync failed after {operation}: {error}");
+        }
     }
 
     /// Appends one record to the log without rewriting what is already there.
@@ -660,12 +722,7 @@ impl DiagnosticStore {
         // is always exactly one line and can never split the log.
         debug_assert!(!encoded.contains(&b'\n'));
         encoded.push(b'\n');
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .open(self.history_file())?;
+        let (mut file, created) = self.open_append_file()?;
         if file.metadata()?.len() != 0 {
             file.seek(SeekFrom::End(-1))?;
             let mut last = [0_u8; 1];
@@ -681,7 +738,11 @@ impl DiagnosticStore {
         // `sync_data`, not `sync_all`: the file's size is the only metadata that
         // matters here and a data sync carries it, so this does not pay for an
         // inode flush the history does not need.
-        file.sync_data()
+        file.sync_data()?;
+        if created {
+            self.sync_directory_best_effort("history creation");
+        }
+        Ok(())
     }
 
     /// Rewrites the whole log atomically. Used only when pruning actually
@@ -731,6 +792,8 @@ impl DiagnosticStore {
         let renamed = fs::rename(&temp, self.history_file());
         if renamed.is_err() {
             let _ = fs::remove_file(&temp);
+        } else {
+            self.sync_directory_best_effort("history replacement");
         }
         renamed
     }
@@ -771,8 +834,8 @@ impl DiagnosticStore {
         Ok(newest_first)
     }
 
-    /// How far the log may drift past the retained record count before a write
-    /// compacts it.
+    /// How far the log may drift past the retained record count, or how many
+    /// age-expired records may accumulate, before a write compacts it.
     ///
     /// Without slack there is no amortization at all at the steady state this
     /// retention policy is designed for: once the ring is full, EVERY Recording
@@ -780,10 +843,20 @@ impl DiagnosticStore {
     /// record and rewrite the whole log — measured at ~250 ms per dictation at
     /// the default retention on a real disk. Compacting once per slack
     /// Recordings instead makes that ~5 ms amortized. The cost is a log bounded
-    /// at `max_records + slack` rather than `max_records`; readers are
-    /// unaffected, because every load prunes before returning.
+    /// at `max_records + slack` rather than `max_records`; age-expired drift is
+    /// rewritten when a subsequent Recording observes more than `slack`
+    /// expired entries. Readers are unaffected, because every load prunes
+    /// before returning.
     fn compaction_slack(&self) -> usize {
         (self.policy.max_records / 4).max(8)
+    }
+
+    fn expired_by_age(&self, records: &[DiagnosticRecord], now_ms: u64) -> usize {
+        let age_floor = now_ms.saturating_sub(self.policy.max_age_ms());
+        records
+            .iter()
+            .filter(|record| record.recorded_at_unix_ms < age_floor)
+            .count()
     }
 
     /// Appends a completed Recording's record, prunes to the retention policy,
@@ -791,10 +864,16 @@ impl DiagnosticStore {
     /// (newest first).
     pub fn record(&self, record: DiagnosticRecord) -> io::Result<Vec<DiagnosticRecord>> {
         let _guard = self.lock_store();
-        let mut records = self.load_raw();
-        let drifted = records.len() + 1 > self.policy.max_records + self.compaction_slack();
+        let mut records = self.load_raw()?;
+        let slack = self.compaction_slack();
+        let count_drifted = records.len() + 1 > self.policy.max_records + slack;
+        // Age drift needs the same amortization as count drift. Without this
+        // bounded slack, every first Recording after an age boundary would
+        // rewrite the whole log; without any age trigger, low-volume long-lived
+        // daemons retain expired transcript text on disk indefinitely.
+        let age_drifted = self.expired_by_age(&records, unix_millis_now()) > slack;
         records.push(record);
-        if drifted {
+        if count_drifted || age_drifted {
             return self.compact(records);
         }
         // Appending the record as given, not the pruned copy: the log is allowed
@@ -814,7 +893,7 @@ impl DiagnosticStore {
     /// expired record.
     pub fn history(&self) -> io::Result<Vec<DiagnosticRecord>> {
         let _guard = self.lock_store();
-        let records = self.load_raw();
+        let records = self.load_raw()?;
         Ok(self.prune_in_memory(records))
     }
 
@@ -856,7 +935,7 @@ impl DiagnosticStore {
         // arrived to trigger a compaction.
         let kept = {
             let _guard = self.lock_store();
-            let records = self.load_raw();
+            let records = self.load_raw()?;
             self.compact(records)?
         };
         let _guard = self.lock_store();
@@ -1019,6 +1098,117 @@ pub async fn replay_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    fn store_with_policy(dir: &Path, policy: RetentionPolicy) -> DiagnosticStore {
+        DiagnosticStore::open(dir.join("diagnostics"), policy).unwrap()
+    }
+
+    #[test]
+    fn history_fifo_is_rejected_without_a_blocking_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_policy(dir.path(), RetentionPolicy::default());
+        let path = store.history_file();
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a live NUL-terminated pathname and mkfifo does not
+        // retain the pointer.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+        let error = store.history().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "diagnostics history is not a regular file");
+    }
+
+    #[test]
+    fn descriptor_based_history_read_still_ignores_only_a_torn_final_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_policy(dir.path(), RetentionPolicy::default());
+        let retained = DiagnosticRecord::new("retained".to_owned(), 1);
+        let mut bytes = serde_json::to_vec(&retained).unwrap();
+        bytes.extend_from_slice(b"\n{\"correlation_id\":\"torn");
+        fs::write(store.history_file(), bytes).unwrap();
+
+        let history = store.history().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].correlation_id, "retained");
+    }
+
+    #[test]
+    fn cleanup_read_failure_never_replaces_the_history_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_policy(dir.path(), RetentionPolicy::default());
+        let history = store.history_file();
+        fs::create_dir(&history).unwrap();
+        fs::write(history.join("retained-marker"), b"must survive").unwrap();
+
+        let error = store.cleanup_expired().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let record_error = store
+            .record(DiagnosticRecord::new("must-not-rewrite".to_owned(), 2))
+            .unwrap_err();
+        assert_eq!(record_error.kind(), io::ErrorKind::InvalidData);
+        assert!(history.is_dir(), "failed cleanup must not rename over history");
+        assert_eq!(
+            fs::read(history.join("retained-marker")).unwrap(),
+            b"must survive"
+        );
+    }
+
+    #[test]
+    fn record_compacts_when_expired_age_drift_exceeds_the_bounded_slack() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = RetentionPolicy {
+            max_records: 100,
+            max_age: Duration::from_secs(1),
+            debug_audio_ttl: Duration::from_secs(1),
+        };
+        let store = store_with_policy(dir.path(), policy);
+        let expired: Vec<_> = (0..=store.compaction_slack())
+            .map(|recording_id| {
+                let mut record =
+                    DiagnosticRecord::new(format!("expired-{recording_id}"), recording_id as u64);
+                record.recorded_at_unix_ms = 0;
+                record
+            })
+            .collect();
+        store.write_all(&expired).unwrap();
+
+        let fresh = DiagnosticRecord::new("fresh".to_owned(), 999);
+        let history = store.record(fresh).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].correlation_id, "fresh");
+        let durable = store.load_raw().unwrap();
+        assert_eq!(durable.len(), 1, "expired text must be removed from disk");
+        assert_eq!(durable[0].correlation_id, "fresh");
+    }
+
+    #[test]
+    fn history_creation_and_atomic_replacement_attempt_directory_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_policy(dir.path(), RetentionPolicy::default());
+
+        store
+            .record(DiagnosticRecord::new("created".to_owned(), 1))
+            .unwrap();
+        assert_eq!(store.directory_sync_attempts.load(Ordering::Relaxed), 1);
+
+        let records = store.load_raw().unwrap();
+        store.write_all(&records).unwrap();
+        assert_eq!(store.directory_sync_attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn directory_sync_failure_is_non_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_policy(dir.path(), RetentionPolicy::default());
+        let moved = dir.path().join("diagnostics-moved");
+        fs::rename(&store.dir, &moved).unwrap();
+
+        store.sync_directory_best_effort("test");
+        assert_eq!(store.directory_sync_attempts.load(Ordering::Relaxed), 1);
+        assert!(moved.is_dir(), "a failed best-effort sync changes no durable data");
+    }
 
     #[test]
     fn diagnostic_store_recovers_a_poisoned_serialization_lock() {

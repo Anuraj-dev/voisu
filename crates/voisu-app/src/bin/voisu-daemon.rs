@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use voisu_app::audio_level::{LevelRegistry, LevelRing};
 use voisu_app::focus::SharedFocusProbe;
-use voisu_app::journal::recording_journal_lines;
+use voisu_app::journal::{escape_journal_control, recording_journal_lines};
 use voisu_app::system::{
     CAPTURE_FINALIZE_DEADLINE, DIAGNOSTIC_RESPONSE_DEADLINE, DeepgramProvider,
     DesktopNotifier, FedoraShortcutPortal, GroqProvider, GuardedDelivery, MergeResultValidator,
@@ -42,6 +42,11 @@ use voisu_core::{
 
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
 const DIAGNOSTIC_PAGE_BYTES: usize = 64 * 1024;
+/// The response-frame ceiling enforced by the shipped pre-paging CLI.
+///
+/// Requests without `paged: true` come from that compatibility path, so their
+/// inline history must fit this cap including its newline frame delimiter.
+const LEGACY_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const IO_DEADLINE: Duration = CAPTURE_FINALIZE_DEADLINE;
 const MAX_CONNECTIONS: usize = 32;
 const PROVIDER_DEADLINE: Duration = PROVIDER_COMPLETION_DEADLINE;
@@ -145,12 +150,13 @@ async fn run() -> Result<(), String> {
             .map(Arc::new)
             .map_err(|error| format!("cannot open diagnostics store: {error}"))
     }) {
-        Ok(store) => {
-            if let Err(error) = store.cleanup_expired() {
-                eprintln!("diagnostics cleanup failed: {error}");
+        Ok(store) => match store.cleanup_expired() {
+            Ok(()) => Some(store),
+            Err(error) => {
+                eprintln!("diagnostics disabled: cleanup failed: {error}");
+                None
             }
-            Some(store)
-        }
+        },
         Err(error) => {
             eprintln!("diagnostics disabled: {error}");
             None
@@ -1007,6 +1013,16 @@ async fn actor_loop(
                                 started_at,
                                 tx.clone(),
                             ));
+                            if controlled
+                                && std::env::var_os(
+                                    "VOISU_TEST_WAIT_FOR_FIRST_CHUNK_BEFORE_START",
+                                )
+                                .is_some()
+                            {
+                                while chunk_counter.load(Ordering::SeqCst) == 0 {
+                                    tokio::task::yield_now().await;
+                                }
+                            }
                             state = ActorState::Recording(ActiveRecording {
                                 id,
                                 stop_tx,
@@ -1036,7 +1052,7 @@ async fn actor_loop(
                             );
                             eprintln!(
                                 "Recording {id} [{correlation}]: {}",
-                                failure.error.diagnostic()
+                                escape_journal_control(failure.error.diagnostic())
                             );
                             eprintln!("{}", journal.structured);
                             // A startup failure is correlated and retained like
@@ -2785,11 +2801,13 @@ async fn write_response(
     paged: bool,
 ) -> Result<(), String> {
     let write_started = Instant::now();
-    // A client that did not ask for paging cannot reassemble pages, so it is
-    // served the whole diagnostic inline in one frame exactly as before paging
-    // existed. Splitting a payload at a client that will not rejoin it would
-    // silently hand it an empty history.
+    // A client that did not ask for paging cannot reassemble pages. Keep its
+    // history inline, newest first, but trim the oldest tail until the complete
+    // frame fits the one-mebibyte ceiling enforced by the shipped legacy CLI.
+    // A useful recent snapshot is backward compatible; a frame the client must
+    // reject is not.
     if !paged {
+        bound_legacy_history(&mut response)?;
         return write_response_frame(writer, &response, write_started, write_deadline).await;
     }
     let diagnostic = if let Some(history) = response.history.take() {
@@ -2826,6 +2844,29 @@ async fn write_response(
         start = end;
         sequence += 1;
     }
+    Ok(())
+}
+
+fn bound_legacy_history(response: &mut Response) -> Result<(), String> {
+    let Some(records) = response.history.take() else {
+        return Ok(());
+    };
+    let mut fits = 0;
+    let mut too_many = records.len() + 1;
+    while fits + 1 < too_many {
+        let candidate = fits + (too_many - fits) / 2;
+        response.history = Some(records[..candidate].to_vec());
+        let frame_bytes = serde_json::to_vec(response)
+            .map_err(|error| format!("cannot encode daemon response: {error}"))?
+            .len()
+            + 1;
+        if frame_bytes <= LEGACY_MAX_RESPONSE_BYTES {
+            fits = candidate;
+        } else {
+            too_many = candidate;
+        }
+    }
+    response.history = Some(records.into_iter().take(fits).collect());
     Ok(())
 }
 
@@ -3121,6 +3162,7 @@ struct ControlledProvider {
     start_stall: Duration,
     start_marker: Option<PathBuf>,
     fail_start_once: bool,
+    start_failure_diagnostic: String,
     fail_abort: bool,
     fail_complete: bool,
     fail_send: bool,
@@ -3169,6 +3211,8 @@ impl ControlledProvider {
             start_stall: env_millis("VOISU_TEST_START_STALL_MS"),
             start_marker: std::env::var_os("VOISU_TEST_START_MARKER").map(PathBuf::from),
             fail_start_once,
+            start_failure_diagnostic: std::env::var("VOISU_TEST_PROVIDER_START_DIAGNOSTIC")
+                .unwrap_or_else(|_| "controlled-provider-start-detail".to_owned()),
             fail_abort,
             fail_complete,
             fail_send,
@@ -3189,7 +3233,7 @@ impl TranscriptProvider for ControlledProvider {
         if std::mem::take(&mut self.fail_start_once) {
             return Err(BoundaryError::new(
                 BoundaryKind::Provider,
-                "controlled-provider-start-detail",
+                self.start_failure_diagnostic.clone(),
             ));
         }
         Ok(Box::new(ControlledProviderStream {
@@ -3391,6 +3435,21 @@ impl DeliveryAdapter for ControlledDelivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn replay_fifo_is_rejected_at_the_descriptor_validation_seam() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fixture.pcm");
+        let path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a live NUL-terminated pathname and mkfifo does not
+        // retain the pointer.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+        let error = read_fixture(dir.path(), "fixture.pcm").unwrap_err();
+        assert_eq!(error.diagnostic(), "fixture must be a regular file");
+    }
 
     #[test]
     fn diagnostic_commands_use_the_diagnostic_write_deadline() {

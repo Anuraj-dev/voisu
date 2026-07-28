@@ -3,10 +3,10 @@
 //! The first line preserves the historical human-readable message, with control
 //! characters escaped so the message cannot end the entry (journald splits the
 //! daemon's stderr on `\n`, and the boundary diagnostic carries a subprocess's
-//! own stderr — see [`escape_control`]). The second is a stable, timing-only
-//! machine record; it never interpolates the diagnostic, so multiline or
-//! unusually long boundary output cannot split or displace its keys, nor forge
-//! a record of its own.
+//! own stderr — see [`escape_journal_control`]). The second is a stable,
+//! timing-only machine record; it never interpolates the diagnostic, so
+//! multiline or unusually long boundary output cannot split or displace its
+//! keys, nor forge a record of its own.
 //!
 //! ```text
 //! Recording <id>: <message>
@@ -45,7 +45,10 @@ pub fn recording_journal_lines(
         None => (DELIVERED_MESSAGE, "ok"),
     };
     RecordingJournalLines {
-        human: format!("Recording {recording_id}: {}", escape_control(message)),
+        human: format!(
+            "Recording {recording_id}: {}",
+            escape_journal_control(message)
+        ),
         structured: format!(
             "Recording {recording_id}: outcome={outcome} correlation_id={} \
              first_chunk_ms={} capture_finalized_ms={} provider_timings_ms={} \
@@ -74,7 +77,7 @@ pub fn recording_journal_lines(
 /// escaping a control byte is not changing the message. The escape is lossless
 /// and reversible, so the historical detail is still fully readable; it just
 /// cannot end the entry any more.
-fn escape_control(message: &str) -> std::borrow::Cow<'_, str> {
+pub fn escape_journal_control(message: &str) -> std::borrow::Cow<'_, str> {
     if !message.chars().any(char::is_control) {
         return std::borrow::Cow::Borrowed(message);
     }
