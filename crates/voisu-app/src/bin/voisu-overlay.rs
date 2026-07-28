@@ -527,13 +527,19 @@ fn install_surface_feedback(
                 // the notifications above: it cannot fail into, block, or
                 // otherwise touch the Recording's delivery, which the daemon
                 // owns and which this process only observes.
-                if let Some(body) = notify_limit
-                    .zip(remaining)
-                    .and_then(|(warning, left)| limit_notification_body(warning, left))
-                {
-                    let notification = gtk::gio::Notification::new("Voisu");
-                    notification.set_body(Some(body.as_str()));
-                    application.send_notification(Some("overlay-limit"), &notification);
+                if notify_limit.is_some() {
+                    if let Some(body) = notify_limit
+                        .zip(remaining)
+                        .and_then(|(warning, left)| limit_notification_body(warning, left))
+                    {
+                        let notification = gtk::gio::Notification::new("Voisu");
+                        notification.set_body(Some(body.as_str()));
+                        application.send_notification(Some("overlay-limit"), &notification);
+                    }
+                    // send_notification cannot refuse and suppression is
+                    // deliberate, so this path always settles the stage. Left
+                    // outstanding it would be rollback-able by a later caller.
+                    limit_latch.borrow_mut().commit();
                 }
                 gtk::glib::ControlFlow::Continue
             }
@@ -625,10 +631,16 @@ fn notification_tick(
     };
     // Both latches observe every tick: they are state machines, not senders,
     // and skipping one would corrupt the next tick's decision.
-    let limit_body = limit_latch
-        .observe(signal, identity.as_deref(), warning)
+    let announced = limit_latch.observe(signal, identity.as_deref(), warning);
+    let limit_body = announced
         .zip(remaining)
         .and_then(|(warning, left)| limit_notification_body(warning, left));
+    if announced.is_some() && limit_body.is_none() {
+        // Deliberately suppressed (no headroom left to report): the stage is
+        // spent on purpose, not lost, so settle it rather than leaving it
+        // outstanding.
+        limit_latch.commit();
+    }
     let fire_no_speech = no_speech_latch.observe(signal);
     // This rung sends at most one bubble per tick; the pure chooser decides
     // which. This rung has no capsule to turn amber, so the notification is
@@ -639,10 +651,12 @@ fn notification_tick(
             // already in flight, hand the stage back so the NEXT tick re-selects
             // it. Committing a warning the sink refused would be silence for
             // the rest of the Recording.
-            if let Some(body) = limit_body
-                && !notifier.notify(&body)
-            {
-                limit_latch.rollback();
+            if let Some(body) = limit_body {
+                if notifier.notify(&body) {
+                    limit_latch.commit();
+                } else {
+                    limit_latch.rollback();
+                }
             }
         }
         Some(RungNotification::Label(label)) => {

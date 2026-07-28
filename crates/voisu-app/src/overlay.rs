@@ -681,12 +681,26 @@ impl LimitWarningLatch {
     ///
     /// Escalate-only survives the rollback: a returned `Approaching` that has
     /// since become `Final` is re-selected as `Final` alone, never as both.
-    /// Calling this without an outstanding announcement, or twice for the same
-    /// one, changes nothing.
+    /// Calling this without an outstanding announcement — because it was
+    /// already committed, or already rolled back, or none was made — changes
+    /// nothing.
     pub fn rollback(&mut self) {
         if let Some(prior) = self.uncommitted.take() {
             self.fired = prior;
         }
+    }
+
+    /// Settle the announcement this tick handed out: the sink took it (or it
+    /// was deliberately suppressed), so the stage is spent and there is nothing
+    /// left to give back.
+    ///
+    /// Every announcement must be resolved by exactly one of this and
+    /// [`rollback`](Self::rollback). Pairing them here rather than trusting the
+    /// caller to never roll back a delivered warning is what makes
+    /// `rollback`'s inertness a property of the latch instead of a property of
+    /// the call site.
+    pub fn commit(&mut self) {
+        self.uncommitted = None;
     }
 
     /// The highest stage already announced for the current Recording. Exposed
@@ -2015,6 +2029,7 @@ mod tests {
                 refusals_left -= i32::from(refusals_left > 0);
                 if accepted {
                     announced.push(body);
+                    latch.commit();
                 } else {
                     latch.rollback();
                 }
@@ -2054,6 +2069,47 @@ mod tests {
         );
         // A rollback with nothing outstanding, or a repeated one, is inert.
         latch.rollback();
+        latch.rollback();
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Final)),
+            None
+        );
+    }
+
+    /// `rollback` promises to be inert without an outstanding announcement, and
+    /// an ACCEPTED announcement is not outstanding. The latch has to enforce
+    /// that itself: a stray rollback between polls must not resurrect a warning
+    /// the user has already been shown, or they get it twice.
+    #[test]
+    fn a_committed_warning_cannot_be_resurrected_by_a_stray_rollback() {
+        let mut latch = LimitWarningLatch::default();
+        let identity = Some("correlation-1");
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Approaching)),
+            Some(LimitWarning::Approaching)
+        );
+        // The sink accepted it, so the tick settles the stage.
+        latch.commit();
+        // A stray rollback before the next poll, and another for good measure.
+        latch.rollback();
+        latch.rollback();
+        assert_eq!(
+            latch.fired(),
+            Some(LimitWarning::Approaching),
+            "an accepted stage stays spent"
+        );
+        // The next tick announces nothing extra.
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Approaching)),
+            None,
+            "the warning must not be announced a second time"
+        );
+        // Escalation still works from the committed stage.
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Final)),
+            Some(LimitWarning::Final)
+        );
+        latch.commit();
         latch.rollback();
         assert_eq!(
             latch.observe(recording(), identity, Some(LimitWarning::Final)),
