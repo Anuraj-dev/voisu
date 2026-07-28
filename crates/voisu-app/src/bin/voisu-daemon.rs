@@ -589,6 +589,10 @@ async fn actor_loop(
                     let replay_whisper_prompt = Arc::new(
                         voisu_app::dictionary::whisper_prompt_for_terms(&replay_terms),
                     );
+                    validator
+                        .as_mut()
+                        .expect("validator is available")
+                        .set_dictionary_terms(replay_terms);
                     if !controlled {
                         deepgram = Some(build_deepgram_provider(
                             deepgram_enabled,
@@ -659,12 +663,16 @@ async fn actor_loop(
                     let id = next_id;
                     next_id += 1;
                     // A dictionary edit becomes visible at this Recording
-                    // boundary, never mid-utterance. Both providers receive
-                    // derivatives of exactly this one merged snapshot.
+                    // boundary, never mid-utterance. Both providers and the
+                    // validator receive derivatives of exactly this one snapshot.
                     let session_terms = voisu_app::dictionary::merged_terms();
                     let session_keyterms = voisu_app::dictionary::deepgram_keyterms(&session_terms);
                     let session_whisper_prompt =
                         voisu_app::dictionary::whisper_prompt_for_terms(&session_terms);
+                    validator
+                        .as_mut()
+                        .expect("validator is available")
+                        .set_dictionary_terms(session_terms);
                     if !controlled {
                         deepgram = Some(build_deepgram_provider(
                             deepgram_enabled,
@@ -3078,6 +3086,10 @@ impl ControlledValidator {
 }
 
 impl TranscriptValidator for ControlledValidator {
+    fn set_dictionary_terms(&mut self, dictionary_terms: Vec<String>) {
+        self.pipeline.set_dictionary_terms(dictionary_terms);
+    }
+
     fn validate(
         &mut self,
         sources: Vec<SourceTranscript>,

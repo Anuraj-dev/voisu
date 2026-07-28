@@ -939,11 +939,32 @@ pub struct TranscriptDecision {
 pub struct TranscriptDecisionPipeline<M> {
     model: M,
     deadline: Duration,
+    dictionary_terms: Vec<String>,
 }
 
 impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
     pub fn new(model: M, deadline: Duration) -> Self {
-        Self { model, deadline }
+        Self {
+            model,
+            deadline,
+            dictionary_terms: Vec::new(),
+        }
+    }
+
+    pub fn with_dictionary_terms(
+        model: M,
+        deadline: Duration,
+        dictionary_terms: Vec<String>,
+    ) -> Self {
+        Self {
+            model,
+            deadline,
+            dictionary_terms,
+        }
+    }
+
+    pub fn set_dictionary_terms(&mut self, dictionary_terms: Vec<String>) {
+        self.dictionary_terms = dictionary_terms;
     }
 
     pub async fn decide(
@@ -956,21 +977,49 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             sources.iter().find(|source| source.provider == Provider::Groq),
         ) {
             if source_similarity(&deepgram.text, &groq.text) >= 0.85 {
-                if let Some(reason) = quality_failure_reason(&groq.text, &sources) {
+                let lexically_identical =
+                    normalized_words(&deepgram.text) == normalized_words(&groq.text);
+                // Word-for-word equal texts differ only in rendering, so the
+                // three formatting signals decide them. Texts whose words
+                // differ keep the Groq default, always: the difference may be a
+                // mishearing or a change of meaning, and nothing available here
+                // tells the two apart — English antonyms and negations are
+                // minimal edits of the words they invert. A lost formatting
+                // improvement is recoverable; text whose meaning is inverted is
+                // not, because the user cannot see that it happened.
+                let (winner, evidence) = if lexically_identical {
+                    near_identical_selection(&deepgram.text, &groq.text, &self.dictionary_terms)
+                } else {
+                    (
+                        GateWinner::Right,
+                        "lexically different Source Transcripts; kept the Groq default because a difference in words may be a change of meaning".to_owned(),
+                    )
+                };
+                let selected = match winner {
+                    GateWinner::Left => deepgram,
+                    GateWinner::Right => groq,
+                };
+                if let Some(reason) =
+                    non_contraction_quality_failure_reason(&selected.text, &sources)
+                {
                     return self
                         .repair_candidate(
                             &sources,
-                            MergeResult(groq.text.trim().to_owned()),
+                            MergeResult(selected.text.trim().to_owned()),
                             reason,
                             false,
                         )
                         .await;
                 }
                 return Ok(TranscriptDecision {
-                    transcript: Transcript(groq.text.trim().to_owned()),
-                    selection: TranscriptSelection::NearIdenticalGroq,
-                    validation_reason: "near-identical Source Transcripts passed validation"
-                        .to_owned(),
+                    transcript: Transcript(selected.text.trim().to_owned()),
+                    selection: match selected.provider {
+                        Provider::Deepgram => TranscriptSelection::SourceDeepgram,
+                        Provider::Groq => TranscriptSelection::NearIdenticalGroq,
+                    },
+                    validation_reason: format!(
+                        "near-identical Source Transcripts passed validation; {evidence}"
+                    ),
                     fallback_reason: None,
                     reconciliation_requested: false,
                     recovery_attempted: false,
@@ -995,7 +1044,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                     GateWinner::Left => deepgram,
                     GateWinner::Right => groq,
                 };
-                if quality_failure_reason(&winner.text, &sources).is_none() {
+                if non_contraction_quality_failure_reason(&winner.text, &sources).is_none() {
                     return Ok(TranscriptDecision {
                         transcript: Transcript(winner.text.trim().to_owned()),
                         selection: match winner.provider {
@@ -1053,7 +1102,11 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                     }
                 }
             };
-            if let Some(reason) = quality_failure_reason(&merge_result.0, &sources) {
+            if let Some(failure) = quality_failure_reason(&merge_result.0, &sources) {
+                let reason = failure.reason();
+                if failure.is_contraction() {
+                    return contraction_source_fallback(&sources, reason, true, false);
+                }
                 return self
                     .repair_candidate(&sources, merge_result, reason, true)
                     .await;
@@ -1071,7 +1124,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         let source = sources.first().ok_or_else(|| {
             BoundaryError::new(BoundaryKind::Validation, "no Source Transcript")
         })?;
-        if let Some(reason) = quality_failure_reason(&source.text, &sources) {
+        if let Some(reason) = non_contraction_quality_failure_reason(&source.text, &sources) {
             return self
                 .repair_candidate(
                     &sources,
@@ -1098,7 +1151,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         &mut self,
         sources: &[SourceTranscript],
         candidate: MergeResult,
-        reason: &'static str,
+        reason: String,
         reconciliation_requested: bool,
     ) -> Result<TranscriptDecision, BoundaryError> {
         let repaired = {
@@ -1137,13 +1190,60 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 }
             }
         };
-        if let Some(repair_reason) = quality_failure_reason(&repaired.0, sources) {
+        let failure = quality_failure_reason(&repaired.0, sources);
+        if let Some(failure) = &failure {
+            if !failure.is_contraction() {
+                return clean_source_fallback(
+                    sources,
+                    format!("recovery produced {}", failure.reason()),
+                    reconciliation_requested,
+                    true,
+                );
+            }
+        }
+        if !is_source_derived(&repaired.0, sources) {
             return clean_source_fallback(
                 sources,
-                format!("recovery produced {repair_reason}"),
+                "recovery produced words no Source Transcript contains".to_owned(),
                 reconciliation_requested,
                 true,
             );
+        }
+        if let Some(failure) = failure {
+            // The repair contracted past the merge floor. It is built out of
+            // words the providers heard and is otherwise clean, so it is still
+            // the user's speech — but a complete Source Transcript carries more
+            // of it, and preferring one is exactly what the floor is for. The
+            // fallback follows the spec's contraction rule: the LONGER Source
+            // Transcript, the user never receiving less than one provider
+            // heard.
+            //
+            // The floor decides PREFERENCE, not delivery. When the offending
+            // text was in both Source Transcripts, neither is safe and this
+            // repair is all that is left of the Recording; refusing it there
+            // was the round-1 P0. So a failure to find a clean source hands the
+            // repair over rather than losing the dictation — with the measured
+            // contraction on the diagnostic record, because a silently
+            // delivered précis is the case an operator tuning the floor most
+            // needs to see.
+            if let Ok(decision) = contraction_source_fallback(
+                sources,
+                format!("recovery produced {}", failure.reason()),
+                reconciliation_requested,
+                true,
+            ) {
+                return Ok(decision);
+            }
+            return Ok(TranscriptDecision {
+                transcript: Transcript(repaired.0.trim().to_owned()),
+                selection: TranscriptSelection::Repaired,
+                validation_reason: format!(
+                    "repaired {reason}; delivered a contracted repair because neither Source Transcript is clean"
+                ),
+                fallback_reason: Some(failure.reason()),
+                reconciliation_requested,
+                recovery_attempted: true,
+            });
         }
         Ok(TranscriptDecision {
             transcript: Transcript(repaired.0.trim().to_owned()),
@@ -1156,6 +1256,70 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
     }
 }
 
+/// Delivers a Source Transcript after a merge or repair was rejected for
+/// contracting.
+///
+/// The rejected candidate is deliberately NOT consulted. The guard has just
+/// declared it untrustworthy for having deleted words, so using it to arbitrate
+/// which source to deliver is circular — and when the merge simply reproduced
+/// the shorter source (a provider that truncated its tail), the "corroboration"
+/// is guaranteed and the guard hands over exactly the contraction it rejected.
+///
+/// So the LONGER Source Transcript wins by default: the user must never receive
+/// less than one provider heard. The single exception is padding — a source
+/// that is longer only because it repeats what it already said heard no more
+/// than its sibling, and losing that surplus loses nothing.
+fn contraction_source_fallback(
+    sources: &[SourceTranscript],
+    reason: String,
+    reconciliation_requested: bool,
+    recovery_attempted: bool,
+) -> Result<TranscriptDecision, BoundaryError> {
+    let safe = quality_safe_sources(sources);
+    let source = match safe.as_slice() {
+        [] => None,
+        [only] => Some(*only),
+        [left, right, ..] => {
+            let left_words = normalized_words(&left.text);
+            let right_words = normalized_words(&right.text);
+            let left_padded = surplus_is_self_repetition(&left_words, &right_words);
+            let right_padded = surplus_is_self_repetition(&right_words, &left_words);
+            Some(match (left_padded, right_padded) {
+                (true, false) => *right,
+                (false, true) => *left,
+                // Neither side is padding (or both are): deliver the longer
+                // text. An exact tie keeps Groq, the standing default.
+                _ => {
+                    if left_words.len() > right_words.len() {
+                        *left
+                    } else {
+                        *right
+                    }
+                }
+            })
+        }
+    };
+    let source = source.ok_or_else(|| {
+        source_fallback_refusal(
+            &reason,
+            reconciliation_requested,
+            recovery_attempted,
+        )
+    })?;
+    Ok(TranscriptDecision {
+        transcript: Transcript(source.text.trim().to_owned()),
+        selection: match source.provider {
+            Provider::Deepgram => TranscriptSelection::SourceDeepgram,
+            Provider::Groq => TranscriptSelection::SourceGroq,
+        },
+        validation_reason:
+            "longer Source Transcript delivered after a rejected contraction".to_owned(),
+        fallback_reason: Some(reason),
+        reconciliation_requested,
+        recovery_attempted,
+    })
+}
+
 fn clean_source_fallback(
     sources: &[SourceTranscript],
     reason: String,
@@ -1166,12 +1330,7 @@ fn clean_source_fallback(
     // comparator the divergence gate uses — never a fixed provider preference,
     // and never an intrinsic score alone, which a fluent unique-word salad can
     // inflate past accurate repetitive dictation.
-    let safe: Vec<&SourceTranscript> = sources
-        .iter()
-        .filter(|source| {
-            quality_failure_reason(&source.text, std::slice::from_ref(*source)).is_none()
-        })
-        .collect();
+    let safe = quality_safe_sources(sources);
     let source = match safe.as_slice() {
         [] => None,
         [only] => Some(*only),
@@ -1187,20 +1346,13 @@ fn clean_source_fallback(
             },
         ),
     };
-    let source = source
-        .ok_or_else(|| {
-            let validation_reason = format!("{reason}; neither Source Transcript is safe");
-            BoundaryError::new(
-                BoundaryKind::Validation,
-                validation_reason.clone(),
-            )
-            .with_transcript_failure(TranscriptFailureEvidence {
-                validation_reason,
-                fallback_reason: Some(reason.clone()),
-                reconciliation_requested,
-                recovery_attempted,
-            })
-        })?;
+    let source = source.ok_or_else(|| {
+        source_fallback_refusal(
+            &reason,
+            reconciliation_requested,
+            recovery_attempted,
+        )
+    })?;
     Ok(TranscriptDecision {
         transcript: Transcript(source.text.trim().to_owned()),
         selection: match source.provider {
@@ -1212,6 +1364,49 @@ fn clean_source_fallback(
         reconciliation_requested,
         recovery_attempted,
     })
+}
+
+/// The Source Transcripts a fallback may deliver: individually clean under
+/// the non-contraction guards AND carrying at least one normalised word.
+///
+/// The wordless exclusion is what keeps every fallback arm inside the
+/// divergence gate's guarantees. A source that normalises to zero words
+/// ("...", stray punctuation from silence) passes every text-shaped guard,
+/// yet no word-level evidence can judge it — the gate never computes garbage
+/// verdicts for such a pair, so a wordless side reaching a fallback
+/// comparison can win it precisely by being unjudgeable, typing "..." into
+/// the user's window as if the dictation succeeded. Pinned by
+/// `a_wordless_source_transcript_is_never_delivered_over_heard_words` and
+/// `an_unsafe_source_beside_a_wordless_sibling_is_refused_not_replaced_with_dots`.
+fn quality_safe_sources<'a>(
+    sources: impl IntoIterator<Item = &'a SourceTranscript>,
+) -> Vec<&'a SourceTranscript> {
+    sources
+        .into_iter()
+        .filter(|source| {
+            !normalized_words(&source.text).is_empty()
+                && non_contraction_quality_failure_reason(
+                    &source.text,
+                    std::slice::from_ref(source),
+                )
+                .is_none()
+        })
+        .collect()
+}
+
+fn source_fallback_refusal(
+    reason: &str,
+    reconciliation_requested: bool,
+    recovery_attempted: bool,
+) -> BoundaryError {
+    let validation_reason = format!("{reason}; neither Source Transcript is safe");
+    BoundaryError::new(BoundaryKind::Validation, validation_reason.clone())
+        .with_transcript_failure(TranscriptFailureEvidence {
+            validation_reason,
+            fallback_reason: Some(reason.to_owned()),
+            reconciliation_requested,
+            recovery_attempted,
+        })
 }
 
 /// A Source Transcript shorter than roughly a third of the other's length is a
@@ -1330,6 +1525,52 @@ fn is_repetition_loop(words: &[String]) -> bool {
     content_count >= MIN_REPETITION_CONTENT
         && distinct_content >= MIN_LOOP_VOCABULARY
         && (distinct_content as f64) < CONTENT_REPETITION_FLOOR * content_count as f64
+}
+
+/// True when everything `candidate` says beyond `other` is `candidate` saying
+/// again what it already said — padding, not speech the other side missed.
+///
+/// The surplus is the multiset of candidate words `other` cannot account for,
+/// so it is order-insensitive: a reordered but equally complete sibling leaves
+/// no surplus. The surplus counts as padding only when ALL of these hold:
+/// - it carries at least `MIN_REPETITION_CONTENT` content words, below which
+///   the shape says nothing (and the few words at stake are worth keeping);
+/// - it introduces no content word the candidate did not already use in its
+///   corroborated part — one genuinely new word means real speech was heard;
+/// - it is itself a repetition loop by the same `CONTENT_REPETITION_FLOOR` the
+///   garbage gate uses.
+///
+/// The conjunction is deliberately strict, because the cost of a false positive
+/// is delivering less than a provider heard. A tail one provider caught and the
+/// other truncated brings new content words, or is not internally repetitive,
+/// and so survives every clause.
+fn surplus_is_self_repetition(candidate: &[String], other: &[String]) -> bool {
+    let mut budget: HashMap<&str, usize> = HashMap::new();
+    for word in other {
+        *budget.entry(word.as_str()).or_default() += 1;
+    }
+    let mut surplus: Vec<&str> = Vec::new();
+    for word in candidate {
+        match budget.get_mut(word.as_str()) {
+            Some(remaining) if *remaining > 0 => *remaining -= 1,
+            _ => surplus.push(word.as_str()),
+        }
+    }
+    let content: Vec<&str> = surplus
+        .into_iter()
+        .filter(|word| !is_stopword(word))
+        .collect();
+    if content.len() < MIN_REPETITION_CONTENT {
+        return false;
+    }
+    let distinct: HashSet<&str> = content.iter().copied().collect();
+    // A word `other` never used cannot have been corroborated earlier in the
+    // candidate either, because every corroborated occurrence was matched
+    // against `other`'s budget. So an unknown word here is new content.
+    if distinct.iter().any(|word| !budget.contains_key(word)) {
+        return false;
+    }
+    (distinct.len() as f64) < CONTENT_REPETITION_FLOOR * content.len() as f64
 }
 
 /// The single garbage verdict for one side of a disagreeing pair, judged by
@@ -1599,9 +1840,13 @@ fn select_better_source(left: &[String], right: &[String]) -> (GateWinner, Selec
 }
 
 /// Decides whether to skip the LLM merge for two materially disagreeing Source
-/// Transcripts and select the better one (§3.4). One symmetric computation —
-/// the one-to-one phonetic-tolerant matching of distinct content words —
-/// feeds every decision:
+/// Transcripts and select the better one (§3.4). The tiers do not share one
+/// computation: the wordless guard and the fragment ratio below are counts
+/// alone, and only tiers 1 and 3 consult the one-to-one phonetic-tolerant
+/// matching of distinct content words (via `select_better_source`). No tier is
+/// evidence about MEANING — nothing here, or anywhere in this module, can tell
+/// a mishearing from a change of meaning, which is why the near-identical path
+/// never lets any of it overturn the Groq default.
 /// 1. Exactly one source is garbage (degenerate filler loop, a repetition loop
 ///    stealing the majority of its recycled words from the other source, or a
 ///    hollow loop nothing of which is confirmed): select the other.
@@ -1620,7 +1865,32 @@ fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
     let fewer = left_words.len().min(right_words.len());
     let more = left_words.len().max(right_words.len());
     if fewer == 0 {
-        return None;
+        if more == 0 {
+            // Both wordless: nothing to select and nothing to divide by.
+            // (`decide` never sends this pair — two wordless texts are
+            // similarity 1.0 and take the near-identical path — the guard
+            // keeps this function total over its own inputs.)
+            return None;
+        }
+        // Exactly one side is wordless: punctuation from silence or noise.
+        // It is not a transcript — no verdict below can judge a side with no
+        // words, and a merge with it is a merge with a stub — so select the
+        // only side that heard words before any tier that a wordless side
+        // cannot take part in. Even degenerate filler is more of the
+        // Recording than nothing. Pinned by
+        // `a_wordless_source_transcript_is_never_delivered_over_heard_words`
+        // and its companion tests.
+        let winner = if left_words.is_empty() {
+            GateWinner::Right
+        } else {
+            GateWinner::Left
+        };
+        return Some(QualityGate {
+            winner,
+            reason:
+                "catastrophically divergent (one Source Transcript is wordless); selected the only Source Transcript with words"
+                    .to_owned(),
+        });
     }
     let left_content = distinct_content_words(&left_words);
     let right_content = distinct_content_words(&right_words);
@@ -1696,6 +1966,228 @@ fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
     None
 }
 
+struct FormattingEvidence {
+    capitalised_sentence_starts: usize,
+    sentence_starts: usize,
+    all_caps: bool,
+    sentence_punctuation_boundaries: usize,
+    dictionary_matches: usize,
+}
+
+/// The outcome of comparing two Source Transcripts on formatting evidence.
+struct FormattingComparison {
+    left_signals: usize,
+    right_signals: usize,
+    measurements: String,
+}
+
+impl FormattingComparison {
+    /// True when one side won at least one signal and the other won none.
+    fn favours_left(&self) -> bool {
+        self.left_signals > 0 && self.right_signals == 0
+    }
+}
+
+fn near_identical_selection(
+    left: &str,
+    right: &str,
+    dictionary_terms: &[String],
+) -> (GateWinner, String) {
+    let comparison = compare_formatting(left, right, dictionary_terms);
+    let measurements = &comparison.measurements;
+    if comparison.favours_left() {
+        (
+            GateWinner::Left,
+            format!("selected Deepgram on one-sided formatting evidence ({measurements})"),
+        )
+    } else {
+        (
+            GateWinner::Right,
+            format!(
+                "defaulted to Groq because formatting evidence was not one-sided ({measurements})"
+            ),
+        )
+    }
+}
+
+fn compare_formatting(
+    left: &str,
+    right: &str,
+    dictionary_terms: &[String],
+) -> FormattingComparison {
+    let left_evidence = formatting_evidence(left, dictionary_terms);
+    let right_evidence = formatting_evidence(right, dictionary_terms);
+    let mut left_signals = 0;
+    let mut right_signals = 0;
+
+    let capitalisation_score = |evidence: &FormattingEvidence| {
+        if evidence.all_caps || evidence.sentence_starts == 0 {
+            0.0
+        } else {
+            evidence.capitalised_sentence_starts as f64 / evidence.sentence_starts as f64
+        }
+    };
+    let left_capitalisation = capitalisation_score(&left_evidence);
+    let right_capitalisation = capitalisation_score(&right_evidence);
+    if left_capitalisation > right_capitalisation {
+        left_signals += 1;
+    } else if right_capitalisation > left_capitalisation {
+        right_signals += 1;
+    }
+    if left_evidence.sentence_punctuation_boundaries
+        > right_evidence.sentence_punctuation_boundaries
+    {
+        left_signals += 1;
+    } else if right_evidence.sentence_punctuation_boundaries
+        > left_evidence.sentence_punctuation_boundaries
+    {
+        right_signals += 1;
+    }
+    if left_evidence.dictionary_matches > right_evidence.dictionary_matches {
+        left_signals += 1;
+    } else if right_evidence.dictionary_matches > left_evidence.dictionary_matches {
+        right_signals += 1;
+    }
+
+    let measurements = format!(
+        "capitalised sentence starts {}/{}{} vs {}/{}{}, sentence punctuation boundaries {} vs {}, dictionary matches {} vs {}",
+        left_evidence.capitalised_sentence_starts,
+        left_evidence.sentence_starts,
+        if left_evidence.all_caps { " (all-caps)" } else { "" },
+        right_evidence.capitalised_sentence_starts,
+        right_evidence.sentence_starts,
+        if right_evidence.all_caps { " (all-caps)" } else { "" },
+        left_evidence.sentence_punctuation_boundaries,
+        right_evidence.sentence_punctuation_boundaries,
+        left_evidence.dictionary_matches,
+        right_evidence.dictionary_matches,
+    );
+    FormattingComparison {
+        left_signals,
+        right_signals,
+        measurements,
+    }
+}
+
+fn formatting_evidence(text: &str, dictionary_terms: &[String]) -> FormattingEvidence {
+    let (capitalised_sentence_starts, sentence_starts) = sentence_start_capitalisation(text);
+    let alphabetic = text.chars().filter(|character| character.is_alphabetic()).count();
+    let lowercase = text.chars().filter(|character| character.is_lowercase()).count();
+    FormattingEvidence {
+        capitalised_sentence_starts,
+        sentence_starts,
+        all_caps: alphabetic >= 4 && lowercase == 0,
+        sentence_punctuation_boundaries: sentence_boundary_credit(text),
+        dictionary_matches: distinct_nonoverlapping_dictionary_matches(text, dictionary_terms),
+    }
+}
+
+fn sentence_punctuation_boundaries(text: &str) -> usize {
+    let mut boundaries = 0;
+    let mut in_boundary = false;
+    for character in text.chars() {
+        if matches!(character, '.' | '?' | '!') {
+            if !in_boundary {
+                boundaries += 1;
+                in_boundary = true;
+            }
+        } else {
+            in_boundary = false;
+        }
+    }
+    boundaries
+}
+
+fn sentence_boundary_credit(text: &str) -> usize {
+    // Past roughly one boundary per six words, more punctuation is more likely
+    // over-segmentation than evidence of better sentence structure. Saturate
+    // there so a period after every word cannot manufacture a winning signal.
+    let plausible_boundaries = normalized_words(text).len().div_ceil(6).max(1);
+    sentence_punctuation_boundaries(text).min(plausible_boundaries)
+}
+
+/// The text's final sentence — everything after the last sentence terminator
+/// that ends a word — with leading non-alphanumerics trimmed. A '.' inside a
+/// token ("amara.org", "otter.ai") does not end a sentence, so an outro
+/// carrying a dotted attribution still reads as one final sentence; a '.'
+/// swallowed by a closing quote does not either, which is why callers must
+/// not rely on sentence boundaries alone to find a trailing artifact. A text
+/// with no terminator is itself the final sentence.
+fn final_sentence(text: &str) -> &str {
+    let trimmed = text.trim_end_matches(|character: char| !character.is_alphanumeric());
+    let start = trimmed
+        .char_indices()
+        .filter(|&(index, character)| {
+            matches!(character, '.' | '?' | '!')
+                && trimmed[index + character.len_utf8()..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_whitespace)
+        })
+        .map(|(index, character)| index + character.len_utf8())
+        .next_back()
+        .unwrap_or(0);
+    trimmed[start..].trim_start_matches(|character: char| !character.is_alphanumeric())
+}
+
+fn sentence_start_capitalisation(text: &str) -> (usize, usize) {
+    let mut at_sentence_start = true;
+    let mut capitalised = 0;
+    let mut total = 0;
+    for character in text.chars() {
+        if character.is_alphabetic() && at_sentence_start {
+            total += 1;
+            if character.is_uppercase() {
+                capitalised += 1;
+            }
+            at_sentence_start = false;
+        } else if matches!(character, '.' | '?' | '!') {
+            at_sentence_start = true;
+        }
+    }
+    (capitalised, total)
+}
+
+fn distinct_nonoverlapping_dictionary_matches(text: &str, terms: &[String]) -> usize {
+    let mut candidates: Vec<(&str, usize, usize)> = terms
+        .iter()
+        .map(String::as_str)
+        .filter(|term| !term.is_empty())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .flat_map(|term| {
+            text.match_indices(term).filter_map(move |(start, matched)| {
+                let before_is_boundary = text[..start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|character| !character.is_alphanumeric());
+                let end = start + matched.len();
+                let after_is_boundary = text[end..]
+                    .chars()
+                    .next()
+                    .is_none_or(|character| !character.is_alphanumeric());
+                (before_is_boundary && after_is_boundary).then_some((term, start, end))
+            })
+        })
+        .collect();
+    candidates.sort_by_key(|(term, start, _)| (std::cmp::Reverse(term.len()), *start));
+
+    let mut selected_terms = HashSet::new();
+    let mut selected_spans: Vec<(usize, usize)> = Vec::new();
+    for (term, start, end) in candidates {
+        if selected_terms.contains(term)
+            || selected_spans
+                .iter()
+                .any(|(selected_start, selected_end)| start < *selected_end && *selected_start < end)
+        {
+            continue;
+        }
+        selected_terms.insert(term);
+        selected_spans.push((start, end));
+    }
+    selected_terms.len()
+}
+
 fn source_similarity(left: &str, right: &str) -> f64 {
     let left = normalized_words(left);
     let right = normalized_words(right);
@@ -1706,19 +2198,128 @@ fn source_similarity(left: &str, right: &str) -> f64 {
     1.0 - word_edit_distance(&left, &right) as f64 / longest as f64
 }
 
+/// The worst observed silent contraction retained 87% of the longest source.
+/// Rejecting below 90% catches all four production cases (77–87%) while an
+/// exact 90% merge remains valid.
+const MERGE_CONTRACTION_RATIO_FLOOR: f64 = 0.90;
+
+enum QualityFailure {
+    Other(&'static str),
+    Contraction {
+        ratio: f64,
+        candidate_words: usize,
+        source_words: usize,
+    },
+}
+
+impl QualityFailure {
+    fn is_contraction(&self) -> bool {
+        matches!(self, Self::Contraction { .. })
+    }
+
+    fn reason(&self) -> String {
+        match self {
+            Self::Other(reason) => (*reason).to_owned(),
+            Self::Contraction {
+                ratio,
+                candidate_words,
+                source_words,
+            } => format!(
+                "suspicious contraction ratio {ratio:.4} below {MERGE_CONTRACTION_RATIO_FLOOR:.2} ({candidate_words} candidate words, {source_words} longest-source words)"
+            ),
+        }
+    }
+}
+
+/// Every quality guard EXCEPT the merge contraction floor.
+///
+/// The floor exists to catch a reconcile merge that silently summarises the two
+/// Source Transcripts, and it is measured against the LONGEST source. That
+/// comparison is meaningful only for the merge output. It is meaningless — and
+/// harmful — for text that is legitimately shorter than the sources: a Source
+/// Transcript is not a merge of its sibling, and a repair exists precisely to
+/// delete unsafe spans from a candidate.
+fn non_contraction_quality_failure_reason(
+    candidate: &str,
+    sources: &[SourceTranscript],
+) -> Option<String> {
+    quality_failure_reason(candidate, sources).and_then(|failure| {
+        if failure.is_contraction() {
+            None
+        } else {
+            Some(failure.reason())
+        }
+    })
+}
+
+/// Whether every content word of a candidate is a word some Source Transcript
+/// actually contains.
+///
+/// This is the guard the length bounds cannot be: repair asks a safety-tuned
+/// model to rebuild an unsafe candidate USING ONLY the Source Transcripts, and
+/// such a model may instead decline — "I can't help with that." is short,
+/// clean, single-script, and trips nothing, yet it is not the user's speech.
+/// Derivation catches it by its one distinguishing property: its vocabulary is
+/// the model's, not the providers'. It is also the reason a repair may shrink
+/// without limit, which no ratio can allow — deleting a hallucinated tail or
+/// collapsing a repetition loop removes most of the words but invents none.
+///
+/// Stopwords are exempt. A repair that closes the gap left by a deleted span
+/// may need a connective, and no refusal is recognisable by its function words.
+///
+/// A candidate with NO content words cannot use that exemption — an empty
+/// content set vacuously passing is how "I can't do that." (pure stopwords
+/// once "can't" expands to "can not") was once typed as the user's dictation.
+/// But a real dictation can be all stopwords too ("Yes, I can do that."), and
+/// refusing it would lose a dictation to a guard. So an all-stopword
+/// candidate is held to the strictest form of the same question: EVERY word,
+/// stopwords included, must be one some provider actually heard. The user's
+/// own words survive that; a refusal's vocabulary, against sources that never
+/// said "i"/"can"/"do"/"that", does not.
+fn is_source_derived(candidate: &str, sources: &[SourceTranscript]) -> bool {
+    let source_words: Vec<String> = sources
+        .iter()
+        .flat_map(|source| normalized_words(&source.text))
+        .collect();
+    let candidate_words = normalized_words(candidate);
+    let content_words: Vec<&String> = candidate_words
+        .iter()
+        .filter(|word| !is_stopword(word))
+        .collect();
+    if content_words.is_empty() {
+        let heard: HashSet<&str> = source_words.iter().map(String::as_str).collect();
+        return !candidate_words.is_empty()
+            && candidate_words.iter().all(|word| heard.contains(word.as_str()));
+    }
+    let vocabulary = distinct_content_words(&source_words);
+    content_words
+        .into_iter()
+        .all(|word| vocabulary.contains(word.as_str()))
+}
+
 fn quality_failure_reason(
     candidate: &str,
     sources: &[SourceTranscript],
-) -> Option<&'static str> {
+) -> Option<QualityFailure> {
     let trimmed = candidate.trim();
     if trimmed.is_empty() || trimmed.contains('\0') || trimmed.len() > 100_000 {
-        return Some("invalid candidate text");
+        return Some(QualityFailure::Other("invalid candidate text"));
     }
     let lower = trimmed.to_lowercase();
-    const PROMPT_ARTIFACTS: [&str; 8] = [
+    // Injection markers, matched anywhere: an instruction smuggled into the
+    // audio is unsafe wherever it lands, and none of these is ordinary speech —
+    // they are imperative instruction forms, colon-terminated role labels, or
+    // markup no speaker utters. The one entry that WAS ordinary speech,
+    // "system prompt", is gone: "let us change the system prompt" is a sentence
+    // this product's users dictate, and routing it into repair mangles or loses
+    // it. The removal does forfeit one leak shape — a model prefacing its leak
+    // with the label, "Here is the system prompt: ..." — which no surviving
+    // marker catches. That trade is deliberate: the false positive cost whole
+    // dictations, while the forfeited catch only lets a labelled leak reach
+    // the user as visible text to delete.
+    const PROMPT_ARTIFACTS: [&str; 7] = [
         "ignore previous instructions",
         "ignore all instructions",
-        "system prompt",
         "system:",
         "assistant:",
         "<|system|>",
@@ -1729,8 +2330,21 @@ fn quality_failure_reason(
         .iter()
         .any(|artifact| lower.contains(artifact))
     {
-        return Some("prompt artifact");
+        return Some(QualityFailure::Other("prompt artifact"));
     }
+    // Meta-reasoning is a model narrating its own task, and a model that leaks
+    // it leaks it as a PREAMBLE. The same words are ordinary English inside a
+    // sentence: "Right, so the user said the deployment failed last night" is
+    // speech, and as a bare substring "the user said" routed that dictation
+    // into repair, where the round-1 floor could refuse it outright. These
+    // markers therefore count only at the very start of the text, after any
+    // leading markup a model may wrap them in — the one position a leaked
+    // preamble always occupies.
+    //
+    // The residual is a leak that begins mid-text. That is the cheap direction:
+    // it hands the user a visible sentence to delete, whereas the false
+    // positive it replaces could cost the whole dictation. (Injection is the
+    // other list; nothing here is unsafe text, only untidy text.)
     const META_REASONING: [&str; 6] = [
         "i think the user said",
         "the user said",
@@ -1739,9 +2353,27 @@ fn quality_failure_reason(
         "here is the reconciled",
         "based on the source",
     ];
-    if META_REASONING.iter().any(|artifact| lower.contains(artifact)) {
-        return Some("meta-reasoning");
+    let preamble = lower.trim_start_matches(|character: char| !character.is_alphanumeric());
+    if META_REASONING
+        .iter()
+        .any(|artifact| preamble.starts_with(artifact))
+    {
+        return Some(QualityFailure::Other("meta-reasoning"));
     }
+    // The archetypal ASR outro hallucinations, learned from captioned video.
+    // All five are appended tail artifacts, so they count when they begin the
+    // text's FINAL sentence or end the text. Both anchors are needed: the
+    // sentence anchor alone misses a provider that omits punctuation entirely
+    // (spec §1 records Groq at zero punctuation, leaving the outro with no
+    // sentence of its own) and a period swallowed by a closing quote, while
+    // the end anchor alone misses an outro whose attribution or second outro
+    // sentence follows it. The anchors stay at the tail deliberately: the
+    // same words mid-sentence are ordinary dictation ("...and the recording
+    // was transcribed by Whisper."), and a false positive routes real speech
+    // into repair — the one path allowed to refuse delivery — so a missed
+    // outro (visible junk the user can delete) is the cheaper direction.
+    // Each anchored placement and the mid-sentence exemption is pinned by a
+    // test.
     const HALLUCINATED_SUFFIXES: [&str; 5] = [
         "thank you for watching",
         "thanks for watching",
@@ -1749,18 +2381,20 @@ fn quality_failure_reason(
         "subtitles by",
         "transcribed by",
     ];
+    let tail = lower.trim_end_matches(|character: char| !character.is_alphanumeric());
+    let outro = final_sentence(&lower);
     if HALLUCINATED_SUFFIXES
         .iter()
-        .any(|suffix| lower.contains(suffix))
+        .any(|suffix| outro.starts_with(suffix) || tail.ends_with(suffix))
     {
-        return Some("hallucinated suffix");
+        return Some(QualityFailure::Other("hallucinated suffix"));
     }
     if script_count(trimmed) >= 3
         || trimmed
             .split_whitespace()
             .any(token_mixes_confusable_scripts)
     {
-        return Some("mixed-script garbage");
+        return Some(QualityFailure::Other("mixed-script garbage"));
     }
     let source_words = sources
         .iter()
@@ -1768,8 +2402,18 @@ fn quality_failure_reason(
         .max()
         .unwrap_or(0);
     let candidate_words = normalized_words(trimmed).len();
-    if source_words > 0 && candidate_words > source_words.saturating_mul(2).saturating_add(8) {
-        return Some("suspicious expansion");
+    if source_words > 0 {
+        let contraction_ratio = candidate_words as f64 / source_words as f64;
+        if sources.len() >= 2 && contraction_ratio < MERGE_CONTRACTION_RATIO_FLOOR {
+            return Some(QualityFailure::Contraction {
+                ratio: contraction_ratio,
+                candidate_words,
+                source_words,
+            });
+        }
+        if candidate_words > source_words.saturating_mul(2).saturating_add(8) {
+            return Some(QualityFailure::Other("suspicious expansion"));
+        }
     }
     None
 }
@@ -1850,11 +2494,69 @@ fn script_count(text: &str) -> usize {
 
 fn normalized_words(text: &str) -> Vec<String> {
     text.split_whitespace()
-        .map(|word| {
-            word.chars()
-                .filter(|character| character.is_alphanumeric())
+        .flat_map(|word| {
+            let word = word
+                .chars()
+                .filter_map(|character| match character {
+                    '\u{2019}' => Some('\''),
+                    character if character.is_alphanumeric() || character == '\'' => {
+                        Some(character)
+                    }
+                    _ => None,
+                })
                 .flat_map(char::to_lowercase)
-                .collect::<String>()
+                .collect::<String>();
+            let expansion: &[&str] = match word.as_str() {
+                "aren't" => &["are", "not"],
+                "can't" => &["can", "not"],
+                "couldn't" => &["could", "not"],
+                "didn't" => &["did", "not"],
+                "doesn't" => &["does", "not"],
+                "don't" => &["do", "not"],
+                "hadn't" => &["had", "not"],
+                "hasn't" => &["has", "not"],
+                "haven't" => &["have", "not"],
+                "needn't" => &["need", "not"],
+                "isn't" => &["is", "not"],
+                "let's" => &["let", "us"],
+                "mustn't" => &["must", "not"],
+                "shan't" => &["shall", "not"],
+                "shouldn't" => &["should", "not"],
+                "they're" => &["they", "are"],
+                "wasn't" => &["was", "not"],
+                "we're" => &["we", "are"],
+                "weren't" => &["were", "not"],
+                "won't" => &["will", "not"],
+                "wouldn't" => &["would", "not"],
+                "you're" => &["you", "are"],
+                "i'm" => &["i", "am"],
+                "he's" => &["he", "is"],
+                "she's" => &["she", "is"],
+                "it's" => &["it", "is"],
+                "that's" => &["that", "is"],
+                "there's" => &["there", "is"],
+                "here's" => &["here", "is"],
+                "what's" => &["what", "is"],
+                "where's" => &["where", "is"],
+                "who's" => &["who", "is"],
+                "how's" => &["how", "is"],
+                "i've" => &["i", "have"],
+                "we've" => &["we", "have"],
+                "they've" => &["they", "have"],
+                "you've" => &["you", "have"],
+                "i'll" => &["i", "will"],
+                "we'll" => &["we", "will"],
+                "they'll" => &["they", "will"],
+                "you'll" => &["you", "will"],
+                "i'd" => &["i", "would"],
+                "he'd" => &["he", "would"],
+                "she'd" => &["she", "would"],
+                "we'd" => &["we", "would"],
+                "they'd" => &["they", "would"],
+                "you'd" => &["you", "would"],
+                _ => return vec![word.replace('\'', "")],
+            };
+            expansion.iter().map(|part| (*part).to_owned()).collect()
         })
         .filter(|word| !word.is_empty())
         .collect()
@@ -2157,6 +2859,8 @@ fn duration_millis(duration: Duration) -> u64 {
 }
 
 pub trait TranscriptValidator: Send {
+    fn set_dictionary_terms(&mut self, _dictionary_terms: Vec<String>) {}
+
     fn validate(
         &mut self,
         sources: Vec<SourceTranscript>,
@@ -2164,6 +2868,10 @@ pub trait TranscriptValidator: Send {
 }
 
 impl<M: ReconciliationModel> TranscriptValidator for TranscriptDecisionPipeline<M> {
+    fn set_dictionary_terms(&mut self, dictionary_terms: Vec<String>) {
+        TranscriptDecisionPipeline::set_dictionary_terms(self, dictionary_terms);
+    }
+
     fn validate(
         &mut self,
         sources: Vec<SourceTranscript>,

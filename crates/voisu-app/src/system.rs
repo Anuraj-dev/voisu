@@ -4167,6 +4167,10 @@ impl Default for MergeResultValidator {
 }
 
 impl TranscriptValidator for MergeResultValidator {
+    fn set_dictionary_terms(&mut self, dictionary_terms: Vec<String>) {
+        self.pipeline.set_dictionary_terms(dictionary_terms);
+    }
+
     fn validate(
         &mut self,
         sources: Vec<SourceTranscript>,

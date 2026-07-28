@@ -65,8 +65,9 @@ const LINUX_SYSTEM: &[&str] = &[
     "SELinux",
     "changelog",
     "dist tag",
-    "voisu",
+    "Voisu",
     "voisu-daemon",
+    "pravah-cli",
     "dnf",
     "grep",
     "systemd",
@@ -515,6 +516,14 @@ mod tests {
         // A built-in term still appears, after the user terms.
         let claude = merged.iter().position(|t| t == "Claude").expect("built-ins present");
         assert!(claude > 1, "built-ins follow the user terms");
+    }
+
+    #[test]
+    fn builtins_include_canonical_product_and_cli_spellings() {
+        let terms = builtin_terms();
+        assert!(terms.iter().any(|term| term == "Voisu"));
+        assert!(terms.iter().any(|term| term == "pravah-cli"));
+        assert!(!terms.iter().any(|term| term == "pravha-cli"));
     }
 
     #[test]
