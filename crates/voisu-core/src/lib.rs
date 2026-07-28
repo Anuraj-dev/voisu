@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -345,6 +345,13 @@ pub struct Response {
     pub overlay_event: Option<OverlayEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level_frames: Option<Vec<LevelFrame>>,
+    /// Milliseconds of headroom left before the Recording Deadline stops the
+    /// live Recording, or `None` when nothing is recording. Presentation only:
+    /// the Deadline is enforced by capture against its own clock, and this
+    /// value exists so the Overlay can warn the user before the cut without
+    /// holding a second copy of the limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_remaining_ms: Option<u64>,
 }
 
 /// One transport page of a serialized diagnostic history or export.
@@ -425,6 +432,7 @@ impl Response {
             diagnostic_page: None,
             overlay_event: None,
             level_frames: None,
+            recording_remaining_ms: None,
         }
     }
 
@@ -2669,7 +2677,32 @@ pub trait AudioCapture: Send {
     fn begin(&mut self, recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError>;
 }
 
+/// The Recording Deadline clock a capture is enforcing: the instant it began
+/// and the Deadline it resolved for itself. Read once at start so the observer
+/// path can report headroom against the SAME clock that will stop the
+/// Recording — anything stamped later (provider start can block on the
+/// keyring) would report headroom the enforcer does not agree with.
+///
+/// Reporting only. Nothing outside the capture may enforce, shorten, or
+/// second-guess this pair.
+#[derive(Clone, Copy, Debug)]
+pub struct DeadlineClock {
+    pub started: Instant,
+    pub deadline: Duration,
+}
+
+impl DeadlineClock {
+    /// Headroom left at `now`, saturating: a Recording already past its
+    /// Deadline (the stop is in flight) has none rather than wrapping.
+    pub fn remaining(&self, now: Instant) -> Duration {
+        self.deadline.saturating_sub(now.saturating_duration_since(self.started))
+    }
+}
+
 pub trait ActiveCapture: Send {
+    /// The Deadline clock this capture will enforce. The capture is the only
+    /// owner of that truth, so it is the only thing allowed to answer.
+    fn deadline_clock(&self) -> DeadlineClock;
     /// Yields the next live audio chunk for this Recording, or `None` once the
     /// capture has no further chunks to stream before it is finished.
     fn next_chunk(&mut self) -> BoundaryFuture<'_, Option<AudioChunk>>;

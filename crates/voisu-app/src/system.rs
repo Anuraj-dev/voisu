@@ -16,7 +16,8 @@ use voisu_core::{
     clipboard_candidates, install_instruction, resolve_session, scan_wav_pcm, socket_path,
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture,
     BoundaryKind, CancelRegistry, CaptureLimit, CapturedAudio, ClipboardTool,
-    Command as DaemonCommand, Credential, DeliveryAdapter, DeliveryOutcome, KeyDiagnosis,
+    Command as DaemonCommand, Credential, DeadlineClock, DeliveryAdapter, DeliveryOutcome,
+    KeyDiagnosis,
     KeyLocation, PackageManager, Provider,
     ProviderAuthenticator, ProviderKeyStatus, ProviderStream, ReadinessCapability, ReadinessFinding,
     MergeResult, ReadinessInspector, ReadinessStatus, ReconciliationKind, ReconciliationModel,
@@ -61,8 +62,10 @@ const PROVIDER_PROCESS_DEADLINE: Duration = Duration::from_secs(14);
 const RECONCILIATION_PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 const MIN_RECORDING_BYTES: usize = PCM_CHUNK_BYTES;
 /// The one configured maximum for a Recording. Both capture's retained PCM
-/// buffer and its default Deadline derive from this value.
-const MAX_RECORDING_DURATION: Duration = Duration::from_secs(600);
+/// buffer and its default Deadline derive from this value — and so do the
+/// Overlay's approaching-limit warnings, which is why this is visible to the
+/// rest of the crate rather than copied into the presentation layer.
+pub(crate) const MAX_RECORDING_DURATION: Duration = Duration::from_secs(600);
 /// Recordings at or below this length (120 s of 16 kHz s16le mono) take a
 /// single full-audio Groq request at finalize: no pre-streamed chunks, no
 /// seams, full context for Whisper. Only Recordings that grow past this switch
@@ -2696,6 +2699,17 @@ pub fn recording_deadline_override_notice(raw: Option<String>) -> Option<String>
     })
 }
 
+/// The Deadline a capture implementation resolves for ITSELF at `begin()`,
+/// through the one resolver every enforcer shares.
+///
+/// Only a capture may call this, and only to stamp its own
+/// [`DeadlineClock`] — the observer path reads that clock back off the capture
+/// rather than re-resolving here, so there is never a second answer to compare
+/// against the running one.
+pub fn capture_deadline() -> Duration {
+    resolve_recording_maximum(std::env::var("VOISU_RECORDING_DEADLINE_MS").ok()).deadline
+}
+
 /// Resolve the Recording maximum from the raw `VOISU_RECORDING_DEADLINE_MS`
 /// value. An override wins up to [`MAX_RECORDING_DURATION`]; absent, zero or
 /// unparseable uses [`DEFAULT_RECORDING_DEADLINE`], and an over-long override
@@ -2850,6 +2864,12 @@ fn stop_child_blocking(
 }
 
 impl ActiveCapture for PipeWireActiveCapture {
+    fn deadline_clock(&self) -> DeadlineClock {
+        // The same pair `next_chunk` enforces against, one field read apart —
+        // there is no second resolution and no second clock to disagree.
+        DeadlineClock { started: self.started, deadline: self.deadline }
+    }
+
     fn next_chunk(&mut self) -> BoundaryFuture<'_, Option<AudioChunk>> {
         Box::pin(async move {
             loop {

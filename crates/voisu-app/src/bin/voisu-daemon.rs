@@ -27,7 +27,8 @@ use voisu_app::system::{
 use voisu_app::config::DeliveryMode;
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
-    CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonState, DeliveryAdapter,
+    CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonState, DeadlineClock,
+    DeliveryAdapter,
     DeliveryMethod, DeliveryOutcome, DiagnosticPage, DiagnosticRecord, DiagnosticStore,
     LifecycleEvidence, LifecycleStage,
     OverlayEvent, OverlayOutcome,
@@ -477,6 +478,11 @@ struct ActiveRecording {
     first_chunk_ms: Arc<AtomicU64>,
     level_ring: Arc<LevelRing>,
     started_at: Instant,
+    /// The capture's OWN Deadline clock, read from the capture at start. Not
+    /// `started_at`: that is stamped after the providers start, and provider
+    /// start can block on the keyring for an unbounded time, which would make
+    /// every warning late by exactly that stall. Reporting only.
+    deadline_clock: DeadlineClock,
     evidence: LifecycleEvidence,
 }
 
@@ -1001,6 +1007,11 @@ async fn actor_loop(
                             });
                         }
                         Ok((active_capture, streams)) => {
+                            // Read the capture's own Deadline clock BEFORE the
+                            // capture is handed to the pump. It was stamped in
+                            // begin(), so it already accounts for whatever the
+                            // provider start cost — including a stalled keyring.
+                            let deadline_clock = active_capture.deadline_clock();
                             let evidence = base_evidence(
                                 id,
                                 correlation,
@@ -1078,6 +1089,7 @@ async fn actor_loop(
                                 first_chunk_ms,
                                 level_ring,
                                 started_at,
+                                deadline_clock,
                                 evidence,
                             });
                             let _ = reply.send(Response::success(
@@ -1499,7 +1511,7 @@ fn overlay_status_response(state: &ActorState, event: Option<&OverlayEvent>) -> 
 
 fn status_response_with_feedback(state: &ActorState) -> Response {
     let daemon_state = state_label(state);
-    Response::with_evidence(
+    let mut response = Response::with_evidence(
         true,
         Some(daemon_state),
         daemon_state.cli_label(),
@@ -1516,7 +1528,20 @@ fn status_response_with_feedback(state: &ActorState) -> Response {
             | ActorState::Recovering(_)
             | ActorState::Replaying(_) => None,
         },
-    )
+    );
+    // Presentation-only headroom for the Overlay's approaching-limit warnings.
+    // Saturating, so a Recording already past its Deadline (the stop is in
+    // flight) reports zero rather than wrapping.
+    if let ActorState::Recording(recording) = state {
+        response.recording_remaining_ms = Some(
+            recording
+                .deadline_clock
+                .remaining(Instant::now())
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+        );
+    }
+    response
 }
 
 /// Retain a terminal outcome for the observer path only. Lifecycle-command
@@ -1904,6 +1929,7 @@ async fn process_recording(
         first_chunk_ms,
         level_ring: _,
         started_at,
+        deadline_clock: _,
         mut evidence,
     } = recording;
     let _ = stop_tx.send(());
@@ -3049,6 +3075,12 @@ impl AudioCapture for ControlledCapture {
         self.finish_failures_remaining = self.finish_failures_remaining.saturating_sub(1);
         let recording_outcome = self.recording_outcome_once.take();
         Ok(Box::new(ControlledActiveCapture {
+            // Stamped here, in begin(), exactly where the real capture stamps
+            // its own — so the double exercises the same reporting path.
+            deadline_clock: DeadlineClock {
+                started: Instant::now(),
+                deadline: voisu_app::system::capture_deadline(),
+            },
             panic_next_chunk,
             fail_finish,
             recording_outcome,
@@ -3065,6 +3097,10 @@ impl AudioCapture for ControlledCapture {
 }
 
 struct ControlledActiveCapture {
+    /// The controlled double counts chunks rather than watching a clock, but it
+    /// still owns a real one so the observer path has the same single source of
+    /// truth it has in production.
+    deadline_clock: DeadlineClock,
     panic_next_chunk: bool,
     fail_finish: bool,
     recording_outcome: Option<String>,
@@ -3079,6 +3115,10 @@ struct ControlledActiveCapture {
 }
 
 impl ActiveCapture for ControlledActiveCapture {
+    fn deadline_clock(&self) -> DeadlineClock {
+        self.deadline_clock
+    }
+
     fn next_chunk(&mut self) -> BoundaryFuture<'_, Option<AudioChunk>> {
         Box::pin(async move {
             if std::mem::take(&mut self.panic_next_chunk) {
@@ -3096,6 +3136,18 @@ impl ActiveCapture for ControlledActiveCapture {
                     "controlled Recording Deadline elapsed",
                 ));
             }
+            // The double also honours the clock it hands out through
+            // `deadline_clock`. Reporting a Deadline it would not enforce would
+            // let controlled tests validate the observer path against a truth
+            // the capture never intended to keep. At the default 600 s ceiling
+            // this can never fire inside a test, so the chunk-count seam above
+            // remains the deterministic one.
+            if self.deadline_clock.remaining(Instant::now()).is_zero() {
+                return Err(BoundaryError::new(
+                    BoundaryKind::RecordingDeadline,
+                    "controlled Recording Deadline elapsed",
+                ));
+            }
             if let Some(limit) = self.buffer_cap_after_chunks
                 && self.chunks_emitted >= limit
             {
@@ -3103,12 +3155,30 @@ impl ActiveCapture for ControlledActiveCapture {
                 return Ok(None);
             }
             if self.remaining_chunks == 0 {
-                std::future::pending::<()>().await;
-                unreachable!();
+                // Out of scripted chunks: wait for the clock instead of
+                // forever, so a Recording whose reported headroom reaches zero
+                // actually stops. Identical to the old unconditional wait
+                // whenever the clock still has headroom to give.
+                tokio::time::sleep(self.deadline_clock.remaining(Instant::now())).await;
+                return Err(BoundaryError::new(
+                    BoundaryKind::RecordingDeadline,
+                    "controlled Recording Deadline elapsed",
+                ));
             }
             self.remaining_chunks -= 1;
             self.chunks_emitted += 1;
             if !self.chunk_delay.is_zero() {
+                // The scripted delay races the clock: a capture must not emit
+                // audio dated past the Deadline it reports. Identical to a
+                // plain sleep whenever the clock still outlasts the delay.
+                let headroom = self.deadline_clock.remaining(Instant::now());
+                if self.chunk_delay >= headroom {
+                    tokio::time::sleep(headroom).await;
+                    return Err(BoundaryError::new(
+                        BoundaryKind::RecordingDeadline,
+                        "controlled Recording Deadline elapsed",
+                    ));
+                }
                 tokio::time::sleep(self.chunk_delay).await;
             }
             Ok(Some(AudioChunk(vec![0])))

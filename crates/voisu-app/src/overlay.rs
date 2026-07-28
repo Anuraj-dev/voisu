@@ -461,15 +461,327 @@ impl NoSpeechNotifyLatch {
     }
 }
 
+/// How close a live Recording is to the Recording Deadline. Ordered: `Final`
+/// supersedes `Approaching`, which is what lets one latch hold both stages
+/// without a second flag.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LimitWarning {
+    /// One minute of headroom left — amber bars, "start wrapping up".
+    Approaching,
+    /// Ten seconds left — the red warn border joins the amber bars.
+    Final,
+}
+
+/// Lead time before the Deadline at which the first warning fires.
+pub const APPROACHING_LIMIT_LEAD: Duration = Duration::from_secs(60);
+/// Lead time before the Deadline at which the final warning fires.
+pub const FINAL_LIMIT_LEAD: Duration = Duration::from_secs(10);
+
+/// The elapsed-time onsets of the two warnings for a given Recording ceiling,
+/// as `(approaching, final)`. Purely derived: there is no warning constant to
+/// drift out of sync with the ceiling, so moving the ceiling moves both
+/// warnings with it. Saturating, so a ceiling shorter than a lead simply means
+/// that warning is live from the first tick rather than wrapping.
+pub fn limit_warning_onsets(ceiling: Duration) -> (Duration, Duration) {
+    (
+        ceiling.saturating_sub(APPROACHING_LIMIT_LEAD),
+        ceiling.saturating_sub(FINAL_LIMIT_LEAD),
+    )
+}
+
+/// The warning stage implied by the headroom the daemon reports. `None`
+/// remaining means the daemon is not Recording, which is never a warning.
+///
+/// Headroom, not elapsed time, is what crosses the wire: the ceiling lives with
+/// the enforcer, so the subtraction happens once, there, and the presentation
+/// layer never holds a copy of the ceiling to fall out of step with.
+pub fn limit_warning_for_remaining(remaining: Option<Duration>) -> Option<LimitWarning> {
+    let remaining = remaining?;
+    if remaining <= FINAL_LIMIT_LEAD {
+        Some(LimitWarning::Final)
+    } else if remaining <= APPROACHING_LIMIT_LEAD {
+        Some(LimitWarning::Approaching)
+    } else {
+        None
+    }
+}
+
+/// The warning stage at `elapsed` against `ceiling`. The same decision as
+/// [`limit_warning_for_remaining`], expressed in the terms the ceiling is
+/// written in so a test can pin the derivation directly.
+pub fn limit_warning_at(elapsed: Duration, ceiling: Duration) -> Option<LimitWarning> {
+    limit_warning_for_remaining(Some(ceiling.saturating_sub(elapsed)))
+}
+
+/// The headroom the daemon reported on this status reply, if it was Recording.
+/// A daemon too old to know the field simply reports nothing, which reads as
+/// "no warning" rather than as a warning at zero.
+pub fn recording_remaining(response: &Response) -> Option<Duration> {
+    response.recording_remaining_ms.map(Duration::from_millis)
+}
+
+/// The warning stage implied by a status reply.
+pub fn limit_warning_from_response(response: &Response) -> Option<LimitWarning> {
+    limit_warning_for_remaining(recording_remaining(response))
+}
+
+/// Which Recording this reply is about, taken from the correlation ID that
+/// already joins every event of one Recording. The Overlay needs it because
+/// phase alone cannot tell two back-to-back Recordings apart: at a 200 ms poll
+/// a stop and a restart can both land inside one gap, and a daemon restart
+/// looks the same.
+pub fn recording_identity(response: &Response) -> Option<&str> {
+    response
+        .evidence
+        .as_ref()
+        .map(|evidence| evidence.correlation_id.as_str())
+        .filter(|identity| !identity.is_empty())
+}
+
+/// The Recording meter's bar colour, amber once the limit is approaching. Both
+/// warning stages keep the amber bars; the final stage only adds the border.
+pub const RECORDING_BAR_RGB: (f64, f64, f64) = (0.949, 0.949, 0.949);
+/// The same amber the NoSpeech capsule uses (#FFB454) — one warm accent, not a
+/// second palette.
+pub const LIMIT_WARNING_BAR_RGB: (f64, f64, f64) = (1.0, 0.706, 0.329);
+
+/// Bar colour for a Recording at a given warning stage.
+pub fn recording_bar_rgb(warning: Option<LimitWarning>) -> (f64, f64, f64) {
+    match warning {
+        Some(_) => LIMIT_WARNING_BAR_RGB,
+        None => RECORDING_BAR_RGB,
+    }
+}
+
+/// The CSS class carrying the red warn border.
+pub const LIMIT_WARNING_CLASS: &str = "limitwarn";
+
+/// The capsule's warn-border class for a warning stage. Only the final stage
+/// earns the border: an amber-bar minute followed by a border at ten seconds is
+/// an escalation, whereas bordering both stages would flatten them into one.
+pub fn limit_warning_class(warning: Option<LimitWarning>) -> Option<&'static str> {
+    matches!(warning, Some(LimitWarning::Final)).then_some(LIMIT_WARNING_CLASS)
+}
+
+/// The notification body for a warning stage at its nominal lead — the exact
+/// approved wording, used whenever it is actually true.
+pub const fn limit_warning_body(warning: LimitWarning) -> &'static str {
+    match warning {
+        LimitWarning::Approaching => "Approaching the recording limit — about a minute left",
+        LimitWarning::Final => "Recording stops in 10 seconds",
+    }
+}
+
+/// The lead this stage's approved wording describes.
+pub const fn limit_warning_lead(warning: LimitWarning) -> Duration {
+    match warning {
+        LimitWarning::Approaching => APPROACHING_LIMIT_LEAD,
+        LimitWarning::Final => FINAL_LIMIT_LEAD,
+    }
+}
+
+/// What to actually say for a warning stage, given the headroom really left.
+///
+/// `VOISU_RECORDING_DEADLINE_MS` is operator-reachable, so a ceiling can be
+/// shorter than a lead: a 30 s ceiling would announce "about a minute left" at
+/// the very first tick, and a 5 s ceiling would promise ten seconds it does not
+/// have. A warning the user can time against and catch lying is worse than no
+/// warning. The approved wording is kept verbatim whenever the headroom really
+/// is the lead it describes, and replaced by the true figure when it is not.
+///
+/// `None` means say nothing: at zero headroom the stop is already in flight,
+/// and counting down to a moment that has passed helps nobody.
+pub fn limit_notification_body(warning: LimitWarning, remaining: Duration) -> Option<String> {
+    let seconds = remaining.as_secs_f64().round() as u64;
+    if seconds == 0 {
+        return None;
+    }
+    if seconds == limit_warning_lead(warning).as_secs() {
+        return Some(limit_warning_body(warning).to_owned());
+    }
+    let unit = if seconds == 1 { "second" } else { "seconds" };
+    Some(match warning {
+        LimitWarning::Approaching => {
+            format!("Approaching the recording limit — about {seconds} {unit} left")
+        }
+        LimitWarning::Final => format!("Recording stops in {seconds} {unit}"),
+    })
+}
+
+/// Edge-latch for the approaching-limit notifications, mirroring
+/// [`NoSpeechNotifyLatch`]. The overlay redraws several times a second, so a
+/// bare threshold test would emit one notification per frame; the latch fires
+/// each stage at most once per Recording and only ever escalates.
+///
+/// Same blip rule as the other latches: `Unreachable` leaves the latch
+/// untouched, so a transient status-read failure mid-Recording cannot replay a
+/// warning. Any reachable non-Recording observation clears it, which is what
+/// stops a short Recording from leaving residue for the next one.
+#[derive(Debug, Default)]
+pub struct LimitWarningLatch {
+    fired: Option<LimitWarning>,
+    /// `Some(prior)` while this tick's announcement is still outstanding —
+    /// handed out but not yet accepted by a sink. Cleared at the start of every
+    /// observation, so an announcement can only be rolled back within the tick
+    /// that produced it. Without it the latch commits a warning that was never
+    /// delivered and the user hears nothing for the rest of the Recording.
+    uncommitted: Option<Option<LimitWarning>>,
+    /// The Recording the fired stages belong to. Phase transitions alone are
+    /// not a reliable boundary between Recordings, so the latch carries the
+    /// identity and clears the moment it changes.
+    identity: Option<String>,
+}
+
+impl LimitWarningLatch {
+    /// Returns the warning to announce this tick, or `None`. A stage is
+    /// announced only when it is strictly beyond everything already announced,
+    /// so repeated ticks inside the same window stay silent and a tick that
+    /// jumps clean over the first window announces only the final warning
+    /// rather than backfilling a stale "about a minute left".
+    pub fn observe(
+        &mut self,
+        signal: ObservedSignal,
+        identity: Option<&str>,
+        warning: Option<LimitWarning>,
+    ) -> Option<LimitWarning> {
+        // A new observation supersedes the last one: whatever was outstanding
+        // is now this tick's problem, not the previous tick's.
+        self.uncommitted = None;
+        match signal {
+            // Deliberately no identity check here: an unreachable poll observes
+            // nothing, so it must not look like a new Recording.
+            ObservedSignal::Unreachable => None,
+            ObservedSignal::Reachable(OverlayPhase::Recording) => {
+                // A different Recording starts from silence even if the
+                // observer never saw a non-Recording phase between the two.
+                if self.identity.as_deref() != identity {
+                    self.identity = identity.map(str::to_owned);
+                    self.fired = None;
+                }
+                if warning > self.fired {
+                    self.uncommitted = Some(self.fired);
+                    self.fired = warning;
+                    warning
+                } else {
+                    None
+                }
+            }
+            ObservedSignal::Reachable(_) => {
+                self.fired = None;
+                self.identity = None;
+                None
+            }
+        }
+    }
+
+    /// Hand back the stage the last [`observe`](Self::observe) handed out,
+    /// because the sink refused it. The next tick re-selects a warning, so the
+    /// user still hears one — a silently dropped announcement would otherwise
+    /// be silence for the rest of the Recording.
+    ///
+    /// Escalate-only survives the rollback: a returned `Approaching` that has
+    /// since become `Final` is re-selected as `Final` alone, never as both.
+    /// Calling this without an outstanding announcement — because it was
+    /// already committed, or already rolled back, or none was made — changes
+    /// nothing.
+    pub fn rollback(&mut self) {
+        if let Some(prior) = self.uncommitted.take() {
+            self.fired = prior;
+        }
+    }
+
+    /// Settle the announcement this tick handed out: the sink took it (or it
+    /// was deliberately suppressed), so the stage is spent and there is nothing
+    /// left to give back.
+    ///
+    /// Every announcement must be resolved by exactly one of this and
+    /// [`rollback`](Self::rollback). Pairing them here rather than trusting the
+    /// caller to never roll back a delivered warning is what makes
+    /// `rollback`'s inertness a property of the latch instead of a property of
+    /// the call site.
+    pub fn commit(&mut self) {
+        self.uncommitted = None;
+    }
+
+    /// The highest stage already announced for the current Recording. Exposed
+    /// so a test can prove no residue survives into the next Recording.
+    pub fn fired(&self) -> Option<LimitWarning> {
+        self.fired
+    }
+}
+
+/// The one thing the desktop-notification rung may say on a single tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RungNotification {
+    /// The approaching-limit warning; its body depends on the real headroom.
+    Limit,
+    /// The capsule's own label — the no-speech explanation, or a transition
+    /// into a visible phase.
+    Label(&'static str),
+}
+
+/// The single notification the desktop-notification rung sends this tick.
+///
+/// Unlike the windowed paths, this rung has one bubble: its channel is depth-1
+/// with a non-blocking send, and it reuses one replaces_id, so a second send on
+/// the same tick is either dropped or paints over the first. Both can genuinely
+/// come due together — the first observation of a Recording that is ALREADY
+/// inside a warning window is a phase transition and a warning at once — and
+/// the latch has already consumed the stage, so a lost warning never returns.
+/// The warning therefore wins: it is time-critical and the transition is not.
+pub fn notification_rung_choice(
+    view: OverlayView,
+    previous_phase: OverlayPhase,
+    limit_pending: bool,
+    fire_no_speech: bool,
+) -> Option<RungNotification> {
+    if limit_pending {
+        return Some(RungNotification::Limit);
+    }
+    if view.phase == OverlayPhase::NoSpeech {
+        return fire_no_speech.then_some(RungNotification::Label(view.visible_label));
+    }
+    // Fire only on a PHASE transition into a visible phase. Comparing the whole
+    // view would re-fire on every meter/activity tick within one Recording.
+    (view.is_visible() && previous_phase != view.phase)
+        .then_some(RungNotification::Label(view.visible_label))
+}
+
 /// The outcome of one fallback-path poll tick, decided purely so the adapter's
 /// side effects (`window.present()`, `send_notification`) stay a thin match.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TickAction {
     /// Stop driving the window this tick and break the poll loop.
     Break,
-    /// Keep polling; `resurface`/`notify`/`notify_no_speech` say which side
-    /// effects to run.
-    Continue { resurface: bool, notify: bool, notify_no_speech: bool },
+    /// Keep polling; `resurface`/`notify`/`notify_no_speech`/`notify_limit`
+    /// say which side effects to run.
+    Continue {
+        resurface: bool,
+        notify: bool,
+        notify_no_speech: bool,
+        notify_limit: Option<LimitWarning>,
+    },
+}
+
+/// Everything one poll observed, in a single value: what the capsule will
+/// render, what the daemon was actually seen to be, which Recording it is, and
+/// how close that Recording is to its Deadline.
+///
+/// Grouped so the pure seam reads as "one observation in, latched decisions
+/// out" instead of a wall of positional arguments — and so the adapter builds
+/// it once, where it reads the status reply, rather than carrying four loose
+/// values to the call.
+#[derive(Clone, Copy, Debug)]
+pub struct TickObservation<'a> {
+    /// What the capsule renders for this tick.
+    pub view: OverlayView,
+    /// What the daemon was observed to be. Deliberately separate from `view`:
+    /// a failed status read still renders something, but observes nothing.
+    pub signal: ObservedSignal,
+    /// Which Recording this tick is about, when one is running.
+    pub identity: Option<&'a str>,
+    /// The limit-warning stage implied by the reported headroom.
+    pub warning: Option<LimitWarning>,
 }
 
 /// Pure decision for a single poll tick, owning the ordering the adapter relied
@@ -481,22 +793,32 @@ pub enum TickAction {
 pub fn poll_tick(
     switched_after_render: bool,
     is_fallback: bool,
-    view: OverlayView,
-    signal: ObservedSignal,
+    observation: TickObservation<'_>,
     tracker: &mut PresentationTracker,
     notify_latch: &mut RecordingNotifyLatch,
     no_speech_latch: &mut NoSpeechNotifyLatch,
+    limit_latch: &mut LimitWarningLatch,
 ) -> TickAction {
+    let TickObservation { view, signal, identity, warning } = observation;
     if switched_after_render {
         return TickAction::Break;
     }
     let notify_no_speech = no_speech_latch.observe(signal);
+    // Fires on BOTH windowed paths, for the same reason NoSpeech does: on
+    // layer-shell the capsule sits at the screen edge and the colour change
+    // alone can be missed, and this warning has a deadline attached.
+    let notify_limit = limit_latch.observe(signal, identity, warning);
     if !is_fallback {
-        return TickAction::Continue { resurface: false, notify: false, notify_no_speech };
+        return TickAction::Continue {
+            resurface: false,
+            notify: false,
+            notify_no_speech,
+            notify_limit,
+        };
     }
     let resurface = tracker.observe(view);
     let notify = notify_latch.observe(signal);
-    TickAction::Continue { resurface, notify, notify_no_speech }
+    TickAction::Continue { resurface, notify, notify_no_speech, notify_limit }
 }
 
 #[cfg(test)]
@@ -1006,6 +1328,7 @@ mod tests {
         let mut tracker = PresentationTracker::default();
         let mut latch = RecordingNotifyLatch::default();
         let mut no_speech_latch = NoSpeechNotifyLatch::default();
+        let mut limit_latch = LimitWarningLatch::default();
         // Prime both to a known state: tracker's last_phase = Recording, latch latched.
         assert!(tracker.observe(recording));
         assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)));
@@ -1016,11 +1339,16 @@ mod tests {
         let action = poll_tick(
             true,
             true,
-            OverlayView::HIDDEN,
-            ObservedSignal::Reachable(OverlayPhase::Hidden),
+            TickObservation {
+                view: OverlayView::HIDDEN,
+                signal: ObservedSignal::Reachable(OverlayPhase::Hidden),
+                identity: None,
+                warning: None,
+            },
             &mut tracker,
             &mut latch,
             &mut no_speech_latch,
+            &mut limit_latch,
         );
         assert_eq!(action, TickAction::Break);
 
@@ -1031,6 +1359,8 @@ mod tests {
         // proves poll_tick broke before touching either.
         assert!(!tracker.observe(recording));
         assert!(!latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)));
+        // Same for the limit latch: a Break tick must not consume a warning.
+        assert_eq!(limit_latch.fired(), None);
     }
 
     #[test]
@@ -1042,17 +1372,33 @@ mod tests {
         let mut tracker = PresentationTracker::default();
         let mut latch = RecordingNotifyLatch::default();
         let mut no_speech_latch = NoSpeechNotifyLatch::default();
+        let mut limit_latch = LimitWarningLatch::default();
         assert_eq!(
-            poll_tick(false, true, recording, signal, &mut tracker, &mut latch, &mut no_speech_latch),
-            TickAction::Continue { resurface: true, notify: true, notify_no_speech: false },
+            poll_tick(
+                false,
+                true,
+                TickObservation { view: recording, signal, identity: None, warning: None },
+                &mut tracker, &mut latch, &mut no_speech_latch, &mut limit_latch,
+            ),
+            TickAction::Continue {
+                resurface: true, notify: true, notify_no_speech: false, notify_limit: None,
+            },
         );
         // The layer-shell (non-fallback) path never resurfaces or notifies here.
         let mut tracker = PresentationTracker::default();
         let mut latch = RecordingNotifyLatch::default();
         let mut no_speech_latch = NoSpeechNotifyLatch::default();
+        let mut limit_latch = LimitWarningLatch::default();
         assert_eq!(
-            poll_tick(false, false, recording, signal, &mut tracker, &mut latch, &mut no_speech_latch),
-            TickAction::Continue { resurface: false, notify: false, notify_no_speech: false },
+            poll_tick(
+                false,
+                false,
+                TickObservation { view: recording, signal, identity: None, warning: None },
+                &mut tracker, &mut latch, &mut no_speech_latch, &mut limit_latch,
+            ),
+            TickAction::Continue {
+                resurface: false, notify: false, notify_no_speech: false, notify_limit: None,
+            },
         );
     }
 
@@ -1092,20 +1438,30 @@ mod tests {
         let mut tracker = PresentationTracker::default();
         let mut notify_latch = RecordingNotifyLatch::default();
         let mut no_speech_latch = NoSpeechNotifyLatch::default();
+        let mut limit_latch = LimitWarningLatch::default();
         let view = OverlayView::no_speech();
         // is_fallback == false is the layer-shell path: recording-notify stays
         // fallback-only, but the no-speech explanation must fire on BOTH paths.
+        let observation = TickObservation {
+            view,
+            signal: ObservedSignal::Reachable(OverlayPhase::NoSpeech),
+            identity: None,
+            warning: None,
+        };
         let action = poll_tick(
-            false, false, view,
-            ObservedSignal::Reachable(OverlayPhase::NoSpeech),
-            &mut tracker, &mut notify_latch, &mut no_speech_latch,
+            false, false, observation,
+            &mut tracker, &mut notify_latch, &mut no_speech_latch, &mut limit_latch,
         );
-        assert_eq!(action, TickAction::Continue { resurface: false, notify: false, notify_no_speech: true });
+        assert_eq!(
+            action,
+            TickAction::Continue {
+                resurface: false, notify: false, notify_no_speech: true, notify_limit: None,
+            },
+        );
         // Break still wins over everything and consumes no latch state.
         let action = poll_tick(
-            true, false, view,
-            ObservedSignal::Reachable(OverlayPhase::NoSpeech),
-            &mut tracker, &mut notify_latch, &mut no_speech_latch,
+            true, false, observation,
+            &mut tracker, &mut notify_latch, &mut no_speech_latch, &mut limit_latch,
         );
         assert_eq!(action, TickAction::Break);
     }
@@ -1305,5 +1661,504 @@ mod tests {
                 assert!((0.25..=1.0).contains(&b), "b={b} at index={index} t={t}");
             }
         }
+    }
+
+    // --- approaching-limit warnings -------------------------------------
+
+    /// The ceiling the daemon actually enforces. Imported rather than repeated:
+    /// if it ever moves, these tests move with it and a hardcoded warning
+    /// threshold would fail here first.
+    use crate::system::MAX_RECORDING_DURATION;
+
+    fn recording() -> ObservedSignal {
+        ObservedSignal::Reachable(OverlayPhase::Recording)
+    }
+
+    #[test]
+    fn limit_warning_onsets_are_derived_from_the_real_recording_ceiling() {
+        let (approaching, final_warning) = limit_warning_onsets(MAX_RECORDING_DURATION);
+        assert_eq!(approaching, MAX_RECORDING_DURATION - APPROACHING_LIMIT_LEAD);
+        assert_eq!(final_warning, MAX_RECORDING_DURATION - FINAL_LIMIT_LEAD);
+        // Pinned in wall-clock terms too, so a silent change to either lead is
+        // visible as the product behaviour the spec describes: 9:00 and 9:50.
+        assert_eq!(approaching, Duration::from_secs(540));
+        assert_eq!(final_warning, Duration::from_secs(590));
+        // And the stages agree with the onsets at the boundary.
+        assert_eq!(limit_warning_at(approaching - Duration::from_millis(1), MAX_RECORDING_DURATION), None);
+        assert_eq!(
+            limit_warning_at(approaching, MAX_RECORDING_DURATION),
+            Some(LimitWarning::Approaching)
+        );
+        assert_eq!(
+            limit_warning_at(final_warning, MAX_RECORDING_DURATION),
+            Some(LimitWarning::Final)
+        );
+        assert_eq!(
+            limit_warning_at(MAX_RECORDING_DURATION, MAX_RECORDING_DURATION),
+            Some(LimitWarning::Final)
+        );
+    }
+
+    #[test]
+    fn limit_warnings_track_an_overridden_ceiling_rather_than_a_literal() {
+        // VOISU_RECORDING_DEADLINE_MS may shorten a Recording. The warnings
+        // must follow it, not the 600 s default: at a 120 s ceiling the first
+        // warning belongs at 60 s, not at 540 s (which would never fire).
+        let ceiling = Duration::from_secs(120);
+        assert_eq!(
+            limit_warning_onsets(ceiling),
+            (Duration::from_secs(60), Duration::from_secs(110))
+        );
+        assert_eq!(limit_warning_at(Duration::from_secs(59), ceiling), None);
+        assert_eq!(limit_warning_at(Duration::from_secs(60), ceiling), Some(LimitWarning::Approaching));
+        assert_eq!(limit_warning_at(Duration::from_secs(110), ceiling), Some(LimitWarning::Final));
+        // A ceiling shorter than a lead saturates instead of wrapping.
+        let tiny = Duration::from_secs(5);
+        assert_eq!(limit_warning_onsets(tiny), (Duration::ZERO, Duration::ZERO));
+        assert_eq!(limit_warning_at(Duration::ZERO, tiny), Some(LimitWarning::Final));
+    }
+
+    #[test]
+    fn limit_warning_reads_the_headroom_the_daemon_reports() {
+        assert_eq!(limit_warning_for_remaining(None), None);
+        assert_eq!(limit_warning_for_remaining(Some(Duration::from_secs(61))), None);
+        assert_eq!(
+            limit_warning_for_remaining(Some(APPROACHING_LIMIT_LEAD)),
+            Some(LimitWarning::Approaching)
+        );
+        assert_eq!(
+            limit_warning_for_remaining(Some(FINAL_LIMIT_LEAD)),
+            Some(LimitWarning::Final)
+        );
+        assert_eq!(
+            limit_warning_for_remaining(Some(Duration::ZERO)),
+            Some(LimitWarning::Final)
+        );
+    }
+
+    #[test]
+    fn each_limit_warning_fires_exactly_once_across_many_overlay_ticks() {
+        // Time is driven synthetically: the overlay polls every 200 ms, so one
+        // simulated Recording is 3000 ticks of a 600 s ceiling. No sleeping.
+        let mut latch = LimitWarningLatch::default();
+        let mut fired = Vec::new();
+        for tick in 0..=3_000u64 {
+            let elapsed = Duration::from_millis(200 * tick);
+            let warning = limit_warning_at(elapsed, MAX_RECORDING_DURATION);
+            if let Some(announced) = latch.observe(recording(), None, warning) {
+                fired.push((elapsed, announced));
+            }
+        }
+        assert_eq!(
+            fired,
+            vec![
+                (Duration::from_secs(540), LimitWarning::Approaching),
+                (Duration::from_secs(590), LimitWarning::Final),
+            ],
+            "each stage announces once, at its derived onset"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_blip_mid_recording_never_replays_a_warning() {
+        let mut latch = LimitWarningLatch::default();
+        assert_eq!(
+            latch.observe(recording(), None, Some(LimitWarning::Approaching)),
+            Some(LimitWarning::Approaching)
+        );
+        // A failed status read is not an observation of a new Recording.
+        assert_eq!(
+            latch.observe(ObservedSignal::Unreachable, None, Some(LimitWarning::Approaching)),
+            None
+        );
+        assert_eq!(latch.fired(), Some(LimitWarning::Approaching));
+        assert_eq!(latch.observe(recording(), None, Some(LimitWarning::Approaching)), None);
+        // Escalation still gets through once.
+        assert_eq!(
+            latch.observe(recording(), None, Some(LimitWarning::Final)),
+            Some(LimitWarning::Final)
+        );
+        assert_eq!(latch.observe(recording(), None, Some(LimitWarning::Final)), None);
+    }
+
+    /// The poll is 200 ms and a stop plus a restart can both complete inside
+    /// one gap, so the observer can see Recording immediately followed by
+    /// Recording with no phase between them. Keying on phase alone, the second
+    /// Recording would inherit the first one's fired stages and never warn.
+    #[test]
+    fn a_new_recording_warns_again_even_with_no_phase_change_between_them() {
+        let mut latch = LimitWarningLatch::default();
+        assert_eq!(
+            latch.observe(recording(), Some("correlation-1"), Some(LimitWarning::Approaching)),
+            Some(LimitWarning::Approaching)
+        );
+        assert_eq!(
+            latch.observe(recording(), Some("correlation-1"), Some(LimitWarning::Final)),
+            Some(LimitWarning::Final)
+        );
+        // A different Recording, observed back to back with the first.
+        assert_eq!(
+            latch.observe(recording(), Some("correlation-2"), Some(LimitWarning::Approaching)),
+            Some(LimitWarning::Approaching),
+            "the next Recording must warn from scratch"
+        );
+        assert_eq!(
+            latch.observe(recording(), Some("correlation-2"), Some(LimitWarning::Approaching)),
+            None,
+            "and must still be latched within itself"
+        );
+        // An unreachable poll is not an identity change, so nothing replays.
+        assert_eq!(
+            latch.observe(ObservedSignal::Unreachable, None, Some(LimitWarning::Approaching)),
+            None
+        );
+        assert_eq!(
+            latch.observe(recording(), Some("correlation-2"), Some(LimitWarning::Approaching)),
+            None
+        );
+    }
+
+    #[test]
+    fn recording_identity_comes_from_the_correlation_id_already_on_the_wire() {
+        let idle = overlay_status(DaemonState::Idle, None);
+        assert_eq!(recording_identity(&idle), None);
+        // Deserialized from the wire shape the daemon actually sends, so this
+        // also pins that the identity survives the round trip.
+        let recording: Response = serde_json::from_str(
+            r#"{"version":1,"ok":true,"state":"recording","message":"recording",
+                "evidence":{"recording_id":7,"correlation_id":"correlation-7",
+                "stages":[],"delivery_count":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(recording_identity(&recording), Some("correlation-7"));
+        // An evidence-free reply (Starting, or an older daemon) has no identity
+        // to key on, which must read as "unknown", never as a shared one.
+        let mut blank = recording_response();
+        blank.evidence = None;
+        assert_eq!(recording_identity(&blank), None);
+    }
+
+    #[test]
+    fn a_short_recording_warns_nothing_and_leaves_no_latch_residue() {
+        let mut latch = LimitWarningLatch::default();
+        // Fifteen seconds of Recording against the real ceiling: no warning.
+        for tick in 0..75u64 {
+            let elapsed = Duration::from_millis(200 * tick);
+            let warning = limit_warning_at(elapsed, MAX_RECORDING_DURATION);
+            assert_eq!(warning, None);
+            assert_eq!(latch.observe(recording(), None, warning), None);
+        }
+        // Then the Recording ends: Processing, then Idle (Hidden).
+        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Processing), None, None), None);
+        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Hidden), None, None), None);
+        assert_eq!(latch.fired(), None, "no residue survives the Recording");
+        // A long Recording that warns must also leave the latch clean.
+        assert_eq!(
+            latch.observe(recording(), None, Some(LimitWarning::Final)),
+            Some(LimitWarning::Final)
+        );
+        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Success), None, None), None);
+        assert_eq!(latch.fired(), None);
+        // The next Recording therefore warns again from scratch.
+        assert_eq!(
+            latch.observe(recording(), None, Some(LimitWarning::Approaching)),
+            Some(LimitWarning::Approaching)
+        );
+    }
+
+    #[test]
+    fn a_status_reply_without_headroom_is_never_a_warning() {
+        // Idle, and any daemon that predates the field, report nothing. The
+        // absent field must read as "no warning", not as zero headroom.
+        let idle = overlay_status(DaemonState::Idle, None);
+        assert_eq!(recording_remaining(&idle), None);
+        assert_eq!(limit_warning_from_response(&idle), None);
+        let mut recording = recording_response();
+        recording.recording_remaining_ms = Some(120_000);
+        assert_eq!(recording_remaining(&recording), Some(Duration::from_secs(120)));
+        assert_eq!(limit_warning_from_response(&recording), None);
+        recording.recording_remaining_ms = Some(45_000);
+        assert_eq!(limit_warning_from_response(&recording), Some(LimitWarning::Approaching));
+        recording.recording_remaining_ms = Some(4_000);
+        assert_eq!(limit_warning_from_response(&recording), Some(LimitWarning::Final));
+    }
+
+    #[test]
+    fn poll_tick_announces_a_limit_warning_once_on_both_windowed_paths() {
+        for is_fallback in [false, true] {
+            let mut tracker = PresentationTracker::default();
+            let mut notify_latch = RecordingNotifyLatch::default();
+            let mut no_speech_latch = NoSpeechNotifyLatch::default();
+            let mut limit_latch = LimitWarningLatch::default();
+            let view = OverlayView::from_response(&recording_response());
+            let signal = recording();
+            let mut announced = Vec::new();
+            // Twenty ticks inside the approaching window, then twenty inside
+            // the final one — the cadence a live 200 ms poll would produce.
+            for warning in std::iter::repeat_n(Some(LimitWarning::Approaching), 20)
+                .chain(std::iter::repeat_n(Some(LimitWarning::Final), 20))
+            {
+                match poll_tick(
+                    false,
+                    is_fallback,
+                    TickObservation { view, signal, identity: None, warning },
+                    &mut tracker, &mut notify_latch, &mut no_speech_latch, &mut limit_latch,
+                ) {
+                    TickAction::Continue { notify_limit, .. } => announced.extend(notify_limit),
+                    TickAction::Break => unreachable!("no handoff in this test"),
+                }
+            }
+            assert_eq!(
+                announced,
+                vec![LimitWarning::Approaching, LimitWarning::Final],
+                "is_fallback={is_fallback}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_capsule_turns_amber_for_both_stages_and_borders_only_at_the_final_one() {
+        assert_eq!(recording_bar_rgb(None), RECORDING_BAR_RGB);
+        assert_eq!(recording_bar_rgb(Some(LimitWarning::Approaching)), LIMIT_WARNING_BAR_RGB);
+        // Amber bars are RETAINED at the final stage; the border is additive.
+        assert_eq!(recording_bar_rgb(Some(LimitWarning::Final)), LIMIT_WARNING_BAR_RGB);
+        assert_eq!(limit_warning_class(None), None);
+        assert_eq!(limit_warning_class(Some(LimitWarning::Approaching)), None);
+        assert_eq!(limit_warning_class(Some(LimitWarning::Final)), Some(LIMIT_WARNING_CLASS));
+    }
+
+    #[test]
+    fn limit_warning_bodies_are_the_approved_notification_text() {
+        assert_eq!(
+            limit_warning_body(LimitWarning::Approaching),
+            "Approaching the recording limit — about a minute left"
+        );
+        assert_eq!(limit_warning_body(LimitWarning::Final), "Recording stops in 10 seconds");
+        // At the real ceiling the approved wording is what actually goes out:
+        // the first poll inside each window still rounds to the nominal lead.
+        let (approaching, final_warning) = limit_warning_onsets(MAX_RECORDING_DURATION);
+        let first_approaching_tick = MAX_RECORDING_DURATION - approaching - TICK;
+        assert_eq!(
+            limit_notification_body(LimitWarning::Approaching, first_approaching_tick).as_deref(),
+            Some("Approaching the recording limit — about a minute left")
+        );
+        let first_final_tick = MAX_RECORDING_DURATION - final_warning - TICK;
+        assert_eq!(
+            limit_notification_body(LimitWarning::Final, first_final_tick).as_deref(),
+            Some("Recording stops in 10 seconds")
+        );
+    }
+
+    /// The Overlay's poll cadence, so the "first tick inside the window" cases
+    /// above are the real ones rather than an idealised exact boundary.
+    const TICK: Duration = Duration::from_millis(200);
+
+    /// `VOISU_RECORDING_DEADLINE_MS` is a real operator knob, not a test seam,
+    /// so a ceiling shorter than a lead is reachable in production. The wording
+    /// must never promise time the Recording does not have.
+    #[test]
+    fn a_short_ceiling_is_told_the_truth_instead_of_the_nominal_wording() {
+        // A 30 s ceiling: the approaching warning is live from the first tick.
+        let ceiling = Duration::from_secs(30);
+        assert_eq!(limit_warning_at(Duration::ZERO, ceiling), Some(LimitWarning::Approaching));
+        assert_eq!(
+            limit_notification_body(LimitWarning::Approaching, ceiling).as_deref(),
+            Some("Approaching the recording limit — about 30 seconds left"),
+            "a 30 s ceiling must not claim a minute"
+        );
+        // A 5 s ceiling: the final warning is live from the first tick.
+        let ceiling = Duration::from_secs(5);
+        assert_eq!(limit_warning_at(Duration::ZERO, ceiling), Some(LimitWarning::Final));
+        assert_eq!(
+            limit_notification_body(LimitWarning::Final, ceiling).as_deref(),
+            Some("Recording stops in 5 seconds"),
+            "a 5 s ceiling must not promise ten"
+        );
+        // Singular reads as English, not "1 seconds".
+        assert_eq!(
+            limit_notification_body(LimitWarning::Final, Duration::from_secs(1)).as_deref(),
+            Some("Recording stops in 1 second")
+        );
+    }
+
+    /// The Notifier rung can carry exactly one bubble per tick, so the two
+    /// sends that used to be able to come due together had to be resolved into
+    /// one choice — and the warning is the one with a deadline attached.
+    #[test]
+    fn the_notification_rung_sends_the_warning_rather_than_the_transition() {
+        let recording = OverlayView::from_response(&recording_response());
+        // The tick where the Overlay first sees an already-warning Recording:
+        // a transition into Recording AND a due warning, on the same tick.
+        assert_eq!(
+            notification_rung_choice(recording, OverlayPhase::Hidden, true, false),
+            Some(RungNotification::Limit),
+            "a due warning must not be dropped or painted over by the transition"
+        );
+        // With no warning due, the transition is announced exactly as before.
+        assert_eq!(
+            notification_rung_choice(recording, OverlayPhase::Hidden, false, false),
+            Some(RungNotification::Label("Recording"))
+        );
+        // And a repeat of the same phase stays silent.
+        assert_eq!(
+            notification_rung_choice(recording, OverlayPhase::Recording, false, false),
+            None
+        );
+        // No-speech keeps its latch-gated explanation, and still loses to a
+        // warning if both somehow come due.
+        let no_speech = OverlayView::no_speech();
+        assert_eq!(
+            notification_rung_choice(no_speech, OverlayPhase::Recording, false, true),
+            Some(RungNotification::Label(no_speech.visible_label))
+        );
+        assert_eq!(
+            notification_rung_choice(no_speech, OverlayPhase::Recording, false, false),
+            None,
+            "an unlatched no-speech repeat stays silent"
+        );
+        assert_eq!(
+            notification_rung_choice(no_speech, OverlayPhase::Recording, true, true),
+            Some(RungNotification::Limit)
+        );
+        // Hidden announces nothing.
+        assert_eq!(
+            notification_rung_choice(OverlayView::HIDDEN, OverlayPhase::Recording, false, false),
+            None
+        );
+    }
+
+    /// The Notifier's channel is depth-1 with a non-blocking send, so a Notify
+    /// call already in flight makes the send fail. A warning is chosen once and
+    /// the latch would commit it, so a dropped send used to mean silence for
+    /// the rest of the Recording. The stage is committed only once the sink
+    /// accepts it.
+    #[test]
+    fn a_warning_the_notifier_refuses_is_re_announced_on_a_later_tick() {
+        let mut latch = LimitWarningLatch::default();
+        let view = OverlayView::from_response(&recording_response());
+        let mut previous_phase = OverlayPhase::Hidden;
+        // The sink refuses the first three attempts, standing in for a full
+        // depth-1 channel with a D-Bus call in flight.
+        let mut refusals_left = 3;
+        let mut announced = Vec::new();
+        // Sixty ticks (twelve seconds at the 200 ms poll) of a Recording that
+        // is inside the approaching window throughout.
+        for _ in 0..60 {
+            let chosen = latch.observe(recording(), Some("correlation-1"), Some(LimitWarning::Approaching));
+            let body = chosen.and_then(|warning| {
+                limit_notification_body(warning, Duration::from_secs(30))
+            });
+            if let Some(RungNotification::Limit) =
+                notification_rung_choice(view, previous_phase, body.is_some(), false)
+                && let Some(body) = body
+            {
+                let accepted = refusals_left == 0;
+                refusals_left -= i32::from(refusals_left > 0);
+                if accepted {
+                    announced.push(body);
+                    latch.commit();
+                } else {
+                    latch.rollback();
+                }
+            }
+            previous_phase = view.phase;
+        }
+        assert_eq!(
+            announced,
+            vec!["Approaching the recording limit — about 30 seconds left".to_owned()],
+            "a refused warning must survive and be announced exactly once"
+        );
+    }
+
+    /// The rollback must not resurrect a stage the Recording has already moved
+    /// past: a returned `Approaching` that is now inside the final window is
+    /// announced as `Final` alone.
+    #[test]
+    fn a_rolled_back_warning_escalates_rather_than_announcing_both_stages() {
+        let mut latch = LimitWarningLatch::default();
+        let identity = Some("correlation-1");
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Approaching)),
+            Some(LimitWarning::Approaching)
+        );
+        // The sink refused it.
+        latch.rollback();
+        assert_eq!(latch.fired(), None);
+        // By the next tick the Recording is in the final window.
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Final)),
+            Some(LimitWarning::Final)
+        );
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Final)),
+            None,
+            "and the stale approaching stage never comes back"
+        );
+        // A rollback with nothing outstanding, or a repeated one, is inert.
+        latch.rollback();
+        latch.rollback();
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Final)),
+            None
+        );
+    }
+
+    /// `rollback` promises to be inert without an outstanding announcement, and
+    /// an ACCEPTED announcement is not outstanding. The latch has to enforce
+    /// that itself: a stray rollback between polls must not resurrect a warning
+    /// the user has already been shown, or they get it twice.
+    #[test]
+    fn a_committed_warning_cannot_be_resurrected_by_a_stray_rollback() {
+        let mut latch = LimitWarningLatch::default();
+        let identity = Some("correlation-1");
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Approaching)),
+            Some(LimitWarning::Approaching)
+        );
+        // The sink accepted it, so the tick settles the stage.
+        latch.commit();
+        // A stray rollback before the next poll, and another for good measure.
+        latch.rollback();
+        latch.rollback();
+        assert_eq!(
+            latch.fired(),
+            Some(LimitWarning::Approaching),
+            "an accepted stage stays spent"
+        );
+        // The next tick announces nothing extra.
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Approaching)),
+            None,
+            "the warning must not be announced a second time"
+        );
+        // Escalation still works from the committed stage.
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Final)),
+            Some(LimitWarning::Final)
+        );
+        latch.commit();
+        latch.rollback();
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Final)),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_headroom_says_nothing_at_all() {
+        // A status reply that arrives while the stop is already in flight. The
+        // stage is still Final (the capsule stays bordered), but counting down
+        // to a moment that has passed is worse than silence.
+        assert_eq!(limit_warning_for_remaining(Some(Duration::ZERO)), Some(LimitWarning::Final));
+        assert_eq!(limit_notification_body(LimitWarning::Final, Duration::ZERO), None);
+        assert_eq!(
+            limit_notification_body(LimitWarning::Final, Duration::from_millis(400)),
+            None,
+            "rounding to zero seconds is the same moment"
+        );
+        assert_eq!(
+            limit_notification_body(LimitWarning::Approaching, Duration::ZERO),
+            None
+        );
     }
 }

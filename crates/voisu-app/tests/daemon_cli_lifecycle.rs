@@ -9740,3 +9740,239 @@ cat > "$dir/clipboard"
     daemon.terminate();
     server.join().unwrap();
 }
+
+/// The Overlay warns the user before the Recording Deadline cuts them off, and
+/// it can only do that if the observer path actually reports the headroom left.
+/// The headroom must also follow the RESOLVED Deadline, not the 600 s default:
+/// this daemon runs with a 300 s override, so a reply above that would mean the
+/// warnings were being computed against a limit nobody is enforcing.
+#[test]
+fn status_reports_the_remaining_recording_headroom_only_while_recording() {
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_RECORDING_DEADLINE_MS", "300000"),
+            ("VOISU_TEST_CAPTURE_CHUNKS", "8"),
+            ("VOISU_TEST_CHUNK_DELAY_MS", "40"),
+        ],
+    );
+
+    let idle = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+    assert_eq!(idle["state"], "idle", "{idle}");
+    assert!(
+        idle["recording_remaining_ms"].is_null(),
+        "an idle daemon has no Recording to report headroom for: {idle}"
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut observed = None;
+    while Instant::now() < deadline {
+        let status = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+        if status["state"] == "recording"
+            && let Some(remaining) = status["recording_remaining_ms"].as_u64()
+        {
+            observed = Some(remaining);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let remaining = observed.expect("a live Recording must report its remaining headroom");
+    assert!(
+        remaining > 0 && remaining <= 300_000,
+        "headroom must track the resolved 300 s Deadline, got {remaining} ms"
+    );
+
+    let stop = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stop["ok"], true, "{stop}");
+    let after = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+    assert!(
+        after["recording_remaining_ms"].is_null(),
+        "headroom must disappear with the Recording it belonged to: {after}"
+    );
+
+    daemon.terminate();
+}
+
+/// The Deadline clock starts in `capture.begin()`, which runs BEFORE the
+/// providers start — and provider start loads credentials, which can block on
+/// the desktop keyring for an unbounded time. Reported headroom must be
+/// measured from the capture's own clock, so a stalled start eats into the
+/// headroom exactly as it eats into the Recording. Stamping it after the
+/// providers instead would hand the user a full ceiling's worth of headroom
+/// against a capture that had already been running for the whole stall, and
+/// every warning would arrive that much too late.
+#[test]
+fn reported_headroom_is_measured_from_the_captures_own_clock_not_a_later_stamp() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+trap 'exit 0' INT TERM
+i=0
+while [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
+"#,
+    );
+    // The credential lookup blocks on an explicit release marker, standing in
+    // for a keyring prompt. The stall sits between capture.begin() and the
+    // point the actor records the Recording, which is precisely the window the
+    // old stamp ignored.
+    write_fake_command(
+        commands.path(),
+        "secret-tool",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+: > "$dir/secret-tool.started"
+i=0
+while [ ! -e "$dir/secret-tool.release" ] && [ "$i" -lt 3000 ]; do sleep 0.02; i=$((i + 1)); done
+printf 'controlled-secret'
+"#,
+    );
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[("PATH", &path), ("VOISU_RECORDING_DEADLINE_MS", "300000")],
+    );
+
+    let runtime_dir = runtime.path().to_owned();
+    let start = thread::spawn(move || voisu(&runtime_dir, "start"));
+    wait_for_marker(commands.path(), "secret-tool.started");
+    // Hold the lookup, and MEASURE the hold rather than assuming it: the
+    // assertion below is an inequality against the observed stall, so it needs
+    // no timing luck to be correct.
+    let held_from = Instant::now();
+    thread::sleep(Duration::from_millis(600));
+    let held = held_from.elapsed();
+    fs::write(commands.path().join("secret-tool.release"), "").unwrap();
+    assert!(start.join().unwrap().status.success());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed = None;
+    while Instant::now() < deadline {
+        let status = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+        if status["state"] == "recording"
+            && let Some(remaining) = status["recording_remaining_ms"].as_u64()
+        {
+            observed = Some(remaining);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let remaining = observed.expect("a live Recording must report its remaining headroom");
+    let spent_before_the_stamp = u64::try_from(held.as_millis()).unwrap();
+    assert!(
+        remaining <= 300_000 - spent_before_the_stamp,
+        "headroom must already have lost the {spent_before_the_stamp} ms the capture spent \
+         waiting on the credential lookup, got {remaining} ms of 300000"
+    );
+
+    daemon.terminate();
+}
+
+/// The controlled capture hands out a `DeadlineClock` through the trait, and
+/// the observer path reports headroom against exactly that clock. The double
+/// must therefore ENFORCE it too: a capture that reports zero headroom and then
+/// keeps running would let every controlled test validate the warning path
+/// against a truth the capture never intended to keep. Both the termination and
+/// the reported zero come from the one clock here.
+#[test]
+fn the_controlled_capture_enforces_the_clock_it_reports() {
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            // No scripted chunks at all: nothing but the clock can end this.
+            ("VOISU_TEST_CAPTURE_CHUNKS", "0"),
+            ("VOISU_RECORDING_DEADLINE_MS", "700"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    // Every headroom the daemon reports must fit inside the ceiling it is
+    // enforcing — an inequality, never a wall-clock equality.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ended = false;
+    while Instant::now() < deadline {
+        let status = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+        if let Some(remaining) = status["recording_remaining_ms"].as_u64() {
+            assert!(
+                remaining <= 700,
+                "reported headroom must come from the 700 ms clock, got {remaining} ms"
+            );
+        }
+        if status["state"] == "idle" {
+            ended = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        ended,
+        "the clock the capture reported must also stop the Recording; it ran on instead"
+    );
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    assert_eq!(
+        record["truncated_by"], "recording_deadline",
+        "the stop must be the Recording Deadline, not some other boundary: {history}"
+    );
+
+    daemon.terminate();
+}
+
+/// The same contract on the scripted-chunk path: a chunk whose delay outlasts
+/// the reported clock must never be emitted. A capture that hands out audio
+/// dated past its own Deadline is reporting a Deadline it does not keep, which
+/// is exactly what the observer path would then be validated against.
+#[test]
+fn a_chunk_delay_longer_than_the_ceiling_loses_to_the_clock() {
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_CAPTURE_CHUNKS", "1"),
+            // Thirty seconds of chunk delay against a 700 ms ceiling: only the
+            // clock can end this inside the bounded wait below.
+            ("VOISU_TEST_CHUNK_DELAY_MS", "30000"),
+            ("VOISU_RECORDING_DEADLINE_MS", "700"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ended = false;
+    while Instant::now() < deadline {
+        let status = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+        if let Some(remaining) = status["recording_remaining_ms"].as_u64() {
+            assert!(
+                remaining <= 700,
+                "reported headroom must come from the 700 ms clock, got {remaining} ms"
+            );
+        }
+        if status["state"] == "idle" {
+            ended = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        ended,
+        "the clock must win against the chunk delay; the capture slept through it instead"
+    );
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(
+        history["history"][0]["truncated_by"], "recording_deadline",
+        "{history}"
+    );
+
+    daemon.terminate();
+}
