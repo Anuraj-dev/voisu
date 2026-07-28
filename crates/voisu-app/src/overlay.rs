@@ -563,12 +563,49 @@ pub fn limit_warning_class(warning: Option<LimitWarning>) -> Option<&'static str
     matches!(warning, Some(LimitWarning::Final)).then_some(LIMIT_WARNING_CLASS)
 }
 
-/// The notification body for a warning stage.
+/// The notification body for a warning stage at its nominal lead — the exact
+/// approved wording, used whenever it is actually true.
 pub const fn limit_warning_body(warning: LimitWarning) -> &'static str {
     match warning {
         LimitWarning::Approaching => "Approaching the recording limit — about a minute left",
         LimitWarning::Final => "Recording stops in 10 seconds",
     }
+}
+
+/// The lead this stage's approved wording describes.
+pub const fn limit_warning_lead(warning: LimitWarning) -> Duration {
+    match warning {
+        LimitWarning::Approaching => APPROACHING_LIMIT_LEAD,
+        LimitWarning::Final => FINAL_LIMIT_LEAD,
+    }
+}
+
+/// What to actually say for a warning stage, given the headroom really left.
+///
+/// `VOISU_RECORDING_DEADLINE_MS` is operator-reachable, so a ceiling can be
+/// shorter than a lead: a 30 s ceiling would announce "about a minute left" at
+/// the very first tick, and a 5 s ceiling would promise ten seconds it does not
+/// have. A warning the user can time against and catch lying is worse than no
+/// warning. The approved wording is kept verbatim whenever the headroom really
+/// is the lead it describes, and replaced by the true figure when it is not.
+///
+/// `None` means say nothing: at zero headroom the stop is already in flight,
+/// and counting down to a moment that has passed helps nobody.
+pub fn limit_notification_body(warning: LimitWarning, remaining: Duration) -> Option<String> {
+    let seconds = remaining.as_secs_f64().round() as u64;
+    if seconds == 0 {
+        return None;
+    }
+    if seconds == limit_warning_lead(warning).as_secs() {
+        return Some(limit_warning_body(warning).to_owned());
+    }
+    let unit = if seconds == 1 { "second" } else { "seconds" };
+    Some(match warning {
+        LimitWarning::Approaching => {
+            format!("Approaching the recording limit — about {seconds} {unit} left")
+        }
+        LimitWarning::Final => format!("Recording stops in {seconds} {unit}"),
+    })
 }
 
 /// Edge-latch for the approaching-limit notifications, mirroring
@@ -632,6 +669,43 @@ impl LimitWarningLatch {
     pub fn fired(&self) -> Option<LimitWarning> {
         self.fired
     }
+}
+
+/// The one thing the desktop-notification rung may say on a single tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RungNotification {
+    /// The approaching-limit warning; its body depends on the real headroom.
+    Limit,
+    /// The capsule's own label — the no-speech explanation, or a transition
+    /// into a visible phase.
+    Label(&'static str),
+}
+
+/// The single notification the desktop-notification rung sends this tick.
+///
+/// Unlike the windowed paths, this rung has one bubble: its channel is depth-1
+/// with a non-blocking send, and it reuses one replaces_id, so a second send on
+/// the same tick is either dropped or paints over the first. Both can genuinely
+/// come due together — the first observation of a Recording that is ALREADY
+/// inside a warning window is a phase transition and a warning at once — and
+/// the latch has already consumed the stage, so a lost warning never returns.
+/// The warning therefore wins: it is time-critical and the transition is not.
+pub fn notification_rung_choice(
+    view: OverlayView,
+    previous_phase: OverlayPhase,
+    limit_pending: bool,
+    fire_no_speech: bool,
+) -> Option<RungNotification> {
+    if limit_pending {
+        return Some(RungNotification::Limit);
+    }
+    if view.phase == OverlayPhase::NoSpeech {
+        return fire_no_speech.then_some(RungNotification::Label(view.visible_label));
+    }
+    // Fire only on a PHASE transition into a visible phase. Comparing the whole
+    // view would re-fire on every meter/activity tick within one Recording.
+    (view.is_visible() && previous_phase != view.phase)
+        .then_some(RungNotification::Label(view.visible_label))
 }
 
 /// The outcome of one fallback-path poll tick, decided purely so the adapter's
@@ -1794,5 +1868,114 @@ mod tests {
             "Approaching the recording limit — about a minute left"
         );
         assert_eq!(limit_warning_body(LimitWarning::Final), "Recording stops in 10 seconds");
+        // At the real ceiling the approved wording is what actually goes out:
+        // the first poll inside each window still rounds to the nominal lead.
+        let (approaching, final_warning) = limit_warning_onsets(MAX_RECORDING_DURATION);
+        let first_approaching_tick = MAX_RECORDING_DURATION - approaching - TICK;
+        assert_eq!(
+            limit_notification_body(LimitWarning::Approaching, first_approaching_tick).as_deref(),
+            Some("Approaching the recording limit — about a minute left")
+        );
+        let first_final_tick = MAX_RECORDING_DURATION - final_warning - TICK;
+        assert_eq!(
+            limit_notification_body(LimitWarning::Final, first_final_tick).as_deref(),
+            Some("Recording stops in 10 seconds")
+        );
+    }
+
+    /// The Overlay's poll cadence, so the "first tick inside the window" cases
+    /// above are the real ones rather than an idealised exact boundary.
+    const TICK: Duration = Duration::from_millis(200);
+
+    /// `VOISU_RECORDING_DEADLINE_MS` is a real operator knob, not a test seam,
+    /// so a ceiling shorter than a lead is reachable in production. The wording
+    /// must never promise time the Recording does not have.
+    #[test]
+    fn a_short_ceiling_is_told_the_truth_instead_of_the_nominal_wording() {
+        // A 30 s ceiling: the approaching warning is live from the first tick.
+        let ceiling = Duration::from_secs(30);
+        assert_eq!(limit_warning_at(Duration::ZERO, ceiling), Some(LimitWarning::Approaching));
+        assert_eq!(
+            limit_notification_body(LimitWarning::Approaching, ceiling).as_deref(),
+            Some("Approaching the recording limit — about 30 seconds left"),
+            "a 30 s ceiling must not claim a minute"
+        );
+        // A 5 s ceiling: the final warning is live from the first tick.
+        let ceiling = Duration::from_secs(5);
+        assert_eq!(limit_warning_at(Duration::ZERO, ceiling), Some(LimitWarning::Final));
+        assert_eq!(
+            limit_notification_body(LimitWarning::Final, ceiling).as_deref(),
+            Some("Recording stops in 5 seconds"),
+            "a 5 s ceiling must not promise ten"
+        );
+        // Singular reads as English, not "1 seconds".
+        assert_eq!(
+            limit_notification_body(LimitWarning::Final, Duration::from_secs(1)).as_deref(),
+            Some("Recording stops in 1 second")
+        );
+    }
+
+    /// The Notifier rung can carry exactly one bubble per tick, so the two
+    /// sends that used to be able to come due together had to be resolved into
+    /// one choice — and the warning is the one with a deadline attached.
+    #[test]
+    fn the_notification_rung_sends_the_warning_rather_than_the_transition() {
+        let recording = OverlayView::from_response(&recording_response());
+        // The tick where the Overlay first sees an already-warning Recording:
+        // a transition into Recording AND a due warning, on the same tick.
+        assert_eq!(
+            notification_rung_choice(recording, OverlayPhase::Hidden, true, false),
+            Some(RungNotification::Limit),
+            "a due warning must not be dropped or painted over by the transition"
+        );
+        // With no warning due, the transition is announced exactly as before.
+        assert_eq!(
+            notification_rung_choice(recording, OverlayPhase::Hidden, false, false),
+            Some(RungNotification::Label("Recording"))
+        );
+        // And a repeat of the same phase stays silent.
+        assert_eq!(
+            notification_rung_choice(recording, OverlayPhase::Recording, false, false),
+            None
+        );
+        // No-speech keeps its latch-gated explanation, and still loses to a
+        // warning if both somehow come due.
+        let no_speech = OverlayView::no_speech();
+        assert_eq!(
+            notification_rung_choice(no_speech, OverlayPhase::Recording, false, true),
+            Some(RungNotification::Label(no_speech.visible_label))
+        );
+        assert_eq!(
+            notification_rung_choice(no_speech, OverlayPhase::Recording, false, false),
+            None,
+            "an unlatched no-speech repeat stays silent"
+        );
+        assert_eq!(
+            notification_rung_choice(no_speech, OverlayPhase::Recording, true, true),
+            Some(RungNotification::Limit)
+        );
+        // Hidden announces nothing.
+        assert_eq!(
+            notification_rung_choice(OverlayView::HIDDEN, OverlayPhase::Recording, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_headroom_says_nothing_at_all() {
+        // A status reply that arrives while the stop is already in flight. The
+        // stage is still Final (the capsule stays bordered), but counting down
+        // to a moment that has passed is worse than silence.
+        assert_eq!(limit_warning_for_remaining(Some(Duration::ZERO)), Some(LimitWarning::Final));
+        assert_eq!(limit_notification_body(LimitWarning::Final, Duration::ZERO), None);
+        assert_eq!(
+            limit_notification_body(LimitWarning::Final, Duration::from_millis(400)),
+            None,
+            "rounding to zero seconds is the same moment"
+        );
+        assert_eq!(
+            limit_notification_body(LimitWarning::Approaching, Duration::ZERO),
+            None
+        );
     }
 }
