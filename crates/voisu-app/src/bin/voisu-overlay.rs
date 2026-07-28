@@ -482,7 +482,11 @@ fn install_surface_feedback(
         // ordering: it breaks on that handoff BEFORE the tracker or latch observe
         // this tick, so a retired window is never re-presented and no duplicate
         // notification is sent. The bin only runs the resulting side effects.
-        match poll_tick(
+        // Bind before matching: a `match` scrutinee keeps its temporary `RefMut`
+        // guards alive for the whole block, and the warning arm below re-borrows
+        // `limit_latch` to commit — inside this C callback that double borrow is
+        // a non-unwinding panic that aborts the whole overlay process.
+        let action = poll_tick(
             switched.get(),
             is_fallback,
             TickObservation { view, signal, identity: identity.as_deref(), warning },
@@ -490,7 +494,8 @@ fn install_surface_feedback(
             &mut notify_latch.borrow_mut(),
             &mut no_speech_latch.borrow_mut(),
             &mut limit_latch.borrow_mut(),
-        ) {
+        );
+        match action {
             TickAction::Break => {
                 if let Some((source, worker)) = level_poll.borrow_mut().take() {
                     source.remove();
