@@ -22,7 +22,7 @@ use voisu_app::feedback::{
 };
 use voisu_app::overlay::{
     edge_falloff_alpha, interpolate_bands, limit_warning_body, limit_warning_class,
-    limit_warning_from_response, phase_glyph, poll_tick, recording_bar_height,
+    limit_warning_from_response, phase_glyph, poll_tick, recording_bar_height, recording_identity,
     recording_bar_rgb, resting_floor, sweep_brightness, BarSmoother, LevelPollAction,
     LevelPollLatch, LimitWarning, LimitWarningLatch, NoSpeechNotifyLatch, VISUAL_BAR_COUNT,
     ObservedSignal, OverlayPhase, OverlayView, PresentationController, PresentationTracker,
@@ -427,17 +427,23 @@ fn install_surface_feedback(
         // from the rendered phase: a failed status read renders an unavailable
         // capsule but is not a reachable observation, so it must not disturb the
         // Recording notification latch.
-        let (view, signal, warning) = match read_status() {
+        let (view, signal, warning, identity) = match read_status() {
             Some(response) => {
                 let view = controller.borrow_mut().observe(&response, now);
-                // Headroom is read off the same reply the phase came from, so
-                // the capsule can never be amber for a Recording that already
-                // ended.
-                (view, ObservedSignal::Reachable(view.phase), limit_warning_from_response(&response))
+                // Headroom and identity are read off the same reply the phase
+                // came from, so the capsule can never be amber for a Recording
+                // that already ended, nor latched against a different one.
+                (
+                    view,
+                    ObservedSignal::Reachable(view.phase),
+                    limit_warning_from_response(&response),
+                    recording_identity(&response).map(str::to_owned),
+                )
             }
             None => (
                 controller.borrow_mut().observe_unreachable(now),
                 ObservedSignal::Unreachable,
+                None,
                 None,
             ),
         };
@@ -479,6 +485,7 @@ fn install_surface_feedback(
             is_fallback,
             view,
             signal,
+            identity.as_deref(),
             warning,
             &mut tracker.borrow_mut(),
             &mut notify_latch.borrow_mut(),
@@ -595,16 +602,21 @@ fn notification_tick(
     notifier: &Notifier,
 ) {
     let now = Instant::now();
-    let (view, signal, warning) = match read_status() {
+    let (view, signal, warning, identity) = match read_status() {
         Some(response) => {
             let view = controller.observe(&response, now);
-            (view, ObservedSignal::Reachable(view.phase), limit_warning_from_response(&response))
+            (
+                view,
+                ObservedSignal::Reachable(view.phase),
+                limit_warning_from_response(&response),
+                recording_identity(&response).map(str::to_owned),
+            )
         }
-        None => (controller.observe_unreachable(now), ObservedSignal::Unreachable, None),
+        None => (controller.observe_unreachable(now), ObservedSignal::Unreachable, None, None),
     };
     // This rung has no capsule to turn amber, so the notification is the whole
     // warning. Latched exactly as on the windowed paths.
-    if let Some(warning) = limit_latch.observe(signal, warning) {
+    if let Some(warning) = limit_latch.observe(signal, identity.as_deref(), warning) {
         notifier.notify(limit_warning_body(warning));
     }
     let fire_no_speech = no_speech_latch.observe(signal);
