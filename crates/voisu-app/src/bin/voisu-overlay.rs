@@ -635,11 +635,20 @@ fn notification_tick(
     // the whole warning.
     match notification_rung_choice(view, *previous_phase, limit_body.is_some(), fire_no_speech) {
         Some(RungNotification::Limit) => {
-            if let Some(body) = limit_body {
-                notifier.notify(&body);
+            // One attempt, no retry loop: if the queue is busy with a call
+            // already in flight, hand the stage back so the NEXT tick re-selects
+            // it. Committing a warning the sink refused would be silence for
+            // the rest of the Recording.
+            if let Some(body) = limit_body
+                && !notifier.notify(&body)
+            {
+                limit_latch.rollback();
             }
         }
-        Some(RungNotification::Label(label)) => notifier.notify(label),
+        Some(RungNotification::Label(label)) => {
+            // A transition genuinely may coalesce away; nothing depends on it.
+            let _ = notifier.notify(label);
+        }
         None => {}
     }
     // Always advances, whichever bubble won: the transition has been observed
@@ -716,14 +725,22 @@ impl Notifier {
         }
     }
 
-    fn notify(&self, label: &str) {
+    /// Returns whether the message was ACCEPTED. A phase transition may
+    /// coalesce away on a full channel without anyone caring, but a limit
+    /// warning is announced once and never again, so its caller has to know
+    /// whether it actually got in.
+    #[must_use]
+    fn notify(&self, label: &str) -> bool {
         match &self.sender {
             // try_send is non-blocking: a full channel means a request is
             // already in flight, so this transition coalesces away.
-            Some(sender) => {
-                let _ = sender.try_send(label.to_owned());
+            Some(sender) => sender.try_send(label.to_owned()).is_ok(),
+            None => {
+                // The journal rung always lands: it is a write to stderr, not a
+                // queue, so there is nothing to refuse.
+                journal_transition(self.selection, label);
+                true
             }
-            None => journal_transition(self.selection, label),
         }
     }
 }

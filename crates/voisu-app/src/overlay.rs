@@ -620,6 +620,12 @@ pub fn limit_notification_body(warning: LimitWarning, remaining: Duration) -> Op
 #[derive(Debug, Default)]
 pub struct LimitWarningLatch {
     fired: Option<LimitWarning>,
+    /// `Some(prior)` while this tick's announcement is still outstanding —
+    /// handed out but not yet accepted by a sink. Cleared at the start of every
+    /// observation, so an announcement can only be rolled back within the tick
+    /// that produced it. Without it the latch commits a warning that was never
+    /// delivered and the user hears nothing for the rest of the Recording.
+    uncommitted: Option<Option<LimitWarning>>,
     /// The Recording the fired stages belong to. Phase transitions alone are
     /// not a reliable boundary between Recordings, so the latch carries the
     /// identity and clears the moment it changes.
@@ -638,6 +644,9 @@ impl LimitWarningLatch {
         identity: Option<&str>,
         warning: Option<LimitWarning>,
     ) -> Option<LimitWarning> {
+        // A new observation supersedes the last one: whatever was outstanding
+        // is now this tick's problem, not the previous tick's.
+        self.uncommitted = None;
         match signal {
             // Deliberately no identity check here: an unreachable poll observes
             // nothing, so it must not look like a new Recording.
@@ -650,6 +659,7 @@ impl LimitWarningLatch {
                     self.fired = None;
                 }
                 if warning > self.fired {
+                    self.uncommitted = Some(self.fired);
                     self.fired = warning;
                     warning
                 } else {
@@ -661,6 +671,21 @@ impl LimitWarningLatch {
                 self.identity = None;
                 None
             }
+        }
+    }
+
+    /// Hand back the stage the last [`observe`](Self::observe) handed out,
+    /// because the sink refused it. The next tick re-selects a warning, so the
+    /// user still hears one — a silently dropped announcement would otherwise
+    /// be silence for the rest of the Recording.
+    ///
+    /// Escalate-only survives the rollback: a returned `Approaching` that has
+    /// since become `Final` is re-selected as `Final` alone, never as both.
+    /// Calling this without an outstanding announcement, or twice for the same
+    /// one, changes nothing.
+    pub fn rollback(&mut self) {
+        if let Some(prior) = self.uncommitted.take() {
+            self.fired = prior;
         }
     }
 
@@ -1957,6 +1982,81 @@ mod tests {
         // Hidden announces nothing.
         assert_eq!(
             notification_rung_choice(OverlayView::HIDDEN, OverlayPhase::Recording, false, false),
+            None
+        );
+    }
+
+    /// The Notifier's channel is depth-1 with a non-blocking send, so a Notify
+    /// call already in flight makes the send fail. A warning is chosen once and
+    /// the latch would commit it, so a dropped send used to mean silence for
+    /// the rest of the Recording. The stage is committed only once the sink
+    /// accepts it.
+    #[test]
+    fn a_warning_the_notifier_refuses_is_re_announced_on_a_later_tick() {
+        let mut latch = LimitWarningLatch::default();
+        let view = OverlayView::from_response(&recording_response());
+        let mut previous_phase = OverlayPhase::Hidden;
+        // The sink refuses the first three attempts, standing in for a full
+        // depth-1 channel with a D-Bus call in flight.
+        let mut refusals_left = 3;
+        let mut announced = Vec::new();
+        // Sixty ticks (twelve seconds at the 200 ms poll) of a Recording that
+        // is inside the approaching window throughout.
+        for _ in 0..60 {
+            let chosen = latch.observe(recording(), Some("correlation-1"), Some(LimitWarning::Approaching));
+            let body = chosen.and_then(|warning| {
+                limit_notification_body(warning, Duration::from_secs(30))
+            });
+            if let Some(RungNotification::Limit) =
+                notification_rung_choice(view, previous_phase, body.is_some(), false)
+                && let Some(body) = body
+            {
+                let accepted = refusals_left == 0;
+                refusals_left -= i32::from(refusals_left > 0);
+                if accepted {
+                    announced.push(body);
+                } else {
+                    latch.rollback();
+                }
+            }
+            previous_phase = view.phase;
+        }
+        assert_eq!(
+            announced,
+            vec!["Approaching the recording limit — about 30 seconds left".to_owned()],
+            "a refused warning must survive and be announced exactly once"
+        );
+    }
+
+    /// The rollback must not resurrect a stage the Recording has already moved
+    /// past: a returned `Approaching` that is now inside the final window is
+    /// announced as `Final` alone.
+    #[test]
+    fn a_rolled_back_warning_escalates_rather_than_announcing_both_stages() {
+        let mut latch = LimitWarningLatch::default();
+        let identity = Some("correlation-1");
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Approaching)),
+            Some(LimitWarning::Approaching)
+        );
+        // The sink refused it.
+        latch.rollback();
+        assert_eq!(latch.fired(), None);
+        // By the next tick the Recording is in the final window.
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Final)),
+            Some(LimitWarning::Final)
+        );
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Final)),
+            None,
+            "and the stale approaching stage never comes back"
+        );
+        // A rollback with nothing outstanding, or a repeated one, is inert.
+        latch.rollback();
+        latch.rollback();
+        assert_eq!(
+            latch.observe(recording(), identity, Some(LimitWarning::Final)),
             None
         );
     }
