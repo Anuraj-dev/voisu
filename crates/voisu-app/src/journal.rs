@@ -150,6 +150,7 @@ mod tests {
             source_transcript_providers: Vec::new(),
             first_chunk_ms: Some(118),
             capture_finalized_ms: Some(842),
+            truncated_by: None,
             provider_timings_ms: vec![
                 ProviderTiming {
                     provider: Provider::Deepgram,
