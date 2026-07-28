@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.8.0
+Version:        0.9.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,28 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Tue Jul 28 2026 Voisu maintainers <voisu@example.invalid> - 0.9.0-1
+- style(daemon): satisfy int_plus_one on the legacy frame assertion
+- style(diagnostics): pin the count bound at compile time
+- test(diagnostics): decouple the retention test from selection policy
+- fix(diagnostics): never present unknown history as durable truth
+- fix(diagnostics): harden history durability and compatibility
+- fix(journal): carry truncated_by through the rebase onto v0.7.0
+- fix(diagnostics): never let a diagnostics precondition block startup
+- perf(diagnostics): append records instead of rewriting the ring
+- fix(diagnostics): retain history in the durable state directory
+- fix(cli): reinstate the diagnostic response ceiling
+- fix(journal): stop a diagnostic forging a structured record
+- fix(ipc): negotiate diagnostic paging per request
+- test(service): follow protocol socket version
+- test(ipc): follow protocol version constant
+- fix(diagnostics): close review gaps
+- test(diagnostics): harden observability regressions
+- fix(service): try-restart optional overlay
+- fix(diagnostics): format startup failure timings
+- fix(diagnostics): align server write deadline
+- fix(diagnostics): separate journal timing records
+
 * Tue Jul 28 2026 Voisu maintainers <voisu@example.invalid> - 0.8.0-1
 - test(core): pin the outro narrowing and the wordless invariant through the contraction arm
 - refactor(core): delete the lexical-difference override; the Groq default always wins
