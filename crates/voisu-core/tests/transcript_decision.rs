@@ -278,13 +278,20 @@ async fn padding_cannot_win_on_formatting_signal_alone() {
     assert!(!decision.validation_reason.contains("one-sided formatting evidence"));
 }
 
-/// The spec's own motivating case (recording 21): Deepgram spelled the product
-/// term, Groq split it into two ordinary words. The texts are not word-for-word
-/// equal, so before the widening the user was handed "voice so" every time. The
-/// dictionary term is what makes the shorter text the safe one here — Groq's
-/// extra word is not extra speech, it is the same word misheard as two.
+/// A dictionary term does not overturn a lexical difference. This is the spec's
+/// own motivating case (recording 21): Deepgram spelled the product term, Groq
+/// split it into two ordinary words, and the user is handed "voice so".
+///
+/// That loss is deliberate. The mechanism that used to rescue this case read
+/// the difference as "a single misheard span" from character distances, and
+/// character distances cannot tell a mishearing from an inverted meaning —
+/// English antonyms and negations are minimal edits of the words they invert.
+/// Three review rounds each found a meaning-inversion escaping through it. The
+/// jargon rescue is given up here and will be re-specced on evidence that is
+/// actually about meaning; this test pins the give-up so no one quietly
+/// reinstates the arithmetic.
 #[tokio::test]
-async fn a_dictionary_term_wins_against_a_two_word_misrecognition() {
+async fn a_dictionary_term_does_not_overturn_a_lexical_difference() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut pipeline = TranscriptDecisionPipeline::with_dictionary_terms(
         CountingModel {
@@ -312,14 +319,15 @@ async fn a_dictionary_term_wins_against_a_two_word_misrecognition() {
         .await
         .unwrap();
 
-    assert_eq!(decision.transcript.0, deepgram);
-    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(decision.transcript.0, groq);
+    assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(
-        decision.validation_reason.contains("dictionary matches 1 vs 0"),
+        decision.validation_reason.contains("lexically different"),
         "{}",
         decision.validation_reason
     );
+    assert!(!decision.validation_reason.contains("one-sided formatting evidence"));
 }
 
 /// The pinned safety fixture is one dictionary term away from the defect it
@@ -579,12 +587,12 @@ async fn an_asymmetric_span_may_not_insert_a_negation_the_user_never_spoke() {
     );
 }
 
-/// The widened gate must not reopen the hole the narrowing existed to close: a
-/// padded transcript manufactures a sentence-punctuation boundary out of text
-/// the other provider never heard. Length-sensitive signals may not decide
-/// across different lengths, and an equal dictionary count is no advantage.
+/// Padding must not win even when the padded side also carries a dictionary
+/// term: a padded transcript manufactures a sentence-punctuation boundary out
+/// of text the other provider never heard. The padding is a lexical difference,
+/// so the Groq default settles it without weighing any formatting signal.
 #[tokio::test]
-async fn padding_cannot_win_under_the_widened_lexical_gate() {
+async fn padding_cannot_win_when_a_dictionary_term_is_present() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut pipeline = TranscriptDecisionPipeline::with_dictionary_terms(
         CountingModel {
@@ -615,17 +623,22 @@ async fn padding_cannot_win_under_the_widened_lexical_gate() {
     assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(
-        decision.validation_reason.contains("dictionary matches 1 vs 1"),
+        decision.validation_reason.contains("lexically different"),
         "{}",
         decision.validation_reason
     );
     assert!(!decision.validation_reason.contains("one-sided formatting evidence"));
+    assert!(!decision.validation_reason.contains("dictionary matches"));
 }
 
-/// Equal-length lexically different texts are safe for the full comparator:
-/// neither side can have padded, so a formatting win costs the user no words.
+/// Equal word counts do not license a formatting win either. Equal length only
+/// proves that neither side padded; it says nothing about whether the words
+/// that differ mean the same thing ("differences" against "no difference" ties
+/// on nothing but count). Formatting evidence decides only texts that are
+/// word-for-word equal after normalisation — everywhere else the Groq default
+/// holds, even where, as here, the difference really is a harmless plural.
 #[tokio::test]
-async fn equal_length_lexical_difference_is_decided_on_formatting() {
+async fn equal_length_lexical_difference_keeps_the_groq_default() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut pipeline = TranscriptDecisionPipeline::new(
         CountingModel {
@@ -652,14 +665,16 @@ async fn equal_length_lexical_difference_is_decided_on_formatting() {
         .await
         .unwrap();
 
-    assert_eq!(decision.transcript.0, deepgram);
-    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(decision.transcript.0, groq);
+    assert_ne!(decision.transcript.0, deepgram);
+    assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(
-        decision.validation_reason.contains("equal length"),
+        decision.validation_reason.contains("lexically different"),
         "{}",
         decision.validation_reason
     );
+    assert!(!decision.validation_reason.contains("one-sided formatting evidence"));
 }
 
 #[tokio::test]

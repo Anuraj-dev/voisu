@@ -979,19 +979,20 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             if source_similarity(&deepgram.text, &groq.text) >= 0.85 {
                 let lexically_identical =
                     normalized_words(&deepgram.text) == normalized_words(&groq.text);
-                // Word-for-word equal texts are decided on all three formatting
-                // signals; texts that differ in words are decided by
-                // `lexically_different_selection`, which lets evidence overturn
-                // the Groq default only when the whole difference is a single
-                // misheard span that is symmetric (one word for one) or whose
-                // single word is a dictionary term.
+                // Word-for-word equal texts differ only in rendering, so the
+                // three formatting signals decide them. Texts whose words
+                // differ keep the Groq default, always: the difference may be a
+                // mishearing or a change of meaning, and nothing available here
+                // tells the two apart — English antonyms and negations are
+                // minimal edits of the words they invert. A lost formatting
+                // improvement is recoverable; text whose meaning is inverted is
+                // not, because the user cannot see that it happened.
                 let (winner, evidence) = if lexically_identical {
                     near_identical_selection(&deepgram.text, &groq.text, &self.dictionary_terms)
                 } else {
-                    lexically_different_selection(
-                        &deepgram.text,
-                        &groq.text,
-                        &self.dictionary_terms,
+                    (
+                        GateWinner::Right,
+                        "lexically different Source Transcripts; kept the Groq default because a difference in words may be a change of meaning".to_owned(),
                     )
                 };
                 let selected = match winner {
@@ -2003,134 +2004,6 @@ fn near_identical_selection(
             ),
         )
     }
-}
-
-/// B2 for near-identical Source Transcripts that are NOT word-for-word equal
-/// after normalisation — the shape the spec's own motivating case has: Deepgram
-/// "Voisu" against Groq "voice so".
-///
-/// One rule, stated once: formatting and dictionary evidence may overturn the
-/// Groq default ONLY when the whole lexical difference is a single misheard
-/// span (`single_misheard_span`) — the texts are word-for-word identical
-/// outside one contiguous, positionally aligned window where one provider
-/// heard a span one way and the other another, and the window itself is safe
-/// to re-render: symmetric (one word for one, so no word can appear or
-/// disappear) or vouched for by the user's own dictionary.
-///
-/// Everything else keeps the default: an insertion beside identical
-/// neighbours leaves one span empty; a difference spread across two sites (a
-/// dropped negation away from a split term) widens the window past a single
-/// mishearing; an asymmetric window without a dictionary term is exactly
-/// where a word appears or disappears, whatever the character distances say.
-/// Each rejection sentence above is pinned by a test in
-/// `transcript_decision.rs`; do not restate a stronger claim here without
-/// writing the test for it first.
-fn lexically_different_selection(
-    left: &str,
-    right: &str,
-    dictionary_terms: &[String],
-) -> (GateWinner, String) {
-    let comparison = compare_formatting(left, right, dictionary_terms);
-    let measurements = &comparison.measurements;
-    let groq_default = |why: &str| {
-        (
-            GateWinner::Right,
-            format!(
-                "lexically different near-identical Source Transcripts; defaulted to Groq {why} ({measurements})"
-            ),
-        )
-    };
-    if !comparison.favours_left() {
-        return groq_default("because formatting evidence was not one-sided");
-    }
-    let left_words = normalized_words(left);
-    let right_words = normalized_words(right);
-    let Some((left_span, right_span)) =
-        single_misheard_span(&left_words, &right_words, dictionary_terms)
-    else {
-        return groq_default("because the Source Transcripts differ by more than one misheard span");
-    };
-    let length_note = if left_words.len() == right_words.len() {
-        "equal length".to_owned()
-    } else {
-        format!("{} vs {} words", left_words.len(), right_words.len())
-    };
-    (
-        GateWinner::Left,
-        format!(
-            "lexically different Source Transcripts ({length_note}) whose only difference is the single span \"{}\" heard as \"{}\"; selected Deepgram on one-sided formatting evidence ({measurements})",
-            left_span.join(" "),
-            right_span.join(" "),
-        ),
-    )
-}
-
-/// The one place two normalised word sequences disagree, when their whole
-/// difference has the shape of a single mishearing — otherwise `None`.
-///
-/// Strip the longest common prefix, then the longest common suffix of what
-/// remains. The leftover spans are the entire lexical difference, contiguous
-/// and positionally aligned by construction. They qualify only if:
-///
-/// 1. Both are non-empty. An empty span means one side heard words the other
-///    simply lacks — a dropped word or padding — and preferring the short side
-///    deletes speech while preferring the long side rewards padding.
-/// 2. One span is exactly one word and neither exceeds two. A mishearing of a
-///    single heard span is one word for one ("dictation"/"dictations"), one
-///    split into two ("voisu"/"voice so"), or two joined into one. A wider
-///    window is not one mishearing but different speech ("pravah cli debug"
-///    against "pravah-cli" is a three-word span, rejected on shape).
-/// 3. An ASYMMETRIC window (one word against two) must have a dictionary term
-///    as its single word. One-for-one is structurally safe — both sides fill
-///    the same slot, so no word can appear or disappear, only be rendered
-///    differently. One-against-two is exactly where a word appears or
-///    disappears, and no character-distance arithmetic is evidence about
-///    which: a short word beside a long one costs ~its own length in edits
-///    but buys a third of it back in budget, which is how round 4 handed out
-///    "differences" for "no difference". Only the user's own dictionary can
-///    vouch that the single word IS the span the loser split into pieces.
-/// 4. Run together, the spans sound alike (`words_sound_alike`). After rules
-///    2 and 3 this is a quality filter, not a safety guard: it rejects
-///    unrelated substitutions ("today"/"yesterday"), and for the shapes it
-///    admits either side renders the same slot.
-fn single_misheard_span<'words>(
-    left: &'words [String],
-    right: &'words [String],
-    dictionary_terms: &[String],
-) -> Option<(&'words [String], &'words [String])> {
-    let prefix = left
-        .iter()
-        .zip(right)
-        .take_while(|(left_word, right_word)| left_word == right_word)
-        .count();
-    let suffix = left[prefix..]
-        .iter()
-        .rev()
-        .zip(right[prefix..].iter().rev())
-        .take_while(|(left_word, right_word)| left_word == right_word)
-        .count();
-    let left_span = &left[prefix..left.len() - suffix];
-    let right_span = &right[prefix..right.len() - suffix];
-    let spans_shaped_like_one_mishearing = left_span.len().min(right_span.len()) == 1
-        && left_span.len().max(right_span.len()) <= 2;
-    if !spans_shaped_like_one_mishearing {
-        return None;
-    }
-    if left_span.len() != right_span.len() {
-        let single_word = if left_span.len() == 1 {
-            &left_span[0]
-        } else {
-            &right_span[0]
-        };
-        let is_dictionary_term = dictionary_terms
-            .iter()
-            .any(|term| normalized_words(term).concat() == *single_word);
-        if !is_dictionary_term {
-            return None;
-        }
-    }
-    words_sound_alike(&left_span.concat(), &right_span.concat())
-        .then_some((left_span, right_span))
 }
 
 fn compare_formatting(
