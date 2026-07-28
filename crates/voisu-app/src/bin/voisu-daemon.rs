@@ -3536,8 +3536,9 @@ mod tests {
             "the client must be told why: {}",
             response.message
         );
+        // Strict `<` leaves the one byte the newline frame delimiter needs.
         assert!(
-            serde_json::to_vec(&response).unwrap().len() + 1 <= LEGACY_MAX_RESPONSE_BYTES,
+            serde_json::to_vec(&response).unwrap().len() < LEGACY_MAX_RESPONSE_BYTES,
             "the rejection itself must fit the legacy frame ceiling"
         );
     }
