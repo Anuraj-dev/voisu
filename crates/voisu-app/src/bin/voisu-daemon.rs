@@ -3168,6 +3168,17 @@ impl ActiveCapture for ControlledActiveCapture {
             self.remaining_chunks -= 1;
             self.chunks_emitted += 1;
             if !self.chunk_delay.is_zero() {
+                // The scripted delay races the clock: a capture must not emit
+                // audio dated past the Deadline it reports. Identical to a
+                // plain sleep whenever the clock still outlasts the delay.
+                let headroom = self.deadline_clock.remaining(Instant::now());
+                if self.chunk_delay >= headroom {
+                    tokio::time::sleep(headroom).await;
+                    return Err(BoundaryError::new(
+                        BoundaryKind::RecordingDeadline,
+                        "controlled Recording Deadline elapsed",
+                    ));
+                }
                 tokio::time::sleep(self.chunk_delay).await;
             }
             Ok(Some(AudioChunk(vec![0])))

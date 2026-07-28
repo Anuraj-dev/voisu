@@ -9927,3 +9927,52 @@ fn the_controlled_capture_enforces_the_clock_it_reports() {
 
     daemon.terminate();
 }
+
+/// The same contract on the scripted-chunk path: a chunk whose delay outlasts
+/// the reported clock must never be emitted. A capture that hands out audio
+/// dated past its own Deadline is reporting a Deadline it does not keep, which
+/// is exactly what the observer path would then be validated against.
+#[test]
+fn a_chunk_delay_longer_than_the_ceiling_loses_to_the_clock() {
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_CAPTURE_CHUNKS", "1"),
+            // Thirty seconds of chunk delay against a 700 ms ceiling: only the
+            // clock can end this inside the bounded wait below.
+            ("VOISU_TEST_CHUNK_DELAY_MS", "30000"),
+            ("VOISU_RECORDING_DEADLINE_MS", "700"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ended = false;
+    while Instant::now() < deadline {
+        let status = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+        if let Some(remaining) = status["recording_remaining_ms"].as_u64() {
+            assert!(
+                remaining <= 700,
+                "reported headroom must come from the 700 ms clock, got {remaining} ms"
+            );
+        }
+        if status["state"] == "idle" {
+            ended = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        ended,
+        "the clock must win against the chunk delay; the capture slept through it instead"
+    );
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(
+        history["history"][0]["truncated_by"], "recording_deadline",
+        "{history}"
+    );
+
+    daemon.terminate();
+}
