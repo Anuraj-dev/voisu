@@ -3136,6 +3136,18 @@ impl ActiveCapture for ControlledActiveCapture {
                     "controlled Recording Deadline elapsed",
                 ));
             }
+            // The double also honours the clock it hands out through
+            // `deadline_clock`. Reporting a Deadline it would not enforce would
+            // let controlled tests validate the observer path against a truth
+            // the capture never intended to keep. At the default 600 s ceiling
+            // this can never fire inside a test, so the chunk-count seam above
+            // remains the deterministic one.
+            if self.deadline_clock.remaining(Instant::now()).is_zero() {
+                return Err(BoundaryError::new(
+                    BoundaryKind::RecordingDeadline,
+                    "controlled Recording Deadline elapsed",
+                ));
+            }
             if let Some(limit) = self.buffer_cap_after_chunks
                 && self.chunks_emitted >= limit
             {
@@ -3143,8 +3155,15 @@ impl ActiveCapture for ControlledActiveCapture {
                 return Ok(None);
             }
             if self.remaining_chunks == 0 {
-                std::future::pending::<()>().await;
-                unreachable!();
+                // Out of scripted chunks: wait for the clock instead of
+                // forever, so a Recording whose reported headroom reaches zero
+                // actually stops. Identical to the old unconditional wait
+                // whenever the clock still has headroom to give.
+                tokio::time::sleep(self.deadline_clock.remaining(Instant::now())).await;
+                return Err(BoundaryError::new(
+                    BoundaryKind::RecordingDeadline,
+                    "controlled Recording Deadline elapsed",
+                ));
             }
             self.remaining_chunks -= 1;
             self.chunks_emitted += 1;

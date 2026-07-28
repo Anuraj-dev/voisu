@@ -9875,3 +9875,55 @@ printf 'controlled-secret'
 
     daemon.terminate();
 }
+
+/// The controlled capture hands out a `DeadlineClock` through the trait, and
+/// the observer path reports headroom against exactly that clock. The double
+/// must therefore ENFORCE it too: a capture that reports zero headroom and then
+/// keeps running would let every controlled test validate the warning path
+/// against a truth the capture never intended to keep. Both the termination and
+/// the reported zero come from the one clock here.
+#[test]
+fn the_controlled_capture_enforces_the_clock_it_reports() {
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            // No scripted chunks at all: nothing but the clock can end this.
+            ("VOISU_TEST_CAPTURE_CHUNKS", "0"),
+            ("VOISU_RECORDING_DEADLINE_MS", "700"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    // Every headroom the daemon reports must fit inside the ceiling it is
+    // enforcing — an inequality, never a wall-clock equality.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ended = false;
+    while Instant::now() < deadline {
+        let status = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+        if let Some(remaining) = status["recording_remaining_ms"].as_u64() {
+            assert!(
+                remaining <= 700,
+                "reported headroom must come from the 700 ms clock, got {remaining} ms"
+            );
+        }
+        if status["state"] == "idle" {
+            ended = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        ended,
+        "the clock the capture reported must also stop the Recording; it ran on instead"
+    );
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    assert_eq!(
+        record["truncated_by"], "recording_deadline",
+        "the stop must be the Recording Deadline, not some other boundary: {history}"
+    );
+
+    daemon.terminate();
+}
