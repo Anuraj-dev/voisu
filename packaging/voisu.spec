@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.7.0
+Version:        0.8.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,28 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Tue Jul 28 2026 Voisu maintainers <voisu@example.invalid> - 0.8.0-1
+- test(core): pin the outro narrowing and the wordless invariant through the contraction arm
+- refactor(core): delete the lexical-difference override; the Groq default always wins
+- fix(core): a wordless source transcript is never delivered while a sibling heard words
+- test(core): RED - a wordless source transcript is delivered over heard words
+- fix(core): narrow the outro anchor back to final-sentence-start or text-end
+- fix(core): catch unpunctuated outros and stop refusing all-stopword dictations
+- fix(core): asymmetric misheard spans must be vouched for by a dictionary term
+- fix(core): anchor hallucinated outros to the final sentence and true up two guard comments
+- fix(core): refuse all-stopword repairs, record delivered contractions, honor the longer-source rule 
+- fix(core): decide lexically different near-identical pairs by a single misheard-span rule
+- style(core): wrap the dictionary-term lookup chain
+- test(core): pin that a misheard dictionary term cannot smuggle out an adjacent negation
+- fix(core): anchor the meta-reasoning trigger and restore a floor repair cannot lose a dictation to
+- feat(core): widen near-identical selection to lexically different Source Transcripts
+- fix(core): scope the contraction floor to the merge and stop the merge arbitrating its own rejection
+- test(core): prevent formatting-driven padding wins
+- fix(core): cap sentence boundary credit
+- fix(core): normalize linguistic contractions
+- test(core): enforce formatting comparator fixtures
+- fix(core): filter contraction fallback sources
+
 * Mon Jul 27 2026 Voisu maintainers <voisu@example.invalid> - 0.7.0-1
 - style(capture): keep the one-line notice assertions as rustfmt writes them
 - refactor(daemon): rename publish_trigger_outcome to publish_terminal_outcome
