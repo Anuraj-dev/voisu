@@ -345,6 +345,13 @@ pub struct Response {
     pub overlay_event: Option<OverlayEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level_frames: Option<Vec<LevelFrame>>,
+    /// Milliseconds of headroom left before the Recording Deadline stops the
+    /// live Recording, or `None` when nothing is recording. Presentation only:
+    /// the Deadline is enforced by capture against its own clock, and this
+    /// value exists so the Overlay can warn the user before the cut without
+    /// holding a second copy of the limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_remaining_ms: Option<u64>,
 }
 
 /// One transport page of a serialized diagnostic history or export.
@@ -425,6 +432,7 @@ impl Response {
             diagnostic_page: None,
             overlay_event: None,
             level_frames: None,
+            recording_remaining_ms: None,
         }
     }
 

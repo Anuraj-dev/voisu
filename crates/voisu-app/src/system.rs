@@ -2698,6 +2698,17 @@ pub fn recording_deadline_override_notice(raw: Option<String>) -> Option<String>
     })
 }
 
+/// The Recording Deadline this process will enforce, resolved exactly the way
+/// capture resolves it (same function, same environment). The daemon reports
+/// the remaining headroom against this so the Overlay can warn before the cut.
+///
+/// Read-only: this decides nothing and stops nothing. Capture still enforces
+/// the Deadline against its own start instant — this is the one ceiling being
+/// reported, not a second one being applied.
+pub fn recording_deadline() -> Duration {
+    resolve_recording_maximum(std::env::var("VOISU_RECORDING_DEADLINE_MS").ok()).deadline
+}
+
 /// Resolve the Recording maximum from the raw `VOISU_RECORDING_DEADLINE_MS`
 /// value. An override wins up to [`MAX_RECORDING_DURATION`]; absent, zero or
 /// unparseable uses [`DEFAULT_RECORDING_DEADLINE`], and an over-long override

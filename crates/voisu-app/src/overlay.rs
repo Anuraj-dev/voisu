@@ -513,6 +513,18 @@ pub fn limit_warning_at(elapsed: Duration, ceiling: Duration) -> Option<LimitWar
     limit_warning_for_remaining(Some(ceiling.saturating_sub(elapsed)))
 }
 
+/// The headroom the daemon reported on this status reply, if it was Recording.
+/// A daemon too old to know the field simply reports nothing, which reads as
+/// "no warning" rather than as a warning at zero.
+pub fn recording_remaining(response: &Response) -> Option<Duration> {
+    response.recording_remaining_ms.map(Duration::from_millis)
+}
+
+/// The warning stage implied by a status reply.
+pub fn limit_warning_from_response(response: &Response) -> Option<LimitWarning> {
+    limit_warning_for_remaining(recording_remaining(response))
+}
+
 /// The notification body for a warning stage.
 pub const fn limit_warning_body(warning: LimitWarning) -> &'static str {
     match warning {
@@ -1560,6 +1572,23 @@ mod tests {
             latch.observe(recording(), Some(LimitWarning::Approaching)),
             Some(LimitWarning::Approaching)
         );
+    }
+
+    #[test]
+    fn a_status_reply_without_headroom_is_never_a_warning() {
+        // Idle, and any daemon that predates the field, report nothing. The
+        // absent field must read as "no warning", not as zero headroom.
+        let idle = overlay_status(DaemonState::Idle, None);
+        assert_eq!(recording_remaining(&idle), None);
+        assert_eq!(limit_warning_from_response(&idle), None);
+        let mut recording = recording_response();
+        recording.recording_remaining_ms = Some(120_000);
+        assert_eq!(recording_remaining(&recording), Some(Duration::from_secs(120)));
+        assert_eq!(limit_warning_from_response(&recording), None);
+        recording.recording_remaining_ms = Some(45_000);
+        assert_eq!(limit_warning_from_response(&recording), Some(LimitWarning::Approaching));
+        recording.recording_remaining_ms = Some(4_000);
+        assert_eq!(limit_warning_from_response(&recording), Some(LimitWarning::Final));
     }
 
     #[test]

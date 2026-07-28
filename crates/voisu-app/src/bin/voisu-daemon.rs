@@ -477,6 +477,11 @@ struct ActiveRecording {
     first_chunk_ms: Arc<AtomicU64>,
     level_ring: Arc<LevelRing>,
     started_at: Instant,
+    /// The Recording Deadline resolved for this Recording, kept only so the
+    /// observer path can report remaining headroom. Capture enforces the
+    /// Deadline itself against its own start instant; nothing here stops
+    /// anything.
+    deadline: Duration,
     evidence: LifecycleEvidence,
 }
 
@@ -1078,6 +1083,7 @@ async fn actor_loop(
                                 first_chunk_ms,
                                 level_ring,
                                 started_at,
+                                deadline: voisu_app::system::recording_deadline(),
                                 evidence,
                             });
                             let _ = reply.send(Response::success(
@@ -1499,7 +1505,7 @@ fn overlay_status_response(state: &ActorState, event: Option<&OverlayEvent>) -> 
 
 fn status_response_with_feedback(state: &ActorState) -> Response {
     let daemon_state = state_label(state);
-    Response::with_evidence(
+    let mut response = Response::with_evidence(
         true,
         Some(daemon_state),
         daemon_state.cli_label(),
@@ -1516,7 +1522,20 @@ fn status_response_with_feedback(state: &ActorState) -> Response {
             | ActorState::Recovering(_)
             | ActorState::Replaying(_) => None,
         },
-    )
+    );
+    // Presentation-only headroom for the Overlay's approaching-limit warnings.
+    // Saturating, so a Recording already past its Deadline (the stop is in
+    // flight) reports zero rather than wrapping.
+    if let ActorState::Recording(recording) = state {
+        response.recording_remaining_ms = Some(
+            recording
+                .deadline
+                .saturating_sub(recording.started_at.elapsed())
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+        );
+    }
+    response
 }
 
 /// Retain a terminal outcome for the observer path only. Lifecycle-command
@@ -1904,6 +1923,7 @@ async fn process_recording(
         first_chunk_ms,
         level_ring: _,
         started_at,
+        deadline: _,
         mut evidence,
     } = recording;
     let _ = stop_tx.send(());
