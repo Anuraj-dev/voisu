@@ -763,6 +763,27 @@ pub enum TickAction {
     },
 }
 
+/// Everything one poll observed, in a single value: what the capsule will
+/// render, what the daemon was actually seen to be, which Recording it is, and
+/// how close that Recording is to its Deadline.
+///
+/// Grouped so the pure seam reads as "one observation in, latched decisions
+/// out" instead of a wall of positional arguments — and so the adapter builds
+/// it once, where it reads the status reply, rather than carrying four loose
+/// values to the call.
+#[derive(Clone, Copy, Debug)]
+pub struct TickObservation<'a> {
+    /// What the capsule renders for this tick.
+    pub view: OverlayView,
+    /// What the daemon was observed to be. Deliberately separate from `view`:
+    /// a failed status read still renders something, but observes nothing.
+    pub signal: ObservedSignal,
+    /// Which Recording this tick is about, when one is running.
+    pub identity: Option<&'a str>,
+    /// The limit-warning stage implied by the reported headroom.
+    pub warning: Option<LimitWarning>,
+}
+
 /// Pure decision for a single poll tick, owning the ordering the adapter relied
 /// on implicitly. Crucially, a surface handoff detected AFTER `render_surface`
 /// (`switched_after_render`) yields `Break` BEFORE the tracker or latch observe
@@ -772,15 +793,13 @@ pub enum TickAction {
 pub fn poll_tick(
     switched_after_render: bool,
     is_fallback: bool,
-    view: OverlayView,
-    signal: ObservedSignal,
-    identity: Option<&str>,
-    warning: Option<LimitWarning>,
+    observation: TickObservation<'_>,
     tracker: &mut PresentationTracker,
     notify_latch: &mut RecordingNotifyLatch,
     no_speech_latch: &mut NoSpeechNotifyLatch,
     limit_latch: &mut LimitWarningLatch,
 ) -> TickAction {
+    let TickObservation { view, signal, identity, warning } = observation;
     if switched_after_render {
         return TickAction::Break;
     }
@@ -1320,10 +1339,12 @@ mod tests {
         let action = poll_tick(
             true,
             true,
-            OverlayView::HIDDEN,
-            ObservedSignal::Reachable(OverlayPhase::Hidden),
-            None,
-            None,
+            TickObservation {
+                view: OverlayView::HIDDEN,
+                signal: ObservedSignal::Reachable(OverlayPhase::Hidden),
+                identity: None,
+                warning: None,
+            },
             &mut tracker,
             &mut latch,
             &mut no_speech_latch,
@@ -1354,7 +1375,9 @@ mod tests {
         let mut limit_latch = LimitWarningLatch::default();
         assert_eq!(
             poll_tick(
-                false, true, recording, signal, None, None,
+                false,
+                true,
+                TickObservation { view: recording, signal, identity: None, warning: None },
                 &mut tracker, &mut latch, &mut no_speech_latch, &mut limit_latch,
             ),
             TickAction::Continue {
@@ -1368,7 +1391,9 @@ mod tests {
         let mut limit_latch = LimitWarningLatch::default();
         assert_eq!(
             poll_tick(
-                false, false, recording, signal, None, None,
+                false,
+                false,
+                TickObservation { view: recording, signal, identity: None, warning: None },
                 &mut tracker, &mut latch, &mut no_speech_latch, &mut limit_latch,
             ),
             TickAction::Continue {
@@ -1417,11 +1442,14 @@ mod tests {
         let view = OverlayView::no_speech();
         // is_fallback == false is the layer-shell path: recording-notify stays
         // fallback-only, but the no-speech explanation must fire on BOTH paths.
+        let observation = TickObservation {
+            view,
+            signal: ObservedSignal::Reachable(OverlayPhase::NoSpeech),
+            identity: None,
+            warning: None,
+        };
         let action = poll_tick(
-            false, false, view,
-            ObservedSignal::Reachable(OverlayPhase::NoSpeech),
-            None,
-            None,
+            false, false, observation,
             &mut tracker, &mut notify_latch, &mut no_speech_latch, &mut limit_latch,
         );
         assert_eq!(
@@ -1432,10 +1460,7 @@ mod tests {
         );
         // Break still wins over everything and consumes no latch state.
         let action = poll_tick(
-            true, false, view,
-            ObservedSignal::Reachable(OverlayPhase::NoSpeech),
-            None,
-            None,
+            true, false, observation,
             &mut tracker, &mut notify_latch, &mut no_speech_latch, &mut limit_latch,
         );
         assert_eq!(action, TickAction::Break);
@@ -1874,7 +1899,9 @@ mod tests {
                 .chain(std::iter::repeat_n(Some(LimitWarning::Final), 20))
             {
                 match poll_tick(
-                    false, is_fallback, view, signal, None, warning,
+                    false,
+                    is_fallback,
+                    TickObservation { view, signal, identity: None, warning },
                     &mut tracker, &mut notify_latch, &mut no_speech_latch, &mut limit_latch,
                 ) {
                     TickAction::Continue { notify_limit, .. } => announced.extend(notify_limit),

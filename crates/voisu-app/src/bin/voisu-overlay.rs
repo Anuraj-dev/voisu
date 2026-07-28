@@ -27,7 +27,7 @@ use voisu_app::overlay::{
     resting_floor, sweep_brightness, BarSmoother, LevelPollAction,
     LevelPollLatch, LimitWarning, LimitWarningLatch, NoSpeechNotifyLatch, VISUAL_BAR_COUNT,
     ObservedSignal, OverlayPhase, OverlayView, PresentationController, PresentationTracker,
-    RecordingNotifyLatch, RungNotification, TickAction, LIMIT_WARNING_CLASS,
+    RecordingNotifyLatch, RungNotification, TickAction, TickObservation, LIMIT_WARNING_CLASS,
 };
 use voisu_core::{Command, Request, Response, socket_path};
 
@@ -310,22 +310,20 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         .map(|settings| !settings.is_gtk_enable_animations())
         .unwrap_or(true);
     let sweep_started = Instant::now();
-    let rendered_phase = Rc::new(Cell::new(OverlayPhase::Hidden));
-    // The warning stage the meter is currently painted for. Held next to the
-    // phase because the draw func runs on GTK's schedule, not the poll's.
-    let rendered_warning = Rc::new(Cell::new(None::<LimitWarning>));
+    // What the meter is currently painted for. One cell, not two: the phase and
+    // its warning stage are always set together, and the draw func runs on
+    // GTK's schedule rather than the poll's, so it must never see a half-update.
+    let rendered = Rc::new(Cell::new(MeterState::HIDDEN));
     meter.set_draw_func({
         let rendered_bars = Rc::clone(&rendered_bars);
-        let rendered_phase = Rc::clone(&rendered_phase);
-        let rendered_warning = Rc::clone(&rendered_warning);
+        let rendered = Rc::clone(&rendered);
         move |_, context, width, height| {
             draw_meter(
                 context,
                 width,
                 height,
                 &rendered_bars.borrow(),
-                rendered_phase.get(),
-                rendered_warning.get(),
+                rendered.get(),
                 sweep_started,
                 reduced_motion,
             );
@@ -379,8 +377,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         meter,
         glyph,
         rendered_bars,
-        rendered_phase,
-        rendered_warning,
+        rendered,
         capsule,
         switched,
     );
@@ -396,8 +393,7 @@ fn install_surface_feedback(
     meter: gtk::DrawingArea,
     glyph: gtk::Label,
     rendered_bars: Rc<RefCell<[u8; 20]>>,
-    rendered_phase: Rc<Cell<OverlayPhase>>,
-    rendered_warning: Rc<Cell<Option<LimitWarning>>>,
+    rendered: Rc<Cell<MeterState>>,
     capsule: gtk::Box,
     switched: Rc<Cell<bool>>,
 ) {
@@ -451,7 +447,10 @@ fn install_surface_feedback(
             ),
         };
         render_surface(
-            &window, &label, &meter, &glyph, &capsule, &rendered_phase, &rendered_warning, view,
+            CapsuleSurface { window: &window, label: &label, meter: &meter, glyph: &glyph,
+                container: &capsule },
+            &rendered,
+            view,
             warning,
         );
         if view.phase == OverlayPhase::Processing {
@@ -486,10 +485,7 @@ fn install_surface_feedback(
         match poll_tick(
             switched.get(),
             is_fallback,
-            view,
-            signal,
-            identity.as_deref(),
-            warning,
+            TickObservation { view, signal, identity: identity.as_deref(), warning },
             &mut tracker.borrow_mut(),
             &mut notify_latch.borrow_mut(),
             &mut no_speech_latch.borrow_mut(),
@@ -816,17 +812,35 @@ async fn notify_call(
     }
 }
 
+/// The capsule's widget set, grouped so rendering one tick reads as "this
+/// surface, this state" rather than a positional list of five widgets.
+struct CapsuleSurface<'a> {
+    window: &'a gtk::ApplicationWindow,
+    label: &'a gtk::Label,
+    meter: &'a gtk::DrawingArea,
+    glyph: &'a gtk::Label,
+    container: &'a gtk::Box,
+}
+
+/// What the meter paints for: the phase, and how close its Recording is to the
+/// Deadline. The two always change together, so they travel together.
+#[derive(Clone, Copy, Debug)]
+struct MeterState {
+    phase: OverlayPhase,
+    warning: Option<LimitWarning>,
+}
+
+impl MeterState {
+    const HIDDEN: Self = Self { phase: OverlayPhase::Hidden, warning: None };
+}
+
 fn render_surface(
-    window: &gtk::ApplicationWindow,
-    label: &gtk::Label,
-    meter: &gtk::DrawingArea,
-    glyph: &gtk::Label,
-    capsule: &gtk::Box,
-    rendered_phase: &Cell<OverlayPhase>,
-    rendered_warning: &Cell<Option<LimitWarning>>,
+    surface: CapsuleSurface<'_>,
+    rendered: &Cell<MeterState>,
     view: OverlayView,
     warning: Option<LimitWarning>,
 ) {
+    let CapsuleSurface { window, label, meter, glyph, container: capsule } = surface;
     for class in ["recording", "processing", "success", "failure", "nospeech", LIMIT_WARNING_CLASS]
     {
         capsule.remove_css_class(class);
@@ -848,8 +862,7 @@ fn render_surface(
     if let Some(warn_class) = limit_warning_class(warning) {
         capsule.add_css_class(warn_class);
     }
-    rendered_phase.set(view.phase);
-    rendered_warning.set(warning);
+    rendered.set(MeterState { phase: view.phase, warning });
     if view.phase == OverlayPhase::Hidden {
         window.set_visible(false);
         return;
@@ -963,11 +976,11 @@ fn draw_meter(
     width: i32,
     height: i32,
     bands: &[u8; 20],
-    phase: OverlayPhase,
-    warning: Option<LimitWarning>,
+    state: MeterState,
     sweep_started: Instant,
     reduced_motion: bool,
 ) {
+    let MeterState { phase, warning } = state;
     let centre = f64::from(height) / 2.0;
     // content_height 40 minus a 2px inset -> 38px drawable (floor 3.8, max swing 34.2).
     let drawable = f64::from(height) - 2.0;
