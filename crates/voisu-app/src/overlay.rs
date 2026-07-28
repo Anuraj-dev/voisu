@@ -525,6 +525,31 @@ pub fn limit_warning_from_response(response: &Response) -> Option<LimitWarning> 
     limit_warning_for_remaining(recording_remaining(response))
 }
 
+/// The Recording meter's bar colour, amber once the limit is approaching. Both
+/// warning stages keep the amber bars; the final stage only adds the border.
+pub const RECORDING_BAR_RGB: (f64, f64, f64) = (0.949, 0.949, 0.949);
+/// The same amber the NoSpeech capsule uses (#FFB454) — one warm accent, not a
+/// second palette.
+pub const LIMIT_WARNING_BAR_RGB: (f64, f64, f64) = (1.0, 0.706, 0.329);
+
+/// Bar colour for a Recording at a given warning stage.
+pub fn recording_bar_rgb(warning: Option<LimitWarning>) -> (f64, f64, f64) {
+    match warning {
+        Some(_) => LIMIT_WARNING_BAR_RGB,
+        None => RECORDING_BAR_RGB,
+    }
+}
+
+/// The CSS class carrying the red warn border.
+pub const LIMIT_WARNING_CLASS: &str = "limitwarn";
+
+/// The capsule's warn-border class for a warning stage. Only the final stage
+/// earns the border: an amber-bar minute followed by a border at ten seconds is
+/// an escalation, whereas bordering both stages would flatten them into one.
+pub fn limit_warning_class(warning: Option<LimitWarning>) -> Option<&'static str> {
+    matches!(warning, Some(LimitWarning::Final)).then_some(LIMIT_WARNING_CLASS)
+}
+
 /// The notification body for a warning stage.
 pub const fn limit_warning_body(warning: LimitWarning) -> &'static str {
     match warning {
@@ -588,9 +613,14 @@ impl LimitWarningLatch {
 pub enum TickAction {
     /// Stop driving the window this tick and break the poll loop.
     Break,
-    /// Keep polling; `resurface`/`notify`/`notify_no_speech` say which side
-    /// effects to run.
-    Continue { resurface: bool, notify: bool, notify_no_speech: bool },
+    /// Keep polling; `resurface`/`notify`/`notify_no_speech`/`notify_limit`
+    /// say which side effects to run.
+    Continue {
+        resurface: bool,
+        notify: bool,
+        notify_no_speech: bool,
+        notify_limit: Option<LimitWarning>,
+    },
 }
 
 /// Pure decision for a single poll tick, owning the ordering the adapter relied
@@ -604,20 +634,31 @@ pub fn poll_tick(
     is_fallback: bool,
     view: OverlayView,
     signal: ObservedSignal,
+    warning: Option<LimitWarning>,
     tracker: &mut PresentationTracker,
     notify_latch: &mut RecordingNotifyLatch,
     no_speech_latch: &mut NoSpeechNotifyLatch,
+    limit_latch: &mut LimitWarningLatch,
 ) -> TickAction {
     if switched_after_render {
         return TickAction::Break;
     }
     let notify_no_speech = no_speech_latch.observe(signal);
+    // Fires on BOTH windowed paths, for the same reason NoSpeech does: on
+    // layer-shell the capsule sits at the screen edge and the colour change
+    // alone can be missed, and this warning has a deadline attached.
+    let notify_limit = limit_latch.observe(signal, warning);
     if !is_fallback {
-        return TickAction::Continue { resurface: false, notify: false, notify_no_speech };
+        return TickAction::Continue {
+            resurface: false,
+            notify: false,
+            notify_no_speech,
+            notify_limit,
+        };
     }
     let resurface = tracker.observe(view);
     let notify = notify_latch.observe(signal);
-    TickAction::Continue { resurface, notify, notify_no_speech }
+    TickAction::Continue { resurface, notify, notify_no_speech, notify_limit }
 }
 
 #[cfg(test)]
@@ -1127,6 +1168,7 @@ mod tests {
         let mut tracker = PresentationTracker::default();
         let mut latch = RecordingNotifyLatch::default();
         let mut no_speech_latch = NoSpeechNotifyLatch::default();
+        let mut limit_latch = LimitWarningLatch::default();
         // Prime both to a known state: tracker's last_phase = Recording, latch latched.
         assert!(tracker.observe(recording));
         assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)));
@@ -1139,9 +1181,11 @@ mod tests {
             true,
             OverlayView::HIDDEN,
             ObservedSignal::Reachable(OverlayPhase::Hidden),
+            None,
             &mut tracker,
             &mut latch,
             &mut no_speech_latch,
+            &mut limit_latch,
         );
         assert_eq!(action, TickAction::Break);
 
@@ -1152,6 +1196,8 @@ mod tests {
         // proves poll_tick broke before touching either.
         assert!(!tracker.observe(recording));
         assert!(!latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)));
+        // Same for the limit latch: a Break tick must not consume a warning.
+        assert_eq!(limit_latch.fired(), None);
     }
 
     #[test]
@@ -1163,17 +1209,29 @@ mod tests {
         let mut tracker = PresentationTracker::default();
         let mut latch = RecordingNotifyLatch::default();
         let mut no_speech_latch = NoSpeechNotifyLatch::default();
+        let mut limit_latch = LimitWarningLatch::default();
         assert_eq!(
-            poll_tick(false, true, recording, signal, &mut tracker, &mut latch, &mut no_speech_latch),
-            TickAction::Continue { resurface: true, notify: true, notify_no_speech: false },
+            poll_tick(
+                false, true, recording, signal, None,
+                &mut tracker, &mut latch, &mut no_speech_latch, &mut limit_latch,
+            ),
+            TickAction::Continue {
+                resurface: true, notify: true, notify_no_speech: false, notify_limit: None,
+            },
         );
         // The layer-shell (non-fallback) path never resurfaces or notifies here.
         let mut tracker = PresentationTracker::default();
         let mut latch = RecordingNotifyLatch::default();
         let mut no_speech_latch = NoSpeechNotifyLatch::default();
+        let mut limit_latch = LimitWarningLatch::default();
         assert_eq!(
-            poll_tick(false, false, recording, signal, &mut tracker, &mut latch, &mut no_speech_latch),
-            TickAction::Continue { resurface: false, notify: false, notify_no_speech: false },
+            poll_tick(
+                false, false, recording, signal, None,
+                &mut tracker, &mut latch, &mut no_speech_latch, &mut limit_latch,
+            ),
+            TickAction::Continue {
+                resurface: false, notify: false, notify_no_speech: false, notify_limit: None,
+            },
         );
     }
 
@@ -1213,20 +1271,28 @@ mod tests {
         let mut tracker = PresentationTracker::default();
         let mut notify_latch = RecordingNotifyLatch::default();
         let mut no_speech_latch = NoSpeechNotifyLatch::default();
+        let mut limit_latch = LimitWarningLatch::default();
         let view = OverlayView::no_speech();
         // is_fallback == false is the layer-shell path: recording-notify stays
         // fallback-only, but the no-speech explanation must fire on BOTH paths.
         let action = poll_tick(
             false, false, view,
             ObservedSignal::Reachable(OverlayPhase::NoSpeech),
-            &mut tracker, &mut notify_latch, &mut no_speech_latch,
+            None,
+            &mut tracker, &mut notify_latch, &mut no_speech_latch, &mut limit_latch,
         );
-        assert_eq!(action, TickAction::Continue { resurface: false, notify: false, notify_no_speech: true });
+        assert_eq!(
+            action,
+            TickAction::Continue {
+                resurface: false, notify: false, notify_no_speech: true, notify_limit: None,
+            },
+        );
         // Break still wins over everything and consumes no latch state.
         let action = poll_tick(
             true, false, view,
             ObservedSignal::Reachable(OverlayPhase::NoSpeech),
-            &mut tracker, &mut notify_latch, &mut no_speech_latch,
+            None,
+            &mut tracker, &mut notify_latch, &mut no_speech_latch, &mut limit_latch,
         );
         assert_eq!(action, TickAction::Break);
     }
@@ -1589,6 +1655,48 @@ mod tests {
         assert_eq!(limit_warning_from_response(&recording), Some(LimitWarning::Approaching));
         recording.recording_remaining_ms = Some(4_000);
         assert_eq!(limit_warning_from_response(&recording), Some(LimitWarning::Final));
+    }
+
+    #[test]
+    fn poll_tick_announces_a_limit_warning_once_on_both_windowed_paths() {
+        for is_fallback in [false, true] {
+            let mut tracker = PresentationTracker::default();
+            let mut notify_latch = RecordingNotifyLatch::default();
+            let mut no_speech_latch = NoSpeechNotifyLatch::default();
+            let mut limit_latch = LimitWarningLatch::default();
+            let view = OverlayView::from_response(&recording_response());
+            let signal = recording();
+            let mut announced = Vec::new();
+            // Twenty ticks inside the approaching window, then twenty inside
+            // the final one — the cadence a live 200 ms poll would produce.
+            for warning in std::iter::repeat_n(Some(LimitWarning::Approaching), 20)
+                .chain(std::iter::repeat_n(Some(LimitWarning::Final), 20))
+            {
+                match poll_tick(
+                    false, is_fallback, view, signal, warning,
+                    &mut tracker, &mut notify_latch, &mut no_speech_latch, &mut limit_latch,
+                ) {
+                    TickAction::Continue { notify_limit, .. } => announced.extend(notify_limit),
+                    TickAction::Break => unreachable!("no handoff in this test"),
+                }
+            }
+            assert_eq!(
+                announced,
+                vec![LimitWarning::Approaching, LimitWarning::Final],
+                "is_fallback={is_fallback}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_capsule_turns_amber_for_both_stages_and_borders_only_at_the_final_one() {
+        assert_eq!(recording_bar_rgb(None), RECORDING_BAR_RGB);
+        assert_eq!(recording_bar_rgb(Some(LimitWarning::Approaching)), LIMIT_WARNING_BAR_RGB);
+        // Amber bars are RETAINED at the final stage; the border is additive.
+        assert_eq!(recording_bar_rgb(Some(LimitWarning::Final)), LIMIT_WARNING_BAR_RGB);
+        assert_eq!(limit_warning_class(None), None);
+        assert_eq!(limit_warning_class(Some(LimitWarning::Approaching)), None);
+        assert_eq!(limit_warning_class(Some(LimitWarning::Final)), Some(LIMIT_WARNING_CLASS));
     }
 
     #[test]

@@ -21,11 +21,12 @@ use voisu_app::feedback::{
     FeedbackDegradation, FeedbackSelection, OverlayRestartPolicy, SessionKind,
 };
 use voisu_app::overlay::{
-    edge_falloff_alpha, interpolate_bands, phase_glyph, poll_tick, recording_bar_height,
-    resting_floor, sweep_brightness, BarSmoother, LevelPollAction, LevelPollLatch,
-    NoSpeechNotifyLatch, VISUAL_BAR_COUNT,
+    edge_falloff_alpha, interpolate_bands, limit_warning_body, limit_warning_class,
+    limit_warning_from_response, phase_glyph, poll_tick, recording_bar_height,
+    recording_bar_rgb, resting_floor, sweep_brightness, BarSmoother, LevelPollAction,
+    LevelPollLatch, LimitWarning, LimitWarningLatch, NoSpeechNotifyLatch, VISUAL_BAR_COUNT,
     ObservedSignal, OverlayPhase, OverlayView, PresentationController, PresentationTracker,
-    RecordingNotifyLatch, TickAction,
+    RecordingNotifyLatch, TickAction, LIMIT_WARNING_CLASS,
 };
 use voisu_core::{Command, Request, Response, socket_path};
 
@@ -309,9 +310,13 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         .unwrap_or(true);
     let sweep_started = Instant::now();
     let rendered_phase = Rc::new(Cell::new(OverlayPhase::Hidden));
+    // The warning stage the meter is currently painted for. Held next to the
+    // phase because the draw func runs on GTK's schedule, not the poll's.
+    let rendered_warning = Rc::new(Cell::new(None::<LimitWarning>));
     meter.set_draw_func({
         let rendered_bars = Rc::clone(&rendered_bars);
         let rendered_phase = Rc::clone(&rendered_phase);
+        let rendered_warning = Rc::clone(&rendered_warning);
         move |_, context, width, height| {
             draw_meter(
                 context,
@@ -319,6 +324,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
                 height,
                 &rendered_bars.borrow(),
                 rendered_phase.get(),
+                rendered_warning.get(),
                 sweep_started,
                 reduced_motion,
             );
@@ -348,7 +354,8 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
          .capsule.success .state-label, .capsule.success .meter { color: #65D6A0; font-size: 14pt; }
          .capsule.failure { border: 1px solid rgba(255, 138, 138, 0.9); box-shadow: 0 0 8px rgba(255, 138, 138, 0.35); }
          .capsule.failure .state-label, .capsule.failure .meter { color: #FF8A8A; }
-         .capsule.nospeech .state-label, .capsule.nospeech .meter { color: #FFB454; }",
+         .capsule.nospeech .state-label, .capsule.nospeech .meter { color: #FFB454; }
+         .capsule.limitwarn { border: 1px solid rgba(255, 138, 138, 0.9); box-shadow: 0 0 8px rgba(255, 138, 138, 0.35); }",
     );
     capsule.add_css_class("capsule");
     gtk::style_context_add_provider_for_display(
@@ -372,6 +379,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         glyph,
         rendered_bars,
         rendered_phase,
+        rendered_warning,
         capsule,
         switched,
     );
@@ -388,6 +396,7 @@ fn install_surface_feedback(
     glyph: gtk::Label,
     rendered_bars: Rc<RefCell<[u8; 20]>>,
     rendered_phase: Rc<Cell<OverlayPhase>>,
+    rendered_warning: Rc<Cell<Option<LimitWarning>>>,
     capsule: gtk::Box,
     switched: Rc<Cell<bool>>,
 ) {
@@ -400,6 +409,7 @@ fn install_surface_feedback(
     let tracker = Rc::new(RefCell::new(PresentationTracker::default()));
     let notify_latch = Rc::new(RefCell::new(RecordingNotifyLatch::default()));
     let no_speech_latch = Rc::new(RefCell::new(NoSpeechNotifyLatch::default()));
+    let limit_latch = Rc::new(RefCell::new(LimitWarningLatch::default()));
     let level_latch = Rc::new(RefCell::new(LevelPollLatch::default()));
     let level_poll = Rc::new(RefCell::new(None::<(gtk::glib::SourceId, Rc<LevelWorker>)>));
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
@@ -417,17 +427,24 @@ fn install_surface_feedback(
         // from the rendered phase: a failed status read renders an unavailable
         // capsule but is not a reachable observation, so it must not disturb the
         // Recording notification latch.
-        let (view, signal) = match read_status() {
+        let (view, signal, warning) = match read_status() {
             Some(response) => {
                 let view = controller.borrow_mut().observe(&response, now);
-                (view, ObservedSignal::Reachable(view.phase))
+                // Headroom is read off the same reply the phase came from, so
+                // the capsule can never be amber for a Recording that already
+                // ended.
+                (view, ObservedSignal::Reachable(view.phase), limit_warning_from_response(&response))
             }
             None => (
                 controller.borrow_mut().observe_unreachable(now),
                 ObservedSignal::Unreachable,
+                None,
             ),
         };
-        render_surface(&window, &label, &meter, &glyph, &capsule, &rendered_phase, view);
+        render_surface(
+            &window, &label, &meter, &glyph, &capsule, &rendered_phase, &rendered_warning, view,
+            warning,
+        );
         if view.phase == OverlayPhase::Processing {
             meter.queue_draw();
         }
@@ -462,9 +479,11 @@ fn install_surface_feedback(
             is_fallback,
             view,
             signal,
+            warning,
             &mut tracker.borrow_mut(),
             &mut notify_latch.borrow_mut(),
             &mut no_speech_latch.borrow_mut(),
+            &mut limit_latch.borrow_mut(),
         ) {
             TickAction::Break => {
                 if let Some((source, worker)) = level_poll.borrow_mut().take() {
@@ -473,7 +492,7 @@ fn install_surface_feedback(
                 }
                 gtk::glib::ControlFlow::Break
             }
-            TickAction::Continue { resurface, notify, notify_no_speech } => {
+            TickAction::Continue { resurface, notify, notify_no_speech, notify_limit } => {
                 // Wayland denies a plain toplevel keep-above; re-present it on
                 // each transition into a visible phase to resurface above
                 // occluders.
@@ -494,6 +513,15 @@ fn install_surface_feedback(
                     notification.set_body(Some(OverlayView::no_speech().visible_label));
                     application.send_notification(Some("overlay-nospeech"), &notification);
                 }
+                // Approaching-limit warning. Same fire-and-forget contract as
+                // the notifications above: it cannot fail into, block, or
+                // otherwise touch the Recording's delivery, which the daemon
+                // owns and which this process only observes.
+                if let Some(warning) = notify_limit {
+                    let notification = gtk::gio::Notification::new("Voisu");
+                    notification.set_body(Some(limit_warning_body(warning)));
+                    application.send_notification(Some("overlay-limit"), &notification);
+                }
                 gtk::glib::ControlFlow::Continue
             }
         }
@@ -509,8 +537,15 @@ fn run_notification_feedback(selection: FeedbackSelection) -> i32 {
     let mut controller = PresentationController::default();
     let mut previous_phase = OverlayView::HIDDEN.phase;
     let mut no_speech_latch = NoSpeechNotifyLatch::default();
+    let mut limit_latch = LimitWarningLatch::default();
     loop {
-        notification_tick(&mut controller, &mut previous_phase, &mut no_speech_latch, &notifier);
+        notification_tick(
+            &mut controller,
+            &mut previous_phase,
+            &mut no_speech_latch,
+            &mut limit_latch,
+            &notifier,
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
 }
@@ -529,12 +564,14 @@ fn install_notification_feedback(application: &gtk::Application) {
     let controller = Rc::new(RefCell::new(PresentationController::default()));
     let previous_phase = Rc::new(RefCell::new(OverlayView::HIDDEN.phase));
     let no_speech_latch = Rc::new(RefCell::new(NoSpeechNotifyLatch::default()));
+    let limit_latch = Rc::new(RefCell::new(LimitWarningLatch::default()));
     gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
         let _hold = &hold;
         notification_tick(
             &mut controller.borrow_mut(),
             &mut previous_phase.borrow_mut(),
             &mut no_speech_latch.borrow_mut(),
+            &mut limit_latch.borrow_mut(),
             &notifier,
         );
         gtk::glib::ControlFlow::Continue
@@ -554,16 +591,22 @@ fn notification_tick(
     controller: &mut PresentationController,
     previous_phase: &mut OverlayPhase,
     no_speech_latch: &mut NoSpeechNotifyLatch,
+    limit_latch: &mut LimitWarningLatch,
     notifier: &Notifier,
 ) {
     let now = Instant::now();
-    let (view, signal) = match read_status() {
+    let (view, signal, warning) = match read_status() {
         Some(response) => {
             let view = controller.observe(&response, now);
-            (view, ObservedSignal::Reachable(view.phase))
+            (view, ObservedSignal::Reachable(view.phase), limit_warning_from_response(&response))
         }
-        None => (controller.observe_unreachable(now), ObservedSignal::Unreachable),
+        None => (controller.observe_unreachable(now), ObservedSignal::Unreachable, None),
     };
+    // This rung has no capsule to turn amber, so the notification is the whole
+    // warning. Latched exactly as on the windowed paths.
+    if let Some(warning) = limit_latch.observe(signal, warning) {
+        notifier.notify(limit_warning_body(warning));
+    }
     let fire_no_speech = no_speech_latch.observe(signal);
     if view.phase == OverlayPhase::NoSpeech {
         if fire_no_speech {
@@ -723,9 +766,12 @@ fn render_surface(
     glyph: &gtk::Label,
     capsule: &gtk::Box,
     rendered_phase: &Cell<OverlayPhase>,
+    rendered_warning: &Cell<Option<LimitWarning>>,
     view: OverlayView,
+    warning: Option<LimitWarning>,
 ) {
-    for class in ["recording", "processing", "success", "failure", "nospeech"] {
+    for class in ["recording", "processing", "success", "failure", "nospeech", LIMIT_WARNING_CLASS]
+    {
         capsule.remove_css_class(class);
     }
     let class = match view.phase {
@@ -739,7 +785,14 @@ fn render_surface(
     if !class.is_empty() {
         capsule.add_css_class(class);
     }
+    // The warn border rides on top of the phase class, and only while the phase
+    // it belongs to is still on screen.
+    let warning = (view.phase == OverlayPhase::Recording).then_some(warning).flatten();
+    if let Some(warn_class) = limit_warning_class(warning) {
+        capsule.add_css_class(warn_class);
+    }
     rendered_phase.set(view.phase);
+    rendered_warning.set(warning);
     if view.phase == OverlayPhase::Hidden {
         window.set_visible(false);
         return;
@@ -854,6 +907,7 @@ fn draw_meter(
     height: i32,
     bands: &[u8; 20],
     phase: OverlayPhase,
+    warning: Option<LimitWarning>,
     sweep_started: Instant,
     reduced_motion: bool,
 ) {
@@ -886,7 +940,9 @@ fn draw_meter(
                     drawable,
                 ),
                 edge_falloff_alpha(index, count),
-                (0.949, 0.949, 0.949), // #F2F2F2
+                // Amber from the moment the limit is approaching; the colour is
+                // decided purely in `overlay.rs` so it stays testable.
+                recording_bar_rgb(warning),
             ),
             OverlayPhase::Processing => (
                 resting_floor(drawable),
