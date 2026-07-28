@@ -217,10 +217,9 @@ fn default_retention_fills_the_count_bound_from_a_week_of_recordings() {
     // the consequence: feeding a week of Recordings in, the count bound — not
     // the age bound — is what trims, and >= 200 records are retained spanning
     // far more than a day. Time is injected, never slept on.
-    assert!(
-        DEFAULT_MAX_RECORDS >= 200,
-        "the count bound must retain at least 200 Recordings, got {DEFAULT_MAX_RECORDS}"
-    );
+    // Compile-time pin (clippy: assertions_on_constants forbids the runtime
+    // form): the count bound must retain at least 200 Recordings.
+    const { assert!(DEFAULT_MAX_RECORDS >= 200) };
     assert!(
         DEFAULT_MAX_AGE >= Duration::from_secs(7 * 24 * 3600),
         "the age bound must retain at least seven days, got {DEFAULT_MAX_AGE:?}"
