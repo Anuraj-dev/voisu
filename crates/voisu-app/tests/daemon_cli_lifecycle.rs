@@ -8559,8 +8559,11 @@ fn diagnostics_are_retained_in_the_private_durable_state_directory() {
     let _daemon = Daemon::start_with_env(
         runtime.path(),
         &[
+            // Identical stub transcripts: this test pins WHERE the record is
+            // retained, so it must not also depend on which sibling the
+            // selection policy prefers when the texts differ.
             ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Retain this dictation."),
-            ("VOISU_TEST_GROQ_TRANSCRIPT", "Retain this dictation"),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Retain this dictation."),
         ],
     );
 
@@ -8601,7 +8604,7 @@ fn diagnostics_are_retained_in_the_private_durable_state_directory() {
     let output = voisu_with_env(runtime.path(), &["history", "--json"], &[]);
     assert!(output.status.success(), "{}", stderr(&output));
     let records: Value = serde_json::from_str(&stdout(&output)).unwrap();
-    assert_eq!(records[0]["final_transcript"], "Retain this dictation");
+    assert_eq!(records[0]["final_transcript"], "Retain this dictation.");
 }
 
 #[test]
