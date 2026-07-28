@@ -21,12 +21,13 @@ use voisu_app::feedback::{
     FeedbackDegradation, FeedbackSelection, OverlayRestartPolicy, SessionKind,
 };
 use voisu_app::overlay::{
-    edge_falloff_alpha, interpolate_bands, limit_warning_body, limit_warning_class,
-    limit_warning_from_response, phase_glyph, poll_tick, recording_bar_height, recording_identity,
-    recording_bar_rgb, resting_floor, sweep_brightness, BarSmoother, LevelPollAction,
+    edge_falloff_alpha, interpolate_bands, limit_notification_body, limit_warning_class,
+    limit_warning_from_response, notification_rung_choice, phase_glyph, poll_tick,
+    recording_bar_height, recording_identity, recording_bar_rgb, recording_remaining,
+    resting_floor, sweep_brightness, BarSmoother, LevelPollAction,
     LevelPollLatch, LimitWarning, LimitWarningLatch, NoSpeechNotifyLatch, VISUAL_BAR_COUNT,
     ObservedSignal, OverlayPhase, OverlayView, PresentationController, PresentationTracker,
-    RecordingNotifyLatch, TickAction, LIMIT_WARNING_CLASS,
+    RecordingNotifyLatch, RungNotification, TickAction, LIMIT_WARNING_CLASS,
 };
 use voisu_core::{Command, Request, Response, socket_path};
 
@@ -427,7 +428,7 @@ fn install_surface_feedback(
         // from the rendered phase: a failed status read renders an unavailable
         // capsule but is not a reachable observation, so it must not disturb the
         // Recording notification latch.
-        let (view, signal, warning, identity) = match read_status() {
+        let (view, signal, warning, identity, remaining) = match read_status() {
             Some(response) => {
                 let view = controller.borrow_mut().observe(&response, now);
                 // Headroom and identity are read off the same reply the phase
@@ -438,11 +439,13 @@ fn install_surface_feedback(
                     ObservedSignal::Reachable(view.phase),
                     limit_warning_from_response(&response),
                     recording_identity(&response).map(str::to_owned),
+                    recording_remaining(&response),
                 )
             }
             None => (
                 controller.borrow_mut().observe_unreachable(now),
                 ObservedSignal::Unreachable,
+                None,
                 None,
                 None,
             ),
@@ -524,9 +527,12 @@ fn install_surface_feedback(
                 // the notifications above: it cannot fail into, block, or
                 // otherwise touch the Recording's delivery, which the daemon
                 // owns and which this process only observes.
-                if let Some(warning) = notify_limit {
+                if let Some(body) = notify_limit
+                    .zip(remaining)
+                    .and_then(|(warning, left)| limit_notification_body(warning, left))
+                {
                     let notification = gtk::gio::Notification::new("Voisu");
-                    notification.set_body(Some(limit_warning_body(warning)));
+                    notification.set_body(Some(body.as_str()));
                     application.send_notification(Some("overlay-limit"), &notification);
                 }
                 gtk::glib::ControlFlow::Continue
@@ -602,7 +608,7 @@ fn notification_tick(
     notifier: &Notifier,
 ) {
     let now = Instant::now();
-    let (view, signal, warning, identity) = match read_status() {
+    let (view, signal, warning, identity, remaining) = match read_status() {
         Some(response) => {
             let view = controller.observe(&response, now);
             (
@@ -610,26 +616,34 @@ fn notification_tick(
                 ObservedSignal::Reachable(view.phase),
                 limit_warning_from_response(&response),
                 recording_identity(&response).map(str::to_owned),
+                recording_remaining(&response),
             )
         }
-        None => (controller.observe_unreachable(now), ObservedSignal::Unreachable, None, None),
-    };
-    // This rung has no capsule to turn amber, so the notification is the whole
-    // warning. Latched exactly as on the windowed paths.
-    if let Some(warning) = limit_latch.observe(signal, identity.as_deref(), warning) {
-        notifier.notify(limit_warning_body(warning));
-    }
-    let fire_no_speech = no_speech_latch.observe(signal);
-    if view.phase == OverlayPhase::NoSpeech {
-        if fire_no_speech {
-            notifier.notify(view.visible_label);
+        None => {
+            (controller.observe_unreachable(now), ObservedSignal::Unreachable, None, None, None)
         }
-    } else if view.is_visible() && *previous_phase != view.phase {
-        // Fire only on a PHASE transition into a visible phase. Comparing the
-        // whole view would re-fire on every meter/activity tick within one
-        // Recording.
-        notifier.notify(view.visible_label);
+    };
+    // Both latches observe every tick: they are state machines, not senders,
+    // and skipping one would corrupt the next tick's decision.
+    let limit_body = limit_latch
+        .observe(signal, identity.as_deref(), warning)
+        .zip(remaining)
+        .and_then(|(warning, left)| limit_notification_body(warning, left));
+    let fire_no_speech = no_speech_latch.observe(signal);
+    // This rung sends at most one bubble per tick; the pure chooser decides
+    // which. This rung has no capsule to turn amber, so the notification is
+    // the whole warning.
+    match notification_rung_choice(view, *previous_phase, limit_body.is_some(), fire_no_speech) {
+        Some(RungNotification::Limit) => {
+            if let Some(body) = limit_body {
+                notifier.notify(&body);
+            }
+        }
+        Some(RungNotification::Label(label)) => notifier.notify(label),
+        None => {}
     }
+    // Always advances, whichever bubble won: the transition has been observed
+    // either way, and a stale previous_phase would re-announce it later.
     *previous_phase = view.phase;
 }
 
