@@ -620,11 +620,34 @@ async fn actor_loop(
                     let _ = reply.send(Response::success(state_label(&state), message));
                 }
                 Command::History => {
-                    let records = diagnostics
-                        .as_ref()
-                        .and_then(|store| store.history().ok())
-                        .unwrap_or_default();
-                    let _ = reply.send(Response::with_history(records));
+                    let response = match diagnostics.as_ref() {
+                        // Degraded mode: the daemon KNOWS there is no durable
+                        // store this session and has already said so in the
+                        // journal. Its established empty-history presentation
+                        // stays, so a client that never had diagnostics is not
+                        // newly broken.
+                        None => Response::with_history(Vec::new()),
+                        Some(store) => match store.history() {
+                            Ok(records) => Response::with_history(records),
+                            // A store that WAS readable at startup and is not
+                            // now: the retained history is unknown, not empty.
+                            // Reporting `[]` would present unknown data as
+                            // durable truth, so this is an explicit failure.
+                            // The bounded message matches `export`'s; the
+                            // unbounded io detail goes to the journal only.
+                            Err(error) => {
+                                eprintln!(
+                                    "diagnostics history read failed: {}",
+                                    escape_journal_control(&error.to_string())
+                                );
+                                Response::rejected(
+                                    Some(state_label(&state)),
+                                    "diagnostics are unavailable",
+                                )
+                            }
+                        },
+                    };
+                    let _ = reply.send(response);
                 }
                 Command::Export(correlation_id) => {
                     let response = match diagnostics.as_ref() {
@@ -1019,7 +1042,31 @@ async fn actor_loop(
                                 )
                                 .is_some()
                             {
+                                // Two exits, never one. The counter is the
+                                // intended marker, but a pump that terminates
+                                // chunkless (capture died, provider streaming
+                                // failed, zero-chunk Recording Deadline) can
+                                // never raise it, and a wait on the counter
+                                // alone would yield-loop inside the actor
+                                // forever — wedging every later command. The
+                                // pump always finishes after queuing
+                                // `PumpTerminated`, so its JoinHandle is the
+                                // deterministic second exit; a yield budget
+                                // would only trade a wedge for a flake.
                                 while chunk_counter.load(Ordering::SeqCst) == 0 {
+                                    if pump.is_finished() {
+                                        // Re-read once: a chunk streamed just
+                                        // before termination still counts, and
+                                        // must not be reported as chunkless.
+                                        if chunk_counter.load(Ordering::SeqCst) == 0 {
+                                            eprintln!(
+                                                "Recording {id}: \
+                                                 VOISU_TEST_WAIT_FOR_FIRST_CHUNK_BEFORE_START: \
+                                                 the capture pump ended before any chunk streamed"
+                                            );
+                                        }
+                                        break;
+                                    }
                                     tokio::task::yield_now().await;
                                 }
                             }
@@ -2866,6 +2913,21 @@ fn bound_legacy_history(response: &mut Response) -> Result<(), String> {
             too_many = candidate;
         }
     }
+    // Zero records fit while records exist: the NEWEST record alone overflows
+    // the legacy ceiling. Records are not globally size-bounded, so this is
+    // reachable. Sending the empty prefix would present a successful, genuinely
+    // empty durable history to a client whose history is not empty — the exact
+    // silent data-loss presentation this daemon must never produce. Tell the
+    // client instead; the message is a fixed literal, so the rejection always
+    // fits the frame it is replacing.
+    if fits == 0 && !records.is_empty() {
+        response.ok = false;
+        response.history = None;
+        response.message = "the newest diagnostic record is too large for an unpaged client; \
+                            upgrade voisu to read this history in pages"
+            .to_owned();
+        return Ok(());
+    }
     response.history = Some(records.into_iter().take(fits).collect());
     Ok(())
 }
@@ -3449,6 +3511,44 @@ mod tests {
 
         let error = read_fixture(dir.path(), "fixture.pcm").unwrap_err();
         assert_eq!(error.diagnostic(), "fixture must be a regular file");
+    }
+
+    #[test]
+    fn an_unpaged_client_is_told_when_the_newest_record_cannot_be_represented() {
+        // Records are not globally size-bounded, so one record can alone exceed
+        // the legacy one-mebibyte frame. Trimming to a zero-record prefix would
+        // hand that client a SUCCESSFUL empty history — silent data loss dressed
+        // as durable truth. It must be an explicit failure instead.
+        let mut record = DiagnosticRecord::new("rec-oversized".to_owned(), 1);
+        record.error = Some("e".repeat(LEGACY_MAX_RESPONSE_BYTES + 1));
+        let mut response = Response::with_history(vec![record]);
+
+        bound_legacy_history(&mut response).unwrap();
+
+        assert!(!response.ok, "an unrepresentable history is not a success");
+        assert!(
+            response.history.is_none(),
+            "the rejection must carry no history payload: {:?}",
+            response.history
+        );
+        assert!(
+            response.message.contains("too large"),
+            "the client must be told why: {}",
+            response.message
+        );
+        assert!(
+            serde_json::to_vec(&response).unwrap().len() + 1 <= LEGACY_MAX_RESPONSE_BYTES,
+            "the rejection itself must fit the legacy frame ceiling"
+        );
+    }
+
+    #[test]
+    fn an_empty_history_stays_a_successful_empty_history_for_an_unpaged_client() {
+        // The guard above must not turn a genuinely empty history into an error.
+        let mut response = Response::with_history(Vec::new());
+        bound_legacy_history(&mut response).unwrap();
+        assert!(response.ok);
+        assert_eq!(response.history.map(|records| records.len()), Some(0));
     }
 
     #[test]

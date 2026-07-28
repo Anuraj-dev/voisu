@@ -8474,6 +8474,36 @@ fn a_delivered_recording_reports_its_per_stage_timings_to_the_journal() {
 }
 
 #[test]
+fn the_first_chunk_start_seam_releases_when_the_capture_pump_ends_chunkless() {
+    // The seam that withholds the start reply until the first chunk has streamed
+    // must have a second exit. Here the capture hits its Recording Deadline
+    // before producing anything, so the pump terminates without ever raising the
+    // chunk counter: a wait with only the counter as an exit yield-loops inside
+    // the actor forever and every later command wedges behind it. The IPC helper
+    // bounds each read, so a wedge fails this test instead of hanging CI.
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_WAIT_FOR_FIRST_CHUNK_BEFORE_START", "1"),
+            ("VOISU_TEST_DEADLINE_AFTER_CHUNKS", "0"),
+        ],
+    );
+
+    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    assert!(
+        started["state"].is_string(),
+        "the start reply must arrive even though no chunk ever streams: {started}"
+    );
+    // Whatever the Recording's outcome, the actor must still be serving.
+    let status = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+    assert!(
+        status["state"].is_string(),
+        "the actor must keep answering commands after the chunkless pump: {status}"
+    );
+}
+
+#[test]
 fn a_failed_recording_keeps_its_journal_message_and_gains_the_timings() {
     // The historical `Recording <id>: <diagnostic>` line is load-bearing for
     // existing journal parsers; timings must be emitted beside it, not inside it.
@@ -8676,6 +8706,66 @@ fn an_unreadable_history_disables_diagnostics_without_rewriting_retained_bytes()
     assert!(
         journal.contains("diagnostics disabled: cleanup failed:"),
         "the read failure must be visible: {journal}"
+    );
+}
+
+#[test]
+fn a_history_read_failure_after_startup_is_not_presented_as_an_empty_history() {
+    // Startup succeeded, so diagnostics are ENABLED and the daemon has already
+    // told this client the durable store holds records. If the store then turns
+    // unreadable, answering `ok: true, history: []` claims the durable history
+    // is empty — presenting unknown data as durable truth. The read failure must
+    // be reported as a failure instead.
+    let runtime = TempDir::new().unwrap();
+    let diagnostics = seeded_diagnostics_dir(runtime.path());
+    let mut retained = voisu_core::DiagnosticRecord::new("retained".to_owned(), 7);
+    retained.set_final_transcript("durable and readable at startup".to_owned());
+    write_seeded_history(&diagnostics, &[retained]);
+
+    let _daemon = Daemon::start(runtime.path());
+    let before = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(before["ok"], true, "{before}");
+    assert_eq!(
+        before["history"].as_array().unwrap().len(),
+        1,
+        "the durable store must be readable at startup: {before}"
+    );
+
+    // The same non-regular-file rejection the store applies at open time, but
+    // reached only AFTER startup, so the store is not in degraded mode.
+    let history = diagnostics.join("history.jsonl");
+    fs::remove_file(&history).unwrap();
+    assert!(Command::new("mkfifo").arg(&history).status().unwrap().success());
+
+    let response = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(
+        response["ok"], false,
+        "an unreadable durable store must not answer with a successful empty history: {response}"
+    );
+    assert!(
+        response["history"].is_null(),
+        "a failed read must carry no history payload at all: {response}"
+    );
+    assert!(
+        response["message"]
+            .as_str()
+            .unwrap()
+            .contains("diagnostics are unavailable"),
+        "the failure must name the unavailable diagnostics: {response}"
+    );
+
+    // The same read failure through `export`, which must stay a rejection too.
+    let export = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"export":"retained"}}"#,
+    );
+    assert_eq!(export["ok"], false, "{export}");
+    assert!(
+        export["message"]
+            .as_str()
+            .unwrap()
+            .contains("diagnostics are unavailable"),
+        "{export}"
     );
 }
 
