@@ -482,21 +482,35 @@ pub const FINAL_LIMIT_LEAD: Duration = Duration::from_secs(10);
 /// drift out of sync with the ceiling, so moving the ceiling moves both
 /// warnings with it. Saturating, so a ceiling shorter than a lead simply means
 /// that warning is live from the first tick rather than wrapping.
-pub fn limit_warning_onsets(_ceiling: Duration) -> (Duration, Duration) {
-    (Duration::ZERO, Duration::ZERO)
+pub fn limit_warning_onsets(ceiling: Duration) -> (Duration, Duration) {
+    (
+        ceiling.saturating_sub(APPROACHING_LIMIT_LEAD),
+        ceiling.saturating_sub(FINAL_LIMIT_LEAD),
+    )
 }
 
 /// The warning stage implied by the headroom the daemon reports. `None`
 /// remaining means the daemon is not Recording, which is never a warning.
-pub fn limit_warning_for_remaining(_remaining: Option<Duration>) -> Option<LimitWarning> {
-    None
+///
+/// Headroom, not elapsed time, is what crosses the wire: the ceiling lives with
+/// the enforcer, so the subtraction happens once, there, and the presentation
+/// layer never holds a copy of the ceiling to fall out of step with.
+pub fn limit_warning_for_remaining(remaining: Option<Duration>) -> Option<LimitWarning> {
+    let remaining = remaining?;
+    if remaining <= FINAL_LIMIT_LEAD {
+        Some(LimitWarning::Final)
+    } else if remaining <= APPROACHING_LIMIT_LEAD {
+        Some(LimitWarning::Approaching)
+    } else {
+        None
+    }
 }
 
 /// The warning stage at `elapsed` against `ceiling`. The same decision as
 /// [`limit_warning_for_remaining`], expressed in the terms the ceiling is
 /// written in so a test can pin the derivation directly.
-pub fn limit_warning_at(_elapsed: Duration, _ceiling: Duration) -> Option<LimitWarning> {
-    None
+pub fn limit_warning_at(elapsed: Duration, ceiling: Duration) -> Option<LimitWarning> {
+    limit_warning_for_remaining(Some(ceiling.saturating_sub(elapsed)))
 }
 
 /// The notification body for a warning stage.
@@ -522,13 +536,31 @@ pub struct LimitWarningLatch {
 }
 
 impl LimitWarningLatch {
-    /// Returns the warning to announce this tick, or `None`.
+    /// Returns the warning to announce this tick, or `None`. A stage is
+    /// announced only when it is strictly beyond everything already announced,
+    /// so repeated ticks inside the same window stay silent and a tick that
+    /// jumps clean over the first window announces only the final warning
+    /// rather than backfilling a stale "about a minute left".
     pub fn observe(
         &mut self,
-        _signal: ObservedSignal,
-        _warning: Option<LimitWarning>,
+        signal: ObservedSignal,
+        warning: Option<LimitWarning>,
     ) -> Option<LimitWarning> {
-        None
+        match signal {
+            ObservedSignal::Unreachable => None,
+            ObservedSignal::Reachable(OverlayPhase::Recording) => {
+                if warning > self.fired {
+                    self.fired = warning;
+                    warning
+                } else {
+                    None
+                }
+            }
+            ObservedSignal::Reachable(_) => {
+                self.fired = None;
+                None
+            }
+        }
     }
 
     /// The highest stage already announced for the current Recording. Exposed
