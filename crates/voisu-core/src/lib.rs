@@ -1840,9 +1840,13 @@ fn select_better_source(left: &[String], right: &[String]) -> (GateWinner, Selec
 }
 
 /// Decides whether to skip the LLM merge for two materially disagreeing Source
-/// Transcripts and select the better one (§3.4). One symmetric computation —
-/// the one-to-one phonetic-tolerant matching of distinct content words —
-/// feeds every decision:
+/// Transcripts and select the better one (§3.4). The tiers do not share one
+/// computation: the wordless guard and the fragment ratio below are counts
+/// alone, and only tiers 1 and 3 consult the one-to-one phonetic-tolerant
+/// matching of distinct content words (via `select_better_source`). No tier is
+/// evidence about MEANING — nothing here, or anywhere in this module, can tell
+/// a mishearing from a change of meaning, which is why the near-identical path
+/// never lets any of it overturn the Groq default.
 /// 1. Exactly one source is garbage (degenerate filler loop, a repetition loop
 ///    stealing the majority of its recycled words from the other source, or a
 ///    hollow loop nothing of which is confirmed): select the other.
