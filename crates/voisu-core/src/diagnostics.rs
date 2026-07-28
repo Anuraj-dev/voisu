@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -661,10 +661,22 @@ impl DiagnosticStore {
         debug_assert!(!encoded.contains(&b'\n'));
         encoded.push(b'\n');
         let mut file = OpenOptions::new()
+            .read(true)
             .append(true)
             .create(true)
             .mode(0o600)
             .open(self.history_file())?;
+        if file.metadata()?.len() != 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut last = [0_u8; 1];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                // A previous ENOSPC/crash may have left a partial JSON tail.
+                // Separate it from this complete record so the torn line alone
+                // is discarded and the newly accepted Recording stays readable.
+                encoded.insert(0, b'\n');
+            }
+        }
         file.write_all(&encoded)?;
         // `sync_data`, not `sync_all`: the file's size is the only metadata that
         // matters here and a data sync carries it, so this does not pay for an

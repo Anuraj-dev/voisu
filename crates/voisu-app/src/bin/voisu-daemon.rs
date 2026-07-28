@@ -134,20 +134,28 @@ async fn run() -> Result<(), String> {
     };
 
     // Correlated local diagnostics live in the private DURABLE state directory
-    // and never leave the local machine. Not the runtime directory: logind
-    // removes /run/user/$UID with the user's last session, which would cap a
-    // retention policy measured in days at "since last login" and silently make
-    // week-over-week latency comparison impossible. Startup cleanup removes any
-    // debug audio or over-retention records a previous run left.
+    // and never leave the local machine. A state/store failure disables
+    // diagnostics rather than startup: delivery must never depend on an
+    // observability precondition. We deliberately do NOT fall back to the
+    // runtime directory because logind removes it at logout; serving history
+    // from there would silently claim durability the store does not have.
     let retention = RetentionPolicy::from_env();
-    let state = create_private_state_dir()?;
-    let diagnostics = Arc::new(
+    let diagnostics = match create_private_state_dir().and_then(|state| {
         DiagnosticStore::open(state.join("diagnostics"), retention)
-            .map_err(|error| format!("cannot open diagnostics store: {error}"))?,
-    );
-    if let Err(error) = diagnostics.cleanup_expired() {
-        eprintln!("diagnostics cleanup failed: {error}");
-    }
+            .map(Arc::new)
+            .map_err(|error| format!("cannot open diagnostics store: {error}"))
+    }) {
+        Ok(store) => {
+            if let Err(error) = store.cleanup_expired() {
+                eprintln!("diagnostics cleanup failed: {error}");
+            }
+            Some(store)
+        }
+        Err(error) => {
+            eprintln!("diagnostics disabled: {error}");
+            None
+        }
+    };
 
     // An over-long VOISU_RECORDING_DEADLINE_MS is clamped to the one bounded
     // maximum. Say so once here rather than at the clamp itself, which runs on
@@ -515,7 +523,7 @@ struct RecordingResult {
 async fn actor_loop(
     mut rx: mpsc::Receiver<ActorMessage>,
     tx: mpsc::Sender<ActorMessage>,
-    diagnostics: Arc<DiagnosticStore>,
+    diagnostics: Option<Arc<DiagnosticStore>>,
     reaper: ProviderReaper,
     delivery_mode: DeliveryMode,
     focus_probe: Option<SharedFocusProbe>,
@@ -606,25 +614,40 @@ async fn actor_loop(
                     let _ = reply.send(Response::success(state_label(&state), message));
                 }
                 Command::History => {
-                    let records = diagnostics.history().unwrap_or_default();
+                    let records = diagnostics
+                        .as_ref()
+                        .and_then(|store| store.history().ok())
+                        .unwrap_or_default();
                     let _ = reply.send(Response::with_history(records));
                 }
                 Command::Export(correlation_id) => {
-                    let response = match diagnostics.find(correlation_id.as_str()) {
-                        Ok(Some(record)) => Response::with_export(voisu_core::export_record(
-                            record,
-                            std::env::vars(),
-                        )),
-                        Ok(None) => Response::rejected(
-                            Some(state_label(&state)),
-                            "no diagnostic record for that correlation ID",
-                        ),
-                        Err(_) => Response::rejected(
+                    let response = match diagnostics.as_ref() {
+                        Some(store) => match store.find(correlation_id.as_str()) {
+                            Ok(Some(record)) => Response::with_export(voisu_core::export_record(
+                                record,
+                                std::env::vars(),
+                            )),
+                            Ok(None) => Response::rejected(
+                                Some(state_label(&state)),
+                                "no diagnostic record for that correlation ID",
+                            ),
+                            Err(_) => Response::rejected(
+                                Some(state_label(&state)),
+                                "diagnostics are unavailable",
+                            ),
+                        },
+                        None => Response::rejected(
                             Some(state_label(&state)),
                             "diagnostics are unavailable",
                         ),
                     };
                     let _ = reply.send(response);
+                }
+                Command::Replay(_) if diagnostics.is_none() => {
+                    let _ = reply.send(Response::rejected(
+                        Some(state_label(&state)),
+                        "diagnostics are unavailable",
+                    ));
                 }
                 Command::Replay(fixture_name) if matches!(state, ActorState::Idle) => {
                     let id = next_id;
@@ -675,7 +698,10 @@ async fn actor_loop(
                     let replay = tokio::spawn(replay_recording(
                         fixture_name.into_inner(),
                         id,
-                        diagnostics.fixture_dir(),
+                        diagnostics
+                            .as_ref()
+                            .expect("diagnostics availability checked above")
+                            .fixture_dir(),
                         current_deepgram,
                         current_groq,
                         current_validator,
@@ -790,7 +816,7 @@ async fn actor_loop(
                                 recording,
                                 &mut validator,
                                 &mut delivery,
-                                Arc::clone(&diagnostics),
+                                diagnostics.clone(),
                                 debug_capture,
                                 controlled,
                                 deepgram_enabled,
@@ -884,10 +910,12 @@ async fn actor_loop(
                             if !deepgram_enabled {
                                 normalize_disabled_deepgram(&mut record.provider_failures);
                             }
-                            if let Err(error) = diagnostics.record(record) {
-                                eprintln!(
-                                    "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
-                                );
+                            if let Some(store) = diagnostics.as_ref() {
+                                if let Err(error) = store.record(record) {
+                                    eprintln!(
+                                        "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
+                                    );
+                                }
                             }
                             let mut evidence = base_evidence(
                                 id,
@@ -1065,10 +1093,12 @@ async fn actor_loop(
                             if !deepgram_enabled {
                                 normalize_disabled_deepgram(&mut record.provider_failures);
                             }
-                            if let Err(error) = diagnostics.record(record) {
-                                eprintln!(
-                                    "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
-                                );
+                            if let Some(store) = diagnostics.as_ref() {
+                                if let Err(error) = store.record(record) {
+                                    eprintln!(
+                                        "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
+                                    );
+                                }
                             }
                             let response = Response::with_evidence(
                                 false,
@@ -1147,7 +1177,7 @@ async fn actor_loop(
                             recording,
                             &mut validator,
                             &mut delivery,
-                            Arc::clone(&diagnostics),
+                            diagnostics.clone(),
                             debug_capture,
                             controlled,
                             deepgram_enabled,
@@ -1277,7 +1307,7 @@ async fn actor_loop(
                             recording,
                             &mut validator,
                             &mut delivery,
-                            Arc::clone(&diagnostics),
+                            diagnostics.clone(),
                             debug_capture,
                             controlled,
                             deepgram_enabled,
@@ -1325,7 +1355,7 @@ fn spawn_recording_processing(
     recording: ActiveRecording,
     validator: &mut Option<Box<dyn TranscriptValidator>>,
     delivery: &mut Option<Box<dyn DeliveryAdapter>>,
-    diagnostics: Arc<DiagnosticStore>,
+    diagnostics: Option<Arc<DiagnosticStore>>,
     debug_capture: bool,
     controlled: bool,
     deepgram_enabled: bool,
@@ -1362,7 +1392,7 @@ fn spawn_recording_processing(
         recording,
         current_validator,
         current_delivery,
-        Arc::clone(&diagnostics),
+        diagnostics.clone(),
         debug_capture,
         deepgram_enabled,
     ));
@@ -1799,7 +1829,7 @@ async fn process_recording(
     recording: ActiveRecording,
     mut validator: Box<dyn TranscriptValidator>,
     mut delivery: Box<dyn DeliveryAdapter>,
-    diagnostics: Arc<DiagnosticStore>,
+    diagnostics: Option<Arc<DiagnosticStore>>,
     debug_capture: bool,
     deepgram_enabled: bool,
 ) -> RecordingResult {
@@ -1848,8 +1878,10 @@ async fn process_recording(
                 None,
                 Some(&error),
             );
-            if let Err(record_error) = diagnostics.record(record) {
-                eprintln!("Recording {id}: writing diagnostics failed: {record_error}");
+            if let Some(store) = diagnostics.as_ref() {
+                if let Err(record_error) = store.record(record) {
+                    eprintln!("Recording {id}: writing diagnostics failed: {record_error}");
+                }
             }
             return RecordingResult {
                 result: Err(error),
@@ -1888,9 +1920,11 @@ async fn process_recording(
         evidence.capture_finalized_ms = Some(elapsed_millis(started_at));
         evidence.stages.push(LifecycleStage::CaptureFinalized);
         if debug_capture {
-            match diagnostics.store_debug_audio(&correlation_id, audio.pcm_s16le_mono_16khz()) {
-                Ok(record) => debug_audio = Some(record),
-                Err(error) => eprintln!("Recording {id}: debug audio capture failed: {error}"),
+            if let Some(store) = diagnostics.as_ref() {
+                match store.store_debug_audio(&correlation_id, audio.pcm_s16le_mono_16khz()) {
+                    Ok(record) => debug_audio = Some(record),
+                    Err(error) => eprintln!("Recording {id}: debug audio capture failed: {error}"),
+                }
             }
         }
         let completed = providers.complete_with_timings(audio).await?;
@@ -1966,8 +2000,10 @@ async fn process_recording(
         debug_audio,
         result.as_ref().err(),
     );
-    if let Err(error) = diagnostics.record(record) {
-        eprintln!("Recording {id}: writing diagnostics failed: {error}");
+    if let Some(store) = diagnostics.as_ref() {
+        if let Err(error) = store.record(record) {
+            eprintln!("Recording {id}: writing diagnostics failed: {error}");
+        }
     }
 
     RecordingResult {
@@ -1993,7 +2029,7 @@ async fn supervise_recording(
     reply: Option<oneshot::Sender<Response>>,
     publish_terminal_outcome: bool,
     actor: mpsc::Sender<ActorMessage>,
-    diagnostics: Arc<DiagnosticStore>,
+    diagnostics: Option<Arc<DiagnosticStore>>,
     reaper: ProviderReaper,
 ) {
     let id = panic_evidence.recording_id;
@@ -2031,10 +2067,12 @@ async fn supervise_recording(
                 None,
                 Some(&error),
             );
-            if let Err(record_error) = diagnostics.record(record) {
-                log_best_effort(format_args!(
-                    "Recording {id}: writing diagnostics failed: {record_error}"
-                ));
+            if let Some(store) = diagnostics.as_ref() {
+                if let Err(record_error) = store.record(record) {
+                    log_best_effort(format_args!(
+                        "Recording {id}: writing diagnostics failed: {record_error}"
+                    ));
+                }
             }
             let (validator, delivery) =
                 rebuild_recording_adapters(controlled, delivery_mode, focus_probe.clone());
@@ -3396,7 +3434,7 @@ mod tests {
             None,
             false,
             actor,
-            Arc::clone(&diagnostics),
+            Some(Arc::clone(&diagnostics)),
             ProviderReaper::new(),
         )
         .await;

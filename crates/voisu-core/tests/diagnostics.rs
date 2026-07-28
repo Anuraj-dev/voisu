@@ -158,6 +158,18 @@ fn a_torn_final_line_costs_one_record_not_the_whole_history() {
     );
     assert_eq!(kept[0].correlation_id, "corr-2");
     assert_eq!(kept[1].correlation_id, "corr-1");
+
+    let returned = store
+        .record(DiagnosticRecord::new("corr-4".to_owned(), 4))
+        .unwrap();
+    assert!(
+        returned.iter().any(|record| record.correlation_id == "corr-4"),
+        "record() accepted the post-tear record"
+    );
+    assert!(
+        store.find("corr-4").unwrap().is_some(),
+        "the first complete record after a torn tail must remain readable"
+    );
 }
 
 #[test]
@@ -755,17 +767,14 @@ fn export_allowlist_passes_the_groq_model_name_through() {
 fn a_preplanted_colliding_temp_file_does_not_lose_the_record() {
     let dir = TempDir::new().unwrap();
     let store_dir = dir.path().join("diag");
-    // A count bound of one, so the SECOND record prunes the first and forces the
-    // atomic whole-log rewrite — the only path that uses a temp file. A record
-    // that prunes nothing is appended in place and never touches one.
+    // A count bound of one still has a compaction slack floor of eight, so the
+    // TENTH record is the first to force the atomic whole-log rewrite — the only
+    // path that uses a temp file.
     let policy = RetentionPolicy {
         max_records: 1,
         ..RetentionPolicy::default()
     };
     let store = DiagnosticStore::open(store_dir.clone(), policy).unwrap();
-    store
-        .record(DiagnosticRecord::new("corr-first".to_owned(), 1))
-        .unwrap();
     // Adversarial: crash leftovers after PID reuse occupy the first temp names
     // this store would pick.
     for nonce in 0..3 {
@@ -775,9 +784,25 @@ fn a_preplanted_colliding_temp_file_does_not_lose_the_record() {
         )
         .unwrap();
     }
-    store
-        .record(DiagnosticRecord::new("corr-collide".to_owned(), 2))
-        .expect("a temp-name collision must retry, not fail");
+    let mut before_inode = None;
+    for id in 1..=10 {
+        let correlation = if id == 10 {
+            "corr-collide".to_owned()
+        } else {
+            format!("corr-{id}")
+        };
+        store
+            .record(DiagnosticRecord::new(correlation, id))
+            .expect("a temp-name collision must retry, not fail");
+        if id == 1 {
+            before_inode = Some(history_inode(&store_dir));
+        }
+    }
+    assert_ne!(
+        history_inode(&store_dir),
+        before_inode.unwrap(),
+        "the test must reach the atomic compaction path that creates a temp file"
+    );
     assert!(
         store.find("corr-collide").unwrap().is_some(),
         "the record persists despite the collision"
@@ -853,8 +878,8 @@ fn startup_cleanup_survives_all_temp_name_candidates_being_preplanted() {
     store
         .cleanup_expired()
         .expect("cleanup must purge stale temp files before rewriting history");
-    // Prunes the earlier record, so this one needs the rewrite path and its
-    // temp file.
+    // This record appends after cleanup; the assertion only verifies that
+    // purging every candidate did not damage subsequent history operations.
     store
         .record(DiagnosticRecord::new("corr-after-purge".to_owned(), 2))
         .unwrap();

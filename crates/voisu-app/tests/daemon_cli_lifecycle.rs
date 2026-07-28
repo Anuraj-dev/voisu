@@ -7196,6 +7196,7 @@ fn runtime_paths_are_private_and_unsafe_runtime_roots_are_rejected() {
     fs::set_permissions(unsafe_runtime.path(), fs::Permissions::from_mode(0o755)).unwrap();
     let rejected = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"))
         .env("XDG_RUNTIME_DIR", unsafe_runtime.path())
+        .env("XDG_STATE_HOME", state_home(unsafe_runtime.path()))
         .output()
         .unwrap();
     assert!(!rejected.status.success());
@@ -7210,6 +7211,7 @@ fn runtime_paths_are_private_and_unsafe_runtime_roots_are_rejected() {
     symlink(real_runtime.path(), &linked_runtime).unwrap();
     let rejected = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"))
         .env("XDG_RUNTIME_DIR", &linked_runtime)
+        .env("XDG_STATE_HOME", state_home(link_parent.path()))
         .output()
         .unwrap();
     assert!(!rejected.status.success());
@@ -8562,6 +8564,46 @@ fn diagnostics_are_retained_in_the_private_durable_state_directory() {
     assert!(output.status.success(), "{}", stderr(&output));
     let records: Value = serde_json::from_str(&stdout(&output)).unwrap();
     assert_eq!(records[0]["final_transcript"], "Retain this dictation");
+}
+
+#[test]
+fn an_unsafe_durable_state_path_disables_diagnostics_without_blocking_dictation() {
+    let runtime = TempDir::new().unwrap();
+    let state = runtime.path().join("unsafe-state");
+    let redirected = runtime.path().join("redirected-state");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&redirected).unwrap();
+    symlink(&redirected, state.join("voisu")).unwrap();
+
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("XDG_STATE_HOME", state.to_str().unwrap()),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Delivery must survive."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Delivery must survive"),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(history["history"], serde_json::json!([]), "{history}");
+    assert!(
+        !runtime
+            .path()
+            .join("voisu")
+            .join(format!("v{PROTOCOL_VERSION}"))
+            .join("diagnostics")
+            .exists(),
+        "degraded mode must not create a misleading non-durable runtime store"
+    );
+
+    let journal = daemon.terminate_and_stderr();
+    assert!(
+        journal.contains("diagnostics disabled: unsafe state path"),
+        "the unavailable durable store must be visible in the journal: {journal}"
+    );
 }
 
 #[test]
