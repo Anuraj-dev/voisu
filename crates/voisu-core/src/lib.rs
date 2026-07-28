@@ -31,6 +31,12 @@ pub use diagnostics::{
     EXPORT_ENV_ALLOWLIST, MAX_STORED_TEXT, REDACTED,
 };
 
+// Paged diagnostic responses are negotiated per REQUEST (see `Request::paged`),
+// never by protocol version. The version is interpolated into the socket path,
+// the single-instance lock, and the store directory, so bumping it partitions
+// the whole namespace and an already-running older daemon becomes unreachable
+// instead of reporting a mismatch. A purely additive, defaulted wire field costs
+// nothing in either skew direction and keeps one namespace.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 pub fn runtime_dir() -> Result<PathBuf, String> {
@@ -57,6 +63,32 @@ pub fn runtime_dir() -> Result<PathBuf, String> {
         return Err("XDG_RUNTIME_DIR must have mode 0700".to_owned());
     }
     Ok(path)
+}
+
+/// Voisu's durable per-user state directory: `$XDG_STATE_HOME/voisu`, falling
+/// back to `~/.local/state/voisu`.
+///
+/// Unlike [`runtime_dir`], this survives logout and reboot. `systemd-logind`
+/// removes `/run/user/$UID` when the user's last session ends, so anything kept
+/// under the runtime directory has an effective lifetime of "since last login" —
+/// a retention policy measured in days cannot be honoured there. The daemon unit
+/// already provisions this location (`StateDirectory=voisu`).
+///
+/// Returning the path does not make it safe to write to: the caller creates it
+/// private and verifies ownership, exactly as the runtime directory is checked
+/// before anything is written there.
+pub fn state_dir() -> Result<PathBuf, String> {
+    let root = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".local/state"))
+        })
+        .ok_or_else(|| "neither XDG_STATE_HOME nor HOME names an absolute path".to_owned())?;
+    Ok(root.join("voisu"))
 }
 
 pub fn socket_path() -> Result<PathBuf, String> {
@@ -148,6 +180,43 @@ pub struct VersionEnvelope {
 pub struct Request {
     pub version: u32,
     pub command: Command,
+    /// Asks the daemon to split a large diagnostic history or export across
+    /// contiguous [`DiagnosticPage`] frames rather than one frame.
+    ///
+    /// Purely additive and defaulted: a client that predates paging omits the
+    /// field and is served the single-frame response it has always received, so
+    /// paging needs no protocol version bump in either skew direction. Only
+    /// `history` and `export` ever produce pages; every other command answers in
+    /// one frame regardless.
+    #[serde(default, skip_serializing_if = "is_not_set")]
+    pub paged: bool,
+}
+
+/// `skip_serializing_if` for an optional boolean flag: an unset flag is omitted
+/// so a request that does not use paging is byte-identical to one from a client
+/// that has never heard of it.
+fn is_not_set(value: &bool) -> bool {
+    !*value
+}
+
+impl Request {
+    /// A request answered in a single response frame.
+    pub fn new(command: Command) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            command,
+            paged: false,
+        }
+    }
+
+    /// A request whose diagnostic payload may be split across pages.
+    pub fn paged(command: Command) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            command,
+            paged: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -271,9 +340,23 @@ pub struct Response {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export: Option<DiagnosticExport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_page: Option<DiagnosticPage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_event: Option<OverlayEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level_frames: Option<Vec<LevelFrame>>,
+}
+
+/// One transport page of a serialized diagnostic history or export.
+///
+/// Pages are zero-based and contiguous. `payload` is a byte-for-byte UTF-8
+/// fragment of the command's complete JSON value; concatenating payloads
+/// through the page with `last = true` reconstructs that value.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DiagnosticPage {
+    pub sequence: u64,
+    pub last: bool,
+    pub payload: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -339,6 +422,7 @@ impl Response {
             evidence,
             history: None,
             export: None,
+            diagnostic_page: None,
             overlay_event: None,
             level_frames: None,
         }

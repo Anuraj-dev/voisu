@@ -203,6 +203,15 @@ if test -n "$fail_unit" && test "$last" = "$fail_unit"; then
   exit 1
 fi
 command=${2:-}
+# Only voisu.service is backed by a real process here. Lifecycle verbs aimed at
+# any other unit (the optional Overlay) are logged and acknowledged, never
+# applied to the daemon's pid file -- otherwise restarting the Overlay would
+# restart the daemon.
+case "$command" in
+  start|restart|try-restart|stop)
+    if test -n "${3:-}" && test "${3:-}" != "voisu.service"; then exit 0; fi
+    ;;
+esac
 pid_file="${state}.pid"
 daemon=$(sed -n 's/^daemon=//p' "$state" 2>/dev/null || true)
 forced=$(sed -n 's/^forced=//p' "$state" 2>/dev/null || true)
@@ -342,7 +351,10 @@ fn stderr(output: &Output) -> String {
 }
 
 fn wait_for_socket(runtime: &Path, present: bool) {
-    let socket = runtime.join("voisu/v1/daemon.sock");
+    let socket = runtime.join(format!(
+        "voisu/v{}/daemon.sock",
+        voisu_core::PROTOCOL_VERSION
+    ));
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         if socket.exists() == present {
@@ -474,7 +486,7 @@ fn packaged_overlay_is_not_managed_when_a_user_unit_shadows_it() {
 }
 
 #[test]
-fn packaged_install_enables_and_starts_the_optional_overlay_service() {
+fn packaged_install_enables_and_restarts_the_optional_overlay_service() {
     let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
     fixture.install_packaged_unit();
     fixture.install_packaged_overlay_unit();
@@ -483,11 +495,15 @@ fn packaged_install_enables_and_starts_the_optional_overlay_service() {
 
     assert!(installed.status.success(), "{}", stderr(&installed));
     assert!(
-        stdout(&installed).contains("optional Overlay service enabled and started")
+        stdout(&installed).contains("optional Overlay service enabled and restarted")
     );
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
     assert!(calls.contains("--user enable voisu.service"));
     assert!(calls.contains("--user enable --now voisu-overlay.service"));
+    // `enable --now` does nothing to an already-running unit, so an update that
+    // replaced the Overlay binary would leave the old process alive without an
+    // explicit restart.
+    assert!(calls.contains("--user restart voisu-overlay.service"), "{calls}");
 }
 
 #[test]
@@ -944,6 +960,9 @@ fn a_manual_daemon_is_reported_and_service_start_does_not_create_a_crash_loop() 
     let mut manual = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"));
     manual
         .env("XDG_RUNTIME_DIR", &fixture.runtime)
+        // Durable diagnostics state: keep this daemon out of the developer's
+        // real ~/.local/state/voisu.
+        .env("XDG_STATE_HOME", fixture.runtime.join("state"))
         .env("VOISU_DISABLE_SHORTCUTS", "1")
         .env("VOISU_DISABLE_DIRECT_DELIVERY", "1")
         .env("VOISU_TEST_MODE", "controlled");
@@ -969,6 +988,9 @@ fn a_systemd_launched_duplicate_exits_cleanly_while_the_manual_daemon_remains_re
     let mut manual = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"));
     manual
         .env("XDG_RUNTIME_DIR", &fixture.runtime)
+        // Durable diagnostics state: keep this daemon out of the developer's
+        // real ~/.local/state/voisu.
+        .env("XDG_STATE_HOME", fixture.runtime.join("state"))
         .env("VOISU_DISABLE_SHORTCUTS", "1")
         .env("VOISU_DISABLE_DIRECT_DELIVERY", "1")
         .env("VOISU_TEST_MODE", "controlled");
@@ -979,6 +1001,7 @@ fn a_systemd_launched_duplicate_exits_cleanly_while_the_manual_daemon_remains_re
     let duplicate = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"))
         .arg("--systemd")
         .env("XDG_RUNTIME_DIR", &fixture.runtime)
+        .env("XDG_STATE_HOME", fixture.runtime.join("state"))
         .output()
         .unwrap();
     assert!(duplicate.status.success(), "{}", stderr(&duplicate));
@@ -1044,6 +1067,117 @@ fn overlay_disable_failure_does_not_fail_daemon_service_uninstall() {
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
     assert!(calls.contains("--user disable --now voisu-overlay.service"));
     assert!(calls.contains("--user disable --now voisu.service"));
+}
+
+#[test]
+fn service_restart_try_restarts_only_an_active_optional_overlay() {
+    // `try-restart` refreshes an active Overlay after an update without starting
+    // one the user deliberately stopped or disabled.
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    assert!(fixture.run(&["service", "install"]).status.success());
+    fixture.use_real_managed_daemon();
+    assert!(fixture.run(&["service", "start"]).status.success());
+    fixture.install_packaged_overlay_unit();
+
+    let restarted = fixture.run(&["service", "restart"]);
+
+    assert!(restarted.status.success(), "{}", stderr(&restarted));
+    assert!(
+        stdout(&restarted).contains("systemd user service active"),
+        "{}",
+        stdout(&restarted)
+    );
+    assert!(
+        stdout(&restarted).contains("optional Overlay service try-restart completed"),
+        "restart must report the non-starting Overlay action accurately: {}",
+        stdout(&restarted)
+    );
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    assert!(calls.contains("--user restart voisu.service"), "{calls}");
+    assert!(
+        calls.contains("--user try-restart voisu-overlay.service"),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("--user restart voisu-overlay.service"),
+        "a stopped Overlay must not be started by daemon restart: {calls}"
+    );
+}
+
+#[test]
+fn service_restart_succeeds_when_the_optional_overlay_unit_is_absent() {
+    // The Overlay is optional. With no packaged overlay unit installed, restart
+    // must neither touch it nor fail.
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    assert!(fixture.run(&["service", "install"]).status.success());
+    fixture.use_real_managed_daemon();
+    assert!(fixture.run(&["service", "start"]).status.success());
+
+    let restarted = fixture.run(&["service", "restart"]);
+
+    assert!(restarted.status.success(), "{}", stderr(&restarted));
+    assert!(
+        !stdout(&restarted).contains("Overlay"),
+        "an absent Overlay must not be reported at all: {}",
+        stdout(&restarted)
+    );
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    assert!(calls.contains("--user restart voisu.service"), "{calls}");
+    assert!(!calls.contains("voisu-overlay.service"), "{calls}");
+}
+
+#[test]
+fn service_restart_succeeds_when_the_optional_overlay_unit_is_invalid() {
+    // A user unit shadows the packaged overlay unit, so the effective unit is
+    // not the one the package owns. Restart must refuse to manage it, say so,
+    // and still restart the daemon successfully.
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    assert!(fixture.run(&["service", "install"]).status.success());
+    fixture.use_real_managed_daemon();
+    assert!(fixture.run(&["service", "start"]).status.success());
+    fixture.install_packaged_overlay_unit();
+    fixture.install_user_overlay_shadow();
+
+    let restarted = fixture.run(&["service", "restart"]);
+
+    assert!(restarted.status.success(), "{}", stderr(&restarted));
+    assert!(
+        stdout(&restarted).contains("warning: optional Overlay service was not managed"),
+        "{}",
+        stdout(&restarted)
+    );
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    assert!(calls.contains("--user restart voisu.service"), "{calls}");
+    assert!(
+        !calls.contains("--user try-restart voisu-overlay.service"),
+        "{calls}"
+    );
+}
+
+#[test]
+fn overlay_restart_failure_does_not_fail_the_daemon_service_restart() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    assert!(fixture.run(&["service", "install"]).status.success());
+    fixture.use_real_managed_daemon();
+    assert!(fixture.run(&["service", "start"]).status.success());
+    fixture.install_packaged_overlay_unit();
+
+    let mut restart = fixture.command(&["service", "restart"]);
+    restart.env("FAKE_SYSTEMCTL_FAIL_UNIT", "voisu-overlay.service");
+    let restarted = output_retrying(&mut restart);
+
+    assert!(restarted.status.success(), "{}", stderr(&restarted));
+    assert!(
+        stdout(&restarted).contains("warning: optional Overlay service was not restarted"),
+        "{}",
+        stdout(&restarted)
+    );
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    assert!(calls.contains("--user restart voisu.service"), "{calls}");
+    assert!(
+        calls.contains("--user try-restart voisu-overlay.service"),
+        "{calls}"
+    );
 }
 
 #[test]

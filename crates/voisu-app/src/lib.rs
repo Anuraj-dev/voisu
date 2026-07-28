@@ -4,6 +4,7 @@ pub mod dictionary;
 pub mod history_view;
 pub mod feedback;
 pub mod focus;
+pub mod journal;
 mod process;
 pub mod overlay;
 pub mod secret_file;

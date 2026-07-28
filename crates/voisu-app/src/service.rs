@@ -79,7 +79,8 @@ enum DaemonIpc {
 
 #[derive(Clone, Copy)]
 enum OptionalOverlayAction {
-    Enable,
+    Install,
+    Restart,
     Disable,
 }
 
@@ -89,12 +90,23 @@ pub fn manage_user_service(action: UserServiceAction) -> Result<UserServiceRepor
             let report = install()?;
             Ok(append_optional_overlay_report(
                 report,
-                manage_optional_overlay(OptionalOverlayAction::Enable),
+                manage_optional_overlay(OptionalOverlayAction::Install),
             ))
         }
         UserServiceAction::Start => start(),
         UserServiceAction::Stop => stop(),
-        UserServiceAction::Restart => restart(),
+        // An update replaces the Overlay binary on disk, but the running Overlay
+        // process survives until its own unit restarts. Restarting only the
+        // daemon left the user on a stale Overlay, so the Overlay rides along —
+        // and the report says so. A missing or invalid Overlay unit is not an
+        // error: the Overlay is optional and the daemon restart still succeeded.
+        UserServiceAction::Restart => {
+            let report = restart()?;
+            Ok(append_optional_overlay_report(
+                report,
+                manage_optional_overlay(OptionalOverlayAction::Restart),
+            ))
+        }
         UserServiceAction::Status => status(),
         UserServiceAction::Uninstall => {
             let overlay_message = manage_optional_overlay(OptionalOverlayAction::Disable);
@@ -114,23 +126,46 @@ fn manage_optional_overlay(action: OptionalOverlayAction) -> Option<String> {
         ));
     }
 
-    let (arguments, success_message, failure_prefix): (&[&str], &str, &str) = match action {
-        OptionalOverlayAction::Enable => (
-            &["enable", "--now", OVERLAY_UNIT_NAME],
-            "optional Overlay service enabled and started",
-            "optional Overlay service was not enabled",
+    // Each step is one systemctl invocation plus the phrase reported if it
+    // fails. Install both enables AND restarts: `enable --now` does nothing to a
+    // unit that is already running, so an update that replaced the Overlay
+    // binary would otherwise leave the previous process in place.
+    let (steps, success_message): (&[(&[&str], &str)], &str) = match action {
+        OptionalOverlayAction::Install => (
+            &[
+                (
+                    &["enable", "--now", OVERLAY_UNIT_NAME],
+                    "optional Overlay service was not enabled",
+                ),
+                (
+                    &["restart", OVERLAY_UNIT_NAME],
+                    "optional Overlay service was not restarted",
+                ),
+            ],
+            "optional Overlay service enabled and restarted",
+        ),
+        OptionalOverlayAction::Restart => (
+            &[(
+                &["try-restart", OVERLAY_UNIT_NAME],
+                "optional Overlay service was not restarted",
+            )],
+            "optional Overlay service try-restart completed",
         ),
         OptionalOverlayAction::Disable => (
-            &["disable", "--now", OVERLAY_UNIT_NAME],
+            &[(
+                &["disable", "--now", OVERLAY_UNIT_NAME],
+                "optional Overlay service was not disabled",
+            )],
             "optional Overlay service disabled and stopped",
-            "optional Overlay service was not disabled",
         ),
     };
 
-    Some(match systemctl_required(arguments) {
-        Ok(()) => success_message.to_owned(),
-        Err(error) => format!("warning: {failure_prefix}: {error}"),
-    })
+    for (arguments, failure_prefix) in steps {
+        if let Err(error) = systemctl_required(arguments) {
+            return Some(format!("warning: {failure_prefix}: {error}"));
+        }
+    }
+    Some(success_message.to_owned())
 }
 
 fn packaged_overlay_unit_exists() -> bool {
@@ -1008,10 +1043,7 @@ fn probe_daemon() -> DaemonIpc {
     {
         return DaemonIpc::Unavailable;
     }
-    let request = Request {
-        version: PROTOCOL_VERSION,
-        command: Command::Status,
-    };
+    let request = Request::new(Command::Status);
     if serde_json::to_writer(&mut stream, &request).is_err() || stream.write_all(b"\n").is_err() {
         return DaemonIpc::Unavailable;
     }

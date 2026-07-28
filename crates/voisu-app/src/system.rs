@@ -51,6 +51,8 @@ pub const PROCESSING_RESPONSE_DEADLINE: Duration = Duration::from_secs(
         + RECONCILIATION_DEADLINE.as_secs() * 2
         + 1,
 );
+/// End-to-end budget shared by both sides of a paged history/export transfer.
+pub const DIAGNOSTIC_RESPONSE_DEADLINE: Duration = Duration::from_secs(15);
 const PROCESS_POLL: Duration = Duration::from_millis(10);
 const MAX_DAEMON_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_RETAINED_STDERR_BYTES: usize = 4 * 1024;
@@ -1978,8 +1980,7 @@ fn daemon_status_handshake() -> Result<(), ()> {
     // an oversized frame can never be fully buffered before the cap is checked.
     let started = Instant::now();
     stream.set_write_timeout(Some(PROCESS_DEADLINE)).map_err(|_| ())?;
-    serde_json::to_writer(&mut stream, &Request { version: PROTOCOL_VERSION, command: DaemonCommand::Status })
-        .map_err(|_| ())?;
+    serde_json::to_writer(&mut stream, &Request::new(DaemonCommand::Status)).map_err(|_| ())?;
     stream.write_all(b"\n").map_err(|_| ())?;
     let response = read_bounded_frame(&mut stream, started)?;
     let envelope: VersionEnvelope = serde_json::from_str(&response).map_err(|_| ())?;

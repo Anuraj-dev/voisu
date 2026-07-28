@@ -10,8 +10,8 @@
 //! cleanup can remove expired captures safely.
 
 use std::collections::BTreeMap;
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,14 +32,35 @@ use crate::{
 pub const MAX_STORED_TEXT: usize = 8 * 1024;
 
 /// The default number of most-recent Recordings retained in local history.
-pub const DEFAULT_MAX_RECORDS: usize = 20;
-/// The default maximum age of a retained diagnostic record.
-pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+///
+/// Both retention bounds are sized for a week of dictation, and they only work
+/// together: at the observed ~36 Recordings a day the age bound prunes first, so
+/// a larger count alone would leave the ring plateaued near a single day's
+/// worth. Sized so a week at that rate (~252) is bounded but a week at a lighter
+/// rate is retained whole.
+pub const DEFAULT_MAX_RECORDS: usize = 200;
+/// The default maximum age of a retained diagnostic record — one week, so this
+/// week's latency can be compared against last week's. Raised in step with
+/// [`DEFAULT_MAX_RECORDS`]; see that constant for why neither moves alone.
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 /// The default time-to-live for an explicitly captured debug audio file.
 pub const DEFAULT_DEBUG_AUDIO_TTL: Duration = Duration::from_secs(3600);
 
 /// The masking placeholder a diagnostic export writes in place of any secret.
 pub const REDACTED: &str = "<redacted>";
+
+/// The retained history: one JSON record per line, in append order.
+///
+/// Line-delimited rather than a single JSON array so a completed Recording can
+/// append its record without rewriting the ring. At the default retention on a
+/// real disk that rewrite costs ~250 ms per dictation, all of it proportional to
+/// the retained history rather than to the one record being added. It also
+/// bounds crash damage: a torn final line loses one record, where a torn single
+/// JSON value is unparseable and loses everything.
+const HISTORY_FILE: &str = "history.jsonl";
+/// Prefix of the temp files [`DiagnosticStore::write_all`] renames into place.
+/// Startup sweeps these, so it has to stay in step with the history file name.
+const HISTORY_TEMP_PREFIX: &str = "history.jsonl.tmp.";
 
 /// Milliseconds since the Unix epoch, saturating to 0 before the epoch.
 pub fn unix_millis_now() -> u64 {
@@ -572,6 +593,8 @@ pub struct DiagnosticStore {
     policy: RetentionPolicy,
     lock: Mutex<()>,
     temp_counter: AtomicU64,
+    #[cfg(test)]
+    directory_sync_attempts: AtomicU64,
 }
 
 impl DiagnosticStore {
@@ -584,6 +607,8 @@ impl DiagnosticStore {
             policy,
             lock: Mutex::new(()),
             temp_counter: AtomicU64::new(0),
+            #[cfg(test)]
+            directory_sync_attempts: AtomicU64::new(0),
         };
         create_private_dir(&store.audio_dir())?;
         create_private_dir(&store.fixture_dir())?;
@@ -600,26 +625,136 @@ impl DiagnosticStore {
     }
 
     fn history_file(&self) -> PathBuf {
-        self.dir.join("history.json")
+        self.dir.join(HISTORY_FILE)
     }
 
     fn lock_store(&self) -> MutexGuard<'_, ()> {
         self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn load_raw(&self) -> Vec<DiagnosticRecord> {
-        // A missing or corrupt history file yields an empty history rather than
-        // failing the daemon: local diagnostics must never block a Recording.
-        match fs::read(self.history_file()) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => Vec::new(),
+    fn load_raw(&self) -> io::Result<Vec<DiagnosticRecord>> {
+        // Only a missing history is an empty history. Any other open/read error
+        // is propagated so no caller can mistake unavailable durable state for
+        // an empty snapshot and compact that fiction over the retained log.
+        //
+        // Line-delimited, so an unreadable line costs only that record. A crash
+        // during the append below can leave a torn final line; skipping it keeps
+        // every record that was completely written, where a single-value file
+        // would have to discard the whole ring.
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(self.history_file())
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "diagnostics history is not a regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_slice(line).ok())
+            .collect())
+    }
+
+    fn open_append_file(&self) -> io::Result<(File, bool)> {
+        let path = self.history_file();
+        match OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(&path)
+        {
+            Ok(file) => Ok((file, true)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                    .open(path)?;
+                if !file.metadata()?.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "diagnostics history is not a regular file",
+                    ));
+                }
+                Ok((file, false))
+            }
+            Err(error) => Err(error),
         }
     }
 
+    /// Makes a newly-created or atomically replaced directory entry durable.
+    ///
+    /// The record itself is already safely on disk when this runs. Directory
+    /// syncing is therefore best-effort: an unusual filesystem that refuses a
+    /// directory fsync must not turn observability into a delivery failure.
+    fn sync_directory_best_effort(&self, operation: &str) {
+        #[cfg(test)]
+        self.directory_sync_attempts.fetch_add(1, Ordering::Relaxed);
+        let result = File::open(&self.dir).and_then(|directory| directory.sync_all());
+        if let Err(error) = result {
+            eprintln!("diagnostics directory sync failed after {operation}: {error}");
+        }
+    }
+
+    /// Appends one record to the log without rewriting what is already there.
+    ///
+    /// This is the whole reason the history is line-delimited. Rewriting the
+    /// full ring on the completion path of every dictation costs, at the default
+    /// retention on a real disk, ~250 ms per Recording — the serialize, the
+    /// write and the fsync all scale with the ENTIRE retained history rather
+    /// than with the one record being added. An append is bounded by the record.
+    fn append(&self, record: &DiagnosticRecord) -> io::Result<()> {
+        let mut encoded = serde_json::to_vec(record)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        // `to_vec` escapes any newline inside a string, so a serialized record
+        // is always exactly one line and can never split the log.
+        debug_assert!(!encoded.contains(&b'\n'));
+        encoded.push(b'\n');
+        let (mut file, created) = self.open_append_file()?;
+        if file.metadata()?.len() != 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut last = [0_u8; 1];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                // A previous ENOSPC/crash may have left a partial JSON tail.
+                // Separate it from this complete record so the torn line alone
+                // is discarded and the newly accepted Recording stays readable.
+                encoded.insert(0, b'\n');
+            }
+        }
+        file.write_all(&encoded)?;
+        // `sync_data`, not `sync_all`: the file's size is the only metadata that
+        // matters here and a data sync carries it, so this does not pay for an
+        // inode flush the history does not need.
+        file.sync_data()?;
+        if created {
+            self.sync_directory_best_effort("history creation");
+        }
+        Ok(())
+    }
+
+    /// Rewrites the whole log atomically. Used only when pruning actually
+    /// removed something, so the common append path never pays for it.
     fn write_all(&self, records: &[DiagnosticRecord]) -> io::Result<()> {
         const TEMP_CREATE_ATTEMPTS: u32 = 32;
-        let encoded = serde_json::to_vec(records)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut encoded = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut encoded, record)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            encoded.push(b'\n');
+        }
         // A unique, exclusively created temp file per write: O_EXCL refuses to
         // follow a pre-planted symlink at the temp path and the descriptor is
         // created 0600 rather than trusting pre-existing permissions. A name
@@ -629,7 +764,7 @@ impl DiagnosticStore {
         let (temp, mut file) = 'created: {
             for _ in 0..TEMP_CREATE_ATTEMPTS {
                 let temp = self.dir.join(format!(
-                    "history.json.tmp.{}.{}",
+                    "{HISTORY_TEMP_PREFIX}{}.{}",
                     std::process::id(),
                     self.temp_counter.fetch_add(1, Ordering::Relaxed)
                 ));
@@ -657,6 +792,8 @@ impl DiagnosticStore {
         let renamed = fs::rename(&temp, self.history_file());
         if renamed.is_err() {
             let _ = fs::remove_file(&temp);
+        } else {
+            self.sync_directory_best_effort("history replacement");
         }
         renamed
     }
@@ -672,10 +809,23 @@ impl DiagnosticStore {
         }
     }
 
-    /// Prunes, removes expired audio, and persists the retained records in
-    /// chronological (append) order, then returns them newest first for reading.
-    /// Callers must hold the store lock.
-    fn prune_and_persist(&self, records: Vec<DiagnosticRecord>) -> io::Result<Vec<DiagnosticRecord>> {
+    /// Prunes in memory, removes expired debug audio, and returns the retained
+    /// records newest first. Writes nothing.
+    ///
+    /// Pruning on every load is what lets the log carry records the policy has
+    /// already expired: they are dropped here, so no reader can ever see one,
+    /// and the log only has to be rewritten when it has drifted far enough to be
+    /// worth the cost. Callers must hold the store lock.
+    fn prune_in_memory(&self, records: Vec<DiagnosticRecord>) -> Vec<DiagnosticRecord> {
+        let outcome = self.policy.prune(records, unix_millis_now());
+        self.remove_audio(&outcome.expired_audio);
+        let mut newest_first = outcome.kept;
+        newest_first.reverse();
+        newest_first
+    }
+
+    /// Rewrites the log to exactly the retained set. Callers must hold the lock.
+    fn compact(&self, records: Vec<DiagnosticRecord>) -> io::Result<Vec<DiagnosticRecord>> {
         let outcome = self.policy.prune(records, unix_millis_now());
         self.remove_audio(&outcome.expired_audio);
         self.write_all(&outcome.kept)?;
@@ -684,23 +834,67 @@ impl DiagnosticStore {
         Ok(newest_first)
     }
 
+    /// How far the log may drift past the retained record count, or how many
+    /// age-expired records may accumulate, before a write compacts it.
+    ///
+    /// Without slack there is no amortization at all at the steady state this
+    /// retention policy is designed for: once the ring is full, EVERY Recording
+    /// pushes the count over the bound, so every Recording would prune one
+    /// record and rewrite the whole log — measured at ~250 ms per dictation at
+    /// the default retention on a real disk. Compacting once per slack
+    /// Recordings instead makes that ~5 ms amortized. The cost is a log bounded
+    /// at `max_records + slack` rather than `max_records`; age-expired drift is
+    /// rewritten when a subsequent Recording observes more than `slack`
+    /// expired entries. Readers are unaffected, because every load prunes
+    /// before returning.
+    fn compaction_slack(&self) -> usize {
+        (self.policy.max_records / 4).max(8)
+    }
+
+    fn expired_by_age(&self, records: &[DiagnosticRecord], now_ms: u64) -> usize {
+        let age_floor = now_ms.saturating_sub(self.policy.max_age_ms());
+        records
+            .iter()
+            .filter(|record| record.recorded_at_unix_ms < age_floor)
+            .count()
+    }
+
     /// Appends a completed Recording's record, prunes to the retention policy,
     /// removes any now-expired debug audio, and returns the retained history
     /// (newest first).
     pub fn record(&self, record: DiagnosticRecord) -> io::Result<Vec<DiagnosticRecord>> {
         let _guard = self.lock_store();
-        let mut records = self.load_raw();
+        let mut records = self.load_raw()?;
+        let slack = self.compaction_slack();
+        let count_drifted = records.len() + 1 > self.policy.max_records + slack;
+        // Age drift needs the same amortization as count drift. Without this
+        // bounded slack, every first Recording after an age boundary would
+        // rewrite the whole log; without any age trigger, low-volume long-lived
+        // daemons retain expired transcript text on disk indefinitely.
+        let age_drifted = self.expired_by_age(&records, unix_millis_now()) > slack;
         records.push(record);
-        self.prune_and_persist(records)
+        if count_drifted || age_drifted {
+            return self.compact(records);
+        }
+        // Appending the record as given, not the pruned copy: the log is allowed
+        // to hold more than the policy retains, and the next load prunes it.
+        self.append(records.last().expect("the record was just pushed"))?;
+        Ok(self.prune_in_memory(records))
     }
 
     /// Returns the retained history (newest first), pruning stale records and
     /// expired debug audio as a side effect so a reader never sees an entry the
     /// retention policy has already expired.
+    ///
+    /// Reads do not write. `Command::History` runs this INLINE in the lifecycle
+    /// actor, so a concurrent `voisu stop` queues behind it; making it rewrite
+    /// and fsync the whole log put ~250 ms at the default retention in front of
+    /// that Stop for no gain, since pruning in memory already hides every
+    /// expired record.
     pub fn history(&self) -> io::Result<Vec<DiagnosticRecord>> {
         let _guard = self.lock_store();
-        let records = self.load_raw();
-        self.prune_and_persist(records)
+        let records = self.load_raw()?;
+        Ok(self.prune_in_memory(records))
     }
 
     /// Finds one Recording's record by its correlation ID, after pruning.
@@ -727,14 +921,23 @@ impl DiagnosticStore {
                     if entry
                         .file_name()
                         .to_str()
-                        .is_some_and(|name| name.starts_with("history.json.tmp."))
+                        .is_some_and(|name| name.starts_with(HISTORY_TEMP_PREFIX))
                     {
                         let _ = fs::remove_file(entry.path());
                     }
                 }
             }
         }
-        let kept = self.history()?;
+        // Startup is the one place a whole-log rewrite is free, so compact here.
+        // Runtime never rewrites unless the log has drifted past its slack, so
+        // records that aged out between runs would otherwise sit on disk being
+        // re-read and re-pruned on every load until enough new Recordings
+        // arrived to trigger a compaction.
+        let kept = {
+            let _guard = self.lock_store();
+            let records = self.load_raw()?;
+            self.compact(records)?
+        };
         let _guard = self.lock_store();
         let referenced: Vec<&str> = kept
             .iter()
@@ -895,6 +1098,117 @@ pub async fn replay_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    fn store_with_policy(dir: &Path, policy: RetentionPolicy) -> DiagnosticStore {
+        DiagnosticStore::open(dir.join("diagnostics"), policy).unwrap()
+    }
+
+    #[test]
+    fn history_fifo_is_rejected_without_a_blocking_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_policy(dir.path(), RetentionPolicy::default());
+        let path = store.history_file();
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a live NUL-terminated pathname and mkfifo does not
+        // retain the pointer.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+        let error = store.history().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "diagnostics history is not a regular file");
+    }
+
+    #[test]
+    fn descriptor_based_history_read_still_ignores_only_a_torn_final_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_policy(dir.path(), RetentionPolicy::default());
+        let retained = DiagnosticRecord::new("retained".to_owned(), 1);
+        let mut bytes = serde_json::to_vec(&retained).unwrap();
+        bytes.extend_from_slice(b"\n{\"correlation_id\":\"torn");
+        fs::write(store.history_file(), bytes).unwrap();
+
+        let history = store.history().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].correlation_id, "retained");
+    }
+
+    #[test]
+    fn cleanup_read_failure_never_replaces_the_history_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_policy(dir.path(), RetentionPolicy::default());
+        let history = store.history_file();
+        fs::create_dir(&history).unwrap();
+        fs::write(history.join("retained-marker"), b"must survive").unwrap();
+
+        let error = store.cleanup_expired().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let record_error = store
+            .record(DiagnosticRecord::new("must-not-rewrite".to_owned(), 2))
+            .unwrap_err();
+        assert_eq!(record_error.kind(), io::ErrorKind::InvalidData);
+        assert!(history.is_dir(), "failed cleanup must not rename over history");
+        assert_eq!(
+            fs::read(history.join("retained-marker")).unwrap(),
+            b"must survive"
+        );
+    }
+
+    #[test]
+    fn record_compacts_when_expired_age_drift_exceeds_the_bounded_slack() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = RetentionPolicy {
+            max_records: 100,
+            max_age: Duration::from_secs(1),
+            debug_audio_ttl: Duration::from_secs(1),
+        };
+        let store = store_with_policy(dir.path(), policy);
+        let expired: Vec<_> = (0..=store.compaction_slack())
+            .map(|recording_id| {
+                let mut record =
+                    DiagnosticRecord::new(format!("expired-{recording_id}"), recording_id as u64);
+                record.recorded_at_unix_ms = 0;
+                record
+            })
+            .collect();
+        store.write_all(&expired).unwrap();
+
+        let fresh = DiagnosticRecord::new("fresh".to_owned(), 999);
+        let history = store.record(fresh).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].correlation_id, "fresh");
+        let durable = store.load_raw().unwrap();
+        assert_eq!(durable.len(), 1, "expired text must be removed from disk");
+        assert_eq!(durable[0].correlation_id, "fresh");
+    }
+
+    #[test]
+    fn history_creation_and_atomic_replacement_attempt_directory_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_policy(dir.path(), RetentionPolicy::default());
+
+        store
+            .record(DiagnosticRecord::new("created".to_owned(), 1))
+            .unwrap();
+        assert_eq!(store.directory_sync_attempts.load(Ordering::Relaxed), 1);
+
+        let records = store.load_raw().unwrap();
+        store.write_all(&records).unwrap();
+        assert_eq!(store.directory_sync_attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn directory_sync_failure_is_non_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_policy(dir.path(), RetentionPolicy::default());
+        let moved = dir.path().join("diagnostics-moved");
+        fs::rename(&store.dir, &moved).unwrap();
+
+        store.sync_directory_best_effort("test");
+        assert_eq!(store.directory_sync_attempts.load(Ordering::Relaxed), 1);
+        assert!(moved.is_dir(), "a failed best-effort sync changes no durable data");
+    }
 
     #[test]
     fn diagnostic_store_recovers_a_poisoned_serialization_lock() {

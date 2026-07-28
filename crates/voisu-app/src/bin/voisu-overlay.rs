@@ -27,7 +27,7 @@ use voisu_app::overlay::{
     ObservedSignal, OverlayPhase, OverlayView, PresentationController, PresentationTracker,
     RecordingNotifyLatch, TickAction,
 };
-use voisu_core::{Command, PROTOCOL_VERSION, Request, Response, socket_path};
+use voisu_core::{Command, Request, Response, socket_path};
 
 fn main() {
     let arguments: Vec<_> = env::args().skip(1).collect();
@@ -945,11 +945,7 @@ fn rounded_rectangle(context: &gtk::cairo::Context, x: f64, y: f64, width: f64, 
 
 fn read_status() -> Option<Response> {
     let mut stream = UnixStream::connect(socket_path().ok()?).ok()?;
-    let request = serde_json::to_vec(&Request {
-        version: PROTOCOL_VERSION,
-        command: Command::OverlayStatus,
-    })
-    .ok()?;
+    let request = serde_json::to_vec(&Request::new(Command::OverlayStatus)).ok()?;
     stream.write_all(&request).ok()?;
     stream.write_all(b"\n").ok()?;
     stream.set_read_timeout(Some(Duration::from_millis(150))).ok()?;
@@ -967,11 +963,7 @@ fn read_status() -> Option<Response> {
 fn read_levels(after_seq: u64, deadline: Instant) -> Option<Vec<voisu_core::LevelFrame>> {
     let path = socket_path().ok()?;
     let mut stream = connect_within(&path, deadline)?;
-    let mut request = serde_json::to_vec(&Request {
-        version: PROTOCOL_VERSION,
-        command: Command::Level { after_seq },
-    })
-    .ok()?;
+    let mut request = serde_json::to_vec(&Request::new(Command::Level { after_seq })).ok()?;
     request.push(b'\n');
     write_within(&mut stream, &request, deadline)?;
     let response = read_until_eof_within(&mut stream, deadline)?;

@@ -16,17 +16,20 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use voisu_app::audio_level::{LevelRegistry, LevelRing};
 use voisu_app::focus::SharedFocusProbe;
+use voisu_app::journal::{escape_journal_control, recording_journal_lines};
 use voisu_app::system::{
-    CAPTURE_FINALIZE_DEADLINE, DeepgramProvider, DesktopNotifier, FedoraShortcutPortal,
-    GroqProvider, GuardedDelivery, MergeResultValidator, PROCESSING_RESPONSE_DEADLINE,
-    PROVIDER_COMPLETION_DEADLINE, PipeWireCapture, PortalClipboardDelivery, ProviderReaper,
+    CAPTURE_FINALIZE_DEADLINE, DIAGNOSTIC_RESPONSE_DEADLINE, DeepgramProvider,
+    DesktopNotifier, FedoraShortcutPortal, GroqProvider, GuardedDelivery, MergeResultValidator,
+    PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture,
+    PortalClipboardDelivery, ProviderReaper,
     RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
 use voisu_app::config::DeliveryMode;
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
-    CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonState, DeliveryAdapter, DeliveryMethod,
-    DeliveryOutcome, DiagnosticRecord, DiagnosticStore, LifecycleEvidence, LifecycleStage,
+    CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonState, DeliveryAdapter,
+    DeliveryMethod, DeliveryOutcome, DiagnosticPage, DiagnosticRecord, DiagnosticStore,
+    LifecycleEvidence, LifecycleStage,
     OverlayEvent, OverlayOutcome,
     MergeResult, PROTOCOL_VERSION, Provider,
     ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream, ProviderStreams,
@@ -38,6 +41,12 @@ use voisu_core::{
 };
 
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
+const DIAGNOSTIC_PAGE_BYTES: usize = 64 * 1024;
+/// The response-frame ceiling enforced by the shipped pre-paging CLI.
+///
+/// Requests without `paged: true` come from that compatibility path, so their
+/// inline history must fit this cap including its newline frame delimiter.
+const LEGACY_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const IO_DEADLINE: Duration = CAPTURE_FINALIZE_DEADLINE;
 const MAX_CONNECTIONS: usize = 32;
 const PROVIDER_DEADLINE: Duration = PROVIDER_COMPLETION_DEADLINE;
@@ -129,17 +138,30 @@ async fn run() -> Result<(), String> {
         inode: metadata.ino(),
     };
 
-    // Correlated local diagnostics live under the already-hardened private
-    // runtime directory and never leave the local machine. Startup cleanup
-    // removes any debug audio or over-retention records a previous run left.
+    // Correlated local diagnostics live in the private DURABLE state directory
+    // and never leave the local machine. A state/store failure disables
+    // diagnostics rather than startup: delivery must never depend on an
+    // observability precondition. We deliberately do NOT fall back to the
+    // runtime directory because logind removes it at logout; serving history
+    // from there would silently claim durability the store does not have.
     let retention = RetentionPolicy::from_env();
-    let diagnostics = Arc::new(
-        DiagnosticStore::open(parent.join("diagnostics"), retention)
-            .map_err(|error| format!("cannot open diagnostics store: {error}"))?,
-    );
-    if let Err(error) = diagnostics.cleanup_expired() {
-        eprintln!("diagnostics cleanup failed: {error}");
-    }
+    let diagnostics = match create_private_state_dir().and_then(|state| {
+        DiagnosticStore::open(state.join("diagnostics"), retention)
+            .map(Arc::new)
+            .map_err(|error| format!("cannot open diagnostics store: {error}"))
+    }) {
+        Ok(store) => match store.cleanup_expired() {
+            Ok(()) => Some(store),
+            Err(error) => {
+                eprintln!("diagnostics disabled: cleanup failed: {error}");
+                None
+            }
+        },
+        Err(error) => {
+            eprintln!("diagnostics disabled: {error}");
+            None
+        }
+    };
 
     // An over-long VOISU_RECORDING_DEADLINE_MS is clamped to the one bounded
     // maximum. Say so once here rather than at the clamp itself, which runs on
@@ -286,6 +308,49 @@ fn create_private_runtime_dirs(parent: &Path) -> Result<(), String> {
         return Err("unexpected daemon runtime directory".to_owned());
     }
     Ok(())
+}
+
+/// Creates Voisu's durable state directory and holds it to the same privacy
+/// contract the runtime directory has: a real directory (never a symlink), owned
+/// by this user, mode 0700.
+///
+/// The XDG state ROOT is shared ground — other applications keep their state
+/// beside Voisu's — so it is only created, with the process umask, and never
+/// re-permissioned. Only Voisu's own directory below it is locked down.
+/// `DiagnosticStore::open` then applies the identical check to the store and its
+/// audio and fixture subdirectories, so moving the store off tmpfs does not
+/// weaken the hardening it had there.
+fn create_private_state_dir() -> Result<PathBuf, String> {
+    let dir = voisu_core::state_dir()?;
+    let root = dir
+        .parent()
+        .ok_or_else(|| "state directory has no parent".to_owned())?;
+    fs::create_dir_all(root)
+        .map_err(|error| format!("cannot create state root {}: {error}", root.display()))?;
+    match fs::symlink_metadata(&dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(format!("unsafe state path: {}", dir.display()));
+            }
+            // SAFETY: geteuid has no preconditions and does not mutate memory.
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(format!(
+                    "state directory is not owned by the current user: {}",
+                    dir.display()
+                ));
+            }
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("cannot secure state directory: {error}"))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|error| format!("cannot create private state directory: {error}"))?;
+        }
+        Err(error) => return Err(format!("cannot inspect state directory: {error}")),
+    }
+    Ok(dir)
 }
 
 struct SingleInstance(File);
@@ -464,7 +529,7 @@ struct RecordingResult {
 async fn actor_loop(
     mut rx: mpsc::Receiver<ActorMessage>,
     tx: mpsc::Sender<ActorMessage>,
-    diagnostics: Arc<DiagnosticStore>,
+    diagnostics: Option<Arc<DiagnosticStore>>,
     reaper: ProviderReaper,
     delivery_mode: DeliveryMode,
     focus_probe: Option<SharedFocusProbe>,
@@ -555,25 +620,63 @@ async fn actor_loop(
                     let _ = reply.send(Response::success(state_label(&state), message));
                 }
                 Command::History => {
-                    let records = diagnostics.history().unwrap_or_default();
-                    let _ = reply.send(Response::with_history(records));
+                    let response = match diagnostics.as_ref() {
+                        // Degraded mode: the daemon KNOWS there is no durable
+                        // store this session and has already said so in the
+                        // journal. Its established empty-history presentation
+                        // stays, so a client that never had diagnostics is not
+                        // newly broken.
+                        None => Response::with_history(Vec::new()),
+                        Some(store) => match store.history() {
+                            Ok(records) => Response::with_history(records),
+                            // A store that WAS readable at startup and is not
+                            // now: the retained history is unknown, not empty.
+                            // Reporting `[]` would present unknown data as
+                            // durable truth, so this is an explicit failure.
+                            // The bounded message matches `export`'s; the
+                            // unbounded io detail goes to the journal only.
+                            Err(error) => {
+                                eprintln!(
+                                    "diagnostics history read failed: {}",
+                                    escape_journal_control(&error.to_string())
+                                );
+                                Response::rejected(
+                                    Some(state_label(&state)),
+                                    "diagnostics are unavailable",
+                                )
+                            }
+                        },
+                    };
+                    let _ = reply.send(response);
                 }
                 Command::Export(correlation_id) => {
-                    let response = match diagnostics.find(correlation_id.as_str()) {
-                        Ok(Some(record)) => Response::with_export(voisu_core::export_record(
-                            record,
-                            std::env::vars(),
-                        )),
-                        Ok(None) => Response::rejected(
-                            Some(state_label(&state)),
-                            "no diagnostic record for that correlation ID",
-                        ),
-                        Err(_) => Response::rejected(
+                    let response = match diagnostics.as_ref() {
+                        Some(store) => match store.find(correlation_id.as_str()) {
+                            Ok(Some(record)) => Response::with_export(voisu_core::export_record(
+                                record,
+                                std::env::vars(),
+                            )),
+                            Ok(None) => Response::rejected(
+                                Some(state_label(&state)),
+                                "no diagnostic record for that correlation ID",
+                            ),
+                            Err(_) => Response::rejected(
+                                Some(state_label(&state)),
+                                "diagnostics are unavailable",
+                            ),
+                        },
+                        None => Response::rejected(
                             Some(state_label(&state)),
                             "diagnostics are unavailable",
                         ),
                     };
                     let _ = reply.send(response);
+                }
+                Command::Replay(_) if diagnostics.is_none() => {
+                    let _ = reply.send(Response::rejected(
+                        Some(state_label(&state)),
+                        "diagnostics are unavailable",
+                    ));
                 }
                 Command::Replay(fixture_name) if matches!(state, ActorState::Idle) => {
                     let id = next_id;
@@ -624,7 +727,10 @@ async fn actor_loop(
                     let replay = tokio::spawn(replay_recording(
                         fixture_name.into_inner(),
                         id,
-                        diagnostics.fixture_dir(),
+                        diagnostics
+                            .as_ref()
+                            .expect("diagnostics availability checked above")
+                            .fixture_dir(),
                         current_deepgram,
                         current_groq,
                         current_validator,
@@ -739,7 +845,7 @@ async fn actor_loop(
                                 recording,
                                 &mut validator,
                                 &mut delivery,
-                                Arc::clone(&diagnostics),
+                                diagnostics.clone(),
                                 debug_capture,
                                 controlled,
                                 deepgram_enabled,
@@ -833,10 +939,12 @@ async fn actor_loop(
                             if !deepgram_enabled {
                                 normalize_disabled_deepgram(&mut record.provider_failures);
                             }
-                            if let Err(error) = diagnostics.record(record) {
-                                eprintln!(
-                                    "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
-                                );
+                            if let Some(store) = diagnostics.as_ref() {
+                                if let Err(error) = store.record(record) {
+                                    eprintln!(
+                                        "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
+                                    );
+                                }
                             }
                             let mut evidence = base_evidence(
                                 id,
@@ -847,6 +955,13 @@ async fn actor_loop(
                                 ],
                             );
                             evidence.recovery_attempted = true;
+                            let journal = recording_journal_lines(
+                                id,
+                                &evidence,
+                                Some("daemon is shutting down"),
+                            );
+                            eprintln!("{}", journal.human);
+                            eprintln!("{}", journal.structured);
                             let _ = reply.send(Response::with_evidence(
                                 false,
                                 Some(DaemonState::Idle),
@@ -921,6 +1036,40 @@ async fn actor_loop(
                                 started_at,
                                 tx.clone(),
                             ));
+                            if controlled
+                                && std::env::var_os(
+                                    "VOISU_TEST_WAIT_FOR_FIRST_CHUNK_BEFORE_START",
+                                )
+                                .is_some()
+                            {
+                                // Two exits, never one. The counter is the
+                                // intended marker, but a pump that terminates
+                                // chunkless (capture died, provider streaming
+                                // failed, zero-chunk Recording Deadline) can
+                                // never raise it, and a wait on the counter
+                                // alone would yield-loop inside the actor
+                                // forever — wedging every later command. The
+                                // pump always finishes after queuing
+                                // `PumpTerminated`, so its JoinHandle is the
+                                // deterministic second exit; a yield budget
+                                // would only trade a wedge for a flake.
+                                while chunk_counter.load(Ordering::SeqCst) == 0 {
+                                    if pump.is_finished() {
+                                        // Re-read once: a chunk streamed just
+                                        // before termination still counts, and
+                                        // must not be reported as chunkless.
+                                        if chunk_counter.load(Ordering::SeqCst) == 0 {
+                                            eprintln!(
+                                                "Recording {id}: \
+                                                 VOISU_TEST_WAIT_FOR_FIRST_CHUNK_BEFORE_START: \
+                                                 the capture pump ended before any chunk streamed"
+                                            );
+                                        }
+                                        break;
+                                    }
+                                    tokio::task::yield_now().await;
+                                }
+                            }
                             state = ActorState::Recording(ActiveRecording {
                                 id,
                                 stop_tx,
@@ -940,10 +1089,19 @@ async fn actor_loop(
                             level_ring.deactivate();
                             let recovering =
                                 failure.capture.is_some() || failure.provider_stream.is_some();
+                            let mut evidence =
+                                base_evidence(id, correlation.clone(), Vec::new());
+                            evidence.recovery_attempted = recovering;
+                            let journal = recording_journal_lines(
+                                id,
+                                &evidence,
+                                Some(failure.error.diagnostic()),
+                            );
                             eprintln!(
                                 "Recording {id} [{correlation}]: {}",
-                                failure.error.diagnostic()
+                                escape_journal_control(failure.error.diagnostic())
                             );
+                            eprintln!("{}", journal.structured);
                             // A startup failure is correlated and retained like
                             // any other Recording outcome: its record persists
                             // locally and the rejection carries the correlated
@@ -998,14 +1156,13 @@ async fn actor_loop(
                             if !deepgram_enabled {
                                 normalize_disabled_deepgram(&mut record.provider_failures);
                             }
-                            if let Err(error) = diagnostics.record(record) {
-                                eprintln!(
-                                    "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
-                                );
+                            if let Some(store) = diagnostics.as_ref() {
+                                if let Err(error) = store.record(record) {
+                                    eprintln!(
+                                        "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
+                                    );
+                                }
                             }
-                            let mut evidence =
-                                base_evidence(id, correlation.clone(), Vec::new());
-                            evidence.recovery_attempted = recovering;
                             let response = Response::with_evidence(
                                 false,
                                 Some(DaemonState::Idle),
@@ -1083,7 +1240,7 @@ async fn actor_loop(
                             recording,
                             &mut validator,
                             &mut delivery,
-                            Arc::clone(&diagnostics),
+                            diagnostics.clone(),
                             debug_capture,
                             controlled,
                             deepgram_enabled,
@@ -1113,6 +1270,17 @@ async fn actor_loop(
                     state = ActorState::Idle;
                     let response = match completed.result {
                         Ok(()) => {
+                            // The journal is the only diagnostic surface that
+                            // outlives the retention ring, so the healthy path
+                            // reports its per-stage timings there too — not just
+                            // the failing one.
+                            let journal = recording_journal_lines(
+                                completed.id,
+                                &completed.evidence,
+                                None,
+                            );
+                            eprintln!("{}", journal.human);
+                            eprintln!("{}", journal.structured);
                             let response = Response::with_evidence(
                             true,
                             Some(DaemonState::Idle),
@@ -1145,7 +1313,16 @@ async fn actor_loop(
                             response
                         }
                         Err(error) => {
-                            eprintln!("Recording {}: {}", completed.id, error.diagnostic());
+                            // Preserve the historical diagnostic line verbatim,
+                            // then emit timings separately so free text cannot
+                            // split or displace the machine record.
+                            let journal = recording_journal_lines(
+                                completed.id,
+                                &completed.evidence,
+                                Some(error.diagnostic()),
+                            );
+                            eprintln!("{}", journal.human);
+                            eprintln!("{}", journal.structured);
                             let response = Response::with_evidence(
                                 false,
                                 Some(DaemonState::Idle),
@@ -1193,7 +1370,7 @@ async fn actor_loop(
                             recording,
                             &mut validator,
                             &mut delivery,
-                            Arc::clone(&diagnostics),
+                            diagnostics.clone(),
                             debug_capture,
                             controlled,
                             deepgram_enabled,
@@ -1241,7 +1418,7 @@ fn spawn_recording_processing(
     recording: ActiveRecording,
     validator: &mut Option<Box<dyn TranscriptValidator>>,
     delivery: &mut Option<Box<dyn DeliveryAdapter>>,
-    diagnostics: Arc<DiagnosticStore>,
+    diagnostics: Option<Arc<DiagnosticStore>>,
     debug_capture: bool,
     controlled: bool,
     deepgram_enabled: bool,
@@ -1278,7 +1455,7 @@ fn spawn_recording_processing(
         recording,
         current_validator,
         current_delivery,
-        Arc::clone(&diagnostics),
+        diagnostics.clone(),
         debug_capture,
         deepgram_enabled,
     ));
@@ -1715,7 +1892,7 @@ async fn process_recording(
     recording: ActiveRecording,
     mut validator: Box<dyn TranscriptValidator>,
     mut delivery: Box<dyn DeliveryAdapter>,
-    diagnostics: Arc<DiagnosticStore>,
+    diagnostics: Option<Arc<DiagnosticStore>>,
     debug_capture: bool,
     deepgram_enabled: bool,
 ) -> RecordingResult {
@@ -1764,8 +1941,10 @@ async fn process_recording(
                 None,
                 Some(&error),
             );
-            if let Err(record_error) = diagnostics.record(record) {
-                eprintln!("Recording {id}: writing diagnostics failed: {record_error}");
+            if let Some(store) = diagnostics.as_ref() {
+                if let Err(record_error) = store.record(record) {
+                    eprintln!("Recording {id}: writing diagnostics failed: {record_error}");
+                }
             }
             return RecordingResult {
                 result: Err(error),
@@ -1804,9 +1983,11 @@ async fn process_recording(
         evidence.capture_finalized_ms = Some(elapsed_millis(started_at));
         evidence.stages.push(LifecycleStage::CaptureFinalized);
         if debug_capture {
-            match diagnostics.store_debug_audio(&correlation_id, audio.pcm_s16le_mono_16khz()) {
-                Ok(record) => debug_audio = Some(record),
-                Err(error) => eprintln!("Recording {id}: debug audio capture failed: {error}"),
+            if let Some(store) = diagnostics.as_ref() {
+                match store.store_debug_audio(&correlation_id, audio.pcm_s16le_mono_16khz()) {
+                    Ok(record) => debug_audio = Some(record),
+                    Err(error) => eprintln!("Recording {id}: debug audio capture failed: {error}"),
+                }
             }
         }
         let completed = providers.complete_with_timings(audio).await?;
@@ -1882,8 +2063,10 @@ async fn process_recording(
         debug_audio,
         result.as_ref().err(),
     );
-    if let Err(error) = diagnostics.record(record) {
-        eprintln!("Recording {id}: writing diagnostics failed: {error}");
+    if let Some(store) = diagnostics.as_ref() {
+        if let Err(error) = store.record(record) {
+            eprintln!("Recording {id}: writing diagnostics failed: {error}");
+        }
     }
 
     RecordingResult {
@@ -1909,7 +2092,7 @@ async fn supervise_recording(
     reply: Option<oneshot::Sender<Response>>,
     publish_terminal_outcome: bool,
     actor: mpsc::Sender<ActorMessage>,
-    diagnostics: Arc<DiagnosticStore>,
+    diagnostics: Option<Arc<DiagnosticStore>>,
     reaper: ProviderReaper,
 ) {
     let id = panic_evidence.recording_id;
@@ -1947,10 +2130,12 @@ async fn supervise_recording(
                 None,
                 Some(&error),
             );
-            if let Err(record_error) = diagnostics.record(record) {
-                log_best_effort(format_args!(
-                    "Recording {id}: writing diagnostics failed: {record_error}"
-                ));
+            if let Some(store) = diagnostics.as_ref() {
+                if let Err(record_error) = store.record(record) {
+                    log_best_effort(format_args!(
+                        "Recording {id}: writing diagnostics failed: {record_error}"
+                    ));
+                }
             }
             let (validator, delivery) =
                 rebuild_recording_adapters(controlled, delivery_mode, focus_probe.clone());
@@ -2621,18 +2806,24 @@ async fn serve(
     }
     let envelope: VersionEnvelope = serde_json::from_str(&request)
         .map_err(|error| format!("cannot decode protocol envelope: {error}"))?;
-    let response = if envelope.version != PROTOCOL_VERSION {
-        Response::rejected(
-            None,
-            format!(
-                "unsupported protocol version {}; expected {PROTOCOL_VERSION}",
-                envelope.version
+    let (response, write_deadline, paged) = if envelope.version != PROTOCOL_VERSION {
+        (
+            Response::rejected(
+                None,
+                format!(
+                    "unsupported protocol version {}; expected {PROTOCOL_VERSION}",
+                    envelope.version
+                ),
             ),
+            IO_DEADLINE,
+            false,
         )
     } else {
         let request: Request = serde_json::from_str(&request)
             .map_err(|error| format!("cannot decode CLI command: {error}"))?;
-        match request.command {
+        let write_deadline = command_write_deadline(&request.command);
+        let paged = request.paged;
+        let response = match request.command {
             Command::Level { after_seq } => Response::with_level_frames(levels.after(after_seq)),
             command => {
                 let (reply_tx, reply_rx) = oneshot::channel();
@@ -2644,12 +2835,124 @@ async fn serve(
                     .await
                     .map_err(|_| "lifecycle actor dropped its response".to_owned())?
             }
-        }
+        };
+        (response, write_deadline, paged)
     };
-    let mut encoded = serde_json::to_vec(&response)
+    write_response(&mut writer, response, write_deadline, paged).await
+}
+
+async fn write_response(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    mut response: Response,
+    write_deadline: Duration,
+    paged: bool,
+) -> Result<(), String> {
+    let write_started = Instant::now();
+    // A client that did not ask for paging cannot reassemble pages. Keep its
+    // history inline, newest first, but trim the oldest tail until the complete
+    // frame fits the one-mebibyte ceiling enforced by the shipped legacy CLI.
+    // A useful recent snapshot is backward compatible; a frame the client must
+    // reject is not.
+    if !paged {
+        bound_legacy_history(&mut response)?;
+        return write_response_frame(writer, &response, write_started, write_deadline).await;
+    }
+    let diagnostic = if let Some(history) = response.history.take() {
+        Some(
+            serde_json::to_string(&history)
+                .map_err(|error| format!("cannot encode diagnostic history: {error}"))?,
+        )
+    } else if let Some(export) = response.export.take() {
+        Some(
+            serde_json::to_string(&export)
+                .map_err(|error| format!("cannot encode diagnostic export: {error}"))?,
+        )
+    } else {
+        None
+    };
+
+    let Some(payload) = diagnostic else {
+        return write_response_frame(writer, &response, write_started, write_deadline).await;
+    };
+
+    let mut start = 0;
+    let mut sequence = 0;
+    while start < payload.len() {
+        let mut end = (start + DIAGNOSTIC_PAGE_BYTES).min(payload.len());
+        while !payload.is_char_boundary(end) {
+            end -= 1;
+        }
+        response.diagnostic_page = Some(DiagnosticPage {
+            sequence,
+            last: end == payload.len(),
+            payload: payload[start..end].to_owned(),
+        });
+        write_response_frame(writer, &response, write_started, write_deadline).await?;
+        start = end;
+        sequence += 1;
+    }
+    Ok(())
+}
+
+fn bound_legacy_history(response: &mut Response) -> Result<(), String> {
+    let Some(records) = response.history.take() else {
+        return Ok(());
+    };
+    let mut fits = 0;
+    let mut too_many = records.len() + 1;
+    while fits + 1 < too_many {
+        let candidate = fits + (too_many - fits) / 2;
+        response.history = Some(records[..candidate].to_vec());
+        let frame_bytes = serde_json::to_vec(response)
+            .map_err(|error| format!("cannot encode daemon response: {error}"))?
+            .len()
+            + 1;
+        if frame_bytes <= LEGACY_MAX_RESPONSE_BYTES {
+            fits = candidate;
+        } else {
+            too_many = candidate;
+        }
+    }
+    // Zero records fit while records exist: the NEWEST record alone overflows
+    // the legacy ceiling. Records are not globally size-bounded, so this is
+    // reachable. Sending the empty prefix would present a successful, genuinely
+    // empty durable history to a client whose history is not empty — the exact
+    // silent data-loss presentation this daemon must never produce. Tell the
+    // client instead; the message is a fixed literal, so the rejection always
+    // fits the frame it is replacing.
+    if fits == 0 && !records.is_empty() {
+        response.ok = false;
+        response.history = None;
+        response.message = "the newest diagnostic record is too large for an unpaged client; \
+                            upgrade voisu to read this history in pages"
+            .to_owned();
+        return Ok(());
+    }
+    response.history = Some(records.into_iter().take(fits).collect());
+    Ok(())
+}
+
+fn command_write_deadline(command: &Command) -> Duration {
+    match command {
+        Command::History | Command::Export(_) => DIAGNOSTIC_RESPONSE_DEADLINE,
+        _ => IO_DEADLINE,
+    }
+}
+
+async fn write_response_frame(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    response: &Response,
+    write_started: Instant,
+    write_deadline: Duration,
+) -> Result<(), String> {
+    let mut encoded = serde_json::to_vec(response)
         .map_err(|error| format!("cannot encode daemon response: {error}"))?;
     encoded.push(b'\n');
-    timeout(IO_DEADLINE, writer.write_all(&encoded))
+    let remaining = write_deadline
+        .checked_sub(write_started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "CLI write deadline elapsed".to_owned())?;
+    timeout(remaining, writer.write_all(&encoded))
         .await
         .map_err(|_| "CLI write deadline elapsed".to_owned())?
         .map_err(|error| format!("cannot write daemon response: {error}"))
@@ -2919,7 +3222,9 @@ struct ControlledProvider {
     /// Blocking stall inside `start`, holding the Recording in Starting long
     /// enough for tests to interleave a shutdown with the start sequence.
     start_stall: Duration,
+    start_marker: Option<PathBuf>,
     fail_start_once: bool,
+    start_failure_diagnostic: String,
     fail_abort: bool,
     fail_complete: bool,
     fail_send: bool,
@@ -2966,7 +3271,10 @@ impl ControlledProvider {
             delay,
             send_stall,
             start_stall: env_millis("VOISU_TEST_START_STALL_MS"),
+            start_marker: std::env::var_os("VOISU_TEST_START_MARKER").map(PathBuf::from),
             fail_start_once,
+            start_failure_diagnostic: std::env::var("VOISU_TEST_PROVIDER_START_DIAGNOSTIC")
+                .unwrap_or_else(|_| "controlled-provider-start-detail".to_owned()),
             fail_abort,
             fail_complete,
             fail_send,
@@ -2977,6 +3285,9 @@ impl ControlledProvider {
 impl TranscriptProvider for ControlledProvider {
     fn start(&mut self, _recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError> {
         if !self.start_stall.is_zero() {
+            if let Some(marker) = &self.start_marker {
+                fs::write(marker, b"starting").expect("controlled start marker must be writable");
+            }
             // `start` runs inside the actor's `begin_recording` blocking task,
             // so a blocking sleep is the faithful stand-in for a slow adapter.
             std::thread::sleep(self.start_stall);
@@ -2984,7 +3295,7 @@ impl TranscriptProvider for ControlledProvider {
         if std::mem::take(&mut self.fail_start_once) {
             return Err(BoundaryError::new(
                 BoundaryKind::Provider,
-                "controlled-provider-start-detail",
+                self.start_failure_diagnostic.clone(),
             ));
         }
         Ok(Box::new(ControlledProviderStream {
@@ -3186,6 +3497,75 @@ impl DeliveryAdapter for ControlledDelivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn replay_fifo_is_rejected_at_the_descriptor_validation_seam() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fixture.pcm");
+        let path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a live NUL-terminated pathname and mkfifo does not
+        // retain the pointer.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+        let error = read_fixture(dir.path(), "fixture.pcm").unwrap_err();
+        assert_eq!(error.diagnostic(), "fixture must be a regular file");
+    }
+
+    #[test]
+    fn an_unpaged_client_is_told_when_the_newest_record_cannot_be_represented() {
+        // Records are not globally size-bounded, so one record can alone exceed
+        // the legacy one-mebibyte frame. Trimming to a zero-record prefix would
+        // hand that client a SUCCESSFUL empty history — silent data loss dressed
+        // as durable truth. It must be an explicit failure instead.
+        let mut record = DiagnosticRecord::new("rec-oversized".to_owned(), 1);
+        record.error = Some("e".repeat(LEGACY_MAX_RESPONSE_BYTES + 1));
+        let mut response = Response::with_history(vec![record]);
+
+        bound_legacy_history(&mut response).unwrap();
+
+        assert!(!response.ok, "an unrepresentable history is not a success");
+        assert!(
+            response.history.is_none(),
+            "the rejection must carry no history payload: {:?}",
+            response.history
+        );
+        assert!(
+            response.message.contains("too large"),
+            "the client must be told why: {}",
+            response.message
+        );
+        // Strict `<` leaves the one byte the newline frame delimiter needs.
+        assert!(
+            serde_json::to_vec(&response).unwrap().len() < LEGACY_MAX_RESPONSE_BYTES,
+            "the rejection itself must fit the legacy frame ceiling"
+        );
+    }
+
+    #[test]
+    fn an_empty_history_stays_a_successful_empty_history_for_an_unpaged_client() {
+        // The guard above must not turn a genuinely empty history into an error.
+        let mut response = Response::with_history(Vec::new());
+        bound_legacy_history(&mut response).unwrap();
+        assert!(response.ok);
+        assert_eq!(response.history.map(|records| records.len()), Some(0));
+    }
+
+    #[test]
+    fn diagnostic_commands_use_the_diagnostic_write_deadline() {
+        assert_eq!(
+            command_write_deadline(&Command::History),
+            DIAGNOSTIC_RESPONSE_DEADLINE
+        );
+        assert_eq!(
+            command_write_deadline(&Command::Export(
+                voisu_core::ExportCorrelationId::new("rec-1"),
+            )),
+            DIAGNOSTIC_RESPONSE_DEADLINE
+        );
+        assert_eq!(command_write_deadline(&Command::Status), IO_DEADLINE);
+    }
 
     #[tokio::test]
     async fn processing_panic_records_only_the_configured_providers() {
@@ -3214,7 +3594,7 @@ mod tests {
             None,
             false,
             actor,
-            Arc::clone(&diagnostics),
+            Some(Arc::clone(&diagnostics)),
             ProviderReaper::new(),
         )
         .await;

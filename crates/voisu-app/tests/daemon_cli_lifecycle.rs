@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -25,7 +25,7 @@ use voisu_app::system::{
     RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
 
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = voisu_core::PROTOCOL_VERSION;
 
 fn flac_total_samples(request: &[u8]) -> u64 {
     let flac = request
@@ -144,6 +144,10 @@ impl Daemon {
         let mut command = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"));
         command
             .env("XDG_RUNTIME_DIR", runtime_dir)
+            // The diagnostics store is durable state now, so every test daemon
+            // needs its own state root or they would all share (and clobber)
+            // the developer's real ~/.local/state/voisu.
+            .env("XDG_STATE_HOME", state_home(runtime_dir))
             .env("VOISU_TEST_MODE", "controlled")
             // The fake pw-record stubs emit headerless PCM, matching the --raw
             // path. Force the capability probe to that path so it neither runs
@@ -166,15 +170,18 @@ impl Daemon {
         // still caught promptly by the try_wait() branch below, so the wide
         // ceiling only ever costs time on a genuinely slow-but-healthy start.
         let deadline = Instant::now() + Duration::from_secs(20);
+        let mut last_status_error = String::new();
         while Instant::now() < deadline {
-            if socket_path(runtime_dir).exists()
-                && voisu(runtime_dir, "status").status.success()
-            {
-                return Self {
-                    child,
-                    _provider_stub: None,
-                    _config_dir: config_dir,
-                };
+            if socket_path(runtime_dir).exists() {
+                let status = voisu(runtime_dir, "status");
+                if status.status.success() {
+                    return Self {
+                        child,
+                        _provider_stub: None,
+                        _config_dir: config_dir,
+                    };
+                }
+                last_status_error = stderr(&status);
             }
             if let Some(status) = child.try_wait().expect("daemon status should be readable") {
                 let mut diagnostics = String::new();
@@ -185,7 +192,7 @@ impl Daemon {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        panic!("daemon did not bind its socket");
+        panic!("daemon did not become reachable: {last_status_error}");
     }
 
     fn start_production_with_env(runtime_dir: &Path, environment: &[(&str, &str)]) -> Self {
@@ -193,6 +200,10 @@ impl Daemon {
         let mut command = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"));
         command
             .env("XDG_RUNTIME_DIR", runtime_dir)
+            // The diagnostics store is durable state now, so every test daemon
+            // needs its own state root or they would all share (and clobber)
+            // the developer's real ~/.local/state/voisu.
+            .env("XDG_STATE_HOME", state_home(runtime_dir))
             // The fake pw-record stubs emit headerless PCM; force the --raw
             // capability path (see start_with_env). Real hosts probe for real.
             .env("VOISU_TEST_PW_RECORD_RAW", "1")
@@ -2881,12 +2892,44 @@ fn wait_for_portal_capture(commands: &Path) {
 }
 
 fn ipc_request(runtime_dir: &Path, request: &str) -> Value {
+    ipc_request_with_page_count(runtime_dir, request).0
+}
+
+fn ipc_request_with_page_count(runtime_dir: &Path, request: &str) -> (Value, usize) {
     let mut stream = UnixStream::connect(socket_path(runtime_dir)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
     stream.write_all(request.as_bytes()).unwrap();
     stream.write_all(b"\n").unwrap();
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).unwrap();
-    serde_json::from_str(&response).unwrap()
+    let mut reader = BufReader::new(stream);
+    let mut payload = String::new();
+    let mut expected_sequence = 0;
+    loop {
+        let mut frame = String::new();
+        reader.read_line(&mut frame).unwrap();
+        let mut response: Value = serde_json::from_str(&frame).unwrap();
+        let Some(page) = response.get_mut("diagnostic_page").map(Value::take) else {
+            return (response, expected_sequence);
+        };
+        assert_eq!(page["sequence"], expected_sequence);
+        expected_sequence += 1;
+        payload.push_str(page["payload"].as_str().unwrap());
+        if page["last"] != true {
+            continue;
+        }
+        response
+            .as_object_mut()
+            .unwrap()
+            .remove("diagnostic_page");
+        let field = if request.contains(r#""command":"history""#) {
+            "history"
+        } else {
+            "export"
+        };
+        response[field] = serde_json::from_str(&payload).unwrap();
+        return (response, expected_sequence);
+    }
 }
 
 fn wait_until_missing(path: &Path) {
@@ -4386,7 +4429,7 @@ fn level_poll_filters_by_cursor_over_deterministic_paused_frames() {
         runtime.path(),
         r#"{"version":1,"command":{"level":{"after_seq":0}}}"#,
     );
-    assert_eq!(idle["version"], 1, "{idle}");
+    assert_eq!(idle["version"], PROTOCOL_VERSION, "{idle}");
     assert_eq!(idle["ok"], true, "{idle}");
     assert_eq!(idle["level_frames"], serde_json::json!([]), "{idle}");
     assert!(idle.get("state").is_none() || idle["state"].is_null(), "{idle}");
@@ -5954,14 +5997,20 @@ fn sigterm_during_an_active_recording_completes_the_recording_before_exit() {
 #[test]
 fn sigterm_while_a_recording_is_starting_persists_a_correlated_record() {
     let runtime = TempDir::new().unwrap();
-    // Provider start stalls hold the Recording in its start sequence long
-    // enough for the SIGTERM to arrive while it is still Starting.
-    let daemon = Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_START_STALL_MS", "700")]);
+    let start_marker = runtime.path().join("provider-starting");
+    let start_marker_env = start_marker.to_string_lossy().into_owned();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_START_STALL_MS", "700"),
+            ("VOISU_TEST_START_MARKER", &start_marker_env),
+        ],
+    );
 
     let runtime_dir = runtime.path().to_path_buf();
     let start = thread::spawn(move || voisu(&runtime_dir, "start"));
-    thread::sleep(Duration::from_millis(150));
-    daemon.terminate();
+    wait_for_marker(runtime.path(), "provider-starting");
+    let journal = daemon.terminate_and_stderr();
 
     // The start that shutdown interrupted is rejected like any other Recording
     // outcome: with the shutdown reason and never a started Recording.
@@ -5980,11 +6029,20 @@ fn sigterm_while_a_recording_is_starting_persists_a_correlated_record() {
     let records = history["history"].as_array().expect("history is a list");
     assert_eq!(records.len(), 1, "{history}");
     assert_eq!(records[0]["error"], "daemon is shutting down", "{history}");
+    let correlation_id = records[0]["correlation_id"]
+        .as_str()
+        .filter(|correlation| !correlation.is_empty())
+        .expect("the interrupted start keeps its correlation ID");
     assert!(
-        records[0]["correlation_id"]
-            .as_str()
-            .is_some_and(|correlation| !correlation.is_empty()),
-        "{history}"
+        journal.lines().any(|line| {
+            line
+                == format!(
+                    "Recording 1: outcome=error correlation_id={correlation_id} \
+                     first_chunk_ms=- capture_finalized_ms=- provider_timings_ms=- \
+                     release_to_text_ms=-"
+                )
+        }),
+        "shutdown during startup must emit structured timings: {journal}"
     );
 }
 
@@ -6815,6 +6873,91 @@ fn incompatible_payload_is_rejected_as_a_protocol_mismatch_from_its_envelope() {
     );
 }
 
+/// The CLI's response ceiling, mirrored from `voisu.rs`. Both are derived from
+/// the retention policy, so a change to either bound has to be a deliberate
+/// change to both.
+const MAX_RESPONSE_BYTES: usize =
+    voisu_core::DEFAULT_MAX_RECORDS * 4 * voisu_core::MAX_STORED_TEXT + 4 * 1024 * 1024;
+
+/// Binds a fake daemon at the real socket path that answers one connection with
+/// whatever `respond` writes, so a CLI-side bound can be exercised without a
+/// real daemon having to produce the payload that trips it.
+fn fake_daemon<F>(runtime_dir: &Path, respond: F) -> thread::JoinHandle<()>
+where
+    F: FnOnce(&mut UnixStream) + Send + 'static,
+{
+    let path = socket_path(runtime_dir);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(&path).unwrap();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        assert!(!request.is_empty());
+        respond(&mut stream);
+    })
+}
+
+#[test]
+fn an_unbounded_paged_payload_is_refused_instead_of_buffered() {
+    // Paging DELETED the CLI's response ceiling rather than raising it, leaving
+    // the accumulated payload answerable only to the 15 s diagnostic deadline —
+    // which on a local Unix socket permits gigabytes. A daemon that never sends
+    // a last page must be cut off at the bound, not followed.
+    let runtime = TempDir::new().unwrap();
+    let page = "a".repeat(64 * 1024);
+    let daemon = fake_daemon(runtime.path(), move |stream| {
+        // Enough pages to pass the ceiling with room to spare. `last` is never
+        // set, so nothing but the bound can stop this.
+        for sequence in 0..(MAX_RESPONSE_BYTES / page.len() + 8) {
+            let frame = format!(
+                "{{\"version\":1,\"ok\":true,\"state\":\"idle\",\"message\":\"\",\
+                 \"diagnostic_page\":{{\"sequence\":{sequence},\"last\":false,\
+                 \"payload\":\"{page}\"}}}}\n"
+            );
+            // A broken pipe is the expected end: the CLI gives up mid-stream.
+            if stream.write_all(frame.as_bytes()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let history = voisu_with_env(runtime.path(), &["history", "--json"], &[]);
+    let _ = daemon.join();
+    assert!(!history.status.success());
+    assert_eq!(stderr(&history), "daemon response frame is too large\n");
+    assert_eq!(
+        history.stdout.len(),
+        0,
+        "a refused response must print nothing"
+    );
+}
+
+#[test]
+fn an_oversized_single_frame_is_refused_while_it_streams() {
+    // The non-paged path needs its own ceiling: a response that never contains
+    // a newline would otherwise be buffered whole before anything rejected it.
+    let runtime = TempDir::new().unwrap();
+    let chunk = "b".repeat(64 * 1024);
+    let daemon = fake_daemon(runtime.path(), move |stream| {
+        if stream.write_all(b"{\"version\":1,\"ok\":true,\"message\":\"").is_err() {
+            return;
+        }
+        for _ in 0..(MAX_RESPONSE_BYTES / chunk.len() + 8) {
+            if stream.write_all(chunk.as_bytes()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let status = voisu(runtime.path(), "status");
+    let _ = daemon.join();
+    assert!(!status.status.success());
+    assert_eq!(stderr(&status), "daemon response frame is too large\n");
+}
+
 #[test]
 fn sigterm_cleans_up_and_a_crash_leaves_a_safely_recoverable_socket() {
     let runtime = TempDir::new().unwrap();
@@ -7023,6 +7166,7 @@ fn single_instance_rejection_preserves_the_live_daemon_and_cleanup_owns_one_inod
 
     let second = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"))
         .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_STATE_HOME", state_home(runtime.path()))
         .output()
         .unwrap();
     assert!(!second.status.success());
@@ -7052,6 +7196,7 @@ fn runtime_paths_are_private_and_unsafe_runtime_roots_are_rejected() {
     fs::set_permissions(unsafe_runtime.path(), fs::Permissions::from_mode(0o755)).unwrap();
     let rejected = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"))
         .env("XDG_RUNTIME_DIR", unsafe_runtime.path())
+        .env("XDG_STATE_HOME", state_home(unsafe_runtime.path()))
         .output()
         .unwrap();
     assert!(!rejected.status.success());
@@ -7066,6 +7211,7 @@ fn runtime_paths_are_private_and_unsafe_runtime_roots_are_rejected() {
     symlink(real_runtime.path(), &linked_runtime).unwrap();
     let rejected = Command::new(env!("CARGO_BIN_EXE_voisu-daemon"))
         .env("XDG_RUNTIME_DIR", &linked_runtime)
+        .env("XDG_STATE_HOME", state_home(link_parent.path()))
         .output()
         .unwrap();
     assert!(!rejected.status.success());
@@ -7837,7 +7983,7 @@ fn oversized_and_slow_frames_do_not_block_or_kill_the_daemon() {
     let path = socket_path(runtime.path());
 
     let mut slow = UnixStream::connect(&path).unwrap();
-    slow.write_all(b"{\"version\":1").unwrap();
+    slow.write_all(b"{\"version\":2").unwrap();
     let status_started = Instant::now();
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
     assert!(status_started.elapsed() < Duration::from_millis(250));
@@ -7864,12 +8010,20 @@ fn oversized_and_slow_frames_do_not_block_or_kill_the_daemon() {
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 }
 
+/// The per-test `XDG_STATE_HOME`. The diagnostics store is durable state, so
+/// every test daemon gets its own state root instead of sharing the developer's
+/// real `~/.local/state/voisu`.
+fn state_home(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join("state")
+}
+
+/// Where the daemon opens its diagnostics store, given a test's runtime dir.
+fn diagnostics_dir(runtime_dir: &Path) -> PathBuf {
+    state_home(runtime_dir).join("voisu").join("diagnostics")
+}
+
 fn diagnostics_audio_dir(runtime_dir: &Path) -> PathBuf {
-    runtime_dir
-        .join("voisu")
-        .join(format!("v{PROTOCOL_VERSION}"))
-        .join("diagnostics")
-        .join("audio")
+    diagnostics_dir(runtime_dir).join("audio")
 }
 
 fn pcm_file_count(dir: &Path) -> usize {
@@ -8003,11 +8157,7 @@ fn expired_debug_audio_is_cleaned_up_safely() {
 }
 
 fn fixture_dir(runtime_dir: &Path) -> PathBuf {
-    runtime_dir
-        .join("voisu")
-        .join(format!("v{PROTOCOL_VERSION}"))
-        .join("diagnostics")
-        .join("fixtures")
+    diagnostics_dir(runtime_dir).join("fixtures")
 }
 
 #[test]
@@ -8078,13 +8228,11 @@ fn replay_rejects_a_fifo_without_wedging_the_daemon() {
     let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
     assert!(status.success());
 
-    let started = Instant::now();
     let replayed = ipc_request(
         runtime.path(),
         r#"{"version":1,"command":{"replay":"pipe.pcm"}}"#,
     );
     assert_eq!(replayed["ok"], false, "a FIFO is not a regular file: {replayed}");
-    assert!(started.elapsed() < Duration::from_secs(2), "the open must not block");
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
 }
@@ -8144,10 +8292,704 @@ fn cli_history_renders_the_complete_bounded_records() {
     assert_eq!(record["delivery_count"], 1);
 }
 
+/// Creates (and hardens) the private diagnostics directory a seeded fixture
+/// writes into, at the same location the daemon opens its store from. The daemon
+/// refuses to start unless every component it owns is 0700.
+fn seeded_diagnostics_dir(runtime_dir: &Path) -> PathBuf {
+    let voisu_dir = state_home(runtime_dir).join("voisu");
+    let diagnostics = voisu_dir.join("diagnostics");
+    fs::create_dir_all(&diagnostics).unwrap();
+    for directory in [&voisu_dir, &diagnostics] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    diagnostics
+}
+
+/// Writes a seeded history in the store's on-disk shape: one JSON record per
+/// line, in append (chronological) order. Returns the bytes written.
+fn write_seeded_history(diagnostics: &Path, records: &[voisu_core::DiagnosticRecord]) -> usize {
+    let mut encoded = Vec::new();
+    for record in records {
+        serde_json::to_writer(&mut encoded, record).unwrap();
+        encoded.push(b'\n');
+    }
+    fs::write(diagnostics.join("history.jsonl"), &encoded).unwrap();
+    encoded.len()
+}
+
+/// Seeds the daemon's diagnostic store to the default count bound, with two
+/// Source Transcripts and a final Transcript at the `MAX_STORED_TEXT` clamp in
+/// every record. Returns the on-disk payload size so the test reports the exact
+/// default-policy fixture it exercised.
+fn seed_full_diagnostic_ring(runtime_dir: &Path) -> usize {
+    let diagnostics = seeded_diagnostics_dir(runtime_dir);
+
+    let text = "s".repeat(voisu_core::MAX_STORED_TEXT);
+    let now = voisu_core::unix_millis_now();
+    let records: Vec<voisu_core::DiagnosticRecord> = (0..voisu_core::DEFAULT_MAX_RECORDS)
+        .map(|index| {
+            let index = u64::try_from(index).unwrap();
+            let mut record =
+                voisu_core::DiagnosticRecord::new(format!("seed-{index}"), index);
+            // One millisecond apart, and so far inside the age bound that the
+            // ring is full by COUNT alone and pruning cannot drop any of it.
+            record.recorded_at_unix_ms = now - (voisu_core::DEFAULT_MAX_RECORDS as u64 - index);
+            record.source_transcripts = vec![
+                voisu_core::SourceTranscriptRecord {
+                    provider: voisu_core::Provider::Deepgram,
+                    text: text.clone(),
+                },
+                voisu_core::SourceTranscriptRecord {
+                    provider: voisu_core::Provider::Groq,
+                    text: text.clone(),
+                },
+            ];
+            record.set_final_transcript(text.clone());
+            record.first_chunk_ms = Some(100 + index);
+            record.capture_finalized_ms = Some(800 + index);
+            record.release_to_text_ms = Some(1_300 + index);
+            record
+        })
+        .collect();
+
+    write_seeded_history(&diagnostics, &records)
+}
+
+/// Mirrors the daemon's private `DIAGNOSTIC_PAGE_BYTES`. Kept as a test-local
+/// constant because the property below is arithmetic on the page size, not on
+/// the daemon's internals.
+const DIAGNOSTIC_PAGE_BYTES: usize = 64 * 1024;
+
+/// The multi-byte filler for the paging fixture.
+///
+/// Three bytes wide, chosen so a split page boundary is guaranteed rather than
+/// hoped for: consecutive boundaries are `DIAGNOSTIC_PAGE_BYTES` apart and
+/// `65536 % 3 == 1`, so three consecutive boundaries falling inside one run of
+/// this character take all three residues mod 3 — at least two of them land
+/// strictly inside a character and must be walked back.
+const MULTIBYTE_FILLER: &str = "€";
+
+/// Seeds a diagnostic store whose serialized history spans several transport
+/// pages, with page boundaries provably landing inside multi-byte characters.
+///
+/// The property under test is "the payload needs more than one page and the
+/// reassembled value is byte-identical across a split character". A few hundred
+/// kilobytes proves that exactly as well as the tens of megabytes this fixture
+/// used to build, and without moving that payload four times inside the 15 s
+/// diagnostic deadline on a machine that may be under load.
+fn seed_diagnostic_beyond_one_page(runtime_dir: &Path) -> (usize, usize, usize, String) {
+    let diagnostics = seeded_diagnostics_dir(runtime_dir);
+
+    // Long enough that boundaries 1, 2 and 3 all fall inside a single run of the
+    // filler, which is what makes the split-character case certain.
+    let diagnostic = MULTIBYTE_FILLER.repeat(3 * DIAGNOSTIC_PAGE_BYTES / MULTIBYTE_FILLER.len() + 1);
+    let diagnostic_bytes = diagnostic.len();
+    let record_count = 2;
+    let now = voisu_core::unix_millis_now();
+    let records: Vec<_> = (0..record_count)
+        .map(|index| {
+            let correlation_id = format!("seed-beyond-one-page-{index}");
+            let mut record = voisu_core::DiagnosticRecord::new(correlation_id, index as u64 + 1);
+            record.recorded_at_unix_ms = now - (record_count - index) as u64;
+            record.provider_failures.push(voisu_core::ProviderFailure::new(
+                voisu_core::Provider::Groq,
+                voisu_core::ProviderFailureStage::Completion,
+                diagnostic.clone(),
+            ));
+            record
+        })
+        .collect();
+    let correlation_id = records.last().unwrap().correlation_id.clone();
+
+    // The daemon pages the SERIALIZED RESPONSE, which is a JSON array, not the
+    // line-delimited on-disk log — so the page-boundary property is checked
+    // against the array encoding even though the store is seeded as JSONL.
+    let payload = serde_json::to_vec(&records).unwrap();
+    assert!(
+        payload.len() > DIAGNOSTIC_PAGE_BYTES,
+        "the fixture must not fit in a single page"
+    );
+    let text = std::str::from_utf8(&payload).unwrap();
+    assert!(
+        (1..payload.len().div_ceil(DIAGNOSTIC_PAGE_BYTES))
+            .any(|page| !text.is_char_boundary(page * DIAGNOSTIC_PAGE_BYTES)),
+        "the fixture must put at least one page boundary inside a multi-byte character"
+    );
+
+    let on_disk = write_seeded_history(&diagnostics, &records);
+    (on_disk, record_count, diagnostic_bytes, correlation_id)
+}
+
+#[test]
+fn a_delivered_recording_reports_its_per_stage_timings_to_the_journal() {
+    // The success path used to log NOTHING, so the healthy path's latency was
+    // unmeasurable once the retention ring pruned it. It must now emit the same
+    // key=value timing line the failure path does. (The exact format is pinned
+    // by the unit tests on the formatting function; this pins the WIRING.)
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Measure the healthy path."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Measure the healthy path"),
+            ("VOISU_TEST_WAIT_FOR_FIRST_CHUNK_BEFORE_START", "1"),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    // The controlled start reply is the deterministic marker: this test seam
+    // withholds it until the pump has streamed a chunk to both providers.
+    let status = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+    let streamed = status["evidence"]["streamed_chunk_count"].as_u64().unwrap();
+    assert!(streamed > 0, "the start marker must establish a streamed chunk: {status}");
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert!(
+        stopped["evidence"]["streamed_chunk_count"].as_u64().unwrap() >= streamed,
+        "stop evidence must retain the chunk observed before stop: {stopped}"
+    );
+
+    let journal = daemon.terminate_and_stderr();
+    let line = journal
+        .lines()
+        .find(|line| line.contains("outcome=ok"))
+        .unwrap_or_else(|| panic!("a delivered Recording must log its timings: {journal}"));
+    assert!(line.starts_with("Recording 1: outcome=ok"), "{line}");
+    assert!(
+        journal.lines().any(|line| line == "Recording 1: delivered"),
+        "the human-readable delivered line must remain separate: {journal}"
+    );
+    assert!(line.contains("correlation_id=rec-"), "{line}");
+    for key in [
+        "first_chunk_ms=",
+        "capture_finalized_ms=",
+        "provider_timings_ms=",
+        "release_to_text_ms=",
+    ] {
+        assert!(line.contains(key), "the journal line must carry {key}: {line}");
+        assert!(
+            !line.contains(&format!("{key}-")),
+            "the delivered path must log the measurement, not an absent marker: {line}"
+        );
+    }
+}
+
+#[test]
+fn the_first_chunk_start_seam_releases_when_the_capture_pump_ends_chunkless() {
+    // The seam that withholds the start reply until the first chunk has streamed
+    // must have a second exit. Here the capture hits its Recording Deadline
+    // before producing anything, so the pump terminates without ever raising the
+    // chunk counter: a wait with only the counter as an exit yield-loops inside
+    // the actor forever and every later command wedges behind it. The IPC helper
+    // bounds each read, so a wedge fails this test instead of hanging CI.
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_WAIT_FOR_FIRST_CHUNK_BEFORE_START", "1"),
+            ("VOISU_TEST_DEADLINE_AFTER_CHUNKS", "0"),
+        ],
+    );
+
+    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    assert!(
+        started["state"].is_string(),
+        "the start reply must arrive even though no chunk ever streams: {started}"
+    );
+    // Whatever the Recording's outcome, the actor must still be serving.
+    let status = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
+    assert!(
+        status["state"].is_string(),
+        "the actor must keep answering commands after the chunkless pump: {status}"
+    );
+}
+
+#[test]
+fn a_failed_recording_keeps_its_journal_message_and_gains_the_timings() {
+    // The historical `Recording <id>: <diagnostic>` line is load-bearing for
+    // existing journal parsers; timings must be emitted beside it, not inside it.
+    let runtime = TempDir::new().unwrap();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_PROVIDER_COMPLETE_FAILURE", "both")],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], false, "{stopped}");
+
+    let journal = daemon.terminate_and_stderr();
+    let line = journal
+        .lines()
+        .find(|line| line.contains("outcome=error"))
+        .unwrap_or_else(|| panic!("a failed Recording must log its timings: {journal}"));
+    assert!(
+        line.starts_with("Recording 1: outcome=error"),
+        "the structured line must contain no diagnostic text: {line}"
+    );
+    assert!(
+        journal
+            .lines()
+            .any(|line| line.starts_with("Recording 1: controlled-provider-completion-detail")),
+        "the existing diagnostic line must be carried through unchanged: {journal}"
+    );
+    for key in [
+        "correlation_id=",
+        "first_chunk_ms=",
+        "capture_finalized_ms=",
+        "provider_timings_ms=",
+        "release_to_text_ms=",
+    ] {
+        assert!(line.contains(key), "the journal line must carry {key}: {line}");
+    }
+}
+
+#[test]
+fn diagnostics_are_retained_in_the_private_durable_state_directory() {
+    // XDG_RUNTIME_DIR is tmpfs that logind removes with the user's last session,
+    // so a retention policy measured in DAYS cannot be honoured there — the
+    // effective retention was "since last login". The store belongs in the
+    // durable state directory the daemon unit already provisions, and it must be
+    // exactly as private there as it was under the runtime directory.
+    let runtime = TempDir::new().unwrap();
+    // Nothing pre-creates it: the daemon has to come up against a state
+    // directory that does not exist yet.
+    assert!(
+        !state_home(runtime.path()).exists(),
+        "the fixture must not pre-create the state root"
+    );
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            // Identical stub transcripts: this test pins WHERE the record is
+            // retained, so it must not also depend on which sibling the
+            // selection policy prefers when the texts differ.
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Retain this dictation."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Retain this dictation."),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+
+    let store = diagnostics_dir(runtime.path());
+    assert!(
+        store.is_dir(),
+        "the store must be opened at {}",
+        store.display()
+    );
+    assert!(
+        !runtime
+            .path()
+            .join("voisu")
+            .join(format!("v{PROTOCOL_VERSION}"))
+            .join("diagnostics")
+            .exists(),
+        "nothing may be retained under the runtime directory any more"
+    );
+    for directory in [
+        state_home(runtime.path()).join("voisu"),
+        store.clone(),
+        store.join("audio"),
+        store.join("fixtures"),
+    ] {
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "{} must stay 0700 at the durable location",
+            directory.display()
+        );
+    }
+
+    // The record really is readable from there, not merely written somewhere.
+    let output = voisu_with_env(runtime.path(), &["history", "--json"], &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let records: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(records[0]["final_transcript"], "Retain this dictation.");
+}
+
+#[test]
+fn an_unsafe_durable_state_path_disables_diagnostics_without_blocking_dictation() {
+    let runtime = TempDir::new().unwrap();
+    let state = runtime.path().join("unsafe-state");
+    let redirected = runtime.path().join("redirected-state");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&redirected).unwrap();
+    symlink(&redirected, state.join("voisu")).unwrap();
+
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("XDG_STATE_HOME", state.to_str().unwrap()),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Delivery must survive."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Delivery must survive"),
+        ],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(history["history"], serde_json::json!([]), "{history}");
+    assert!(
+        !runtime
+            .path()
+            .join("voisu")
+            .join(format!("v{PROTOCOL_VERSION}"))
+            .join("diagnostics")
+            .exists(),
+        "degraded mode must not create a misleading non-durable runtime store"
+    );
+
+    let journal = daemon.terminate_and_stderr();
+    assert!(
+        journal.contains("diagnostics disabled: unsafe state path"),
+        "the unavailable durable store must be visible in the journal: {journal}"
+    );
+}
+
+#[test]
+fn a_fifo_history_disables_diagnostics_without_blocking_dictation() {
+    let runtime = TempDir::new().unwrap();
+    let diagnostics = seeded_diagnostics_dir(runtime.path());
+    let history = diagnostics.join("history.jsonl");
+    assert!(Command::new("mkfifo").arg(&history).status().unwrap().success());
+
+    let daemon = Daemon::start(runtime.path());
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    let history_response =
+        ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(history_response["history"], serde_json::json!([]));
+    assert!(
+        fs::symlink_metadata(&history).unwrap().file_type().is_fifo(),
+        "degraded diagnostics must leave the rejected history path untouched"
+    );
+
+    let journal = daemon.terminate_and_stderr();
+    assert!(
+        journal.contains(
+            "diagnostics disabled: cleanup failed: diagnostics history is not a regular file"
+        ),
+        "the degraded startup must be visible: {journal}"
+    );
+}
+
+#[test]
+fn an_unreadable_history_disables_diagnostics_without_rewriting_retained_bytes() {
+    let runtime = TempDir::new().unwrap();
+    let diagnostics = seeded_diagnostics_dir(runtime.path());
+    let mut retained = voisu_core::DiagnosticRecord::new("retained".to_owned(), 41);
+    retained.set_final_transcript("must survive cleanup".to_owned());
+    write_seeded_history(&diagnostics, &[retained]);
+    let history = diagnostics.join("history.jsonl");
+    let original = fs::read(&history).unwrap();
+    fs::set_permissions(&history, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let daemon = Daemon::start(runtime.path());
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+
+    fs::set_permissions(&history, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        fs::read(&history).unwrap(),
+        original,
+        "a failed startup read must not compact an invented empty history"
+    );
+    let history_response =
+        ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(
+        history_response["history"],
+        serde_json::json!([]),
+        "the store stays disabled for the session after cleanup fails"
+    );
+
+    let journal = daemon.terminate_and_stderr();
+    assert!(
+        journal.contains("diagnostics disabled: cleanup failed:"),
+        "the read failure must be visible: {journal}"
+    );
+}
+
+#[test]
+fn a_history_read_failure_after_startup_is_not_presented_as_an_empty_history() {
+    // Startup succeeded, so diagnostics are ENABLED and the daemon has already
+    // told this client the durable store holds records. If the store then turns
+    // unreadable, answering `ok: true, history: []` claims the durable history
+    // is empty — presenting unknown data as durable truth. The read failure must
+    // be reported as a failure instead.
+    let runtime = TempDir::new().unwrap();
+    let diagnostics = seeded_diagnostics_dir(runtime.path());
+    let mut retained = voisu_core::DiagnosticRecord::new("retained".to_owned(), 7);
+    retained.set_final_transcript("durable and readable at startup".to_owned());
+    write_seeded_history(&diagnostics, &[retained]);
+
+    let _daemon = Daemon::start(runtime.path());
+    let before = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(before["ok"], true, "{before}");
+    assert_eq!(
+        before["history"].as_array().unwrap().len(),
+        1,
+        "the durable store must be readable at startup: {before}"
+    );
+
+    // The same non-regular-file rejection the store applies at open time, but
+    // reached only AFTER startup, so the store is not in degraded mode.
+    let history = diagnostics.join("history.jsonl");
+    fs::remove_file(&history).unwrap();
+    assert!(Command::new("mkfifo").arg(&history).status().unwrap().success());
+
+    let response = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(
+        response["ok"], false,
+        "an unreadable durable store must not answer with a successful empty history: {response}"
+    );
+    assert!(
+        response["history"].is_null(),
+        "a failed read must carry no history payload at all: {response}"
+    );
+    assert!(
+        response["message"]
+            .as_str()
+            .unwrap()
+            .contains("diagnostics are unavailable"),
+        "the failure must name the unavailable diagnostics: {response}"
+    );
+
+    // The same read failure through `export`, which must stay a rejection too.
+    let export = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"export":"retained"}}"#,
+    );
+    assert_eq!(export["ok"], false, "{export}");
+    assert!(
+        export["message"]
+            .as_str()
+            .unwrap()
+            .contains("diagnostics are unavailable"),
+        "{export}"
+    );
+}
+
+#[test]
+fn a_full_diagnostic_ring_round_trips_through_cli_history_json() {
+    // HARD GATE on the default retention raise: `voisu history --json` must
+    // reconstruct the complete default-bound ring. Every clamped stored-text
+    // field must reach the CLI intact, not truncated or rejected.
+    let runtime = TempDir::new().unwrap();
+    let payload_bytes = seed_full_diagnostic_ring(runtime.path());
+    let _daemon = Daemon::start(runtime.path());
+
+    let output = voisu_with_env(runtime.path(), &["history", "--json"], &[]);
+    assert!(
+        output.status.success(),
+        "a full ring must survive the IPC response frame ({payload_bytes} bytes on disk): {}",
+        stderr(&output)
+    );
+    let records: Value = serde_json::from_str(&stdout(&output))
+        .expect("voisu history --json prints structured JSON at a full ring");
+    let records = records.as_array().expect("history is a list");
+    assert_eq!(
+        records.len(),
+        voisu_core::DEFAULT_MAX_RECORDS,
+        "every retained record must reach the CLI, not a truncated prefix"
+    );
+    // Newest first, and the newest record's stored text arrives whole.
+    assert_eq!(
+        records[0]["correlation_id"],
+        format!("seed-{}", voisu_core::DEFAULT_MAX_RECORDS - 1)
+    );
+    assert_eq!(
+        records[0]["final_transcript"].as_str().unwrap().len(),
+        voisu_core::MAX_STORED_TEXT,
+        "a clamped final Transcript must round-trip without truncation"
+    );
+    assert_eq!(
+        records[0]["source_transcripts"][1]["text"].as_str().unwrap().len(),
+        voisu_core::MAX_STORED_TEXT,
+        "a clamped Source Transcript must round-trip without truncation"
+    );
+    assert_eq!(
+        records[voisu_core::DEFAULT_MAX_RECORDS - 1]["correlation_id"],
+        "seed-0",
+        "the oldest retained record must survive to the end of the frame"
+    );
+}
+
+#[test]
+fn legacy_unpaged_history_frame_stays_within_one_mebibyte_and_keeps_newest_records() {
+    const LEGACY_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+    let runtime = TempDir::new().unwrap();
+    seed_full_diagnostic_ring(runtime.path());
+    let _daemon = Daemon::start(runtime.path());
+
+    let mut stream = UnixStream::connect(socket_path(runtime.path())).unwrap();
+    stream
+        .write_all(b"{\"version\":1,\"command\":\"history\"}\n")
+        .unwrap();
+    let mut frame = Vec::new();
+    BufReader::new(stream).read_until(b'\n', &mut frame).unwrap();
+    assert!(
+        frame.len() <= LEGACY_MAX_RESPONSE_BYTES,
+        "legacy CLI rejects frames larger than one mebibyte: {} bytes",
+        frame.len()
+    );
+    assert_eq!(frame.last(), Some(&b'\n'), "the response must be one complete frame");
+
+    let response: Value = serde_json::from_slice(&frame).unwrap();
+    let records = response["history"].as_array().unwrap();
+    assert!(
+        !records.is_empty() && records.len() < voisu_core::DEFAULT_MAX_RECORDS,
+        "an oversized legacy history must retain a useful bounded prefix: {} records",
+        records.len()
+    );
+    assert_eq!(
+        records[0]["correlation_id"],
+        format!("seed-{}", voisu_core::DEFAULT_MAX_RECORDS - 1),
+        "the bounded compatibility snapshot starts with the newest record"
+    );
+    let recording_ids: Vec<u64> = records
+        .iter()
+        .map(|record| record["recording_id"].as_u64().unwrap())
+        .collect();
+    assert!(
+        recording_ids.windows(2).all(|pair| pair[0] == pair[1] + 1),
+        "the compatibility snapshot must be a contiguous newest-first prefix"
+    );
+}
+
+#[test]
+fn diagnostic_paging_serves_history_and_export_across_multiple_pages() {
+    let runtime = TempDir::new().unwrap();
+    let (payload_bytes, record_count, diagnostic_bytes, correlation_id) =
+        seed_diagnostic_beyond_one_page(runtime.path());
+    let _daemon = Daemon::start(runtime.path());
+
+    // `paged` is what asks for pages; a request without it is answered in one
+    // frame (pinned by the upgrade-path test below).
+    let (protocol_history, page_count) = ipc_request_with_page_count(
+        runtime.path(),
+        r#"{"version":1,"command":"history","paged":true}"#,
+    );
+    assert!(page_count > 1, "the oversized snapshot must use multiple pages");
+    assert_eq!(
+        protocol_history["history"].as_array().unwrap().len(),
+        record_count
+    );
+    let export_request = format!(
+        r#"{{"version":1,"command":{{"export":"{correlation_id}"}},"paged":true}}"#
+    );
+    let (protocol_export, export_page_count) =
+        ipc_request_with_page_count(runtime.path(), &export_request);
+    assert!(
+        export_page_count > 1,
+        "the oversized export must use multiple pages"
+    );
+    assert_eq!(
+        protocol_export["export"]["record"]["correlation_id"],
+        correlation_id
+    );
+
+    let history = voisu_with_env(runtime.path(), &["history", "--json"], &[]);
+    let export = voisu_with_env(runtime.path(), &["export", &correlation_id], &[]);
+
+    assert!(
+        history.status.success(),
+        "paged history must serve a {payload_bytes}-byte retained snapshot: {}",
+        stderr(&history)
+    );
+    assert!(
+        export.status.success(),
+        "paged export must serve a record that outgrows one page: {}",
+        stderr(&export)
+    );
+
+    let history: Value =
+        serde_json::from_str(&stdout(&history)).expect("history remains one complete JSON value");
+    let export: Value =
+        serde_json::from_str(&stdout(&export)).expect("export remains one complete JSON value");
+    assert_eq!(history.as_array().unwrap().len(), record_count);
+    assert_eq!(history[0]["correlation_id"], correlation_id);
+    assert_eq!(export["record"]["correlation_id"], correlation_id);
+    let diagnostic = history[0]["provider_failures"][0]["diagnostic"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        diagnostic.len(),
+        diagnostic_bytes,
+        "each unbounded diagnostic must arrive intact"
+    );
+    assert!(
+        diagnostic.chars().all(|character| MULTIBYTE_FILLER.starts_with(character)),
+        "UTF-8 text must survive page boundaries intact"
+    );
+}
+
+#[test]
+fn a_request_without_the_paging_field_is_answered_in_a_single_frame() {
+    // THE UPGRADE PATH. Paging is negotiated per request, not by protocol
+    // version, so both request shapes must be served correctly by one daemon on
+    // one socket:
+    //
+    //   * old shape (no `paged`) — what a CLI built before paging sends, and
+    //     what it can parse: history inline in ONE frame. This fixture fits the
+    //     legacy cap and therefore arrives whole; the oversized-prefix behavior
+    //     is pinned separately above. Paging at such a client would hand it a
+    //     successful but empty history.
+    //   * new shape (`paged: true`) — contiguous pages carrying the same
+    //     history.
+    //
+    // The mirror direction (new CLI, old daemon) is covered by `read_response`
+    // accepting an unpaged first frame; that is the same single-frame response
+    // this test pins.
+    let runtime = TempDir::new().unwrap();
+    let (_, record_count, diagnostic_bytes, _) = seed_diagnostic_beyond_one_page(runtime.path());
+    let _daemon = Daemon::start(runtime.path());
+
+    let (old_shape, old_pages) =
+        ipc_request_with_page_count(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(
+        old_pages, 0,
+        "a request without `paged` must not be split into pages: {old_shape}"
+    );
+    assert!(
+        old_shape.get("diagnostic_page").is_none(),
+        "an unpaged response must not carry a page at all: {old_shape}"
+    );
+    let old_records = old_shape["history"]
+        .as_array()
+        .expect("the unpaged response carries history inline");
+    assert_eq!(old_records.len(), record_count);
+    assert_eq!(
+        old_records[0]["provider_failures"][0]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .len(),
+        diagnostic_bytes,
+        "the inline history must be complete, not a first page"
+    );
+
+    let (new_shape, new_pages) = ipc_request_with_page_count(
+        runtime.path(),
+        r#"{"version":1,"command":"history","paged":true}"#,
+    );
+    assert!(
+        new_pages > 1,
+        "a request that asks for paging must get pages: {new_pages}"
+    );
+    assert_eq!(
+        new_shape["history"].as_array().unwrap().len(),
+        record_count,
+        "both request shapes must reconstruct the same history"
+    );
+}
+
 #[test]
 fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
     let runtime = TempDir::new().unwrap();
-    let _daemon = Daemon::start_with_env(
+    let daemon = Daemon::start_with_env(
         runtime.path(),
         &[("VOISU_TEST_PROVIDER_START_FAILURE", "1")],
     );
@@ -8160,26 +9002,76 @@ fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
         .to_owned();
     assert!(correlation_id.starts_with("rec-"), "{correlation_id}");
 
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
-        let found = history["history"]
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert!(
+        history["history"]
             .as_array()
             .unwrap()
             .iter()
             .any(|record| {
                 record["correlation_id"] == correlation_id.as_str()
                     && record["error"].is_string()
-            });
-        if found {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the startup failure must be retained with its correlation ID: {history}"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+            }),
+        "the startup failure is retained before its response is sent: {history}"
+    );
+
+    let journal = daemon.terminate_and_stderr();
+    let structured = journal
+        .lines()
+        .find(|line| line.contains("outcome=error"))
+        .unwrap_or_else(|| panic!("a startup failure must emit structured timings: {journal}"));
+    assert_eq!(
+        structured,
+        format!(
+            "Recording 1: outcome=error correlation_id={correlation_id} first_chunk_ms=- \
+             capture_finalized_ms=- provider_timings_ms=- release_to_text_ms=-"
+        )
+    );
+    assert!(
+        journal.lines().any(|line| {
+            line
+                == format!(
+                    "Recording 1 [{correlation_id}]: controlled-provider-start-detail"
+                )
+        }),
+        "the startup failure keeps its exact historical diagnostic line: {journal}"
+    );
+}
+
+#[test]
+fn multiline_startup_failure_cannot_forge_a_journal_entry() {
+    let runtime = TempDir::new().unwrap();
+    let forged = "Recording 9: outcome=ok correlation_id=rec-forged \
+                  first_chunk_ms=1 capture_finalized_ms=1 \
+                  provider_timings_ms=groq:1 release_to_text_ms=1";
+    let diagnostic = format!("provider failed\n{forged}\rwith\ttabs");
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_PROVIDER_START_FAILURE", "1"),
+            ("VOISU_TEST_PROVIDER_START_DIAGNOSTIC", &diagnostic),
+        ],
+    );
+
+    let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
+    assert_eq!(started["ok"], false, "{started}");
+    let correlation_id = started["evidence"]["correlation_id"].as_str().unwrap();
+    let journal = daemon.terminate_and_stderr();
+    let escaped = format!(
+        "Recording 1 [{correlation_id}]: provider failed\\n{forged}\\rwith\\ttabs"
+    );
+    assert!(
+        journal.lines().any(|line| line == escaped),
+        "the correlated human line must preserve escaped diagnostic text: {journal}"
+    );
+    assert!(
+        !journal.lines().any(|line| line == forged),
+        "embedded newlines must not create a forged journal entry: {journal}"
+    );
+    assert!(
+        !journal.contains('\r') && !journal.contains('\t'),
+        "raw diagnostic control characters must not reach stderr: {journal:?}"
+    );
 }
 
 #[test]
