@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.9.0
+Version:        0.10.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,22 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Tue Jul 28 2026 Voisu maintainers <voisu@example.invalid> - 0.10.0-1
+- refactor(overlay): group the per-tick inputs instead of growing arg lists
+- fix(overlay): settle an accepted limit warning instead of leaving it open
+- fix(daemon): race the controlled chunk delay against the Deadline clock
+- fix(overlay): commit a limit warning only once the notifier accepts it
+- fix(daemon): make the controlled capture enforce the clock it reports
+- fix(overlay): route both notification paths through the truthful body
+- fix(overlay): say what is true, and say only one thing per notifier tick
+- fix(overlay): key the limit-warning latch to the Recording it warned about
+- fix(daemon): report headroom against the capture's own Deadline clock
+- test(daemon): prove status carries the Recording headroom over the wire
+- feat(overlay): warn the user before the Recording limit cuts them off
+- feat(daemon): report the remaining Recording headroom on the observer path
+- feat(overlay): derive the approaching-limit warning stages from the ceiling
+- test(overlay): pin the approaching-limit warnings to the derived ceiling
+
 * Tue Jul 28 2026 Voisu maintainers <voisu@example.invalid> - 0.9.0-1
 - style(daemon): satisfy int_plus_one on the legacy frame assertion
 - style(diagnostics): pin the count bound at compile time
