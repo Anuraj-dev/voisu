@@ -61,8 +61,10 @@ const PROVIDER_PROCESS_DEADLINE: Duration = Duration::from_secs(14);
 const RECONCILIATION_PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 const MIN_RECORDING_BYTES: usize = PCM_CHUNK_BYTES;
 /// The one configured maximum for a Recording. Both capture's retained PCM
-/// buffer and its default Deadline derive from this value.
-const MAX_RECORDING_DURATION: Duration = Duration::from_secs(600);
+/// buffer and its default Deadline derive from this value — and so do the
+/// Overlay's approaching-limit warnings, which is why this is visible to the
+/// rest of the crate rather than copied into the presentation layer.
+pub(crate) const MAX_RECORDING_DURATION: Duration = Duration::from_secs(600);
 /// Recordings at or below this length (120 s of 16 kHz s16le mono) take a
 /// single full-audio Groq request at finalize: no pre-streamed chunks, no
 /// seams, full context for Whisper. Only Recordings that grow past this switch

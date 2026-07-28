@@ -461,6 +461,83 @@ impl NoSpeechNotifyLatch {
     }
 }
 
+/// How close a live Recording is to the Recording Deadline. Ordered: `Final`
+/// supersedes `Approaching`, which is what lets one latch hold both stages
+/// without a second flag.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LimitWarning {
+    /// One minute of headroom left — amber bars, "start wrapping up".
+    Approaching,
+    /// Ten seconds left — the red warn border joins the amber bars.
+    Final,
+}
+
+/// Lead time before the Deadline at which the first warning fires.
+pub const APPROACHING_LIMIT_LEAD: Duration = Duration::from_secs(60);
+/// Lead time before the Deadline at which the final warning fires.
+pub const FINAL_LIMIT_LEAD: Duration = Duration::from_secs(10);
+
+/// The elapsed-time onsets of the two warnings for a given Recording ceiling,
+/// as `(approaching, final)`. Purely derived: there is no warning constant to
+/// drift out of sync with the ceiling, so moving the ceiling moves both
+/// warnings with it. Saturating, so a ceiling shorter than a lead simply means
+/// that warning is live from the first tick rather than wrapping.
+pub fn limit_warning_onsets(_ceiling: Duration) -> (Duration, Duration) {
+    (Duration::ZERO, Duration::ZERO)
+}
+
+/// The warning stage implied by the headroom the daemon reports. `None`
+/// remaining means the daemon is not Recording, which is never a warning.
+pub fn limit_warning_for_remaining(_remaining: Option<Duration>) -> Option<LimitWarning> {
+    None
+}
+
+/// The warning stage at `elapsed` against `ceiling`. The same decision as
+/// [`limit_warning_for_remaining`], expressed in the terms the ceiling is
+/// written in so a test can pin the derivation directly.
+pub fn limit_warning_at(_elapsed: Duration, _ceiling: Duration) -> Option<LimitWarning> {
+    None
+}
+
+/// The notification body for a warning stage.
+pub const fn limit_warning_body(warning: LimitWarning) -> &'static str {
+    match warning {
+        LimitWarning::Approaching => "Approaching the recording limit — about a minute left",
+        LimitWarning::Final => "Recording stops in 10 seconds",
+    }
+}
+
+/// Edge-latch for the approaching-limit notifications, mirroring
+/// [`NoSpeechNotifyLatch`]. The overlay redraws several times a second, so a
+/// bare threshold test would emit one notification per frame; the latch fires
+/// each stage at most once per Recording and only ever escalates.
+///
+/// Same blip rule as the other latches: `Unreachable` leaves the latch
+/// untouched, so a transient status-read failure mid-Recording cannot replay a
+/// warning. Any reachable non-Recording observation clears it, which is what
+/// stops a short Recording from leaving residue for the next one.
+#[derive(Debug, Default)]
+pub struct LimitWarningLatch {
+    fired: Option<LimitWarning>,
+}
+
+impl LimitWarningLatch {
+    /// Returns the warning to announce this tick, or `None`.
+    pub fn observe(
+        &mut self,
+        _signal: ObservedSignal,
+        _warning: Option<LimitWarning>,
+    ) -> Option<LimitWarning> {
+        None
+    }
+
+    /// The highest stage already announced for the current Recording. Exposed
+    /// so a test can prove no residue survives into the next Recording.
+    pub fn fired(&self) -> Option<LimitWarning> {
+        self.fired
+    }
+}
+
 /// The outcome of one fallback-path poll tick, decided purely so the adapter's
 /// side effects (`window.present()`, `send_notification`) stay a thin match.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1305,5 +1382,160 @@ mod tests {
                 assert!((0.25..=1.0).contains(&b), "b={b} at index={index} t={t}");
             }
         }
+    }
+
+    // --- approaching-limit warnings -------------------------------------
+
+    /// The ceiling the daemon actually enforces. Imported rather than repeated:
+    /// if it ever moves, these tests move with it and a hardcoded warning
+    /// threshold would fail here first.
+    use crate::system::MAX_RECORDING_DURATION;
+
+    fn recording() -> ObservedSignal {
+        ObservedSignal::Reachable(OverlayPhase::Recording)
+    }
+
+    #[test]
+    fn limit_warning_onsets_are_derived_from_the_real_recording_ceiling() {
+        let (approaching, final_warning) = limit_warning_onsets(MAX_RECORDING_DURATION);
+        assert_eq!(approaching, MAX_RECORDING_DURATION - APPROACHING_LIMIT_LEAD);
+        assert_eq!(final_warning, MAX_RECORDING_DURATION - FINAL_LIMIT_LEAD);
+        // Pinned in wall-clock terms too, so a silent change to either lead is
+        // visible as the product behaviour the spec describes: 9:00 and 9:50.
+        assert_eq!(approaching, Duration::from_secs(540));
+        assert_eq!(final_warning, Duration::from_secs(590));
+        // And the stages agree with the onsets at the boundary.
+        assert_eq!(limit_warning_at(approaching - Duration::from_millis(1), MAX_RECORDING_DURATION), None);
+        assert_eq!(
+            limit_warning_at(approaching, MAX_RECORDING_DURATION),
+            Some(LimitWarning::Approaching)
+        );
+        assert_eq!(
+            limit_warning_at(final_warning, MAX_RECORDING_DURATION),
+            Some(LimitWarning::Final)
+        );
+        assert_eq!(
+            limit_warning_at(MAX_RECORDING_DURATION, MAX_RECORDING_DURATION),
+            Some(LimitWarning::Final)
+        );
+    }
+
+    #[test]
+    fn limit_warnings_track_an_overridden_ceiling_rather_than_a_literal() {
+        // VOISU_RECORDING_DEADLINE_MS may shorten a Recording. The warnings
+        // must follow it, not the 600 s default: at a 120 s ceiling the first
+        // warning belongs at 60 s, not at 540 s (which would never fire).
+        let ceiling = Duration::from_secs(120);
+        assert_eq!(
+            limit_warning_onsets(ceiling),
+            (Duration::from_secs(60), Duration::from_secs(110))
+        );
+        assert_eq!(limit_warning_at(Duration::from_secs(59), ceiling), None);
+        assert_eq!(limit_warning_at(Duration::from_secs(60), ceiling), Some(LimitWarning::Approaching));
+        assert_eq!(limit_warning_at(Duration::from_secs(110), ceiling), Some(LimitWarning::Final));
+        // A ceiling shorter than a lead saturates instead of wrapping.
+        let tiny = Duration::from_secs(5);
+        assert_eq!(limit_warning_onsets(tiny), (Duration::ZERO, Duration::ZERO));
+        assert_eq!(limit_warning_at(Duration::ZERO, tiny), Some(LimitWarning::Final));
+    }
+
+    #[test]
+    fn limit_warning_reads_the_headroom_the_daemon_reports() {
+        assert_eq!(limit_warning_for_remaining(None), None);
+        assert_eq!(limit_warning_for_remaining(Some(Duration::from_secs(61))), None);
+        assert_eq!(
+            limit_warning_for_remaining(Some(APPROACHING_LIMIT_LEAD)),
+            Some(LimitWarning::Approaching)
+        );
+        assert_eq!(
+            limit_warning_for_remaining(Some(FINAL_LIMIT_LEAD)),
+            Some(LimitWarning::Final)
+        );
+        assert_eq!(
+            limit_warning_for_remaining(Some(Duration::ZERO)),
+            Some(LimitWarning::Final)
+        );
+    }
+
+    #[test]
+    fn each_limit_warning_fires_exactly_once_across_many_overlay_ticks() {
+        // Time is driven synthetically: the overlay polls every 200 ms, so one
+        // simulated Recording is 3000 ticks of a 600 s ceiling. No sleeping.
+        let mut latch = LimitWarningLatch::default();
+        let mut fired = Vec::new();
+        for tick in 0..=3_000u64 {
+            let elapsed = Duration::from_millis(200 * tick);
+            let warning = limit_warning_at(elapsed, MAX_RECORDING_DURATION);
+            if let Some(announced) = latch.observe(recording(), warning) {
+                fired.push((elapsed, announced));
+            }
+        }
+        assert_eq!(
+            fired,
+            vec![
+                (Duration::from_secs(540), LimitWarning::Approaching),
+                (Duration::from_secs(590), LimitWarning::Final),
+            ],
+            "each stage announces once, at its derived onset"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_blip_mid_recording_never_replays_a_warning() {
+        let mut latch = LimitWarningLatch::default();
+        assert_eq!(
+            latch.observe(recording(), Some(LimitWarning::Approaching)),
+            Some(LimitWarning::Approaching)
+        );
+        // A failed status read is not an observation of a new Recording.
+        assert_eq!(
+            latch.observe(ObservedSignal::Unreachable, Some(LimitWarning::Approaching)),
+            None
+        );
+        assert_eq!(latch.fired(), Some(LimitWarning::Approaching));
+        assert_eq!(latch.observe(recording(), Some(LimitWarning::Approaching)), None);
+        // Escalation still gets through once.
+        assert_eq!(
+            latch.observe(recording(), Some(LimitWarning::Final)),
+            Some(LimitWarning::Final)
+        );
+        assert_eq!(latch.observe(recording(), Some(LimitWarning::Final)), None);
+    }
+
+    #[test]
+    fn a_short_recording_warns_nothing_and_leaves_no_latch_residue() {
+        let mut latch = LimitWarningLatch::default();
+        // Fifteen seconds of Recording against the real ceiling: no warning.
+        for tick in 0..75u64 {
+            let elapsed = Duration::from_millis(200 * tick);
+            let warning = limit_warning_at(elapsed, MAX_RECORDING_DURATION);
+            assert_eq!(warning, None);
+            assert_eq!(latch.observe(recording(), warning), None);
+        }
+        // Then the Recording ends: Processing, then Idle (Hidden).
+        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Processing), None), None);
+        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Hidden), None), None);
+        assert_eq!(latch.fired(), None, "no residue survives the Recording");
+        // A long Recording that warns must also leave the latch clean.
+        assert_eq!(
+            latch.observe(recording(), Some(LimitWarning::Final)),
+            Some(LimitWarning::Final)
+        );
+        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Success), None), None);
+        assert_eq!(latch.fired(), None);
+        // The next Recording therefore warns again from scratch.
+        assert_eq!(
+            latch.observe(recording(), Some(LimitWarning::Approaching)),
+            Some(LimitWarning::Approaching)
+        );
+    }
+
+    #[test]
+    fn limit_warning_bodies_are_the_approved_notification_text() {
+        assert_eq!(
+            limit_warning_body(LimitWarning::Approaching),
+            "Approaching the recording limit — about a minute left"
+        );
+        assert_eq!(limit_warning_body(LimitWarning::Final), "Recording stops in 10 seconds");
     }
 }
