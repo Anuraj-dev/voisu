@@ -1869,10 +1869,12 @@ async fn repeated_command_dictation_is_not_discarded_as_degenerate() {
     // confirmed by the other source, and the vocabulary is too small to judge,
     // so the honest path is reconciliation.
     let kinds = Arc::new(Mutex::new(Vec::new()));
+    // Merge text must stay source-derived under the #98 gate; only vocabulary
+    // from the two Source Transcripts is fair game for a SuccessfulModel mock.
     let mut pipeline = TranscriptDecisionPipeline::new(
         SuccessfulModel {
             kinds: Arc::clone(&kinds),
-            text: "Start stop reset start stop reset start stop reset while the quiet village square waits before sunrise.".to_owned(),
+            text: "Start stop reset start stop reset start stop reset before the quiet village square sunrise.".to_owned(),
         },
         Duration::from_millis(50),
     );
@@ -2154,10 +2156,12 @@ async fn gate_decision_is_stable_under_provider_position_swap() {
     let mut outcomes = Vec::new();
     for (deepgram, groq) in [(texts[0], texts[1]), (texts[1], texts[0])] {
         let kinds = Arc::new(Mutex::new(Vec::new()));
+        // Source-derived mock: pick one of the two source strings so the #98
+        // gate does not reject an invented merge vocabulary.
         let mut pipeline = TranscriptDecisionPipeline::new(
             SuccessfulModel {
                 kinds: Arc::clone(&kinds),
-                text: "The blank front octopus quenched shift.".to_owned(),
+                text: texts[1].to_owned(),
             },
             Duration::from_millis(50),
         );
@@ -2231,10 +2235,11 @@ async fn legitimate_repetitive_jargon_is_not_flagged_degenerate() {
     // not be mistaken for a degenerate loop and gated away. Paired with a
     // coherent source that shares part of its content, it must reconcile.
     let kinds = Arc::new(Mutex::new(Vec::new()));
+    // Source-derived merge of both providers' jargon — no invented content words.
     let mut pipeline = TranscriptDecisionPipeline::new(
         SuccessfulModel {
             kinds: Arc::clone(&kinds),
-            text: "The kubelet restarts the pod and the scheduler reschedules it onto another node while Redis keeps the session token available for the gateway.".to_owned(),
+            text: "The kubelet restarts the pod and the scheduler reschedules the pod onto another node until Redis stores the session token for the gateway.".to_owned(),
         },
         Duration::from_millis(50),
     );
@@ -2400,6 +2405,125 @@ async fn material_disagreement_uses_the_bounded_reconciliation_model() {
     assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
     assert!(decision.reconciliation_requested);
     assert!(!decision.recovery_attempted);
+}
+
+/// #98 co-land guard: a source-derived Merge Result with no quality failure
+/// still delivers as Reconciled. The new gate must not reject honest merges.
+#[tokio::test]
+async fn source_derived_initial_reconciliation_still_delivers_as_reconciled() {
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::clone(&kinds),
+            text: "Book the review for Wednesday morning.".to_owned(),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Book the room for Tuesday afternoon.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Schedule a review on Wednesday morning.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::Reconciled);
+    assert_eq!(decision.transcript.0, "Book the review for Wednesday morning.");
+    assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
+    assert!(decision.reconciliation_requested);
+    assert!(!decision.recovery_attempted);
+    assert!(decision.fallback_reason.is_none());
+}
+
+/// #98 co-land guard: Qwen-style meta and GPT-OSS-style refusals pass
+/// `quality_failure_reason` but invent vocabulary no Source Transcript heard.
+/// They must fall straight to clean_source_fallback — no Repair, no delivery.
+#[tokio::test]
+async fn non_source_derived_initial_reconciliation_falls_back_without_repair() {
+    let fixtures = [
+        "Please provide the Source Transcripts you would like me to reconcile.",
+        "I'm sorry, but I can't comply with that.",
+    ];
+    let deepgram = "Do not deploy the migration tonight.";
+    let groq = "Deploy the migration tonight.";
+
+    for candidate in fixtures {
+        let kinds = Arc::new(Mutex::new(Vec::new()));
+        let mut pipeline = TranscriptDecisionPipeline::new(
+            SuccessfulModel {
+                kinds: Arc::clone(&kinds),
+                text: candidate.to_owned(),
+            },
+            Duration::from_millis(50),
+        );
+
+        let decision = pipeline
+            .decide(vec![
+                SourceTranscript {
+                    provider: Provider::Deepgram,
+                    text: deepgram.to_owned(),
+                },
+                SourceTranscript {
+                    provider: Provider::Groq,
+                    text: groq.to_owned(),
+                },
+            ])
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "non-source-derived reconcile must fall back to a clean source, not refuse: {candidate:?}: {}",
+                    error.diagnostic()
+                )
+            });
+
+        assert_ne!(
+            decision.selection,
+            TranscriptSelection::Reconciled,
+            "non-source-derived reconcile must not deliver as Reconciled: {candidate:?}"
+        );
+        assert!(
+            matches!(
+                decision.selection,
+                TranscriptSelection::SourceDeepgram | TranscriptSelection::SourceGroq
+            ),
+            "expected a clean Source Transcript, got {:?} for {candidate:?}",
+            decision.selection
+        );
+        assert!(
+            decision.transcript.0 == deepgram || decision.transcript.0 == groq,
+            "fallback text must be one of the Source Transcripts for {candidate:?}: {:?}",
+            decision.transcript.0
+        );
+        assert_eq!(
+            *kinds.lock().unwrap(),
+            vec![ReconciliationKind::Reconcile],
+            "Repair must not run for a non-source-derived initial reconcile: {candidate:?}"
+        );
+        assert!(
+            decision.reconciliation_requested,
+            "reconciliation was requested even when the Merge Result was rejected: {candidate:?}"
+        );
+        assert!(
+            !decision.recovery_attempted,
+            "recovery must not be attempted for a non-source-derived initial reconcile: {candidate:?}"
+        );
+        let fallback = decision
+            .fallback_reason
+            .as_deref()
+            .unwrap_or_else(|| panic!("fallback_reason required for {candidate:?}"));
+        assert!(
+            fallback.contains("absent from every Source Transcript")
+                || fallback.contains("no Source Transcript contains"),
+            "diagnostic must state non-source-derived words for {candidate:?}: {fallback}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3128,11 +3252,14 @@ impl ReconciliationModel for RepairingHomoglyphModel {
 async fn legitimate_bilingual_merge_result_passes_validation() {
     let kinds = Arc::new(Mutex::new(Vec::new()));
     // Two scripts across SEPARATE tokens is legitimate bilingual dictation and
-    // must not be rejected as mixed-script garbage.
+    // must not be rejected as mixed-script garbage. Both Source Transcripts
+    // carry the bilingual vocabulary so the #98 source-derived gate still
+    // allows a successful Reconciled delivery.
+    let bilingual = "Скажи Марии that the review is Wednesday morning.";
     let mut pipeline = TranscriptDecisionPipeline::new(
         SuccessfulModel {
             kinds: Arc::clone(&kinds),
-            text: "Скажи Марии that the review is Wednesday morning.".to_owned(),
+            text: bilingual.to_owned(),
         },
         Duration::from_millis(50),
     );
@@ -3141,20 +3268,17 @@ async fn legitimate_bilingual_merge_result_passes_validation() {
         .decide(vec![
             SourceTranscript {
                 provider: Provider::Deepgram,
-                text: "Book the room Tuesday afternoon.".to_owned(),
+                text: "Скажи Марии about the room Tuesday afternoon.".to_owned(),
             },
             SourceTranscript {
                 provider: Provider::Groq,
-                text: "Schedule the review Wednesday morning.".to_owned(),
+                text: "Скажи Марии that the review is Wednesday morning.".to_owned(),
             },
         ])
         .await
         .unwrap();
 
-    assert_eq!(
-        decision.transcript.0,
-        "Скажи Марии that the review is Wednesday morning."
-    );
+    assert_eq!(decision.transcript.0, bilingual);
     assert_eq!(decision.selection, TranscriptSelection::Reconciled);
     assert!(!decision.recovery_attempted);
     assert!(decision.fallback_reason.is_none());
@@ -3209,12 +3333,16 @@ async fn extended_block_homoglyph_merge_results_are_rejected_and_repaired() {
 #[tokio::test]
 async fn fully_greek_extended_token_passes_validation() {
     // A word written entirely in Greek (including Greek Extended letters) as
-    // its own token is legitimate bilingual dictation, not a homoglyph.
+    // its own token is legitimate bilingual dictation, not a homoglyph. The
+    // Greek token must appear in a Source Transcript so the #98 source-derived
+    // gate does not reject a legitimate bilingual Merge Result.
     let kinds = Arc::new(Mutex::new(Vec::new()));
+    let merge =
+        "Tell \u{1f00}\u{03b3}\u{03b1}\u{03b8}\u{03cc}\u{03c2} that the review is Wednesday morning.";
     let mut pipeline = TranscriptDecisionPipeline::new(
         SuccessfulModel {
             kinds: Arc::clone(&kinds),
-            text: "Tell \u{1f00}\u{03b3}\u{03b1}\u{03b8}\u{03cc}\u{03c2} that the review is Wednesday morning.".to_owned(),
+            text: merge.to_owned(),
         },
         Duration::from_millis(50),
     );
@@ -3223,11 +3351,11 @@ async fn fully_greek_extended_token_passes_validation() {
         .decide(vec![
             SourceTranscript {
                 provider: Provider::Deepgram,
-                text: "Book the room Tuesday afternoon.".to_owned(),
+                text: "Tell \u{1f00}\u{03b3}\u{03b1}\u{03b8}\u{03cc}\u{03c2} about the room Tuesday afternoon.".to_owned(),
             },
             SourceTranscript {
                 provider: Provider::Groq,
-                text: "Schedule the review Wednesday morning.".to_owned(),
+                text: "Tell \u{1f00}\u{03b3}\u{03b1}\u{03b8}\u{03cc}\u{03c2} that the review is Wednesday morning.".to_owned(),
             },
         ])
         .await
