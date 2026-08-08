@@ -1,0 +1,413 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Anuraj-dev/voisu/main/docs/research/smart-writing-behavior-schema-2026-08-09.json",
+  "title": "Voisu Smart Writing Behavior Approval Corpus",
+  "description": "Structural schema for GitHub issue #99 approval examples only. Exact Smart/Literal strings are for Raja approval, not CI/release gates. Machine safety/edit validation is #100; implementation thresholds are #103.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "corpus_id",
+    "version",
+    "issue",
+    "approval_state",
+    "language",
+    "scope",
+    "decisions",
+    "fixtures",
+    "dataset_counts"
+  ],
+  "properties": {
+    "corpus_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "github_number",
+        "title",
+        "parent_map"
+      ],
+      "properties": {
+        "github_number": {
+          "type": "integer",
+          "const": 99
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "parent_map": {
+          "type": "integer",
+          "const": 96
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "approval_state": {
+      "type": "string",
+      "const": "pending"
+    },
+    "language": {
+      "type": "string",
+      "const": "en"
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "in_scope",
+        "out_of_scope"
+      ],
+      "properties": {
+        "in_scope": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "out_of_scope": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "title",
+          "question",
+          "status",
+          "recommendation",
+          "blocks_fixture_ids",
+          "options"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "question": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "type": "string",
+            "const": "pending"
+          },
+          "recommendation": {
+            "type": "string",
+            "minLength": 1
+          },
+          "blocks_fixture_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "options": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "label",
+                "summary"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "label": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "summary": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "status",
+          "category",
+          "roles",
+          "input",
+          "rationale",
+          "formatting_changes",
+          "grammar_changes"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^F[0-9]{2}[a-z]?$"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "locked",
+              "open"
+            ]
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "casual",
+              "email",
+              "technical",
+              "punctuation_command",
+              "line_paragraph",
+              "list",
+              "already_correct",
+              "quotation",
+              "informal",
+              "grammar",
+              "safety",
+              "separability",
+              "command_safety"
+            ]
+          },
+          "roles": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "must_change",
+                "must_preserve",
+                "mode_delta",
+                "already_correct",
+                "command",
+                "safety",
+                "separability_format_without_grammar",
+                "command_safety_counterexample"
+              ]
+            }
+          },
+          "input": {
+            "type": "string",
+            "minLength": 1
+          },
+          "expected": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "literal",
+              "smart"
+            ],
+            "properties": {
+              "literal": {
+                "type": "string",
+                "minLength": 1
+              },
+              "smart": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "open_decision_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "alternatives": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "summary",
+                "decision_option_ids",
+                "expected"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "summary": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "decision_option_ids": {
+                  "type": "array",
+                  "minItems": 1,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "description": "Exactly one selected option id for each fixture open_decision_id, in the same order. Cross-link completeness is checked as a corpus invariant."
+                },
+                "expected": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "literal",
+                    "smart"
+                  ],
+                  "properties": {
+                    "literal": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "smart": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "formatting_changes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Human-readable labels of proposed exact-output changes. Empty means none. Not an evaluator."
+          },
+          "grammar_changes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Human-readable labels of proposed exact-output changes. Empty means none. Not an evaluator."
+          },
+          "rationale": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "locked"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "required": [
+                "expected"
+              ],
+              "properties": {
+                "open_decision_ids": false,
+                "alternatives": false
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "open"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "required": [
+                "open_decision_ids",
+                "alternatives"
+              ],
+              "properties": {
+                "expected": false
+              }
+            }
+          }
+        ]
+      }
+    },
+    "dataset_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixtures_total",
+        "fixtures_locked",
+        "fixtures_open",
+        "decisions_total",
+        "decisions_pending"
+      ],
+      "properties": {
+        "fixtures_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "fixtures_locked": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "fixtures_open": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "decisions_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "decisions_pending": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}
