@@ -213,6 +213,8 @@ case "$command" in
     ;;
 esac
 pid_file="${state}.pid"
+# Hermetic capture only — lifecycle verbs are unchanged; stderr is no longer discarded.
+daemon_log="${state}.daemon.log"
 daemon=$(sed -n 's/^daemon=//p' "$state" 2>/dev/null || true)
 forced=$(sed -n 's/^forced=//p' "$state" 2>/dev/null || true)
 stuck_stop=$(sed -n 's/^stuck_stop=//p' "$state" 2>/dev/null || true)
@@ -262,7 +264,7 @@ case "$command" in
     ;;
   start)
     if ! active; then
-      "$daemon" >/dev/null 2>&1 &
+      "$daemon" >>"$daemon_log" 2>&1 &
       printf '%s\n' "$!" > "$pid_file"
     fi
     ;;
@@ -277,7 +279,7 @@ case "$command" in
       while active && test "$i" -lt 100; do i=$((i + 1)); sleep 0.01; done
     fi
     rm -f "$pid_file"
-    "$daemon" >/dev/null 2>&1 &
+    "$daemon" >>"$daemon_log" 2>&1 &
     printf '%s\n' "$!" > "$pid_file"
     ;;
   stop)
@@ -348,6 +350,43 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// Diagnostic dump for managed-lifecycle assertion failures (no behavior change).
+fn lifecycle_failure_evidence(fixture: &ServiceFixture, output: &Output) -> String {
+    let systemctl_log = fs::read_to_string(&fixture.systemctl_log).unwrap_or_default();
+    let systemctl_state = fs::read_to_string(&fixture.systemctl_state).unwrap_or_default();
+    let pid_path = PathBuf::from(format!("{}.pid", fixture.systemctl_state.display()));
+    let daemon_log_path = PathBuf::from(format!("{}.daemon.log", fixture.systemctl_state.display()));
+    let pid_raw = fs::read_to_string(&pid_path).unwrap_or_else(|_| "<missing>".into());
+    let daemon_log = fs::read_to_string(&daemon_log_path).unwrap_or_else(|_| "<missing>".into());
+    let active_marker = pid_raw
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .map(|pid| {
+            if unsafe { libc::kill(pid as libc::pid_t, 0) == 0 } {
+                "kill0=alive"
+            } else {
+                "kill0=dead"
+            }
+        })
+        .unwrap_or("kill0=n/a");
+    let socket = fixture.runtime.join(format!(
+        "voisu/v{}/daemon.sock",
+        voisu_core::PROTOCOL_VERSION
+    ));
+    format!(
+        "status={:?}\nstdout:\n{}\nstderr:\n{}\n--- systemctl.log ---\n{}\n--- systemctl.state ---\n{}\n--- pid_file ({active_marker}) ---\n{}\n--- socket present={} ---\n--- daemon.log ---\n{}",
+        output.status.code(),
+        stdout(output),
+        stderr(output),
+        systemctl_log,
+        systemctl_state,
+        pid_raw,
+        socket.exists(),
+        daemon_log,
+    )
 }
 
 fn wait_for_socket(runtime: &Path, present: bool) {
@@ -893,21 +932,53 @@ fn managed_service_lifecycle_reports_systemd_ownership_and_daemon_ipc() {
     fixture.use_real_managed_daemon();
 
     let started = fixture.run(&["service", "start"]);
-    assert!(started.status.success(), "{}", stderr(&started));
-    assert!(stdout(&started).contains("systemd user service active; daemon IPC idle"));
+    assert!(
+        started.status.success(),
+        "{}",
+        lifecycle_failure_evidence(&fixture, &started)
+    );
+    assert!(
+        stdout(&started).contains("systemd user service active; daemon IPC idle"),
+        "{}",
+        lifecycle_failure_evidence(&fixture, &started)
+    );
     wait_for_socket(&fixture.runtime, true);
 
     let status = fixture.run(&["service", "status"]);
-    assert!(status.status.success(), "{}", stderr(&status));
-    assert!(stdout(&status).contains("systemd user service active; daemon IPC idle"));
+    assert!(
+        status.status.success(),
+        "{}",
+        lifecycle_failure_evidence(&fixture, &status)
+    );
+    assert!(
+        stdout(&status).contains("systemd user service active; daemon IPC idle"),
+        "{}",
+        lifecycle_failure_evidence(&fixture, &status)
+    );
 
     let restarted = fixture.run(&["service", "restart"]);
-    assert!(restarted.status.success(), "{}", stderr(&restarted));
-    assert!(stdout(&restarted).contains("systemd user service active; daemon IPC idle"));
+    assert!(
+        restarted.status.success(),
+        "{}",
+        lifecycle_failure_evidence(&fixture, &restarted)
+    );
+    assert!(
+        stdout(&restarted).contains("systemd user service active; daemon IPC idle"),
+        "{}",
+        lifecycle_failure_evidence(&fixture, &restarted)
+    );
 
     let stopped = fixture.run(&["service", "stop"]);
-    assert!(stopped.status.success(), "{}", stderr(&stopped));
-    assert!(stdout(&stopped).contains("systemd user service inactive; daemon IPC unavailable"));
+    assert!(
+        stopped.status.success(),
+        "{}",
+        lifecycle_failure_evidence(&fixture, &stopped)
+    );
+    assert!(
+        stdout(&stopped).contains("systemd user service inactive; daemon IPC unavailable"),
+        "{}",
+        lifecycle_failure_evidence(&fixture, &stopped)
+    );
     wait_for_socket(&fixture.runtime, false);
 }
 
