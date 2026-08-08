@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.10.2
+Version:        0.10.3
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,11 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Sat Aug 08 2026 Voisu maintainers <voisu@example.invalid> - 0.10.3-1
+- fix(reconciliation): migrate default model to Qwen (#107)
+- docs(research): record Groq reconciliation benchmark (#106)
+- test(service): capture lifecycle flake evidence (#104)
+
 * Sat Aug 08 2026 Voisu maintainers <voisu@example.invalid> - 0.10.2-1
 - fix(deps): update event-listener for RUSTSEC-2026-0221 (#105)
 
