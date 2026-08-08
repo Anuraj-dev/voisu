@@ -60,6 +60,10 @@ const MAX_RETAINED_STDERR_BYTES: usize = 4 * 1024;
 const MAX_RETAINED_STDOUT_BYTES: usize = 64 * 1024;
 const PROVIDER_PROCESS_DEADLINE: Duration = Duration::from_secs(14);
 const RECONCILIATION_PROCESS_DEADLINE: Duration = Duration::from_secs(2);
+/// Default Groq chat-completions model for Transcript reconciliation.
+/// Exact id only — no family-wide Qwen rule. Co-lands with the #98
+/// `reasoning_effort: "none"` body field for this same exact id.
+const DEFAULT_GROQ_RECONCILIATION_MODEL: &str = "qwen/qwen3.6-27b";
 const MIN_RECORDING_BYTES: usize = PCM_CHUNK_BYTES;
 /// The one configured maximum for a Recording. Both capture's retained PCM
 /// buffer and its default Deadline derive from this value — and so do the
@@ -4254,7 +4258,7 @@ fn request_groq_reconciliation(
         ));
     }
     let model = std::env::var("VOISU_GROQ_RECONCILIATION_MODEL")
-        .unwrap_or_else(|_| "llama-3.3-70b-versatile".to_owned());
+        .unwrap_or_else(|_| DEFAULT_GROQ_RECONCILIATION_MODEL.to_owned());
     if model.trim().is_empty() || model.contains(['\n', '\r']) {
         return Err(BoundaryError::new(
             BoundaryKind::Validation,
@@ -4281,18 +4285,7 @@ fn request_groq_reconciliation(
             ));
         }
     };
-    let body = serde_json::json!({
-        "model": model,
-        "temperature": 0,
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are Voisu's Transcript reconciliation model. Preserve spoken meaning and never add commentary, prompt text, or facts."
-            },
-            { "role": "user", "content": task }
-        ]
-    })
-    .to_string();
+    let body = groq_reconciliation_request_body(&model, &task).to_string();
     let config = format!(
         "url = \"{}\"\nheader = \"Authorization: Bearer {}\"\nheader = \"Content-Type: application/json\"\ndata = \"{}\"\n",
         curl_config_escape(&endpoint),
@@ -4341,6 +4334,35 @@ fn request_groq_reconciliation(
         .ok_or_else(|| {
             BoundaryError::new(BoundaryKind::Validation, "Groq reconciliation omitted text")
         })
+}
+
+/// Build the Groq chat-completions JSON body for reconciliation.
+///
+/// `reasoning_effort: "none"` is attached only when `model` is exactly the
+/// selected default id (`qwen/qwen3.6-27b`). Every other override — including
+/// other `qwen/…` ids and GPT-OSS — omits the field unless separately supported
+/// later. Attaching `none` to GPT-OSS or Llama returns HTTP 400.
+fn groq_reconciliation_request_body(model: &str, task: &str) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are Voisu's Transcript reconciliation model. Preserve spoken meaning and never add commentary, prompt text, or facts."
+            },
+            { "role": "user", "content": task }
+        ]
+    });
+    if model == DEFAULT_GROQ_RECONCILIATION_MODEL {
+        body.as_object_mut()
+            .expect("reconciliation request body is a JSON object")
+            .insert(
+                "reasoning_effort".to_owned(),
+                serde_json::Value::String("none".to_owned()),
+            );
+    }
+    body
 }
 
 pub trait ClipboardBoundary: Send {
@@ -8026,5 +8048,56 @@ mod tests {
         let text = libei_text_buffer("Hello, दुनिया!").unwrap();
         assert_eq!(text.as_bytes_with_nul().last(), Some(&0));
         assert!(libei_text_buffer("unsafe\0tail").is_err());
+    }
+
+    /// #98: the default reconciliation model is the exact selected Qwen id.
+    #[test]
+    fn default_groq_reconciliation_model_is_exact_qwen_id() {
+        assert_eq!(DEFAULT_GROQ_RECONCILIATION_MODEL, "qwen/qwen3.6-27b");
+    }
+
+    /// #98: only the exact selected model gets `reasoning_effort: "none"`.
+    #[test]
+    fn selected_qwen_reconciliation_body_sets_reasoning_effort_none() {
+        let body = groq_reconciliation_request_body(
+            DEFAULT_GROQ_RECONCILIATION_MODEL,
+            "Reconcile these Source Transcripts.",
+        );
+        assert_eq!(
+            body.get("model").and_then(|value| value.as_str()),
+            Some("qwen/qwen3.6-27b")
+        );
+        assert_eq!(
+            body.get("reasoning_effort").and_then(|value| value.as_str()),
+            Some("none")
+        );
+        assert_eq!(
+            body.get("temperature").and_then(|value| value.as_f64()),
+            Some(0.0)
+        );
+    }
+
+    /// #98: every other override omits `reasoning_effort` (no family-wide Qwen
+    /// rule; GPT-OSS rejects `none` with HTTP 400).
+    #[test]
+    fn non_selected_reconciliation_models_omit_reasoning_effort() {
+        let overrides = [
+            "openai/gpt-oss-120b",
+            "llama-3.3-70b-versatile",
+            "qwen/qwen3-32b",
+            "configured-model",
+        ];
+        for model in overrides {
+            let body = groq_reconciliation_request_body(model, "Reconcile these Source Transcripts.");
+            assert_eq!(
+                body.get("model").and_then(|value| value.as_str()),
+                Some(model),
+                "model id must pass through unchanged: {model}"
+            );
+            assert!(
+                body.get("reasoning_effort").is_none(),
+                "reasoning_effort must be omitted for override {model}: {body}"
+            );
+        }
     }
 }

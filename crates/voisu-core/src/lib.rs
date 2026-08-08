@@ -1203,6 +1203,21 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                     .repair_candidate(&sources, merge_result, reason, true)
                     .await;
             }
+            // Reconcile success requires both a clean quality check and
+            // source-derived vocabulary. A model may return short, clean
+            // meta/refusal text that trips no quality marker yet invents words
+            // no provider heard — deliver that as Reconciled and the user is
+            // typed a non-transcript. Fall back without Repair: Repair exists
+            // for quality failures, not for non-source-derived invent.
+            if !is_source_derived(&merge_result.0, &sources) {
+                return clean_source_fallback(
+                    &sources,
+                    "reconciliation produced words absent from every Source Transcript"
+                        .to_owned(),
+                    true,
+                    false,
+                );
+            }
             return Ok(TranscriptDecision {
                 transcript: Transcript(merge_result.0.trim().to_owned()),
                 selection: TranscriptSelection::Reconciled,

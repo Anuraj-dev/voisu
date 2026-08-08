@@ -4912,6 +4912,103 @@ rm -f "$config"
     let config = fs::read_to_string(commands.path().join("reconciliation.config")).unwrap();
     assert!(config.contains("configured-model"));
     assert!(config.contains("Authorization: Bearer groq-controlled-secret"));
+    // A non-selected override must not inherit the Qwen-only reasoning_effort.
+    assert!(
+        !config.contains("reasoning_effort"),
+        "non-selected model override must omit reasoning_effort: {config}"
+    );
+}
+
+#[test]
+fn default_qwen_reconciliation_request_includes_model_and_reasoning_effort_none() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+head -c 32000 /dev/zero | tr '\000' '\001'
+trap 'exit 0' INT TERM
+: > "$dir/pw-record.ready"
+i=0
+while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "secret-tool",
+        r#"#!/bin/sh
+if [ "$1" = "lookup" ]; then
+  printf 'groq-controlled-secret'
+fi
+"#,
+    );
+    write_fake_command(
+        commands.path(),
+        "curl",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+config=$(mktemp "$dir/curl-config.XXXXXX")
+cat > "$config"
+if grep -q 'reconciliation.test' "$config"; then
+  cp "$config" "$dir/reconciliation.config"
+  printf '{"choices":[{"message":{"content":"Book the review for Wednesday morning."}}]}'
+else
+  printf '{"text":"Schedule the review Wednesday morning."}'
+fi
+rm -f "$config"
+"#,
+    );
+    let deepgram_endpoint = spawn_mock_deepgram(
+        commands.path(),
+        MockDeepgramBehavior::Finalize("Book the room Tuesday afternoon."),
+    );
+    write_fake_command(
+        commands.path(),
+        "wl-copy",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\ncat > \"$dir/clipboard\"\n",
+    );
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    // No VOISU_GROQ_RECONCILIATION_MODEL — the default Qwen body contract.
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_TEST_MODE", "system-boundaries"),
+            ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
+            ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
+            ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
+            (
+                "VOISU_GROQ_RECONCILIATION_URL",
+                "https://reconciliation.test/chat/completions",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "pw-record.ready");
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["evidence"]["transcript_selection"], "reconciled");
+    let config = fs::read_to_string(commands.path().join("reconciliation.config")).unwrap();
+    assert!(
+        config.contains("qwen/qwen3.6-27b"),
+        "default model must be exact selected Qwen id: {config}"
+    );
+    assert!(
+        config.contains("reasoning_effort") && config.contains("none"),
+        "selected Qwen must send reasoning_effort none: {config}"
+    );
 }
 
 #[test]
