@@ -328,11 +328,11 @@ mod tests {
     #[derive(Clone, Copy)]
     enum HangMode {
         /// Read request start, then stop reading so the client stalls mid-upload.
-        DuringUpload,
+        Upload,
         /// Fully read request; never send response headers.
-        DuringWait,
+        Wait,
         /// Send 200 headers + partial body; stall before finishing the body.
-        DuringResponse,
+        PartialBody,
     }
 
     #[derive(Clone, Copy)]
@@ -391,21 +391,21 @@ mod tests {
         let _active = ActiveGuard(&probe.active_handlers);
 
         match reply {
-            ReplyMode::Hang(HangMode::DuringUpload) => {
+            ReplyMode::Hang(HangMode::Upload) => {
                 // Read only a little of the request so the client is still uploading.
                 let mut buf = [0u8; 256];
                 let _ = socket.read(&mut buf).await;
                 probe.hang_entered.fetch_add(1, Ordering::SeqCst);
                 drain_until_eof_counting_after_drop(&mut socket, &probe, drop_rx).await;
             }
-            ReplyMode::Hang(HangMode::DuringWait) => {
+            ReplyMode::Hang(HangMode::Wait) => {
                 let _ = read_http_request(&mut socket).await;
                 probe.requests_seen.fetch_add(1, Ordering::SeqCst);
                 probe.hang_entered.fetch_add(1, Ordering::SeqCst);
                 // Hold the connection open until the client drops (EOF).
                 drain_until_eof_counting_after_drop(&mut socket, &probe, drop_rx).await;
             }
-            ReplyMode::Hang(HangMode::DuringResponse) => {
+            ReplyMode::Hang(HangMode::PartialBody) => {
                 let _ = read_http_request(&mut socket).await;
                 probe.requests_seen.fetch_add(1, Ordering::SeqCst);
                 let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n";
@@ -743,7 +743,7 @@ mod tests {
         let server = spawn_http_server(
             listener,
             Arc::clone(&probe),
-            ReplyMode::Hang(HangMode::DuringWait),
+            ReplyMode::Hang(HangMode::Wait),
             None,
         )
         .await;
@@ -762,19 +762,19 @@ mod tests {
     /// §11.2 gate (1): mid-wait drop on the **real** reqwest client stack.
     #[tokio::test]
     async fn drop_mid_wait_leaves_zero_per_request_work() {
-        assert_drop_cancels(HangMode::DuringWait).await;
+        assert_drop_cancels(HangMode::Wait).await;
     }
 
     /// §11.2 gate (1): mid-response drop on the real client stack.
     #[tokio::test]
     async fn drop_mid_response_leaves_zero_per_request_work() {
-        assert_drop_cancels(HangMode::DuringResponse).await;
+        assert_drop_cancels(HangMode::PartialBody).await;
     }
 
     /// §11.2 gate (1): mid-upload drop on the real client stack.
     #[tokio::test]
     async fn drop_mid_upload_leaves_zero_per_request_work() {
-        assert_drop_cancels(HangMode::DuringUpload).await;
+        assert_drop_cancels(HangMode::Upload).await;
     }
 
     async fn assert_drop_cancels(mode: HangMode) {
