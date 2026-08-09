@@ -4519,6 +4519,10 @@ impl<'a> TakenRunningChild<'a> {
             let mut guard = self.entry.inner.lock().unwrap_or_else(|p| p.into_inner());
             guard.stdout_eof_observed = self.stdout_eof;
             guard.stderr_eof_observed = self.stderr_eof;
+            // Wait + both EOFs: the OS process is fully owned/reaped. Clear the
+            // durable kill target immediately so retry-backoff Drop/cancel cannot
+            // SIGKILL a PGID that the kernel may reuse for an unrelated process.
+            guard.last_pgid = None;
         }
         self.fully_reaped = true;
         let _ = self.child.take();
@@ -10399,11 +10403,16 @@ mod tests {
         CredentialEnvGuard::set("VOISU_TEST_KEYRING_RETRY_MS", "0");
 
         let tool_dir = tempfile::tempdir().unwrap();
-        // Write a secret-like payload then hang so Drop mid-drive must re-park
-        // live pipes (not silent Nones) until supervisor observes both EOFs.
+        let ready = tool_dir.path().join("ready");
+        let ready_path = ready.to_string_lossy().into_owned();
+        // Write a secret-like payload, barrier-signal, then hang so Drop mid-drive
+        // must re-park live pipes (not silent Nones) until supervisor observes
+        // both EOFs. Ready-file avoids racing cancel before the secret write.
         install_fake_secret_tool(
             tool_dir.path(),
-            "#!/bin/sh\nprintf 'drop-secret-must-drain\\n'\nsleep 30\n",
+            &format!(
+                "#!/bin/sh\nprintf 'drop-secret-must-drain\\n'\n: > '{ready_path}'\nsleep 30\n"
+            ),
         );
 
         let reaper = ProviderReaper::new();
@@ -10411,8 +10420,8 @@ mod tests {
         let entry = lane.register();
         let entry_watch = Arc::clone(&entry);
 
-        // Drive first poll far enough to launch, then drop the owner without
-        // awaiting terminal — Drop kill-signals but must not deregister.
+        // Drive first poll past the secret write + launch, then drop the owner
+        // without awaiting terminal — Drop kill-signals but must not deregister.
         let pgid = {
             let mut owner = CredentialPreparationOwner::new(
                 Arc::clone(&entry),
@@ -10430,12 +10439,15 @@ mod tests {
                             panic!("owner should be dropped before poll completes");
                         }
                         _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                            if let Some(pgid) = entry_watch.retained_pgid() {
-                                break pgid;
+                            // Barrier: secret payload written before Drop.
+                            if ready.exists() {
+                                if let Some(pgid) = entry_watch.retained_pgid() {
+                                    break pgid;
+                                }
                             }
                             assert!(
                                 Instant::now() < deadline,
-                                "child never launched before Drop test budget"
+                                "child never signalled ready before Drop test budget"
                             );
                         }
                     }
@@ -10566,6 +10578,110 @@ mod tests {
         assert!(
             !entry.has_retained_running_child(),
             "no undrained pipe buffers may remain after terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_cancel_during_retry_backoff_does_not_retain_stale_pgid() {
+        // First secret-tool attempt fails with stderr → Retry. Between attempts
+        // the child is fully reaped (wait + both EOFs). last_pgid must already
+        // be cleared so cancel/Drop during backoff cannot SIGKILL a reused PGID.
+        let _lock = credential_owner_test_lock().await;
+        let _env = CredentialEnvGuard::capture(&[
+            "VOISU_GROQ_API_KEY",
+            "VOISU_TEST_SECRET_STORE",
+            "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+            "VOISU_TEST_KEYRING_RETRY_MS",
+            "PATH",
+        ]);
+        clear_groq_credential_surface();
+        // Long flat backoff so cancel lands squarely between attempts.
+        CredentialEnvGuard::set("VOISU_TEST_KEYRING_RETRY_MS", "5000");
+
+        let tool_dir = tempfile::tempdir().unwrap();
+        let ready = tool_dir.path().join("ready");
+        let ready_path = ready.to_string_lossy().into_owned();
+        // Nonzero exit + stderr → KeyringLocked → Retry (not Missing).
+        install_fake_secret_tool(
+            tool_dir.path(),
+            &format!("#!/bin/sh\necho 'keyring locked' >&2\n: > '{ready_path}'\nexit 1\n"),
+        );
+
+        let reaper = ProviderReaper::new();
+        let lane = reaper.credential_lane().clone();
+        let entry = lane.register();
+        let entry_watch = Arc::clone(&entry);
+        let mut owner =
+            CredentialPreparationOwner::new(Arc::clone(&entry), lane.clone(), Provider::Groq);
+
+        let poll = owner.poll_outcome();
+        tokio::pin!(poll);
+
+        // Wait until first attempt is fully reaped and durable pgid is cleared.
+        let first_pgid = {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut seen_pgid = None;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut poll => {
+                        panic!("long retry backoff must not finish before cancel");
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                        if let Some(pgid) = entry_watch.retained_pgid() {
+                            seen_pgid = Some(pgid);
+                        }
+                        // Ready means the failing attempt wrote and exited; full
+                        // reap clears last_pgid and leaves no running child.
+                        if ready.exists()
+                            && entry_watch.has_launched_child()
+                            && entry_watch.both_pipe_eofs_observed()
+                            && entry_watch.retained_pgid().is_none()
+                            && !entry_watch.has_retained_running_child()
+                        {
+                            break seen_pgid;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "first retry attempt never fully reaped before backoff"
+                        );
+                    }
+                }
+            }
+        };
+
+        // Core r4 invariant: after wait + both EOFs there is no durable kill target.
+        assert!(
+            entry_watch.retained_pgid().is_none(),
+            "last_pgid must be cleared after full reap so retry-backoff cancel is a no-op kill"
+        );
+        if let Some(pgid) = first_pgid {
+            assert_os_process_reaped(pgid);
+        }
+
+        // Cancel during backoff: no live child / no last_pgid → kill is no-op.
+        entry_watch.request_cancel_and_kill();
+        let capability = poll.await;
+        assert!(
+            matches!(
+                capability,
+                GrammarCapability::Unavailable(GrammarUnavailableReason::Cancelled)
+            ),
+            "cancel during retry backoff must yield Cancelled, got {capability:?}"
+        );
+        assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
+        assert_eq!(lane.pending_count(), 0);
+        assert!(
+            entry.retained_pgid().is_none(),
+            "cancel during backoff must not re-arm a stale last_pgid"
+        );
+        assert!(
+            entry.both_pipe_eofs_observed(),
+            "first-attempt EOFs must remain observed after backoff cancel"
+        );
+        assert!(
+            !entry.has_retained_running_child(),
+            "no undrained child may remain after backoff cancel terminal"
         );
     }
 
