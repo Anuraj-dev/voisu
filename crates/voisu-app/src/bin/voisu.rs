@@ -14,7 +14,7 @@ use voisu_app::system::{
     DIAGNOSTIC_RESPONSE_DEADLINE, FedoraReadiness, PROCESSING_RESPONSE_DEADLINE,
     ProviderHttpClient, SecretToolStore,
 };
-use voisu_app::config::DeliveryMode;
+use voisu_app::config::{DeliveryMode, WritingMode};
 
 /// The most response the CLI will buffer — per transport frame, and in total
 /// across the pages of one diagnostic payload.
@@ -46,6 +46,7 @@ enum CliAction {
     AuthVerify(Provider),
     SetDeepgram(bool),
     Delivery(Option<DeliveryMode>),
+    Writing(Option<WritingMode>),
     DictionaryAdd(String),
     DictionaryRemove(String),
     DictionaryList { json: bool },
@@ -67,6 +68,7 @@ fn main() -> ExitCode {
         Ok(CliAction::AuthVerify(provider)) => auth_verify(provider),
         Ok(CliAction::SetDeepgram(enabled)) => set_deepgram(enabled),
         Ok(CliAction::Delivery(mode)) => delivery(mode),
+        Ok(CliAction::Writing(mode)) => writing(mode),
         Ok(CliAction::DictionaryAdd(term)) => dictionary_add(&term),
         Ok(CliAction::DictionaryRemove(term)) => dictionary_remove(&term),
         Ok(CliAction::DictionaryList { json }) => dictionary_list(json),
@@ -549,6 +551,26 @@ fn delivery(mode: Option<DeliveryMode>) -> ExitCode {
     }
 }
 
+/// Reads or persists the Writing Mode. A running daemon resolves configuration
+/// only at start, so writes apply after the next restart.
+fn writing(mode: Option<WritingMode>) -> ExitCode {
+    let Some(mode) = mode else {
+        println!("writing mode: {}", voisu_app::config::writing_mode().as_str());
+        return ExitCode::SUCCESS;
+    };
+    match voisu_app::config::set_writing_mode(mode) {
+        Ok(_) => {
+            println!(
+                "Writing mode set to {} for new Recordings; restart the daemon to apply \
+                 (voisu service restart)",
+                mode.as_str()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(message) => fail(4, &message),
+    }
+}
+
 fn dictionary_add(term: &str) -> ExitCode {
     match voisu_app::dictionary::add_user_term(term) {
         Ok(true) => {
@@ -782,6 +804,10 @@ fn parse_command() -> Result<CliAction, String> {
         [command, mode] if command == "delivery" => {
             Ok(CliAction::Delivery(Some(parse_delivery_mode(mode)?)))
         }
+        [command] if command == "writing" => Ok(CliAction::Writing(None)),
+        [command, mode] if command == "writing" => {
+            Ok(CliAction::Writing(Some(parse_writing_mode(mode)?)))
+        }
         [dictionary, action, term] if dictionary == "dictionary" && action == "add" => {
             Ok(CliAction::DictionaryAdd(term.clone()))
         }
@@ -834,6 +860,14 @@ fn parse_delivery_mode(value: &str) -> Result<DeliveryMode, String> {
     }
 }
 
+fn parse_writing_mode(value: &str) -> Result<WritingMode, String> {
+    match value {
+        "smart" => Ok(WritingMode::Smart),
+        "literal" => Ok(WritingMode::Literal),
+        _ => Err("writing mode must be smart or literal".to_owned()),
+    }
+}
+
 fn parse_provider(value: &str) -> Result<Provider, String> {
     match value {
         "groq" => Ok(Provider::Groq),
@@ -843,7 +877,7 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: voisu <setup|start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|delivery|dictionary|service>\n\n  voisu setup  # guided, re-runnable wizard: validate and store your Deepgram and Groq keys\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor [--verbose]  # capability, focus-guard, and live per-key round-trip checks; --verbose adds the reasoning behind each line\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu delivery [type|clipboard|guarded]  # choose Transcript Delivery (default type); no argument shows the persisted mode\n  voisu dictionary add <term>\n  voisu dictionary remove <term>\n  voisu dictionary list [--json]\n  voisu service <install|start|stop|restart|status|uninstall>"
+    "usage: voisu <setup|start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|delivery|writing|dictionary|service>\n\n  voisu setup  # guided, re-runnable wizard: validate and store your Deepgram and Groq keys\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor [--verbose]  # capability, focus-guard, and live per-key round-trip checks; --verbose adds the reasoning behind each line\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu delivery [type|clipboard|guarded]  # choose Transcript Delivery (default type); no argument shows the persisted mode\n  voisu writing [smart|literal]  # choose Writing Mode (default smart); no argument shows the persisted mode\n  voisu dictionary add <term>\n  voisu dictionary remove <term>\n  voisu dictionary list [--json]\n  voisu service <install|start|stop|restart|status|uninstall>"
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {
