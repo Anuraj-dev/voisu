@@ -407,12 +407,11 @@ fn collect_composite_spans(text: &str, out: &mut Vec<SourceSpan>) {
 
     // Technical identifiers + numbers/dates/times: single token pass (O(n)).
     for (s, e, tok) in word_tokens(text) {
-        if tok.contains('_')
+        if (tok.contains('_')
             && tok.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-            && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+            || is_number_date_or_time(tok)
         {
-            out.push(SourceSpan::new(s, e));
-        } else if is_number_date_or_time(tok) {
             out.push(SourceSpan::new(s, e));
         }
     }
