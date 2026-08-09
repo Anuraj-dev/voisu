@@ -1658,8 +1658,6 @@ fn grammar_didnt(text: &str, protected: &[bool]) -> String {
         }
         let replacement = if tok.starts_with('D') {
             "Didn't"
-        } else if tok.starts_with('d') {
-            "didn't"
         } else {
             "didn't"
         };
