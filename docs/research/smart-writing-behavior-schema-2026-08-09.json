@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/Anuraj-dev/voisu/main/docs/research/smart-writing-behavior-schema-2026-08-09.json",
-  "title": "Voisu Smart Writing Behavior Approval Corpus",
-  "description": "Structural schema for GitHub issue #99 approval examples only. Exact Smart/Literal strings are for Raja approval, not CI/release gates. Machine safety/edit validation is #100; implementation thresholds are #103.",
+  "title": "Voisu Smart Writing Behavior Approved Corpus",
+  "description": "Structural schema for the GitHub issue #99 approved examples. Exact Smart/Literal strings are product behavior evidence, not CI/release gates. Machine safety/edit validation is #100; implementation thresholds are #103.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -54,7 +54,7 @@
     },
     "approval_state": {
       "type": "string",
-      "const": "pending"
+      "const": "approved"
     },
     "language": {
       "type": "string",
@@ -98,6 +98,7 @@
           "question",
           "status",
           "recommendation",
+          "selected_option_id",
           "blocks_fixture_ids",
           "options"
         ],
@@ -116,11 +117,16 @@
           },
           "status": {
             "type": "string",
-            "const": "pending"
+            "const": "approved"
           },
           "recommendation": {
             "type": "string",
             "minLength": 1
+          },
+          "selected_option_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The option Raja approved for this decision. It must match exactly one id in options; the corpus invariant checker enforces the cross-link."
           },
           "blocks_fixture_ids": {
             "type": "array",
