@@ -1660,6 +1660,12 @@ fn add_terminal_punctuation(text: &str, protected: &[bool]) -> String {
 
     // Paragraphs (`\n\n` from command new paragraph): D1-B — period on each fragment.
     if text.contains("\n\n") {
+        // Splitting/trimming paragraphs that intersect fenced code can delete
+        // significant whitespace. Keep the whole late-punctuation pass inert;
+        // earlier span-aware casing and grammar have already handled exteriors.
+        if protected.iter().any(|byte| *byte) {
+            return text.to_owned();
+        }
         let mut rendered = Vec::new();
         let mut start = 0usize;
         for paragraph in text.split("\n\n") {
@@ -2218,10 +2224,10 @@ mod tests {
 
     #[test]
     fn multiline_fenced_code_interior_is_byte_exact_after_all_formatting_passes() {
-        let input = "note is below\n```\n1. foo\nlet value is two\ncommand period\nshe said \"x\" and left\n```";
+        let input = "note is below\n```\n1. foo  \n\nlet value is two\ncommand period\nshe said \"x\" and left\n```";
         assert_eq!(
             smart(input),
-            "Note is below.\n```\n1. foo\nlet value is two\ncommand period\nshe said \"x\" and left\n```"
+            "Note is below\n```\n1. foo  \n\nlet value is two\ncommand period\nshe said \"x\" and left\n```"
         );
     }
 
