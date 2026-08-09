@@ -963,7 +963,7 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     if s_bytes[..p_bytes.len()]
         .iter()
         .zip(p_bytes)
-        .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+        .all(|(a, b)| a.eq_ignore_ascii_case(b))
     {
         Some(&s[p_bytes.len()..])
     } else {
@@ -1441,14 +1441,14 @@ fn word_tokens(text: &str) -> Vec<(usize, usize, &str)> {
             i += len;
             while i < bytes.len() {
                 let c2 = text[i..].chars().next().unwrap();
-                if is_word_char(c2) {
-                    i += c2.len_utf8();
-                } else if (c2 == '\'' || c2 == '\u{2019}')
-                    && i + c2.len_utf8() < bytes.len()
-                    && text[i + c2.len_utf8()..]
-                        .chars()
-                        .next()
-                        .is_some_and(is_word_char)
+                // Continue through alphanumerics and apostrophes mid-word (ASCII / U+2019).
+                if is_word_char(c2)
+                    || ((c2 == '\'' || c2 == '\u{2019}')
+                        && i + c2.len_utf8() < bytes.len()
+                        && text[i + c2.len_utf8()..]
+                            .chars()
+                            .next()
+                            .is_some_and(is_word_char))
                 {
                     i += c2.len_utf8();
                 } else {
@@ -1480,13 +1480,7 @@ fn ascii_lower(s: &str) -> String {
 }
 
 fn eq_ascii_ignore_case(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        // lengths can differ only with non-ascii; still compare lowercased
-        return ascii_lower(a) == ascii_lower(b);
-    }
-    a.bytes()
-        .zip(b.bytes())
-        .all(|(x, y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
+    a.eq_ignore_ascii_case(b)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
