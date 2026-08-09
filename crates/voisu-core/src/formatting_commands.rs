@@ -412,12 +412,39 @@ fn make_scalar_match(
     }
 }
 
+/// Whether this command kind absorbs whitespace immediately before the introducer.
+///
+/// Quote and numbered list deliberately do **not**: the space before `"` / `1.` stays
+/// so mid-utterance constructs do not glue to the prior word.
+fn command_consumes_leading_ws(kind: &CommandKind) -> bool {
+    matches!(
+        kind,
+        CommandKind::Period
+            | CommandKind::Comma
+            | CommandKind::QuestionMark
+            | CommandKind::ExclamationPoint
+            | CommandKind::NewLine
+            | CommandKind::NewParagraph
+    )
+}
+
+/// Whether this command kind absorbs whitespace immediately after its phrase.
+fn command_consumes_trailing_ws(kind: &CommandKind) -> bool {
+    matches!(
+        kind,
+        CommandKind::NewLine | CommandKind::NewParagraph | CommandKind::NumberedList { .. }
+    )
+}
+
 /// Expand the replaced region to absorb adjacent whitespace for spacing rules.
 ///
 /// - Punctuation / new line / new paragraph: consume whitespace immediately before
 ///   the introducer (so `word command period` → `word.`) and, for breaks only,
 ///   whitespace immediately after the phrase (so the next line has no indent).
-/// - Quote / list: do not consume leading whitespace (space before `"` stays).
+/// - Quote / list: do **not** consume leading whitespace (space before `"` / `1.` stays).
+/// - Trailing expansion yields to a following command that claims the same gap via
+///   leading-ws expansion, so consecutive `CommandEvent.span` values form a
+///   non-overlapping half-open partition.
 fn expand_replace_span(
     source: &str,
     tokens: &[Token],
@@ -428,17 +455,7 @@ fn expand_replace_span(
     let mut start = tokens[command_index].span.start;
     let mut end = tokens[last_phrase_index].span.end;
 
-    let consumes_leading_ws = matches!(
-        kind,
-        CommandKind::Period
-            | CommandKind::Comma
-            | CommandKind::QuestionMark
-            | CommandKind::ExclamationPoint
-            | CommandKind::NewLine
-            | CommandKind::NewParagraph
-            | CommandKind::NumberedList { .. }
-    );
-    if consumes_leading_ws {
+    if command_consumes_leading_ws(kind) {
         // Include whitespace between previous token (if any) and this command.
         let ws_start = if command_index > 0 {
             tokens[command_index - 1].span.end
@@ -456,32 +473,27 @@ fn expand_replace_span(
         let before = &source[ws_start..start];
         if !before.is_empty() && before.chars().all(|c| c.is_whitespace()) {
             start = ws_start;
-        } else if command_index > 0 {
-            // Only the inter-token whitespace.
-            start = tokens[command_index - 1].span.end;
-            // But only if that region is whitespace (it should be).
-            if !source[start..tokens[command_index].span.start]
-                .chars()
-                .all(|c| c.is_whitespace())
-            {
-                start = tokens[command_index].span.start;
-            }
         }
     }
 
-    let consumes_trailing_ws = matches!(
-        kind,
-        CommandKind::NewLine | CommandKind::NewParagraph | CommandKind::NumberedList { .. }
-    );
-    if consumes_trailing_ws {
-        let ws_end = if last_phrase_index + 1 < tokens.len() {
-            tokens[last_phrase_index + 1].span.start
-        } else {
+    if command_consumes_trailing_ws(kind) {
+        let next_tok = last_phrase_index + 1;
+        if next_tok >= tokens.len() {
             // Trailing: consume trailing whitespace to EOF.
-            source.len()
-        };
-        if ws_end > end && source[end..ws_end].chars().all(|c| c.is_whitespace()) {
-            end = ws_end;
+            if end < source.len() && source[end..].chars().all(|c| c.is_whitespace()) {
+                end = source.len();
+            }
+        } else {
+            // Do not claim inter-token whitespace that the next recognized command
+            // will claim via leading-ws expansion (avoids overlapping replace spans).
+            let next_claims_leading = try_command_match(source, tokens, next_tok)
+                .is_some_and(|m| command_consumes_leading_ws(&m.kind));
+            if !next_claims_leading {
+                let ws_end = tokens[next_tok].span.start;
+                if ws_end > end && source[end..ws_end].chars().all(|c| c.is_whitespace()) {
+                    end = ws_end;
+                }
+            }
         }
     }
 
@@ -627,7 +639,9 @@ fn try_numbered_list(source: &str, tokens: &[Token], i: usize) -> Option<Command
     let kind = CommandKind::NumberedList {
         items: items.clone(),
     };
-    // Consume leading whitespace before the list and trailing whitespace after last item token.
+    // List does not consume leading whitespace (space before `1.` stays); may
+    // absorb trailing whitespace after the last item when not claimed by a
+    // following leading-ws command.
     let replace_span = expand_replace_span(source, tokens, first_cmd, last_token_idx, &kind);
 
     let mut render = String::new();
@@ -829,6 +843,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mid_utterance_numbered_list_keeps_leading_space() {
+        // Numbered lists must not consume leading whitespace (same rule as quotes).
+        assert_eq!(
+            lit("prefix command number one apples command number two oranges"),
+            "prefix 1. apples\n2. oranges"
+        );
+        assert_eq!(
+            lit("go command number one a command number two b please"),
+            "go 1. a\n2. b please"
+        );
+    }
+
     // --- Unknown / incomplete ---
 
     #[test]
@@ -904,6 +931,83 @@ mod tests {
         assert_eq!(&src[event.start..event.end], "Ab C");
     }
 
+    /// Collect half-open replace spans from `Command` events (not text, not `command_spans`).
+    fn command_event_replace_spans(parsed: &ParsedCommands) -> Vec<SourceSpan> {
+        parsed
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                CommandEvent::Command { span, .. } => Some(*span),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_replace_spans_non_overlapping(input: &str) {
+        let spans = command_event_replace_spans(&parse_formatting_commands(input));
+        for i in 0..spans.len() {
+            assert!(
+                spans[i].start <= spans[i].end,
+                "span {i} inverted on {input:?}: {:?}",
+                spans[i]
+            );
+            for j in (i + 1)..spans.len() {
+                let a = spans[i];
+                let b = spans[j];
+                // Half-open: [a.start, a.end) and [b.start, b.end) must not share a byte.
+                let overlap = a.start < b.end && b.start < a.end;
+                assert!(
+                    !overlap,
+                    "overlapping replace spans on {input:?}: [{}, {}) and [{}, {})",
+                    a.start, a.end, b.start, b.end
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn consecutive_command_replace_spans_do_not_overlap() {
+        // Trailing-ws break/list + following leading-ws punctuation used to share
+        // the inter-command whitespace byte in both event spans.
+        let cases = [
+            "a command new line command period",
+            "stop command period command new line next item",
+            "go command number one a command number two b command period",
+            "x command new line command new line y",
+            "intro command new paragraph body command period",
+            "prefix command number one apples command number two oranges",
+        ];
+        for input in cases {
+            assert_replace_spans_non_overlapping(input);
+            // Smoke: render still correct for the known bug pair.
+        }
+        assert_eq!(lit("a command new line command period"), "a\n.");
+        assert_eq!(
+            lit("go command number one a command number two b command period"),
+            "go 1. a\n2. b."
+        );
+    }
+
+    #[test]
+    fn command_spans_phrase_covers_are_non_overlapping() {
+        let input = "stop command period command new line next item";
+        let parsed = parse_formatting_commands(input);
+        let spans = parsed.command_spans();
+        assert_eq!(spans.len(), 2);
+        for i in 0..spans.len() {
+            for j in (i + 1)..spans.len() {
+                let a = spans[i];
+                let b = spans[j];
+                assert!(
+                    !(a.start < b.end && b.start < a.end),
+                    "overlapping command_spans on {input:?}"
+                );
+            }
+        }
+        assert_eq!(&input[spans[0].start..spans[0].end], "command period");
+        assert_eq!(&input[spans[1].start..spans[1].end], "command new line");
+    }
+
     // --- Comma / question mark ---
 
     #[test]
@@ -930,6 +1034,11 @@ mod tests {
         // Fixtures where Literal output is exactly structural command rendering
         // (or identity for bare/ambiguity). Every fixture's expected.literal is
         // the oracle for command application alone.
+        // Core command / escape / ambiguity IDs that must remain covered by this filter.
+        const REQUIRED_IDS: &[&str] = &[
+            "F09b", "F10b", "F13b", "F14", "F15b", "F16b", "F21b", "F22b", "F36b",
+        ];
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut checked = 0usize;
         for fx in fixtures {
             let id = fx["id"].as_str().unwrap();
@@ -954,20 +1063,7 @@ mod tests {
                 || category == "list"
                 || category == "quotation"
                 || category == "command_safety"
-                || input.to_ascii_lowercase().contains("command")
-                || id.ends_with('b')
-                    && matches!(
-                        id,
-                        "F09b"
-                            | "F10b"
-                            | "F13b"
-                            | "F14b"
-                            | "F15b"
-                            | "F16b"
-                            | "F21b"
-                            | "F22b"
-                            | "F36b"
-                    );
+                || input.to_ascii_lowercase().contains("command");
 
             // Also always check fixtures whose input mentions command-like words
             // or whose literal differs from input (command applied).
@@ -1011,7 +1107,14 @@ mod tests {
                 );
             }
 
+            seen_ids.insert(id.to_owned());
             checked += 1;
+        }
+        for req in REQUIRED_IDS {
+            assert!(
+                seen_ids.contains(*req),
+                "corpus filter must cover required fixture {req}; seen {seen_ids:?}"
+            );
         }
         assert!(
             checked >= 20,
