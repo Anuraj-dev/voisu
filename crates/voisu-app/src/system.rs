@@ -52,6 +52,15 @@ pub const PROCESSING_RESPONSE_DEADLINE: Duration = Duration::from_secs(
         + RECONCILIATION_DEADLINE.as_secs() * 2
         + 1,
 );
+/// Pre-validation credential preparation work budget (#103 / SW7). At expiry the
+/// owner stops retries, kills any credential process group, and begins terminal
+/// reap. Concurrent with provider completion; does not consume the Final
+/// Transform Gate second.
+pub const CREDENTIAL_PREP_WORK_DEADLINE: Duration = Duration::from_secs(13);
+/// Diagnostic watchdog for credential kill/reap after cancel or work-deadline
+/// expiry. Crossing it is not permission to detach: remain Processing, log once,
+/// and keep awaiting terminal child wait + pipe EOF.
+pub const CREDENTIAL_REAP_WATCHDOG: Duration = Duration::from_secs(2);
 /// End-to-end budget shared by both sides of a paged history/export transfer.
 pub const DIAGNOSTIC_RESPONSE_DEADLINE: Duration = Duration::from_secs(15);
 const PROCESS_POLL: Duration = Duration::from_millis(10);
@@ -3150,6 +3159,10 @@ type ReapTask = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 /// it acknowledges completion to the actor — the acknowledgement that alone
 /// permits Idle — and the daemon drains it again after the actor has joined,
 /// before the runtime is torn down.
+///
+/// The dedicated **credential lane** retains Architecture A pre-validation
+/// credential process state (`CredentialCleanupEntry`) separately from provider
+/// curl/capture cleanup futures. See `CredentialPreparationOwner`.
 #[derive(Clone, Default)]
 pub struct ProviderReaper {
     tasks: Arc<std::sync::Mutex<Vec<ReapTask>>>,
@@ -3157,11 +3170,1316 @@ pub struct ProviderReaper {
     /// futures out of `tasks`, a concurrent drain must wait here instead of
     /// reading `tasks` as empty and reporting a completed drain over live work.
     serial: Arc<tokio::sync::Mutex<()>>,
+    /// Dedicated lane for Smart Writing credential preparation cleanup (SW7).
+    credential_lane: CredentialLane,
+}
+
+// ---------------------------------------------------------------------------
+// SW7 — CredentialPreparationOwner + dedicated ProviderReaper credential lane
+// ---------------------------------------------------------------------------
+
+/// Work-deadline duration, overridable via `VOISU_TEST_CREDENTIAL_PREP_DEADLINE_MS`.
+fn credential_prep_work_deadline() -> Duration {
+    if let Some(ms) = std::env::var("VOISU_TEST_CREDENTIAL_PREP_DEADLINE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    CREDENTIAL_PREP_WORK_DEADLINE
+}
+
+/// Reap-watchdog duration, overridable via `VOISU_TEST_CREDENTIAL_REAP_WATCHDOG_MS`.
+fn credential_reap_watchdog() -> Duration {
+    if let Some(ms) = std::env::var("VOISU_TEST_CREDENTIAL_REAP_WATCHDOG_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    CREDENTIAL_REAP_WATCHDOG
+}
+
+/// Artificial post-kill stall for hermetic watchdog-overrun tests.
+fn credential_reap_stall() -> Option<Duration> {
+    std::env::var("VOISU_TEST_CREDENTIAL_REAP_STALL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+/// Closed reason why Minimal Grammar capability is unavailable for this Recording.
+/// Secret-free; safe for diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GrammarUnavailableReason {
+    /// Prep was cancelled (provider failure, caught panic, or explicit cancel).
+    Cancelled,
+    /// The 13 s work deadline expired before a credential was resolved.
+    WorkDeadlineExceeded,
+    /// No env/cache/keyring/file credential was found.
+    NoCredential,
+    /// Desktop keyring is locked or refused access (and no file fallback).
+    KeyringLocked,
+    /// No Secret Service is available (and no file fallback).
+    KeyringUnavailable,
+    /// `secret-tool` is not installed (and no file fallback).
+    ToolMissing,
+    /// Credential bytes were present but rejected by `Credential::new`.
+    InvalidCredential,
+}
+
+impl GrammarUnavailableReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::WorkDeadlineExceeded => "work_deadline_exceeded",
+            Self::NoCredential => "no_credential",
+            Self::KeyringLocked => "keyring_locked",
+            Self::KeyringUnavailable => "keyring_unavailable",
+            Self::ToolMissing => "tool_missing",
+            Self::InvalidCredential => "invalid_credential",
+        }
+    }
+}
+
+/// Explicit pre-validation grammar capability — never a lazy loader.
+/// Only terminal `Ready` / `Unavailable` may reach Validation (Architecture A).
+#[derive(Clone, Debug)]
+pub enum GrammarCapability {
+    Ready(ReadyGrammarCapability),
+    Unavailable(GrammarUnavailableReason),
+}
+
+impl GrammarCapability {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable(_))
+    }
+}
+
+/// Credential material resolved before Validation. The production async HTTP
+/// client is attached by SW5/SW10; this owner only proves credential ownership
+/// and terminal cleanup. `Credential` has no `Debug`.
+#[derive(Clone)]
+pub struct ReadyGrammarCapability {
+    credential: Credential,
+}
+
+impl std::fmt::Debug for ReadyGrammarCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReadyGrammarCapability { credential: <redacted> }")
+    }
+}
+
+impl ReadyGrammarCapability {
+    pub fn new(credential: Credential) -> Self {
+        Self { credential }
+    }
+
+    pub fn credential(&self) -> &Credential {
+        &self.credential
+    }
+
+    pub fn into_credential(self) -> Credential {
+        self.credential
+    }
+}
+
+/// Observable phase of a credential cleanup entry (Architecture A state machine).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialEntryPhase {
+    Registered,
+    Running,
+    CancelRequested,
+    Terminal,
+    Deregistered,
+}
+
+/// Who currently drives the retained entry toward Terminal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DriveClaim {
+    Free,
+    Normal,
+    Supervisor,
+}
+
+/// Live Tokio child + capped async pipes retained on the entry (not a task local).
+struct CredentialRunningChild {
+    child: tokio::process::Child,
+    pgid: libc::pid_t,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    stdout_buf: Vec<u8>,
+    stderr_buf: Vec<u8>,
+}
+
+/// Terminal outcome after child wait + both pipe EOFs (or no-child fast path).
+#[derive(Clone)]
+enum CredentialTerminalOutcome {
+    Ready(Credential),
+    Unavailable(GrammarUnavailableReason),
+}
+
+struct CredentialEntryInner {
+    phase: CredentialEntryPhase,
+    drive: DriveClaim,
+    running: Option<CredentialRunningChild>,
+    terminal: Option<CredentialTerminalOutcome>,
+    /// True once a child was spawned for this entry.
+    launched_child: bool,
+    watchdog_overrun_logged: bool,
+    /// Hermetic test stall applied at most once after kill.
+    reap_stall_applied: bool,
+}
+
+/// Retained credential process state registered on the reaper credential lane
+/// **before** the first owner poll may launch work.
+pub struct CredentialCleanupEntry {
+    id: u64,
+    kill_requested: std::sync::atomic::AtomicBool,
+    cancel_requested: std::sync::atomic::AtomicBool,
+    inner: std::sync::Mutex<CredentialEntryInner>,
+}
+
+impl CredentialCleanupEntry {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            kill_requested: std::sync::atomic::AtomicBool::new(false),
+            cancel_requested: std::sync::atomic::AtomicBool::new(false),
+            inner: std::sync::Mutex::new(CredentialEntryInner {
+                phase: CredentialEntryPhase::Registered,
+                drive: DriveClaim::Free,
+                running: None,
+                terminal: None,
+                launched_child: false,
+                watchdog_overrun_logged: false,
+                reap_stall_applied: false,
+            }),
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn phase(&self) -> CredentialEntryPhase {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .phase
+    }
+
+    pub fn has_launched_child(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .launched_child
+    }
+
+    pub fn watchdog_overrun_logged(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .watchdog_overrun_logged
+    }
+
+    pub fn is_cancel_requested(&self) -> bool {
+        self.cancel_requested
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Synchronously request cancel and process-group SIGKILL. Does **not**
+    /// wait for terminal, deregister, or release a live drive claim — the
+    /// driving owner finishes or `Drop` releases the claim so the supervisor
+    /// can resume.
+    pub fn request_cancel_and_kill(&self) {
+        self.cancel_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.kill_process_group_once();
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(
+            guard.phase,
+            CredentialEntryPhase::Registered | CredentialEntryPhase::Running
+        ) {
+            guard.phase = CredentialEntryPhase::CancelRequested;
+        }
+    }
+
+    fn kill_process_group_once(&self) {
+        if self
+            .kill_requested
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let pgid = {
+            let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            guard.running.as_ref().map(|r| r.pgid)
+        };
+        if let Some(pgid) = pgid {
+            // SAFETY: pgid is the child's process-group id established at spawn
+            // via setpgid(0,0). Negative pid targets the whole group.
+            let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+    }
+
+    fn try_claim(&self, who: DriveClaim) -> bool {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.drive != DriveClaim::Free {
+            return false;
+        }
+        if matches!(
+            guard.phase,
+            CredentialEntryPhase::Terminal | CredentialEntryPhase::Deregistered
+        ) {
+            return false;
+        }
+        guard.drive = who;
+        true
+    }
+
+    fn release_claim(&self) {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        guard.drive = DriveClaim::Free;
+    }
+
+    fn mark_watchdog_overrun(&self) -> bool {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.watchdog_overrun_logged {
+            return false;
+        }
+        guard.watchdog_overrun_logged = true;
+        true
+    }
+
+    fn set_terminal(&self, outcome: CredentialTerminalOutcome) {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(
+            guard.phase,
+            CredentialEntryPhase::Terminal | CredentialEntryPhase::Deregistered
+        ) {
+            return;
+        }
+        // Drop any retained child handles; wait+EOF already completed.
+        guard.running = None;
+        guard.terminal = Some(outcome);
+        guard.phase = CredentialEntryPhase::Terminal;
+        guard.drive = DriveClaim::Free;
+    }
+
+    fn terminal_capability(&self) -> Option<GrammarCapability> {
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        match &guard.terminal {
+            Some(CredentialTerminalOutcome::Ready(credential)) => Some(GrammarCapability::Ready(
+                ReadyGrammarCapability::new(credential.clone()),
+            )),
+            Some(CredentialTerminalOutcome::Unavailable(reason)) => {
+                Some(GrammarCapability::Unavailable(reason.clone()))
+            }
+            None => None,
+        }
+    }
+}
+
+/// Dedicated ProviderReaper lane for credential cleanup entries.
+#[derive(Clone, Default)]
+pub struct CredentialLane {
+    inner: Arc<CredentialLaneInner>,
+}
+
+struct CredentialLaneInner {
+    entries: std::sync::Mutex<std::collections::HashMap<u64, Arc<CredentialCleanupEntry>>>,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+impl Default for CredentialLaneInner {
+    fn default() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+}
+
+impl CredentialLane {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Inserts a retained cleanup entry **before** any child may launch.
+    /// First owner poll is the only path that may start work against this entry.
+    pub fn register(&self) -> Arc<CredentialCleanupEntry> {
+        let id = self
+            .inner
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let entry = Arc::new(CredentialCleanupEntry::new(id));
+        let mut guard = self
+            .inner
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.insert(id, Arc::clone(&entry));
+        entry
+    }
+
+    /// Idempotent removal after Terminal. Double deregistration is a no-op.
+    pub fn deregister(&self, entry: &CredentialCleanupEntry) {
+        let mut guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.phase == CredentialEntryPhase::Deregistered {
+            return;
+        }
+        // Only Terminal → Deregistered (or force from Terminal).
+        if guard.phase != CredentialEntryPhase::Terminal {
+            return;
+        }
+        guard.phase = CredentialEntryPhase::Deregistered;
+        drop(guard);
+        let mut map = self
+            .inner
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        map.remove(&entry.id);
+    }
+
+    /// Force-remove after supervisor has driven Terminal (or entry is stuck
+    /// CancelRequested with no child). Idempotent.
+    pub fn force_deregister(&self, entry: &CredentialCleanupEntry) {
+        {
+            let mut guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if guard.phase == CredentialEntryPhase::Deregistered {
+                return;
+            }
+            if guard.phase != CredentialEntryPhase::Terminal {
+                // Supervisor may only force-remove once terminal outcome is set.
+                if guard.terminal.is_none() {
+                    return;
+                }
+                guard.phase = CredentialEntryPhase::Terminal;
+            }
+            guard.phase = CredentialEntryPhase::Deregistered;
+        }
+        let mut map = self
+            .inner
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        map.remove(&entry.id);
+    }
+
+    pub fn contains(&self, id: u64) -> bool {
+        self.inner
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&id)
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.inner
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+
+    fn snapshot_entries(&self) -> Vec<Arc<CredentialCleanupEntry>> {
+        self.inner
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Supervisor / shutdown drain: claim each retained entry, drive to Terminal,
+    /// deregister. Blocks `Completed`/Idle semantics when called from
+    /// `supervise_recording` (SW10 wiring). Idempotent when the lane is empty.
+    pub async fn drain_all(&self) {
+        loop {
+            let entries = self.snapshot_entries();
+            if entries.is_empty() {
+                return;
+            }
+            for entry in entries {
+                drive_entry_to_terminal_as(entry.as_ref(), DriveClaim::Supervisor).await;
+                // Ensure a terminal outcome even if already terminal with none
+                // (should not happen).
+                if entry.terminal_capability().is_none() {
+                    entry.set_terminal(CredentialTerminalOutcome::Unavailable(
+                        GrammarUnavailableReason::Cancelled,
+                    ));
+                }
+                self.force_deregister(entry.as_ref());
+            }
+        }
+    }
+}
+
+/// Owns one pre-validation credential preparation for Groq Minimal Grammar.
+///
+/// Lifecycle (Architecture A):
+/// 1. `CredentialLane::register` retains the entry.
+/// 2. `CredentialPreparationOwner::new` binds the entry (no launch yet).
+/// 3. First `poll_outcome` / drive may launch restricted Tokio `secret-tool`.
+/// 4. Normal path: Terminal then Deregistered **before** Validation.
+/// 5. `Drop`: sync cancel + process-group kill; cannot claim Terminal.
+///
+/// Does **not** reuse blocking `SecretToolStore::load` / `run_restricted`.
+pub struct CredentialPreparationOwner {
+    entry: Arc<CredentialCleanupEntry>,
+    lane: CredentialLane,
+    provider: Provider,
+    /// Whether this owner currently holds (or held) the Normal drive claim.
+    claimed_normal: bool,
+    finished: bool,
+}
+
+impl CredentialPreparationOwner {
+    /// Bind a previously registered entry. First poll may launch work.
+    pub fn new(entry: Arc<CredentialCleanupEntry>, lane: CredentialLane, provider: Provider) -> Self {
+        Self {
+            entry,
+            lane,
+            provider,
+            claimed_normal: false,
+            finished: false,
+        }
+    }
+
+    pub fn entry(&self) -> &Arc<CredentialCleanupEntry> {
+        &self.entry
+    }
+
+    pub fn lane(&self) -> &CredentialLane {
+        &self.lane
+    }
+
+    /// Poll the preparation to a terminal `GrammarCapability`, then deregister.
+    /// Fast paths: env override, session cache, test seam. Cache miss uses a
+    /// Tokio process for restricted `secret-tool lookup` retained on the entry.
+    pub async fn poll_outcome(&mut self) -> GrammarCapability {
+        if self.finished {
+            return self
+                .entry
+                .terminal_capability()
+                .unwrap_or(GrammarCapability::Unavailable(
+                    GrammarUnavailableReason::Cancelled,
+                ));
+        }
+        if !self.entry.try_claim(DriveClaim::Normal) {
+            // Another driver owns the entry; wait until terminal appears.
+            let capability = wait_for_terminal_capability(&self.entry).await;
+            self.finished = true;
+            return capability;
+        }
+        self.claimed_normal = true;
+        let capability = drive_credential_work(&self.entry, self.provider).await;
+        self.entry.release_claim();
+        self.claimed_normal = false;
+        self.lane.deregister(&self.entry);
+        // If phase was Terminal, deregister advanced to Deregistered.
+        // If set_terminal was skipped (race), force.
+        if self.lane.contains(self.entry.id()) {
+            if self.entry.terminal_capability().is_some() {
+                self.lane.force_deregister(&self.entry);
+            }
+        }
+        self.finished = true;
+        capability
+    }
+
+    /// Cancel, kill, reap to Terminal (with 2 s watchdog diagnostic), deregister.
+    /// Used on provider failure, caught concurrent panic, or explicit abort.
+    pub async fn cancel_and_drive_terminal(&mut self) -> GrammarCapability {
+        if self.finished
+            && matches!(
+                self.entry.phase(),
+                CredentialEntryPhase::Deregistered | CredentialEntryPhase::Terminal
+            )
+        {
+            let cap = self
+                .entry
+                .terminal_capability()
+                .unwrap_or(GrammarCapability::Unavailable(
+                    GrammarUnavailableReason::Cancelled,
+                ));
+            if self.entry.phase() == CredentialEntryPhase::Terminal {
+                self.lane.deregister(&self.entry);
+                if self.lane.contains(self.entry.id()) {
+                    self.lane.force_deregister(&self.entry);
+                }
+            }
+            self.finished = true;
+            return cap;
+        }
+
+        self.entry
+            .cancel_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.entry.kill_process_group_once();
+        {
+            let mut guard = self.entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if matches!(
+                guard.phase,
+                CredentialEntryPhase::Registered | CredentialEntryPhase::Running
+            ) {
+                guard.phase = CredentialEntryPhase::CancelRequested;
+            }
+        }
+
+        // Resume a Normal claim interrupted by dropping an in-flight poll, or
+        // take a free claim. Never spin forever on a stale Normal we own.
+        let claimed = if self.claimed_normal {
+            true
+        } else if self.entry.try_claim(DriveClaim::Normal) {
+            self.claimed_normal = true;
+            true
+        } else {
+            false
+        };
+
+        let entry = Arc::clone(&self.entry);
+        let drive = async {
+            if claimed {
+                reap_running_child_to_terminal(
+                    &entry,
+                    CredentialTerminalOutcome::Unavailable(GrammarUnavailableReason::Cancelled),
+                )
+                .await;
+            } else {
+                // Wait for the other driver or become supervisor-like.
+                wait_for_terminal_capability(&entry).await;
+            }
+        };
+        tokio::pin!(drive);
+        if tokio::time::timeout(credential_reap_watchdog(), &mut drive)
+            .await
+            .is_err()
+        {
+            if entry.mark_watchdog_overrun() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "voisu: credential reap crossed {} ms watchdog; remaining Processing until terminal",
+                    credential_reap_watchdog().as_millis()
+                );
+            }
+            drive.await;
+        }
+
+        if claimed {
+            self.entry.release_claim();
+            self.claimed_normal = false;
+        }
+
+        if self.entry.terminal_capability().is_none() {
+            self.entry.set_terminal(CredentialTerminalOutcome::Unavailable(
+                GrammarUnavailableReason::Cancelled,
+            ));
+        }
+        self.lane.deregister(&self.entry);
+        if self.lane.contains(self.entry.id()) {
+            self.lane.force_deregister(&self.entry);
+        }
+        self.finished = true;
+        self.entry
+            .terminal_capability()
+            .unwrap_or(GrammarCapability::Unavailable(
+                GrammarUnavailableReason::Cancelled,
+            ))
+    }
+
+    /// After concurrent join: ensure Terminal + Deregistered, return capability.
+    pub async fn finish_terminal(&mut self, outcome: GrammarCapability) -> GrammarCapability {
+        if self.finished
+            && self.entry.phase() == CredentialEntryPhase::Deregistered
+        {
+            return outcome;
+        }
+        if !matches!(
+            self.entry.phase(),
+            CredentialEntryPhase::Terminal | CredentialEntryPhase::Deregistered
+        ) {
+            return self.cancel_and_drive_terminal().await;
+        }
+        if self.entry.phase() == CredentialEntryPhase::Terminal {
+            self.lane.deregister(&self.entry);
+            if self.lane.contains(self.entry.id()) {
+                self.lane.force_deregister(&self.entry);
+            }
+        }
+        self.finished = true;
+        self.entry.terminal_capability().unwrap_or(outcome)
+    }
+}
+
+impl Drop for CredentialPreparationOwner {
+    fn drop(&mut self) {
+        if self.finished
+            && self.entry.phase() == CredentialEntryPhase::Deregistered
+        {
+            return;
+        }
+        // Sync cancel + process-group kill backstop. Cannot declare Terminal or
+        // remove the entry — supervisor / shutdown drain owns that. Releasing
+        // the drive claim lets supervise_recording resume the retained entry.
+        self.entry.request_cancel_and_kill();
+        self.entry.release_claim();
+        self.claimed_normal = false;
+    }
+}
+
+async fn wait_for_terminal_capability(entry: &CredentialCleanupEntry) -> GrammarCapability {
+    loop {
+        if let Some(cap) = entry.terminal_capability() {
+            return cap;
+        }
+        if matches!(
+            entry.phase(),
+            CredentialEntryPhase::Deregistered
+        ) {
+            return entry.terminal_capability().unwrap_or(
+                GrammarCapability::Unavailable(GrammarUnavailableReason::Cancelled),
+            );
+        }
+        // Try to claim as supervisor-style driver if free.
+        if entry.try_claim(DriveClaim::Supervisor) {
+            reap_running_child_to_terminal(
+                entry,
+                CredentialTerminalOutcome::Unavailable(GrammarUnavailableReason::Cancelled),
+            )
+            .await;
+            entry.release_claim();
+            return entry.terminal_capability().unwrap_or(
+                GrammarCapability::Unavailable(GrammarUnavailableReason::Cancelled),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn drive_entry_to_terminal_as(entry: &CredentialCleanupEntry, who: DriveClaim) {
+    if matches!(
+        entry.phase(),
+        CredentialEntryPhase::Terminal | CredentialEntryPhase::Deregistered
+    ) {
+        return;
+    }
+    entry
+        .cancel_requested
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    entry.kill_process_group_once();
+    if !entry.try_claim(who) {
+        // Spin until the other driver finishes or frees the claim.
+        let _ = wait_for_terminal_capability(entry).await;
+        return;
+    }
+    reap_running_child_to_terminal(
+        entry,
+        CredentialTerminalOutcome::Unavailable(GrammarUnavailableReason::Cancelled),
+    )
+    .await;
+    entry.release_claim();
+}
+
+/// Drive credential resolution on a claimed entry through Terminal.
+async fn drive_credential_work(
+    entry: &Arc<CredentialCleanupEntry>,
+    provider: Provider,
+) -> GrammarCapability {
+    let work_deadline = Instant::now() + credential_prep_work_deadline();
+
+    // --- Fast path: environment override (never cached) ---
+    if let Some(value) = std::env::var_os(provider.environment_variable()) {
+        return finish_no_child(
+            entry,
+            match Credential::new(value.to_string_lossy().into_owned()) {
+                Ok(credential) => CredentialTerminalOutcome::Ready(credential),
+                Err(_) => CredentialTerminalOutcome::Unavailable(
+                    GrammarUnavailableReason::InvalidCredential,
+                ),
+            },
+        );
+    }
+
+    // --- Fast path: session cache ---
+    if let Some(credential) = credential_cache().get(provider, credential_cache_ttl()) {
+        return finish_no_child(entry, CredentialTerminalOutcome::Ready(credential));
+    }
+
+    // --- Test seam: VOISU_TEST_SECRET_STORE (no real secret-tool) ---
+    if let Some(mode) = secret_seam_mode() {
+        let outcome = match mode.as_str() {
+            "available" => {
+                let name = match provider {
+                    Provider::Groq => "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+                    Provider::Deepgram => "VOISU_TEST_STORED_DEEPGRAM_CREDENTIAL",
+                };
+                match std::env::var(name)
+                    .ok()
+                    .and_then(|value| Credential::new(value).ok())
+                {
+                    Some(credential) => {
+                        credential_cache().put(provider, credential.clone());
+                        CredentialTerminalOutcome::Ready(credential)
+                    }
+                    None => match file_fallback_credential(provider) {
+                        Some(credential) => CredentialTerminalOutcome::Ready(credential),
+                        None => CredentialTerminalOutcome::Unavailable(
+                            GrammarUnavailableReason::NoCredential,
+                        ),
+                    },
+                }
+            }
+            "denied" | "locked" => match file_fallback_credential(provider) {
+                Some(credential) => CredentialTerminalOutcome::Ready(credential),
+                None => CredentialTerminalOutcome::Unavailable(
+                    GrammarUnavailableReason::KeyringLocked,
+                ),
+            },
+            _ => match file_fallback_credential(provider) {
+                Some(credential) => CredentialTerminalOutcome::Ready(credential),
+                None => CredentialTerminalOutcome::Unavailable(
+                    GrammarUnavailableReason::KeyringUnavailable,
+                ),
+            },
+        };
+        return finish_no_child(entry, outcome);
+    }
+
+    // --- Cache miss: Tokio secret-tool with bounded retries under work deadline ---
+    let mut backoff = lookup_retry_backoff().into_iter();
+    loop {
+        if entry.is_cancel_requested() {
+            return cancel_reap(entry).await;
+        }
+        if Instant::now() >= work_deadline {
+            return deadline_reap(entry).await;
+        }
+
+        match run_secret_tool_lookup_attempt(entry, provider, work_deadline).await {
+            AsyncLoadStep::Found(credential) => {
+                credential_cache().put(provider, credential.clone());
+                return finish_no_child(
+                    entry,
+                    CredentialTerminalOutcome::Ready(credential),
+                );
+            }
+            AsyncLoadStep::Missing => {
+                return finish_no_child(
+                    entry,
+                    match file_fallback_credential(provider) {
+                        Some(credential) => CredentialTerminalOutcome::Ready(credential),
+                        None => CredentialTerminalOutcome::Unavailable(
+                            GrammarUnavailableReason::NoCredential,
+                        ),
+                    },
+                );
+            }
+            AsyncLoadStep::Stop(reason) => {
+                return finish_no_child(
+                    entry,
+                    match file_fallback_credential(provider) {
+                        Some(credential) => CredentialTerminalOutcome::Ready(credential),
+                        None => CredentialTerminalOutcome::Unavailable(reason),
+                    },
+                );
+            }
+            AsyncLoadStep::Retry(reason) => match backoff.next() {
+                Some(delay) => {
+                    let remaining = work_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return deadline_reap(entry).await;
+                    }
+                    let sleep_for = delay.min(remaining);
+                    tokio::select! {
+                        _ = tokio::time::sleep(sleep_for) => {}
+                        _ = wait_cancel_or_deadline(entry, work_deadline) => {
+                            if entry.is_cancel_requested() {
+                                return cancel_reap(entry).await;
+                            }
+                            return deadline_reap(entry).await;
+                        }
+                    }
+                    let _ = reason;
+                }
+                None => {
+                    return finish_no_child(
+                        entry,
+                        match file_fallback_credential(provider) {
+                            Some(credential) => CredentialTerminalOutcome::Ready(credential),
+                            None => CredentialTerminalOutcome::Unavailable(reason),
+                        },
+                    );
+                }
+            },
+            AsyncLoadStep::Cancelled => return cancel_reap(entry).await,
+            AsyncLoadStep::Deadline => return deadline_reap(entry).await,
+        }
+    }
+}
+
+fn finish_no_child(
+    entry: &CredentialCleanupEntry,
+    outcome: CredentialTerminalOutcome,
+) -> GrammarCapability {
+    let capability = match &outcome {
+        CredentialTerminalOutcome::Ready(credential) => {
+            GrammarCapability::Ready(ReadyGrammarCapability::new(credential.clone()))
+        }
+        CredentialTerminalOutcome::Unavailable(reason) => {
+            GrammarCapability::Unavailable(reason.clone())
+        }
+    };
+    entry.set_terminal(outcome);
+    capability
+}
+
+async fn cancel_reap(entry: &CredentialCleanupEntry) -> GrammarCapability {
+    entry
+        .cancel_requested
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    entry.kill_process_group_once();
+    reap_running_child_to_terminal(
+        entry,
+        CredentialTerminalOutcome::Unavailable(GrammarUnavailableReason::Cancelled),
+    )
+    .await;
+    entry
+        .terminal_capability()
+        .unwrap_or(GrammarCapability::Unavailable(
+            GrammarUnavailableReason::Cancelled,
+        ))
+}
+
+async fn deadline_reap(entry: &CredentialCleanupEntry) -> GrammarCapability {
+    entry
+        .cancel_requested
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    entry.kill_process_group_once();
+    let drive = reap_running_child_to_terminal(
+        entry,
+        CredentialTerminalOutcome::Unavailable(GrammarUnavailableReason::WorkDeadlineExceeded),
+    );
+    tokio::pin!(drive);
+    if tokio::time::timeout(credential_reap_watchdog(), &mut drive)
+        .await
+        .is_err()
+    {
+        if entry.mark_watchdog_overrun() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "voisu: credential reap crossed {} ms watchdog; remaining Processing until terminal",
+                credential_reap_watchdog().as_millis()
+            );
+        }
+        drive.await;
+    }
+    entry
+        .terminal_capability()
+        .unwrap_or(GrammarCapability::Unavailable(
+            GrammarUnavailableReason::WorkDeadlineExceeded,
+        ))
+}
+
+async fn wait_cancel_or_deadline(entry: &CredentialCleanupEntry, work_deadline: Instant) {
+    loop {
+        if entry.is_cancel_requested() || Instant::now() >= work_deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn file_fallback_credential(provider: Provider) -> Option<Credential> {
+    match FileSecretStore::at_default().read(provider) {
+        Ok(Some(credential)) => {
+            // Best-effort migration/read warnings match the blocking load path.
+            warn_fallback(FallbackNotice::ReadWhileKeyringAvailable);
+            Some(credential)
+        }
+        _ => None,
+    }
+}
+
+enum AsyncLoadStep {
+    Found(Credential),
+    Missing,
+    Retry(GrammarUnavailableReason),
+    Stop(GrammarUnavailableReason),
+    Cancelled,
+    Deadline,
+}
+
+/// One restricted Tokio `secret-tool lookup`. Child/pipes live on the entry.
+async fn run_secret_tool_lookup_attempt(
+    entry: &Arc<CredentialCleanupEntry>,
+    provider: Provider,
+    work_deadline: Instant,
+) -> AsyncLoadStep {
+    // Per-attempt process bound (mirrors PROCESS_DEADLINE), clamped by work deadline.
+    let attempt_deadline = Instant::now() + PROCESS_DEADLINE;
+    let effective_deadline = if attempt_deadline < work_deadline {
+        attempt_deadline
+    } else {
+        work_deadline
+    };
+
+    if entry.is_cancel_requested() {
+        return AsyncLoadStep::Cancelled;
+    }
+    if Instant::now() >= work_deadline {
+        return AsyncLoadStep::Deadline;
+    }
+
+    let mut command = tokio::process::Command::new("secret-tool");
+    command
+        .args([
+            "lookup",
+            "voisu-provider",
+            provider.secret_service_value(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(false)
+        .env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    for name in [
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "WAYLAND_DISPLAY",
+        "XDG_SESSION_TYPE",
+        "HYPRLAND_INSTANCE_SIGNATURE",
+        "DISPLAY",
+        "XAUTHORITY",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+
+    // Own process group + parent-death SIGKILL, matching restricted_command
+    // contracts while remaining Tokio-process based for drop-safe reaping.
+    // tokio::process::Command exposes inherent Unix pre_exec.
+    #[cfg(target_os = "linux")]
+    {
+        let expected_parent = unsafe { libc::getpid() };
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != expected_parent {
+                    return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return AsyncLoadStep::Stop(GrammarUnavailableReason::ToolMissing),
+    };
+
+    let pid = match child.id() {
+        Some(pid) => pid as libc::pid_t,
+        None => return AsyncLoadStep::Stop(GrammarUnavailableReason::KeyringUnavailable),
+    };
+    // Child is process-group leader after setpgid(0,0).
+    let pgid = pid;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    {
+        let mut guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+        guard.launched_child = true;
+        guard.phase = CredentialEntryPhase::Running;
+        guard.running = Some(CredentialRunningChild {
+            child,
+            pgid,
+            stdout,
+            stderr,
+            stdout_buf: Vec::new(),
+            stderr_buf: Vec::new(),
+        });
+    }
+
+    // Drive this attempt until the child is fully reaped (wait + EOFs).
+    let classify = drive_attempt_until_reaped(entry, effective_deadline, work_deadline).await;
+    classify
+}
+
+/// Drive one retained attempt: wait + drain pipes (or kill on cancel/deadline),
+/// then classify. Child state lives on the entry until fully reaped.
+async fn drive_attempt_until_reaped(
+    entry: &CredentialCleanupEntry,
+    attempt_deadline: Instant,
+    work_deadline: Instant,
+) -> AsyncLoadStep {
+    // Kill early when cancel/deadline already require it.
+    if entry.is_cancel_requested()
+        || Instant::now() >= work_deadline
+        || Instant::now() >= attempt_deadline
+    {
+        entry.kill_process_group_once();
+    }
+
+    let reaped = take_and_reap_running_child(entry, attempt_deadline, work_deadline).await;
+    let Some((success, stdout, stderr, killed)) = reaped else {
+        return if entry.is_cancel_requested() && Instant::now() < work_deadline {
+            AsyncLoadStep::Cancelled
+        } else if Instant::now() >= work_deadline {
+            AsyncLoadStep::Deadline
+        } else {
+            AsyncLoadStep::Stop(GrammarUnavailableReason::KeyringUnavailable)
+        };
+    };
+
+    // Between attempts the entry is idle-Registered (or CancelRequested).
+    {
+        let mut guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.phase == CredentialEntryPhase::Running {
+            guard.phase = CredentialEntryPhase::Registered;
+        }
+    }
+
+    if killed {
+        if Instant::now() >= work_deadline {
+            return AsyncLoadStep::Deadline;
+        }
+        if entry.is_cancel_requested() {
+            return AsyncLoadStep::Cancelled;
+        }
+        return AsyncLoadStep::Deadline;
+    }
+
+    if success {
+        match String::from_utf8(stdout) {
+            Ok(value) => match Credential::new(value.trim_end().to_owned()) {
+                Ok(credential) => AsyncLoadStep::Found(credential),
+                Err(_) => AsyncLoadStep::Missing,
+            },
+            Err(_) => AsyncLoadStep::Stop(GrammarUnavailableReason::KeyringLocked),
+        }
+    } else if stderr.is_empty() {
+        AsyncLoadStep::Missing
+    } else {
+        AsyncLoadStep::Retry(GrammarUnavailableReason::KeyringLocked)
+    }
+}
+
+/// Take the running child off the entry, kill if needed, wait + drain pipes.
+/// Returns `(success, stdout, stderr, was_killed)` or `None` if no child.
+async fn take_and_reap_running_child(
+    entry: &CredentialCleanupEntry,
+    attempt_deadline: Instant,
+    work_deadline: Instant,
+) -> Option<(bool, Vec<u8>, Vec<u8>, bool)> {
+    use tokio::io::AsyncReadExt;
+
+    // Ensure kill is signalled when budgets require it, before we take the child.
+    if entry.is_cancel_requested()
+        || Instant::now() >= work_deadline
+        || Instant::now() >= attempt_deadline
+    {
+        entry.kill_process_group_once();
+    }
+
+    let mut running = {
+        let mut guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+        guard.running.take()?
+    };
+    let pgid = running.pgid;
+    let mut was_killed = entry
+        .kill_requested
+        .load(std::sync::atomic::Ordering::SeqCst);
+    if was_killed {
+        // SAFETY: process-group SIGKILL for the retained pgid.
+        let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
+
+    // Hermetic watchdog stall (once per entry) after kill.
+    if was_killed {
+        let stall = {
+            let mut guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if !guard.reap_stall_applied {
+                if let Some(stall) = credential_reap_stall() {
+                    guard.reap_stall_applied = true;
+                    Some(stall)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(stall) = stall {
+            tokio::time::sleep(stall).await;
+        }
+    }
+
+    let mut stdout_buf = std::mem::take(&mut running.stdout_buf);
+    let mut stderr_buf = std::mem::take(&mut running.stderr_buf);
+    let mut stdout = running.stdout.take();
+    let mut stderr = running.stderr.take();
+    let mut child = running.child;
+
+    // Wait for exit, killing if cancel/deadline lands mid-wait.
+    let status = loop {
+        if entry.is_cancel_requested()
+            || Instant::now() >= work_deadline
+            || Instant::now() >= attempt_deadline
+        {
+            if !was_killed {
+                let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                entry
+                    .kill_requested
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                was_killed = true;
+            }
+        }
+
+        match tokio::time::timeout(Duration::from_millis(50), child.wait()).await {
+            Ok(Ok(status)) => break status,
+            Ok(Err(_)) => break std::process::ExitStatus::from_raw(256),
+            Err(_) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    break status;
+                }
+                // Still live — also drain pipes so a full pipe cannot block exit.
+                if let Some(pipe) = stdout.as_mut() {
+                    let mut buf = [0u8; 1024];
+                    match tokio::time::timeout(Duration::from_millis(5), pipe.read(&mut buf)).await
+                    {
+                        Ok(Ok(0)) | Ok(Err(_)) => stdout = None,
+                        Ok(Ok(n)) => {
+                            let room =
+                                MAX_RETAINED_STDOUT_BYTES.saturating_sub(stdout_buf.len());
+                            stdout_buf.extend_from_slice(&buf[..n.min(room)]);
+                        }
+                        Err(_) => {}
+                    }
+                }
+                if let Some(pipe) = stderr.as_mut() {
+                    let mut buf = [0u8; 512];
+                    match tokio::time::timeout(Duration::from_millis(5), pipe.read(&mut buf)).await
+                    {
+                        Ok(Ok(0)) | Ok(Err(_)) => stderr = None,
+                        Ok(Ok(n)) => {
+                            let room =
+                                MAX_RETAINED_STDERR_BYTES.saturating_sub(stderr_buf.len());
+                            stderr_buf.extend_from_slice(&buf[..n.min(room)]);
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+    };
+
+    // Final pipe drain to EOF (or drop after short budget). Spec Terminal =
+    // wait + both EOFs; after process exit, pipes EOF quickly.
+    if let Some(mut pipe) = stdout.take() {
+        let mut buf = [0u8; 4096];
+        for _ in 0..32 {
+            match tokio::time::timeout(Duration::from_millis(20), pipe.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => {
+                    let room = MAX_RETAINED_STDOUT_BYTES.saturating_sub(stdout_buf.len());
+                    stdout_buf.extend_from_slice(&buf[..n.min(room)]);
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    if let Some(mut pipe) = stderr.take() {
+        let mut buf = [0u8; 1024];
+        for _ in 0..32 {
+            match tokio::time::timeout(Duration::from_millis(20), pipe.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => {
+                    let room = MAX_RETAINED_STDERR_BYTES.saturating_sub(stderr_buf.len());
+                    stderr_buf.extend_from_slice(&buf[..n.min(room)]);
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    was_killed = entry
+        .kill_requested
+        .load(std::sync::atomic::Ordering::SeqCst);
+    Some((status.success(), stdout_buf, stderr_buf, was_killed))
+}
+
+/// After kill (or no child): await wait + EOFs, then set terminal outcome.
+async fn reap_running_child_to_terminal(
+    entry: &CredentialCleanupEntry,
+    outcome_if_empty: CredentialTerminalOutcome,
+) {
+    entry.kill_process_group_once();
+
+    {
+        let stall = {
+            let mut guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if !guard.reap_stall_applied {
+                if let Some(stall) = credential_reap_stall() {
+                    guard.reap_stall_applied = true;
+                    Some(stall)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(stall) = stall {
+            tokio::time::sleep(stall).await;
+        }
+    }
+
+    let _ = take_and_reap_running_child(
+        entry,
+        Instant::now() + Duration::from_secs(30),
+        Instant::now() + Duration::from_secs(30),
+    )
+    .await;
+
+    if entry.terminal_capability().is_none() {
+        entry.set_terminal(outcome_if_empty);
+    }
 }
 
 impl ProviderReaper {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Dedicated Architecture A credential-preparation cleanup lane (SW7).
+    pub fn credential_lane(&self) -> &CredentialLane {
+        &self.credential_lane
+    }
+
+    /// Supervisor/shutdown drain of any retained credential entries, then the
+    /// existing provider/capture cleanup futures. SW10 wires this into
+    /// `supervise_recording` and daemon teardown; abnormal owner Drop leaves
+    /// entries here until this path claims them.
+    pub async fn drain_credential_lane(&self) {
+        self.credential_lane.drain_all().await;
     }
 
     /// Adopts the still-live chunk tasks of a dropped stream. Cancellation MUST
@@ -8099,5 +9417,568 @@ mod tests {
                 "reasoning_effort must be omitted for override {model}: {body}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // SW7 — CredentialPreparationOwner + reaper credential lane seams
+    // -----------------------------------------------------------------
+
+    /// Serializes tests that mutate process-global credential env/cache/PATH.
+    fn credential_owner_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    struct CredentialEnvGuard {
+        keys: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl CredentialEnvGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            let keys = keys
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect();
+            Self { keys }
+        }
+
+        fn set(key: &str, value: &str) {
+            // SAFETY: tests hold credential_owner_test_lock; single-threaded mutation.
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        fn remove(key: &str) {
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    impl Drop for CredentialEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.keys.drain(..) {
+                match value {
+                    Some(v) => unsafe { std::env::set_var(key, v) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
+    }
+
+    fn clear_groq_credential_surface() {
+        CredentialEnvGuard::remove("VOISU_GROQ_API_KEY");
+        CredentialEnvGuard::remove("VOISU_TEST_SECRET_STORE");
+        CredentialEnvGuard::remove("VOISU_TEST_STORED_GROQ_CREDENTIAL");
+        CredentialEnvGuard::remove("VOISU_TEST_CREDENTIAL_PREP_DEADLINE_MS");
+        CredentialEnvGuard::remove("VOISU_TEST_CREDENTIAL_REAP_WATCHDOG_MS");
+        CredentialEnvGuard::remove("VOISU_TEST_CREDENTIAL_REAP_STALL_MS");
+        CredentialEnvGuard::remove("VOISU_TEST_KEYRING_RETRY_MS");
+        credential_cache().invalidate(Provider::Groq);
+    }
+
+    fn install_fake_secret_tool(dir: &std::path::Path, script: &str) {
+        let path = dir.join("secret-tool");
+        fs::write(&path, script).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = dir.as_os_str().to_os_string();
+        new_path.push(":");
+        new_path.push(old_path);
+        unsafe { std::env::set_var("PATH", new_path) };
+    }
+
+    #[test]
+    fn credential_prep_constants_match_spec() {
+        assert_eq!(CREDENTIAL_PREP_WORK_DEADLINE, Duration::from_secs(13));
+        assert_eq!(CREDENTIAL_REAP_WATCHDOG, Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn credential_lane_registers_before_owner_may_launch() {
+        let _lock = credential_owner_test_lock();
+        let _env = CredentialEnvGuard::capture(&[
+            "VOISU_GROQ_API_KEY",
+            "VOISU_TEST_SECRET_STORE",
+            "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+            "PATH",
+        ]);
+        clear_groq_credential_surface();
+
+        let reaper = ProviderReaper::new();
+        let lane = reaper.credential_lane().clone();
+        let entry = lane.register();
+
+        assert_eq!(entry.phase(), CredentialEntryPhase::Registered);
+        assert!(
+            !entry.has_launched_child(),
+            "registration alone must not launch secret-tool"
+        );
+        assert!(lane.contains(entry.id()));
+        assert_eq!(lane.pending_count(), 1);
+
+        // Owner construction still must not launch.
+        let mut owner =
+            CredentialPreparationOwner::new(Arc::clone(&entry), lane.clone(), Provider::Groq);
+        assert!(!entry.has_launched_child());
+        assert_eq!(entry.phase(), CredentialEntryPhase::Registered);
+
+        // Fast path (env) reaches Terminal without a child, then Deregistered.
+        CredentialEnvGuard::set("VOISU_GROQ_API_KEY", "sw7-env-key");
+        let capability = owner.poll_outcome().await;
+        assert!(capability.is_ready(), "{capability:?}");
+        assert!(!entry.has_launched_child());
+        assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
+        assert!(!lane.contains(entry.id()));
+        assert_eq!(lane.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn credential_prep_cache_hit_ready_without_child() {
+        let _lock = credential_owner_test_lock();
+        let _env = CredentialEnvGuard::capture(&[
+            "VOISU_GROQ_API_KEY",
+            "VOISU_TEST_SECRET_STORE",
+            "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+            "PATH",
+        ]);
+        clear_groq_credential_surface();
+
+        let credential = Credential::new("sw7-cached-key".to_owned()).unwrap();
+        credential_cache().put(Provider::Groq, credential);
+
+        let reaper = ProviderReaper::new();
+        let lane = reaper.credential_lane().clone();
+        let entry = lane.register();
+        let mut owner =
+            CredentialPreparationOwner::new(Arc::clone(&entry), lane.clone(), Provider::Groq);
+
+        let capability = owner.poll_outcome().await;
+        match capability {
+            GrammarCapability::Ready(ready) => {
+                assert_eq!(ready.credential().expose_to_boundary(), "sw7-cached-key");
+            }
+            other => panic!("expected Ready from cache hit, got {other:?}"),
+        }
+        assert!(!entry.has_launched_child());
+        assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
+        assert_eq!(lane.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn credential_prep_test_seam_ready_and_single_deregistration() {
+        let _lock = credential_owner_test_lock();
+        let _env = CredentialEnvGuard::capture(&[
+            "VOISU_GROQ_API_KEY",
+            "VOISU_TEST_SECRET_STORE",
+            "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+            "PATH",
+        ]);
+        clear_groq_credential_surface();
+        CredentialEnvGuard::set("VOISU_TEST_SECRET_STORE", "available");
+        CredentialEnvGuard::set("VOISU_TEST_STORED_GROQ_CREDENTIAL", "sw7-seam-key");
+
+        let reaper = ProviderReaper::new();
+        let lane = reaper.credential_lane().clone();
+        let entry = lane.register();
+        let id = entry.id();
+        let mut owner =
+            CredentialPreparationOwner::new(Arc::clone(&entry), lane.clone(), Provider::Groq);
+
+        let capability = owner.poll_outcome().await;
+        assert!(capability.is_ready(), "{capability:?}");
+        assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
+        assert!(!lane.contains(id));
+
+        // Second deregister is a no-op (idempotent).
+        lane.deregister(&entry);
+        lane.force_deregister(&entry);
+        assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
+        assert_eq!(lane.pending_count(), 0);
+
+        // finish_terminal is stable after completion.
+        let again = owner.finish_terminal(capability).await;
+        assert!(again.is_ready());
+    }
+
+    #[tokio::test]
+    async fn credential_prep_cancel_kills_child_and_deregisters() {
+        let _lock = credential_owner_test_lock();
+        let _env = CredentialEnvGuard::capture(&[
+            "VOISU_GROQ_API_KEY",
+            "VOISU_TEST_SECRET_STORE",
+            "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+            "VOISU_TEST_KEYRING_RETRY_MS",
+            "PATH",
+        ]);
+        clear_groq_credential_surface();
+        CredentialEnvGuard::set("VOISU_TEST_KEYRING_RETRY_MS", "0");
+
+        let tool_dir = tempfile::tempdir().unwrap();
+        install_fake_secret_tool(
+            tool_dir.path(),
+            "#!/bin/sh\n# SW7 cancel seam: hang until killed\nsleep 30\n",
+        );
+
+        let reaper = ProviderReaper::new();
+        let lane = reaper.credential_lane().clone();
+        let entry = lane.register();
+        let entry_watch = Arc::clone(&entry);
+        let mut owner =
+            CredentialPreparationOwner::new(Arc::clone(&entry), lane.clone(), Provider::Groq);
+
+        let poll = owner.poll_outcome();
+        tokio::pin!(poll);
+
+        // Wait until the child has launched, then cancel via entry (poll holds &mut owner).
+        let launched = async {
+            loop {
+                if entry_watch.has_launched_child() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::select! {
+            _ = &mut poll => panic!("hanging secret-tool should not finish before cancel"),
+            _ = launched => {
+                entry_watch.request_cancel_and_kill();
+            }
+        }
+        let capability = poll.await;
+        assert!(
+            matches!(
+                capability,
+                GrammarCapability::Unavailable(GrammarUnavailableReason::Cancelled)
+                    | GrammarCapability::Unavailable(GrammarUnavailableReason::WorkDeadlineExceeded)
+            ),
+            "cancel must yield Unavailable, got {capability:?}"
+        );
+        assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
+        assert_eq!(lane.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn credential_prep_work_deadline_stops_and_reaps() {
+        let _lock = credential_owner_test_lock();
+        let _env = CredentialEnvGuard::capture(&[
+            "VOISU_GROQ_API_KEY",
+            "VOISU_TEST_SECRET_STORE",
+            "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+            "VOISU_TEST_CREDENTIAL_PREP_DEADLINE_MS",
+            "VOISU_TEST_KEYRING_RETRY_MS",
+            "PATH",
+        ]);
+        clear_groq_credential_surface();
+        CredentialEnvGuard::set("VOISU_TEST_CREDENTIAL_PREP_DEADLINE_MS", "80");
+        CredentialEnvGuard::set("VOISU_TEST_KEYRING_RETRY_MS", "0");
+
+        let tool_dir = tempfile::tempdir().unwrap();
+        install_fake_secret_tool(
+            tool_dir.path(),
+            "#!/bin/sh\nsleep 30\n",
+        );
+
+        let reaper = ProviderReaper::new();
+        let lane = reaper.credential_lane().clone();
+        let entry = lane.register();
+        let mut owner =
+            CredentialPreparationOwner::new(Arc::clone(&entry), lane.clone(), Provider::Groq);
+
+        let started = Instant::now();
+        let capability = owner.poll_outcome().await;
+        assert!(
+            matches!(
+                capability,
+                GrammarCapability::Unavailable(GrammarUnavailableReason::WorkDeadlineExceeded)
+                    | GrammarCapability::Unavailable(GrammarUnavailableReason::Cancelled)
+            ),
+            "deadline must yield Unavailable, got {capability:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "deadline path must not wait out the full sleep, elapsed {:?}",
+            started.elapsed()
+        );
+        assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
+        assert_eq!(lane.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn credential_reap_watchdog_overrun_logs_and_awaits_terminal() {
+        let _lock = credential_owner_test_lock();
+        let _env = CredentialEnvGuard::capture(&[
+            "VOISU_GROQ_API_KEY",
+            "VOISU_TEST_SECRET_STORE",
+            "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+            "VOISU_TEST_CREDENTIAL_PREP_DEADLINE_MS",
+            "VOISU_TEST_CREDENTIAL_REAP_WATCHDOG_MS",
+            "VOISU_TEST_CREDENTIAL_REAP_STALL_MS",
+            "VOISU_TEST_KEYRING_RETRY_MS",
+            "PATH",
+        ]);
+        clear_groq_credential_surface();
+        // Short work deadline forces kill; short watchdog + artificial stall
+        // crosses the diagnostic threshold once; stall ends and terminal arrives.
+        CredentialEnvGuard::set("VOISU_TEST_CREDENTIAL_PREP_DEADLINE_MS", "50");
+        CredentialEnvGuard::set("VOISU_TEST_CREDENTIAL_REAP_WATCHDOG_MS", "30");
+        CredentialEnvGuard::set("VOISU_TEST_CREDENTIAL_REAP_STALL_MS", "120");
+        CredentialEnvGuard::set("VOISU_TEST_KEYRING_RETRY_MS", "0");
+
+        let tool_dir = tempfile::tempdir().unwrap();
+        install_fake_secret_tool(tool_dir.path(), "#!/bin/sh\nsleep 30\n");
+
+        let reaper = ProviderReaper::new();
+        let lane = reaper.credential_lane().clone();
+        let entry = lane.register();
+        let mut owner =
+            CredentialPreparationOwner::new(Arc::clone(&entry), lane.clone(), Provider::Groq);
+
+        let capability = owner.poll_outcome().await;
+        assert!(capability.is_unavailable(), "{capability:?}");
+        assert!(
+            entry.watchdog_overrun_logged(),
+            "crossing the reap watchdog must log once"
+        );
+        assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
+        assert_eq!(lane.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn credential_owner_drop_kills_without_claiming_terminal() {
+        let _lock = credential_owner_test_lock();
+        let _env = CredentialEnvGuard::capture(&[
+            "VOISU_GROQ_API_KEY",
+            "VOISU_TEST_SECRET_STORE",
+            "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+            "VOISU_TEST_KEYRING_RETRY_MS",
+            "PATH",
+        ]);
+        clear_groq_credential_surface();
+        CredentialEnvGuard::set("VOISU_TEST_KEYRING_RETRY_MS", "0");
+
+        let tool_dir = tempfile::tempdir().unwrap();
+        install_fake_secret_tool(tool_dir.path(), "#!/bin/sh\nsleep 30\n");
+
+        let reaper = ProviderReaper::new();
+        let lane = reaper.credential_lane().clone();
+        let entry = lane.register();
+        let entry_watch = Arc::clone(&entry);
+
+        // Drive first poll far enough to launch, then drop the owner without
+        // awaiting terminal — Drop kill-signals but must not deregister.
+        {
+            let mut owner = CredentialPreparationOwner::new(
+                Arc::clone(&entry),
+                lane.clone(),
+                Provider::Groq,
+            );
+            {
+                let poll = owner.poll_outcome();
+                tokio::pin!(poll);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut poll => {
+                            panic!("owner should be dropped before poll completes");
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                            if entry_watch.has_launched_child() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                // End the poll borrow before Drop of the owner.
+            }
+            drop(owner);
+        }
+
+        assert!(
+            entry.is_cancel_requested(),
+            "Drop must request cancellation"
+        );
+        assert!(
+            lane.contains(entry.id()),
+            "Drop must not deregister; supervisor retains the entry"
+        );
+        assert_ne!(
+            entry.phase(),
+            CredentialEntryPhase::Deregistered,
+            "Drop cannot claim Deregistered"
+        );
+
+        // Supervisor drain claims, reaps, deregisters.
+        reaper.drain_credential_lane().await;
+        assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
+        assert_eq!(lane.pending_count(), 0);
+        // Idempotent second drain.
+        reaper.drain_credential_lane().await;
+        assert_eq!(lane.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn credential_cancel_and_drive_terminal_api_reaps() {
+        let _lock = credential_owner_test_lock();
+        let _env = CredentialEnvGuard::capture(&[
+            "VOISU_GROQ_API_KEY",
+            "VOISU_TEST_SECRET_STORE",
+            "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+            "PATH",
+        ]);
+        clear_groq_credential_surface();
+        // Registered, no launch yet — cancel still reaches Terminal + Deregistered.
+        let reaper = ProviderReaper::new();
+        let lane = reaper.credential_lane().clone();
+        let entry = lane.register();
+        let mut owner =
+            CredentialPreparationOwner::new(Arc::clone(&entry), lane.clone(), Provider::Groq);
+
+        let capability = owner.cancel_and_drive_terminal().await;
+        assert!(
+            matches!(
+                capability,
+                GrammarCapability::Unavailable(GrammarUnavailableReason::Cancelled)
+            ),
+            "{capability:?}"
+        );
+        assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
+        assert_eq!(lane.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn credential_caught_panic_seam_cancel_reaps_before_error() {
+        // Models the concurrent catch_unwind path: on panic, explicitly
+        // cancel_and_drive_terminal before returning a Processing error.
+        let _lock = credential_owner_test_lock();
+        let _env = CredentialEnvGuard::capture(&[
+            "VOISU_GROQ_API_KEY",
+            "VOISU_TEST_SECRET_STORE",
+            "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+            "VOISU_TEST_KEYRING_RETRY_MS",
+            "PATH",
+        ]);
+        clear_groq_credential_surface();
+        CredentialEnvGuard::set("VOISU_TEST_KEYRING_RETRY_MS", "0");
+
+        let tool_dir = tempfile::tempdir().unwrap();
+        install_fake_secret_tool(tool_dir.path(), "#!/bin/sh\nsleep 30\n");
+
+        let reaper = ProviderReaper::new();
+        let lane = reaper.credential_lane().clone();
+        let entry = lane.register();
+        let mut owner =
+            CredentialPreparationOwner::new(Arc::clone(&entry), lane.clone(), Provider::Groq);
+
+        // Simulate: prep started, then a caught panic forces explicit cancel-reap.
+        let entry_watch = Arc::clone(&entry);
+        {
+            let poll = owner.poll_outcome();
+            tokio::pin!(poll);
+            loop {
+                tokio::select! {
+                    _ = &mut poll => break,
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                        if entry_watch.has_launched_child() {
+                            break;
+                        }
+                    }
+                }
+            }
+            // Drop the in-flight poll so we can mutably use owner again.
+        }
+        // Explicit cancel-reap (caught panic path) — do not rely on Drop alone.
+        let capability = owner.cancel_and_drive_terminal().await;
+        assert!(capability.is_unavailable(), "{capability:?}");
+        assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
+        assert_eq!(lane.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn credential_secret_tool_miss_path_uses_tokio_process() {
+        let _lock = credential_owner_test_lock();
+        let _env = CredentialEnvGuard::capture(&[
+            "VOISU_GROQ_API_KEY",
+            "VOISU_TEST_SECRET_STORE",
+            "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+            "VOISU_TEST_KEYRING_RETRY_MS",
+            "PATH",
+        ]);
+        clear_groq_credential_surface();
+        CredentialEnvGuard::set("VOISU_TEST_KEYRING_RETRY_MS", "0");
+
+        let tool_dir = tempfile::tempdir().unwrap();
+        // Clean no-match: nonzero exit, empty stderr → Missing → NoCredential
+        // (no file fallback in this hermetic home).
+        install_fake_secret_tool(tool_dir.path(), "#!/bin/sh\nexit 1\n");
+
+        let reaper = ProviderReaper::new();
+        let lane = reaper.credential_lane().clone();
+        let entry = lane.register();
+        let mut owner =
+            CredentialPreparationOwner::new(Arc::clone(&entry), lane.clone(), Provider::Groq);
+
+        let capability = owner.poll_outcome().await;
+        assert!(
+            entry.has_launched_child(),
+            "cache miss must launch Tokio secret-tool"
+        );
+        assert!(
+            matches!(
+                capability,
+                GrammarCapability::Unavailable(GrammarUnavailableReason::NoCredential)
+            ),
+            "missing keyring+file must be NoCredential, got {capability:?}"
+        );
+        assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
+    }
+
+    #[tokio::test]
+    async fn credential_secret_tool_found_path_caches_and_ready() {
+        let _lock = credential_owner_test_lock();
+        let _env = CredentialEnvGuard::capture(&[
+            "VOISU_GROQ_API_KEY",
+            "VOISU_TEST_SECRET_STORE",
+            "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+            "VOISU_TEST_KEYRING_RETRY_MS",
+            "PATH",
+        ]);
+        clear_groq_credential_surface();
+        CredentialEnvGuard::set("VOISU_TEST_KEYRING_RETRY_MS", "0");
+
+        let tool_dir = tempfile::tempdir().unwrap();
+        install_fake_secret_tool(
+            tool_dir.path(),
+            "#!/bin/sh\nprintf '%s' 'sw7-from-secret-tool'\n",
+        );
+
+        let reaper = ProviderReaper::new();
+        let lane = reaper.credential_lane().clone();
+        let entry = lane.register();
+        let mut owner =
+            CredentialPreparationOwner::new(Arc::clone(&entry), lane.clone(), Provider::Groq);
+
+        let capability = owner.poll_outcome().await;
+        match capability {
+            GrammarCapability::Ready(ready) => {
+                assert_eq!(
+                    ready.credential().expose_to_boundary(),
+                    "sw7-from-secret-tool"
+                );
+            }
+            other => panic!("expected Ready from secret-tool, got {other:?}"),
+        }
+        assert!(entry.has_launched_child());
+        assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
+
+        // Cache filled — second owner must Ready without another child.
+        let entry2 = lane.register();
+        let mut owner2 =
+            CredentialPreparationOwner::new(Arc::clone(&entry2), lane.clone(), Provider::Groq);
+        let cap2 = owner2.poll_outcome().await;
+        assert!(cap2.is_ready(), "{cap2:?}");
+        assert!(
+            !entry2.has_launched_child(),
+            "cache hit after miss must not re-launch secret-tool"
+        );
     }
 }
