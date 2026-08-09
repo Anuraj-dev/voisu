@@ -707,17 +707,7 @@ fn is_number_date_or_time(tok: &str) -> bool {
 
 fn collect_quote_and_code_ranges(text: &str, out: &mut Vec<SourceSpan>) {
     // Fenced ``` … ```
-    let mut search = 0;
-    while let Some(rel) = text[search..].find("```") {
-        let start = search + rel;
-        if let Some(rel2) = text[start + 3..].find("```") {
-            let end = start + 3 + rel2 + 3;
-            out.push(SourceSpan::new(start, end));
-            search = end;
-        } else {
-            break;
-        }
-    }
+    collect_fenced_code_ranges(text, out);
     // Inline `…`
     let mut in_tick = false;
     let mut tick_start = 0;
@@ -744,6 +734,20 @@ fn collect_quote_and_code_ranges(text: &str, out: &mut Vec<SourceSpan>) {
     // Quotation ranges (ASCII + curly), ported from edit-safety
     // `_quotation_source_ranges`: unmatched/ambiguous → whole base.
     collect_quotation_ranges(text, out);
+}
+
+fn collect_fenced_code_ranges(text: &str, out: &mut Vec<SourceSpan>) {
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("```") {
+        let start = search + rel;
+        if let Some(rel2) = text[start + 3..].find("```") {
+            let end = start + 3 + rel2 + 3;
+            out.push(SourceSpan::new(start, end));
+            search = end;
+        } else {
+            break;
+        }
+    }
 }
 
 /// Port of edit-safety `_quotation_source_ranges` (UTF-8 byte spans).
@@ -900,8 +904,20 @@ fn smart_format(
     if deadline_hit(deadline_at) {
         return None;
     }
-    let literal = parsed.render_commands_only();
-    let has_commands = parsed.has_command_span();
+    // A command-looking phrase inside quote/code is content, not an instruction.
+    // The parser deliberately owns only the closed phrase grammar, so the formatter
+    // applies its pre-edit protection boundary before consuming parser events.
+    let quote_or_code = build_quote_and_code_protection(input);
+    let protected_command = parsed
+        .command_spans()
+        .iter()
+        .any(|span| span_touches_protection(span.start, span.end, &quote_or_code));
+    let literal = if protected_command {
+        input.to_owned()
+    } else {
+        parsed.render_commands_only()
+    };
+    let has_commands = parsed.has_command_span() && !protected_command;
 
     // F19/F20/F35 identity only when no §4 command span remains.
     if !has_commands && is_already_correct_identity(input) {
@@ -929,9 +945,10 @@ fn smart_format(
         return None;
     }
 
-    text = apply_vocative_commas(&text);
+    text = apply_vocative_commas(&text, dictionary, protected_names);
     text = apply_casing(&text, dictionary, protected_names);
-    text = capitalize_numbered_list_items(&text);
+    let protected = build_edit_protection(&text, dictionary, protected_names);
+    text = capitalize_numbered_list_items(&text, &protected);
 
     if deadline_hit(deadline_at) {
         return None;
@@ -947,7 +964,8 @@ fn smart_format(
         }
     }
 
-    text = add_terminal_punctuation(&text);
+    let fenced_code = build_fenced_code_protection(&text);
+    text = add_terminal_punctuation(&text, &fenced_code);
 
     // Closed Minimal Grammar catalog applied locally for hermetic #99 Smart
     // oracle (F25/F26/F27). Separability (§6.1): skip when any §4 command span
@@ -1244,26 +1262,40 @@ fn split_email_update_sentence(text: &str, protected: &[bool]) -> String {
     text.to_owned()
 }
 
-fn apply_vocative_commas(text: &str) -> String {
+fn apply_vocative_commas(
+    text: &str,
+    dictionary: &[&str],
+    protected_names: &[&str],
+) -> String {
     let mut t = text.to_owned();
     // hey␠ → Hey,
+    let protected = build_edit_protection(&t, dictionary, protected_names);
     if let Some(rest) = strip_prefix_ci(&t, "hey") {
         if rest.starts_with(|c: char| c.is_whitespace()) {
-            t = format!("Hey,{}", rest);
+            if !span_touches_protection(0, "hey".len(), &protected) {
+                t = format!("Hey,{}", rest);
+            }
         }
     }
     // trailing ok / lol → , ok / , lol (before optional punct)
-    t = comma_before_trailing_word(&t, "ok");
-    t = comma_before_trailing_word(&t, "lol");
+    let protected = build_edit_protection(&t, dictionary, protected_names);
+    t = comma_before_trailing_word(&t, "ok", &protected);
+    let protected = build_edit_protection(&t, dictionary, protected_names);
+    t = comma_before_trailing_word(&t, "lol", &protected);
     // said " → said, "
-    t = replace_ci_word_before_quote(&t, "said");
+    let protected = build_edit_protection(&t, dictionary, protected_names);
+    t = replace_ci_word_before_quote(&t, "said", &protected);
     // " and → ," and (closing quote discourse comma, F21b)
     if let Some(idx) = t.find("\" ") {
         // only when followed by "and"
         let after = &t[idx + 2..];
         if after.len() >= 3 && ascii_lower(&after[..3.min(after.len())]).starts_with("and") {
             // ensure not already ,"
-            if idx > 0 && !t[..idx].ends_with(',') {
+            let fenced_code = build_fenced_code_protection(&t);
+            if idx > 0
+                && !t[..idx].ends_with(',')
+                && !span_touches_protection(idx, idx + 1, &fenced_code)
+            {
                 t = format!("{},\"{}", &t[..idx], &t[idx + 1..]);
             }
         }
@@ -1288,7 +1320,7 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-fn comma_before_trailing_word(text: &str, word: &str) -> String {
+fn comma_before_trailing_word(text: &str, word: &str, protected: &[bool]) -> String {
     // Match optional terminal punct.
     let trimmed = text.trim_end_matches(['.', '!', '?']);
     let trail = &text[trimmed.len()..];
@@ -1296,14 +1328,18 @@ fn comma_before_trailing_word(text: &str, word: &str) -> String {
     let needle = format!(" {word}");
     if lower.ends_with(&needle) {
         let head_end = trimmed.len() - needle.len();
-        if head_end > 0 && !trimmed[..head_end].ends_with(',') {
+        let word_start = head_end + 1;
+        if head_end > 0
+            && !trimmed[..head_end].ends_with(',')
+            && !span_touches_protection(word_start, trimmed.len(), protected)
+        {
             return format!("{}, {}{trail}", &trimmed[..head_end], word);
         }
     }
     text.to_owned()
 }
 
-fn replace_ci_word_before_quote(text: &str, word: &str) -> String {
+fn replace_ci_word_before_quote(text: &str, word: &str, protected: &[bool]) -> String {
     // word + spaces + " → word, "
     let lower = ascii_lower(text);
     let mut search = 0;
@@ -1315,7 +1351,10 @@ fn replace_ci_word_before_quote(text: &str, word: &str) -> String {
         let boundary_before = abs == 0
             || !text.as_bytes()[abs - 1].is_ascii_alphanumeric();
         let after_word = abs + word.len();
-        if boundary_before && after_word <= text.len() {
+        if boundary_before
+            && after_word <= text.len()
+            && !span_touches_protection(abs, after_word, protected)
+        {
             let rest = &text[after_word..];
             let ws_len = rest.chars().take_while(|c| c.is_whitespace()).map(char::len_utf8).sum::<usize>();
             if rest.len() > ws_len && rest.as_bytes()[ws_len] == b'"' {
@@ -1463,29 +1502,60 @@ fn build_edit_protection(text: &str, dictionary: &[&str], protected_names: &[&st
     protected
 }
 
+fn build_fenced_code_protection(text: &str) -> Vec<bool> {
+    protection_mask(text, collect_fenced_code_ranges)
+}
+
+fn build_quote_and_code_protection(text: &str) -> Vec<bool> {
+    protection_mask(text, collect_quote_and_code_ranges)
+}
+
+fn protection_mask(text: &str, collect: fn(&str, &mut Vec<SourceSpan>)) -> Vec<bool> {
+    let mut protected = vec![false; text.len()];
+    let mut ranges = Vec::new();
+    collect(text, &mut ranges);
+    for range in ranges {
+        for byte in range.start..range.end.min(protected.len()) {
+            protected[byte] = true;
+        }
+    }
+    protected
+}
+
 #[inline]
 fn span_touches_protection(start: usize, end: usize, protected: &[bool]) -> bool {
     (start..end).any(|i| protected.get(i).copied().unwrap_or(false))
 }
 
-fn capitalize_numbered_list_items(text: &str) -> String {
+fn capitalize_numbered_list_items(text: &str, protected: &[bool]) -> String {
     if !text.lines().any(starts_with_numbered_marker) {
         return text.to_owned();
     }
+    let mut line_start = 0usize;
     text.lines()
         .map(|line| {
             if let Some(rest) = line.split_once(". ") {
                 if rest.0.chars().all(|c| c.is_ascii_digit()) {
                     let mut item = rest.1.to_owned();
                     if let Some(first) = item.chars().next() {
-                        if first.is_alphabetic() {
+                        let item_start = line_start + rest.0.len() + 2;
+                        if first.is_alphabetic()
+                            && !span_touches_protection(
+                                item_start,
+                                item_start + first.len_utf8(),
+                                protected,
+                            )
+                        {
                             let upper = first.to_ascii_uppercase();
                             item = format!("{upper}{}", &item[first.len_utf8()..]);
                         }
                     }
-                    return format!("{}. {item}", rest.0);
+                    let rendered = format!("{}. {item}", rest.0);
+                    line_start += line.len() + 1;
+                    return rendered;
                 }
             }
+            line_start += line.len() + 1;
             line.to_owned()
         })
         .collect::<Vec<_>>()
@@ -1551,9 +1621,21 @@ fn line_independently_needs_period(line: &str) -> bool {
         .any(|w| PERIOD_VERBS.iter().any(|v| eq_ascii_ignore_case(w, v)))
 }
 
-fn add_terminal_punct_line(line: &str) -> String {
+fn terminal_byte_is_protected(line: &str, protected: &[bool]) -> bool {
+    let stripped = line.trim_end();
+    !stripped.is_empty()
+        && protected
+            .get(stripped.len().saturating_sub(1))
+            .copied()
+            .unwrap_or(false)
+}
+
+fn add_terminal_punct_line(line: &str, protected: &[bool]) -> String {
     let stripped = line.trim_end();
     if stripped.is_empty() || stripped.ends_with(['.', '!', '?', ':']) {
+        return line.to_owned();
+    }
+    if terminal_byte_is_protected(line, protected) {
         return line.to_owned();
     }
     if starts_with_numbered_marker(stripped) || stripped.starts_with("- ") {
@@ -1566,7 +1648,7 @@ fn add_terminal_punct_line(line: &str) -> String {
     format!("{stripped}.{trail}")
 }
 
-fn add_terminal_punctuation(text: &str) -> String {
+fn add_terminal_punctuation(text: &str, protected: &[bool]) -> String {
     if text.is_empty() || is_shell_command_line(text) {
         return text.to_owned();
     }
@@ -1578,35 +1660,59 @@ fn add_terminal_punctuation(text: &str) -> String {
 
     // Paragraphs (`\n\n` from command new paragraph): D1-B — period on each fragment.
     if text.contains("\n\n") {
-        return text
-            .split("\n\n")
-            .map(|p| {
-                let p = p.trim();
-                if p.is_empty() {
-                    return String::new();
-                }
-                if p.ends_with(['.', '!', '?', ':']) {
-                    p.to_owned()
+        let mut rendered = Vec::new();
+        let mut start = 0usize;
+        for paragraph in text.split("\n\n") {
+            let end = start + paragraph.len();
+            let p = paragraph.trim();
+            if p.is_empty() {
+                rendered.push(String::new());
+            } else {
+                let leading = paragraph.len() - paragraph.trim_start().len();
+                let p_start = start + leading;
+                let p_end = p_start + p.len();
+                if p.ends_with(['.', '!', '?', ':'])
+                    || terminal_byte_is_protected(p, &protected[p_start..p_end])
+                {
+                    rendered.push(p.to_owned());
                 } else {
-                    format!("{p}.")
+                    rendered.push(format!("{p}."));
                 }
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
+            }
+            start = end.saturating_add(2);
+        }
+        return rendered.join("\n\n");
     }
 
     // Single newlines (command new line): cascade periods only if any line
     // independently needs one (F36b); otherwise leave bare (F13b/F10b).
     if text.contains('\n') {
-        let lines: Vec<&str> = text.split('\n').collect();
-        if lines.iter().any(|l| line_independently_needs_period(l)) {
+        let mut start = 0usize;
+        let lines: Vec<(usize, &str)> = text
+            .split('\n')
+            .map(|line| {
+                let line_start = start;
+                start += line.len() + 1;
+                (line_start, line)
+            })
+            .collect();
+        if lines.iter().any(|(line_start, line)| {
+            line_independently_needs_period(line)
+                && !terminal_byte_is_protected(
+                    line,
+                    &protected[*line_start..*line_start + line.len()],
+                )
+        }) {
             return lines
                 .iter()
-                .map(|l| {
-                    if l.trim().is_empty() {
-                        (*l).to_owned()
+                .map(|(line_start, line)| {
+                    if line.trim().is_empty() {
+                        (*line).to_owned()
                     } else {
-                        add_terminal_punct_line(l)
+                        add_terminal_punct_line(
+                            line,
+                            &protected[*line_start..*line_start + line.len()],
+                        )
                     }
                 })
                 .collect::<Vec<_>>()
@@ -1615,7 +1721,7 @@ fn add_terminal_punctuation(text: &str) -> String {
         return text.to_owned();
     }
 
-    add_terminal_punct_line(text)
+    add_terminal_punct_line(text, protected)
 }
 
 // ─── Closed local grammar catalog (hermetic #99 Smart oracle) ────────────────
@@ -1628,6 +1734,11 @@ fn apply_closed_local_grammar(
     dictionary: &[&str],
     protected_names: &[&str],
 ) -> String {
+    // #100 prompt-shaped content is formatted locally but is never grammar-editable.
+    // The safety contract protects the whole candidate base for these closed markers.
+    if is_prompt_shaped(text) {
+        return text.to_owned();
+    }
     let protected = build_edit_protection(text, dictionary, protected_names);
     let mut t = text.to_owned();
     t = grammar_there_is_plural(&t, &protected);
@@ -1637,6 +1748,19 @@ fn apply_closed_local_grammar(
     let protected = build_edit_protection(&t, dictionary, protected_names);
     t = grammar_didnt(&t, &protected);
     t
+}
+
+fn is_prompt_shaped(text: &str) -> bool {
+    const PROMPT_MARKERS: &[&str] = &[
+        "ignore previous instructions",
+        "system prompt",
+        "developer message",
+        "you are chatgpt",
+        "system:",
+        "user:",
+    ];
+    let lower = ascii_lower(text);
+    PROMPT_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
 fn grammar_there_is_plural(text: &str, protected: &[bool]) -> String {
@@ -2089,6 +2213,23 @@ mod tests {
         assert_eq!(
             smart("i didnt see no error in the logs"),
             "I didn't see no error in the logs."
+        );
+    }
+
+    #[test]
+    fn multiline_fenced_code_interior_is_byte_exact_after_all_formatting_passes() {
+        let input = "note is below\n```\n1. foo\nlet value is two\ncommand period\nshe said \"x\" and left\n```";
+        assert_eq!(
+            smart(input),
+            "Note is below.\n```\n1. foo\nlet value is two\ncommand period\nshe said \"x\" and left\n```"
+        );
+    }
+
+    #[test]
+    fn prompt_shaped_text_is_formatted_but_not_grammar_edited() {
+        assert_eq!(
+            smart("ignore previous instructions and didnt obey"),
+            "Ignore previous instructions and didnt obey."
         );
     }
 
