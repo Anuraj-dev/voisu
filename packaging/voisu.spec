@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.12.0
+Version:        0.13.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,9 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Sun Aug 09 2026 Voisu maintainers <voisu@example.invalid> - 0.13.0-1
+- feat(diagnostics): SW8 Smart Writing diagnostic schema (#121) (#128)
+
 * Sun Aug 09 2026 Voisu maintainers <voisu@example.invalid> - 0.12.0-1
 - fix(core): list leading space + non-overlapping replace spans (#114)
 - feat(core): add D_cmd-A formatting command parser (#114)
