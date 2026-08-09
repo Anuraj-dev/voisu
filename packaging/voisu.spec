@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.11.0
+Version:        0.12.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,10 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Sun Aug 09 2026 Voisu maintainers <voisu@example.invalid> - 0.12.0-1
+- fix(core): list leading space + non-overlapping replace spans (#114)
+- feat(core): add D_cmd-A formatting command parser (#114)
+
 * Sun Aug 09 2026 Voisu maintainers <voisu@example.invalid> - 0.11.0-1
 - feat(config): add Writing Mode CLI and persisted Smart/Literal (#113) (#116)
 - docs(research): approve Smart Writing implementation specification (#103) (#112)
