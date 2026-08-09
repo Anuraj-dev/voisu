@@ -3327,6 +3327,10 @@ struct CredentialEntryInner {
     phase: CredentialEntryPhase,
     drive: DriveClaim,
     running: Option<CredentialRunningChild>,
+    /// Durable process-group id retained after `running` is taken for wait.
+    /// Drop / supervisor kill use this when the Child handle is mid-reap so a
+    /// cancelled drive future cannot leave a live OS process without a signal.
+    last_pgid: Option<libc::pid_t>,
     terminal: Option<CredentialTerminalOutcome>,
     /// True once a child was spawned for this entry.
     launched_child: bool,
@@ -3354,6 +3358,7 @@ impl CredentialCleanupEntry {
                 phase: CredentialEntryPhase::Registered,
                 drive: DriveClaim::Free,
                 running: None,
+                last_pgid: None,
                 terminal: None,
                 launched_child: false,
                 watchdog_overrun_logged: false,
@@ -3378,6 +3383,17 @@ impl CredentialCleanupEntry {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .launched_child
+    }
+
+    /// Process-group id of the last launched credential child, if any still
+    /// needs kill/wait ownership. Survives take-for-reap so Drop can signal.
+    pub fn retained_pgid(&self) -> Option<libc::pid_t> {
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .running
+            .as_ref()
+            .map(|r| r.pgid)
+            .or(guard.last_pgid)
     }
 
     pub fn watchdog_overrun_logged(&self) -> bool {
@@ -3409,22 +3425,30 @@ impl CredentialCleanupEntry {
         }
     }
 
+    /// Signal SIGKILL to the retained process group when a durable pgid exists.
+    ///
+    /// Pre-spawn cancel must **not** sticky-consume this path with no signal:
+    /// if `running` / `last_pgid` is still empty, leave `kill_requested` false so
+    /// a later post-spawn kill can fire. Once a pgid is known, SIGKILL is always
+    /// sent (idempotent) and `kill_requested` is set for classification.
     fn kill_process_group_once(&self) {
-        if self
-            .kill_requested
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            return;
-        }
         let pgid = {
             let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            guard.running.as_ref().map(|r| r.pgid)
+            guard
+                .running
+                .as_ref()
+                .map(|r| r.pgid)
+                .or(guard.last_pgid)
         };
-        if let Some(pgid) = pgid {
-            // SAFETY: pgid is the child's process-group id established at spawn
-            // via setpgid(0,0). Negative pid targets the whole group.
-            let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-        }
+        let Some(pgid) = pgid else {
+            // No child yet (or fully reaped). Do not stick kill_requested.
+            return;
+        };
+        // SAFETY: pgid is the child's process-group id established at spawn
+        // via setpgid(0,0). Negative pid targets the whole group.
+        let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        self.kill_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn try_claim(&self, who: DriveClaim) -> bool {
@@ -3466,6 +3490,7 @@ impl CredentialCleanupEntry {
         }
         // Drop any retained child handles; wait+EOF already completed.
         guard.running = None;
+        guard.last_pgid = None;
         guard.terminal = Some(outcome);
         guard.phase = CredentialEntryPhase::Terminal;
         guard.drive = DriveClaim::Free;
@@ -3686,10 +3711,8 @@ impl CredentialPreparationOwner {
         self.lane.deregister(&self.entry);
         // If phase was Terminal, deregister advanced to Deregistered.
         // If set_terminal was skipped (race), force.
-        if self.lane.contains(self.entry.id()) {
-            if self.entry.terminal_capability().is_some() {
-                self.lane.force_deregister(&self.entry);
-            }
+        if self.lane.contains(self.entry.id()) && self.entry.terminal_capability().is_some() {
+            self.lane.force_deregister(&self.entry);
         }
         self.finished = true;
         capability
@@ -4208,6 +4231,8 @@ async fn run_secret_tool_lookup_attempt(
         let mut guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
         guard.launched_child = true;
         guard.phase = CredentialEntryPhase::Running;
+        // Durable pgid survives take-for-reap so Drop/cancel can always SIGKILL.
+        guard.last_pgid = Some(pgid);
         guard.running = Some(CredentialRunningChild {
             child,
             pgid,
@@ -4218,9 +4243,13 @@ async fn run_secret_tool_lookup_attempt(
         });
     }
 
+    // Pre-spawn cancel must still kill once the durable pgid is parked.
+    if entry.is_cancel_requested() {
+        entry.kill_process_group_once();
+    }
+
     // Drive this attempt until the child is fully reaped (wait + EOFs).
-    let classify = drive_attempt_until_reaped(entry, effective_deadline, work_deadline).await;
-    classify
+    drive_attempt_until_reaped(entry, effective_deadline, work_deadline).await
 }
 
 /// Drive one retained attempt: wait + drain pipes (or kill on cancel/deadline),
@@ -4282,8 +4311,109 @@ async fn drive_attempt_until_reaped(
     }
 }
 
+/// RAII take of the running child. On cancel/Drop of the drive future before
+/// wait completes, re-parks the Child + pipes on the entry and SIGKILLs via the
+/// durable pgid so owner Drop / supervisor drain can always kill+wait.
+struct TakenRunningChild<'a> {
+    entry: &'a CredentialCleanupEntry,
+    running: Option<CredentialRunningChild>,
+    /// Set once `child.wait`/`try_wait` observed exit — handle must not be re-parked
+    /// for a second wait (would fail); durable pgid is cleared on Drop.
+    child_waited: bool,
+    /// Set after full wait + pipe drain so Drop is a pure no-op.
+    fully_reaped: bool,
+}
+
+impl<'a> TakenRunningChild<'a> {
+    fn take(entry: &'a CredentialCleanupEntry) -> Option<Self> {
+        let mut guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let running = guard.running.take()?;
+        // last_pgid stays set until a successful reap clears it.
+        Some(Self {
+            entry,
+            running: Some(running),
+            child_waited: false,
+            fully_reaped: false,
+        })
+    }
+
+    fn running_mut(&mut self) -> &mut CredentialRunningChild {
+        self.running
+            .as_mut()
+            .expect("TakenRunningChild without running")
+    }
+
+    fn mark_child_waited(&mut self) {
+        self.child_waited = true;
+    }
+
+    fn finish(mut self) -> CredentialRunningChild {
+        self.fully_reaped = true;
+        self.child_waited = true;
+        self.running
+            .take()
+            .expect("TakenRunningChild without running")
+    }
+}
+
+impl Drop for TakenRunningChild<'_> {
+    fn drop(&mut self) {
+        if self.fully_reaped {
+            return;
+        }
+        let Some(running) = self.running.take() else {
+            return;
+        };
+        let pgid = running.pgid;
+
+        if self.child_waited {
+            // OS wait already completed; do not re-park a waited Child (a second
+            // wait would fail). Keep last_pgid until set_terminal so Drop kill
+            // remains a no-op signal against a known id if still racing.
+            let _ = pgid;
+            return;
+        }
+
+        // Signal before re-park: Drop of owner may race with this Drop; durable
+        // last_pgid + re-parked Child keep kill and wait ownership on the entry.
+        // SAFETY: pgid is the retained process-group leader from setpgid(0,0).
+        let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        self.entry
+            .kill_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.entry
+            .cancel_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let mut guard = self.entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(
+            guard.phase,
+            CredentialEntryPhase::Terminal | CredentialEntryPhase::Deregistered
+        ) {
+            // Already terminal — discard handle; process was SIGKILLed above.
+            return;
+        }
+        if guard.running.is_none() {
+            guard.last_pgid = Some(pgid);
+            if matches!(
+                guard.phase,
+                CredentialEntryPhase::Registered | CredentialEntryPhase::Running
+            ) {
+                guard.phase = CredentialEntryPhase::CancelRequested;
+            }
+            guard.running = Some(running);
+        } else {
+            // Another path re-parked; keep durable pgid, drop our duplicate handle.
+            guard.last_pgid = Some(pgid);
+        }
+    }
+}
+
 /// Take the running child off the entry, kill if needed, wait + drain pipes.
 /// Returns `(success, stdout, stderr, was_killed)` or `None` if no child.
+///
+/// Cancel of this future re-parks the Child (see [`TakenRunningChild`]) so
+/// wait ownership is never lost to a detached `kill_on_drop(false)` local.
 async fn take_and_reap_running_child(
     entry: &CredentialCleanupEntry,
     attempt_deadline: Instant,
@@ -4299,11 +4429,8 @@ async fn take_and_reap_running_child(
         entry.kill_process_group_once();
     }
 
-    let mut running = {
-        let mut guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
-        guard.running.take()?
-    };
-    let pgid = running.pgid;
+    let mut taken = TakenRunningChild::take(entry)?;
+    let pgid = taken.running_mut().pgid;
     let mut was_killed = entry
         .kill_requested
         .load(std::sync::atomic::Ordering::SeqCst);
@@ -4332,11 +4459,10 @@ async fn take_and_reap_running_child(
         }
     }
 
-    let mut stdout_buf = std::mem::take(&mut running.stdout_buf);
-    let mut stderr_buf = std::mem::take(&mut running.stderr_buf);
-    let mut stdout = running.stdout.take();
-    let mut stderr = running.stderr.take();
-    let mut child = running.child;
+    let mut stdout_buf = std::mem::take(&mut taken.running_mut().stdout_buf);
+    let mut stderr_buf = std::mem::take(&mut taken.running_mut().stderr_buf);
+    let mut stdout = taken.running_mut().stdout.take();
+    let mut stderr = taken.running_mut().stderr.take();
 
     // Wait for exit, killing if cancel/deadline lands mid-wait.
     let status = loop {
@@ -4353,11 +4479,20 @@ async fn take_and_reap_running_child(
             }
         }
 
-        match tokio::time::timeout(Duration::from_millis(50), child.wait()).await {
-            Ok(Ok(status)) => break status,
-            Ok(Err(_)) => break std::process::ExitStatus::from_raw(256),
+        match tokio::time::timeout(Duration::from_millis(50), taken.running_mut().child.wait())
+            .await
+        {
+            Ok(Ok(status)) => {
+                taken.mark_child_waited();
+                break status;
+            }
+            Ok(Err(_)) => {
+                taken.mark_child_waited();
+                break std::process::ExitStatus::from_raw(256);
+            }
             Err(_) => {
-                if let Ok(Some(status)) = child.try_wait() {
+                if let Ok(Some(status)) = taken.running_mut().child.try_wait() {
+                    taken.mark_child_waited();
                     break status;
                 }
                 // Still live — also drain pipes so a full pipe cannot block exit.
@@ -4419,6 +4554,11 @@ async fn take_and_reap_running_child(
             }
         }
     }
+
+    // Wait ownership complete — do not re-park. last_pgid is cleared only at
+    // set_terminal so Drop/supervisor kill remains well-defined until then.
+    let _finished_child = taken.finish();
+    let _ = pgid;
 
     was_killed = entry
         .kill_requested
@@ -9424,9 +9564,12 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// Serializes tests that mutate process-global credential env/cache/PATH.
-    fn credential_owner_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    /// Tokio mutex is intentional: the guard is held across `.await` points.
+    async fn credential_owner_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
     }
 
     struct CredentialEnvGuard {
@@ -9487,6 +9630,48 @@ mod tests {
         unsafe { std::env::set_var("PATH", new_path) };
     }
 
+    /// Prove the OS process (and its /proc entry) is fully gone after reap.
+    fn assert_os_process_reaped(pgid: libc::pid_t) {
+        let proc_path = std::path::PathBuf::from(format!("/proc/{pgid}"));
+        assert!(
+            !proc_path.exists(),
+            "credential child pgid {pgid} still has /proc entry after reap"
+        );
+        // kill(pid, 0) must fail with ESRCH when the process is fully gone
+        // (including no unreaped zombie still owned by us).
+        let rc = unsafe { libc::kill(pgid, 0) };
+        assert_eq!(
+            rc, -1,
+            "credential child pgid {pgid} still accepts kill(0) after reap"
+        );
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(
+            errno,
+            Some(libc::ESRCH),
+            "credential child pgid {pgid} kill(0) errno {errno:?}, expected ESRCH"
+        );
+    }
+
+    /// Wait until a child has launched (or panic after budget).
+    async fn wait_until_credential_child_launched(entry: &CredentialCleanupEntry) -> libc::pid_t {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pgid) = entry.retained_pgid() {
+                return pgid;
+            }
+            if entry.has_launched_child() {
+                if let Some(pgid) = entry.retained_pgid() {
+                    return pgid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "credential child never launched / no durable pgid within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     #[test]
     fn credential_prep_constants_match_spec() {
         assert_eq!(CREDENTIAL_PREP_WORK_DEADLINE, Duration::from_secs(13));
@@ -9495,7 +9680,7 @@ mod tests {
 
     #[tokio::test]
     async fn credential_lane_registers_before_owner_may_launch() {
-        let _lock = credential_owner_test_lock();
+        let _lock = credential_owner_test_lock().await;
         let _env = CredentialEnvGuard::capture(&[
             "VOISU_GROQ_API_KEY",
             "VOISU_TEST_SECRET_STORE",
@@ -9534,7 +9719,7 @@ mod tests {
 
     #[tokio::test]
     async fn credential_prep_cache_hit_ready_without_child() {
-        let _lock = credential_owner_test_lock();
+        let _lock = credential_owner_test_lock().await;
         let _env = CredentialEnvGuard::capture(&[
             "VOISU_GROQ_API_KEY",
             "VOISU_TEST_SECRET_STORE",
@@ -9566,7 +9751,7 @@ mod tests {
 
     #[tokio::test]
     async fn credential_prep_test_seam_ready_and_single_deregistration() {
-        let _lock = credential_owner_test_lock();
+        let _lock = credential_owner_test_lock().await;
         let _env = CredentialEnvGuard::capture(&[
             "VOISU_GROQ_API_KEY",
             "VOISU_TEST_SECRET_STORE",
@@ -9602,7 +9787,7 @@ mod tests {
 
     #[tokio::test]
     async fn credential_prep_cancel_kills_child_and_deregisters() {
-        let _lock = credential_owner_test_lock();
+        let _lock = credential_owner_test_lock().await;
         let _env = CredentialEnvGuard::capture(&[
             "VOISU_GROQ_API_KEY",
             "VOISU_TEST_SECRET_STORE",
@@ -9630,36 +9815,30 @@ mod tests {
         tokio::pin!(poll);
 
         // Wait until the child has launched, then cancel via entry (poll holds &mut owner).
-        let launched = async {
-            loop {
-                if entry_watch.has_launched_child() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        let launched = wait_until_credential_child_launched(&entry_watch);
+        let pgid = tokio::select! {
+            _ = &mut poll => panic!("hanging secret-tool should not finish before cancel"),
+            pgid = launched => {
+                entry_watch.request_cancel_and_kill();
+                pgid
             }
         };
-        tokio::select! {
-            _ = &mut poll => panic!("hanging secret-tool should not finish before cancel"),
-            _ = launched => {
-                entry_watch.request_cancel_and_kill();
-            }
-        }
         let capability = poll.await;
         assert!(
             matches!(
                 capability,
                 GrammarCapability::Unavailable(GrammarUnavailableReason::Cancelled)
-                    | GrammarCapability::Unavailable(GrammarUnavailableReason::WorkDeadlineExceeded)
             ),
-            "cancel must yield Unavailable, got {capability:?}"
+            "cancel must yield Cancelled (not deadline), got {capability:?}"
         );
         assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
         assert_eq!(lane.pending_count(), 0);
+        assert_os_process_reaped(pgid);
     }
 
     #[tokio::test]
     async fn credential_prep_work_deadline_stops_and_reaps() {
-        let _lock = credential_owner_test_lock();
+        let _lock = credential_owner_test_lock().await;
         let _env = CredentialEnvGuard::capture(&[
             "VOISU_GROQ_API_KEY",
             "VOISU_TEST_SECRET_STORE",
@@ -9681,18 +9860,40 @@ mod tests {
         let reaper = ProviderReaper::new();
         let lane = reaper.credential_lane().clone();
         let entry = lane.register();
+        let entry_watch = Arc::clone(&entry);
         let mut owner =
             CredentialPreparationOwner::new(Arc::clone(&entry), lane.clone(), Provider::Groq);
 
         let started = Instant::now();
-        let capability = owner.poll_outcome().await;
+        let poll = owner.poll_outcome();
+        tokio::pin!(poll);
+        let mut seen_pgid = None;
+        let capability = loop {
+            tokio::select! {
+                biased;
+                result = &mut poll => break result,
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                    if seen_pgid.is_none() {
+                        seen_pgid = entry_watch.retained_pgid();
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(3),
+                        "deadline path must not wait out the full sleep, elapsed {:?}",
+                        started.elapsed()
+                    );
+                }
+            }
+        };
         assert!(
             matches!(
                 capability,
                 GrammarCapability::Unavailable(GrammarUnavailableReason::WorkDeadlineExceeded)
-                    | GrammarCapability::Unavailable(GrammarUnavailableReason::Cancelled)
             ),
-            "deadline must yield Unavailable, got {capability:?}"
+            "deadline must yield WorkDeadlineExceeded (not Cancelled), got {capability:?}"
+        );
+        assert!(
+            entry.has_launched_child(),
+            "deadline path must have launched secret-tool"
         );
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -9701,11 +9902,13 @@ mod tests {
         );
         assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
         assert_eq!(lane.pending_count(), 0);
+        let pgid = seen_pgid.expect("deadline hang child must expose durable pgid before reap");
+        assert_os_process_reaped(pgid);
     }
 
     #[tokio::test]
     async fn credential_reap_watchdog_overrun_logs_and_awaits_terminal() {
-        let _lock = credential_owner_test_lock();
+        let _lock = credential_owner_test_lock().await;
         let _env = CredentialEnvGuard::capture(&[
             "VOISU_GROQ_API_KEY",
             "VOISU_TEST_SECRET_STORE",
@@ -9745,7 +9948,7 @@ mod tests {
 
     #[tokio::test]
     async fn credential_owner_drop_kills_without_claiming_terminal() {
-        let _lock = credential_owner_test_lock();
+        let _lock = credential_owner_test_lock().await;
         let _env = CredentialEnvGuard::capture(&[
             "VOISU_GROQ_API_KEY",
             "VOISU_TEST_SECRET_STORE",
@@ -9766,15 +9969,16 @@ mod tests {
 
         // Drive first poll far enough to launch, then drop the owner without
         // awaiting terminal — Drop kill-signals but must not deregister.
-        {
+        let pgid = {
             let mut owner = CredentialPreparationOwner::new(
                 Arc::clone(&entry),
                 lane.clone(),
                 Provider::Groq,
             );
-            {
+            let pgid = {
                 let poll = owner.poll_outcome();
                 tokio::pin!(poll);
+                let deadline = Instant::now() + Duration::from_secs(5);
                 loop {
                     tokio::select! {
                         biased;
@@ -9782,17 +9986,22 @@ mod tests {
                             panic!("owner should be dropped before poll completes");
                         }
                         _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                            if entry_watch.has_launched_child() {
-                                break;
+                            if let Some(pgid) = entry_watch.retained_pgid() {
+                                break pgid;
                             }
+                            assert!(
+                                Instant::now() < deadline,
+                                "child never launched before Drop test budget"
+                            );
                         }
                     }
                 }
-                // End the poll borrow before Drop of the owner.
-            }
+                // End the poll borrow: cancels drive future. TakenRunningChild
+                // re-parks Child + durable pgid so Drop/supervisor can kill+wait.
+            };
             drop(owner);
-        }
-
+            pgid
+        };
         assert!(
             entry.is_cancel_requested(),
             "Drop must request cancellation"
@@ -9806,11 +10015,18 @@ mod tests {
             CredentialEntryPhase::Deregistered,
             "Drop cannot claim Deregistered"
         );
+        // After Drop: durable kill must have signalled. Process may be zombie
+        // until supervisor wait; must not still be a running sleep.
+        assert!(
+            entry.retained_pgid().is_some() || !std::path::Path::new(&format!("/proc/{pgid}")).exists(),
+            "after Drop, either wait ownership (pgid) remains or OS process is already gone"
+        );
 
         // Supervisor drain claims, reaps, deregisters.
         reaper.drain_credential_lane().await;
         assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
         assert_eq!(lane.pending_count(), 0);
+        assert_os_process_reaped(pgid);
         // Idempotent second drain.
         reaper.drain_credential_lane().await;
         assert_eq!(lane.pending_count(), 0);
@@ -9818,7 +10034,7 @@ mod tests {
 
     #[tokio::test]
     async fn credential_cancel_and_drive_terminal_api_reaps() {
-        let _lock = credential_owner_test_lock();
+        let _lock = credential_owner_test_lock().await;
         let _env = CredentialEnvGuard::capture(&[
             "VOISU_GROQ_API_KEY",
             "VOISU_TEST_SECRET_STORE",
@@ -9849,7 +10065,7 @@ mod tests {
     async fn credential_caught_panic_seam_cancel_reaps_before_error() {
         // Models the concurrent catch_unwind path: on panic, explicitly
         // cancel_and_drive_terminal before returning a Processing error.
-        let _lock = credential_owner_test_lock();
+        let _lock = credential_owner_test_lock().await;
         let _env = CredentialEnvGuard::capture(&[
             "VOISU_GROQ_API_KEY",
             "VOISU_TEST_SECRET_STORE",
@@ -9871,31 +10087,44 @@ mod tests {
 
         // Simulate: prep started, then a caught panic forces explicit cancel-reap.
         let entry_watch = Arc::clone(&entry);
-        {
+        let pgid = {
             let poll = owner.poll_outcome();
             tokio::pin!(poll);
+            let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 tokio::select! {
-                    _ = &mut poll => break,
+                    _ = &mut poll => panic!("hanging secret-tool finished before panic-seam cancel"),
                     _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                        if entry_watch.has_launched_child() {
-                            break;
+                        if let Some(pgid) = entry_watch.retained_pgid() {
+                            break pgid;
                         }
+                        assert!(
+                            Instant::now() < deadline,
+                            "child never launched before panic-seam cancel"
+                        );
                     }
                 }
             }
             // Drop the in-flight poll so we can mutably use owner again.
-        }
+            // Re-parks wait ownership for cancel_and_drive_terminal.
+        };
         // Explicit cancel-reap (caught panic path) — do not rely on Drop alone.
         let capability = owner.cancel_and_drive_terminal().await;
-        assert!(capability.is_unavailable(), "{capability:?}");
+        assert!(
+            matches!(
+                capability,
+                GrammarCapability::Unavailable(GrammarUnavailableReason::Cancelled)
+            ),
+            "panic-seam cancel must yield Cancelled, got {capability:?}"
+        );
         assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
         assert_eq!(lane.pending_count(), 0);
+        assert_os_process_reaped(pgid);
     }
 
     #[tokio::test]
     async fn credential_secret_tool_miss_path_uses_tokio_process() {
-        let _lock = credential_owner_test_lock();
+        let _lock = credential_owner_test_lock().await;
         let _env = CredentialEnvGuard::capture(&[
             "VOISU_GROQ_API_KEY",
             "VOISU_TEST_SECRET_STORE",
@@ -9934,7 +10163,7 @@ mod tests {
 
     #[tokio::test]
     async fn credential_secret_tool_found_path_caches_and_ready() {
-        let _lock = credential_owner_test_lock();
+        let _lock = credential_owner_test_lock().await;
         let _env = CredentialEnvGuard::capture(&[
             "VOISU_GROQ_API_KEY",
             "VOISU_TEST_SECRET_STORE",
