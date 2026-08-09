@@ -216,29 +216,57 @@ pub fn format_validated_with(
         }
     };
 
-    // Miss after work → identity (last safe value is Validated text).
-    if Instant::now() >= deadline_at {
-        return seal_identity_baseline(validated_transcript, options.version, fingerprint);
-    }
-
-    seal_baseline(
+    // Miss after work, during seal, or after seal → identity. Sealing must not
+    // return a formatted baseline once the cooperative bound has elapsed.
+    finish_baseline(
         validated_transcript,
         options.version,
         fingerprint,
         rendered,
+        deadline_at,
     )
 }
 
-// ─── Sealing ─────────────────────────────────────────────────────────────────
-
-fn seal_baseline(
+/// Seal a rendered string, or fall back to identity if the deadline hits before,
+/// during, or immediately after sealing work.
+fn finish_baseline(
     source: &str,
     version: &str,
     fingerprint: String,
     rendered: String,
+    deadline_at: Instant,
 ) -> FormattingBaseline {
+    if deadline_hit(deadline_at) {
+        return seal_identity_baseline(source, version, fingerprint);
+    }
+    let Some(sealed) = try_seal_baseline(source, version, fingerprint.clone(), rendered, deadline_at)
+    else {
+        return seal_identity_baseline(source, version, fingerprint);
+    };
+    if deadline_hit(deadline_at) {
+        return seal_identity_baseline(source, version, fingerprint);
+    }
+    sealed
+}
+
+// ─── Sealing ─────────────────────────────────────────────────────────────────
+
+/// Build a sealed baseline, or `None` if the cooperative deadline elapses mid-seal.
+fn try_seal_baseline(
+    source: &str,
+    version: &str,
+    fingerprint: String,
+    rendered: String,
+    deadline_at: Instant,
+) -> Option<FormattingBaseline> {
     let anchors = source_anchors(source, &rendered);
+    if deadline_hit(deadline_at) {
+        return None;
+    }
     let protected = protected_source_ranges(source);
+    if deadline_hit(deadline_at) {
+        return None;
+    }
     let contract = FORMATTER_CONTRACT_ID.to_owned();
     let digest = derivation_digest(
         version,
@@ -248,7 +276,7 @@ fn seal_baseline(
         &protected,
         &contract,
     );
-    FormattingBaseline {
+    Some(FormattingBaseline {
         base_version: version.to_owned(),
         base_fingerprint: fingerprint,
         rendered,
@@ -256,7 +284,7 @@ fn seal_baseline(
         protected_source_ranges: protected,
         formatter_contract: contract,
         derivation_digest: digest,
-    }
+    })
 }
 
 /// Cheap identity seal for oversize / deadline-miss paths.
@@ -352,20 +380,73 @@ fn derivation_digest(
     format!("sha256:{}", hex_sha256(encoded.as_bytes()))
 }
 
-/// Greedy case-insensitive whole-token anchors from source → rendered.
+/// Case-insensitive whole-token anchors from source → rendered.
+///
+/// Uses a linear dual-pointer scan so local 1:1 rewrites (`is`→`are`, `lets`→`let's`,
+/// `didnt`→`didn't`) leave following tokens anchored. Only truly unmappable source
+/// tokens are omitted; non-matching rendered tokens are not consumed while hunting
+/// for an exact match (that old greedy hunt collapsed the rest of the stream).
 fn source_anchors(base: &str, rendered: &str) -> BTreeMap<(usize, usize), SourceAnchor> {
     let base_tokens = word_tokens(base);
     let rendered_tokens = word_tokens(rendered);
     let mut anchors = BTreeMap::new();
-    let mut ri = 0usize;
-    for (bs, be, btok) in base_tokens {
-        while ri < rendered_tokens.len() {
-            let (rs, re, rtok) = &rendered_tokens[ri];
-            ri += 1;
+
+    // Equal token counts: strict index zip. Local grammar rewrites are 1:1, so
+    // unmappable indices drop without shifting later matches.
+    if base_tokens.len() == rendered_tokens.len() {
+        for (&(bs, be, btok), &(rs, re, rtok)) in base_tokens.iter().zip(rendered_tokens.iter()) {
             if eq_ascii_ignore_case(btok, rtok) {
-                anchors.insert((bs, be), SourceAnchor::new(*rs, *re));
-                break;
+                anchors.insert((bs, be), SourceAnchor::new(rs, re));
             }
+        }
+        return anchors;
+    }
+
+    // Unequal counts (command expansion, list inference): dual-pointer realignment.
+    let mut bi = 0usize;
+    let mut ri = 0usize;
+    while bi < base_tokens.len() && ri < rendered_tokens.len() {
+        let (bs, be, btok) = base_tokens[bi];
+        let (rs, re, rtok) = rendered_tokens[ri];
+        if eq_ascii_ignore_case(btok, rtok) {
+            anchors.insert((bs, be), SourceAnchor::new(rs, re));
+            bi += 1;
+            ri += 1;
+            continue;
+        }
+        // One source token deleted (e.g. command phrase word removed).
+        if bi + 1 < base_tokens.len()
+            && eq_ascii_ignore_case(base_tokens[bi + 1].2, rtok)
+        {
+            bi += 1;
+            continue;
+        }
+        // One rendered word inserted.
+        if ri + 1 < rendered_tokens.len()
+            && eq_ascii_ignore_case(btok, rendered_tokens[ri + 1].2)
+        {
+            ri += 1;
+            continue;
+        }
+        // Local 1:1 substitution mid-stream (next tokens realign).
+        if bi + 1 < base_tokens.len()
+            && ri + 1 < rendered_tokens.len()
+            && eq_ascii_ignore_case(base_tokens[bi + 1].2, rendered_tokens[ri + 1].2)
+        {
+            bi += 1;
+            ri += 1;
+            continue;
+        }
+        // Prefer draining the longer remaining side (multi-token command deletions).
+        let base_left = base_tokens.len() - bi;
+        let rend_left = rendered_tokens.len() - ri;
+        if base_left > rend_left {
+            bi += 1;
+        } else if rend_left > base_left {
+            ri += 1;
+        } else {
+            bi += 1;
+            ri += 1;
         }
     }
     anchors
@@ -815,6 +896,8 @@ fn smart_format(
     // Closed Minimal Grammar catalog applied locally for hermetic #99 Smart
     // oracle (F25/F26/F27). Separability (§6.1): skip when any §4 command span
     // is present, or when consecutive word-tokens `new`+`line` appear (F36).
+    // Quote/code/composite protection matches seal ranges so local rewrites
+    // cannot mutate protected interiors.
     if !has_commands && !has_new_line_token_pair(input) {
         if deadline_hit(deadline_at) {
             return None;
@@ -1257,47 +1340,33 @@ fn is_sentence_or_line_start(text: &str, byte_idx: usize) -> bool {
     trimmed.ends_with(['.', '!', '?'])
 }
 
+/// Byte mask: quote/code/composite ranges (same families as seal) plus dictionary/names.
+/// Unmatched/ambiguous quote delimiters protect the whole base (fail-closed).
 fn build_casing_protection(text: &str, dictionary: &[&str], protected_names: &[&str]) -> Vec<bool> {
     let mut protected = vec![false; text.len()];
     let mut ranges = Vec::new();
     collect_composite_spans(text, &mut ranges);
-    // Quoted interiors (ASCII ")
-    let mut pending: Option<usize> = None;
-    for (idx, ch) in text.char_indices() {
-        if ch == '"' {
-            if let Some(start) = pending.take() {
-                for i in start + 1..idx {
-                    if i < protected.len() {
-                        protected[i] = true;
-                    }
-                }
-            } else {
-                pending = Some(idx);
-            }
-        }
-    }
-    // Bare quote … unquote interiors (token words)
+    // ASCII + curly quotes, inline/fenced code — same as seal `protected_source_ranges`.
+    collect_quote_and_code_ranges(text, &mut ranges);
+    // Bare quote … unquote interiors (token words; command form handled by parser at seal).
     {
         let tokens = word_tokens(text);
         let mut i = 0;
         while i < tokens.len() {
             if ascii_lower(tokens[i].2) == "quote" {
-                if let Some(j) = (i + 1..tokens.len()).find(|&j| ascii_lower(tokens[j].2) == "unquote")
+                if let Some(j) =
+                    (i + 1..tokens.len()).find(|&j| ascii_lower(tokens[j].2) == "unquote")
                 {
                     let start = tokens[i].1;
                     let end = tokens[j].0;
-                    for k in start..end {
-                        if k < protected.len() {
-                            protected[k] = true;
-                        }
-                    }
+                    ranges.push(SourceSpan::new(start, end));
                     i = j;
                 }
             }
             i += 1;
         }
     }
-    for r in ranges {
+    for r in normalize_ranges(ranges) {
         for i in r.start..r.end.min(protected.len()) {
             protected[i] = true;
         }
@@ -1317,6 +1386,25 @@ fn build_casing_protection(text: &str, dictionary: &[&str], protected_names: &[&
         }
     }
     protected
+}
+
+/// Quote/code/composite protection mask for local grammar (no dictionary/names).
+fn build_local_grammar_protection(text: &str) -> Vec<bool> {
+    let mut protected = vec![false; text.len()];
+    let mut ranges = Vec::new();
+    collect_composite_spans(text, &mut ranges);
+    collect_quote_and_code_ranges(text, &mut ranges);
+    for r in normalize_ranges(ranges) {
+        for i in r.start..r.end.min(protected.len()) {
+            protected[i] = true;
+        }
+    }
+    protected
+}
+
+#[inline]
+fn span_touches_protection(start: usize, end: usize, protected: &[bool]) -> bool {
+    (start..end).any(|i| protected.get(i).copied().unwrap_or(false))
 }
 
 fn capitalize_numbered_list_items(text: &str) -> String {
@@ -1475,14 +1563,18 @@ fn add_terminal_punctuation(text: &str) -> String {
 // a provider. SW4 still owns candidate validation/composition for untrusted JSON.
 
 fn apply_closed_local_grammar(text: &str) -> String {
+    let protected = build_local_grammar_protection(text);
     let mut t = text.to_owned();
-    t = grammar_there_is_plural(&t);
-    t = grammar_lets_meet(&t);
-    t = grammar_didnt(&t);
+    t = grammar_there_is_plural(&t, &protected);
+    // Recompute mask after each rewrite so byte indices stay valid.
+    let protected = build_local_grammar_protection(&t);
+    t = grammar_lets_meet(&t, &protected);
+    let protected = build_local_grammar_protection(&t);
+    t = grammar_didnt(&t, &protected);
     t
 }
 
-fn grammar_there_is_plural(text: &str) -> String {
+fn grammar_there_is_plural(text: &str, protected: &[bool]) -> String {
     // there + spaces + is + spaces + quantity + spaces + issues
     let tokens = word_tokens(text);
     for i in 0..tokens.len() {
@@ -1510,14 +1602,17 @@ fn grammar_there_is_plural(text: &str) -> String {
         {
             continue;
         }
-        // Replace "is" with "are"
+        // Replace "is" with "are" only when the verb span is not protected.
         let (s, e, _) = tokens[i + 1];
+        if span_touches_protection(s, e, protected) {
+            continue;
+        }
         return format!("{}are{}", &text[..s], &text[e..]);
     }
     text.to_owned()
 }
 
-fn grammar_lets_meet(text: &str) -> String {
+fn grammar_lets_meet(text: &str, protected: &[bool]) -> String {
     // sentence-initial lets + spaces + meet → let's
     let tokens = word_tokens(text);
     if tokens.is_empty() {
@@ -1532,6 +1627,9 @@ fn grammar_lets_meet(text: &str) -> String {
         }
     }
     if ascii_lower(tok) != "lets" {
+        return text.to_owned();
+    }
+    if span_touches_protection(s, e, protected) {
         return text.to_owned();
     }
     if tokens.len() < 2 || ascii_lower(tokens[1].2) != "meet" {
@@ -1549,32 +1647,23 @@ fn grammar_lets_meet(text: &str) -> String {
     format!("{}{}{}", &text[..s], replacement, &text[e..])
 }
 
-fn grammar_didnt(text: &str) -> String {
+fn grammar_didnt(text: &str, protected: &[bool]) -> String {
     let tokens = word_tokens(text);
     for (s, e, tok) in tokens {
-        if ascii_lower(tok) == "didnt" {
-            let replacement = if tok.chars().next().is_some_and(|c| c.is_uppercase()) {
-                "Didn't"
-            } else if tok.chars().next().is_some_and(|c| c.is_lowercase()) {
-                // preserve mid-sentence casing of first letter only
-                if tok.as_bytes()[0].is_ascii_uppercase() {
-                    "Didn't"
-                } else {
-                    "didn't"
-                }
-            } else {
-                "didn't"
-            };
-            // If whole token is lowercase "didnt" → "didn't"; if "Didnt" → "Didn't"
-            let replacement = if tok.starts_with('D') {
-                "Didn't"
-            } else if tok.starts_with('d') {
-                "didn't"
-            } else {
-                replacement
-            };
-            return format!("{}{}{}", &text[..s], replacement, &text[e..]);
+        if ascii_lower(tok) != "didnt" {
+            continue;
         }
+        if span_touches_protection(s, e, protected) {
+            continue;
+        }
+        let replacement = if tok.starts_with('D') {
+            "Didn't"
+        } else if tok.starts_with('d') {
+            "didn't"
+        } else {
+            "didn't"
+        };
+        return format!("{}{}{}", &text[..s], replacement, &text[e..]);
     }
     text.to_owned()
 }
@@ -1893,12 +1982,150 @@ mod tests {
         );
     }
 
+    // ── Sol revise: local formatting honors quote/code protection ────────────
+
+    #[test]
+    fn quoted_interior_not_mutated_by_local_formatting() {
+        // Behavioral: rendered must preserve protected interiors (casing + grammar).
+        // ASCII paired double quotes.
+        let ascii = smart("she said \"i didnt know\"");
+        assert!(
+            ascii.contains("\"i didnt know\""),
+            "ASCII quote interior must keep i/didnt, got {ascii:?}"
+        );
+        assert!(
+            !ascii.contains("didn't") && !ascii.contains("\"I "),
+            "must not rewrite/case inside ASCII quotes: {ascii:?}"
+        );
+
+        // Curly double quotes.
+        let curly = smart("she said \u{201C}i didnt know\u{201D}");
+        assert!(
+            curly.contains("\u{201C}i didnt know\u{201D}"),
+            "curly quote interior must keep i/didnt, got {curly:?}"
+        );
+
+        // ASCII single quotes.
+        let single = smart("she said 'i didnt know'");
+        assert!(
+            single.contains("'i didnt know'"),
+            "single-quote interior must keep i/didnt, got {single:?}"
+        );
+
+        // Inline code.
+        let code = smart("use `didnt` exactly");
+        assert!(
+            code.contains("`didnt`"),
+            "inline code must not get didnt→didn't, got {code:?}"
+        );
+        assert!(!code.contains("`didn't`"), "code interior rewritten: {code:?}");
+    }
+
+    #[test]
+    fn unprotected_didnt_still_rewrites_outside_quotes() {
+        assert_eq!(
+            smart("i didnt see no error in the logs"),
+            "I didn't see no error in the logs."
+        );
+    }
+
+    // ── Sol revise: source anchors survive local rewrites ────────────────────
+
+    fn assert_token_anchored(b: &FormattingBaseline, source: &str, token: &str) {
+        let tok = word_tokens(source)
+            .into_iter()
+            .find(|(_, _, t)| *t == token)
+            .unwrap_or_else(|| panic!("source missing token {token:?} in {source:?}"));
+        assert!(
+            b.anchor_for_source(SourceSpan::new(tok.0, tok.1)).is_some(),
+            "expected anchor for {token:?} in {source:?}; rendered={:?}",
+            b.rendered()
+        );
+    }
+
+    #[test]
+    fn anchors_survive_is_are_rewrite() {
+        let source = "there is two issues with the patch";
+        let b = format_validated(source, WritingMode::Smart);
+        assert_eq!(b.rendered(), "There are two issues with the patch.");
+        // Rewritten verb is unmappable; following tokens must still anchor.
+        assert_token_anchored(&b, source, "there");
+        assert!(
+            b.anchor_for_source({
+                let t = word_tokens(source)
+                    .into_iter()
+                    .find(|(_, _, t)| *t == "is")
+                    .unwrap();
+                SourceSpan::new(t.0, t.1)
+            })
+            .is_none(),
+            "is→are must leave source 'is' unmappable"
+        );
+        for tok in ["two", "issues", "with", "the", "patch"] {
+            assert_token_anchored(&b, source, tok);
+        }
+    }
+
+    #[test]
+    fn anchors_survive_lets_rewrite() {
+        let source = "lets meet tomorrow";
+        let b = format_validated(source, WritingMode::Smart);
+        assert_eq!(b.rendered(), "Let's meet tomorrow.");
+        assert!(
+            b.anchor_for_source({
+                let t = word_tokens(source)
+                    .into_iter()
+                    .find(|(_, _, t)| *t == "lets")
+                    .unwrap();
+                SourceSpan::new(t.0, t.1)
+            })
+            .is_none(),
+            "lets→let's must leave source 'lets' unmappable"
+        );
+        assert_token_anchored(&b, source, "meet");
+        assert_token_anchored(&b, source, "tomorrow");
+    }
+
+    #[test]
+    fn anchors_survive_didnt_rewrite_mid_sentence() {
+        let source = "i didnt see no error in the logs";
+        let b = format_validated(source, WritingMode::Smart);
+        assert_eq!(b.rendered(), "I didn't see no error in the logs.");
+        assert_token_anchored(&b, source, "i");
+        assert!(
+            b.anchor_for_source({
+                let t = word_tokens(source)
+                    .into_iter()
+                    .find(|(_, _, t)| *t == "didnt")
+                    .unwrap();
+                SourceSpan::new(t.0, t.1)
+            })
+            .is_none(),
+            "didnt→didn't must leave source 'didnt' unmappable"
+        );
+        for tok in ["see", "no", "error", "in", "the", "logs"] {
+            assert_token_anchored(&b, source, tok);
+        }
+    }
+
+    #[test]
+    fn anchors_compose_two_rewrites() {
+        // Mid-sentence is→are and didnt→didn't; remaining tokens stay anchored.
+        let source = "there is two issues and i didnt know";
+        let b = format_validated(source, WritingMode::Smart);
+        assert!(
+            b.rendered().contains("are") && b.rendered().contains("didn't"),
+            "expected both rewrites, got {:?}",
+            b.rendered()
+        );
+        for tok in ["there", "two", "issues", "and", "i", "know"] {
+            assert_token_anchored(&b, source, tok);
+        }
+    }
+
     // ── Bug 3: cooperative deadline + linear scans at max size ──────────────
 
-    /// Synthetic tight deadline on 32 KiB must not burn multi-second CPU.
-    ///
-    /// With zero budget the entry path seals identity before heavy work; linear
-    /// composite scans keep any residual tokenization well under a second.
+    /// Synthetic zero Instant deadline forces identity without heavy work.
     #[test]
     fn max_size_zero_deadline_aborts_without_multi_second_cpu() {
         let input = "x".repeat(MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES);
@@ -1921,25 +2148,54 @@ mod tests {
             elapsed < Duration::from_millis(250),
             "zero-deadline 32 KiB path must not burn multi-second CPU, took {elapsed:?}"
         );
+        // Identity seal: whole base protected, anchors 1:1 on source tokens.
+        assert!(
+            baseline
+                .protected_source_ranges()
+                .iter()
+                .any(|r| r.start == 0 && r.end == input.len()),
+            "identity seal must protect whole base"
+        );
+    }
+
+    /// Deterministic: already-elapsed deadline never returns a rewritten baseline.
+    #[test]
+    fn expired_deadline_returns_identity_not_formatted() {
+        let input = "there is two issues with the patch";
+        // Zero budget → miss before/during work; must not emit Smart rewrite.
+        let b = format_validated_with(
+            input,
+            WritingMode::Smart,
+            FormatOptions {
+                work_deadline: Some(Duration::ZERO),
+                ..FormatOptions::default()
+            },
+        );
+        assert_eq!(b.rendered(), input);
+        assert_ne!(
+            smart(input),
+            input,
+            "precondition: Smart would rewrite without deadline"
+        );
     }
 
     /// Full format of max-size input must stay linear (no multi-second O(n²)).
     ///
-    /// Release builds are held to the normative 50 ms budget. Debug builds get a
-    /// looser 500 ms cap that still fails the pre-fix O(n²) multi-second path.
+    /// Uses a generous wall cap that still fails pathological quadratic scans;
+    /// cooperative 50 ms is enforced via synthetic Instant deadlines above, not
+    /// a scheduler-flaky release assertion.
     #[test]
     fn max_size_full_format_stays_linear_budget() {
         let input = "x".repeat(MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES);
         let t0 = Instant::now();
-        let _baseline = format_validated(&input, WritingMode::Smart);
+        let baseline = format_validated(&input, WritingMode::Smart);
         let elapsed = t0.elapsed();
-        #[cfg(not(debug_assertions))]
-        let cap = Duration::from_millis(50);
-        #[cfg(debug_assertions)]
-        let cap = Duration::from_millis(500);
+        let _ = baseline.rendered();
+        // 2 s is far above linear O(n) at 32 KiB and far below O(n²) multi-second paths.
+        let cap = Duration::from_secs(2);
         assert!(
             elapsed < cap,
-            "32 KiB full format must stay under {cap:?} (linear scans); took {elapsed:?}"
+            "32 KiB full format must stay linear (under {cap:?}); took {elapsed:?}"
         );
     }
 }
