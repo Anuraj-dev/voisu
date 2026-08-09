@@ -107,7 +107,9 @@ The JSON Schema describes the research corpus. The runner implements the declare
 subset with Python's standard library and fails on unsupported validation keywords. That validator is
 the authoritative corpus gate; optional `jsonschema` behavior is not used. File loading rejects
 oversize/deep JSON and converts decoder/depth `RecursionError` or `MemoryError` into bounded proof
-failures. If schema validation fails, semantic metadata, #99 cross-links, and fixtures do not run.
+failures. Bounded loading and the provider boundary also reject non-scalar Unicode strings such as
+lone surrogate escapes before UTF-8 accounting. If schema validation fails, semantic metadata,
+#99 cross-links, and fixtures do not run.
 
 Run:
 

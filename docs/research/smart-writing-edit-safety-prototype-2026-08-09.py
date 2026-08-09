@@ -30,6 +30,7 @@ MAX_BASE_BYTES = 100_000
 MAX_EDITS = 64
 MAX_FIELD_BYTES = 512
 MAX_DIAG_BYTES = 128
+MAX_JSON_NODES = 20_000
 
 RULE_IDS = (
     "G_THERE_IS_PLURAL_QUANTITY",
@@ -140,6 +141,37 @@ def json_depth(value: Any, depth: int = 0) -> int:
     return depth
 
 
+def scalar_strings_valid(value: Any) -> bool:
+    """Reject lone surrogates, cycles, and unreasonable in-memory JSON shapes."""
+    stack = [value]
+    containers: set[int] = set()
+    nodes = 0
+    while stack:
+        current = stack.pop()
+        nodes += 1
+        if nodes > MAX_JSON_NODES:
+            return False
+        if isinstance(current, str):
+            try:
+                current.encode("utf-8", errors="strict")
+            except UnicodeEncodeError:
+                return False
+        elif isinstance(current, dict):
+            identity = id(current)
+            if identity in containers:
+                return False
+            containers.add(identity)
+            stack.extend(current.keys())
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            identity = id(current)
+            if identity in containers:
+                return False
+            containers.add(identity)
+            stack.extend(current)
+    return True
+
+
 def decode_json_bounded(text: str, label: str) -> Any:
     size = utf8_len(text)
     if size > MAX_FILE_BYTES:
@@ -154,6 +186,8 @@ def decode_json_bounded(text: str, label: str) -> Any:
         raise ValueError(f"{label}: JSON depth resource bound exceeded") from exc
     if depth > MAX_JSON_DEPTH:
         raise ValueError(f"{label}: depth {depth} exceeds {MAX_JSON_DEPTH}")
+    if not scalar_strings_valid(value):
+        raise ValueError(f"{label}: non-scalar string or invalid JSON object graph")
     return value
 
 
@@ -737,6 +771,14 @@ def validate_grammar(
             [Diagnostic("E_FORMATTING_DERIVATION", "baseline capability derivation invalid")],
         )
 
+    if not scalar_strings_valid(candidate):
+        return result_for(
+            base,
+            baseline.rendered,
+            False,
+            [Diagnostic("E_MALFORMED", "grammar candidate contains invalid text or shape")],
+        )
+
     # Container/envelope first, then freshness, then individual edit shapes.
     raw_edits, diagnostics = _candidate_container(candidate)
     if diagnostics or raw_edits is None:
@@ -1157,6 +1199,33 @@ def direct_adversaries(schema: Mapping[str, Any], corpus: Mapping[str, Any]) -> 
         injection_result["rendered"] == baseline.rendered
         and injection_result["error_codes"] == ["E_MALFORMED"],
         injection_result,
+    )
+
+    surrogate_edit = {
+        "id": "surrogate",
+        "rule_id": "G_DIDNT_APOSTROPHE",
+        "start_utf8": 0,
+        "end_utf8": 2,
+        "before": "do",
+        "after": "\ud800",
+    }
+    surrogate_result = validate_grammar(base, baseline, _candidate(base, [surrogate_edit]))
+    record(
+        "ADV_PROVIDER_LONE_SURROGATE",
+        surrogate_result["rendered"] == baseline.rendered
+        and surrogate_result["error_codes"] == ["E_MALFORMED"],
+        surrogate_result,
+    )
+
+    try:
+        decode_json_bounded(r'{"base":{"text":"\ud800"}}', "surrogate-corpus")
+        surrogate_corpus_rejected = False
+    except ValueError:
+        surrogate_corpus_rejected = True
+    record(
+        "ADV_CORPUS_LONE_SURROGATE",
+        surrogate_corpus_rejected,
+        surrogate_corpus_rejected,
     )
 
     # Protected URL/path/command/name coverage uses otherwise valid apostrophe edits.
