@@ -42,6 +42,13 @@ pub use formatting_commands::{
     SourceSpan,
 };
 
+mod formatting;
+pub use formatting::{
+    format_validated, format_validated_with, FormatOptions, FormattingBaseline, SourceAnchor,
+    WritingMode, FORMATTER_CONTRACT_ID, LOCAL_FORMATTER_WORK_DEADLINE,
+    MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES, VALIDATED_TRANSCRIPT_VERSION,
+};
+
 // Paged diagnostic responses are negotiated per REQUEST (see `Request::paged`),
 // never by protocol version. The version is interpolated into the socket path,
 // the single-instance lock, and the store directory, so bumping it partitions
