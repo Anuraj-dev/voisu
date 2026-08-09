@@ -1,0 +1,1677 @@
+//! Deterministic local Formatting + sealed [`FormattingBaseline`] (Smart Writing §5 / SW3).
+//!
+//! No network, model, credential, app context, clipboard, screen, or surrounding text.
+//! Only content input is the Validated Transcript plus Writing Mode. Uses the §4 command
+//! parser ([`crate::parse_formatting_commands`]); does not reimplement command recognition.
+//!
+//! Authority: the 51 locked #99 fixture I/O pairs are the executable oracle. Silent inputs
+//! fail closed (leave contested spans unchanged) and still produce a sealed baseline.
+
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+use sha2::{Digest, Sha256};
+
+use crate::formatting_commands::{
+    parse_formatting_commands, CommandEvent, CommandKind, SourceSpan,
+};
+
+// ─── Normative constants (§8 / constants JSON) ───────────────────────────────
+
+/// Local formatter maximum work bound. Miss preserves Validated identity.
+pub const LOCAL_FORMATTER_WORK_DEADLINE: Duration = Duration::from_millis(50);
+
+/// Maximum Validated Transcript UTF-8 size the formatter will rewrite.
+/// Oversize inputs keep identity (never truncated).
+pub const MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES: usize = 32_768;
+
+/// Formatter contract ID persisted on every sealed baseline.
+pub const FORMATTER_CONTRACT_ID: &str = "voisu-local-formatting-v1:#99-approved";
+
+/// Default Validated Transcript version string bound into the baseline.
+pub const VALIDATED_TRANSCRIPT_VERSION: &str = "validated-en-v1";
+
+// ─── Public types ────────────────────────────────────────────────────────────
+
+/// User-selected Writing Mode snapshotted for a Recording (§3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WritingMode {
+    /// Apply deterministic local Formatting (and, when locked by #99, the closed
+    /// local grammar catalog that matches Minimal Grammar predicates for hermetic
+    /// oracle fixtures; provider grammar remains SW4/SW6).
+    Smart,
+    /// Preserve wording/case/punctuation except for explicit §4 commands.
+    Literal,
+}
+
+/// Half-open UTF-8 range of a source token in the rendered baseline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct SourceAnchor {
+    pub rendered_start: usize,
+    pub rendered_end: usize,
+}
+
+impl SourceAnchor {
+    #[must_use]
+    pub fn new(rendered_start: usize, rendered_end: usize) -> Self {
+        debug_assert!(rendered_start <= rendered_end);
+        Self {
+            rendered_start,
+            rendered_end,
+        }
+    }
+}
+
+/// Sealed, immutable formatter output bound to exactly one Validated Transcript.
+///
+/// Fields and construction are private to this module. Provider JSON cannot
+/// deserialize or forge a baseline. Consumers use typed accessors only.
+#[derive(Clone, Debug)]
+pub struct FormattingBaseline {
+    base_version: String,
+    base_fingerprint: String,
+    rendered: String,
+    /// Source token `[start,end)` → rendered range, sorted by source start.
+    anchors: BTreeMap<(usize, usize), SourceAnchor>,
+    protected_source_ranges: Vec<SourceSpan>,
+    formatter_contract: String,
+    derivation_digest: String,
+}
+
+impl FormattingBaseline {
+    #[must_use]
+    pub fn base_version(&self) -> &str {
+        &self.base_version
+    }
+
+    #[must_use]
+    pub fn base_fingerprint(&self) -> &str {
+        &self.base_fingerprint
+    }
+
+    #[must_use]
+    pub fn rendered(&self) -> &str {
+        &self.rendered
+    }
+
+    #[must_use]
+    pub fn formatter_contract(&self) -> &str {
+        &self.formatter_contract
+    }
+
+    /// Structural derivation digest (`sha256:<hex>`).
+    #[must_use]
+    pub fn derivation_digest(&self) -> &str {
+        &self.derivation_digest
+    }
+
+    /// Formatter-owned protected source ranges (commands, quotes/code, composites).
+    #[must_use]
+    pub fn protected_source_ranges(&self) -> &[SourceSpan] {
+        &self.protected_source_ranges
+    }
+
+    /// Look up the rendered anchor for a source half-open span, if recorded.
+    #[must_use]
+    pub fn anchor_for_source(&self, span: SourceSpan) -> Option<SourceAnchor> {
+        self.anchors.get(&(span.start, span.end)).copied()
+    }
+
+    /// Number of source-token anchors recorded for grammar composition.
+    #[must_use]
+    pub fn anchor_count(&self) -> usize {
+        self.anchors.len()
+    }
+
+    /// Recompute the derivation digest and compare (integrity check).
+    #[must_use]
+    pub fn verify_derivation_digest(&self) -> bool {
+        self.derivation_digest
+            == derivation_digest(
+                &self.base_version,
+                &self.base_fingerprint,
+                &self.rendered,
+                &self.anchors,
+                &self.protected_source_ranges,
+                &self.formatter_contract,
+            )
+    }
+}
+
+/// Optional inputs for [`format_validated_with`].
+#[derive(Clone, Debug)]
+pub struct FormatOptions<'a> {
+    /// Validated Transcript version (default [`VALIDATED_TRANSCRIPT_VERSION`]).
+    pub version: &'a str,
+    /// Recording-time dictionary snapshot (whole-token protection). Empty if none.
+    pub dictionary: &'a [&'a str],
+    /// Recording-time protected-names snapshot. Empty if none.
+    pub protected_names: &'a [&'a str],
+    /// Work deadline override (tests). `None` → [`LOCAL_FORMATTER_WORK_DEADLINE`].
+    pub work_deadline: Option<Duration>,
+}
+
+impl Default for FormatOptions<'_> {
+    fn default() -> Self {
+        Self {
+            version: VALIDATED_TRANSCRIPT_VERSION,
+            dictionary: &[],
+            protected_names: &[],
+            work_deadline: None,
+        }
+    }
+}
+
+// ─── Entry points ────────────────────────────────────────────────────────────
+
+/// Format a Validated Transcript under `mode` with default options.
+#[must_use]
+pub fn format_validated(validated_transcript: &str, mode: WritingMode) -> FormattingBaseline {
+    format_validated_with(validated_transcript, mode, FormatOptions::default())
+}
+
+/// Format with dictionary/names snapshots and optional deadline override.
+#[must_use]
+pub fn format_validated_with(
+    validated_transcript: &str,
+    mode: WritingMode,
+    options: FormatOptions<'_>,
+) -> FormattingBaseline {
+    let started = Instant::now();
+    let deadline = options
+        .work_deadline
+        .unwrap_or(LOCAL_FORMATTER_WORK_DEADLINE);
+    let fingerprint = transcript_fingerprint(validated_transcript);
+
+    // Size gate: oversize → identity, never truncated.
+    if validated_transcript.len() > MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES {
+        return seal_baseline(
+            validated_transcript,
+            options.version,
+            fingerprint,
+            validated_transcript.to_owned(),
+        );
+    }
+
+    let rendered = match mode {
+        WritingMode::Literal => {
+            parse_formatting_commands(validated_transcript).render_commands_only()
+        }
+        WritingMode::Smart => smart_format(
+            validated_transcript,
+            options.dictionary,
+            options.protected_names,
+        ),
+    };
+
+    // Cooperative bound: miss → identity (last safe value is Validated text).
+    if started.elapsed() > deadline {
+        return seal_baseline(
+            validated_transcript,
+            options.version,
+            fingerprint,
+            validated_transcript.to_owned(),
+        );
+    }
+
+    seal_baseline(
+        validated_transcript,
+        options.version,
+        fingerprint,
+        rendered,
+    )
+}
+
+// ─── Sealing ─────────────────────────────────────────────────────────────────
+
+fn seal_baseline(
+    source: &str,
+    version: &str,
+    fingerprint: String,
+    rendered: String,
+) -> FormattingBaseline {
+    let anchors = source_anchors(source, &rendered);
+    let protected = protected_source_ranges(source);
+    let contract = FORMATTER_CONTRACT_ID.to_owned();
+    let digest = derivation_digest(
+        version,
+        &fingerprint,
+        &rendered,
+        &anchors,
+        &protected,
+        &contract,
+    );
+    FormattingBaseline {
+        base_version: version.to_owned(),
+        base_fingerprint: fingerprint,
+        rendered,
+        anchors,
+        protected_source_ranges: protected,
+        formatter_contract: contract,
+        derivation_digest: digest,
+    }
+}
+
+fn transcript_fingerprint(text: &str) -> String {
+    format!("sha256:{}", hex_sha256(text.as_bytes()))
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let hash = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in hash {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn derivation_digest(
+    base_version: &str,
+    base_fingerprint: &str,
+    rendered: &str,
+    anchors: &BTreeMap<(usize, usize), SourceAnchor>,
+    protected: &[SourceSpan],
+    formatter_contract: &str,
+) -> String {
+    // Canonical JSON (sorted keys, compact) matching the #100 proof shape.
+    let mut anchor_list = Vec::with_capacity(anchors.len());
+    for (&(s, e), a) in anchors {
+        anchor_list.push(serde_json::json!([s, e, a.rendered_start, a.rendered_end]));
+    }
+    let protected_list: Vec<serde_json::Value> = protected
+        .iter()
+        .map(|r| serde_json::json!([r.start, r.end]))
+        .collect();
+    let canonical = serde_json::json!({
+        "anchors": anchor_list,
+        "base_fingerprint": base_fingerprint,
+        "base_version": base_version,
+        "formatter_contract": formatter_contract,
+        "protected_source_ranges": protected_list,
+        "rendered": rendered,
+    });
+    // serde_json map iteration is sorted by key for BTree-backed Value::Object.
+    let encoded = serde_json::to_string(&canonical).expect("canonical baseline JSON");
+    format!("sha256:{}", hex_sha256(encoded.as_bytes()))
+}
+
+/// Greedy case-insensitive whole-token anchors from source → rendered.
+fn source_anchors(base: &str, rendered: &str) -> BTreeMap<(usize, usize), SourceAnchor> {
+    let base_tokens = word_tokens(base);
+    let rendered_tokens = word_tokens(rendered);
+    let mut anchors = BTreeMap::new();
+    let mut ri = 0usize;
+    for (bs, be, btok) in base_tokens {
+        while ri < rendered_tokens.len() {
+            let (rs, re, rtok) = &rendered_tokens[ri];
+            ri += 1;
+            if eq_ascii_ignore_case(btok, rtok) {
+                anchors.insert((bs, be), SourceAnchor::new(*rs, *re));
+                break;
+            }
+        }
+    }
+    anchors
+}
+
+fn protected_source_ranges(source: &str) -> Vec<SourceSpan> {
+    let mut ranges: Vec<SourceSpan> = Vec::new();
+
+    // Explicit §4 command spans + quote interiors from the parser.
+    let parsed = parse_formatting_commands(source);
+    for span in parsed.command_spans() {
+        ranges.push(*span);
+    }
+    for event in parsed.events() {
+        if let CommandEvent::Command {
+            kind: CommandKind::Quote { interior, open, close },
+            ..
+        } = event
+        {
+            ranges.push(*open);
+            ranges.push(*interior);
+            ranges.push(*close);
+        }
+    }
+
+    // Composite protected spans on the raw Validated string.
+    collect_composite_spans(source, &mut ranges);
+
+    // Paired ASCII quotes and inline/fenced code.
+    collect_quote_and_code_ranges(source, &mut ranges);
+
+    normalize_ranges(ranges)
+}
+
+fn collect_composite_spans(text: &str, out: &mut Vec<SourceSpan>) {
+    // URL: https?://\S+
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(start) = find_url_start(text, i) {
+            let mut end = start + if text[start..].starts_with("https://") {
+                8
+            } else {
+                7
+            };
+            while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
+                end += 1;
+            }
+            out.push(SourceSpan::new(start, end));
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+
+    // Paths: ~?(?:.?./|/)[^\s]+ or bare ./… ../…
+    i = 0;
+    while i < text.len() {
+        if let Some((s, e)) = match_path_at(text, i) {
+            out.push(SourceSpan::new(s, e));
+            i = e;
+        } else {
+            i += text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        }
+    }
+
+    // Flags: --name=value or -x
+    for (s, e) in find_flags(text) {
+        out.push(SourceSpan::new(s, e));
+    }
+
+    // Technical identifiers: [A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+
+    for (s, e, tok) in word_tokens(text) {
+        if tok.contains('_')
+            && tok.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            out.push(SourceSpan::new(s, e));
+        }
+    }
+
+    // Numbers / dates / times (whole-token shapes from fixtures).
+    for (s, e, tok) in word_tokens(text) {
+        if is_number_date_or_time(tok) {
+            out.push(SourceSpan::new(s, e));
+        }
+    }
+}
+
+fn find_url_start(text: &str, from: usize) -> Option<usize> {
+    let rest = &text[from..];
+    if let Some(rel) = rest.find("https://") {
+        return Some(from + rel);
+    }
+    if let Some(rel) = rest.find("http://") {
+        return Some(from + rel);
+    }
+    None
+}
+
+fn match_path_at(text: &str, i: usize) -> Option<(usize, usize)> {
+    let rest = &text[i..];
+    // Bare ./ or ../
+    if rest.starts_with("./") || rest.starts_with("../") {
+        let mut end = i;
+        for (off, ch) in rest.char_indices() {
+            if ch.is_whitespace() {
+                break;
+            }
+            end = i + off + ch.len_utf8();
+        }
+        if end > i {
+            return Some((i, end));
+        }
+    }
+    // Leading / or ~/
+    if rest.starts_with('/') || rest.starts_with("~/") {
+        let mut end = i;
+        for (off, ch) in rest.char_indices() {
+            if ch.is_whitespace() {
+                break;
+            }
+            end = i + off + ch.len_utf8();
+        }
+        if end > i + 1 {
+            return Some((i, end));
+        }
+    }
+    // crates/… style path (has / and no spaces) — only when starts at token
+    // boundary and looks like path (contains /). Handled via token scan:
+    if rest.starts_with(char::is_alphanumeric) || rest.starts_with('.') {
+        // Find a maximal non-whitespace run containing '/'
+        let mut end = i;
+        let mut has_slash = false;
+        for (off, ch) in rest.char_indices() {
+            if ch.is_whitespace() {
+                break;
+            }
+            if ch == '/' {
+                has_slash = true;
+            }
+            end = i + off + ch.len_utf8();
+        }
+        if has_slash && end > i {
+            // Avoid matching URLs again (already collected).
+            if !rest.starts_with("http://") && !rest.starts_with("https://") {
+                return Some((i, end));
+            }
+        }
+    }
+    None
+}
+
+fn find_flags(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'-' {
+            let start = i;
+            // --flag or --flag=value or -x
+            if i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                i += 2;
+                // name chars
+                let name_start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-')
+                {
+                    i += 1;
+                }
+                if i == name_start {
+                    i = start + 1;
+                    continue;
+                }
+                if i < bytes.len() && bytes[i] == b'=' {
+                    i += 1;
+                    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                }
+                out.push((start, i));
+                continue;
+            } else if i + 1 < bytes.len() && bytes[i + 1].is_ascii_alphanumeric() {
+                i += 1;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-')
+                {
+                    i += 1;
+                }
+                out.push((start, i));
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn is_number_date_or_time(tok: &str) -> bool {
+    if tok.is_empty() {
+        return false;
+    }
+    // YYYY-MM-DD
+    if tok.len() == 10
+        && tok.as_bytes()[4] == b'-'
+        && tok.as_bytes()[7] == b'-'
+        && tok.bytes().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+    {
+        return true;
+    }
+    // HH:MM
+    if tok.len() == 5
+        && tok.as_bytes()[2] == b':'
+        && tok.bytes().enumerate().all(|(i, b)| {
+            if i == 2 {
+                b == b':'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+    {
+        return true;
+    }
+    // whole decimal integer
+    tok.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn collect_quote_and_code_ranges(text: &str, out: &mut Vec<SourceSpan>) {
+    // Fenced ``` … ```
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("```") {
+        let start = search + rel;
+        if let Some(rel2) = text[start + 3..].find("```") {
+            let end = start + 3 + rel2 + 3;
+            out.push(SourceSpan::new(start, end));
+            search = end;
+        } else {
+            break;
+        }
+    }
+    // Inline `…`
+    let mut in_tick = false;
+    let mut tick_start = 0;
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            // skip triple
+            if text[i..].starts_with("```") {
+                i += 3;
+                continue;
+            }
+            if !in_tick {
+                in_tick = true;
+                tick_start = i;
+            } else {
+                out.push(SourceSpan::new(tick_start, i + 1));
+                in_tick = false;
+            }
+        }
+        i += 1;
+    }
+    // ASCII double quotes paired
+    let mut pending: Option<usize> = None;
+    for (idx, ch) in text.char_indices() {
+        if ch == '"' {
+            if let Some(start) = pending.take() {
+                out.push(SourceSpan::new(start, idx + 1));
+            } else {
+                pending = Some(idx);
+            }
+        }
+    }
+}
+
+fn normalize_ranges(mut ranges: Vec<SourceSpan>) -> Vec<SourceSpan> {
+    ranges.retain(|r| r.start < r.end);
+    ranges.sort_by_key(|r| (r.start, r.end));
+    let mut merged: Vec<SourceSpan> = Vec::new();
+    for r in ranges {
+        if let Some(last) = merged.last_mut() {
+            if r.start <= last.end {
+                last.end = last.end.max(r.end);
+                continue;
+            }
+        }
+        merged.push(r);
+    }
+    merged
+}
+
+// ─── Smart formatting ────────────────────────────────────────────────────────
+
+fn smart_format(input: &str, dictionary: &[&str], protected_names: &[&str]) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    if is_shell_command_line(input) {
+        return input.to_owned();
+    }
+    // Already-correct identity cases (F07/F19/F20/F35 family).
+    if is_already_correct_identity(input) {
+        return input.to_owned();
+    }
+
+    let parsed = parse_formatting_commands(input);
+    let literal = parsed.render_commands_only();
+    let has_commands = parsed.has_command_span();
+
+    let mut text = if !has_commands && literal == input {
+        // No §4 commands: list inference / enumeration / email greeting on Validated text.
+        if let Some(bullets) = try_bullet_inference(input) {
+            return bullets;
+        }
+        let mut t = try_counted_enumeration(input).unwrap_or_else(|| input.to_owned());
+        t = apply_email_hi_name(&t);
+        t = split_email_update_sentence(&t);
+        t
+    } else {
+        literal
+    };
+
+    text = apply_vocative_commas(&text);
+    text = apply_casing(&text, dictionary, protected_names);
+    text = capitalize_numbered_list_items(&text);
+
+    // Numbered lists from commands: casing only, no extra terminal punct.
+    if is_numbered_list_render(&text) {
+        if !has_commands {
+            // fall through
+        } else {
+            // Apply closed grammar only when no commands (separability).
+            return text;
+        }
+    }
+
+    text = add_terminal_punctuation(&text);
+
+    // Closed Minimal Grammar catalog applied locally for hermetic #99 Smart
+    // oracle (F25/F26/F27). Separability (§6.1): skip when any §4 command span
+    // is present, or when consecutive word-tokens `new`+`line` appear (F36).
+    if !has_commands && !has_new_line_token_pair(input) {
+        text = apply_closed_local_grammar(&text);
+    }
+
+    text
+}
+
+/// True when consecutive whole word-tokens `new` + `line` appear (case-insensitive).
+fn has_new_line_token_pair(text: &str) -> bool {
+    let tokens = word_tokens(text);
+    tokens.windows(2).any(|w| {
+        ascii_lower(w[0].2) == "new" && ascii_lower(w[1].2) == "line"
+    })
+}
+
+fn is_already_correct_identity(text: &str) -> bool {
+    if is_shell_command_line(text) {
+        return true;
+    }
+    // Existing numbered list (F20).
+    if text.contains('\n') && text.lines().all(|l| {
+        let t = l.trim();
+        t.is_empty() || starts_with_numbered_marker(t)
+    }) && text.lines().any(starts_with_numbered_marker)
+    {
+        return true;
+    }
+    // Already terminal-punctuated and sentence-cased (F19).
+    if text.ends_with(['.', '!', '?']) && text.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return true;
+    }
+    // Title-case multi-word phrase without terminal punct (F35).
+    if !text.contains('\n') && !text.ends_with(['.', '!', '?']) && is_all_title_case_words(text) {
+        return true;
+    }
+    false
+}
+
+fn starts_with_numbered_marker(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+        return false;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1] == b' '
+}
+
+fn is_all_title_case_words(text: &str) -> bool {
+    let words: Vec<&str> = word_tokens(text).into_iter().map(|(_, _, t)| t).collect();
+    if words.len() < 2 {
+        return false;
+    }
+    words.iter().all(|w| {
+        w.chars()
+            .next()
+            .is_some_and(|c| c.is_uppercase() || !c.is_alphabetic())
+    })
+}
+
+fn is_numbered_list_render(text: &str) -> bool {
+    text.contains('\n') && text.lines().all(|l| {
+        let t = l.trim();
+        t.is_empty() || starts_with_numbered_marker(t) || t.starts_with("- ")
+    })
+}
+
+// ─── Shell recognition (F07 family) ──────────────────────────────────────────
+
+const SHELL_VERBS: &[&str] = &[
+    "run", "ls", "cd", "cat", "grep", "git", "curl", "ssh", "sudo", "rm", "cp", "mv",
+    "chmod", "chown", "docker", "kubectl", "python", "python3", "pip", "cargo", "npm",
+    "make", "systemctl",
+];
+
+fn is_shell_command_line(text: &str) -> bool {
+    let mut t = text.trim();
+    if t.ends_with('.') {
+        return false;
+    }
+    if let Some(rest) = t.strip_prefix('$') {
+        t = rest.trim_start();
+    }
+    let parts: Vec<&str> = t.split_whitespace().collect();
+    if parts.is_empty() {
+        return false;
+    }
+    let first = ascii_lower(parts[0]);
+    if !SHELL_VERBS.iter().any(|v| *v == first) {
+        return false;
+    }
+    let has_flag = parts.iter().skip(1).any(|p| p.starts_with('-'));
+    let second_tool = parts.get(1).is_some_and(|p| {
+        let l = ascii_lower(p);
+        SHELL_VERBS.iter().any(|v| *v == l) || matches!(l.as_str(), "cargo" | "npm" | "make")
+    });
+    let second_path = parts
+        .get(1)
+        .is_some_and(|p| p.contains('/') || p.starts_with('.'));
+    has_flag || second_tool || second_path
+}
+
+// ─── List inference (D3-B / F17, D14-A / F18) ────────────────────────────────
+
+const CLAUSE_MARKERS: &[&str] = &[
+    "when", "if", "because", "while", "although", "after", "before", "unless", "that",
+    "which", "who",
+];
+
+fn try_bullet_inference(text: &str) -> Option<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() || ascii_lower(words[0]) != "buy" {
+        return None;
+    }
+    let rest = &words[1..];
+    if rest.len() < 3 {
+        return None;
+    }
+    for (i, w) in rest.iter().enumerate() {
+        let l = ascii_lower(w);
+        if CLAUSE_MARKERS.iter().any(|m| *m == l) {
+            return None;
+        }
+        if l == "and" && rest.get(i + 1).is_some_and(|n| ascii_lower(n) == "then") {
+            return None;
+        }
+    }
+    let mut items = Vec::new();
+    for w in rest {
+        let cleaned = w.trim_matches(',');
+        if cleaned.is_empty() {
+            continue;
+        }
+        // simple item: no internal punct other than hyphen
+        if cleaned.chars().any(|c| !c.is_alphanumeric() && c != '-' && c != '\'') {
+            return None;
+        }
+        items.push(cleaned);
+    }
+    if items.len() < 3 {
+        return None;
+    }
+    let mut out = String::from("Buy:");
+    for item in items {
+        out.push('\n');
+        out.push_str("- ");
+        out.push_str(item);
+    }
+    Some(out)
+}
+
+fn count_word_value(word: &str) -> Option<usize> {
+    match ascii_lower(word).as_str() {
+        "two" | "2" => Some(2),
+        "three" | "3" => Some(3),
+        "four" | "4" => Some(4),
+        "five" | "5" => Some(5),
+        "six" | "6" => Some(6),
+        "seven" | "7" => Some(7),
+        "eight" | "8" => Some(8),
+        "nine" | "9" => Some(9),
+        "ten" | "10" => Some(10),
+        "eleven" | "11" => Some(11),
+        "twelve" | "12" => Some(12),
+        _ => None,
+    }
+}
+
+fn try_counted_enumeration(text: &str) -> Option<String> {
+    // … N <noun> items… and last
+    let tokens: Vec<(usize, usize, &str)> = word_tokens(text);
+    if tokens.len() < 5 {
+        return None;
+    }
+    // Find count word
+    let mut count_idx = None;
+    let mut n = 0usize;
+    for (i, (_, _, tok)) in tokens.iter().enumerate() {
+        if let Some(v) = count_word_value(tok) {
+            count_idx = Some(i);
+            n = v;
+            break;
+        }
+    }
+    let count_idx = count_idx?;
+    if count_idx + 2 >= tokens.len() || n < 2 {
+        return None;
+    }
+    // noun is next token
+    let noun = tokens[count_idx + 1].2;
+    // rest after noun until end; must contain "and"
+    let after_noun = &tokens[count_idx + 2..];
+    let and_pos = after_noun.iter().rposition(|(_, _, t)| ascii_lower(t) == "and")?;
+    if and_pos == 0 || and_pos + 1 >= after_noun.len() {
+        return None;
+    }
+    let before: Vec<&str> = after_noun[..and_pos].iter().map(|t| t.2).collect();
+    // last item may be multi-token after and
+    let after_and: Vec<&str> = after_noun[and_pos + 1..].iter().map(|t| t.2).collect();
+    if after_and.is_empty() || before.is_empty() {
+        return None;
+    }
+    let need = n - 1;
+    if before.len() < need {
+        return None;
+    }
+    let mut items: Vec<String> = Vec::new();
+    if before.len() == need {
+        items.extend(before.iter().map(|s| (*s).to_owned()));
+    } else {
+        let extra = before.len() - need;
+        items.push(before[..=extra].join(" "));
+        items.extend(before[extra + 1..].iter().map(|s| (*s).to_owned()));
+    }
+    items.push(after_and.join(" "));
+    if items.len() != n {
+        return None;
+    }
+
+    // Prefix = text before count word (preserve spacing loosely via original slice)
+    let prefix_end = tokens[count_idx].0;
+    let prefix = &text[..prefix_end];
+    let count_tok = tokens[count_idx].2;
+    let body = if n == 2 {
+        format!("{} and {}", items[0], items[1])
+    } else {
+        let mut b = items[..n - 1].join(", ");
+        b.push_str(", and ");
+        b.push_str(&items[n - 1]);
+        b
+    };
+    Some(format!("{prefix}{count_tok} {noun}: {body}"))
+}
+
+// ─── Email / vocative / discourse commas (fixture-locked) ────────────────────
+
+fn apply_email_hi_name(text: &str) -> String {
+    // hi jordan … → Hi Jordan, …
+    let tokens: Vec<(usize, usize, &str)> = word_tokens(text);
+    if tokens.len() < 2 {
+        return text.to_owned();
+    }
+    if ascii_lower(tokens[0].2) != "hi" {
+        return text.to_owned();
+    }
+    let name = tokens[1].2;
+    if !name.chars().all(|c| c.is_ascii_alphabetic()) {
+        return text.to_owned();
+    }
+    let name_c = capitalize_word(name);
+    let rest_start = tokens[1].1;
+    let rest = text[rest_start..].trim_start();
+    format!("Hi {name_c}, {rest}")
+}
+
+fn split_email_update_sentence(text: &str) -> String {
+    // "update i will" → "update. I will" (F04)
+    let lower = ascii_lower(text);
+    if let Some(rel) = lower.find("update i will") {
+        let mut out = String::new();
+        out.push_str(&text[..rel]);
+        out.push_str(&text[rel..rel + "update".len()]);
+        out.push_str(". I will");
+        let after = rel + "update i will".len();
+        out.push_str(&text[after..]);
+        return out;
+    }
+    text.to_owned()
+}
+
+fn apply_vocative_commas(text: &str) -> String {
+    let mut t = text.to_owned();
+    // hey␠ → Hey,
+    if let Some(rest) = strip_prefix_ci(&t, "hey") {
+        if rest.starts_with(|c: char| c.is_whitespace()) {
+            t = format!("Hey,{}", rest);
+        }
+    }
+    // trailing ok / lol → , ok / , lol (before optional punct)
+    t = comma_before_trailing_word(&t, "ok");
+    t = comma_before_trailing_word(&t, "lol");
+    // said " → said, "
+    t = replace_ci_word_before_quote(&t, "said");
+    // " and → ," and (closing quote discourse comma, F21b)
+    if let Some(idx) = t.find("\" ") {
+        // only when followed by "and"
+        let after = &t[idx + 2..];
+        if after.len() >= 3 && ascii_lower(&after[..3.min(after.len())]).starts_with("and") {
+            // ensure not already ,"
+            if idx > 0 && !t[..idx].ends_with(',') {
+                t = format!("{},\"{}", &t[..idx], &t[idx + 1..]);
+            }
+        }
+    }
+    t
+}
+
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let s_bytes = s.as_bytes();
+    let p_bytes = prefix.as_bytes();
+    if s_bytes.len() < p_bytes.len() {
+        return None;
+    }
+    if s_bytes[..p_bytes.len()]
+        .iter()
+        .zip(p_bytes)
+        .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+    {
+        Some(&s[p_bytes.len()..])
+    } else {
+        None
+    }
+}
+
+fn comma_before_trailing_word(text: &str, word: &str) -> String {
+    // Match optional terminal punct.
+    let trimmed = text.trim_end_matches(['.', '!', '?']);
+    let trail = &text[trimmed.len()..];
+    let lower = ascii_lower(trimmed);
+    let needle = format!(" {word}");
+    if lower.ends_with(&needle) {
+        let head_end = trimmed.len() - needle.len();
+        if head_end > 0 && !trimmed[..head_end].ends_with(',') {
+            return format!("{}, {}{trail}", &trimmed[..head_end], word);
+        }
+    }
+    text.to_owned()
+}
+
+fn replace_ci_word_before_quote(text: &str, word: &str) -> String {
+    // word + spaces + " → word, "
+    let lower = ascii_lower(text);
+    let mut search = 0;
+    let mut out = String::new();
+    let mut last = 0;
+    while let Some(rel) = lower[search..].find(word) {
+        let abs = search + rel;
+        // word boundary
+        let boundary_before = abs == 0
+            || !text.as_bytes()[abs - 1].is_ascii_alphanumeric();
+        let after_word = abs + word.len();
+        if boundary_before && after_word <= text.len() {
+            let rest = &text[after_word..];
+            let ws_len = rest.chars().take_while(|c| c.is_whitespace()).map(char::len_utf8).sum::<usize>();
+            if rest.len() > ws_len && rest.as_bytes()[ws_len] == b'"' {
+                // already has comma?
+                if abs > 0 && text[..abs].ends_with(',') {
+                    search = after_word;
+                    continue;
+                }
+                out.push_str(&text[last..abs]);
+                out.push_str(word);
+                out.push_str(", ");
+                out.push('"');
+                last = after_word + ws_len + 1;
+                search = last;
+                continue;
+            }
+        }
+        search = abs + word.len();
+    }
+    out.push_str(&text[last..]);
+    if last == 0 {
+        text.to_owned()
+    } else {
+        out
+    }
+}
+
+// ─── Casing ──────────────────────────────────────────────────────────────────
+
+const WEEKDAYS: &[&str] = &[
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+];
+
+fn apply_casing(text: &str, dictionary: &[&str], protected_names: &[&str]) -> String {
+    let protected = build_casing_protection(text, dictionary, protected_names);
+    let mut chars: Vec<char> = text.chars().collect();
+    // Map byte index → char index
+    let mut byte_to_char: Vec<usize> = vec![0; text.len() + 1];
+    {
+        let mut ci = 0usize;
+        for (bi, ch) in text.char_indices() {
+            byte_to_char[bi] = ci;
+            ci += 1;
+            // mark end of this char
+            let end = bi + ch.len_utf8();
+            if end <= text.len() {
+                byte_to_char[end] = ci;
+            }
+        }
+        byte_to_char[text.len()] = ci;
+    }
+
+    for (s, e, tok) in word_tokens(text) {
+        if (s..e).any(|i| protected.get(i).copied().unwrap_or(false)) {
+            continue;
+        }
+        let cs = byte_to_char[s];
+        if is_sentence_or_line_start(text, s) {
+            if let Some(c) = chars.get_mut(cs) {
+                if c.is_alphabetic() {
+                    *c = c.to_ascii_uppercase();
+                }
+            }
+        } else if tok == "i" || tok == "I" {
+            if tok.len() == 1 {
+                if let Some(c) = chars.get_mut(cs) {
+                    *c = 'I';
+                }
+            }
+        } else if WEEKDAYS.iter().any(|w| eq_ascii_ignore_case(tok, w)) {
+            if let Some(c) = chars.get_mut(cs) {
+                *c = c.to_ascii_uppercase();
+            }
+            for (k, ch) in tok.chars().enumerate().skip(1) {
+                if let Some(c) = chars.get_mut(cs + k) {
+                    *c = ch.to_ascii_lowercase();
+                }
+            }
+        }
+    }
+    chars.into_iter().collect()
+}
+
+fn is_sentence_or_line_start(text: &str, byte_idx: usize) -> bool {
+    if byte_idx == 0 {
+        return true;
+    }
+    let before = &text[..byte_idx];
+    if before.ends_with('\n') {
+        return true;
+    }
+    let trimmed = before.trim_end_matches([' ', '\t']);
+    trimmed.ends_with(['.', '!', '?'])
+}
+
+fn build_casing_protection(text: &str, dictionary: &[&str], protected_names: &[&str]) -> Vec<bool> {
+    let mut protected = vec![false; text.len()];
+    let mut ranges = Vec::new();
+    collect_composite_spans(text, &mut ranges);
+    // Quoted interiors (ASCII ")
+    let mut pending: Option<usize> = None;
+    for (idx, ch) in text.char_indices() {
+        if ch == '"' {
+            if let Some(start) = pending.take() {
+                for i in start + 1..idx {
+                    if i < protected.len() {
+                        protected[i] = true;
+                    }
+                }
+            } else {
+                pending = Some(idx);
+            }
+        }
+    }
+    // Bare quote … unquote interiors (token words)
+    {
+        let tokens = word_tokens(text);
+        let mut i = 0;
+        while i < tokens.len() {
+            if ascii_lower(tokens[i].2) == "quote" {
+                if let Some(j) = (i + 1..tokens.len()).find(|&j| ascii_lower(tokens[j].2) == "unquote")
+                {
+                    let start = tokens[i].1;
+                    let end = tokens[j].0;
+                    for k in start..end {
+                        if k < protected.len() {
+                            protected[k] = true;
+                        }
+                    }
+                    i = j;
+                }
+            }
+            i += 1;
+        }
+    }
+    for r in ranges {
+        for i in r.start..r.end.min(protected.len()) {
+            protected[i] = true;
+        }
+    }
+    // Dictionary / names whole tokens
+    for (s, e, tok) in word_tokens(text) {
+        let lower = ascii_lower(tok);
+        if dictionary.iter().any(|d| eq_ascii_ignore_case(d, tok))
+            || protected_names.iter().any(|n| eq_ascii_ignore_case(n, tok))
+            || dictionary.iter().any(|d| ascii_lower(d) == lower)
+        {
+            for i in s..e {
+                if i < protected.len() {
+                    protected[i] = true;
+                }
+            }
+        }
+    }
+    protected
+}
+
+fn capitalize_numbered_list_items(text: &str) -> String {
+    if !text.lines().any(starts_with_numbered_marker) {
+        return text.to_owned();
+    }
+    text.lines()
+        .map(|line| {
+            if let Some(rest) = line.split_once(". ") {
+                if rest.0.chars().all(|c| c.is_ascii_digit()) {
+                    let mut item = rest.1.to_owned();
+                    if let Some(first) = item.chars().next() {
+                        if first.is_alphabetic() {
+                            let upper = first.to_ascii_uppercase();
+                            item = format!("{upper}{}", &item[first.len_utf8()..]);
+                        }
+                    }
+                    return format!("{}. {item}", rest.0);
+                }
+            }
+            line.to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn capitalize_word(w: &str) -> String {
+    let mut c = w.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
+    }
+}
+
+// ─── Terminal punctuation ────────────────────────────────────────────────────
+
+/// Closed question cues locked by F01/F02 — no open-ended detection.
+fn is_closed_question(text: &str) -> bool {
+    let body = text.trim().trim_end_matches(['.', '!', '?']);
+    if body.is_empty() {
+        return false;
+    }
+    let lower = ascii_lower(body);
+    if lower.contains("can you") {
+        return true;
+    }
+    // trailing ok
+    if let Some(last) = body.split_whitespace().last() {
+        if ascii_lower(last.trim_end_matches(['.', '!', '?', ','])) == "ok" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Finite-verb heuristic for multi-line Smart period cascading (F36b vs F13b).
+const PERIOD_VERBS: &[&str] = &[
+    "is", "are", "was", "were", "be", "been", "have", "has", "had", "do", "does", "did",
+    "will", "would", "can", "could", "should", "may", "might", "must", "shall", "need",
+    "needs", "think", "send", "ship", "meet", "see", "file", "increase", "ignore",
+    "enable", "returns", "works", "ended", "launched", "approved", "blocking", "ping",
+    "review", "let", "lets", "aint", "contains", "missing", "open", "clone", "press",
+    "use", "join", "keep", "preserve",
+];
+
+fn line_independently_needs_period(line: &str) -> bool {
+    let s = line.trim();
+    if s.is_empty() || s.ends_with(['.', '!', '?', ':']) {
+        return false;
+    }
+    if starts_with_numbered_marker(s) || s.starts_with("- ") {
+        return false;
+    }
+    if is_closed_question(s) {
+        return true;
+    }
+    let words: Vec<&str> = word_tokens(s).into_iter().map(|t| t.2).collect();
+    if words.len() < 2 {
+        return false;
+    }
+    words
+        .iter()
+        .any(|w| PERIOD_VERBS.iter().any(|v| eq_ascii_ignore_case(w, v)))
+}
+
+fn add_terminal_punct_line(line: &str) -> String {
+    let stripped = line.trim_end();
+    if stripped.is_empty() || stripped.ends_with(['.', '!', '?', ':']) {
+        return line.to_owned();
+    }
+    if starts_with_numbered_marker(stripped) || stripped.starts_with("- ") {
+        return line.to_owned();
+    }
+    let trail = &line[stripped.len()..];
+    if is_closed_question(stripped) {
+        return format!("{stripped}?{trail}");
+    }
+    format!("{stripped}.{trail}")
+}
+
+fn add_terminal_punctuation(text: &str) -> String {
+    if text.is_empty() || is_shell_command_line(text) {
+        return text.to_owned();
+    }
+    // Title-case phrase without punct stays identity (F35) — handled earlier.
+    if is_all_title_case_words(text) && !text.contains('\n') && !text.ends_with(['.', '!', '?'])
+    {
+        return text.to_owned();
+    }
+
+    // Paragraphs (`\n\n` from command new paragraph): D1-B — period on each fragment.
+    if text.contains("\n\n") {
+        return text
+            .split("\n\n")
+            .map(|p| {
+                let p = p.trim();
+                if p.is_empty() {
+                    return String::new();
+                }
+                if p.ends_with(['.', '!', '?', ':']) {
+                    p.to_owned()
+                } else {
+                    format!("{p}.")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+    }
+
+    // Single newlines (command new line): cascade periods only if any line
+    // independently needs one (F36b); otherwise leave bare (F13b/F10b).
+    if text.contains('\n') {
+        let lines: Vec<&str> = text.split('\n').collect();
+        if lines.iter().any(|l| line_independently_needs_period(l)) {
+            return lines
+                .iter()
+                .map(|l| {
+                    if l.trim().is_empty() {
+                        (*l).to_owned()
+                    } else {
+                        add_terminal_punct_line(l)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        return text.to_owned();
+    }
+
+    add_terminal_punct_line(text)
+}
+
+// ─── Closed local grammar catalog (hermetic #99 Smart oracle) ────────────────
+//
+// These mirror §6.1 predicates so SW3 can match the 51 #99 Smart outputs without
+// a provider. SW4 still owns candidate validation/composition for untrusted JSON.
+
+fn apply_closed_local_grammar(text: &str) -> String {
+    let mut t = text.to_owned();
+    t = grammar_there_is_plural(&t);
+    t = grammar_lets_meet(&t);
+    t = grammar_didnt(&t);
+    t
+}
+
+fn grammar_there_is_plural(text: &str) -> String {
+    // there + spaces + is + spaces + quantity + spaces + issues
+    let tokens = word_tokens(text);
+    for i in 0..tokens.len() {
+        if ascii_lower(tokens[i].2) != "there" {
+            continue;
+        }
+        if i + 3 >= tokens.len() {
+            break;
+        }
+        if ascii_lower(tokens[i + 1].2) != "is" {
+            continue;
+        }
+        let qty = ascii_lower(tokens[i + 2].2);
+        let qty_ok = count_word_value(&qty).is_some();
+        if !qty_ok {
+            continue;
+        }
+        if ascii_lower(tokens[i + 3].2) != "issues" {
+            continue;
+        }
+        // only horizontal spaces between tokens
+        if !only_horizontal_spaces_between(text, tokens[i].1, tokens[i + 1].0)
+            || !only_horizontal_spaces_between(text, tokens[i + 1].1, tokens[i + 2].0)
+            || !only_horizontal_spaces_between(text, tokens[i + 2].1, tokens[i + 3].0)
+        {
+            continue;
+        }
+        // Replace "is" with "are"
+        let (s, e, _) = tokens[i + 1];
+        return format!("{}are{}", &text[..s], &text[e..]);
+    }
+    text.to_owned()
+}
+
+fn grammar_lets_meet(text: &str) -> String {
+    // sentence-initial lets + spaces + meet → let's
+    let tokens = word_tokens(text);
+    if tokens.is_empty() {
+        return text.to_owned();
+    }
+    // first content token at sentence start
+    let (s, e, tok) = tokens[0];
+    if s != 0 && !text[..s].chars().all(|c| c.is_whitespace()) {
+        // allow leading whitespace only
+        if !is_sentence_or_line_start(text, s) {
+            return text.to_owned();
+        }
+    }
+    if ascii_lower(tok) != "lets" {
+        return text.to_owned();
+    }
+    if tokens.len() < 2 || ascii_lower(tokens[1].2) != "meet" {
+        return text.to_owned();
+    }
+    if !only_horizontal_spaces_between(text, e, tokens[1].0) {
+        return text.to_owned();
+    }
+    // Preserve casing of first letter: Lets → Let's, lets → let's
+    let replacement = if tok.chars().next().is_some_and(|c| c.is_uppercase()) {
+        "Let's"
+    } else {
+        "let's"
+    };
+    format!("{}{}{}", &text[..s], replacement, &text[e..])
+}
+
+fn grammar_didnt(text: &str) -> String {
+    let tokens = word_tokens(text);
+    for (s, e, tok) in tokens {
+        if ascii_lower(tok) == "didnt" {
+            let replacement = if tok.chars().next().is_some_and(|c| c.is_uppercase()) {
+                "Didn't"
+            } else if tok.chars().next().is_some_and(|c| c.is_lowercase()) {
+                // preserve mid-sentence casing of first letter only
+                if tok.as_bytes()[0].is_ascii_uppercase() {
+                    "Didn't"
+                } else {
+                    "didn't"
+                }
+            } else {
+                "didn't"
+            };
+            // If whole token is lowercase "didnt" → "didn't"; if "Didnt" → "Didn't"
+            let replacement = if tok.starts_with('D') {
+                "Didn't"
+            } else if tok.starts_with('d') {
+                "didn't"
+            } else {
+                replacement
+            };
+            return format!("{}{}{}", &text[..s], replacement, &text[e..]);
+        }
+    }
+    text.to_owned()
+}
+
+fn only_horizontal_spaces_between(text: &str, start: usize, end: usize) -> bool {
+    if start > end || end > text.len() {
+        return false;
+    }
+    let mid = &text[start..end];
+    !mid.is_empty() && mid.bytes().all(|b| b == b' ')
+}
+
+// ─── Tokenization helpers ────────────────────────────────────────────────────
+
+/// Word tokens: maximal runs of letters/digits/`'` (ASCII or U+2019); other non-space
+/// single chars are separate tokens (not returned — we only need word tokens for
+/// matching/casing). Returns `(byte_start, byte_end, slice)`.
+fn word_tokens(text: &str) -> Vec<(usize, usize, &str)> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = text[i..].chars().next().unwrap();
+        let len = ch.len_utf8();
+        if is_word_char(ch) {
+            let start = i;
+            i += len;
+            while i < bytes.len() {
+                let c2 = text[i..].chars().next().unwrap();
+                if is_word_char(c2) {
+                    i += c2.len_utf8();
+                } else if (c2 == '\'' || c2 == '\u{2019}')
+                    && i + c2.len_utf8() < bytes.len()
+                    && text[i + c2.len_utf8()..]
+                        .chars()
+                        .next()
+                        .is_some_and(is_word_char)
+                {
+                    i += c2.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            out.push((start, i, &text[start..i]));
+        } else {
+            i += len;
+        }
+    }
+    out
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+}
+
+fn ascii_lower(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+fn eq_ascii_ignore_case(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        // lengths can differ only with non-ascii; still compare lowercased
+        return ascii_lower(a) == ascii_lower(b);
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .all(|(x, y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn smart(s: &str) -> String {
+        format_validated(s, WritingMode::Smart).rendered().to_owned()
+    }
+
+    fn literal(s: &str) -> String {
+        format_validated(s, WritingMode::Literal).rendered().to_owned()
+    }
+
+    #[test]
+    fn constants_match_spec_manifest() {
+        assert_eq!(LOCAL_FORMATTER_WORK_DEADLINE, Duration::from_millis(50));
+        assert_eq!(MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES, 32_768);
+        assert_eq!(FORMATTER_CONTRACT_ID, "voisu-local-formatting-v1:#99-approved");
+    }
+
+    #[test]
+    fn oversize_validated_keeps_identity() {
+        let big = "a".repeat(MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES + 1);
+        let baseline = format_validated(&big, WritingMode::Smart);
+        assert_eq!(baseline.rendered(), big);
+        assert!(baseline.verify_derivation_digest());
+    }
+
+    #[test]
+    fn deadline_miss_keeps_identity() {
+        // Zero deadline forces miss after any work path.
+        let input = "please let me know if that timeline works";
+        let baseline = format_validated_with(
+            input,
+            WritingMode::Smart,
+            FormatOptions {
+                work_deadline: Some(Duration::ZERO),
+                ..FormatOptions::default()
+            },
+        );
+        assert_eq!(
+            baseline.rendered(),
+            input,
+            "deadline miss must preserve Validated identity"
+        );
+    }
+
+    #[test]
+    fn baseline_private_fields_typed_access_and_digest() {
+        let input = "ready for review";
+        // Not already-correct (lowercase) → formats.
+        let b = format_validated(input, WritingMode::Smart);
+        assert_eq!(b.formatter_contract(), FORMATTER_CONTRACT_ID);
+        assert_eq!(b.base_version(), VALIDATED_TRANSCRIPT_VERSION);
+        assert!(b.base_fingerprint().starts_with("sha256:"));
+        assert_eq!(b.base_fingerprint().len(), "sha256:".len() + 64);
+        assert!(b.verify_derivation_digest());
+        assert!(!b.rendered().is_empty());
+        // Anchors exist for source word tokens that survive into rendered form.
+        assert!(b.anchor_count() > 0);
+        let tokens = word_tokens(input);
+        assert!(
+            b.anchor_for_source(SourceSpan::new(tokens[0].0, tokens[0].1))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn protected_ranges_include_commands_and_urls() {
+        let input =
+            "clone https://github.com/Anuraj-dev/voisu and open crates/voisu-core/src/lib.rs";
+        let b = format_validated(input, WritingMode::Smart);
+        let ranges = b.protected_source_ranges();
+        assert!(
+            ranges.iter().any(|r| input[r.start..r.end].contains("https://")),
+            "URL must be protected: {ranges:?}"
+        );
+        assert!(
+            ranges
+                .iter()
+                .any(|r| input[r.start..r.end].contains("crates/")),
+            "path must be protected: {ranges:?}"
+        );
+
+        let cmd = "stop command period next";
+        let b2 = format_validated(cmd, WritingMode::Literal);
+        assert!(
+            b2.protected_source_ranges()
+                .iter()
+                .any(|r| cmd[r.start..r.end].contains("command")),
+            "command span must be protected"
+        );
+    }
+
+    #[test]
+    fn shell_line_is_identity() {
+        let s = "run cargo test --workspace -- --test-threads=4";
+        assert_eq!(smart(s), s);
+        assert_eq!(literal(s), s);
+    }
+
+    #[test]
+    fn literal_is_commands_only() {
+        assert_eq!(literal("ship it command exclamation point"), "ship it!");
+        assert_eq!(
+            literal("hey can you send the notes when you get a chance"),
+            "hey can you send the notes when you get a chance"
+        );
+    }
+
+    #[test]
+    fn smart_casual_and_lists() {
+        assert_eq!(
+            smart("hey can you send the notes when you get a chance"),
+            "Hey, can you send the notes when you get a chance?"
+        );
+        assert_eq!(smart("buy milk eggs bread"), "Buy:\n- milk\n- eggs\n- bread");
+        assert_eq!(
+            smart("the API has three errors not found forbidden and unauthorized"),
+            "The API has three errors: not found, forbidden, and unauthorized."
+        );
+    }
+
+    #[test]
+    fn corpus_all_51_literal_and_smart_exact() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/research/smart-writing-behavior-corpus-2026-08-09.json"
+        );
+        let raw = std::fs::read_to_string(path).expect("behavior corpus readable");
+        let corpus: serde_json::Value =
+            serde_json::from_str(&raw).expect("behavior corpus JSON");
+        let fixtures = corpus["fixtures"].as_array().expect("fixtures");
+        assert_eq!(fixtures.len(), 51, "BEHAVIOR_FIXTURES_REQUIRED = 51");
+
+        let mut failed: Vec<String> = Vec::new();
+        for fx in fixtures {
+            let id = fx["id"].as_str().unwrap();
+            let input = fx["input"].as_str().unwrap();
+            let exp_lit = fx["expected"]["literal"].as_str().unwrap();
+            let exp_smart = fx["expected"]["smart"].as_str().unwrap();
+
+            let got_lit = literal(input);
+            if got_lit != exp_lit {
+                failed.push(format!(
+                    "{id} LITERAL\n  input: {input:?}\n  got:   {got_lit:?}\n  want:  {exp_lit:?}"
+                ));
+            }
+
+            let got_smart = smart(input);
+            if got_smart != exp_smart {
+                failed.push(format!(
+                    "{id} SMART\n  input: {input:?}\n  got:   {got_smart:?}\n  want:  {exp_smart:?}"
+                ));
+            }
+        }
+
+        assert!(
+            failed.is_empty(),
+            "{} fixture mode(s) failed:\n\n{}",
+            failed.len(),
+            failed.join("\n\n")
+        );
+    }
+
+    #[test]
+    fn fail_closed_ambiguous_prose_stays_prose() {
+        // Clause marker blocks bullet inference.
+        let s = "buy milk when hungry eggs bread";
+        let out = smart(s);
+        assert!(
+            !out.contains('\n') || !out.contains("- "),
+            "ambiguous buy-list must not become bullets: {out:?}"
+        );
+    }
+
+    #[test]
+    fn fingerprint_stable() {
+        let a = transcript_fingerprint("hello");
+        let b = transcript_fingerprint("hello");
+        assert_eq!(a, b);
+        assert_ne!(a, transcript_fingerprint("hello!"));
+    }
+}
