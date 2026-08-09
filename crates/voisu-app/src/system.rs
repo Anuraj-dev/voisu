@@ -3314,6 +3314,11 @@ struct CredentialRunningChild {
     stderr: Option<tokio::process::ChildStderr>,
     stdout_buf: Vec<u8>,
     stderr_buf: Vec<u8>,
+    /// True after `Child::wait`/`try_wait` observed exit. A second wait must not
+    /// run; remaining work is stdout/stderr drain to EOF only.
+    wait_done: bool,
+    /// Exit success bit when `wait_done` (ignored otherwise).
+    exit_success: bool,
 }
 
 /// Terminal outcome after child wait + both pipe EOFs (or no-child fast path).
@@ -3769,7 +3774,10 @@ impl CredentialPreparationOwner {
         };
 
         let entry = Arc::clone(&self.entry);
-        let drive = async {
+        // reap_running_child_to_terminal already applies the 2 s watchdog; the
+        // wait_for_terminal_capability branch may claim and reap under the same
+        // helper. Wrap the whole drive so a stuck peer-wait also diagnoses.
+        with_credential_reap_watchdog(&entry, async {
             if claimed {
                 reap_running_child_to_terminal(
                     &entry,
@@ -3780,21 +3788,8 @@ impl CredentialPreparationOwner {
                 // Wait for the other driver or become supervisor-like.
                 wait_for_terminal_capability(&entry).await;
             }
-        };
-        tokio::pin!(drive);
-        if tokio::time::timeout(credential_reap_watchdog(), &mut drive)
-            .await
-            .is_err()
-        {
-            if entry.mark_watchdog_overrun() {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "voisu: credential reap crossed {} ms watchdog; remaining Processing until terminal",
-                    credential_reap_watchdog().as_millis()
-                );
-            }
-            drive.await;
-        }
+        })
+        .await;
 
         if claimed {
             self.entry.release_claim();
@@ -4069,6 +4064,7 @@ async fn cancel_reap(entry: &CredentialCleanupEntry) -> GrammarCapability {
         .cancel_requested
         .store(true, std::sync::atomic::Ordering::SeqCst);
     entry.kill_process_group_once();
+    // Watchdog is inside reap_running_child_to_terminal — every cleanup path.
     reap_running_child_to_terminal(
         entry,
         CredentialTerminalOutcome::Unavailable(GrammarUnavailableReason::Cancelled),
@@ -4086,12 +4082,28 @@ async fn deadline_reap(entry: &CredentialCleanupEntry) -> GrammarCapability {
         .cancel_requested
         .store(true, std::sync::atomic::Ordering::SeqCst);
     entry.kill_process_group_once();
-    let drive = reap_running_child_to_terminal(
+    // Watchdog is inside reap_running_child_to_terminal — every cleanup path.
+    // Kill is signalled here first so the watchdog covers wait+EOF (not after).
+    reap_running_child_to_terminal(
         entry,
         CredentialTerminalOutcome::Unavailable(GrammarUnavailableReason::WorkDeadlineExceeded),
-    );
-    tokio::pin!(drive);
-    if tokio::time::timeout(credential_reap_watchdog(), &mut drive)
+    )
+    .await;
+    entry
+        .terminal_capability()
+        .unwrap_or(GrammarCapability::Unavailable(
+            GrammarUnavailableReason::WorkDeadlineExceeded,
+        ))
+}
+
+/// 2 s diagnostic threshold around a terminal reap future. Crossing it logs once
+/// and keeps awaiting — never detach before child wait + both pipe EOFs.
+async fn with_credential_reap_watchdog<F>(entry: &CredentialCleanupEntry, fut: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    tokio::pin!(fut);
+    if tokio::time::timeout(credential_reap_watchdog(), &mut fut)
         .await
         .is_err()
     {
@@ -4102,13 +4114,8 @@ async fn deadline_reap(entry: &CredentialCleanupEntry) -> GrammarCapability {
                 credential_reap_watchdog().as_millis()
             );
         }
-        drive.await;
+        fut.await;
     }
-    entry
-        .terminal_capability()
-        .unwrap_or(GrammarCapability::Unavailable(
-            GrammarUnavailableReason::WorkDeadlineExceeded,
-        ))
 }
 
 async fn wait_cancel_or_deadline(entry: &CredentialCleanupEntry, work_deadline: Instant) {
@@ -4240,6 +4247,8 @@ async fn run_secret_tool_lookup_attempt(
             stderr,
             stdout_buf: Vec::new(),
             stderr_buf: Vec::new(),
+            wait_done: false,
+            exit_success: false,
         });
     }
 
@@ -4252,75 +4261,112 @@ async fn run_secret_tool_lookup_attempt(
     drive_attempt_until_reaped(entry, effective_deadline, work_deadline).await
 }
 
-/// Drive one retained attempt: wait + drain pipes (or kill on cancel/deadline),
-/// then classify. Child state lives on the entry until fully reaped.
+/// Drive one retained attempt: wait + both pipe EOFs on the cooperative path,
+/// then classify. Cancel/deadline **kills and returns** without claiming a
+/// terminal reap here so the outer `cancel_reap` / `deadline_reap` (watchdog-
+/// wrapped) owns wait + EOFs.
 async fn drive_attempt_until_reaped(
     entry: &CredentialCleanupEntry,
     attempt_deadline: Instant,
     work_deadline: Instant,
 ) -> AsyncLoadStep {
-    // Kill early when cancel/deadline already require it.
+    // Cancel/deadline before wait: kill and hand off to outer terminal reap.
+    // Do not wait here — that would run kill/wait before the 2 s watchdog starts.
     if entry.is_cancel_requested()
         || Instant::now() >= work_deadline
         || Instant::now() >= attempt_deadline
     {
         entry.kill_process_group_once();
-    }
-
-    let reaped = take_and_reap_running_child(entry, attempt_deadline, work_deadline).await;
-    let Some((success, stdout, stderr, killed)) = reaped else {
         return if entry.is_cancel_requested() && Instant::now() < work_deadline {
             AsyncLoadStep::Cancelled
-        } else if Instant::now() >= work_deadline {
-            AsyncLoadStep::Deadline
         } else {
-            AsyncLoadStep::Stop(GrammarUnavailableReason::KeyringUnavailable)
+            AsyncLoadStep::Deadline
         };
-    };
-
-    // Between attempts the entry is idle-Registered (or CancelRequested).
-    {
-        let mut guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if guard.phase == CredentialEntryPhase::Running {
-            guard.phase = CredentialEntryPhase::Registered;
-        }
     }
 
-    if killed {
-        if Instant::now() >= work_deadline {
-            return AsyncLoadStep::Deadline;
+    match take_and_reap_running_child(entry, attempt_deadline, work_deadline).await {
+        TakeReapResult::NoChild => {
+            if entry.is_cancel_requested() && Instant::now() < work_deadline {
+                AsyncLoadStep::Cancelled
+            } else if Instant::now() >= work_deadline || Instant::now() >= attempt_deadline {
+                AsyncLoadStep::Deadline
+            } else {
+                AsyncLoadStep::Stop(GrammarUnavailableReason::KeyringUnavailable)
+            }
         }
-        if entry.is_cancel_requested() {
-            return AsyncLoadStep::Cancelled;
+        TakeReapResult::NeedsTerminalReap => {
+            // Child re-parked; kill already signalled. Outer cancel/deadline reap
+            // applies the 2 s watchdog around wait + both EOFs.
+            if entry.is_cancel_requested() && Instant::now() < work_deadline {
+                AsyncLoadStep::Cancelled
+            } else {
+                AsyncLoadStep::Deadline
+            }
         }
-        return AsyncLoadStep::Deadline;
-    }
+        TakeReapResult::Reaped {
+            success,
+            stdout,
+            stderr,
+            was_killed,
+        } => {
+            // Between attempts the entry is idle-Registered (or CancelRequested).
+            {
+                let mut guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+                if guard.phase == CredentialEntryPhase::Running {
+                    guard.phase = CredentialEntryPhase::Registered;
+                }
+            }
 
-    if success {
-        match String::from_utf8(stdout) {
-            Ok(value) => match Credential::new(value.trim_end().to_owned()) {
-                Ok(credential) => AsyncLoadStep::Found(credential),
-                Err(_) => AsyncLoadStep::Missing,
-            },
-            Err(_) => AsyncLoadStep::Stop(GrammarUnavailableReason::KeyringLocked),
+            if was_killed {
+                if Instant::now() >= work_deadline {
+                    return AsyncLoadStep::Deadline;
+                }
+                if entry.is_cancel_requested() {
+                    return AsyncLoadStep::Cancelled;
+                }
+                return AsyncLoadStep::Deadline;
+            }
+
+            if success {
+                match String::from_utf8(stdout) {
+                    Ok(value) => match Credential::new(value.trim_end().to_owned()) {
+                        Ok(credential) => AsyncLoadStep::Found(credential),
+                        Err(_) => AsyncLoadStep::Missing,
+                    },
+                    Err(_) => AsyncLoadStep::Stop(GrammarUnavailableReason::KeyringLocked),
+                }
+            } else if stderr.is_empty() {
+                AsyncLoadStep::Missing
+            } else {
+                AsyncLoadStep::Retry(GrammarUnavailableReason::KeyringLocked)
+            }
         }
-    } else if stderr.is_empty() {
-        AsyncLoadStep::Missing
-    } else {
-        AsyncLoadStep::Retry(GrammarUnavailableReason::KeyringLocked)
     }
 }
 
+/// Outcome of taking and (attempting to) reap a retained credential child.
+enum TakeReapResult {
+    /// No running child was parked on the entry.
+    NoChild,
+    /// Cancel/deadline killed; Child re-parked for outer watchdog-wrapped reap.
+    /// Must not claim Terminal here.
+    NeedsTerminalReap,
+    /// Child wait completed and **both** stdout/stderr reached EOF.
+    Reaped {
+        success: bool,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        was_killed: bool,
+    },
+}
+
 /// RAII take of the running child. On cancel/Drop of the drive future before
-/// wait completes, re-parks the Child + pipes on the entry and SIGKILLs via the
-/// durable pgid so owner Drop / supervisor drain can always kill+wait.
+/// full wait + both EOFs, re-parks Child + remaining pipes on the entry and
+/// SIGKILLs via the durable pgid so owner Drop / supervisor drain can finish.
 struct TakenRunningChild<'a> {
     entry: &'a CredentialCleanupEntry,
     running: Option<CredentialRunningChild>,
-    /// Set once `child.wait`/`try_wait` observed exit — handle must not be re-parked
-    /// for a second wait (would fail); durable pgid is cleared on Drop.
-    child_waited: bool,
-    /// Set after full wait + pipe drain so Drop is a pure no-op.
+    /// Set after full wait + both pipe EOFs so Drop is a pure no-op.
     fully_reaped: bool,
 }
 
@@ -4332,7 +4378,6 @@ impl<'a> TakenRunningChild<'a> {
         Some(Self {
             entry,
             running: Some(running),
-            child_waited: false,
             fully_reaped: false,
         })
     }
@@ -4343,16 +4388,18 @@ impl<'a> TakenRunningChild<'a> {
             .expect("TakenRunningChild without running")
     }
 
-    fn mark_child_waited(&mut self) {
-        self.child_waited = true;
-    }
-
     fn finish(mut self) -> CredentialRunningChild {
         self.fully_reaped = true;
-        self.child_waited = true;
         self.running
             .take()
             .expect("TakenRunningChild without running")
+    }
+
+    /// Consume and re-park via Drop: cancel/deadline hands off to the outer
+    /// terminal reap (watchdog covers wait + EOFs).
+    fn repark_for_terminal_reap(self) {
+        // Drop impl re-parks + SIGKILLs.
+        drop(self);
     }
 }
 
@@ -4361,21 +4408,14 @@ impl Drop for TakenRunningChild<'_> {
         if self.fully_reaped {
             return;
         }
-        let Some(running) = self.running.take() else {
+        let Some(mut running) = self.running.take() else {
             return;
         };
         let pgid = running.pgid;
 
-        if self.child_waited {
-            // OS wait already completed; do not re-park a waited Child (a second
-            // wait would fail). Keep last_pgid until set_terminal so Drop kill
-            // remains a no-op signal against a known id if still racing.
-            let _ = pgid;
-            return;
-        }
-
-        // Signal before re-park: Drop of owner may race with this Drop; durable
-        // last_pgid + re-parked Child keep kill and wait ownership on the entry.
+        // Always re-park remaining state (even after wait_done) so pipe EOFs are
+        // never abandoned by dropping handles without EOF. Terminal = wait + both
+        // EOFs; a waited Child is re-parked with wait_done and remaining pipes.
         // SAFETY: pgid is the retained process-group leader from setpgid(0,0).
         let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
         self.entry
@@ -4401,6 +4441,8 @@ impl Drop for TakenRunningChild<'_> {
             ) {
                 guard.phase = CredentialEntryPhase::CancelRequested;
             }
+            // Preserve wait_done / exit_success / partial pipe buffers.
+            let _ = &mut running;
             guard.running = Some(running);
         } else {
             // Another path re-parked; keep durable pgid, drop our duplicate handle.
@@ -4409,54 +4451,76 @@ impl Drop for TakenRunningChild<'_> {
     }
 }
 
-/// Take the running child off the entry, kill if needed, wait + drain pipes.
-/// Returns `(success, stdout, stderr, was_killed)` or `None` if no child.
+/// Drain an async pipe into `buf` until EOF. Never returns without observing
+/// EOF or a hard read error. On read stall, invokes `on_stall` (process-group
+/// kill for non-cooperative write-end holders) and keeps awaiting.
+async fn drain_pipe_to_eof<R, F>(pipe: &mut R, buf: &mut Vec<u8>, cap: usize, mut on_stall: F)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: FnMut(),
+{
+    use tokio::io::AsyncReadExt;
+    let mut tmp = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(Duration::from_millis(50), pipe.read(&mut tmp)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => return,
+            Ok(Ok(n)) => {
+                let room = cap.saturating_sub(buf.len());
+                buf.extend_from_slice(&tmp[..n.min(room)]);
+            }
+            Err(_) => on_stall(),
+        }
+    }
+}
+
+/// Take the running child off the entry, wait + drain both pipes to EOF, or
+/// hand off to outer terminal reap on cancel/deadline.
 ///
-/// Cancel of this future re-parks the Child (see [`TakenRunningChild`]) so
-/// wait ownership is never lost to a detached `kill_on_drop(false)` local.
+/// Cancel of this future re-parks the Child + remaining pipes (see
+/// [`TakenRunningChild`]) so wait/EOF ownership is never lost.
 async fn take_and_reap_running_child(
     entry: &CredentialCleanupEntry,
     attempt_deadline: Instant,
     work_deadline: Instant,
-) -> Option<(bool, Vec<u8>, Vec<u8>, bool)> {
+) -> TakeReapResult {
     use tokio::io::AsyncReadExt;
 
-    // Ensure kill is signalled when budgets require it, before we take the child.
+    // Cleanup already required: do not wait here without the outer watchdog.
     if entry.is_cancel_requested()
         || Instant::now() >= work_deadline
         || Instant::now() >= attempt_deadline
     {
         entry.kill_process_group_once();
+        let has_child = {
+            let guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+            guard.running.is_some() || guard.last_pgid.is_some()
+        };
+        return if has_child {
+            TakeReapResult::NeedsTerminalReap
+        } else {
+            TakeReapResult::NoChild
+        };
     }
 
-    let mut taken = TakenRunningChild::take(entry)?;
+    let mut taken = match TakenRunningChild::take(entry) {
+        Some(t) => t,
+        None => return TakeReapResult::NoChild,
+    };
     let pgid = taken.running_mut().pgid;
-    let mut was_killed = entry
+
+    // Resume post-wait pipe drain if a prior driver observed exit then dropped.
+    let already_waited = taken.running_mut().wait_done;
+    let mut exit_success = taken.running_mut().exit_success;
+    // True if kill was already sticky when we took the child (or becomes true
+    // from cancel/deadline before we observe exit). Post-wait process-group
+    // re-signals for non-cooperative pipe holders alone must not reclassify a
+    // natural cooperative exit as Cancelled/Deadline.
+    let mut killed_for_cleanup = entry
         .kill_requested
         .load(std::sync::atomic::Ordering::SeqCst);
-    if was_killed {
+    if killed_for_cleanup {
         // SAFETY: process-group SIGKILL for the retained pgid.
         let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-    }
-
-    // Hermetic watchdog stall (once per entry) after kill.
-    if was_killed {
-        let stall = {
-            let mut guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
-            if !guard.reap_stall_applied {
-                if let Some(stall) = credential_reap_stall() {
-                    guard.reap_stall_applied = true;
-                    Some(stall)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        if let Some(stall) = stall {
-            tokio::time::sleep(stall).await;
-        }
     }
 
     let mut stdout_buf = std::mem::take(&mut taken.running_mut().stdout_buf);
@@ -4464,143 +4528,273 @@ async fn take_and_reap_running_child(
     let mut stdout = taken.running_mut().stdout.take();
     let mut stderr = taken.running_mut().stderr.take();
 
-    // Wait for exit, killing if cancel/deadline lands mid-wait.
-    let status = loop {
+    if !already_waited {
+        // Wait for exit. On cancel/deadline: kill, re-park, hand off to outer
+        // watchdog-wrapped terminal reap (do not claim wait+EOF success here).
+        let status = loop {
+            if entry.is_cancel_requested()
+                || Instant::now() >= work_deadline
+                || Instant::now() >= attempt_deadline
+            {
+                if !killed_for_cleanup {
+                    let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                    entry
+                        .kill_requested
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                // Put pipes/buffers back and re-park for cancel_reap/deadline_reap.
+                taken.running_mut().stdout = stdout.take();
+                taken.running_mut().stderr = stderr.take();
+                taken.running_mut().stdout_buf = std::mem::take(&mut stdout_buf);
+                taken.running_mut().stderr_buf = std::mem::take(&mut stderr_buf);
+                taken.repark_for_terminal_reap();
+                return TakeReapResult::NeedsTerminalReap;
+            }
+
+            match tokio::time::timeout(Duration::from_millis(50), taken.running_mut().child.wait())
+                .await
+            {
+                Ok(Ok(status)) => break status,
+                Ok(Err(_)) => break std::process::ExitStatus::from_raw(256),
+                Err(_) => {
+                    if let Ok(Some(status)) = taken.running_mut().child.try_wait() {
+                        break status;
+                    }
+                    // Still live — drain pipes so a full buffer cannot block exit.
+                    // Mid-wait short timeouts are OK; final post-wait drain is strict.
+                    if let Some(pipe) = stdout.as_mut() {
+                        let mut buf = [0u8; 1024];
+                        match tokio::time::timeout(Duration::from_millis(5), pipe.read(&mut buf))
+                            .await
+                        {
+                            Ok(Ok(0)) | Ok(Err(_)) => stdout = None,
+                            Ok(Ok(n)) => {
+                                let room =
+                                    MAX_RETAINED_STDOUT_BYTES.saturating_sub(stdout_buf.len());
+                                stdout_buf.extend_from_slice(&buf[..n.min(room)]);
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    if let Some(pipe) = stderr.as_mut() {
+                        let mut buf = [0u8; 512];
+                        match tokio::time::timeout(Duration::from_millis(5), pipe.read(&mut buf))
+                            .await
+                        {
+                            Ok(Ok(0)) | Ok(Err(_)) => stderr = None,
+                            Ok(Ok(n)) => {
+                                let room =
+                                    MAX_RETAINED_STDERR_BYTES.saturating_sub(stderr_buf.len());
+                                stderr_buf.extend_from_slice(&buf[..n.min(room)]);
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
+        };
+        exit_success = status.success();
+        taken.running_mut().wait_done = true;
+        taken.running_mut().exit_success = exit_success;
+
+        // External cancel/kill can race the wait future: SIGKILL makes wait
+        // return before this loop's cancel check. Re-sample flags so a killed
+        // exit is never classified as Missing/NoCredential.
         if entry.is_cancel_requested()
+            || entry
+                .kill_requested
+                .load(std::sync::atomic::Ordering::SeqCst)
             || Instant::now() >= work_deadline
             || Instant::now() >= attempt_deadline
         {
-            if !was_killed {
-                let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-                entry
-                    .kill_requested
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                was_killed = true;
-            }
+            killed_for_cleanup = true;
         }
+    }
 
-        match tokio::time::timeout(Duration::from_millis(50), taken.running_mut().child.wait())
-            .await
-        {
-            Ok(Ok(status)) => {
-                taken.mark_child_waited();
-                break status;
-            }
-            Ok(Err(_)) => {
-                taken.mark_child_waited();
-                break std::process::ExitStatus::from_raw(256);
-            }
-            Err(_) => {
-                if let Ok(Some(status)) = taken.running_mut().child.try_wait() {
-                    taken.mark_child_waited();
-                    break status;
-                }
-                // Still live — also drain pipes so a full pipe cannot block exit.
-                if let Some(pipe) = stdout.as_mut() {
-                    let mut buf = [0u8; 1024];
-                    match tokio::time::timeout(Duration::from_millis(5), pipe.read(&mut buf)).await
-                    {
-                        Ok(Ok(0)) | Ok(Err(_)) => stdout = None,
-                        Ok(Ok(n)) => {
-                            let room =
-                                MAX_RETAINED_STDOUT_BYTES.saturating_sub(stdout_buf.len());
-                            stdout_buf.extend_from_slice(&buf[..n.min(room)]);
-                        }
-                        Err(_) => {}
-                    }
-                }
-                if let Some(pipe) = stderr.as_mut() {
-                    let mut buf = [0u8; 512];
-                    match tokio::time::timeout(Duration::from_millis(5), pipe.read(&mut buf)).await
-                    {
-                        Ok(Ok(0)) | Ok(Err(_)) => stderr = None,
-                        Ok(Ok(n)) => {
-                            let room =
-                                MAX_RETAINED_STDERR_BYTES.saturating_sub(stderr_buf.len());
-                            stderr_buf.extend_from_slice(&buf[..n.min(room)]);
-                        }
-                        Err(_) => {}
-                    }
-                }
-            }
-        }
+    // Spec Terminal = child wait + **both** pipe EOFs. Never abandon on a short
+    // read timeout while claiming a successful reap. On stall, re-signal the
+    // process group so non-cooperative write-end holders (grandchildren that
+    // inherited stdout/stderr) cannot hold the pipe open forever.
+    let kill_on_stall = || {
+        let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
     };
 
-    // Final pipe drain to EOF (or drop after short budget). Spec Terminal =
-    // wait + both EOFs; after process exit, pipes EOF quickly.
     if let Some(mut pipe) = stdout.take() {
-        let mut buf = [0u8; 4096];
-        for _ in 0..32 {
-            match tokio::time::timeout(Duration::from_millis(20), pipe.read(&mut buf)).await {
-                Ok(Ok(0)) | Ok(Err(_)) => break,
-                Ok(Ok(n)) => {
-                    let room = MAX_RETAINED_STDOUT_BYTES.saturating_sub(stdout_buf.len());
-                    stdout_buf.extend_from_slice(&buf[..n.min(room)]);
-                }
-                Err(_) => break,
-            }
-        }
+        drain_pipe_to_eof(
+            &mut pipe,
+            &mut stdout_buf,
+            MAX_RETAINED_STDOUT_BYTES,
+            kill_on_stall,
+        )
+        .await;
     }
     if let Some(mut pipe) = stderr.take() {
-        let mut buf = [0u8; 1024];
-        for _ in 0..32 {
-            match tokio::time::timeout(Duration::from_millis(20), pipe.read(&mut buf)).await {
-                Ok(Ok(0)) | Ok(Err(_)) => break,
-                Ok(Ok(n)) => {
-                    let room = MAX_RETAINED_STDERR_BYTES.saturating_sub(stderr_buf.len());
-                    stderr_buf.extend_from_slice(&buf[..n.min(room)]);
-                }
-                Err(_) => break,
-            }
-        }
+        drain_pipe_to_eof(
+            &mut pipe,
+            &mut stderr_buf,
+            MAX_RETAINED_STDERR_BYTES,
+            kill_on_stall,
+        )
+        .await;
     }
 
-    // Wait ownership complete — do not re-park. last_pgid is cleared only at
+    // Wait + both EOFs complete — do not re-park. last_pgid is cleared only at
     // set_terminal so Drop/supervisor kill remains well-defined until then.
     let _finished_child = taken.finish();
-    let _ = pgid;
 
-    was_killed = entry
-        .kill_requested
-        .load(std::sync::atomic::Ordering::SeqCst);
-    Some((status.success(), stdout_buf, stderr_buf, was_killed))
+    TakeReapResult::Reaped {
+        success: exit_success,
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+        was_killed: killed_for_cleanup,
+    }
 }
 
-/// After kill (or no child): await wait + EOFs, then set terminal outcome.
+/// After kill (or no child): await wait + both EOFs under the 2 s reap
+/// watchdog diagnostic, then set terminal outcome. Watchdog is not permission
+/// to detach: on overrun log once and keep awaiting terminal cleanup.
 async fn reap_running_child_to_terminal(
     entry: &CredentialCleanupEntry,
     outcome_if_empty: CredentialTerminalOutcome,
 ) {
+    // Kill first so the watchdog covers the real wait+EOF work, not only a
+    // no-child set_terminal after an earlier unreaped path.
     entry.kill_process_group_once();
 
-    {
-        let stall = {
-            let mut guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
-            if !guard.reap_stall_applied {
-                if let Some(stall) = credential_reap_stall() {
-                    guard.reap_stall_applied = true;
-                    Some(stall)
+    with_credential_reap_watchdog(entry, async {
+        {
+            let stall = {
+                let mut guard = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+                if !guard.reap_stall_applied {
+                    if let Some(stall) = credential_reap_stall() {
+                        guard.reap_stall_applied = true;
+                        Some(stall)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
-            } else {
-                None
+            };
+            if let Some(stall) = stall {
+                tokio::time::sleep(stall).await;
+            }
+        }
+
+        // Dedicated cleanup reap always completes wait + both EOFs (never
+        // NeedsTerminalReap hand-off — this *is* the terminal path).
+        let _ = take_and_reap_for_cleanup(entry).await;
+
+        if entry.terminal_capability().is_none() {
+            entry.set_terminal(outcome_if_empty);
+        }
+    })
+    .await;
+}
+
+/// Terminal cleanup reap: always completes wait + both EOFs (or NoChild).
+/// Unlike attempt reap, cancel/deadline never returns `NeedsTerminalReap` —
+/// this **is** the terminal path. Kill stays sticky from the entry.
+async fn take_and_reap_for_cleanup(entry: &CredentialCleanupEntry) -> TakeReapResult {
+    use tokio::io::AsyncReadExt;
+
+    let mut taken = match TakenRunningChild::take(entry) {
+        Some(t) => t,
+        None => return TakeReapResult::NoChild,
+    };
+    let pgid = taken.running_mut().pgid;
+    // SAFETY: always re-signal; cleanup is kill+wait+EOF.
+    let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    entry
+        .kill_requested
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let was_killed = true;
+
+    let already_waited = taken.running_mut().wait_done;
+    let mut exit_success = taken.running_mut().exit_success;
+    let mut stdout_buf = std::mem::take(&mut taken.running_mut().stdout_buf);
+    let mut stderr_buf = std::mem::take(&mut taken.running_mut().stderr_buf);
+    let mut stdout = taken.running_mut().stdout.take();
+    let mut stderr = taken.running_mut().stderr.take();
+
+    if !already_waited {
+        let status = loop {
+            match tokio::time::timeout(Duration::from_millis(50), taken.running_mut().child.wait())
+                .await
+            {
+                Ok(Ok(status)) => break status,
+                Ok(Err(_)) => break std::process::ExitStatus::from_raw(256),
+                Err(_) => {
+                    if let Ok(Some(status)) = taken.running_mut().child.try_wait() {
+                        break status;
+                    }
+                    // Re-signal while waiting; non-cooperative children die eventually.
+                    let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                    if let Some(pipe) = stdout.as_mut() {
+                        let mut buf = [0u8; 1024];
+                        match tokio::time::timeout(Duration::from_millis(5), pipe.read(&mut buf))
+                            .await
+                        {
+                            Ok(Ok(0)) | Ok(Err(_)) => stdout = None,
+                            Ok(Ok(n)) => {
+                                let room =
+                                    MAX_RETAINED_STDOUT_BYTES.saturating_sub(stdout_buf.len());
+                                stdout_buf.extend_from_slice(&buf[..n.min(room)]);
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    if let Some(pipe) = stderr.as_mut() {
+                        let mut buf = [0u8; 512];
+                        match tokio::time::timeout(Duration::from_millis(5), pipe.read(&mut buf))
+                            .await
+                        {
+                            Ok(Ok(0)) | Ok(Err(_)) => stderr = None,
+                            Ok(Ok(n)) => {
+                                let room =
+                                    MAX_RETAINED_STDERR_BYTES.saturating_sub(stderr_buf.len());
+                                stderr_buf.extend_from_slice(&buf[..n.min(room)]);
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
             }
         };
-        if let Some(stall) = stall {
-            tokio::time::sleep(stall).await;
-        }
+        exit_success = status.success();
+        taken.running_mut().wait_done = true;
+        taken.running_mut().exit_success = exit_success;
     }
 
-    let _ = take_and_reap_running_child(
-        entry,
-        Instant::now() + Duration::from_secs(30),
-        Instant::now() + Duration::from_secs(30),
-    )
-    .await;
+    let kill_on_stall = || {
+        let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    };
 
-    if entry.terminal_capability().is_none() {
-        entry.set_terminal(outcome_if_empty);
+    if let Some(mut pipe) = stdout.take() {
+        drain_pipe_to_eof(
+            &mut pipe,
+            &mut stdout_buf,
+            MAX_RETAINED_STDOUT_BYTES,
+            kill_on_stall,
+        )
+        .await;
+    }
+    if let Some(mut pipe) = stderr.take() {
+        drain_pipe_to_eof(
+            &mut pipe,
+            &mut stderr_buf,
+            MAX_RETAINED_STDERR_BYTES,
+            kill_on_stall,
+        )
+        .await;
+    }
+
+    let _finished = taken.finish();
+    TakeReapResult::Reaped {
+        success: exit_success,
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+        was_killed,
     }
 }
 
@@ -9944,6 +10138,116 @@ mod tests {
         );
         assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
         assert_eq!(lane.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn credential_noncooperative_pipe_awaits_both_eofs_before_terminal() {
+        // Parent exits 0 after writing the secret, but a grandchild inherits
+        // stdout and holds the write end open. Terminal requires wait + both
+        // EOFs: post-wait drain must not abandon on a short read timeout.
+        // Stall re-signals the process group so the holder dies and EOF arrives.
+        let _lock = credential_owner_test_lock().await;
+        let _env = CredentialEnvGuard::capture(&[
+            "VOISU_GROQ_API_KEY",
+            "VOISU_TEST_SECRET_STORE",
+            "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+            "VOISU_TEST_KEYRING_RETRY_MS",
+            "PATH",
+        ]);
+        clear_groq_credential_surface();
+        CredentialEnvGuard::set("VOISU_TEST_KEYRING_RETRY_MS", "0");
+
+        let tool_dir = tempfile::tempdir().unwrap();
+        install_fake_secret_tool(
+            tool_dir.path(),
+            "#!/bin/sh\nprintf 'noncoop-secret-token\\n'\nsleep 100 &\nexit 0\n",
+        );
+
+        let reaper = ProviderReaper::new();
+        let lane = reaper.credential_lane().clone();
+        let entry = lane.register();
+        let mut owner =
+            CredentialPreparationOwner::new(Arc::clone(&entry), lane.clone(), Provider::Groq);
+
+        let started = Instant::now();
+        let capability = owner.poll_outcome().await;
+        assert!(
+            matches!(capability, GrammarCapability::Ready(_)),
+            "after wait + both EOFs the secret must classify Ready, got {capability:?}"
+        );
+        assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
+        assert_eq!(lane.pending_count(), 0);
+        // Must not hang on the grandchild's full sleep; process-group kill on
+        // pipe stall frees the write end. Bound well under sleep 100.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "non-cooperative pipe drain must free via process-group kill, elapsed {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_cancel_reap_applies_watchdog_diagnostic() {
+        // In-band cancel must use the same 2 s watchdog as deadline cleanup —
+        // unbounded cancel_reap is forbidden.
+        let _lock = credential_owner_test_lock().await;
+        let _env = CredentialEnvGuard::capture(&[
+            "VOISU_GROQ_API_KEY",
+            "VOISU_TEST_SECRET_STORE",
+            "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+            "VOISU_TEST_CREDENTIAL_REAP_WATCHDOG_MS",
+            "VOISU_TEST_CREDENTIAL_REAP_STALL_MS",
+            "VOISU_TEST_KEYRING_RETRY_MS",
+            "PATH",
+        ]);
+        clear_groq_credential_surface();
+        CredentialEnvGuard::set("VOISU_TEST_CREDENTIAL_REAP_WATCHDOG_MS", "30");
+        CredentialEnvGuard::set("VOISU_TEST_CREDENTIAL_REAP_STALL_MS", "120");
+        CredentialEnvGuard::set("VOISU_TEST_KEYRING_RETRY_MS", "0");
+
+        let tool_dir = tempfile::tempdir().unwrap();
+        install_fake_secret_tool(tool_dir.path(), "#!/bin/sh\nsleep 30\n");
+
+        let reaper = ProviderReaper::new();
+        let lane = reaper.credential_lane().clone();
+        let entry = lane.register();
+        let entry_watch = Arc::clone(&entry);
+        let mut owner =
+            CredentialPreparationOwner::new(Arc::clone(&entry), lane.clone(), Provider::Groq);
+
+        let pgid = {
+            let poll = owner.poll_outcome();
+            tokio::pin!(poll);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut poll => panic!("hanging secret-tool finished before cancel"),
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                        if let Some(pgid) = entry_watch.retained_pgid() {
+                            break pgid;
+                        }
+                        assert!(Instant::now() < deadline, "child never launched");
+                    }
+                }
+            }
+        };
+
+        let capability = owner.cancel_and_drive_terminal().await;
+        assert!(
+            matches!(
+                capability,
+                GrammarCapability::Unavailable(GrammarUnavailableReason::Cancelled)
+            ),
+            "{capability:?}"
+        );
+        assert!(
+            entry.watchdog_overrun_logged(),
+            "cancel reap must apply the 2 s watchdog diagnostic"
+        );
+        assert_eq!(entry.phase(), CredentialEntryPhase::Deregistered);
+        assert_eq!(lane.pending_count(), 0);
+        assert_os_process_reaped(pgid);
     }
 
     #[tokio::test]
