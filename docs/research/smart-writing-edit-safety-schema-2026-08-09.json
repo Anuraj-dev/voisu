@@ -215,6 +215,7 @@
         "owner",
         "max_file_bytes",
         "max_json_depth",
+        "max_json_nodes",
         "max_base_utf8_bytes",
         "max_edits",
         "max_edit_field_utf8_bytes",
@@ -229,6 +230,9 @@
         },
         "max_json_depth": {
           "const": 12
+        },
+        "max_json_nodes": {
+          "const": 20000
         },
         "max_base_utf8_bytes": {
           "const": 100000

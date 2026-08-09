@@ -1020,6 +1020,18 @@ def validate_schema_instance(
 
 def corpus_meta_errors(corpus: Mapping[str, Any]) -> list[str]:
     errors: list[str] = []
+    expected_thresholds = {
+        "owner": "research_defaults_issue_103_owns_release",
+        "max_file_bytes": MAX_FILE_BYTES,
+        "max_json_depth": MAX_JSON_DEPTH,
+        "max_json_nodes": MAX_JSON_NODES,
+        "max_base_utf8_bytes": MAX_BASE_BYTES,
+        "max_edits": MAX_EDITS,
+        "max_edit_field_utf8_bytes": MAX_FIELD_BYTES,
+        "max_diagnostic_utf8_bytes": MAX_DIAG_BYTES,
+    }
+    if corpus["thresholds"] != expected_thresholds:
+        errors.append("declared thresholds differ from executable bounds")
     fixtures = corpus["fixtures"]
     ids = [fixture["id"] for fixture in fixtures]
     if len(ids) != len(set(ids)):

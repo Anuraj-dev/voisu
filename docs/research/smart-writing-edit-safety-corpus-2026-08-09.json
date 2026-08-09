@@ -42,6 +42,7 @@
     "owner": "research_defaults_issue_103_owns_release",
     "max_file_bytes": 524288,
     "max_json_depth": 12,
+    "max_json_nodes": 20000,
     "max_base_utf8_bytes": 100000,
     "max_edits": 64,
     "max_edit_field_utf8_bytes": 512,
