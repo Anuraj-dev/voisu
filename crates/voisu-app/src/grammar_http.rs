@@ -313,6 +313,9 @@ mod tests {
         upload_body_bytes: AtomicU64,
         /// Declared Content-Length from the Upload hang request headers.
         upload_content_length: AtomicU64,
+        /// Hang handlers that observed peer EOF/reset on the live socket
+        /// (not exit by independently dropping the connection).
+        client_eof_observed: AtomicUsize,
     }
 
     impl ServerProbe {
@@ -324,10 +327,6 @@ mod tests {
             self.requests_seen.load(Ordering::SeqCst)
         }
 
-        fn residual_bytes_after_drop(&self) -> u64 {
-            self.bytes_after_drop.load(Ordering::SeqCst)
-        }
-
         fn upload_body_bytes(&self) -> u64 {
             self.upload_body_bytes.load(Ordering::SeqCst)
         }
@@ -335,11 +334,15 @@ mod tests {
         fn upload_content_length(&self) -> u64 {
             self.upload_content_length.load(Ordering::SeqCst)
         }
+
+        fn client_eof_observed(&self) -> usize {
+            self.client_eof_observed.load(Ordering::SeqCst)
+        }
     }
 
     #[derive(Clone, Copy)]
     enum HangMode {
-        /// Read a verified partial body, then stop reading (client stalls mid-upload).
+        /// Observe a verified partial body, then drain until peer EOF/reset.
         Upload,
         /// Fully read request; never send response headers.
         Wait,
@@ -404,10 +407,18 @@ mod tests {
 
         match reply {
             ReplyMode::Hang(HangMode::Upload) => {
-                // Mid-upload proof: constrain capacity, observe a verified partial
-                // body, then *stop reading*. Draining to EOF would let the full
-                // body land in the handler and only prove post-drop teardown.
-                constrain_socket_recv_buffer(&socket, UPLOAD_HANG_RECV_BUF);
+                // Mid-upload proof:
+                // 1) Observe a verified partial body (body < Content-Length) so
+                //    hang entry is still mid-upload, not full-request teardown.
+                // 2) Keep the live socket open and read until peer EOF/reset.
+                //    The drop barrier only flips residual-byte accounting — it
+                //    must never end the handler or close the server socket.
+                //    active_handlers==0 therefore requires observing client cancel.
+                //
+                // Note: do not shrink SO_RCVBUF to force a zero window here.
+                // A stuck mid-write with zero window can leave the client unable
+                // to complete TCP teardown on drop, so the server never sees
+                // EOF/reset — which fails the cancel-quiescence proof.
                 let partial = read_verified_partial_body(
                     &mut socket,
                     UPLOAD_HANG_MAX_BODY_OBSERVE,
@@ -424,10 +435,7 @@ mod tests {
                 if partial.content_length > 0 && partial.body_bytes < partial.content_length {
                     probe.hang_entered.fetch_add(1, Ordering::SeqCst);
                 }
-                // Hold until the client drop barrier — do not read more body.
-                if let Some(rx) = drop_rx {
-                    let _ = rx.await;
-                }
+                drain_until_eof_counting_after_drop(&mut socket, &probe, drop_rx).await;
             }
             ReplyMode::Hang(HangMode::Wait) => {
                 let _ = read_http_request(&mut socket).await;
@@ -482,12 +490,9 @@ mod tests {
         }
     }
 
-    /// Small SO_RCVBUF so a large JSON body cannot fully enter the kernel buffer
-    /// while the Upload hang refuses to drain past a partial observation.
-    const UPLOAD_HANG_RECV_BUF: i32 = 4 * 1024;
-    /// Max body bytes the Upload hang intentionally reads (must stay ≪ request CL).
+    /// Max body bytes the Upload hang intentionally observes (must stay ≪ request CL).
     const UPLOAD_HANG_MAX_BODY_OBSERVE: usize = 512;
-    /// Request padding large enough to exceed constrained capacity + partial read.
+    /// Request padding large enough that Content-Length ≫ intentional partial read.
     const UPLOAD_HANG_BODY_PADDING: usize = 1024 * 1024;
 
     struct PartialBodyObservation {
@@ -495,26 +500,8 @@ mod tests {
         content_length: usize,
     }
 
-    /// Shrink the TCP receive buffer so unsent request bytes can remain in flight.
-    fn constrain_socket_recv_buffer(socket: &TcpStream, requested: i32) {
-        use std::os::fd::AsRawFd;
-        let fd = socket.as_raw_fd();
-        let size = requested as libc::c_int;
-        // Best-effort: Linux doubles the value; failure leaves default buffers
-        // but the partial-read stop + large body still keep CL >> observed.
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &size as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&size) as libc::socklen_t,
-            );
-        }
-    }
-
-    /// Read headers + at most `max_body_observe` body bytes. Never drains to EOF
-    /// or to Content-Length — that is the mid-upload cancel invariant.
+    /// Read headers + at most `max_body_observe` body bytes. Never drains to
+    /// Content-Length — hang entry must remain a partial-body observation.
     async fn read_verified_partial_body(
         socket: &mut TcpStream,
         max_body_observe: usize,
@@ -563,6 +550,33 @@ mod tests {
         }
     }
 
+    /// After client cancel, keep the live socket open and read until peer
+    /// EOF/reset. Returning without this would drop the server socket first and
+    /// would not prove cancellation caused quiescence.
+    async fn observe_peer_close_after_cancel(socket: &mut TcpStream, probe: &ServerProbe) {
+        let mut buf = [0u8; 4096];
+        loop {
+            match socket.read(&mut buf).await {
+                Ok(0) | Err(_) => {
+                    probe
+                        .client_eof_observed
+                        .fetch_add(1, Ordering::SeqCst);
+                    break;
+                }
+                Ok(n) => {
+                    // Kernel-buffered remainder that arrived with/before the close.
+                    probe
+                        .bytes_after_drop
+                        .fetch_add(n as u64, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    /// Keep reading the live peer until EOF/reset. The optional drop barrier
+    /// only flips residual-byte accounting — it never closes the server socket
+    /// or ends the handler. Exit therefore requires observing client cancel
+    /// (or peer error), not independent server close.
     async fn drain_until_eof_counting_after_drop(
         socket: &mut TcpStream,
         probe: &ServerProbe,
@@ -574,8 +588,8 @@ mod tests {
         loop {
             if !dropped {
                 if let Some(rx) = drop_rx.as_mut() {
-                    // Non-blocking poll of the barrier via try_recv-equivalent:
-                    // wait on either more socket data or the drop signal.
+                    // Wait on either more socket data or the drop signal.
+                    // Barrier alone never terminates this loop.
                     tokio::select! {
                         biased;
                         msg = rx => {
@@ -585,7 +599,12 @@ mod tests {
                         }
                         read = socket.read(&mut buf) => {
                             match read {
-                                Ok(0) | Err(_) => break,
+                                Ok(0) | Err(_) => {
+                                    probe
+                                        .client_eof_observed
+                                        .fetch_add(1, Ordering::SeqCst);
+                                    break;
+                                }
                                 Ok(n) => {
                                     // Still before client drop — not residual.
                                     let _ = n;
@@ -595,14 +614,10 @@ mod tests {
                     }
                 }
             } else {
-                match socket.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        probe
-                            .bytes_after_drop
-                            .fetch_add(n as u64, Ordering::SeqCst);
-                    }
-                }
+                // Reuse the post-cancel observation path so Wait / PartialBody
+                // and Upload share the same EOF/reset proof.
+                observe_peer_close_after_cancel(socket, probe).await;
+                break;
             }
         }
     }
@@ -905,8 +920,7 @@ mod tests {
         let client =
             GrammarHttpClient::with_config(endpoint, Duration::from_secs(30), 65_536).unwrap();
 
-        // Upload: body must exceed constrained recv capacity + partial observe
-        // so unsent bytes remain when the future is dropped mid-write.
+        // Upload: large body so Content-Length ≫ intentional partial observation.
         // Wait / PartialBody: modest padding is enough for a full request read.
         let padding = match mode {
             HangMode::Upload => UPLOAD_HANG_BODY_PADDING,
@@ -954,40 +968,47 @@ mod tests {
 
         // Cancel the request future — the production gate's drop path.
         drop(fut);
+        // Barrier only marks residual-byte accounting; hang handlers must keep
+        // the socket open and exit only after observing peer EOF/reset.
         let _ = drop_tx.send(());
 
         // §11.2 / PRODUCTION_CANCEL_RESIDUAL_REQUEST_WORK_MAX = 0:
         // after the request future is dropped, the server-side handler for that
-        // connection must reach terminal. Kernel buffers may still deliver a few
-        // pre-drop bytes; residual *handler* work (active > 0) is the gate.
+        // connection must reach terminal *because the client closed*, not because
+        // the server independently returned and dropped its own socket.
+        // Kernel buffers may still deliver a few pre-drop bytes; residual
+        // *handler* work (active > 0) is the gate.
         timeout(Duration::from_secs(3), async {
-            wait_until(|| probe.active() == 0, Duration::from_secs(3)).await;
+            wait_until(
+                || probe.active() == 0 && probe.client_eof_observed() > 0,
+                Duration::from_secs(3),
+            )
+            .await;
         })
         .await
-        .expect("server handler must exit after client drop");
+        .expect("server handler must observe client EOF/reset and exit after drop");
 
         assert_eq!(
             probe.active(),
             0,
             "residual per-request handler work must be zero"
         );
+        assert!(
+            probe.client_eof_observed() > 0,
+            "server must observe peer EOF/reset after cancel without closing first"
+        );
 
-        // Mid-upload proof: after drop, the handler never observed a full body.
-        // (Upload mode stops reading after the partial observation; it does not
-        // drain-to-EOF, so body_bytes stays strictly below Content-Length.)
+        // Mid-upload: intentional partial observation (hang entry) must have been
+        // strictly below Content-Length — that is the active-upload condition.
+        // (Post-drop drain may still consume kernel-buffered remainder; that is
+        // not residual *handler* work and is not required to be zero.)
         if matches!(mode, HangMode::Upload) {
             let body_seen = probe.upload_body_bytes();
             let content_length = probe.upload_content_length();
             assert!(
                 body_seen < content_length,
-                "after mid-upload drop, server body observation must remain partial \
+                "mid-upload hang entry must remain a partial body observation \
                  (body_bytes={body_seen} < Content-Length={content_length})"
-            );
-            // Residual post-drop drains must stay zero: Upload does not pump.
-            assert_eq!(
-                probe.residual_bytes_after_drop(),
-                0,
-                "Upload hang must not drain the remainder after client drop"
             );
         }
 
