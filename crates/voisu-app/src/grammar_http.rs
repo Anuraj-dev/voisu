@@ -309,6 +309,10 @@ mod tests {
         bytes_after_drop: AtomicU64,
         /// Set when the server has entered the hang phase of the scenario.
         hang_entered: AtomicUsize,
+        /// Request body bytes the Upload hang mode intentionally observed.
+        upload_body_bytes: AtomicU64,
+        /// Declared Content-Length from the Upload hang request headers.
+        upload_content_length: AtomicU64,
     }
 
     impl ServerProbe {
@@ -323,11 +327,19 @@ mod tests {
         fn residual_bytes_after_drop(&self) -> u64 {
             self.bytes_after_drop.load(Ordering::SeqCst)
         }
+
+        fn upload_body_bytes(&self) -> u64 {
+            self.upload_body_bytes.load(Ordering::SeqCst)
+        }
+
+        fn upload_content_length(&self) -> u64 {
+            self.upload_content_length.load(Ordering::SeqCst)
+        }
     }
 
     #[derive(Clone, Copy)]
     enum HangMode {
-        /// Read request start, then stop reading so the client stalls mid-upload.
+        /// Read a verified partial body, then stop reading (client stalls mid-upload).
         Upload,
         /// Fully read request; never send response headers.
         Wait,
@@ -392,11 +404,30 @@ mod tests {
 
         match reply {
             ReplyMode::Hang(HangMode::Upload) => {
-                // Read only a little of the request so the client is still uploading.
-                let mut buf = [0u8; 256];
-                let _ = socket.read(&mut buf).await;
-                probe.hang_entered.fetch_add(1, Ordering::SeqCst);
-                drain_until_eof_counting_after_drop(&mut socket, &probe, drop_rx).await;
+                // Mid-upload proof: constrain capacity, observe a verified partial
+                // body, then *stop reading*. Draining to EOF would let the full
+                // body land in the handler and only prove post-drop teardown.
+                constrain_socket_recv_buffer(&socket, UPLOAD_HANG_RECV_BUF);
+                let partial = read_verified_partial_body(
+                    &mut socket,
+                    UPLOAD_HANG_MAX_BODY_OBSERVE,
+                )
+                .await;
+                probe
+                    .upload_body_bytes
+                    .store(partial.body_bytes as u64, Ordering::SeqCst);
+                probe
+                    .upload_content_length
+                    .store(partial.content_length as u64, Ordering::SeqCst);
+                // Only enter hang once we know the client still has unsent /
+                // unobserved body (body_bytes < Content-Length).
+                if partial.content_length > 0 && partial.body_bytes < partial.content_length {
+                    probe.hang_entered.fetch_add(1, Ordering::SeqCst);
+                }
+                // Hold until the client drop barrier — do not read more body.
+                if let Some(rx) = drop_rx {
+                    let _ = rx.await;
+                }
             }
             ReplyMode::Hang(HangMode::Wait) => {
                 let _ = read_http_request(&mut socket).await;
@@ -448,6 +479,87 @@ mod tests {
                 let chunk = vec![b'y'; send_bytes.min(declare_length)];
                 let _ = socket.write_all(&chunk).await;
             }
+        }
+    }
+
+    /// Small SO_RCVBUF so a large JSON body cannot fully enter the kernel buffer
+    /// while the Upload hang refuses to drain past a partial observation.
+    const UPLOAD_HANG_RECV_BUF: i32 = 4 * 1024;
+    /// Max body bytes the Upload hang intentionally reads (must stay ≪ request CL).
+    const UPLOAD_HANG_MAX_BODY_OBSERVE: usize = 512;
+    /// Request padding large enough to exceed constrained capacity + partial read.
+    const UPLOAD_HANG_BODY_PADDING: usize = 1024 * 1024;
+
+    struct PartialBodyObservation {
+        body_bytes: usize,
+        content_length: usize,
+    }
+
+    /// Shrink the TCP receive buffer so unsent request bytes can remain in flight.
+    fn constrain_socket_recv_buffer(socket: &TcpStream, requested: i32) {
+        use std::os::fd::AsRawFd;
+        let fd = socket.as_raw_fd();
+        let size = requested as libc::c_int;
+        // Best-effort: Linux doubles the value; failure leaves default buffers
+        // but the partial-read stop + large body still keep CL >> observed.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &size as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&size) as libc::socklen_t,
+            );
+        }
+    }
+
+    /// Read headers + at most `max_body_observe` body bytes. Never drains to EOF
+    /// or to Content-Length — that is the mid-upload cancel invariant.
+    async fn read_verified_partial_body(
+        socket: &mut TcpStream,
+        max_body_observe: usize,
+    ) -> PartialBodyObservation {
+        let mut buf = Vec::with_capacity(4096);
+        // Small chunks so a single read cannot swallow the whole body even if
+        // the kernel buffer still holds more than max_body_observe.
+        let mut tmp = [0u8; 256];
+        loop {
+            let n = match socket.read(&mut tmp).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(header_end) = find_header_end(&buf) {
+                let content_length = parse_content_length(&buf[..header_end]).unwrap_or(0);
+                let mut body_bytes = buf.len().saturating_sub(header_end);
+                // Cap intentional observation strictly below Content-Length when known.
+                let observe_cap = match content_length {
+                    0 => max_body_observe,
+                    cl => max_body_observe.min(cl.saturating_sub(1)),
+                };
+                while body_bytes < observe_cap {
+                    let want = (observe_cap - body_bytes).min(tmp.len());
+                    match socket.read(&mut tmp[..want]).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            body_bytes += n;
+                        }
+                    }
+                }
+                return PartialBodyObservation {
+                    body_bytes,
+                    content_length,
+                };
+            }
+            if buf.len() > 64 * 1024 {
+                break;
+            }
+        }
+        PartialBodyObservation {
+            body_bytes: 0,
+            content_length: 0,
         }
     }
 
@@ -793,11 +905,17 @@ mod tests {
         let client =
             GrammarHttpClient::with_config(endpoint, Duration::from_secs(30), 65_536).unwrap();
 
-        // Large body helps mid-upload stall against a slow/partial server read.
+        // Upload: body must exceed constrained recv capacity + partial observe
+        // so unsent bytes remain when the future is dropped mid-write.
+        // Wait / PartialBody: modest padding is enough for a full request read.
+        let padding = match mode {
+            HangMode::Upload => UPLOAD_HANG_BODY_PADDING,
+            HangMode::Wait | HangMode::PartialBody => 256 * 1024,
+        };
         let body = json!({
             "model": "openai/gpt-oss-20b",
             "stream": false,
-            "padding": "x".repeat(256 * 1024),
+            "padding": "x".repeat(padding),
             "messages": [{"role": "user", "content": "hello"}]
         });
 
@@ -818,6 +936,22 @@ mod tests {
             "server must still own the in-flight request before drop"
         );
 
+        // Mid-upload: server must already have a verified partial body *before*
+        // drop — this is the active-upload condition, not post-EOF teardown.
+        if matches!(mode, HangMode::Upload) {
+            let body_seen = probe.upload_body_bytes();
+            let content_length = probe.upload_content_length();
+            assert!(
+                content_length > 0,
+                "Upload hang must parse Content-Length from request headers"
+            );
+            assert!(
+                body_seen < content_length,
+                "server must observe a partial body before drop \
+                 (body_bytes={body_seen} < Content-Length={content_length})"
+            );
+        }
+
         // Cancel the request future — the production gate's drop path.
         drop(fut);
         let _ = drop_tx.send(());
@@ -837,9 +971,25 @@ mod tests {
             0,
             "residual per-request handler work must be zero"
         );
-        // Touch the counter so a future hang that keeps pumping is visible in
-        // debug failures without treating pre-drop socket buffer drains as fail.
-        let _pre_drop_drain = probe.residual_bytes_after_drop();
+
+        // Mid-upload proof: after drop, the handler never observed a full body.
+        // (Upload mode stops reading after the partial observation; it does not
+        // drain-to-EOF, so body_bytes stays strictly below Content-Length.)
+        if matches!(mode, HangMode::Upload) {
+            let body_seen = probe.upload_body_bytes();
+            let content_length = probe.upload_content_length();
+            assert!(
+                body_seen < content_length,
+                "after mid-upload drop, server body observation must remain partial \
+                 (body_bytes={body_seen} < Content-Length={content_length})"
+            );
+            // Residual post-drop drains must stay zero: Upload does not pump.
+            assert_eq!(
+                probe.residual_bytes_after_drop(),
+                0,
+                "Upload hang must not drain the remainder after client drop"
+            );
+        }
 
         server.abort();
     }
