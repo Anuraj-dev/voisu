@@ -103,7 +103,7 @@ libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 voisu-core = { path = "../voisu-core" }
