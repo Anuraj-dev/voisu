@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.10.3
+Version:        0.11.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,14 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Sun Aug 09 2026 Voisu maintainers <voisu@example.invalid> - 0.11.0-1
+- feat(config): add Writing Mode CLI and persisted Smart/Literal (#113) (#116)
+- docs(research): approve Smart Writing implementation specification (#103) (#112)
+- docs(research): approve Smart Writing edit safety (#111)
+- docs(research): define final-only transform pipeline (#110)
+- docs(research): approve Smart Writing behavior corpus (#109)
+- docs(research): add Smart Writing approval corpus (#108)
+
 * Sat Aug 08 2026 Voisu maintainers <voisu@example.invalid> - 0.10.3-1
 - fix(reconciliation): migrate default model to Qwen (#107)
 - docs(research): record Groq reconciliation benchmark (#106)
