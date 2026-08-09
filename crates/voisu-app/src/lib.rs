@@ -2,6 +2,7 @@ pub mod audio_level;
 pub mod config;
 pub mod dictionary;
 pub mod grammar_http;
+pub mod minimal_grammar;
 pub mod history_view;
 pub mod feedback;
 pub mod focus;
