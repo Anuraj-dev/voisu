@@ -365,9 +365,7 @@ mod seal_deadline_test_hook {
 
     pub(super) fn poll() -> Option<bool> {
         FREE_CHECKS.with(|c| {
-            let Some(left) = c.get() else {
-                return None;
-            };
+            let left = c.get()?;
             if left == 0 {
                 // Stay armed so subsequent checks keep hitting until `clear`.
                 Some(true)
