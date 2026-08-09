@@ -326,6 +326,13 @@ def _plain_format(text: str) -> str:
             chars[index] = char.upper()
             break
     rendered = "".join(chars)
+    protected = _formatting_protected_source_ranges(text)
+    chars = list(rendered)
+    for match in TOKEN_RE.finditer(rendered):
+        span = (char_to_utf8(rendered, match.start()), char_to_utf8(rendered, match.end()))
+        if match.group() == "i" and not any(overlaps(span, item) for item in protected):
+            chars[match.start()] = "I"
+    rendered = "".join(chars)
     if rendered[-1] not in ".!?\n":
         rendered += "."
     return rendered

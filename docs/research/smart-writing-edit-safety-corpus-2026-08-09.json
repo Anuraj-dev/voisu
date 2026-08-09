@@ -708,7 +708,7 @@
       "dictionary_terms": [],
       "expected": {
         "decision": "both",
-        "rendered": "There are two issues and i didn't know.",
+        "rendered": "There are two issues and I didn't know.",
         "error_codes": []
       },
       "related_behavior_fixture_ids": [],
