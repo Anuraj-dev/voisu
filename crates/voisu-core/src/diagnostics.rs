@@ -139,18 +139,45 @@ pub fn clamp_utf8_bytes(text: &str, max_bytes: usize) -> String {
     text[..boundary].to_owned()
 }
 
+/// Exact wire length of a text fingerprint: `sha256:` (7) + 64 lowercase hex.
+pub const TEXT_SHA256_FINGERPRINT_LEN: usize = 7 + 64;
+
 /// Full SHA-256 fingerprint of `text` as `sha256:` + 64 lowercase hex digits.
 /// Used so Validated/Rendered equality remains inspectable after the diagnostic
 /// text clamp drops tail bytes.
 pub fn text_sha256_fingerprint(text: &str) -> String {
     let digest = Sha256::digest(text.as_bytes());
-    let mut out = String::with_capacity(7 + 64);
+    let mut out = String::with_capacity(TEXT_SHA256_FINGERPRINT_LEN);
     out.push_str("sha256:");
     for byte in digest {
         out.push(HEX_LOWER[(byte >> 4) as usize] as char);
         out.push(HEX_LOWER[(byte & 0x0f) as usize] as char);
     }
+    debug_assert!(is_text_sha256_fingerprint(&out));
     out
+}
+
+/// Returns true when `value` is exactly `sha256:` followed by 64 lowercase hex
+/// digits. Anything else is free-form (possibly secret-bearing or unbounded)
+/// and must not be treated as a fingerprint.
+pub fn is_text_sha256_fingerprint(value: &str) -> bool {
+    if value.len() != TEXT_SHA256_FINGERPRINT_LEN {
+        return false;
+    }
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.bytes()
+        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// When `value` is not exact `sha256:` + 64 lowercase hex, replaces it with a
+/// fingerprint of `source_text` so free-form or secret-bearing mutation cannot
+/// leave non-fingerprint content in a fingerprint field.
+fn sanitize_text_sha256_fingerprint(value: &mut String, source_text: &str) {
+    if !is_text_sha256_fingerprint(value) {
+        *value = text_sha256_fingerprint(source_text);
+    }
 }
 
 const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
@@ -489,7 +516,8 @@ impl SmartWritingDiagnostic {
         };
     }
 
-    /// Re-applies every §10 Smart Writing byte budget and the edit-count cap.
+    /// Re-applies every §10 Smart Writing byte budget, the edit-count cap, and
+    /// fingerprint form validation.
     ///
     /// Constructors and setters clamp, but the diagnostic fields stay publicly
     /// mutable (serde + in-process assembly). Export scrubbing can also expand a
@@ -497,8 +525,10 @@ impl SmartWritingDiagnostic {
     /// [`REDACTED`]. Persistence and export call this so the bounds remain
     /// invariants of stored and exported records.
     ///
-    /// Fingerprints are **not** recomputed: they are digests of the unclamped
-    /// source and must survive clamp and scrub unchanged.
+    /// Fingerprints that already match `sha256:` + 64 lowercase hex are kept
+    /// (they may digest an unclamped source longer than the clamped text). Any
+    /// other value is rejected and regenerated from the clamped text so
+    /// free-form or secret-bearing mutation cannot persist or export.
     pub fn normalize(&mut self) {
         self.formatter_contract_id = clamp_utf8_bytes(
             &self.formatter_contract_id,
@@ -511,6 +541,16 @@ impl SmartWritingDiagnostic {
         self.rendered_after = clamp_utf8_bytes(
             &self.rendered_after,
             MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES,
+        );
+        // Validate fingerprints after text clamps so invalid values regenerate
+        // from the bounded stored text (unclamped source is unavailable here).
+        sanitize_text_sha256_fingerprint(
+            &mut self.validated_before_sha256,
+            &self.validated_before,
+        );
+        sanitize_text_sha256_fingerprint(
+            &mut self.rendered_after_sha256,
+            &self.rendered_after,
         );
         if let Some(model_id) = self.model_id.take() {
             let clamped = clamp_utf8_bytes(&model_id, MAX_MODEL_ID_UTF8_BYTES);
@@ -992,13 +1032,16 @@ pub fn export_record(
 }
 
 /// Scrubs every free-form string on a Smart Writing diagnostic, then re-clamps
-/// §10 budgets. Fingerprints are left alone (they are fixed-width hex digests,
-/// never secret material). Never introduces credentials, prompts, raw bodies, or
-/// app/window context.
+/// §10 budgets and validates fingerprint form via [`SmartWritingDiagnostic::normalize`].
+/// Fingerprints are not scrubbed as free text: only the exact `sha256:` + 64
+/// lowercase hex form is retained; any other value is regenerated so secrets
+/// cannot hide in a fingerprint field. Never introduces credentials, prompts,
+/// raw bodies, or app/window context.
 ///
 /// Scrub-then-normalize is required: replacing a short secret with
 /// [`REDACTED`] can expand a field past its byte budget, and public mutation can
-/// leave oversized text/edits on the in-memory record before export.
+/// leave oversized text/edits or invalid fingerprints on the in-memory record
+/// before export.
 fn scrub_smart_writing_diagnostic(smart: &mut SmartWritingDiagnostic, secrets: &[String]) {
     smart.formatter_contract_id = scrub_free_text(&smart.formatter_contract_id, secrets);
     smart.validated_before = scrub_free_text(&smart.validated_before, secrets);
@@ -1016,7 +1059,8 @@ fn scrub_smart_writing_diagnostic(smart: &mut SmartWritingDiagnostic, secrets: &
         edit.before = scrub_free_text(&edit.before, secrets);
         edit.after = scrub_free_text(&edit.after, secrets);
     }
-    // Re-clamp after scrub so redaction expansion cannot violate §10 budgets.
+    // Re-clamp after scrub so redaction expansion cannot violate §10 budgets,
+    // and sanitize fingerprints so invalid/secret-bearing values cannot export.
     smart.normalize();
 }
 
@@ -1303,10 +1347,11 @@ impl DiagnosticStore {
     /// removes any now-expired debug audio, and returns the retained history
     /// (newest first).
     ///
-    /// Smart Writing §10 byte budgets and edit-count caps are re-applied before
-    /// the record is serialized so public field mutation cannot persist
-    /// oversized text, model IDs, free-form errors, or more than
-    /// [`MAX_SMART_WRITING_DIAGNOSTIC_EDITS`] edits.
+    /// Smart Writing §10 byte budgets, edit-count caps, and fingerprint form
+    /// validation are re-applied before the record is serialized so public field
+    /// mutation cannot persist oversized text, model IDs, free-form errors, more
+    /// than [`MAX_SMART_WRITING_DIAGNOSTIC_EDITS`] edits, or non-fingerprint
+    /// content in the SHA-256 fields.
     pub fn record(&self, mut record: DiagnosticRecord) -> io::Result<Vec<DiagnosticRecord>> {
         if let Some(smart) = record.smart_writing.as_mut() {
             smart.normalize();

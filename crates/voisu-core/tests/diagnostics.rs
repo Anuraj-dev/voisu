@@ -2,16 +2,17 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use voisu_core::{
-    clamp_utf8_bytes, correlation_id, export_record, replay_capture, text_sha256_fingerprint,
-    unix_millis_now, AudioChunk, BoundaryFuture, CapturedAudio, DebugAudioRecord,
-    DiagnosticRecord, DiagnosticStore, EnglishEligibilityOutcome, LifecycleStage, Provider,
-    ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream, ProviderStreams,
-    RetentionPolicy, SmartWritingDiagnostic, SmartWritingEditEvidence, SmartWritingMode,
-    SmartWritingOutcome, SmartWritingReasonCode, SourceTranscript, Transcript, TranscriptDecision,
-    TranscriptSelection, TranscriptValidator, DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS,
-    MAX_MODEL_ID_UTF8_BYTES, MAX_SMART_WRITING_DIAGNOSTIC_EDITS,
+    clamp_utf8_bytes, correlation_id, export_record, is_text_sha256_fingerprint, replay_capture,
+    text_sha256_fingerprint, unix_millis_now, AudioChunk, BoundaryFuture, CapturedAudio,
+    DebugAudioRecord, DiagnosticRecord, DiagnosticStore, EnglishEligibilityOutcome, LifecycleStage,
+    Provider, ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream,
+    ProviderStreams, RetentionPolicy, SmartWritingDiagnostic, SmartWritingEditEvidence,
+    SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode, SourceTranscript, Transcript,
+    TranscriptDecision, TranscriptSelection, TranscriptValidator, DEFAULT_MAX_AGE,
+    DEFAULT_MAX_RECORDS, MAX_MODEL_ID_UTF8_BYTES, MAX_SMART_WRITING_DIAGNOSTIC_EDITS,
     MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES, MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES,
     MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES, REDACTED, SMART_WRITING_DIAGNOSTIC_VERSION,
+    TEXT_SHA256_FINGERPRINT_LEN,
 };
 
 fn record_at(id: u64, recorded_at_unix_ms: u64) -> DiagnosticRecord {
@@ -1485,7 +1486,8 @@ fn clamp_utf8_bytes_respects_scalar_boundaries() {
 fn text_sha256_fingerprint_is_stable_and_prefixed() {
     let fp = text_sha256_fingerprint("hello");
     assert!(fp.starts_with("sha256:"));
-    assert_eq!(fp.len(), "sha256:".len() + 64);
+    assert_eq!(fp.len(), TEXT_SHA256_FINGERPRINT_LEN);
+    assert!(is_text_sha256_fingerprint(&fp));
     assert_eq!(fp, text_sha256_fingerprint("hello"));
     assert_ne!(fp, text_sha256_fingerprint("Hello"));
     // Known SHA-256 of "hello".
@@ -1493,6 +1495,128 @@ fn text_sha256_fingerprint_is_stable_and_prefixed() {
         fp,
         "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
     );
+    // Form validator rejects free-form, wrong case, wrong length, and uppercase hex.
+    assert!(!is_text_sha256_fingerprint("sk-not-a-fingerprint"));
+    assert!(!is_text_sha256_fingerprint(&format!("sha256:{}", "A".repeat(64))));
+    assert!(!is_text_sha256_fingerprint(&format!("sha256:{}", "a".repeat(63))));
+    assert!(!is_text_sha256_fingerprint(&format!("SHA256:{}", "a".repeat(64))));
+    assert!(!is_text_sha256_fingerprint(&format!("sha256:{}", "g".repeat(64))));
+}
+
+#[test]
+fn smart_writing_persistence_rejects_invalid_fingerprints() {
+    // Fingerprint fields are publicly mutable strings. Persist must reject any
+    // value that is not exact `sha256:` + 64 lowercase hex (including secrets
+    // and oversized free-form) and regenerate from the clamped text.
+    let secret = "sk-sw8-fingerprint-smuggle-secret";
+    let mut smart = SmartWritingDiagnostic::new(
+        SmartWritingMode::Smart,
+        EnglishEligibilityOutcome::Eligible,
+        "contract",
+        "validated-source-text",
+        "rendered-source-text",
+        SmartWritingOutcome::FormattingOnly,
+    );
+    let valid_before = smart.validated_before_sha256.clone();
+    let valid_after = smart.rendered_after_sha256.clone();
+    assert!(is_text_sha256_fingerprint(&valid_before));
+    assert!(is_text_sha256_fingerprint(&valid_after));
+
+    // Valid form survives normalize-on-record (unclamped digests stay intact).
+    smart.validated_before_sha256 = valid_before.clone();
+    smart.rendered_after_sha256 = valid_after.clone();
+
+    let dir = TempDir::new().unwrap();
+    let store = DiagnosticStore::open(dir.path().to_owned(), RetentionPolicy::default()).unwrap();
+    let mut record = DiagnosticRecord::new("sw-fp-valid".to_owned(), 1);
+    record.smart_writing = Some(smart.clone());
+    store.record(record).unwrap();
+    let loaded = store.find("sw-fp-valid").unwrap().unwrap();
+    let sw = loaded.smart_writing.as_ref().unwrap();
+    assert_eq!(sw.validated_before_sha256, valid_before);
+    assert_eq!(sw.rendered_after_sha256, valid_after);
+
+    // Secret-bearing free-form, wrong case, and oversized garbage are rejected.
+    smart.validated_before_sha256 = secret.to_owned();
+    smart.rendered_after_sha256 = format!("sha256:{}", "A".repeat(64)); // uppercase hex
+    let mut record = DiagnosticRecord::new("sw-fp-invalid".to_owned(), 2);
+    record.smart_writing = Some(smart.clone());
+    store.record(record).unwrap();
+    let loaded = store.find("sw-fp-invalid").unwrap().unwrap();
+    let sw = loaded.smart_writing.as_ref().unwrap();
+    assert_eq!(
+        sw.validated_before_sha256,
+        text_sha256_fingerprint(&sw.validated_before)
+    );
+    assert_eq!(
+        sw.rendered_after_sha256,
+        text_sha256_fingerprint(&sw.rendered_after)
+    );
+    assert!(is_text_sha256_fingerprint(&sw.validated_before_sha256));
+    assert!(is_text_sha256_fingerprint(&sw.rendered_after_sha256));
+    let on_disk = std::fs::read_to_string(dir.path().join("history.jsonl")).unwrap();
+    assert!(
+        !on_disk.contains(secret),
+        "secret must not persist in a fingerprint field: {on_disk}"
+    );
+
+    // Oversized free-form fingerprint cannot persist either.
+    smart.validated_before_sha256 = format!("not-a-fp-{}", "x".repeat(4_000));
+    smart.rendered_after_sha256 = format!("still-not-{}", "y".repeat(4_000));
+    let mut record = DiagnosticRecord::new("sw-fp-oversized".to_owned(), 3);
+    record.smart_writing = Some(smart);
+    store.record(record).unwrap();
+    let loaded = store.find("sw-fp-oversized").unwrap().unwrap();
+    let sw = loaded.smart_writing.as_ref().unwrap();
+    assert_eq!(sw.validated_before_sha256.len(), TEXT_SHA256_FINGERPRINT_LEN);
+    assert_eq!(sw.rendered_after_sha256.len(), TEXT_SHA256_FINGERPRINT_LEN);
+    assert!(is_text_sha256_fingerprint(&sw.validated_before_sha256));
+    assert!(is_text_sha256_fingerprint(&sw.rendered_after_sha256));
+}
+
+#[test]
+fn smart_writing_export_rejects_invalid_and_secret_bearing_fingerprints() {
+    // Export is a second boundary: invalid fingerprints are regenerated, so a
+    // secret smuggled into a fingerprint field cannot appear in the export.
+    let secret = "sk-export-fingerprint-smuggle";
+    let mut smart = SmartWritingDiagnostic::new(
+        SmartWritingMode::Smart,
+        EnglishEligibilityOutcome::Eligible,
+        "contract",
+        "before-text",
+        "after-text",
+        SmartWritingOutcome::FormattingOnly,
+    );
+    let valid_fp = smart.validated_before_sha256.clone();
+    smart.validated_before_sha256 = secret.to_owned();
+    smart.rendered_after_sha256 = format!("SHA256:{}", "a".repeat(64));
+
+    let mut record = record_at(9, unix_millis_now());
+    record.smart_writing = Some(smart);
+    let export = export_record(
+        record,
+        vec![("VOISU_GROQ_API_KEY".to_owned(), secret.to_owned())],
+    );
+    let encoded = serde_json::to_string(&export).unwrap();
+    assert!(
+        !encoded.contains(secret),
+        "export must not leak a secret via fingerprint fields: {encoded}"
+    );
+
+    let sw = export.record.smart_writing.as_ref().unwrap();
+    assert!(is_text_sha256_fingerprint(&sw.validated_before_sha256));
+    assert!(is_text_sha256_fingerprint(&sw.rendered_after_sha256));
+    assert_eq!(
+        sw.validated_before_sha256,
+        text_sha256_fingerprint(&sw.validated_before)
+    );
+    assert_eq!(
+        sw.rendered_after_sha256,
+        text_sha256_fingerprint(&sw.rendered_after)
+    );
+    // Regenerated from clamped text, not the original constructor fingerprint
+    // of the same short text — equal in this case because text was never oversized.
+    assert_eq!(sw.validated_before_sha256, valid_fp);
 }
 
 #[test]

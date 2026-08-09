@@ -23,16 +23,17 @@ pub use wav::{scan_wav_pcm, WavScan};
 
 mod diagnostics;
 pub use diagnostics::{
-    clamp_utf8_bytes, correlation_id, export_record, is_secret_env_key, redacted_environment,
-    replay_capture, sanitize_url, scrub_embedded_urls, scrub_secret_values,
-    text_sha256_fingerprint, unix_millis_now, DebugAudioRecord, DiagnosticExport, DiagnosticRecord,
-    DiagnosticStore, EnglishEligibilityOutcome, PruneOutcome, ReplayOutcome, RetentionPolicy,
+    clamp_utf8_bytes, correlation_id, export_record, is_secret_env_key,
+    is_text_sha256_fingerprint, redacted_environment, replay_capture, sanitize_url,
+    scrub_embedded_urls, scrub_secret_values, text_sha256_fingerprint, unix_millis_now,
+    DebugAudioRecord, DiagnosticExport, DiagnosticRecord, DiagnosticStore,
+    EnglishEligibilityOutcome, PruneOutcome, ReplayOutcome, RetentionPolicy,
     SmartWritingDiagnostic, SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome,
     SmartWritingReasonCode, SourceTranscriptRecord, DEFAULT_DEBUG_AUDIO_TTL, DEFAULT_MAX_AGE,
     DEFAULT_MAX_RECORDS, EXPORT_ENV_ALLOWLIST, MAX_MODEL_ID_UTF8_BYTES,
     MAX_SMART_WRITING_DIAGNOSTIC_EDITS, MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES,
     MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES, MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES,
-    MAX_STORED_TEXT, REDACTED, SMART_WRITING_DIAGNOSTIC_VERSION,
+    MAX_STORED_TEXT, REDACTED, SMART_WRITING_DIAGNOSTIC_VERSION, TEXT_SHA256_FINGERPRINT_LEN,
 };
 
 // Paged diagnostic responses are negotiated per REQUEST (see `Request::paged`),
