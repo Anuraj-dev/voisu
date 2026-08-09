@@ -180,6 +180,30 @@ pub fn format_validated_with(
     mode: WritingMode,
     options: FormatOptions<'_>,
 ) -> FormattingBaseline {
+    format_validated_impl(validated_transcript, mode, options, true)
+}
+
+/// Produce the formatter-owned baseline consumed by Minimal Grammar.
+///
+/// SW3 keeps a hermetic copy of the three closed grammar rules solely so the
+/// approved #99 Smart oracle remains executable before the provider is wired.
+/// The production safety gate must instead receive Formatting alone and compose
+/// provider grammar through its source anchors, so this entry point disables
+/// that hermetic oracle without exposing baseline construction.
+#[must_use]
+pub fn format_validated_for_grammar(
+    validated_transcript: &str,
+    options: FormatOptions<'_>,
+) -> FormattingBaseline {
+    format_validated_impl(validated_transcript, WritingMode::Smart, options, false)
+}
+
+fn format_validated_impl(
+    validated_transcript: &str,
+    mode: WritingMode,
+    options: FormatOptions<'_>,
+    apply_hermetic_grammar: bool,
+) -> FormattingBaseline {
     let started = Instant::now();
     let budget = options
         .work_deadline
@@ -208,6 +232,7 @@ pub fn format_validated_with(
                 options.dictionary,
                 options.protected_names,
                 deadline_at,
+                apply_hermetic_grammar,
             ) else {
                 return seal_identity_baseline(
                     validated_transcript,
@@ -885,6 +910,7 @@ fn smart_format(
     dictionary: &[&str],
     protected_names: &[&str],
     deadline_at: Instant,
+    apply_hermetic_grammar: bool,
 ) -> Option<String> {
     if input.is_empty() {
         return Some(String::new());
@@ -972,7 +998,7 @@ fn smart_format(
     // is present, or when consecutive word-tokens `new`+`line` appear (F36).
     // Quote/code/composite + dictionary/names protection so local rewrites
     // cannot mutate protected interiors or snapshot tokens.
-    if !has_commands && !has_new_line_token_pair(input) {
+    if apply_hermetic_grammar && !has_commands && !has_new_line_token_pair(input) {
         if deadline_hit(deadline_at) {
             return None;
         }
@@ -1284,12 +1310,14 @@ fn apply_vocative_commas(
     t = comma_before_trailing_word(&t, "lol", &protected);
     // said " → said, "
     let protected = build_edit_protection(&t, dictionary, protected_names);
-    t = replace_ci_word_before_quote(&t, "said", &protected);
+    if closing_quote_is_followed_by_and(&t) {
+        t = replace_ci_word_before_quote(&t, "said", &protected);
+    }
     // " and → ," and (closing quote discourse comma, F21b)
     if let Some(idx) = t.find("\" ") {
         // only when followed by "and"
         let after = &t[idx + 2..];
-        if after.len() >= 3 && ascii_lower(&after[..3.min(after.len())]).starts_with("and") {
+        if starts_with_ascii_word_ci(after, "and") {
             // ensure not already ,"
             let fenced_code = build_fenced_code_protection(&t);
             if idx > 0
@@ -1301,6 +1329,20 @@ fn apply_vocative_commas(
         }
     }
     t
+}
+
+fn closing_quote_is_followed_by_and(text: &str) -> bool {
+    text.match_indices("\" ")
+        .any(|(index, _)| starts_with_ascii_word_ci(&text[index + 2..], "and"))
+}
+
+fn starts_with_ascii_word_ci(text: &str, word: &str) -> bool {
+    text.get(..word.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(word))
+        && text[word.len()..]
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_alphanumeric() && character != '_')
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {

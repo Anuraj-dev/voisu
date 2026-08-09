@@ -44,9 +44,18 @@ pub use formatting_commands::{
 
 mod formatting;
 pub use formatting::{
-    format_validated, format_validated_with, FormatOptions, FormattingBaseline, SourceAnchor,
-    WritingMode, FORMATTER_CONTRACT_ID, LOCAL_FORMATTER_WORK_DEADLINE,
+    format_validated, format_validated_for_grammar, format_validated_with, FormatOptions,
+    FormattingBaseline, SourceAnchor, WritingMode, FORMATTER_CONTRACT_ID,
+    LOCAL_FORMATTER_WORK_DEADLINE,
     MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES, VALIDATED_TRANSCRIPT_VERSION,
+};
+
+mod grammar_safety;
+pub use grammar_safety::{
+    apply_grammar_candidate_json, GrammarDiagnostic, GrammarErrorCode, GrammarOutcome,
+    GrammarSafetyOptions, GrammarSafetyResult, MAX_GRAMMAR_DIAGNOSTIC_UTF8_BYTES,
+    MAX_GRAMMAR_EDITS, MAX_GRAMMAR_EDIT_FIELD_UTF8_BYTES, MAX_GRAMMAR_JSON_DEPTH,
+    MAX_GRAMMAR_JSON_NODES, MAX_GRAMMAR_RESPONSE_BYTES,
 };
 
 // Paged diagnostic responses are negotiated per REQUEST (see `Request::paged`),
