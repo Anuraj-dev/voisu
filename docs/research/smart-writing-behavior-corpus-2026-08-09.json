@@ -1,13 +1,13 @@
 {
   "corpus_id": "voisu-smart-writing-behavior-2026-08-09",
-  "version": "3.0.0-pending",
+  "version": "3.1.0-approved",
   "issue": {
     "github_number": 99,
     "title": "Prototype the Smart and Literal writing behavior",
     "parent_map": 96,
     "url": "https://github.com/Anuraj-dev/voisu/issues/99"
   },
-  "approval_state": "pending",
+  "approval_state": "approved",
   "language": "en",
   "scope": {
     "in_scope": [
@@ -29,7 +29,7 @@
       "id": "D_cmd",
       "title": "Command syntax strategy",
       "question": "How should explicit formatting commands be recognized in the Validated Transcript? This is a product choice; #99 does not lock a parser.",
-      "status": "pending",
+      "status": "approved",
       "recommendation": "Prefer A (explicit introducer) for meaning safety; accept B only if Raja wants Wispr-like bare phrases and accepts noun-phrase ambiguity risk on counterexamples.",
       "blocks_fixture_ids": [
         "F09",
@@ -70,13 +70,14 @@
           "label": "Natural bare commands",
           "summary": "Bare phrases may fire as commands with an explicit literal escape for word-sense. Accepts documented ambiguity risk on noun phrases (bullet train, brand new line, etc.)."
         }
-      ]
+      ],
+      "selected_option_id": "D_cmd-A"
     },
     {
       "id": "D1",
       "title": "Terminal punctuation after paragraph command",
       "question": "When a new paragraph command fires, should Smart add terminal periods on short multi-word fragments?",
-      "status": "pending",
+      "status": "approved",
       "recommendation": "Yes for fragments with two or more content words.",
       "blocks_fixture_ids": [
         "F14",
@@ -93,14 +94,15 @@
           "label": "Smart terminal punct",
           "summary": "Also add periods on multi-word fragments."
         }
-      ]
+      ],
+      "selected_option_id": "D1-B"
     },
     {
       "id": "D3",
       "title": "List inference without list commands",
-      "question": "May Smart invent bullets/lists without spoken number/bullet commands?",
-      "status": "pending",
-      "recommendation": "No for v1.",
+      "question": "May Smart infer bullets from a clearly list-like Validated Transcript without a spoken list command?",
+      "status": "approved",
+      "recommendation": "Approved: conservative transcript-content-aware inference; never application context. Ambiguous prose stays prose.",
       "blocks_fixture_ids": [
         "F17"
       ],
@@ -113,15 +115,16 @@
         {
           "id": "D3-B",
           "label": "Infer bullets",
-          "summary": "Allow Smart to invent list structure."
+          "summary": "Allow Smart to infer list structure only when the Validated Transcript clearly expresses a list. Ambiguous prose stays prose; exact conservative gates belong to #100/#103."
         }
-      ]
+      ],
+      "selected_option_id": "D3-B"
     },
     {
       "id": "D4",
       "title": "Capitalization inside quotes",
       "question": "When quote commands fire, may Smart sentence-case a full quoted sentence?",
-      "status": "pending",
+      "status": "approved",
       "recommendation": "Preserve validated in-quote casing by default.",
       "blocks_fixture_ids": [
         "F21",
@@ -138,13 +141,14 @@
           "label": "Sentence-case full quotes",
           "summary": "Also case inside full quoted sentences."
         }
-      ]
+      ],
+      "selected_option_id": "D4-A"
     },
     {
       "id": "D5",
       "title": "Double negatives",
       "question": "Should Minimal Grammar standardize double negatives, or preserve spoken voice?",
-      "status": "pending",
+      "status": "approved",
       "recommendation": "Preserve voice; only apostrophe/case.",
       "blocks_fixture_ids": [
         "F27"
@@ -160,14 +164,15 @@
           "label": "Standardize negation",
           "summary": "I didn't see any error."
         }
-      ]
+      ],
+      "selected_option_id": "D5-A"
     },
     {
       "id": "D10",
       "title": "Email greeting structure",
       "question": "Should Smart invent a greeting line and blank line for hi <name> openings?",
-      "status": "pending",
-      "recommendation": "Only for clear hi/hello/dear openings; else single paragraph.",
+      "status": "approved",
+      "recommendation": "Approved: no special email-layout invention for v1; punctuate as a single paragraph.",
       "blocks_fixture_ids": [
         "F04"
       ],
@@ -182,13 +187,14 @@
           "label": "Single paragraph",
           "summary": "Punctuate without invented blank lines."
         }
-      ]
+      ],
+      "selected_option_id": "D10-B"
     },
     {
       "id": "D14",
       "title": "Oxford comma",
       "question": "Prefer Oxford comma in Smart serial lists?",
-      "status": "pending",
+      "status": "approved",
       "recommendation": "Prefer Oxford comma.",
       "blocks_fixture_ids": [
         "F18"
@@ -204,7 +210,8 @@
           "label": "No Oxford comma",
           "summary": "a, b and c"
         }
-      ]
+      ],
+      "selected_option_id": "D14-A"
     }
   ],
   "fixtures": [
@@ -625,180 +632,88 @@
     },
     {
       "id": "F09",
-      "status": "open",
+      "status": "locked",
       "category": "punctuation_command",
       "roles": [
         "must_change",
         "command"
       ],
       "input": "ship it exclamation point",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F09-A",
-          "summary": "Strategy A (introducer-only): bare phrase does not fire; words remain.",
-          "expected": {
-            "literal": "ship it exclamation point",
-            "smart": "Ship it exclamation point."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F09-B",
-          "summary": "Strategy B (natural bare): bare exclamation point fires to !.",
-          "expected": {
-            "literal": "ship it!",
-            "smart": "Ship it!"
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
-        "sentence case on Smart (both alts where applicable)",
-        "terminal period when command does not fire (A)",
-        "punctuation command render when bare fires (B)"
+        "sentence case",
+        "terminal period",
+        "preserve bare command-like words"
       ],
       "grammar_changes": [],
-      "rationale": "Named punctuation. A and B disagree on whether bare exclamation point is a command."
+      "rationale": "Named punctuation. A and B disagree on whether bare exclamation point is a command. Approved choice: Strategy A (introducer-only): bare phrase does not fire; words remain.",
+      "expected": {
+        "literal": "ship it exclamation point",
+        "smart": "Ship it exclamation point."
+      }
     },
     {
       "id": "F09b",
-      "status": "open",
+      "status": "locked",
       "category": "punctuation_command",
       "roles": [
         "must_change",
         "command"
       ],
       "input": "ship it command exclamation point",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F09b-A",
-          "summary": "Strategy A: introducer+phrase fires; command words consumed.",
-          "expected": {
-            "literal": "ship it!",
-            "smart": "Ship it!"
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F09b-B",
-          "summary": "Strategy B: word command stays; bare exclamation point still fires.",
-          "expected": {
-            "literal": "ship it command!",
-            "smart": "Ship it command!"
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "exclamation render when phrase fires",
         "sentence case on Smart"
       ],
       "grammar_changes": [],
-      "rationale": "Same intent with explicit introducer present in the Validated Transcript."
+      "rationale": "Same intent with explicit introducer present in the Validated Transcript. Approved choice: Strategy A: introducer+phrase fires; command words consumed.",
+      "expected": {
+        "literal": "ship it!",
+        "smart": "Ship it!"
+      }
     },
     {
       "id": "F10",
-      "status": "open",
+      "status": "locked",
       "category": "punctuation_command",
       "roles": [
         "must_change",
         "command"
       ],
       "input": "stop period new line next item",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F10-A",
-          "summary": "Strategy A: bare period/new line do not fire.",
-          "expected": {
-            "literal": "stop period new line next item",
-            "smart": "Stop period new line next item."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F10-B",
-          "summary": "Strategy B: bare period and new line fire.",
-          "expected": {
-            "literal": "stop.\nnext item",
-            "smart": "Stop.\nNext item"
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "sentence case / line case when commands fire (B)",
         "terminal period when no fire (A)"
       ],
       "grammar_changes": [],
-      "rationale": "Stacked bare punctuation/line commands."
+      "rationale": "Stacked bare punctuation/line commands. Approved choice: Strategy A: bare period/new line do not fire.",
+      "expected": {
+        "literal": "stop period new line next item",
+        "smart": "Stop period new line next item."
+      }
     },
     {
       "id": "F10b",
-      "status": "open",
+      "status": "locked",
       "category": "punctuation_command",
       "roles": [
         "must_change",
         "command"
       ],
       "input": "stop command period command new line next item",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F10b-A",
-          "summary": "Strategy A: introducer-gated period and new line fire.",
-          "expected": {
-            "literal": "stop.\nnext item",
-            "smart": "Stop.\nNext item"
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F10b-B",
-          "summary": "Strategy B: command words remain as content; bare period/new line still fire around them.",
-          "expected": {
-            "literal": "stop command.\ncommand next item",
-            "smart": "Stop command.\nCommand next item"
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "period and newline renders",
         "Smart line casing"
       ],
       "grammar_changes": [],
-      "rationale": "Introducer form of period+newline stack."
+      "rationale": "Introducer form of period+newline stack. Approved choice: Strategy A: introducer-gated period and new line fire.",
+      "expected": {
+        "literal": "stop.\nnext item",
+        "smart": "Stop.\nNext item"
+      }
     },
     {
       "id": "F11",
-      "status": "open",
+      "status": "locked",
       "category": "punctuation_command",
       "roles": [
         "must_preserve",
@@ -806,172 +721,82 @@
         "command_safety_counterexample"
       ],
       "input": "the period of the moon is twenty seven days",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F11-A",
-          "summary": "Strategy A: bare period never fires (noun sense).",
-          "expected": {
-            "literal": "the period of the moon is twenty seven days",
-            "smart": "The period of the moon is twenty seven days."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F11-B",
-          "summary": "Strategy B desired preserve: product should still keep noun period (ambiguity risk acknowledged).",
-          "expected": {
-            "literal": "the period of the moon is twenty seven days",
-            "smart": "The period of the moon is twenty seven days."
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "sentence case",
         "terminal period"
       ],
       "grammar_changes": [],
-      "rationale": "Noun-phrase counterexample for period. Both strategies propose preserve; B carries documented ambiguity risk if bare commands over-fire."
+      "rationale": "Noun-phrase counterexample for period. Both strategies propose preserve; B carries documented ambiguity risk if bare commands over-fire. Approved choice: Strategy A: bare period never fires (noun sense).",
+      "expected": {
+        "literal": "the period of the moon is twenty seven days",
+        "smart": "The period of the moon is twenty seven days."
+      }
     },
     {
       "id": "F12",
-      "status": "open",
+      "status": "locked",
       "category": "punctuation_command",
       "roles": [
         "must_change",
         "command"
       ],
       "input": "are you free question mark",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F12-A",
-          "summary": "Strategy A: bare question mark does not fire.",
-          "expected": {
-            "literal": "are you free question mark",
-            "smart": "Are you free question mark."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F12-B",
-          "summary": "Strategy B: bare question mark fires to ?.",
-          "expected": {
-            "literal": "are you free?",
-            "smart": "Are you free?"
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "sentence case",
-        "question mark render under B"
+        "terminal period",
+        "preserve bare question mark words"
       ],
       "grammar_changes": [],
-      "rationale": "Bare question mark command choice."
+      "rationale": "Bare question mark command choice. Approved choice: Strategy A: bare question mark does not fire.",
+      "expected": {
+        "literal": "are you free question mark",
+        "smart": "Are you free question mark."
+      }
     },
     {
       "id": "F13",
-      "status": "open",
+      "status": "locked",
       "category": "line_paragraph",
       "roles": [
         "must_change",
         "command"
       ],
       "input": "first thought new line second thought",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F13-A",
-          "summary": "Strategy A: bare new line does not fire.",
-          "expected": {
-            "literal": "first thought new line second thought",
-            "smart": "First thought new line second thought."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F13-B",
-          "summary": "Strategy B: bare new line fires.",
-          "expected": {
-            "literal": "first thought\nsecond thought",
-            "smart": "First thought\nSecond thought"
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
-        "sentence/line case",
-        "newline under B"
+        "sentence case",
+        "terminal period",
+        "preserve bare new line words"
       ],
       "grammar_changes": [],
-      "rationale": "Mid-utterance new line."
+      "rationale": "Mid-utterance new line. Approved choice: Strategy A: bare new line does not fire.",
+      "expected": {
+        "literal": "first thought new line second thought",
+        "smart": "First thought new line second thought."
+      }
     },
     {
       "id": "F13b",
-      "status": "open",
+      "status": "locked",
       "category": "line_paragraph",
       "roles": [
         "must_change",
         "command"
       ],
       "input": "first thought command new line second thought",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F13b-A",
-          "summary": "Strategy A: introducer+new line fires.",
-          "expected": {
-            "literal": "first thought\nsecond thought",
-            "smart": "First thought\nSecond thought"
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F13b-B",
-          "summary": "Strategy B: command word kept; bare new line fires after it.",
-          "expected": {
-            "literal": "first thought command\nsecond thought",
-            "smart": "First thought command\nSecond thought"
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "newline",
         "line casing"
       ],
       "grammar_changes": [],
-      "rationale": "Introducer form of mid-utterance new line."
+      "rationale": "Introducer form of mid-utterance new line. Approved choice: Strategy A: introducer+new line fires.",
+      "expected": {
+        "literal": "first thought\nsecond thought",
+        "smart": "First thought\nSecond thought"
+      }
     },
     {
       "id": "F15",
-      "status": "open",
+      "status": "locked",
       "category": "line_paragraph",
       "roles": [
         "must_preserve",
@@ -979,43 +804,20 @@
         "command_safety_counterexample"
       ],
       "input": "please press new line after the title when you typeset it",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F15-A",
-          "summary": "Strategy A: bare new line does not fire; meta speech preserved.",
-          "expected": {
-            "literal": "please press new line after the title when you typeset it",
-            "smart": "Please press new line after the title when you typeset it."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F15-B",
-          "summary": "Strategy B desired preserve of meta speech (ambiguity risk if bare new line over-fires).",
-          "expected": {
-            "literal": "please press new line after the title when you typeset it",
-            "smart": "Please press new line after the title when you typeset it."
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "sentence case",
         "terminal period"
       ],
       "grammar_changes": [],
-      "rationale": "Meta speech about new line; must-preserve counterexample."
+      "rationale": "Meta speech about new line; must-preserve counterexample. Approved choice: Strategy A: bare new line does not fire; meta speech preserved.",
+      "expected": {
+        "literal": "please press new line after the title when you typeset it",
+        "smart": "Please press new line after the title when you typeset it."
+      }
     },
     {
       "id": "F15b",
-      "status": "open",
+      "status": "locked",
       "category": "line_paragraph",
       "roles": [
         "must_preserve",
@@ -1023,217 +825,103 @@
         "command_safety_counterexample"
       ],
       "input": "literal command new line then continue",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F15b-A",
-          "summary": "Strategy A: literal escapes introducer+phrase → words command new line remain.",
-          "expected": {
-            "literal": "command new line then continue",
-            "smart": "Command new line then continue."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F15b-B",
-          "summary": "Strategy B: literal is ordinary word; bare new line may still be intended as escape context — proposed preserve of words.",
-          "expected": {
-            "literal": "literal command new line then continue",
-            "smart": "Literal command new line then continue."
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "sentence case",
         "terminal period"
       ],
       "grammar_changes": [],
-      "rationale": "Escape/meta forms for speaking command phrases as words. Alternatives are complete proposed renders under each strategy."
+      "rationale": "Escape/meta forms for speaking command phrases as words. Alternatives are complete proposed renders under each strategy. Approved choice: Strategy A: literal escapes introducer+phrase → words command new line remain.",
+      "expected": {
+        "literal": "command new line then continue",
+        "smart": "Command new line then continue."
+      }
     },
     {
       "id": "F16",
-      "status": "open",
+      "status": "locked",
       "category": "list",
       "roles": [
         "must_change",
         "command"
       ],
       "input": "number one apples number two oranges number three pears",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F16-A",
-          "summary": "Strategy A: bare number one/two/three do not fire.",
-          "expected": {
-            "literal": "number one apples number two oranges number three pears",
-            "smart": "Number one apples number two oranges number three pears."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F16-B",
-          "summary": "Strategy B: bare list commands fire to separate numbered lines.",
-          "expected": {
-            "literal": "1. apples\n2. oranges\n3. pears",
-            "smart": "1. Apples\n2. Oranges\n3. Pears"
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
-        "list structure and item casing under B",
-        "sentence case under A"
+        "sentence case",
+        "terminal period",
+        "preserve bare numbered-list words"
       ],
       "grammar_changes": [],
-      "rationale": "Enumerated list via spoken number commands."
+      "rationale": "Enumerated list via spoken number commands. Approved choice: Strategy A: bare number one/two/three do not fire.",
+      "expected": {
+        "literal": "number one apples number two oranges number three pears",
+        "smart": "Number one apples number two oranges number three pears."
+      }
     },
     {
       "id": "F16b",
-      "status": "open",
+      "status": "locked",
       "category": "list",
       "roles": [
         "must_change",
         "command"
       ],
       "input": "command number one apples command number two oranges command number three pears",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F16b-A",
-          "summary": "Strategy A: introducer-gated list commands fire to separate lines.",
-          "expected": {
-            "literal": "1. apples\n2. oranges\n3. pears",
-            "smart": "1. Apples\n2. Oranges\n3. Pears"
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F16b-B",
-          "summary": "Strategy B: command words may remain while bare number phrases also fire — proposed render keeps markers and drops introducer words as content noise avoided by treating number phrases as commands.",
-          "expected": {
-            "literal": "1. apples\n2. oranges\n3. pears",
-            "smart": "1. Apples\n2. Oranges\n3. Pears"
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "numbered list lines",
         "item casing on Smart"
       ],
       "grammar_changes": [],
-      "rationale": "Introducer form of enumerated list. Under B, number phrases still fire; proposed exact outputs match multiline list."
+      "rationale": "Introducer form of enumerated list. Under B, number phrases still fire; proposed exact outputs match multiline list. Approved choice: Strategy A: introducer-gated list commands fire to separate lines.",
+      "expected": {
+        "literal": "1. apples\n2. oranges\n3. pears",
+        "smart": "1. Apples\n2. Oranges\n3. Pears"
+      }
     },
     {
       "id": "F22",
-      "status": "open",
+      "status": "locked",
       "category": "quotation",
       "roles": [
         "must_preserve",
         "command"
       ],
       "input": "use the exact error quote connection refused unquote in the ticket",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F22-A",
-          "summary": "Strategy A: bare quote/unquote do not fire.",
-          "expected": {
-            "literal": "use the exact error quote connection refused unquote in the ticket",
-            "smart": "Use the exact error quote connection refused unquote in the ticket."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F22-B",
-          "summary": "Strategy B: bare quote/unquote fire to ASCII quotes around connection refused.",
-          "expected": {
-            "literal": "use the exact error \"connection refused\" in the ticket",
-            "smart": "Use the exact error \"connection refused\" in the ticket."
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "sentence case",
         "terminal period",
-        "quote pairing under B"
+        "preserve bare quote and unquote words"
       ],
       "grammar_changes": [],
-      "rationale": "Quoted technical string. In-quote casing preserved in both B Smart/Literal (no D4 here)."
+      "rationale": "Quoted technical string. In-quote casing preserved in both B Smart/Literal (no D4 here). Approved choice: Strategy A: bare quote/unquote do not fire.",
+      "expected": {
+        "literal": "use the exact error quote connection refused unquote in the ticket",
+        "smart": "Use the exact error quote connection refused unquote in the ticket."
+      }
     },
     {
       "id": "F22b",
-      "status": "open",
+      "status": "locked",
       "category": "quotation",
       "roles": [
         "must_preserve",
         "command"
       ],
       "input": "use the exact error command quote connection refused command unquote in the ticket",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F22b-A",
-          "summary": "Strategy A: introducer-gated quote/unquote fire.",
-          "expected": {
-            "literal": "use the exact error \"connection refused\" in the ticket",
-            "smart": "Use the exact error \"connection refused\" in the ticket."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F22b-B",
-          "summary": "Strategy B: command words remain; bare quote/unquote fire around the span.",
-          "expected": {
-            "literal": "use the exact error command \"connection refused\" command in the ticket",
-            "smart": "Use the exact error command \"connection refused\" command in the ticket."
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "quote pairing",
         "sentence case",
         "terminal period"
       ],
       "grammar_changes": [],
-      "rationale": "Introducer form of technical quotes."
+      "rationale": "Introducer form of technical quotes. Approved choice: Strategy A: introducer-gated quote/unquote fire.",
+      "expected": {
+        "literal": "use the exact error \"connection refused\" in the ticket",
+        "smart": "Use the exact error \"connection refused\" in the ticket."
+      }
     },
     {
       "id": "F36",
-      "status": "open",
+      "status": "locked",
       "category": "separability",
       "roles": [
         "must_change",
@@ -1241,44 +929,21 @@
         "separability_format_without_grammar"
       ],
       "input": "there is two issues new line next topic",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F36-A",
-          "summary": "Strategy A: bare new line does not fire; grammar error is intentionally preserved in Smart (no is→are).",
-          "expected": {
-            "literal": "there is two issues new line next topic",
-            "smart": "There is two issues new line next topic."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F36-B",
-          "summary": "Strategy B: bare new line fires; Smart cases lines and adds a period but intentionally preserves is two (not are). A corrected There are two… is a different example, not this fixture.",
-          "expected": {
-            "literal": "there is two issues\nnext topic",
-            "smart": "There is two issues.\nNext topic."
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
-        "sentence/line case",
-        "newline under B",
-        "terminal period on first line under B Smart"
+        "sentence case",
+        "terminal period",
+        "preserve bare new line words"
       ],
       "grammar_changes": [],
-      "rationale": "Formatting-with-deliberate-grammar-miss example for human approval. grammar_changes empty: this fixture intentionally does not correct is→are."
+      "rationale": "Formatting-with-deliberate-grammar-miss example for human approval. grammar_changes empty: this fixture intentionally does not correct is→are. Approved choice: Strategy A: bare new line does not fire; grammar error is intentionally preserved in Smart (no is→are).",
+      "expected": {
+        "literal": "there is two issues new line next topic",
+        "smart": "There is two issues new line next topic."
+      }
     },
     {
       "id": "F36b",
-      "status": "open",
+      "status": "locked",
       "category": "separability",
       "roles": [
         "must_change",
@@ -1286,260 +951,122 @@
         "separability_format_without_grammar"
       ],
       "input": "there is two issues command new line next topic",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F36b-A",
-          "summary": "Strategy A: introducer new line fires; grammar error deliberately preserved.",
-          "expected": {
-            "literal": "there is two issues\nnext topic",
-            "smart": "There is two issues.\nNext topic."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F36b-B",
-          "summary": "Strategy B: command word may remain; bare new line fires; grammar error still deliberately preserved.",
-          "expected": {
-            "literal": "there is two issues command\nnext topic",
-            "smart": "There is two issues command.\nNext topic."
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "newline",
         "line casing",
         "period on first line Smart"
       ],
       "grammar_changes": [],
-      "rationale": "Introducer form of separability example. Still not a grammar-correction fixture."
+      "rationale": "Introducer form of separability example. Still not a grammar-correction fixture. Approved choice: Strategy A: introducer new line fires; grammar error deliberately preserved.",
+      "expected": {
+        "literal": "there is two issues\nnext topic",
+        "smart": "There is two issues.\nNext topic."
+      }
     },
     {
       "id": "F38",
-      "status": "open",
+      "status": "locked",
       "category": "punctuation_command",
       "roles": [
         "must_change",
         "command"
       ],
       "input": "yes comma I can join",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F38-A",
-          "summary": "Strategy A: bare comma does not fire.",
-          "expected": {
-            "literal": "yes comma I can join",
-            "smart": "Yes comma I can join."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F38-B",
-          "summary": "Strategy B: bare comma fires to ,.",
-          "expected": {
-            "literal": "yes, I can join",
-            "smart": "Yes, I can join."
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "sentence case",
-        "comma render under B",
-        "terminal period"
+        "terminal period",
+        "preserve bare comma word"
       ],
       "grammar_changes": [],
-      "rationale": "Bare comma command."
+      "rationale": "Bare comma command. Approved choice: Strategy A: bare comma does not fire.",
+      "expected": {
+        "literal": "yes comma I can join",
+        "smart": "Yes comma I can join."
+      }
     },
     {
       "id": "F39",
-      "status": "open",
+      "status": "locked",
       "category": "command_safety",
       "roles": [
         "must_preserve",
         "command_safety_counterexample"
       ],
       "input": "the bullet train is fast",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F39-A",
-          "summary": "Strategy A: bare bullet does not fire.",
-          "expected": {
-            "literal": "the bullet train is fast",
-            "smart": "The bullet train is fast."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F39-B",
-          "summary": "Strategy B desired preserve of noun phrase bullet train (ambiguity risk if bare bullet over-fires to a list marker).",
-          "expected": {
-            "literal": "the bullet train is fast",
-            "smart": "The bullet train is fast."
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "sentence case",
         "terminal period"
       ],
       "grammar_changes": [],
-      "rationale": "Noun-phrase counterexample: bullet train."
+      "rationale": "Noun-phrase counterexample: bullet train. Approved choice: Strategy A: bare bullet does not fire.",
+      "expected": {
+        "literal": "the bullet train is fast",
+        "smart": "The bullet train is fast."
+      }
     },
     {
       "id": "F40",
-      "status": "open",
+      "status": "locked",
       "category": "command_safety",
       "roles": [
         "must_preserve",
         "command_safety_counterexample"
       ],
       "input": "the quote was approved",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F40-A",
-          "summary": "Strategy A: bare quote does not fire.",
-          "expected": {
-            "literal": "the quote was approved",
-            "smart": "The quote was approved."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F40-B",
-          "summary": "Strategy B desired preserve (ambiguity risk if bare quote inserts \").",
-          "expected": {
-            "literal": "the quote was approved",
-            "smart": "The quote was approved."
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "sentence case",
         "terminal period"
       ],
       "grammar_changes": [],
-      "rationale": "Noun-phrase counterexample: the quote was approved."
+      "rationale": "Noun-phrase counterexample: the quote was approved. Approved choice: Strategy A: bare quote does not fire.",
+      "expected": {
+        "literal": "the quote was approved",
+        "smart": "The quote was approved."
+      }
     },
     {
       "id": "F41",
-      "status": "open",
+      "status": "locked",
       "category": "command_safety",
       "roles": [
         "must_preserve",
         "command_safety_counterexample"
       ],
       "input": "we launched a brand new line yesterday",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F41-A",
-          "summary": "Strategy A: bare new line does not fire.",
-          "expected": {
-            "literal": "we launched a brand new line yesterday",
-            "smart": "We launched a brand new line yesterday."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F41-B",
-          "summary": "Strategy B desired preserve of brand new line (ambiguity risk if bare new line over-fires).",
-          "expected": {
-            "literal": "we launched a brand new line yesterday",
-            "smart": "We launched a brand new line yesterday."
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "sentence case",
         "terminal period"
       ],
       "grammar_changes": [],
-      "rationale": "Noun-phrase counterexample: brand new line."
+      "rationale": "Noun-phrase counterexample: brand new line. Approved choice: Strategy A: bare new line does not fire.",
+      "expected": {
+        "literal": "we launched a brand new line yesterday",
+        "smart": "We launched a brand new line yesterday."
+      }
     },
     {
       "id": "F42",
-      "status": "open",
+      "status": "locked",
       "category": "command_safety",
       "roles": [
         "must_preserve",
         "command_safety_counterexample"
       ],
       "input": "the number one rule is safety",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F42-A",
-          "summary": "Strategy A: bare number one does not fire.",
-          "expected": {
-            "literal": "the number one rule is safety",
-            "smart": "The number one rule is safety."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F42-B",
-          "summary": "Strategy B desired preserve of number one rule (ambiguity risk if bare number one starts a list).",
-          "expected": {
-            "literal": "the number one rule is safety",
-            "smart": "The number one rule is safety."
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "sentence case",
         "terminal period"
       ],
       "grammar_changes": [],
-      "rationale": "Noun-phrase counterexample: number one rule."
+      "rationale": "Noun-phrase counterexample: number one rule. Approved choice: Strategy A: bare number one does not fire.",
+      "expected": {
+        "literal": "the number one rule is safety",
+        "smart": "The number one rule is safety."
+      }
     },
     {
       "id": "F37",
-      "status": "open",
+      "status": "locked",
       "category": "punctuation_command",
       "roles": [
         "must_preserve",
@@ -1547,505 +1074,188 @@
         "command_safety_counterexample"
       ],
       "input": "the reporting period ended yesterday",
-      "open_decision_ids": [
-        "D_cmd"
-      ],
-      "alternatives": [
-        {
-          "id": "F37-A",
-          "summary": "Strategy A: bare period does not fire.",
-          "expected": {
-            "literal": "the reporting period ended yesterday",
-            "smart": "The reporting period ended yesterday."
-          },
-          "decision_option_ids": [
-            "D_cmd-A"
-          ]
-        },
-        {
-          "id": "F37-B",
-          "summary": "Strategy B desired preserve of reporting period (ambiguity risk).",
-          "expected": {
-            "literal": "the reporting period ended yesterday",
-            "smart": "The reporting period ended yesterday."
-          },
-          "decision_option_ids": [
-            "D_cmd-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "sentence case",
         "terminal period"
       ],
       "grammar_changes": [],
-      "rationale": "Noun-phrase counterexample: reporting period."
+      "rationale": "Noun-phrase counterexample: reporting period. Approved choice: Strategy A: bare period does not fire.",
+      "expected": {
+        "literal": "the reporting period ended yesterday",
+        "smart": "The reporting period ended yesterday."
+      }
     },
     {
       "id": "F04",
-      "status": "open",
+      "status": "locked",
       "category": "email",
       "roles": [
         "must_change"
       ],
       "input": "hi jordan thanks for the update i will review the proposal by thursday and send comments",
-      "open_decision_ids": [
-        "D10"
-      ],
-      "alternatives": [
-        {
-          "id": "F04-A",
-          "summary": "Structured email: greeting line + blank line + body.",
-          "expected": {
-            "literal": "hi jordan thanks for the update i will review the proposal by thursday and send comments",
-            "smart": "Hi Jordan,\n\nThanks for the update. I will review the proposal by Thursday and send comments."
-          },
-          "decision_option_ids": [
-            "D10-A"
-          ]
-        },
-        {
-          "id": "F04-B",
-          "summary": "Single paragraph: no invented blank line.",
-          "expected": {
-            "literal": "hi jordan thanks for the update i will review the proposal by thursday and send comments",
-            "smart": "Hi Jordan, thanks for the update. I will review the proposal by Thursday and send comments."
-          },
-          "decision_option_ids": [
-            "D10-B"
-          ]
-        }
-      ],
       "formatting_changes": [
-        "name/weekday casing",
+        "name and weekday casing",
         "sentence punctuation",
-        "optional greeting/paragraph structure"
+        "single-paragraph greeting"
       ],
       "grammar_changes": [],
-      "rationale": "Email structure inference is a product choice (D10). No command dependency."
+      "rationale": "Email structure inference is a product choice (D10). No command dependency. Approved choice: Single paragraph: no invented blank line.",
+      "expected": {
+        "literal": "hi jordan thanks for the update i will review the proposal by thursday and send comments",
+        "smart": "Hi Jordan, thanks for the update. I will review the proposal by Thursday and send comments."
+      }
     },
     {
       "id": "F17",
-      "status": "open",
+      "status": "locked",
       "category": "list",
       "roles": [
         "must_change"
       ],
       "input": "buy milk eggs bread",
-      "open_decision_ids": [
-        "D3"
-      ],
-      "alternatives": [
-        {
-          "id": "F17-A",
-          "summary": "No list inference: prose commas.",
-          "expected": {
-            "literal": "buy milk eggs bread",
-            "smart": "Buy milk, eggs, bread."
-          },
-          "decision_option_ids": [
-            "D3-A"
-          ]
-        },
-        {
-          "id": "F17-B",
-          "summary": "Infer bullet list without list commands.",
-          "expected": {
-            "literal": "buy milk eggs bread",
-            "smart": "Buy:\n- milk\n- eggs\n- bread"
-          },
-          "decision_option_ids": [
-            "D3-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "sentence case",
-        "comma list or bullet structure"
+        "context-aware inferred bullet structure"
       ],
       "grammar_changes": [],
-      "rationale": "List inference without spoken list commands (D3). Not a D_cmd fixture."
+      "rationale": "List inference without spoken list commands (D3). Not a D_cmd fixture. Approved choice: Infer bullet list without list commands.",
+      "expected": {
+        "literal": "buy milk eggs bread",
+        "smart": "Buy:\n- milk\n- eggs\n- bread"
+      }
     },
     {
       "id": "F18",
-      "status": "open",
+      "status": "locked",
       "category": "list",
       "roles": [
         "must_preserve"
       ],
       "input": "the API has three errors not found forbidden and unauthorized",
-      "open_decision_ids": [
-        "D14"
-      ],
-      "alternatives": [
-        {
-          "id": "F18-A",
-          "summary": "Colon + Oxford comma.",
-          "expected": {
-            "literal": "the API has three errors not found forbidden and unauthorized",
-            "smart": "The API has three errors: not found, forbidden, and unauthorized."
-          },
-          "decision_option_ids": [
-            "D14-A"
-          ]
-        },
-        {
-          "id": "F18-B",
-          "summary": "Colon without Oxford comma.",
-          "expected": {
-            "literal": "the API has three errors not found forbidden and unauthorized",
-            "smart": "The API has three errors: not found, forbidden and unauthorized."
-          },
-          "decision_option_ids": [
-            "D14-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "sentence case",
         "colon before list",
-        "serial comma choice"
+        "Oxford comma"
       ],
       "grammar_changes": [],
-      "rationale": "Oxford comma taste (D14). Must not invent HTTP codes (exact strings avoid 404/403/401)."
+      "rationale": "Oxford comma taste (D14). Must not invent HTTP codes (exact strings avoid 404/403/401). Approved choice: Colon + Oxford comma.",
+      "expected": {
+        "literal": "the API has three errors not found forbidden and unauthorized",
+        "smart": "The API has three errors: not found, forbidden, and unauthorized."
+      }
     },
     {
       "id": "F27",
-      "status": "open",
+      "status": "locked",
       "category": "grammar",
       "roles": [
         "must_preserve"
       ],
       "input": "i didnt see no error in the logs",
-      "open_decision_ids": [
-        "D5"
-      ],
-      "alternatives": [
-        {
-          "id": "F27-A",
-          "summary": "Preserve double-negative voice; only apostrophe/case.",
-          "expected": {
-            "literal": "i didnt see no error in the logs",
-            "smart": "I didn't see no error in the logs."
-          },
-          "decision_option_ids": [
-            "D5-A"
-          ]
-        },
-        {
-          "id": "F27-B",
-          "summary": "Standardize to single negation.",
-          "expected": {
-            "literal": "i didnt see no error in the logs",
-            "smart": "I didn't see any error in the logs."
-          },
-          "decision_option_ids": [
-            "D5-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "sentence case",
         "terminal period"
       ],
       "grammar_changes": [
-        "apostrophe didnt→didn't",
-        "optional double-negative rewrite under B only"
+        "apostrophe insertion in didnt"
       ],
-      "rationale": "Double-negative handling (D5). Grammar notes: B's any is a grammar choice, not formatting."
+      "rationale": "Double-negative handling (D5). Grammar notes: B's any is a grammar choice, not formatting. Approved choice: Preserve double-negative voice; only apostrophe/case.",
+      "expected": {
+        "literal": "i didnt see no error in the logs",
+        "smart": "I didn't see no error in the logs."
+      }
     },
     {
       "id": "F14",
-      "status": "open",
+      "status": "locked",
       "category": "line_paragraph",
       "roles": [
         "must_change",
         "command"
       ],
       "input": "intro command new paragraph body text",
-      "open_decision_ids": [
-        "D_cmd",
-        "D1"
-      ],
-      "alternatives": [
-        {
-          "id": "F14-A-breaks",
-          "summary": "A: introducer new paragraph fires; Smart cases lines; no added periods (D1-A).",
-          "expected": {
-            "literal": "intro\n\nbody text",
-            "smart": "Intro\n\nBody text"
-          },
-          "decision_option_ids": [
-            "D_cmd-A",
-            "D1-A"
-          ]
-        },
-        {
-          "id": "F14-A-punct",
-          "summary": "A: introducer fires; Smart adds periods on fragments (D1-B).",
-          "expected": {
-            "literal": "intro\n\nbody text",
-            "smart": "Intro.\n\nBody text."
-          },
-          "decision_option_ids": [
-            "D_cmd-A",
-            "D1-B"
-          ]
-        },
-        {
-          "id": "F14-B-breaks",
-          "summary": "B: command word remains; bare new paragraph fires; no added periods (D1-A).",
-          "expected": {
-            "literal": "intro command\n\nbody text",
-            "smart": "Intro command\n\nBody text"
-          },
-          "decision_option_ids": [
-            "D_cmd-B",
-            "D1-A"
-          ]
-        },
-        {
-          "id": "F14-B-punct",
-          "summary": "B: command word remains; bare new paragraph fires; Smart periods (D1-B).",
-          "expected": {
-            "literal": "intro command\n\nbody text",
-            "smart": "Intro command.\n\nBody text."
-          },
-          "decision_option_ids": [
-            "D_cmd-B",
-            "D1-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "paragraph break",
         "line casing",
-        "optional terminal periods on fragments"
+        "terminal periods on fragments"
       ],
       "grammar_changes": [],
-      "rationale": "Cross-product D_cmd × D1 on introducer-containing input. Four complete alternatives."
+      "rationale": "Cross-product D_cmd × D1 on introducer-containing input. Four complete alternatives. Approved choice: A: introducer fires; Smart adds periods on fragments (D1-B).",
+      "expected": {
+        "literal": "intro\n\nbody text",
+        "smart": "Intro.\n\nBody text."
+      }
     },
     {
       "id": "F14b",
-      "status": "open",
+      "status": "locked",
       "category": "line_paragraph",
       "roles": [
         "must_change",
         "command"
       ],
       "input": "intro new paragraph body text",
-      "open_decision_ids": [
-        "D_cmd",
-        "D1"
-      ],
-      "alternatives": [
-        {
-          "id": "F14b-A-breaks",
-          "summary": "A: bare new paragraph does not fire; D1 irrelevant — no break to punctuate.",
-          "expected": {
-            "literal": "intro new paragraph body text",
-            "smart": "Intro new paragraph body text."
-          },
-          "decision_option_ids": [
-            "D_cmd-A",
-            "D1-A"
-          ]
-        },
-        {
-          "id": "F14b-A-punct",
-          "summary": "A: same as no-fire (D1 cannot apply without a paragraph command firing).",
-          "expected": {
-            "literal": "intro new paragraph body text",
-            "smart": "Intro new paragraph body text."
-          },
-          "decision_option_ids": [
-            "D_cmd-A",
-            "D1-B"
-          ]
-        },
-        {
-          "id": "F14b-B-breaks",
-          "summary": "B: bare new paragraph fires; no added periods (D1-A).",
-          "expected": {
-            "literal": "intro\n\nbody text",
-            "smart": "Intro\n\nBody text"
-          },
-          "decision_option_ids": [
-            "D_cmd-B",
-            "D1-A"
-          ]
-        },
-        {
-          "id": "F14b-B-punct",
-          "summary": "B: bare new paragraph fires; Smart periods (D1-B).",
-          "expected": {
-            "literal": "intro\n\nbody text",
-            "smart": "Intro.\n\nBody text."
-          },
-          "decision_option_ids": [
-            "D_cmd-B",
-            "D1-B"
-          ]
-        }
-      ],
       "formatting_changes": [
-        "optional paragraph break under B",
-        "line casing",
-        "optional fragment periods under B+D1-B",
-        "terminal period under A"
+        "sentence case",
+        "terminal period",
+        "preserve bare new paragraph words"
       ],
       "grammar_changes": [],
-      "rationale": "Bare-input cross-product D_cmd × D1. A-breaks and A-punct are intentionally identical because D1 only applies when a paragraph command fires."
+      "rationale": "Bare-input cross-product D_cmd × D1. A-breaks and A-punct are intentionally identical because D1 only applies when a paragraph command fires. Approved choice: A: same as no-fire (D1 cannot apply without a paragraph command firing).",
+      "expected": {
+        "literal": "intro new paragraph body text",
+        "smart": "Intro new paragraph body text."
+      }
     },
     {
       "id": "F21",
-      "status": "open",
+      "status": "locked",
       "category": "quotation",
       "roles": [
         "must_change",
         "command"
       ],
       "input": "she said quote we ship friday unquote and hung up",
-      "open_decision_ids": [
-        "D_cmd",
-        "D4"
-      ],
-      "alternatives": [
-        {
-          "id": "F21-A-preserve",
-          "summary": "A: bare quote/unquote do not fire; D4 N/A — no quote delimiters added.",
-          "expected": {
-            "literal": "she said quote we ship friday unquote and hung up",
-            "smart": "She said quote we ship friday unquote and hung up."
-          },
-          "decision_option_ids": [
-            "D_cmd-A",
-            "D4-A"
-          ]
-        },
-        {
-          "id": "F21-A-case",
-          "summary": "A: same no-fire render (D4 cannot apply without quote commands firing).",
-          "expected": {
-            "literal": "she said quote we ship friday unquote and hung up",
-            "smart": "She said quote we ship friday unquote and hung up."
-          },
-          "decision_option_ids": [
-            "D_cmd-A",
-            "D4-B"
-          ]
-        },
-        {
-          "id": "F21-B-preserve",
-          "summary": "B: bare quote/unquote fire; preserve in-quote casing (D4-A).",
-          "expected": {
-            "literal": "she said \"we ship friday\" and hung up",
-            "smart": "She said, \"we ship friday,\" and hung up."
-          },
-          "decision_option_ids": [
-            "D_cmd-B",
-            "D4-A"
-          ]
-        },
-        {
-          "id": "F21-B-case",
-          "summary": "B: bare quote/unquote fire; sentence-case inside quote (D4-B).",
-          "expected": {
-            "literal": "she said \"we ship friday\" and hung up",
-            "smart": "She said, \"We ship Friday,\" and hung up."
-          },
-          "decision_option_ids": [
-            "D_cmd-B",
-            "D4-B"
-          ]
-        }
-      ],
       "formatting_changes": [
-        "outer sentence case/punct",
-        "quote delimiters under B",
-        "optional in-quote casing under B+D4-B"
+        "sentence case",
+        "terminal period",
+        "preserve bare quote and unquote words"
       ],
       "grammar_changes": [],
-      "rationale": "Cross-product D_cmd × D4 on bare quote input. A-preserve and A-case identical because D4 needs quotes to fire."
+      "rationale": "Cross-product D_cmd × D4 on bare quote input. A-preserve and A-case identical because D4 needs quotes to fire. Approved choice: A: bare quote/unquote do not fire; D4 N/A — no quote delimiters added.",
+      "expected": {
+        "literal": "she said quote we ship friday unquote and hung up",
+        "smart": "She said quote we ship friday unquote and hung up."
+      }
     },
     {
       "id": "F21b",
-      "status": "open",
+      "status": "locked",
       "category": "quotation",
       "roles": [
         "must_change",
         "command"
       ],
       "input": "she said command quote we ship friday command unquote and hung up",
-      "open_decision_ids": [
-        "D_cmd",
-        "D4"
-      ],
-      "alternatives": [
-        {
-          "id": "F21b-A-preserve",
-          "summary": "A: introducer quotes fire; preserve in-quote casing (D4-A).",
-          "expected": {
-            "literal": "she said \"we ship friday\" and hung up",
-            "smart": "She said, \"we ship friday,\" and hung up."
-          },
-          "decision_option_ids": [
-            "D_cmd-A",
-            "D4-A"
-          ]
-        },
-        {
-          "id": "F21b-A-case",
-          "summary": "A: introducer quotes fire; case inside quote (D4-B).",
-          "expected": {
-            "literal": "she said \"we ship friday\" and hung up",
-            "smart": "She said, \"We ship Friday,\" and hung up."
-          },
-          "decision_option_ids": [
-            "D_cmd-A",
-            "D4-B"
-          ]
-        },
-        {
-          "id": "F21b-B-preserve",
-          "summary": "B: command words remain; bare quote/unquote fire; preserve in-quote (D4-A).",
-          "expected": {
-            "literal": "she said command \"we ship friday\" command and hung up",
-            "smart": "She said command, \"we ship friday,\" command and hung up."
-          },
-          "decision_option_ids": [
-            "D_cmd-B",
-            "D4-A"
-          ]
-        },
-        {
-          "id": "F21b-B-case",
-          "summary": "B: command words remain; bare quote/unquote fire; case inside (D4-B).",
-          "expected": {
-            "literal": "she said command \"we ship friday\" command and hung up",
-            "smart": "She said command, \"We ship Friday,\" command and hung up."
-          },
-          "decision_option_ids": [
-            "D_cmd-B",
-            "D4-B"
-          ]
-        }
-      ],
       "formatting_changes": [
         "quote delimiters",
-        "outer punctuation/casing",
-        "optional in-quote casing"
+        "outer punctuation and casing",
+        "preserve in-quote casing"
       ],
       "grammar_changes": [],
-      "rationale": "Cross-product D_cmd × D4 on introducer-containing quote input."
+      "rationale": "Cross-product D_cmd × D4 on introducer-containing quote input. Approved choice: A: introducer quotes fire; preserve in-quote casing (D4-A).",
+      "expected": {
+        "literal": "she said \"we ship friday\" and hung up",
+        "smart": "She said, \"we ship friday,\" and hung up."
+      }
     }
   ],
   "dataset_counts": {
     "fixtures_total": 51,
-    "fixtures_locked": 21,
-    "fixtures_open": 30,
+    "fixtures_locked": 51,
+    "fixtures_open": 0,
     "decisions_total": 7,
-    "decisions_pending": 7,
-    "notes": "Inventory only. These counts are not release denominators. Exact expected strings are approval examples for issue #99, not CI/release claims. #100 defines machine safety/edit validation; #103 defines implementation thresholds after Raja approves."
+    "decisions_pending": 0,
+    "notes": "All 51 exact-output fixtures are approved product examples. Context-aware list inference uses only the Validated Transcript and must fail closed to prose when ambiguous. #100 defines machine safety/edit validation; #103 defines implementation gates and thresholds."
   }
 }
