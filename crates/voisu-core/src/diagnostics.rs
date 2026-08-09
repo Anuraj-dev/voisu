@@ -19,6 +19,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     BoundaryError, CaptureLimit, CapturedAudio, DeliveryMethod, LifecycleStage, Provider, ProviderCoordinator,
@@ -48,6 +49,31 @@ pub const DEFAULT_DEBUG_AUDIO_TTL: Duration = Duration::from_secs(3600);
 
 /// The masking placeholder a diagnostic export writes in place of any secret.
 pub const REDACTED: &str = "<redacted>";
+
+/// Schema version stamped on every [`SmartWritingDiagnostic`] record.
+pub const SMART_WRITING_DIAGNOSTIC_VERSION: u32 = 1;
+
+/// Maximum UTF-8 bytes of Validated-before / Rendered-after text retained in a
+/// Smart Writing diagnostic. Clamping is diagnostics-only — Delivery always uses
+/// the full text. Spec §10 / constants JSON.
+pub const MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES: usize = 2048;
+
+/// Maximum structured edit evidence entries retained on one Smart Writing
+/// diagnostic. Spec §10 / constants JSON.
+pub const MAX_SMART_WRITING_DIAGNOSTIC_EDITS: usize = 32;
+
+/// Maximum UTF-8 bytes of the Minimal Grammar model ID retained in diagnostics.
+/// Spec §10 / constants JSON.
+pub const MAX_MODEL_ID_UTF8_BYTES: usize = 128;
+
+/// Maximum UTF-8 bytes of any free-form Smart Writing diagnostic string
+/// (errors, edit identifiers, rule IDs, edit before/after snippets). Spec §10
+/// retains the 128-byte diagnostic limit from #100.
+pub const MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES: usize = 128;
+
+/// Maximum UTF-8 bytes of an edit before/after field in diagnostic evidence.
+/// Matches #100 `MAX_GRAMMAR_EDIT_FIELD_UTF8_BYTES`.
+pub const MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES: usize = 256;
 
 /// The retained history: one JSON record per line, in append order.
 ///
@@ -98,6 +124,37 @@ fn clamp_text(text: String) -> String {
     clamped
 }
 
+/// Clamps `text` to at most `max_bytes` UTF-8 bytes on a char boundary. Unlike
+/// [`clamp_text`], no ellipsis is appended — Smart Writing diagnostic clamps are
+/// exact byte budgets that fingerprints of the unclamped source cover for
+/// equality.
+pub fn clamp_utf8_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text[..boundary].to_owned()
+}
+
+/// Full SHA-256 fingerprint of `text` as `sha256:` + 64 lowercase hex digits.
+/// Used so Validated/Rendered equality remains inspectable after the diagnostic
+/// text clamp drops tail bytes.
+pub fn text_sha256_fingerprint(text: &str) -> String {
+    let digest = Sha256::digest(text.as_bytes());
+    let mut out = String::with_capacity(7 + 64);
+    out.push_str("sha256:");
+    for byte in digest {
+        out.push(HEX_LOWER[(byte >> 4) as usize] as char);
+        out.push(HEX_LOWER[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
 /// A Source Transcript as retained in local history, with its provider so a
 /// reader can attribute the text.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -131,6 +188,292 @@ pub struct DebugAudioRecord {
 impl DebugAudioRecord {
     pub fn is_expired(&self, now_ms: u64) -> bool {
         now_ms >= self.expires_at_unix_ms
+    }
+}
+
+/// Writing Mode snapshotted for the Recording that produced this diagnostic.
+///
+/// Distinct from the app config type so `voisu-core` stays free of config I/O
+/// while still recording the exact §10 mode that governed the path.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartWritingMode {
+    Smart,
+    Literal,
+}
+
+/// Resolved EnglishEligibility for the Recording — never inferred from words.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnglishEligibilityOutcome {
+    Eligible,
+    Ineligible,
+}
+
+/// Exactly one Smart Writing path outcome per Recording. Spec §10 closed set.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartWritingOutcome {
+    /// Literal mode, success, no explicit command applied (ordinary identity).
+    Literal,
+    /// Literal mode, success, at least one explicit formatting command rendered.
+    LiteralCommands,
+    /// Literal path failed closed to Validated identity (formatter panic/deadline/
+    /// oversize/atomic command render failure), whether or not a command was
+    /// recognized.
+    LiteralFallback,
+    /// Smart local Formatting baseline delivered without accepted grammar
+    /// (includes command-present Smart runs that skip grammar under §6.1).
+    FormattingOnly,
+    /// Smart baseline plus accepted grammar edits.
+    FormattingAndGrammar,
+    /// **Smart only**: failed closed to Validated identity (formatter miss/panic/
+    /// oversize). Never used for Literal — use [`Literal`](Self::Literal) or
+    /// [`LiteralFallback`](Self::LiteralFallback) instead.
+    IdentityFallback,
+}
+
+/// Closed rejection / fallback / edit disposition codes for Smart Writing
+/// diagnostics. Prefer these over free-form strings. Spec §10.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartWritingReasonCode {
+    /// Path governed by Literal Writing Mode (no grammar).
+    ModeLiteral,
+    /// Path governed by Smart Writing Mode.
+    ModeSmart,
+    /// EnglishEligibility resolved ineligible — grammar not attempted.
+    EnglishIneligible,
+    /// GrammarCapability was Unavailable before the gate.
+    CapabilityUnavailable,
+    /// Validated Transcript or other input exceeded a configured bound.
+    InputOversize,
+    /// Provider response body exceeded a configured bound.
+    ResponseOversize,
+    /// Grammar HTTP request hit its deadline.
+    HttpTimeout,
+    /// Grammar HTTP returned a non-success status.
+    HttpStatus,
+    /// Grammar HTTP transport/connect failure.
+    HttpTransport,
+    /// Envelope or edit shape was unreadable / malformed.
+    Malformed,
+    /// Response failed strict schema validation.
+    Schema,
+    /// Grammar base identity was stale relative to the Validated Transcript.
+    Stale,
+    /// An edit intersected a protected span.
+    ProtectedSpan,
+    /// A closed-rule predicate did not match its narrow context.
+    RuleContext,
+    /// Formatter supplied no unambiguous source anchor for composition.
+    Unmappable,
+    /// Two grammar edits overlapped or duplicated a source range.
+    Overlap,
+    /// Local formatter panicked.
+    FormatterPanic,
+    /// Local formatter exceeded its work deadline.
+    FormatterDeadline,
+    /// Safety / composition validation panicked.
+    SafetyPanic,
+    /// Safety / composition exceeded its work deadline.
+    SafetyDeadline,
+    /// Anchor composition panicked.
+    ComposePanic,
+    /// Anchor composition exceeded its work deadline.
+    ComposeDeadline,
+    /// Credential reaper crossed the 2 s watchdog while still non-terminal.
+    CleanupOverrun,
+    /// Edit accepted and applied to the baseline.
+    EditAccepted,
+    /// Unknown / out-of-catalog grammar rule ID.
+    UnknownRule,
+}
+
+/// One structured edit evidence entry retained on a Smart Writing diagnostic.
+/// Never carries prompts or raw provider bodies.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SmartWritingEditEvidence {
+    /// Bounded diagnostic edit identifier from the provider envelope.
+    pub edit_id: String,
+    /// Closed grammar rule ID (e.g. `G_DIDNT_APOSTROPHE`).
+    pub rule_id: String,
+    /// Half-open UTF-8 byte start against the Validated Transcript.
+    pub start_utf8: u64,
+    /// Half-open UTF-8 byte end against the Validated Transcript.
+    pub end_utf8: u64,
+    /// Bounded before snippet at the edit range.
+    pub before: String,
+    /// Bounded after snippet proposed or applied.
+    pub after: String,
+    /// Acceptance or rejection code for this edit.
+    pub code: SmartWritingReasonCode,
+}
+
+impl SmartWritingEditEvidence {
+    /// Builds edit evidence with clamped free-form fields.
+    pub fn new(
+        edit_id: impl Into<String>,
+        rule_id: impl Into<String>,
+        start_utf8: u64,
+        end_utf8: u64,
+        before: impl AsRef<str>,
+        after: impl AsRef<str>,
+        code: SmartWritingReasonCode,
+    ) -> Self {
+        Self {
+            edit_id: clamp_utf8_bytes(&edit_id.into(), MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES),
+            rule_id: clamp_utf8_bytes(&rule_id.into(), MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES),
+            start_utf8,
+            end_utf8,
+            before: clamp_utf8_bytes(before.as_ref(), MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES),
+            after: clamp_utf8_bytes(after.as_ref(), MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES),
+            code,
+        }
+    }
+}
+
+/// Optional, versioned Smart Writing diagnostic evidence for one Recording.
+///
+/// Absent on pre-SW records (serde default). Never stores credentials, prompts,
+/// raw bodies, app/window/screen/clipboard context, or newly captured audio.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SmartWritingDiagnostic {
+    /// Schema version. Current: [`SMART_WRITING_DIAGNOSTIC_VERSION`].
+    #[serde(default = "default_smart_writing_diagnostic_version")]
+    pub version: u32,
+    /// Writing Mode that governed the path for this Recording.
+    pub writing_mode: SmartWritingMode,
+    /// EnglishEligibility resolution for this Recording.
+    pub english_eligibility: EnglishEligibilityOutcome,
+    /// Formatter contract ID sealed into the FormattingBaseline.
+    pub formatter_contract_id: String,
+    /// Bounded Validated-before text (≤ 2,048 UTF-8 bytes). Full equality uses
+    /// [`validated_before_sha256`](Self::validated_before_sha256).
+    pub validated_before: String,
+    /// Full SHA-256 fingerprint of the unclamped Validated Transcript.
+    pub validated_before_sha256: String,
+    /// Bounded Rendered-after text (≤ 2,048 UTF-8 bytes). Full equality uses
+    /// [`rendered_after_sha256`](Self::rendered_after_sha256).
+    pub rendered_after: String,
+    /// Full SHA-256 fingerprint of the unclamped Rendered Transcript.
+    pub rendered_after_sha256: String,
+    /// Exactly one path outcome.
+    pub outcome: SmartWritingOutcome,
+    /// Up to [`MAX_SMART_WRITING_DIAGNOSTIC_EDITS`] structured edit evidence
+    /// entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<SmartWritingEditEvidence>,
+    /// Exact Minimal Grammar model ID when a request was considered, clamped to
+    /// [`MAX_MODEL_ID_UTF8_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// Whether a Minimal Grammar HTTP request began.
+    #[serde(default)]
+    pub request_began: bool,
+    /// Local formatter work latency in milliseconds, when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formatter_latency_ms: Option<u64>,
+    /// Grammar HTTP latency in milliseconds, when a request began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_latency_ms: Option<u64>,
+    /// Safety / composition latency in milliseconds, when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_latency_ms: Option<u64>,
+    /// Total final-transform gate latency in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_gate_latency_ms: Option<u64>,
+    /// Credential prep latency in milliseconds, when prep ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_prep_latency_ms: Option<u64>,
+    /// Whether the 2 s credential reap watchdog was crossed.
+    #[serde(default)]
+    pub reap_watchdog_crossed: bool,
+    /// Closed rejection / fallback reason codes for the Recording path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<SmartWritingReasonCode>,
+    /// Optional free-form error, scrubbed and bounded to 128 bytes. Prefer
+    /// [`reason_codes`](Self::reason_codes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_form_error: Option<String>,
+}
+
+fn default_smart_writing_diagnostic_version() -> u32 {
+    SMART_WRITING_DIAGNOSTIC_VERSION
+}
+
+impl SmartWritingDiagnostic {
+    /// Builds a diagnostic with clamped texts, full fingerprints of the
+    /// unclamped sources, and empty optional/list fields ready to fill.
+    pub fn new(
+        writing_mode: SmartWritingMode,
+        english_eligibility: EnglishEligibilityOutcome,
+        formatter_contract_id: impl Into<String>,
+        validated_before: impl AsRef<str>,
+        rendered_after: impl AsRef<str>,
+        outcome: SmartWritingOutcome,
+    ) -> Self {
+        let validated = validated_before.as_ref();
+        let rendered = rendered_after.as_ref();
+        Self {
+            version: SMART_WRITING_DIAGNOSTIC_VERSION,
+            writing_mode,
+            english_eligibility,
+            formatter_contract_id: clamp_utf8_bytes(
+                &formatter_contract_id.into(),
+                MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES,
+            ),
+            validated_before: clamp_utf8_bytes(
+                validated,
+                MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES,
+            ),
+            validated_before_sha256: text_sha256_fingerprint(validated),
+            rendered_after: clamp_utf8_bytes(rendered, MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES),
+            rendered_after_sha256: text_sha256_fingerprint(rendered),
+            outcome,
+            edits: Vec::new(),
+            model_id: None,
+            request_began: false,
+            formatter_latency_ms: None,
+            http_latency_ms: None,
+            safety_latency_ms: None,
+            total_gate_latency_ms: None,
+            credential_prep_latency_ms: None,
+            reap_watchdog_crossed: false,
+            reason_codes: Vec::new(),
+            free_form_error: None,
+        }
+    }
+
+    /// Sets the model ID, clamping to [`MAX_MODEL_ID_UTF8_BYTES`]. Empty becomes
+    /// `None`.
+    pub fn set_model_id(&mut self, model_id: impl Into<String>) {
+        let clamped = clamp_utf8_bytes(&model_id.into(), MAX_MODEL_ID_UTF8_BYTES);
+        self.model_id = if clamped.is_empty() {
+            None
+        } else {
+            Some(clamped)
+        };
+    }
+
+    /// Replaces edit evidence, retaining at most
+    /// [`MAX_SMART_WRITING_DIAGNOSTIC_EDITS`] entries in input order.
+    pub fn set_edits(&mut self, edits: Vec<SmartWritingEditEvidence>) {
+        self.edits = edits;
+        if self.edits.len() > MAX_SMART_WRITING_DIAGNOSTIC_EDITS {
+            self.edits.truncate(MAX_SMART_WRITING_DIAGNOSTIC_EDITS);
+        }
+    }
+
+    /// Sets a free-form error, clamping to
+    /// [`MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES`]. Prefer enums.
+    pub fn set_free_form_error(&mut self, error: impl Into<String>) {
+        let clamped = clamp_utf8_bytes(&error.into(), MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+        self.free_form_error = if clamped.is_empty() {
+            None
+        } else {
+            Some(clamped)
+        };
     }
 }
 
@@ -184,6 +527,10 @@ pub struct DiagnosticRecord {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug_audio: Option<DebugAudioRecord>,
+    /// Optional Smart Writing path diagnostic. Absent on pre-SW records so old
+    /// history lines keep deserializing without a schema bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smart_writing: Option<SmartWritingDiagnostic>,
 }
 
 impl DiagnosticRecord {
@@ -214,6 +561,7 @@ impl DiagnosticRecord {
             release_to_text_ms: None,
             error: None,
             debug_audio: None,
+            smart_writing: None,
         }
     }
 
@@ -574,9 +922,34 @@ pub fn export_record(
     for failure in &mut record.provider_failures {
         failure.diagnostic = scrub_free_text(&failure.diagnostic, &secrets);
     }
+    if let Some(smart) = record.smart_writing.as_mut() {
+        scrub_smart_writing_diagnostic(smart, &secrets);
+    }
     DiagnosticExport {
         record,
         environment: redacted_environment(vars),
+    }
+}
+
+/// Scrubs every free-form string on a Smart Writing diagnostic. Fingerprints are
+/// left alone (they are fixed-width hex digests, never secret material). Never
+/// introduces credentials, prompts, raw bodies, or app/window context.
+fn scrub_smart_writing_diagnostic(smart: &mut SmartWritingDiagnostic, secrets: &[String]) {
+    smart.formatter_contract_id = scrub_free_text(&smart.formatter_contract_id, secrets);
+    smart.validated_before = scrub_free_text(&smart.validated_before, secrets);
+    smart.rendered_after = scrub_free_text(&smart.rendered_after, secrets);
+    if let Some(model_id) = smart.model_id.as_mut() {
+        *model_id = scrub_free_text(model_id, secrets);
+    }
+    smart.free_form_error = smart
+        .free_form_error
+        .as_ref()
+        .map(|text| scrub_free_text(text, secrets));
+    for edit in &mut smart.edits {
+        edit.edit_id = scrub_free_text(&edit.edit_id, secrets);
+        edit.rule_id = scrub_free_text(&edit.rule_id, secrets);
+        edit.before = scrub_free_text(&edit.before, secrets);
+        edit.after = scrub_free_text(&edit.after, secrets);
     }
 }
 
