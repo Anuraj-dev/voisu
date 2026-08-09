@@ -321,15 +321,28 @@ impl SmartWritingEditEvidence {
         after: impl AsRef<str>,
         code: SmartWritingReasonCode,
     ) -> Self {
-        Self {
-            edit_id: clamp_utf8_bytes(&edit_id.into(), MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES),
-            rule_id: clamp_utf8_bytes(&rule_id.into(), MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES),
+        let mut evidence = Self {
+            edit_id: edit_id.into(),
+            rule_id: rule_id.into(),
             start_utf8,
             end_utf8,
-            before: clamp_utf8_bytes(before.as_ref(), MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES),
-            after: clamp_utf8_bytes(after.as_ref(), MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES),
+            before: before.as_ref().to_owned(),
+            after: after.as_ref().to_owned(),
             code,
-        }
+        };
+        evidence.normalize();
+        evidence
+    }
+
+    /// Re-applies §10 field clamps. Fields are publicly mutable after
+    /// construction, and export scrubbing can expand a string past its budget
+    /// when a short secret is replaced with [`REDACTED`]; call this at every
+    /// persistence and export boundary so the byte budgets stay invariants.
+    pub fn normalize(&mut self) {
+        self.edit_id = clamp_utf8_bytes(&self.edit_id, MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+        self.rule_id = clamp_utf8_bytes(&self.rule_id, MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+        self.before = clamp_utf8_bytes(&self.before, MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES);
+        self.after = clamp_utf8_bytes(&self.after, MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES);
     }
 }
 
@@ -474,6 +487,53 @@ impl SmartWritingDiagnostic {
         } else {
             Some(clamped)
         };
+    }
+
+    /// Re-applies every §10 Smart Writing byte budget and the edit-count cap.
+    ///
+    /// Constructors and setters clamp, but the diagnostic fields stay publicly
+    /// mutable (serde + in-process assembly). Export scrubbing can also expand a
+    /// field past its budget when a short secret is replaced with
+    /// [`REDACTED`]. Persistence and export call this so the bounds remain
+    /// invariants of stored and exported records.
+    ///
+    /// Fingerprints are **not** recomputed: they are digests of the unclamped
+    /// source and must survive clamp and scrub unchanged.
+    pub fn normalize(&mut self) {
+        self.formatter_contract_id = clamp_utf8_bytes(
+            &self.formatter_contract_id,
+            MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES,
+        );
+        self.validated_before = clamp_utf8_bytes(
+            &self.validated_before,
+            MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES,
+        );
+        self.rendered_after = clamp_utf8_bytes(
+            &self.rendered_after,
+            MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES,
+        );
+        if let Some(model_id) = self.model_id.take() {
+            let clamped = clamp_utf8_bytes(&model_id, MAX_MODEL_ID_UTF8_BYTES);
+            self.model_id = if clamped.is_empty() {
+                None
+            } else {
+                Some(clamped)
+            };
+        }
+        if let Some(error) = self.free_form_error.take() {
+            let clamped = clamp_utf8_bytes(&error, MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+            self.free_form_error = if clamped.is_empty() {
+                None
+            } else {
+                Some(clamped)
+            };
+        }
+        if self.edits.len() > MAX_SMART_WRITING_DIAGNOSTIC_EDITS {
+            self.edits.truncate(MAX_SMART_WRITING_DIAGNOSTIC_EDITS);
+        }
+        for edit in &mut self.edits {
+            edit.normalize();
+        }
     }
 }
 
@@ -931,9 +991,14 @@ pub fn export_record(
     }
 }
 
-/// Scrubs every free-form string on a Smart Writing diagnostic. Fingerprints are
-/// left alone (they are fixed-width hex digests, never secret material). Never
-/// introduces credentials, prompts, raw bodies, or app/window context.
+/// Scrubs every free-form string on a Smart Writing diagnostic, then re-clamps
+/// §10 budgets. Fingerprints are left alone (they are fixed-width hex digests,
+/// never secret material). Never introduces credentials, prompts, raw bodies, or
+/// app/window context.
+///
+/// Scrub-then-normalize is required: replacing a short secret with
+/// [`REDACTED`] can expand a field past its byte budget, and public mutation can
+/// leave oversized text/edits on the in-memory record before export.
 fn scrub_smart_writing_diagnostic(smart: &mut SmartWritingDiagnostic, secrets: &[String]) {
     smart.formatter_contract_id = scrub_free_text(&smart.formatter_contract_id, secrets);
     smart.validated_before = scrub_free_text(&smart.validated_before, secrets);
@@ -951,6 +1016,8 @@ fn scrub_smart_writing_diagnostic(smart: &mut SmartWritingDiagnostic, secrets: &
         edit.before = scrub_free_text(&edit.before, secrets);
         edit.after = scrub_free_text(&edit.after, secrets);
     }
+    // Re-clamp after scrub so redaction expansion cannot violate §10 budgets.
+    smart.normalize();
 }
 
 /// A bounded, private, on-disk store of correlated diagnostic records. All state
@@ -1235,7 +1302,15 @@ impl DiagnosticStore {
     /// Appends a completed Recording's record, prunes to the retention policy,
     /// removes any now-expired debug audio, and returns the retained history
     /// (newest first).
-    pub fn record(&self, record: DiagnosticRecord) -> io::Result<Vec<DiagnosticRecord>> {
+    ///
+    /// Smart Writing §10 byte budgets and edit-count caps are re-applied before
+    /// the record is serialized so public field mutation cannot persist
+    /// oversized text, model IDs, free-form errors, or more than
+    /// [`MAX_SMART_WRITING_DIAGNOSTIC_EDITS`] edits.
+    pub fn record(&self, mut record: DiagnosticRecord) -> io::Result<Vec<DiagnosticRecord>> {
+        if let Some(smart) = record.smart_writing.as_mut() {
+            smart.normalize();
+        }
         let _guard = self.lock_store();
         let mut records = self.load_raw()?;
         let slack = self.compaction_slack();

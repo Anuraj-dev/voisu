@@ -1251,6 +1251,228 @@ fn smart_writing_diagnostic_omits_audio_and_never_requires_debug_capture() {
 }
 
 #[test]
+fn smart_writing_persistence_normalizes_publicly_mutated_oversized_fields() {
+    // §10 budgets are construction-time clamps, but fields stay publicly
+    // mutable. DiagnosticStore::record must re-normalize so oversized text /
+    // model / error / edit fields and >32 edits cannot persist.
+    let full_source = "Ω".repeat(MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES / 2 + 300);
+    assert!(full_source.len() > MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    let source_fp = text_sha256_fingerprint(&full_source);
+
+    let mut smart = SmartWritingDiagnostic::new(
+        SmartWritingMode::Smart,
+        EnglishEligibilityOutcome::Eligible,
+        "contract",
+        "short-before",
+        "short-after",
+        SmartWritingOutcome::FormattingAndGrammar,
+    );
+    // Fingerprints of the unclamped source must survive normalize-on-record.
+    smart.validated_before_sha256 = source_fp.clone();
+    smart.rendered_after_sha256 = source_fp.clone();
+
+    // Bypass constructors/setters: write oversized values directly.
+    smart.validated_before = full_source.clone();
+    smart.rendered_after = full_source.clone();
+    smart.formatter_contract_id = "c".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES + 40);
+    smart.model_id = Some("m".repeat(MAX_MODEL_ID_UTF8_BYTES + 60));
+    smart.free_form_error = Some("e".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES + 70));
+    smart.edits = (0..(MAX_SMART_WRITING_DIAGNOSTIC_EDITS + 12))
+        .map(|i| SmartWritingEditEvidence {
+            edit_id: format!("e{i}-{}", "i".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES)),
+            rule_id: "r".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES + 30),
+            start_utf8: i as u64,
+            end_utf8: i as u64 + 1,
+            before: "b".repeat(MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES + 90),
+            after: "a".repeat(MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES + 90),
+            code: SmartWritingReasonCode::EditAccepted,
+        })
+        .collect();
+    assert!(smart.validated_before.len() > MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert!(smart.edits.len() > MAX_SMART_WRITING_DIAGNOSTIC_EDITS);
+
+    let dir = TempDir::new().unwrap();
+    let store = DiagnosticStore::open(dir.path().to_owned(), RetentionPolicy::default()).unwrap();
+    let mut record = DiagnosticRecord::new("sw-oversized-persist".to_owned(), 1);
+    record.smart_writing = Some(smart);
+    store.record(record).unwrap();
+
+    let loaded = store
+        .find("sw-oversized-persist")
+        .unwrap()
+        .expect("record retained");
+    let sw = loaded.smart_writing.expect("smart writing present");
+
+    assert!(sw.validated_before.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert!(sw.rendered_after.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert!(sw.formatter_contract_id.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+    assert!(
+        sw.model_id
+            .as_ref()
+            .is_some_and(|m| m.len() <= MAX_MODEL_ID_UTF8_BYTES)
+    );
+    assert!(
+        sw.free_form_error
+            .as_ref()
+            .is_some_and(|e| e.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES)
+    );
+    assert_eq!(sw.edits.len(), MAX_SMART_WRITING_DIAGNOSTIC_EDITS);
+    for edit in &sw.edits {
+        assert!(edit.edit_id.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+        assert!(edit.rule_id.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+        assert!(edit.before.len() <= MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES);
+        assert!(edit.after.len() <= MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES);
+    }
+    // Fingerprints stay of the unclamped source, not the clamped on-disk text.
+    assert_eq!(sw.validated_before_sha256, source_fp);
+    assert_eq!(sw.rendered_after_sha256, source_fp);
+    assert_ne!(
+        sw.validated_before_sha256,
+        text_sha256_fingerprint(&sw.validated_before)
+    );
+}
+
+#[test]
+fn smart_writing_export_reclamp_after_redaction_expansion_past_bound() {
+    // REDACTED is longer than a short secret. Scrubbing a field already at its
+    // §10 budget can expand past the bound unless export re-clamps afterward.
+    const SECRET: &str = "Z"; // 1 UTF-8 byte
+    assert!(REDACTED.len() > SECRET.len());
+
+    // free_form_error budget is 128: fill to max ending with the secret so a
+    // naive replace(SECRET, REDACTED) would exceed the budget by REDACTED.len()-1.
+    let prefix_len = MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES - SECRET.len();
+    let at_budget = format!("{}{}", "x".repeat(prefix_len), SECRET);
+    assert_eq!(at_budget.len(), MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+    let expanded = at_budget.replace(SECRET, REDACTED);
+    assert!(
+        expanded.len() > MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES,
+        "fixture must expand past the free-text budget without re-clamp"
+    );
+
+    let model_prefix = MAX_MODEL_ID_UTF8_BYTES - SECRET.len();
+    let model_at_budget = format!("{}{}", "m".repeat(model_prefix), SECRET);
+    assert_eq!(model_at_budget.len(), MAX_MODEL_ID_UTF8_BYTES);
+
+    let text_prefix = MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES - SECRET.len();
+    let text_at_budget = format!("{}{}", "t".repeat(text_prefix), SECRET);
+    assert_eq!(
+        text_at_budget.len(),
+        MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES
+    );
+    let text_fp = text_sha256_fingerprint(&text_at_budget);
+
+    let edit_prefix = MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES - SECRET.len();
+    let edit_at_budget = format!("{}{}", "b".repeat(edit_prefix), SECRET);
+
+    let mut smart = SmartWritingDiagnostic::new(
+        SmartWritingMode::Smart,
+        EnglishEligibilityOutcome::Eligible,
+        at_budget.clone(),
+        &text_at_budget,
+        &text_at_budget,
+        SmartWritingOutcome::FormattingAndGrammar,
+    );
+    // new() clamps texts and fingerprints the unclamped args; keep fingerprints
+    // of the at-budget source (already within the clamp so equal to stored text).
+    assert_eq!(smart.validated_before_sha256, text_fp);
+    smart.model_id = Some(model_at_budget);
+    smart.free_form_error = Some(at_budget.clone());
+    smart.edits = vec![SmartWritingEditEvidence {
+        edit_id: at_budget.clone(),
+        rule_id: at_budget,
+        start_utf8: 0,
+        end_utf8: 1,
+        before: edit_at_budget.clone(),
+        after: edit_at_budget,
+        code: SmartWritingReasonCode::EditAccepted,
+    }];
+
+    let mut record = record_at(1, unix_millis_now());
+    record.smart_writing = Some(smart);
+    let export = export_record(
+        record,
+        vec![("VOISU_GROQ_API_KEY".to_owned(), SECRET.to_owned())],
+    );
+    let encoded = serde_json::to_string(&export).unwrap();
+    assert!(
+        !encoded.contains(SECRET),
+        "secret must be scrubbed from export: {encoded}"
+    );
+
+    let sw = export.record.smart_writing.as_ref().unwrap();
+    assert!(sw.formatter_contract_id.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+    assert!(sw.validated_before.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert!(sw.rendered_after.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert!(
+        sw.model_id
+            .as_ref()
+            .is_some_and(|m| m.len() <= MAX_MODEL_ID_UTF8_BYTES)
+    );
+    assert!(
+        sw.free_form_error
+            .as_ref()
+            .is_some_and(|e| e.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES)
+    );
+    assert!(sw.edits[0].edit_id.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+    assert!(sw.edits[0].rule_id.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+    assert!(sw.edits[0].before.len() <= MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES);
+    assert!(sw.edits[0].after.len() <= MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES);
+    // Scrub expanded (REDACTED is longer than SECRET) then re-clamped to exact
+    // budgets. At a max-full field the clamp cuts inside REDACTED, so only a
+    // leading prefix of the mask remains — still within budget, secret gone.
+    let free = sw.free_form_error.as_ref().expect("free_form_error present");
+    assert_eq!(free.len(), MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+    assert!(
+        free.contains('<'),
+        "re-clamp after scrub should retain a redaction prefix within budget: {free:?}"
+    );
+    // Fingerprints are digests, not secret material, and must survive export.
+    assert_eq!(sw.validated_before_sha256, text_fp);
+    assert_eq!(sw.rendered_after_sha256, text_fp);
+}
+
+#[test]
+fn smart_writing_export_normalizes_publicly_mutated_oversized_fields() {
+    // Export is a second boundary: even without scrub hits, oversized public
+    // mutation must not leave export payloads past §10 budgets.
+    let mut smart = smart_writing_for_outcome(SmartWritingOutcome::FormattingOnly);
+    smart.validated_before = "v".repeat(MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES + 500);
+    smart.rendered_after = "r".repeat(MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES + 500);
+    smart.model_id = Some("m".repeat(MAX_MODEL_ID_UTF8_BYTES + 20));
+    smart.free_form_error = Some("e".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES + 20));
+    smart.edits = (0..(MAX_SMART_WRITING_DIAGNOSTIC_EDITS + 5))
+        .map(|i| SmartWritingEditEvidence {
+            edit_id: format!("id-{i}"),
+            rule_id: "rule".to_owned(),
+            start_utf8: 0,
+            end_utf8: 1,
+            before: "b".repeat(MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES + 10),
+            after: "a".repeat(MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES + 10),
+            code: SmartWritingReasonCode::EditAccepted,
+        })
+        .collect();
+    let fingerprint = smart.validated_before_sha256.clone();
+
+    let mut record = record_at(3, unix_millis_now());
+    record.smart_writing = Some(smart);
+    let export = export_record(record, Vec::<(String, String)>::new());
+    let sw = export.record.smart_writing.as_ref().unwrap();
+    assert!(sw.validated_before.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert!(sw.rendered_after.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert_eq!(
+        sw.model_id.as_ref().map(String::len),
+        Some(MAX_MODEL_ID_UTF8_BYTES)
+    );
+    assert_eq!(
+        sw.free_form_error.as_ref().map(String::len),
+        Some(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES)
+    );
+    assert_eq!(sw.edits.len(), MAX_SMART_WRITING_DIAGNOSTIC_EDITS);
+    assert_eq!(sw.validated_before_sha256, fingerprint);
+}
+
+#[test]
 fn clamp_utf8_bytes_respects_scalar_boundaries() {
     // Multi-byte scalar at the cut must not produce invalid UTF-8.
     let text = "ab\u{1F600}cd"; // grinning face is 4 bytes
