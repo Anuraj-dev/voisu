@@ -1,0 +1,725 @@
+{
+  "corpus_id": "voisu-smart-writing-edit-safety-2026-08-09",
+  "version": "4.0.0-architecture-reset",
+  "issue": {
+    "github_number": 100,
+    "title": "Prototype the structured edit and safety contract",
+    "parent_map": 96,
+    "blocked_by": 99,
+    "blocks": 103,
+    "url": "https://github.com/Anuraj-dev/voisu/issues/100"
+  },
+  "approval_state": "approved_b1a_b2a_b3a",
+  "language": "en",
+  "architecture": {
+    "formatting_authority": "deterministic_local_formatter",
+    "grammar_authority": "untrusted_localized_patches_only",
+    "baseline_transport": "sealed_typed_value_not_json",
+    "baseline_derivation": "immutable_formatter_contract_and_structural_digest",
+    "whole_text_rewrite_rule": "absent",
+    "context_source": "validated_transcript_only"
+  },
+  "coordinate_system": {
+    "unit": "utf8_byte",
+    "interval": "half_open",
+    "boundary_rule": "must_be_char_boundary",
+    "grammar_span_rule": "exactly_one_whole_lexical_token",
+    "zero_width_grammar": "forbidden"
+  },
+  "policy_under_test": {
+    "grammar_failure_unit": "whole_candidate",
+    "stale_fallback": "keep_fresh_formatting_baseline",
+    "protected_span_blast_radius": "reject_grammar_keep_formatting",
+    "composition": "formatter_source_anchors_formatting_priority",
+    "ballot_status": "approved"
+  },
+  "grammar_rule_catalog": [
+    "G_THERE_IS_PLURAL_QUANTITY",
+    "G_LETS_MEET_CONTRACTION",
+    "G_DIDNT_APOSTROPHE"
+  ],
+  "thresholds": {
+    "owner": "research_defaults_issue_103_owns_release",
+    "max_file_bytes": 524288,
+    "max_json_depth": 12,
+    "max_json_nodes": 20000,
+    "max_base_utf8_bytes": 100000,
+    "max_edits": 64,
+    "max_edit_field_utf8_bytes": 512,
+    "max_diagnostic_utf8_bytes": 128
+  },
+  "invariants": [
+    {
+      "id": "I-TYPED-BASELINE",
+      "summary": "Formatting is immutable and sealed, with a verified contract and digest; provider JSON cannot construct it."
+    },
+    {
+      "id": "I-NO-WHOLE-REWRITE",
+      "summary": "The grammar catalog has no whole-text rewrite operation."
+    },
+    {
+      "id": "I-VALIDATED-ANCHOR",
+      "summary": "Every grammar edit is anchored to the immutable Validated Transcript."
+    },
+    {
+      "id": "I-FORMATTING-PRIORITY",
+      "summary": "Unsafe grammar retains the already-produced formatting baseline."
+    },
+    {
+      "id": "I-PROTECTED",
+      "summary": "Semantic spans and exact base-derived formatter quote/code/command ranges are protected."
+    },
+    {
+      "id": "I-D3B",
+      "summary": "List inference uses only the Validated Transcript and ambiguous prose remains prose."
+    },
+    {
+      "id": "I-ERROR-ORDER",
+      "summary": "Errors retain deterministic first-seen order."
+    },
+    {
+      "id": "I-APPROVED-99",
+      "summary": "Exact accepted outputs cross-link to the approved #99 corpus."
+    }
+  ],
+  "error_codes": [
+    {
+      "code": "E_FORMATTING_TYPE",
+      "summary": "Formatting input is not the sealed baseline type."
+    },
+    {
+      "code": "E_FORMATTING_IDENTITY",
+      "summary": "Formatting baseline is not bound to this Validated Transcript."
+    },
+    {
+      "code": "E_FORMATTING_DERIVATION",
+      "summary": "Formatting capability structure or derivation digest is invalid."
+    },
+    {
+      "code": "E_MALFORMED",
+      "summary": "Grammar candidate or edit shape is invalid."
+    },
+    {
+      "code": "E_OVERSIZE",
+      "summary": "A configured research bound is exceeded."
+    },
+    {
+      "code": "E_STALE_GRAMMAR",
+      "summary": "Grammar base identity differs from the Validated Transcript."
+    },
+    {
+      "code": "E_UNSORTED",
+      "summary": "Grammar edits are not ordered by source range."
+    },
+    {
+      "code": "E_SPAN_OUT_OF_BOUNDS",
+      "summary": "An edit range is outside the base."
+    },
+    {
+      "code": "E_SPAN_NOT_CHAR_BOUNDARY",
+      "summary": "An edit range cuts a UTF-8 scalar."
+    },
+    {
+      "code": "E_NOT_TOKEN_BOUNDARY",
+      "summary": "Grammar must replace exactly one whole lexical token."
+    },
+    {
+      "code": "E_ANCHOR_MISMATCH",
+      "summary": "The exact before text does not match the base range."
+    },
+    {
+      "code": "E_PROTECTED_SPAN",
+      "summary": "An edit intersects protected meaning-bearing text."
+    },
+    {
+      "code": "E_UNKNOWN_RULE",
+      "summary": "The rule identifier is not in the closed grammar catalog."
+    },
+    {
+      "code": "E_RULE_CONTEXT",
+      "summary": "A closed rule predicate does not match its narrow context."
+    },
+    {
+      "code": "E_UNMAPPABLE",
+      "summary": "The formatter supplied no unambiguous source anchor for composition."
+    },
+    {
+      "code": "E_OVERLAP",
+      "summary": "Two grammar edits overlap or duplicate a source range."
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "A01_F01_FORMATTING",
+      "title": "Approved question formatting is retained without grammar",
+      "roles": ["accept", "formatting", "behavior_99"],
+      "base": {
+        "text": "hey can you send the notes when you get a chance",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:599fa103ead6f2f49c078c3cdb14d9a57d659fe734ae57fce4f384271bb29fb2"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:599fa103ead6f2f49c078c3cdb14d9a57d659fe734ae57fce4f384271bb29fb2",
+        "edits": []
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "formatting_only",
+        "rendered": "Hey, can you send the notes when you get a chance?",
+        "error_codes": []
+      },
+      "related_behavior_fixture_ids": ["F01"],
+      "rationale": "Formatting exists before the grammar gate."
+    },
+    {
+      "id": "A02_COMMAND_WHITESPACE",
+      "title": "Explicit command consumption is formatter-owned",
+      "roles": ["accept", "formatting", "command", "behavior_99"],
+      "base": {
+        "text": "ship it command exclamation point",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:8f0c67de15513ae717556f1dc87993f8e1ddf277d5a6123839a2247da870f175"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:8f0c67de15513ae717556f1dc87993f8e1ddf277d5a6123839a2247da870f175",
+        "edits": []
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "formatting_only",
+        "rendered": "Ship it!",
+        "error_codes": []
+      },
+      "related_behavior_fixture_ids": ["F09b"],
+      "rationale": "No command whitespace rule is exposed to provider JSON."
+    },
+    {
+      "id": "A03_COMMAND_NEWLINE",
+      "title": "Exact command newline output is formatter-owned",
+      "roles": ["accept", "formatting", "command", "behavior_99"],
+      "base": {
+        "text": "stop command period command new line next item",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:1d04aa1e2fe0b0320f08d2eb1ff07720d9c4b6e040d2658f2fccd1a0b48b3daa"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:1d04aa1e2fe0b0320f08d2eb1ff07720d9c4b6e040d2658f2fccd1a0b48b3daa",
+        "edits": []
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "formatting_only",
+        "rendered": "Stop.\nNext item",
+        "error_codes": []
+      },
+      "related_behavior_fixture_ids": ["F10b"],
+      "rationale": "The grammar validator neither consumes commands nor repairs their spacing."
+    },
+    {
+      "id": "A04_CLEAR_LIST",
+      "title": "Approved clear list stays a local formatting result",
+      "roles": ["accept", "formatting", "list", "behavior_99"],
+      "base": {
+        "text": "buy milk eggs bread",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:0763f6624a8bd9fec7ad2ca2fa0bf2bcc22a7a63092e29aa47cb626f88f03c8d"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:0763f6624a8bd9fec7ad2ca2fa0bf2bcc22a7a63092e29aa47cb626f88f03c8d",
+        "edits": []
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "formatting_only",
+        "rendered": "Buy:\n- milk\n- eggs\n- bread",
+        "error_codes": []
+      },
+      "related_behavior_fixture_ids": ["F17"],
+      "rationale": "The approved exact #99 example is local and transcript-only."
+    },
+    {
+      "id": "A05_AMBIGUOUS_PROSE",
+      "title": "Ambiguous buy prose is not inferred as a list",
+      "roles": ["accept", "formatting", "d3_b", "adversarial"],
+      "base": {
+        "text": "buy milk when hungry",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:5258c82b8f2405032fa7038448e390a671a3593b900a1e5f7784e57f5593ce7e"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:5258c82b8f2405032fa7038448e390a671a3593b900a1e5f7784e57f5593ce7e",
+        "edits": []
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "formatting_only",
+        "rendered": "Buy milk when hungry.",
+        "error_codes": []
+      },
+      "related_behavior_fixture_ids": [],
+      "rationale": "D3-B fails closed to prose without app or surrounding context."
+    },
+    {
+      "id": "G01_THERE_IS_ACCEPT",
+      "title": "Narrow existential plural-quantity correction",
+      "roles": ["accept", "grammar", "behavior_99"],
+      "base": {
+        "text": "there is two issues with the patch",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:12fe3bc6c2f4b18951ac25ecf651646612a6b354ddc176ef7d5036bee2ed3e45"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:12fe3bc6c2f4b18951ac25ecf651646612a6b354ddc176ef7d5036bee2ed3e45",
+        "edits": [
+          {
+            "id": "g1",
+            "rule_id": "G_THERE_IS_PLURAL_QUANTITY",
+            "start_utf8": 6,
+            "end_utf8": 8,
+            "before": "is",
+            "after": "are"
+          }
+        ]
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "both",
+        "rendered": "There are two issues with the patch.",
+        "error_codes": []
+      },
+      "related_behavior_fixture_ids": ["F25"],
+      "rationale": "The exact safe pattern is there + is + two + issues with horizontal whitespace only."
+    },
+    {
+      "id": "G02_PRICE_IS_REJECT",
+      "title": "Price-is-two is not an existential agreement error",
+      "roles": ["reject", "grammar", "adversarial", "false_positive"],
+      "base": {
+        "text": "the price is two dollars",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:4e617a25dc0e1c0bd71ed62532894e43c92ff74b6ba5d765828b38640c91353d"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:4e617a25dc0e1c0bd71ed62532894e43c92ff74b6ba5d765828b38640c91353d",
+        "edits": [
+          {
+            "id": "g1",
+            "rule_id": "G_THERE_IS_PLURAL_QUANTITY",
+            "start_utf8": 10,
+            "end_utf8": 12,
+            "before": "is",
+            "after": "are"
+          }
+        ]
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "formatting_only",
+        "rendered": "The price is two dollars.",
+        "error_codes": ["E_RULE_CONTEXT"]
+      },
+      "related_behavior_fixture_ids": [],
+      "rationale": "Prevents the reviewed corruption to the price are two dollars."
+    },
+    {
+      "id": "G03_LETS_ACCEPT",
+      "title": "Narrow sentence-initial lets-meet contraction",
+      "roles": ["accept", "grammar", "behavior_99", "composition"],
+      "base": {
+        "text": "lets meet tomorrow",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:b097b4d9332d1cafb8c483fdde16eed609c608994e2c1b44fa2fe868734ac335"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:b097b4d9332d1cafb8c483fdde16eed609c608994e2c1b44fa2fe868734ac335",
+        "edits": [
+          {
+            "id": "g1",
+            "rule_id": "G_LETS_MEET_CONTRACTION",
+            "start_utf8": 0,
+            "end_utf8": 4,
+            "before": "lets",
+            "after": "let's"
+          }
+        ]
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "both",
+        "rendered": "Let's meet tomorrow.",
+        "error_codes": []
+      },
+      "related_behavior_fixture_ids": ["F26"],
+      "rationale": "Formatter casing wins while grammar supplies only the apostrophe."
+    },
+    {
+      "id": "G04_APP_LETS_REJECT",
+      "title": "Application lets-users verb is preserved",
+      "roles": ["reject", "grammar", "adversarial", "false_positive"],
+      "base": {
+        "text": "the app lets users export",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:27bb0a19824a632029041739d515c9ef1bafa5becdff7ebac51712502c1218f3"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:27bb0a19824a632029041739d515c9ef1bafa5becdff7ebac51712502c1218f3",
+        "edits": [
+          {
+            "id": "g1",
+            "rule_id": "G_LETS_MEET_CONTRACTION",
+            "start_utf8": 8,
+            "end_utf8": 12,
+            "before": "lets",
+            "after": "let's"
+          }
+        ]
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "formatting_only",
+        "rendered": "The app lets users export.",
+        "error_codes": ["E_RULE_CONTEXT"]
+      },
+      "related_behavior_fixture_ids": [],
+      "rationale": "Prevents the reviewed app let's users corruption."
+    },
+    {
+      "id": "G05_DIDNT_ACCEPT",
+      "title": "Apostrophe correction preserves the double negative",
+      "roles": ["accept", "grammar", "negation", "behavior_99"],
+      "base": {
+        "text": "i didnt see no error in the logs",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:2f127db5c63cd1cee873d102dfb9e626ddb24aa8a34c93316c85ede8841ce614"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:2f127db5c63cd1cee873d102dfb9e626ddb24aa8a34c93316c85ede8841ce614",
+        "edits": [
+          {
+            "id": "g1",
+            "rule_id": "G_DIDNT_APOSTROPHE",
+            "start_utf8": 2,
+            "end_utf8": 7,
+            "before": "didnt",
+            "after": "didn't"
+          }
+        ]
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "both",
+        "rendered": "I didn't see no error in the logs.",
+        "error_codes": []
+      },
+      "related_behavior_fixture_ids": ["F27"],
+      "rationale": "Only punctuation changes; no is removed or rewritten."
+    },
+    {
+      "id": "P01_QUOTED_REJECT",
+      "title": "Quoted wording is protected from grammar",
+      "roles": ["reject", "grammar", "protected", "quotation"],
+      "base": {
+        "text": "she said \"i didnt know\"",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:ca0df7a97e706076f351077e7f9b98f77ffac6dc9b809c321702af24bf381d3e"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:ca0df7a97e706076f351077e7f9b98f77ffac6dc9b809c321702af24bf381d3e",
+        "edits": [
+          {
+            "id": "g1",
+            "rule_id": "G_DIDNT_APOSTROPHE",
+            "start_utf8": 12,
+            "end_utf8": 17,
+            "before": "didnt",
+            "after": "didn't"
+          }
+        ]
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "formatting_only",
+        "rendered": "She said \"i didnt know\".",
+        "error_codes": ["E_PROTECTED_SPAN"]
+      },
+      "related_behavior_fixture_ids": [],
+      "rationale": "Exact quoted wording outranks polish."
+    },
+    {
+      "id": "P02_DICTIONARY_REJECT",
+      "title": "Dictionary term cannot be repurposed by a rule label",
+      "roles": ["reject", "grammar", "protected", "dictionary", "adversarial"],
+      "base": {
+        "text": "use PostgreSQL didnt work",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:45859618be31b5663222764d25b85b582c1dd009bc3f60422e01fe33c985a3cb"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:45859618be31b5663222764d25b85b582c1dd009bc3f60422e01fe33c985a3cb",
+        "edits": [
+          {
+            "id": "g1",
+            "rule_id": "G_DIDNT_APOSTROPHE",
+            "start_utf8": 4,
+            "end_utf8": 14,
+            "before": "PostgreSQL",
+            "after": "didn't"
+          }
+        ]
+      },
+      "protected_names": [],
+      "dictionary_terms": ["PostgreSQL"],
+      "expected": {
+        "decision": "formatting_only",
+        "rendered": "Use PostgreSQL didnt work.",
+        "error_codes": ["E_PROTECTED_SPAN", "E_RULE_CONTEXT"]
+      },
+      "related_behavior_fixture_ids": [],
+      "rationale": "A closed rule ID grants no authority over a different token."
+    },
+    {
+      "id": "S01_STALE_GRAMMAR",
+      "title": "Stale grammar keeps fresh formatting",
+      "roles": ["reject", "grammar", "stale", "fallback"],
+      "base": {
+        "text": "lets meet tomorrow",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:b097b4d9332d1cafb8c483fdde16eed609c608994e2c1b44fa2fe868734ac335"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v0",
+        "base_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "edits": [
+          {
+            "id": "g1",
+            "rule_id": "G_LETS_MEET_CONTRACTION",
+            "start_utf8": 0,
+            "end_utf8": 4,
+            "before": "lets",
+            "after": "let's"
+          }
+        ]
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "formatting_only",
+        "rendered": "Lets meet tomorrow.",
+        "error_codes": ["E_STALE_GRAMMAR"]
+      },
+      "related_behavior_fixture_ids": [],
+      "rationale": "B2-A does not discard deterministic formatting."
+    },
+    {
+      "id": "S02_INVALID_DUPLICATE",
+      "title": "Invalid grammar at a duplicate range cannot suppress formatting",
+      "roles": ["reject", "grammar", "overlap", "fallback", "regression"],
+      "base": {
+        "text": "lets meet tomorrow",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:b097b4d9332d1cafb8c483fdde16eed609c608994e2c1b44fa2fe868734ac335"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:b097b4d9332d1cafb8c483fdde16eed609c608994e2c1b44fa2fe868734ac335",
+        "edits": [
+          {
+            "id": "bad",
+            "rule_id": "G_DIDNT_APOSTROPHE",
+            "start_utf8": 0,
+            "end_utf8": 4,
+            "before": "lets",
+            "after": "didn't"
+          },
+          {
+            "id": "good",
+            "rule_id": "G_LETS_MEET_CONTRACTION",
+            "start_utf8": 0,
+            "end_utf8": 4,
+            "before": "lets",
+            "after": "let's"
+          }
+        ]
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "formatting_only",
+        "rendered": "Lets meet tomorrow.",
+        "error_codes": ["E_RULE_CONTEXT", "E_OVERLAP"]
+      },
+      "related_behavior_fixture_ids": [],
+      "rationale": "The authorities are separate, so a grammar conflict cannot erase formatting."
+    },
+    {
+      "id": "S03_WHOLE_REWRITE",
+      "title": "Rule labels cannot authorize a whole-text negation rewrite",
+      "roles": ["reject", "grammar", "whole_text", "negation", "adversarial"],
+      "base": {
+        "text": "do not transfer money",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:8bf545c51f30ace97d07a583d1b6f72d59389bbb860ee2ed5b6564acefcee069"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:8bf545c51f30ace97d07a583d1b6f72d59389bbb860ee2ed5b6564acefcee069",
+        "edits": [
+          {
+            "id": "rewrite",
+            "rule_id": "F_trusted_precomputed",
+            "start_utf8": 0,
+            "end_utf8": 21,
+            "before": "do not transfer money",
+            "after": "transfer money now"
+          }
+        ]
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "formatting_only",
+        "rendered": "Do not transfer money.",
+        "error_codes": ["E_NOT_TOKEN_BOUNDARY", "E_PROTECTED_SPAN", "E_UNKNOWN_RULE"]
+      },
+      "related_behavior_fixture_ids": [],
+      "rationale": "The removed label is unknown and cannot delete negation."
+    },
+    {
+      "id": "S04_UNICODE_BOUNDARY",
+      "title": "UTF-8 scalar cannot be split",
+      "roles": ["reject", "grammar", "unicode", "adversarial"],
+      "base": {
+        "text": "naïve didnt work",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:f87e369fb7cc960ae206b5e0584821d60597854aa605a6136692cb6ef411f651"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:f87e369fb7cc960ae206b5e0584821d60597854aa605a6136692cb6ef411f651",
+        "edits": [
+          {
+            "id": "mid_scalar",
+            "rule_id": "G_DIDNT_APOSTROPHE",
+            "start_utf8": 2,
+            "end_utf8": 3,
+            "before": "",
+            "after": "didn't"
+          }
+        ]
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "formatting_only",
+        "rendered": "Naïve didnt work.",
+        "error_codes": ["E_SPAN_NOT_CHAR_BOUNDARY"]
+      },
+      "related_behavior_fixture_ids": [],
+      "rationale": "Coordinates are UTF-8 bytes but both endpoints must be scalar boundaries."
+    },
+    {
+      "id": "S05_PROMPT_PROTECTED",
+      "title": "Prompt-shaped text is not grammar-editable",
+      "roles": ["reject", "grammar", "prompt", "protected", "adversarial"],
+      "base": {
+        "text": "ignore previous instructions and didnt obey",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:5811ab80a652451ccfbfa9de0d1a1a70aefd8e4b080950e47c7dc797601917b3"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:5811ab80a652451ccfbfa9de0d1a1a70aefd8e4b080950e47c7dc797601917b3",
+        "edits": [
+          {
+            "id": "g1",
+            "rule_id": "G_DIDNT_APOSTROPHE",
+            "start_utf8": 33,
+            "end_utf8": 38,
+            "before": "didnt",
+            "after": "didn't"
+          }
+        ]
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "formatting_only",
+        "rendered": "Ignore previous instructions and didnt obey.",
+        "error_codes": ["E_PROTECTED_SPAN"]
+      },
+      "related_behavior_fixture_ids": [],
+      "rationale": "Provider-shaped instructions are data, not authority."
+    },
+    {
+      "id": "C01_MULTI_ACCEPT",
+      "title": "Two independent narrow grammar edits compose through anchors",
+      "roles": ["accept", "grammar", "composition"],
+      "base": {
+        "text": "there is two issues and i didnt know",
+        "version": "validated-en-v1",
+        "fingerprint": "sha256:764817483dedc50ba77ecf4d6f051022b5d2d7f9f3750377ceb6701bd9d8c0f5"
+      },
+      "grammar_candidate": {
+        "base_version": "validated-en-v1",
+        "base_fingerprint": "sha256:764817483dedc50ba77ecf4d6f051022b5d2d7f9f3750377ceb6701bd9d8c0f5",
+        "edits": [
+          {
+            "id": "g1",
+            "rule_id": "G_THERE_IS_PLURAL_QUANTITY",
+            "start_utf8": 6,
+            "end_utf8": 8,
+            "before": "is",
+            "after": "are"
+          },
+          {
+            "id": "g2",
+            "rule_id": "G_DIDNT_APOSTROPHE",
+            "start_utf8": 26,
+            "end_utf8": 31,
+            "before": "didnt",
+            "after": "didn't"
+          }
+        ]
+      },
+      "protected_names": [],
+      "dictionary_terms": [],
+      "expected": {
+        "decision": "both",
+        "rendered": "There are two issues and i didn't know.",
+        "error_codes": []
+      },
+      "related_behavior_fixture_ids": [],
+      "rationale": "Non-overlapping edits use formatter-owned source anchors."
+    }
+  ],
+  "dataset_counts": {
+    "fixtures_total": 18,
+    "fixtures_accept_grammar": 4,
+    "fixtures_reject_grammar": 9,
+    "fixtures_formatting_only": 5,
+    "notes": "Counts classify four accepted grammar fixtures, nine rejected grammar fixtures, and five formatting-only contract fixtures."
+  }
+}
