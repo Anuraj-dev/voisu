@@ -31,6 +31,12 @@ pub use diagnostics::{
     EXPORT_ENV_ALLOWLIST, MAX_STORED_TEXT, REDACTED,
 };
 
+mod formatting_commands;
+pub use formatting_commands::{
+    parse_formatting_commands, CommandEvent, CommandKind, NumberedListItem, ParsedCommands,
+    SourceSpan,
+};
+
 // Paged diagnostic responses are negotiated per REQUEST (see `Request::paged`),
 // never by protocol version. The version is interpolated into the socket path,
 // the single-instance lock, and the store directory, so bumping it partitions
