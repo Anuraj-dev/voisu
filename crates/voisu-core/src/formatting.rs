@@ -10,6 +10,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use sha2::{Digest, Sha256};
 
 use crate::formatting_commands::{
@@ -334,7 +337,54 @@ fn identity_source_anchors(source: &str) -> BTreeMap<(usize, usize), SourceAncho
 
 #[inline]
 fn deadline_hit(deadline_at: Instant) -> bool {
+    #[cfg(test)]
+    if let Some(forced) = seal_deadline_test_hook::poll() {
+        return forced;
+    }
     Instant::now() >= deadline_at
+}
+
+/// Test-only: force cooperative deadline hits after N free checks (deterministic
+/// seal before/during/after branches without flaky wall-clock races).
+#[cfg(test)]
+mod seal_deadline_test_hook {
+    use super::*;
+
+    thread_local! {
+        /// Remaining free (non-hit) checks before forced hit. `None` = inactive.
+        static FREE_CHECKS: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    pub fn arm_hit_after(free_checks: u32) {
+        FREE_CHECKS.with(|c| c.set(Some(free_checks)));
+    }
+
+    pub fn clear() {
+        FREE_CHECKS.with(|c| c.set(None));
+    }
+
+    pub(super) fn poll() -> Option<bool> {
+        FREE_CHECKS.with(|c| {
+            let Some(left) = c.get() else {
+                return None;
+            };
+            if left == 0 {
+                // Stay armed so subsequent checks keep hitting until `clear`.
+                Some(true)
+            } else {
+                c.set(Some(left - 1));
+                Some(false)
+            }
+        })
+    }
+
+    /// RAII clear so a panic mid-test cannot poison later tests.
+    pub struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            clear();
+        }
+    }
 }
 
 fn transcript_fingerprint(text: &str) -> String {
@@ -841,6 +891,10 @@ fn smart_format(
         return Some(input.to_owned());
     }
 
+    // §5.1 step 1: protected recognition before any edit (quote/code/composite,
+    // dictionary, protected names). Structural + casing + local grammar honor this.
+    let protect = build_edit_protection(input, dictionary, protected_names);
+
     // §5.1 step 2: command parse before already-correct identity short-circuits.
     // Spoken commands in an otherwise sentence-cased string must still expand
     // (e.g. "Ship it command period." → "Ship it.").
@@ -858,12 +912,16 @@ fn smart_format(
 
     let mut text = if !has_commands && literal == input {
         // No §4 commands: list inference / enumeration / email greeting on Validated text.
-        if let Some(bullets) = try_bullet_inference(input) {
+        // Each structural rewrite skips when it would touch protected spans.
+        if let Some(bullets) = try_bullet_inference(input, &protect) {
             return Some(bullets);
         }
-        let mut t = try_counted_enumeration(input).unwrap_or_else(|| input.to_owned());
-        t = apply_email_hi_name(&t);
-        t = split_email_update_sentence(&t);
+        let mut t = try_counted_enumeration(input, &protect).unwrap_or_else(|| input.to_owned());
+        // Recompute mask after each structural rewrite (byte indices shift).
+        let p = build_edit_protection(&t, dictionary, protected_names);
+        t = apply_email_hi_name(&t, &p);
+        let p = build_edit_protection(&t, dictionary, protected_names);
+        t = split_email_update_sentence(&t, &p);
         t
     } else {
         literal
@@ -896,13 +954,13 @@ fn smart_format(
     // Closed Minimal Grammar catalog applied locally for hermetic #99 Smart
     // oracle (F25/F26/F27). Separability (§6.1): skip when any §4 command span
     // is present, or when consecutive word-tokens `new`+`line` appear (F36).
-    // Quote/code/composite protection matches seal ranges so local rewrites
-    // cannot mutate protected interiors.
+    // Quote/code/composite + dictionary/names protection so local rewrites
+    // cannot mutate protected interiors or snapshot tokens.
     if !has_commands && !has_new_line_token_pair(input) {
         if deadline_hit(deadline_at) {
             return None;
         }
-        text = apply_closed_local_grammar(&text);
+        text = apply_closed_local_grammar(&text, dictionary, protected_names);
     }
 
     Some(text)
@@ -1012,7 +1070,11 @@ const CLAUSE_MARKERS: &[&str] = &[
     "which", "who",
 ];
 
-fn try_bullet_inference(text: &str) -> Option<String> {
+fn try_bullet_inference(text: &str, protected: &[bool]) -> Option<String> {
+    // Whole-string structural rewrite: any protected byte ⇒ fail closed.
+    if span_touches_protection(0, text.len(), protected) {
+        return None;
+    }
     let words: Vec<&str> = text.split_whitespace().collect();
     if words.is_empty() || ascii_lower(words[0]) != "buy" {
         return None;
@@ -1071,7 +1133,7 @@ fn count_word_value(word: &str) -> Option<usize> {
     }
 }
 
-fn try_counted_enumeration(text: &str) -> Option<String> {
+fn try_counted_enumeration(text: &str, protected: &[bool]) -> Option<String> {
     // … N <noun> items… and last
     let tokens: Vec<(usize, usize, &str)> = word_tokens(text);
     if tokens.len() < 5 {
@@ -1124,6 +1186,10 @@ fn try_counted_enumeration(text: &str) -> Option<String> {
 
     // Prefix = text before count word (preserve spacing loosely via original slice)
     let prefix_end = tokens[count_idx].0;
+    // Rebuilt region is count…end; skip if quote/code/composite/dict spans would be destroyed.
+    if span_touches_protection(prefix_end, text.len(), protected) {
+        return None;
+    }
     let prefix = &text[..prefix_end];
     let count_tok = tokens[count_idx].2;
     let body = if n == 2 {
@@ -1139,7 +1205,7 @@ fn try_counted_enumeration(text: &str) -> Option<String> {
 
 // ─── Email / vocative / discourse commas (fixture-locked) ────────────────────
 
-fn apply_email_hi_name(text: &str) -> String {
+fn apply_email_hi_name(text: &str, protected: &[bool]) -> String {
     // hi jordan … → Hi Jordan, …
     let tokens: Vec<(usize, usize, &str)> = word_tokens(text);
     if tokens.len() < 2 {
@@ -1152,22 +1218,29 @@ fn apply_email_hi_name(text: &str) -> String {
     if !name.chars().all(|c| c.is_ascii_alphabetic()) {
         return text.to_owned();
     }
+    // Greeting rewrite spans hi + name.
+    if span_touches_protection(tokens[0].0, tokens[1].1, protected) {
+        return text.to_owned();
+    }
     let name_c = capitalize_word(name);
     let rest_start = tokens[1].1;
     let rest = text[rest_start..].trim_start();
     format!("Hi {name_c}, {rest}")
 }
 
-fn split_email_update_sentence(text: &str) -> String {
+fn split_email_update_sentence(text: &str, protected: &[bool]) -> String {
     // "update i will" → "update. I will" (F04)
     let lower = ascii_lower(text);
     if let Some(rel) = lower.find("update i will") {
+        let end = rel + "update i will".len();
+        if span_touches_protection(rel, end, protected) {
+            return text.to_owned();
+        }
         let mut out = String::new();
         out.push_str(&text[..rel]);
         out.push_str(&text[rel..rel + "update".len()]);
         out.push_str(". I will");
-        let after = rel + "update i will".len();
-        out.push_str(&text[after..]);
+        out.push_str(&text[end..]);
         return out;
     }
     text.to_owned()
@@ -1279,7 +1352,7 @@ const WEEKDAYS: &[&str] = &[
 ];
 
 fn apply_casing(text: &str, dictionary: &[&str], protected_names: &[&str]) -> String {
-    let protected = build_casing_protection(text, dictionary, protected_names);
+    let protected = build_edit_protection(text, dictionary, protected_names);
     let mut chars: Vec<char> = text.chars().collect();
     // Map byte index → char index
     let mut byte_to_char: Vec<usize> = vec![0; text.len() + 1];
@@ -1340,9 +1413,13 @@ fn is_sentence_or_line_start(text: &str, byte_idx: usize) -> bool {
     trimmed.ends_with(['.', '!', '?'])
 }
 
-/// Byte mask: quote/code/composite ranges (same families as seal) plus dictionary/names.
-/// Unmatched/ambiguous quote delimiters protect the whole base (fail-closed).
-fn build_casing_protection(text: &str, dictionary: &[&str], protected_names: &[&str]) -> Vec<bool> {
+/// Byte mask for all local edits before/while rewriting (spec §5.1 protected recognition).
+///
+/// Covers quote/code/composite (same families as seal), bare `quote`…`unquote` interiors,
+/// and Recording-time dictionary / protected-name whole tokens. Unmatched/ambiguous quote
+/// delimiters protect the whole base (fail-closed). Used by structural transforms, casing,
+/// and local grammar.
+fn build_edit_protection(text: &str, dictionary: &[&str], protected_names: &[&str]) -> Vec<bool> {
     let mut protected = vec![false; text.len()];
     let mut ranges = Vec::new();
     collect_composite_spans(text, &mut ranges);
@@ -1371,7 +1448,7 @@ fn build_casing_protection(text: &str, dictionary: &[&str], protected_names: &[&
             protected[i] = true;
         }
     }
-    // Dictionary / names whole tokens
+    // Dictionary / names whole tokens (casing + local grammar).
     for (s, e, tok) in word_tokens(text) {
         let lower = ascii_lower(tok);
         if dictionary.iter().any(|d| eq_ascii_ignore_case(d, tok))
@@ -1383,20 +1460,6 @@ fn build_casing_protection(text: &str, dictionary: &[&str], protected_names: &[&
                     protected[i] = true;
                 }
             }
-        }
-    }
-    protected
-}
-
-/// Quote/code/composite protection mask for local grammar (no dictionary/names).
-fn build_local_grammar_protection(text: &str) -> Vec<bool> {
-    let mut protected = vec![false; text.len()];
-    let mut ranges = Vec::new();
-    collect_composite_spans(text, &mut ranges);
-    collect_quote_and_code_ranges(text, &mut ranges);
-    for r in normalize_ranges(ranges) {
-        for i in r.start..r.end.min(protected.len()) {
-            protected[i] = true;
         }
     }
     protected
@@ -1562,14 +1625,18 @@ fn add_terminal_punctuation(text: &str) -> String {
 // These mirror §6.1 predicates so SW3 can match the 51 #99 Smart outputs without
 // a provider. SW4 still owns candidate validation/composition for untrusted JSON.
 
-fn apply_closed_local_grammar(text: &str) -> String {
-    let protected = build_local_grammar_protection(text);
+fn apply_closed_local_grammar(
+    text: &str,
+    dictionary: &[&str],
+    protected_names: &[&str],
+) -> String {
+    let protected = build_edit_protection(text, dictionary, protected_names);
     let mut t = text.to_owned();
     t = grammar_there_is_plural(&t, &protected);
     // Recompute mask after each rewrite so byte indices stay valid.
-    let protected = build_local_grammar_protection(&t);
+    let protected = build_edit_protection(&t, dictionary, protected_names);
     t = grammar_lets_meet(&t, &protected);
-    let protected = build_local_grammar_protection(&t);
+    let protected = build_edit_protection(&t, dictionary, protected_names);
     t = grammar_didnt(&t, &protected);
     t
 }
@@ -2027,6 +2094,86 @@ mod tests {
         );
     }
 
+    /// P1: structural enumeration must not run through inline code (Sol r2).
+    /// Repro: list reconstructed *outside* backticks and backticks discarded.
+    #[test]
+    fn code_span_blocks_counted_enumeration_rewrite() {
+        let input = "the API has three errors `not found forbidden and unauthorized`";
+        let out = smart(input);
+        assert!(
+            out.contains("`not found forbidden and unauthorized`"),
+            "code interior must stay intact (no list reconstruction outside backticks), got {out:?}"
+        );
+        assert!(
+            !out.contains("errors: not found") && !out.contains(": not found, forbidden"),
+            "must not reconstruct enumeration by stripping code fences: {out:?}"
+        );
+        // Unprotected exterior still gets ordinary Smart casing/punct.
+        assert!(
+            out.starts_with("The API has three errors"),
+            "exterior casing should still apply, got {out:?}"
+        );
+    }
+
+    /// P1: ASCII quote interiors also block structural list inference.
+    #[test]
+    fn quoted_span_blocks_bullet_inference() {
+        let input = "buy \"milk eggs bread cheese\"";
+        let out = smart(input);
+        assert!(
+            !out.contains('\n') || !out.contains("- "),
+            "quoted buy-list must not become bullets: {out:?}"
+        );
+        assert!(
+            out.contains("\"milk eggs bread cheese\"") || out.contains("milk eggs bread cheese"),
+            "quoted interior should remain, got {out:?}"
+        );
+    }
+
+    // ── Sol r2: dictionary / protected-names block local grammar ─────────────
+
+    #[test]
+    fn dictionary_didnt_not_rewritten_by_local_grammar() {
+        let input = "i didnt see no error in the logs";
+        let b = format_validated_with(
+            input,
+            WritingMode::Smart,
+            FormatOptions {
+                dictionary: &["didnt"],
+                ..FormatOptions::default()
+            },
+        );
+        assert!(
+            b.rendered().contains("didnt") && !b.rendered().contains("didn't"),
+            "dictionary snapshot token must not get didnt→didn't, got {:?}",
+            b.rendered()
+        );
+        // Casing outside the protected token still applies.
+        assert!(
+            b.rendered().starts_with('I'),
+            "unprotected sentence-start casing still applies: {:?}",
+            b.rendered()
+        );
+    }
+
+    #[test]
+    fn protected_name_lets_not_rewritten_by_local_grammar() {
+        let input = "Lets meet tomorrow";
+        let b = format_validated_with(
+            input,
+            WritingMode::Smart,
+            FormatOptions {
+                protected_names: &["Lets"],
+                ..FormatOptions::default()
+            },
+        );
+        assert!(
+            b.rendered().contains("Lets") && !b.rendered().contains("Let's"),
+            "protected-name snapshot must not get lets→let's, got {:?}",
+            b.rendered()
+        );
+    }
+
     // ── Sol revise: source anchors survive local rewrites ────────────────────
 
     fn assert_token_anchored(b: &FormattingBaseline, source: &str, token: &str) {
@@ -2175,6 +2322,80 @@ mod tests {
             input,
             "precondition: Smart would rewrite without deadline"
         );
+    }
+
+    // ── Sol r2: deterministic seal-path deadline branches ────────────────────
+    //
+    // Zero-budget tests only hit the pre-work check. These drive finish_baseline
+    // with a far-future Instant plus a test hook so before/during/after-seal
+    // identity fallback is exercised without flaky wall-clock gates.
+
+    fn assert_seal_path_identity(source: &str, free_checks_before_hit: u32) {
+        let rendered = smart(source);
+        assert_ne!(
+            rendered, source,
+            "precondition: Smart rewrite must differ from source"
+        );
+        let fp = transcript_fingerprint(source);
+        let far = Instant::now() + Duration::from_secs(3600);
+        let _guard = seal_deadline_test_hook::Guard;
+        seal_deadline_test_hook::arm_hit_after(free_checks_before_hit);
+        let b = finish_baseline(
+            source,
+            VALIDATED_TRANSCRIPT_VERSION,
+            fp,
+            rendered,
+            far,
+        );
+        assert_eq!(
+            b.rendered(),
+            source,
+            "seal-path deadline miss (free={free_checks_before_hit}) must identity-fallback"
+        );
+        assert!(
+            b.protected_source_ranges()
+                .iter()
+                .any(|r| r.start == 0 && r.end == source.len()),
+            "identity seal must protect whole base"
+        );
+        assert!(b.verify_derivation_digest());
+    }
+
+    #[test]
+    fn seal_deadline_before_seal_returns_identity() {
+        // 0 free: first deadline_hit in finish_baseline → before-seal branch.
+        assert_seal_path_identity("there is two issues with the patch", 0);
+    }
+
+    #[test]
+    fn seal_deadline_during_seal_returns_identity() {
+        // 1 free: finish before-check passes; first try_seal_baseline check hits → None.
+        assert_seal_path_identity("there is two issues with the patch", 1);
+    }
+
+    #[test]
+    fn seal_deadline_after_seal_returns_identity() {
+        // 3 free: before + two mid-seal checks pass; post-seal deadline_hit → identity.
+        assert_seal_path_identity("there is two issues with the patch", 3);
+    }
+
+    #[test]
+    fn seal_deadline_past_instant_returns_identity() {
+        // Instant already elapsed at seal entry (no hook): before-seal path.
+        let source = "there is two issues with the patch";
+        let rendered = smart(source);
+        let fp = transcript_fingerprint(source);
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("Instant supports past deadline");
+        let b = finish_baseline(
+            source,
+            VALIDATED_TRANSCRIPT_VERSION,
+            fp,
+            rendered,
+            past,
+        );
+        assert_eq!(b.rendered(), source);
     }
 
     /// Full format of max-size input must stay linear (no multi-second O(n²)).
