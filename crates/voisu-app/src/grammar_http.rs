@@ -164,6 +164,37 @@ impl GrammarHttpClient {
             .await
             .map_err(map_reqwest_error)?;
 
+        Self::finish_response(response, self.max_body_bytes).await
+    }
+
+    /// Test-only: same transport path as [`Self::post_json`], but with a caller-
+    /// owned body (used to prove mid-upload cancel with an explicit unsent
+    /// remainder under test control).
+    #[cfg(test)]
+    async fn post_transport_body(
+        &self,
+        bearer_token: &str,
+        body: reqwest::Body,
+    ) -> Result<GrammarHttpSuccess, GrammarHttpError> {
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .timeout(self.request_timeout)
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {bearer_token}"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ACCEPT, "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+
+        Self::finish_response(response, self.max_body_bytes).await
+    }
+
+    async fn finish_response(
+        response: reqwest::Response,
+        max_body_bytes: usize,
+    ) -> Result<GrammarHttpSuccess, GrammarHttpError> {
         let status = response.status();
         if status != reqwest::StatusCode::OK {
             // Drop the response without streaming the body; connection work ends.
@@ -172,7 +203,7 @@ impl GrammarHttpClient {
             });
         }
 
-        let body = read_bounded_body(response, self.max_body_bytes).await?;
+        let body = read_bounded_body(response, max_body_bytes).await?;
         Ok(GrammarHttpSuccess { body })
     }
 
@@ -309,7 +340,8 @@ mod tests {
         bytes_after_drop: AtomicU64,
         /// Set when the server has entered the hang phase of the scenario.
         hang_entered: AtomicUsize,
-        /// Request body bytes the Upload hang mode intentionally observed.
+        /// Request body bytes the Upload hang mode intentionally observed
+        /// *at hang entry* (frozen; never updated by post-cancel drain).
         upload_body_bytes: AtomicU64,
         /// Declared Content-Length from the Upload hang request headers.
         upload_content_length: AtomicU64,
@@ -342,7 +374,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum HangMode {
-        /// Observe a verified partial body, then drain until peer EOF/reset.
+        /// Mid-upload: partial body + stall (no further drain) until cancel.
         Upload,
         /// Fully read request; never send response headers.
         Wait,
@@ -407,18 +439,19 @@ mod tests {
 
         match reply {
             ReplyMode::Hang(HangMode::Upload) => {
-                // Mid-upload proof:
-                // 1) Observe a verified partial body (body < Content-Length) so
-                //    hang entry is still mid-upload, not full-request teardown.
-                // 2) Keep the live socket open and read until peer EOF/reset.
-                //    The drop barrier only flips residual-byte accounting — it
-                //    must never end the handler or close the server socket.
-                //    active_handlers==0 therefore requires observing client cancel.
+                // Mid-upload proof (§11.2 / Sol r3):
+                // 1) Read a verified partial body only (never drain-to-CL).
+                // 2) STALL — no further reads — until the test signals cancel.
+                //    body_seen is frozen at hang entry. Continued draining would
+                //    make body_seen < CL vacuous (the rest may already have left
+                //    the client into socket buffers).
+                // 3) After cancel, keep the live socket open and exit only on
+                //    peer EOF/reset so active_handlers==0 is client-caused.
                 //
-                // Note: do not shrink SO_RCVBUF to force a zero window here.
-                // A stuck mid-write with zero window can leave the client unable
-                // to complete TCP teardown on drop, so the server never sees
-                // EOF/reset — which fails the cancel-quiescence proof.
+                // Client-side unsent remainder is proved by a gated stream body
+                // in the mid-upload test (explicit remaining bytes under test
+                // control). No SO_RCVBUF zero-window: that blocks client
+                // teardown so the server never observes EOF/reset.
                 let partial = read_verified_partial_body(
                     &mut socket,
                     UPLOAD_HANG_MAX_BODY_OBSERVE,
@@ -430,12 +463,18 @@ mod tests {
                 probe
                     .upload_content_length
                     .store(partial.content_length as u64, Ordering::SeqCst);
-                // Only enter hang once we know the client still has unsent /
-                // unobserved body (body_bytes < Content-Length).
-                if partial.content_length > 0 && partial.body_bytes < partial.content_length {
+                if partial.content_length > 0
+                    && partial.body_bytes > 0
+                    && partial.body_bytes < partial.content_length
+                {
                     probe.hang_entered.fetch_add(1, Ordering::SeqCst);
                 }
-                drain_until_eof_counting_after_drop(&mut socket, &probe, drop_rx).await;
+                // Stall: barrier only marks cancel epoch. Must not close the
+                // socket here — observe peer terminal next.
+                if let Some(rx) = drop_rx {
+                    let _ = rx.await;
+                }
+                observe_peer_close_after_cancel(&mut socket, &probe).await;
             }
             ReplyMode::Hang(HangMode::Wait) => {
                 let _ = read_http_request(&mut socket).await;
@@ -492,8 +531,14 @@ mod tests {
 
     /// Max body bytes the Upload hang intentionally observes (must stay ≪ request CL).
     const UPLOAD_HANG_MAX_BODY_OBSERVE: usize = 512;
-    /// Request padding large enough that Content-Length ≫ intentional partial read.
-    const UPLOAD_HANG_BODY_PADDING: usize = 1024 * 1024;
+    /// Declared Content-Length / gated-body total for the mid-upload cancel proof.
+    /// First frame is small; the remainder is held under test control and never
+    /// yielded before cancel — so unsent client payload is explicit, not inferred
+    /// from socket buffers.
+    const UPLOAD_HANG_BODY_TOTAL: usize = 256 * 1024;
+    /// First gated body frame size (must be ≥ server partial observe cap so the
+    /// hang can enter without needing further client frames).
+    const UPLOAD_HANG_BODY_FIRST_FRAME: usize = 1024;
 
     struct PartialBodyObservation {
         body_bytes: usize,
@@ -898,45 +943,75 @@ mod tests {
         assert_drop_cancels(HangMode::PartialBody).await;
     }
 
-    /// §11.2 gate (1): mid-upload drop on the real client stack.
-    #[tokio::test]
-    async fn drop_mid_upload_leaves_zero_per_request_work() {
-        assert_drop_cancels(HangMode::Upload).await;
+    /// Gated body: yields one frame, then Pending forever. Exact size_hint sets
+    /// Content-Length so the server can see a partial body while the client
+    /// still owns unsent stream bytes under test control (Sol r3 mid-upload).
+    struct GatedUploadBody {
+        first: Option<bytes::Bytes>,
+        total: u64,
+        yielded: Arc<AtomicU64>,
     }
 
-    async fn assert_drop_cancels(mode: HangMode) {
+    impl http_body::Body for GatedUploadBody {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            if let Some(chunk) = self.first.take() {
+                self.yielded
+                    .fetch_add(chunk.len() as u64, Ordering::SeqCst);
+                return Poll::Ready(Some(Ok(http_body::Frame::data(chunk))));
+            }
+            // Remainder never yields — cancel must happen with unsent payload.
+            Poll::Pending
+        }
+
+        fn is_end_stream(&self) -> bool {
+            false
+        }
+
+        fn size_hint(&self) -> http_body::SizeHint {
+            http_body::SizeHint::with_exact(self.total)
+        }
+    }
+
+    /// §11.2 gate (1): mid-upload drop on the real client stack.
+    ///
+    /// Protocol (Sol r3):
+    /// 1. Client streams a gated body (first frame only; remainder held).
+    /// 2. Server reads a verified partial body, freezes body_seen, STALLS
+    ///    (no further drain) until the test cancel barrier.
+    /// 3. Cancel while client_yielded < total (explicit unsent remainder).
+    /// 4. Server observes peer EOF/reset → active_handlers == 0.
+    #[tokio::test]
+    async fn drop_mid_upload_leaves_zero_per_request_work() {
         let probe = Arc::new(ServerProbe::default());
         let (listener, endpoint) = bind_loopback().await;
         let (drop_tx, drop_rx) = oneshot::channel();
         let server = spawn_http_server(
             listener,
             Arc::clone(&probe),
-            ReplyMode::Hang(mode),
+            ReplyMode::Hang(HangMode::Upload),
             Some(drop_rx),
         )
         .await;
 
-        // Generous timeout so the hang is client-drop, not request timeout.
         let client =
             GrammarHttpClient::with_config(endpoint, Duration::from_secs(30), 65_536).unwrap();
 
-        // Upload: large body so Content-Length ≫ intentional partial observation.
-        // Wait / PartialBody: modest padding is enough for a full request read.
-        let padding = match mode {
-            HangMode::Upload => UPLOAD_HANG_BODY_PADDING,
-            HangMode::Wait | HangMode::PartialBody => 256 * 1024,
-        };
-        let body = json!({
-            "model": "openai/gpt-oss-20b",
-            "stream": false,
-            "padding": "x".repeat(padding),
-            "messages": [{"role": "user", "content": "hello"}]
+        let yielded = Arc::new(AtomicU64::new(0));
+        let first = bytes::Bytes::from(vec![b'x'; UPLOAD_HANG_BODY_FIRST_FRAME]);
+        let body = reqwest::Body::wrap(GatedUploadBody {
+            first: Some(first),
+            total: UPLOAD_HANG_BODY_TOTAL as u64,
+            yielded: Arc::clone(&yielded),
         });
 
         // Box::pin so `drop(fut)` owns and tears down the request future.
-        // (`tokio::pin!` shadows with `Pin<&mut _>`; dropping that Pin alone
-        // would leave the owned future alive — not a real cancel.)
-        let mut fut = Box::pin(client.post_json("already-ready-token", &body));
+        let mut fut = Box::pin(client.post_transport_body("already-ready-token", body));
 
         drive_until(
             &mut fut,
@@ -950,34 +1025,42 @@ mod tests {
             "server must still own the in-flight request before drop"
         );
 
-        // Mid-upload: server must already have a verified partial body *before*
-        // drop — this is the active-upload condition, not post-EOF teardown.
-        if matches!(mode, HangMode::Upload) {
-            let body_seen = probe.upload_body_bytes();
-            let content_length = probe.upload_content_length();
-            assert!(
-                content_length > 0,
-                "Upload hang must parse Content-Length from request headers"
-            );
-            assert!(
-                body_seen < content_length,
-                "server must observe a partial body before drop \
-                 (body_bytes={body_seen} < Content-Length={content_length})"
-            );
-        }
+        // Cancel-epoch mid-upload invariants (before drop):
+        // - server froze a non-empty partial body observation
+        // - client still owns unsent stream bytes (yielded < total)
+        let body_seen = probe.upload_body_bytes();
+        let content_length = probe.upload_content_length();
+        let client_yielded = yielded.load(Ordering::SeqCst);
+        assert!(
+            content_length > 0,
+            "Upload hang must parse Content-Length from request headers"
+        );
+        assert_eq!(
+            content_length as usize, UPLOAD_HANG_BODY_TOTAL,
+            "gated body must declare the full Content-Length"
+        );
+        assert!(
+            body_seen > 0 && body_seen < content_length,
+            "server must observe a non-empty partial body before drop \
+             (body_bytes={body_seen}, Content-Length={content_length})"
+        );
+        assert!(
+            client_yielded > 0 && (client_yielded as usize) < UPLOAD_HANG_BODY_TOTAL,
+            "client must still own unsent stream bytes at cancel epoch \
+             (yielded={client_yielded}, total={UPLOAD_HANG_BODY_TOTAL})"
+        );
+        let client_remaining = (UPLOAD_HANG_BODY_TOTAL as u64).saturating_sub(client_yielded);
+        assert!(
+            client_remaining > 0,
+            "explicit unsent remainder required for mid-upload cancel proof"
+        );
 
         // Cancel the request future — the production gate's drop path.
         drop(fut);
-        // Barrier only marks residual-byte accounting; hang handlers must keep
-        // the socket open and exit only after observing peer EOF/reset.
+        // Barrier marks cancel epoch only. Upload stalled without draining;
+        // now observe peer EOF/reset (client-caused quiescence).
         let _ = drop_tx.send(());
 
-        // §11.2 / PRODUCTION_CANCEL_RESIDUAL_REQUEST_WORK_MAX = 0:
-        // after the request future is dropped, the server-side handler for that
-        // connection must reach terminal *because the client closed*, not because
-        // the server independently returned and dropped its own socket.
-        // Kernel buffers may still deliver a few pre-drop bytes; residual
-        // *handler* work (active > 0) is the gate.
         timeout(Duration::from_secs(3), async {
             wait_until(
                 || probe.active() == 0 && probe.client_eof_observed() > 0,
@@ -998,19 +1081,101 @@ mod tests {
             "server must observe peer EOF/reset after cancel without closing first"
         );
 
-        // Mid-upload: intentional partial observation (hang entry) must have been
-        // strictly below Content-Length — that is the active-upload condition.
-        // (Post-drop drain may still consume kernel-buffered remainder; that is
-        // not residual *handler* work and is not required to be zero.)
-        if matches!(mode, HangMode::Upload) {
-            let body_seen = probe.upload_body_bytes();
-            let content_length = probe.upload_content_length();
-            assert!(
-                body_seen < content_length,
-                "mid-upload hang entry must remain a partial body observation \
-                 (body_bytes={body_seen} < Content-Length={content_length})"
-            );
-        }
+        // Hang-entry observation stays frozen (no drain-to-CL during the stall).
+        let body_seen_after = probe.upload_body_bytes();
+        assert_eq!(
+            body_seen_after, body_seen,
+            "upload hang must not update body_seen after hang entry (no drain during stall)"
+        );
+        assert!(
+            body_seen_after < content_length,
+            "mid-upload hang entry must remain a partial body observation \
+             (body_bytes={body_seen_after} < Content-Length={content_length})"
+        );
+        // Gated body never yields the remainder — cancel was mid-upload.
+        assert!(
+            (yielded.load(Ordering::SeqCst) as usize) < UPLOAD_HANG_BODY_TOTAL,
+            "client must not have finished the gated body after cancel"
+        );
+
+        server.abort();
+    }
+
+    async fn assert_drop_cancels(mode: HangMode) {
+        // Wait / PartialBody only — Upload has a dedicated gated-body proof.
+        assert!(
+            matches!(mode, HangMode::Wait | HangMode::PartialBody),
+            "assert_drop_cancels is for mid-wait / mid-response only"
+        );
+
+        let probe = Arc::new(ServerProbe::default());
+        let (listener, endpoint) = bind_loopback().await;
+        let (drop_tx, drop_rx) = oneshot::channel();
+        let server = spawn_http_server(
+            listener,
+            Arc::clone(&probe),
+            ReplyMode::Hang(mode),
+            Some(drop_rx),
+        )
+        .await;
+
+        // Generous timeout so the hang is client-drop, not request timeout.
+        let client =
+            GrammarHttpClient::with_config(endpoint, Duration::from_secs(30), 65_536).unwrap();
+
+        let body = json!({
+            "model": "openai/gpt-oss-20b",
+            "stream": false,
+            "padding": "x".repeat(256 * 1024),
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        // Box::pin so `drop(fut)` owns and tears down the request future.
+        // (`tokio::pin!` shadows with `Pin<&mut _>`; dropping that Pin alone
+        // would leave the owned future alive — not a real cancel.)
+        let mut fut = Box::pin(client.post_json("already-ready-token", &body));
+
+        drive_until(
+            &mut fut,
+            || probe.hang_entered.load(Ordering::SeqCst) > 0,
+            Duration::from_secs(3),
+        )
+        .await;
+
+        assert!(
+            probe.active() >= 1,
+            "server must still own the in-flight request before drop"
+        );
+
+        // Cancel the request future — the production gate's drop path.
+        drop(fut);
+        // Barrier marks residual-byte accounting; hang handlers keep the socket
+        // open and exit only after observing peer EOF/reset.
+        let _ = drop_tx.send(());
+
+        // §11.2 / PRODUCTION_CANCEL_RESIDUAL_REQUEST_WORK_MAX = 0:
+        // after the request future is dropped, the server-side handler for that
+        // connection must reach terminal *because the client closed*, not because
+        // the server independently returned and dropped its own socket.
+        timeout(Duration::from_secs(3), async {
+            wait_until(
+                || probe.active() == 0 && probe.client_eof_observed() > 0,
+                Duration::from_secs(3),
+            )
+            .await;
+        })
+        .await
+        .expect("server handler must observe client EOF/reset and exit after drop");
+
+        assert_eq!(
+            probe.active(),
+            0,
+            "residual per-request handler work must be zero"
+        );
+        assert!(
+            probe.client_eof_observed() > 0,
+            "server must observe peer EOF/reset after cancel without closing first"
+        );
 
         server.abort();
     }
