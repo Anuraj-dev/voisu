@@ -1271,10 +1271,10 @@ fn apply_vocative_commas(
     // hey␠ → Hey,
     let protected = build_edit_protection(&t, dictionary, protected_names);
     if let Some(rest) = strip_prefix_ci(&t, "hey") {
-        if rest.starts_with(|c: char| c.is_whitespace()) {
-            if !span_touches_protection(0, "hey".len(), &protected) {
-                t = format!("Hey,{}", rest);
-            }
+        if rest.starts_with(|c: char| c.is_whitespace())
+            && !span_touches_protection(0, "hey".len(), &protected)
+        {
+            t = format!("Hey,{}", rest);
         }
     }
     // trailing ok / lol → , ok / , lol (before optional punct)
