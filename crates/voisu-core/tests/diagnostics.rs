@@ -2,12 +2,17 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use voisu_core::{
-    correlation_id, export_record, replay_capture, unix_millis_now, AudioChunk, BoundaryFuture,
-    CapturedAudio, DebugAudioRecord, DiagnosticRecord, DiagnosticStore, LifecycleStage,
-    DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS, Provider,
-    ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream, ProviderStreams,
-    RetentionPolicy, SourceTranscript, Transcript, TranscriptDecision, TranscriptSelection,
-    TranscriptValidator, REDACTED,
+    clamp_utf8_bytes, correlation_id, export_record, is_text_sha256_fingerprint, replay_capture,
+    text_sha256_fingerprint, unix_millis_now, AudioChunk, BoundaryFuture, CapturedAudio,
+    DebugAudioRecord, DiagnosticRecord, DiagnosticStore, EnglishEligibilityOutcome, LifecycleStage,
+    Provider, ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream,
+    ProviderStreams, RetentionPolicy, SmartWritingDiagnostic, SmartWritingEditEvidence,
+    SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode, SourceTranscript, Transcript,
+    TranscriptDecision, TranscriptSelection, TranscriptValidator, DEFAULT_MAX_AGE,
+    DEFAULT_MAX_RECORDS, MAX_MODEL_ID_UTF8_BYTES, MAX_SMART_WRITING_DIAGNOSTIC_EDITS,
+    MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES, MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES,
+    MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES, REDACTED, SMART_WRITING_DIAGNOSTIC_VERSION,
+    TEXT_SHA256_FINGERPRINT_LEN,
 };
 
 fn record_at(id: u64, recorded_at_unix_ms: u64) -> DiagnosticRecord {
@@ -898,5 +903,730 @@ fn sanitize_url_validates_ipv6_structure_not_just_characters() {
     assert_eq!(
         voisu_core::sanitize_url("https://[2001:db8::1]/v1?k=leak"),
         "https://[2001:db8::1]/v1"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SW8 / #121 — Smart Writing diagnostic schema (§10)
+// ---------------------------------------------------------------------------
+
+fn smart_writing_for_outcome(outcome: SmartWritingOutcome) -> SmartWritingDiagnostic {
+    let (mode, eligibility) = match outcome {
+        SmartWritingOutcome::Literal
+        | SmartWritingOutcome::LiteralCommands
+        | SmartWritingOutcome::LiteralFallback => {
+            (SmartWritingMode::Literal, EnglishEligibilityOutcome::Eligible)
+        }
+        SmartWritingOutcome::FormattingOnly
+        | SmartWritingOutcome::FormattingAndGrammar
+        | SmartWritingOutcome::IdentityFallback => {
+            (SmartWritingMode::Smart, EnglishEligibilityOutcome::Eligible)
+        }
+    };
+    SmartWritingDiagnostic::new(
+        mode,
+        eligibility,
+        "formatter-contract-v1",
+        "validated before text",
+        "rendered after text",
+        outcome,
+    )
+}
+
+#[test]
+fn smart_writing_outcome_enum_serializes_exactly_the_section_10_set() {
+    // Spec §10 closed outcome set — wire names are snake_case and exact.
+    let cases = [
+        (SmartWritingOutcome::Literal, "literal"),
+        (SmartWritingOutcome::LiteralCommands, "literal_commands"),
+        (SmartWritingOutcome::LiteralFallback, "literal_fallback"),
+        (SmartWritingOutcome::FormattingOnly, "formatting_only"),
+        (
+            SmartWritingOutcome::FormattingAndGrammar,
+            "formatting_and_grammar",
+        ),
+        (SmartWritingOutcome::IdentityFallback, "identity_fallback"),
+    ];
+    for (outcome, wire) in cases {
+        let encoded = serde_json::to_string(&outcome).unwrap();
+        assert_eq!(encoded, format!("\"{wire}\""));
+        let decoded: SmartWritingOutcome = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, outcome);
+    }
+}
+
+#[test]
+fn smart_writing_every_outcome_and_major_reason_path_round_trips_on_a_record() {
+    // Hermetic path coverage: every outcome plus representative reason codes
+    // for mode / eligibility / capability / oversize / HTTP / schema / safety /
+    // formatter / cleanup — stored on a DiagnosticRecord and round-tripped.
+    let outcomes = [
+        SmartWritingOutcome::Literal,
+        SmartWritingOutcome::LiteralCommands,
+        SmartWritingOutcome::LiteralFallback,
+        SmartWritingOutcome::FormattingOnly,
+        SmartWritingOutcome::FormattingAndGrammar,
+        SmartWritingOutcome::IdentityFallback,
+    ];
+    let reasons = [
+        SmartWritingReasonCode::ModeLiteral,
+        SmartWritingReasonCode::ModeSmart,
+        SmartWritingReasonCode::EnglishIneligible,
+        SmartWritingReasonCode::CapabilityUnavailable,
+        SmartWritingReasonCode::InputOversize,
+        SmartWritingReasonCode::ResponseOversize,
+        SmartWritingReasonCode::HttpTimeout,
+        SmartWritingReasonCode::HttpStatus,
+        SmartWritingReasonCode::HttpTransport,
+        SmartWritingReasonCode::Malformed,
+        SmartWritingReasonCode::Schema,
+        SmartWritingReasonCode::Stale,
+        SmartWritingReasonCode::ProtectedSpan,
+        SmartWritingReasonCode::RuleContext,
+        SmartWritingReasonCode::Unmappable,
+        SmartWritingReasonCode::Overlap,
+        SmartWritingReasonCode::FormatterPanic,
+        SmartWritingReasonCode::FormatterDeadline,
+        SmartWritingReasonCode::SafetyPanic,
+        SmartWritingReasonCode::SafetyDeadline,
+        SmartWritingReasonCode::ComposePanic,
+        SmartWritingReasonCode::ComposeDeadline,
+        SmartWritingReasonCode::CleanupOverrun,
+        SmartWritingReasonCode::EditAccepted,
+        SmartWritingReasonCode::UnknownRule,
+    ];
+
+    let dir = TempDir::new().unwrap();
+    let store = DiagnosticStore::open(dir.path().to_owned(), RetentionPolicy::default()).unwrap();
+
+    for (index, outcome) in outcomes.iter().enumerate() {
+        let mut smart = smart_writing_for_outcome(*outcome);
+        smart.reason_codes = vec![reasons[index % reasons.len()]];
+        smart.request_began = matches!(
+            outcome,
+            SmartWritingOutcome::FormattingAndGrammar | SmartWritingOutcome::FormattingOnly
+        );
+        if smart.request_began {
+            smart.set_model_id("openai/gpt-oss-20b");
+            smart.http_latency_ms = Some(42);
+        }
+        smart.formatter_latency_ms = Some(5);
+        smart.safety_latency_ms = Some(3);
+        smart.total_gate_latency_ms = Some(50);
+        smart.credential_prep_latency_ms = Some(12);
+        smart.reap_watchdog_crossed = *outcome == SmartWritingOutcome::IdentityFallback
+            && smart.reason_codes.contains(&SmartWritingReasonCode::CleanupOverrun);
+
+        let mut record = DiagnosticRecord::new(format!("sw-outcome-{index}"), index as u64 + 1);
+        record.smart_writing = Some(smart.clone());
+        store.record(record).unwrap();
+
+        let loaded = store
+            .find(&format!("sw-outcome-{index}"))
+            .unwrap()
+            .expect("record retained");
+        let loaded_sw = loaded.smart_writing.expect("smart writing present");
+        assert_eq!(loaded_sw.outcome, *outcome);
+        assert_eq!(loaded_sw.version, SMART_WRITING_DIAGNOSTIC_VERSION);
+        assert_eq!(loaded_sw.reason_codes, smart.reason_codes);
+        assert_eq!(loaded_sw.model_id, smart.model_id);
+        assert_eq!(loaded_sw.request_began, smart.request_began);
+    }
+
+    // Every reason code serializes as snake_case and deserializes back.
+    for reason in reasons {
+        let wire = serde_json::to_string(&reason).unwrap();
+        assert!(
+            wire.starts_with('"') && !wire.contains(char::is_uppercase),
+            "reason codes are snake_case wire values: {wire}"
+        );
+        let decoded: SmartWritingReasonCode = serde_json::from_str(&wire).unwrap();
+        assert_eq!(decoded, reason);
+    }
+}
+
+#[test]
+fn smart_writing_text_and_model_clamps_preserve_full_fingerprints() {
+    let long_text = "α".repeat(MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES / 2 + 200);
+    assert!(
+        long_text.len() > MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES,
+        "fixture must exceed the diagnostic text clamp"
+    );
+    let smart = SmartWritingDiagnostic::new(
+        SmartWritingMode::Smart,
+        EnglishEligibilityOutcome::Eligible,
+        "contract",
+        &long_text,
+        &long_text,
+        SmartWritingOutcome::FormattingOnly,
+    );
+    assert!(smart.validated_before.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert!(smart.rendered_after.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert!(smart.validated_before.is_char_boundary(smart.validated_before.len()));
+    // Fingerprints cover the unclamped source so equality remains inspectable.
+    assert_eq!(
+        smart.validated_before_sha256,
+        text_sha256_fingerprint(&long_text)
+    );
+    assert_eq!(
+        smart.rendered_after_sha256,
+        text_sha256_fingerprint(&long_text)
+    );
+    assert_ne!(
+        smart.validated_before_sha256,
+        text_sha256_fingerprint(&smart.validated_before),
+        "fingerprint must be of the full source, not the clamped tail-drop"
+    );
+
+    let mut smart = smart;
+    let long_model = "m".repeat(MAX_MODEL_ID_UTF8_BYTES + 40);
+    smart.set_model_id(long_model);
+    assert_eq!(
+        smart.model_id.as_ref().map(String::len),
+        Some(MAX_MODEL_ID_UTF8_BYTES)
+    );
+
+    let long_error = "e".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES + 50);
+    smart.set_free_form_error(long_error);
+    assert_eq!(
+        smart.free_form_error.as_ref().map(String::len),
+        Some(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES)
+    );
+}
+
+#[test]
+fn smart_writing_edit_evidence_is_bounded_to_32_entries_and_field_limits() {
+    let long_field = "x".repeat(MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES + 80);
+    let long_id = "i".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES + 20);
+    let edit = SmartWritingEditEvidence::new(
+        long_id.clone(),
+        long_id,
+        0,
+        5,
+        &long_field,
+        &long_field,
+        SmartWritingReasonCode::EditAccepted,
+    );
+    assert!(edit.edit_id.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+    assert!(edit.rule_id.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+    assert!(edit.before.len() <= MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES);
+    assert!(edit.after.len() <= MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES);
+
+    let mut smart = smart_writing_for_outcome(SmartWritingOutcome::FormattingAndGrammar);
+    let many: Vec<_> = (0..(MAX_SMART_WRITING_DIAGNOSTIC_EDITS + 10))
+        .map(|i| {
+            SmartWritingEditEvidence::new(
+                format!("e{i}"),
+                "G_DIDNT_APOSTROPHE",
+                i as u64,
+                i as u64 + 1,
+                "didnt",
+                "didn't",
+                if i % 2 == 0 {
+                    SmartWritingReasonCode::EditAccepted
+                } else {
+                    SmartWritingReasonCode::ProtectedSpan
+                },
+            )
+        })
+        .collect();
+    smart.set_edits(many);
+    assert_eq!(smart.edits.len(), MAX_SMART_WRITING_DIAGNOSTIC_EDITS);
+    assert_eq!(smart.edits[0].edit_id, "e0");
+    assert_eq!(
+        smart.edits.last().unwrap().edit_id,
+        format!("e{}", MAX_SMART_WRITING_DIAGNOSTIC_EDITS - 1)
+    );
+}
+
+#[test]
+fn smart_writing_export_scrubs_secrets_from_all_free_form_fields() {
+    let secret = "sk-sw8-hostile-secret";
+    let mut smart = SmartWritingDiagnostic::new(
+        SmartWritingMode::Smart,
+        EnglishEligibilityOutcome::Eligible,
+        format!("contract-with-{secret}"),
+        format!("validated contains {secret}"),
+        format!("rendered contains {secret}"),
+        SmartWritingOutcome::FormattingAndGrammar,
+    );
+    smart.set_model_id(format!("model-{secret}"));
+    smart.set_free_form_error(format!("transport failed for {secret}"));
+    smart.set_edits(vec![SmartWritingEditEvidence::new(
+        format!("id-{secret}"),
+        format!("rule-{secret}"),
+        0,
+        4,
+        format!("bef-{secret}"),
+        format!("aft-{secret}"),
+        SmartWritingReasonCode::EditAccepted,
+    )]);
+
+    let mut record = record_at(1, unix_millis_now());
+    record.smart_writing = Some(smart);
+    let export = export_record(
+        record,
+        vec![("VOISU_GROQ_API_KEY".to_owned(), secret.to_owned())],
+    );
+    let encoded = serde_json::to_string(&export).unwrap();
+    assert!(
+        !encoded.contains(secret),
+        "no Smart Writing free-form field may leak a known secret: {encoded}"
+    );
+    assert!(encoded.contains(REDACTED));
+
+    let sw = export.record.smart_writing.as_ref().unwrap();
+    // Fingerprints are digests, not secret material, and must survive export.
+    assert!(sw.validated_before_sha256.starts_with("sha256:"));
+    assert_eq!(sw.validated_before_sha256.len(), "sha256:".len() + 64);
+}
+
+#[test]
+fn smart_writing_export_structurally_scrubs_url_secrets_in_free_form_error() {
+    let mut smart = smart_writing_for_outcome(SmartWritingOutcome::FormattingOnly);
+    smart.set_free_form_error(
+        "grammar failed at https://user:pw@api.example/v1?token=xyz please retry",
+    );
+    let mut record = record_at(2, unix_millis_now());
+    record.smart_writing = Some(smart);
+    let export = export_record(record, Vec::<(String, String)>::new());
+    let encoded = serde_json::to_string(&export).unwrap();
+    assert!(!encoded.contains("user:pw"), "userinfo must be stripped: {encoded}");
+    assert!(!encoded.contains("token=xyz"), "query secrets must be stripped: {encoded}");
+}
+
+#[test]
+fn pre_smart_writing_history_records_deserialize_without_smart_writing() {
+    // Backward compatibility: a history line written before SW8 has no
+    // smart_writing field and must load as None. JSONL is one record per line.
+    // Timestamp must be recent so the default 7-day age bound does not prune it.
+    let now = unix_millis_now();
+    let pre_sw = format!(
+        concat!(
+            r#"{{"correlation_id":"pre-sw-1","recording_id":7,"recorded_at_unix_ms":{now},"#,
+            r#""stages":[],"streamed_chunk_count":0,"source_transcripts":[],"#,
+            r#""reconciliation_requested":false,"recovery_attempted":false,"#,
+            r#""delivery_count":1,"provider_timings_ms":[]}}"#
+        ),
+        now = now
+    );
+    let record: DiagnosticRecord = serde_json::from_str(&pre_sw).unwrap();
+    assert!(
+        record.smart_writing.is_none(),
+        "pre-SW records default smart_writing to None"
+    );
+    assert_eq!(record.correlation_id, "pre-sw-1");
+    assert_eq!(record.recording_id, 7);
+
+    // A store that already holds a pre-SW line still accepts and returns SW records.
+    let dir = TempDir::new().unwrap();
+    let store = DiagnosticStore::open(dir.path().to_owned(), RetentionPolicy::default()).unwrap();
+    let history_path = dir.path().join("history.jsonl");
+    std::fs::write(&history_path, format!("{pre_sw}\n")).unwrap();
+    let history = store.history().unwrap();
+    assert_eq!(history.len(), 1);
+    assert!(history[0].smart_writing.is_none());
+
+    let mut with_sw = DiagnosticRecord::new("post-sw".to_owned(), 8);
+    with_sw.recorded_at_unix_ms = now;
+    with_sw.smart_writing = Some(smart_writing_for_outcome(SmartWritingOutcome::Literal));
+    store.record(with_sw).unwrap();
+    let mixed = store.history().unwrap();
+    assert_eq!(mixed.len(), 2);
+    let post = mixed.iter().find(|r| r.correlation_id == "post-sw").unwrap();
+    assert!(post.smart_writing.is_some());
+    let pre = mixed.iter().find(|r| r.correlation_id == "pre-sw-1").unwrap();
+    assert!(pre.smart_writing.is_none());
+}
+
+#[test]
+fn smart_writing_diagnostic_omits_audio_and_never_requires_debug_capture() {
+    // Audio remains opt-in via debug_audio only; Smart Writing does not attach it.
+    let mut record = DiagnosticRecord::new("sw-no-audio".to_owned(), 1);
+    record.smart_writing = Some(smart_writing_for_outcome(SmartWritingOutcome::Literal));
+    assert!(record.debug_audio.is_none());
+    let encoded = serde_json::to_string(&record).unwrap();
+    assert!(!encoded.contains("debug_audio"));
+    assert!(encoded.contains("smart_writing"));
+    assert!(encoded.contains("\"literal\""));
+}
+
+#[test]
+fn smart_writing_persistence_normalizes_publicly_mutated_oversized_fields() {
+    // §10 budgets are construction-time clamps, but fields stay publicly
+    // mutable. DiagnosticStore::record must re-normalize so oversized text /
+    // model / error / edit fields and >32 edits cannot persist.
+    let full_source = "Ω".repeat(MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES / 2 + 300);
+    assert!(full_source.len() > MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    let source_fp = text_sha256_fingerprint(&full_source);
+
+    let mut smart = SmartWritingDiagnostic::new(
+        SmartWritingMode::Smart,
+        EnglishEligibilityOutcome::Eligible,
+        "contract",
+        "short-before",
+        "short-after",
+        SmartWritingOutcome::FormattingAndGrammar,
+    );
+    // Fingerprints of the unclamped source must survive normalize-on-record.
+    smart.validated_before_sha256 = source_fp.clone();
+    smart.rendered_after_sha256 = source_fp.clone();
+
+    // Bypass constructors/setters: write oversized values directly.
+    smart.validated_before = full_source.clone();
+    smart.rendered_after = full_source.clone();
+    smart.formatter_contract_id = "c".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES + 40);
+    smart.model_id = Some("m".repeat(MAX_MODEL_ID_UTF8_BYTES + 60));
+    smart.free_form_error = Some("e".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES + 70));
+    smart.edits = (0..(MAX_SMART_WRITING_DIAGNOSTIC_EDITS + 12))
+        .map(|i| SmartWritingEditEvidence {
+            edit_id: format!("e{i}-{}", "i".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES)),
+            rule_id: "r".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES + 30),
+            start_utf8: i as u64,
+            end_utf8: i as u64 + 1,
+            before: "b".repeat(MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES + 90),
+            after: "a".repeat(MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES + 90),
+            code: SmartWritingReasonCode::EditAccepted,
+        })
+        .collect();
+    assert!(smart.validated_before.len() > MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert!(smart.edits.len() > MAX_SMART_WRITING_DIAGNOSTIC_EDITS);
+
+    let dir = TempDir::new().unwrap();
+    let store = DiagnosticStore::open(dir.path().to_owned(), RetentionPolicy::default()).unwrap();
+    let mut record = DiagnosticRecord::new("sw-oversized-persist".to_owned(), 1);
+    record.smart_writing = Some(smart);
+    store.record(record).unwrap();
+
+    let loaded = store
+        .find("sw-oversized-persist")
+        .unwrap()
+        .expect("record retained");
+    let sw = loaded.smart_writing.expect("smart writing present");
+
+    assert!(sw.validated_before.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert!(sw.rendered_after.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert!(sw.formatter_contract_id.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+    assert!(
+        sw.model_id
+            .as_ref()
+            .is_some_and(|m| m.len() <= MAX_MODEL_ID_UTF8_BYTES)
+    );
+    assert!(
+        sw.free_form_error
+            .as_ref()
+            .is_some_and(|e| e.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES)
+    );
+    assert_eq!(sw.edits.len(), MAX_SMART_WRITING_DIAGNOSTIC_EDITS);
+    for edit in &sw.edits {
+        assert!(edit.edit_id.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+        assert!(edit.rule_id.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+        assert!(edit.before.len() <= MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES);
+        assert!(edit.after.len() <= MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES);
+    }
+    // Fingerprints stay of the unclamped source, not the clamped on-disk text.
+    assert_eq!(sw.validated_before_sha256, source_fp);
+    assert_eq!(sw.rendered_after_sha256, source_fp);
+    assert_ne!(
+        sw.validated_before_sha256,
+        text_sha256_fingerprint(&sw.validated_before)
+    );
+}
+
+#[test]
+fn smart_writing_export_reclamp_after_redaction_expansion_past_bound() {
+    // REDACTED is longer than a short secret. Scrubbing a field already at its
+    // §10 budget can expand past the bound unless export re-clamps afterward.
+    const SECRET: &str = "Z"; // 1 UTF-8 byte
+    assert!(REDACTED.len() > SECRET.len());
+
+    // free_form_error budget is 128: fill to max ending with the secret so a
+    // naive replace(SECRET, REDACTED) would exceed the budget by REDACTED.len()-1.
+    let prefix_len = MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES - SECRET.len();
+    let at_budget = format!("{}{}", "x".repeat(prefix_len), SECRET);
+    assert_eq!(at_budget.len(), MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+    let expanded = at_budget.replace(SECRET, REDACTED);
+    assert!(
+        expanded.len() > MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES,
+        "fixture must expand past the free-text budget without re-clamp"
+    );
+
+    let model_prefix = MAX_MODEL_ID_UTF8_BYTES - SECRET.len();
+    let model_at_budget = format!("{}{}", "m".repeat(model_prefix), SECRET);
+    assert_eq!(model_at_budget.len(), MAX_MODEL_ID_UTF8_BYTES);
+
+    let text_prefix = MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES - SECRET.len();
+    let text_at_budget = format!("{}{}", "t".repeat(text_prefix), SECRET);
+    assert_eq!(
+        text_at_budget.len(),
+        MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES
+    );
+    let text_fp = text_sha256_fingerprint(&text_at_budget);
+
+    let edit_prefix = MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES - SECRET.len();
+    let edit_at_budget = format!("{}{}", "b".repeat(edit_prefix), SECRET);
+
+    let mut smart = SmartWritingDiagnostic::new(
+        SmartWritingMode::Smart,
+        EnglishEligibilityOutcome::Eligible,
+        at_budget.clone(),
+        &text_at_budget,
+        &text_at_budget,
+        SmartWritingOutcome::FormattingAndGrammar,
+    );
+    // new() clamps texts and fingerprints the unclamped args; keep fingerprints
+    // of the at-budget source (already within the clamp so equal to stored text).
+    assert_eq!(smart.validated_before_sha256, text_fp);
+    smart.model_id = Some(model_at_budget);
+    smart.free_form_error = Some(at_budget.clone());
+    smart.edits = vec![SmartWritingEditEvidence {
+        edit_id: at_budget.clone(),
+        rule_id: at_budget,
+        start_utf8: 0,
+        end_utf8: 1,
+        before: edit_at_budget.clone(),
+        after: edit_at_budget,
+        code: SmartWritingReasonCode::EditAccepted,
+    }];
+
+    let mut record = record_at(1, unix_millis_now());
+    record.smart_writing = Some(smart);
+    let export = export_record(
+        record,
+        vec![("VOISU_GROQ_API_KEY".to_owned(), SECRET.to_owned())],
+    );
+    let encoded = serde_json::to_string(&export).unwrap();
+    assert!(
+        !encoded.contains(SECRET),
+        "secret must be scrubbed from export: {encoded}"
+    );
+
+    let sw = export.record.smart_writing.as_ref().unwrap();
+    assert!(sw.formatter_contract_id.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+    assert!(sw.validated_before.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert!(sw.rendered_after.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert!(
+        sw.model_id
+            .as_ref()
+            .is_some_and(|m| m.len() <= MAX_MODEL_ID_UTF8_BYTES)
+    );
+    assert!(
+        sw.free_form_error
+            .as_ref()
+            .is_some_and(|e| e.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES)
+    );
+    assert!(sw.edits[0].edit_id.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+    assert!(sw.edits[0].rule_id.len() <= MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+    assert!(sw.edits[0].before.len() <= MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES);
+    assert!(sw.edits[0].after.len() <= MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES);
+    // Scrub expanded (REDACTED is longer than SECRET) then re-clamped to exact
+    // budgets. At a max-full field the clamp cuts inside REDACTED, so only a
+    // leading prefix of the mask remains — still within budget, secret gone.
+    let free = sw.free_form_error.as_ref().expect("free_form_error present");
+    assert_eq!(free.len(), MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+    assert!(
+        free.contains('<'),
+        "re-clamp after scrub should retain a redaction prefix within budget: {free:?}"
+    );
+    // Fingerprints are digests, not secret material, and must survive export.
+    assert_eq!(sw.validated_before_sha256, text_fp);
+    assert_eq!(sw.rendered_after_sha256, text_fp);
+}
+
+#[test]
+fn smart_writing_export_normalizes_publicly_mutated_oversized_fields() {
+    // Export is a second boundary: even without scrub hits, oversized public
+    // mutation must not leave export payloads past §10 budgets.
+    let mut smart = smart_writing_for_outcome(SmartWritingOutcome::FormattingOnly);
+    smart.validated_before = "v".repeat(MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES + 500);
+    smart.rendered_after = "r".repeat(MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES + 500);
+    smart.model_id = Some("m".repeat(MAX_MODEL_ID_UTF8_BYTES + 20));
+    smart.free_form_error = Some("e".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES + 20));
+    smart.edits = (0..(MAX_SMART_WRITING_DIAGNOSTIC_EDITS + 5))
+        .map(|i| SmartWritingEditEvidence {
+            edit_id: format!("id-{i}"),
+            rule_id: "rule".to_owned(),
+            start_utf8: 0,
+            end_utf8: 1,
+            before: "b".repeat(MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES + 10),
+            after: "a".repeat(MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES + 10),
+            code: SmartWritingReasonCode::EditAccepted,
+        })
+        .collect();
+    let fingerprint = smart.validated_before_sha256.clone();
+
+    let mut record = record_at(3, unix_millis_now());
+    record.smart_writing = Some(smart);
+    let export = export_record(record, Vec::<(String, String)>::new());
+    let sw = export.record.smart_writing.as_ref().unwrap();
+    assert!(sw.validated_before.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert!(sw.rendered_after.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
+    assert_eq!(
+        sw.model_id.as_ref().map(String::len),
+        Some(MAX_MODEL_ID_UTF8_BYTES)
+    );
+    assert_eq!(
+        sw.free_form_error.as_ref().map(String::len),
+        Some(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES)
+    );
+    assert_eq!(sw.edits.len(), MAX_SMART_WRITING_DIAGNOSTIC_EDITS);
+    assert_eq!(sw.validated_before_sha256, fingerprint);
+}
+
+#[test]
+fn clamp_utf8_bytes_respects_scalar_boundaries() {
+    // Multi-byte scalar at the cut must not produce invalid UTF-8.
+    let text = "ab\u{1F600}cd"; // grinning face is 4 bytes
+    let clamped = clamp_utf8_bytes(text, 3);
+    assert_eq!(clamped, "ab");
+    assert!(std::str::from_utf8(clamped.as_bytes()).is_ok());
+}
+
+#[test]
+fn text_sha256_fingerprint_is_stable_and_prefixed() {
+    let fp = text_sha256_fingerprint("hello");
+    assert!(fp.starts_with("sha256:"));
+    assert_eq!(fp.len(), TEXT_SHA256_FINGERPRINT_LEN);
+    assert!(is_text_sha256_fingerprint(&fp));
+    assert_eq!(fp, text_sha256_fingerprint("hello"));
+    assert_ne!(fp, text_sha256_fingerprint("Hello"));
+    // Known SHA-256 of "hello".
+    assert_eq!(
+        fp,
+        "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    );
+    // Form validator rejects free-form, wrong case, wrong length, and uppercase hex.
+    assert!(!is_text_sha256_fingerprint("sk-not-a-fingerprint"));
+    assert!(!is_text_sha256_fingerprint(&format!("sha256:{}", "A".repeat(64))));
+    assert!(!is_text_sha256_fingerprint(&format!("sha256:{}", "a".repeat(63))));
+    assert!(!is_text_sha256_fingerprint(&format!("SHA256:{}", "a".repeat(64))));
+    assert!(!is_text_sha256_fingerprint(&format!("sha256:{}", "g".repeat(64))));
+}
+
+#[test]
+fn smart_writing_persistence_rejects_invalid_fingerprints() {
+    // Fingerprint fields are publicly mutable strings. Persist must reject any
+    // value that is not exact `sha256:` + 64 lowercase hex (including secrets
+    // and oversized free-form) and regenerate from the clamped text.
+    let secret = "sk-sw8-fingerprint-smuggle-secret";
+    let mut smart = SmartWritingDiagnostic::new(
+        SmartWritingMode::Smart,
+        EnglishEligibilityOutcome::Eligible,
+        "contract",
+        "validated-source-text",
+        "rendered-source-text",
+        SmartWritingOutcome::FormattingOnly,
+    );
+    let valid_before = smart.validated_before_sha256.clone();
+    let valid_after = smart.rendered_after_sha256.clone();
+    assert!(is_text_sha256_fingerprint(&valid_before));
+    assert!(is_text_sha256_fingerprint(&valid_after));
+
+    // Valid form survives normalize-on-record (unclamped digests stay intact).
+    smart.validated_before_sha256 = valid_before.clone();
+    smart.rendered_after_sha256 = valid_after.clone();
+
+    let dir = TempDir::new().unwrap();
+    let store = DiagnosticStore::open(dir.path().to_owned(), RetentionPolicy::default()).unwrap();
+    let mut record = DiagnosticRecord::new("sw-fp-valid".to_owned(), 1);
+    record.smart_writing = Some(smart.clone());
+    store.record(record).unwrap();
+    let loaded = store.find("sw-fp-valid").unwrap().unwrap();
+    let sw = loaded.smart_writing.as_ref().unwrap();
+    assert_eq!(sw.validated_before_sha256, valid_before);
+    assert_eq!(sw.rendered_after_sha256, valid_after);
+
+    // Secret-bearing free-form, wrong case, and oversized garbage are rejected.
+    smart.validated_before_sha256 = secret.to_owned();
+    smart.rendered_after_sha256 = format!("sha256:{}", "A".repeat(64)); // uppercase hex
+    let mut record = DiagnosticRecord::new("sw-fp-invalid".to_owned(), 2);
+    record.smart_writing = Some(smart.clone());
+    store.record(record).unwrap();
+    let loaded = store.find("sw-fp-invalid").unwrap().unwrap();
+    let sw = loaded.smart_writing.as_ref().unwrap();
+    assert_eq!(
+        sw.validated_before_sha256,
+        text_sha256_fingerprint(&sw.validated_before)
+    );
+    assert_eq!(
+        sw.rendered_after_sha256,
+        text_sha256_fingerprint(&sw.rendered_after)
+    );
+    assert!(is_text_sha256_fingerprint(&sw.validated_before_sha256));
+    assert!(is_text_sha256_fingerprint(&sw.rendered_after_sha256));
+    let on_disk = std::fs::read_to_string(dir.path().join("history.jsonl")).unwrap();
+    assert!(
+        !on_disk.contains(secret),
+        "secret must not persist in a fingerprint field: {on_disk}"
+    );
+
+    // Oversized free-form fingerprint cannot persist either.
+    smart.validated_before_sha256 = format!("not-a-fp-{}", "x".repeat(4_000));
+    smart.rendered_after_sha256 = format!("still-not-{}", "y".repeat(4_000));
+    let mut record = DiagnosticRecord::new("sw-fp-oversized".to_owned(), 3);
+    record.smart_writing = Some(smart);
+    store.record(record).unwrap();
+    let loaded = store.find("sw-fp-oversized").unwrap().unwrap();
+    let sw = loaded.smart_writing.as_ref().unwrap();
+    assert_eq!(sw.validated_before_sha256.len(), TEXT_SHA256_FINGERPRINT_LEN);
+    assert_eq!(sw.rendered_after_sha256.len(), TEXT_SHA256_FINGERPRINT_LEN);
+    assert!(is_text_sha256_fingerprint(&sw.validated_before_sha256));
+    assert!(is_text_sha256_fingerprint(&sw.rendered_after_sha256));
+}
+
+#[test]
+fn smart_writing_export_rejects_invalid_and_secret_bearing_fingerprints() {
+    // Export is a second boundary: invalid fingerprints are regenerated, so a
+    // secret smuggled into a fingerprint field cannot appear in the export.
+    let secret = "sk-export-fingerprint-smuggle";
+    let mut smart = SmartWritingDiagnostic::new(
+        SmartWritingMode::Smart,
+        EnglishEligibilityOutcome::Eligible,
+        "contract",
+        "before-text",
+        "after-text",
+        SmartWritingOutcome::FormattingOnly,
+    );
+    let valid_fp = smart.validated_before_sha256.clone();
+    smart.validated_before_sha256 = secret.to_owned();
+    smart.rendered_after_sha256 = format!("SHA256:{}", "a".repeat(64));
+
+    let mut record = record_at(9, unix_millis_now());
+    record.smart_writing = Some(smart);
+    let export = export_record(
+        record,
+        vec![("VOISU_GROQ_API_KEY".to_owned(), secret.to_owned())],
+    );
+    let encoded = serde_json::to_string(&export).unwrap();
+    assert!(
+        !encoded.contains(secret),
+        "export must not leak a secret via fingerprint fields: {encoded}"
+    );
+
+    let sw = export.record.smart_writing.as_ref().unwrap();
+    assert!(is_text_sha256_fingerprint(&sw.validated_before_sha256));
+    assert!(is_text_sha256_fingerprint(&sw.rendered_after_sha256));
+    assert_eq!(
+        sw.validated_before_sha256,
+        text_sha256_fingerprint(&sw.validated_before)
+    );
+    assert_eq!(
+        sw.rendered_after_sha256,
+        text_sha256_fingerprint(&sw.rendered_after)
+    );
+    // Regenerated from clamped text, not the original constructor fingerprint
+    // of the same short text — equal in this case because text was never oversized.
+    assert_eq!(sw.validated_before_sha256, valid_fp);
+}
+
+#[test]
+fn smart_writing_new_record_defaults_smart_writing_to_none() {
+    let record = DiagnosticRecord::new("fresh".to_owned(), 1);
+    assert!(record.smart_writing.is_none());
+    // Serializing a fresh record must not force a smart_writing key.
+    let encoded = serde_json::to_string(&record).unwrap();
+    assert!(
+        !encoded.contains("smart_writing"),
+        "absent smart_writing is skipped on serialize: {encoded}"
     );
 }
