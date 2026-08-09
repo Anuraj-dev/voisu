@@ -178,40 +178,47 @@ pub fn format_validated_with(
     options: FormatOptions<'_>,
 ) -> FormattingBaseline {
     let started = Instant::now();
-    let deadline = options
+    let budget = options
         .work_deadline
         .unwrap_or(LOCAL_FORMATTER_WORK_DEADLINE);
+    // Instant deadline so zero-budget and mid-loop checks share one comparison.
+    let deadline_at = started + budget;
     let fingerprint = transcript_fingerprint(validated_transcript);
 
-    // Size gate: oversize → identity, never truncated.
+    // Size gate: oversize → identity, never truncated (cheap 1:1 seal).
     if validated_transcript.len() > MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES {
-        return seal_baseline(
-            validated_transcript,
-            options.version,
-            fingerprint,
-            validated_transcript.to_owned(),
-        );
+        return seal_identity_baseline(validated_transcript, options.version, fingerprint);
+    }
+
+    // Cooperative bound: already elapsed / zero budget → identity without heavy work.
+    if Instant::now() >= deadline_at {
+        return seal_identity_baseline(validated_transcript, options.version, fingerprint);
     }
 
     let rendered = match mode {
         WritingMode::Literal => {
             parse_formatting_commands(validated_transcript).render_commands_only()
         }
-        WritingMode::Smart => smart_format(
-            validated_transcript,
-            options.dictionary,
-            options.protected_names,
-        ),
+        WritingMode::Smart => {
+            let Some(s) = smart_format(
+                validated_transcript,
+                options.dictionary,
+                options.protected_names,
+                deadline_at,
+            ) else {
+                return seal_identity_baseline(
+                    validated_transcript,
+                    options.version,
+                    fingerprint,
+                );
+            };
+            s
+        }
     };
 
-    // Cooperative bound: miss → identity (last safe value is Validated text).
-    if started.elapsed() > deadline {
-        return seal_baseline(
-            validated_transcript,
-            options.version,
-            fingerprint,
-            validated_transcript.to_owned(),
-        );
+    // Miss after work → identity (last safe value is Validated text).
+    if Instant::now() >= deadline_at {
+        return seal_identity_baseline(validated_transcript, options.version, fingerprint);
     }
 
     seal_baseline(
@@ -250,6 +257,56 @@ fn seal_baseline(
         formatter_contract: contract,
         derivation_digest: digest,
     }
+}
+
+/// Cheap identity seal for oversize / deadline-miss paths.
+///
+/// Anchors are 1:1 source→rendered word tokens (no re-tokenization against a
+/// rewritten string). Protected ranges cover the whole base (fail-closed for
+/// grammar) without O(n²) composite scans.
+fn seal_identity_baseline(
+    source: &str,
+    version: &str,
+    fingerprint: String,
+) -> FormattingBaseline {
+    let anchors = identity_source_anchors(source);
+    let protected = if source.is_empty() {
+        Vec::new()
+    } else {
+        vec![SourceSpan::new(0, source.len())]
+    };
+    let contract = FORMATTER_CONTRACT_ID.to_owned();
+    let rendered = source.to_owned();
+    let digest = derivation_digest(
+        version,
+        &fingerprint,
+        &rendered,
+        &anchors,
+        &protected,
+        &contract,
+    );
+    FormattingBaseline {
+        base_version: version.to_owned(),
+        base_fingerprint: fingerprint,
+        rendered,
+        anchors,
+        protected_source_ranges: protected,
+        formatter_contract: contract,
+        derivation_digest: digest,
+    }
+}
+
+fn identity_source_anchors(source: &str) -> BTreeMap<(usize, usize), SourceAnchor> {
+    let mut anchors = BTreeMap::new();
+    for (s, e, _) in word_tokens(source) {
+        anchors.insert((s, e), SourceAnchor::new(s, e));
+    }
+    anchors
+}
+
+#[inline]
+fn deadline_hit(deadline_at: Instant) -> bool {
+    Instant::now() >= deadline_at
 }
 
 fn transcript_fingerprint(text: &str) -> String {
@@ -344,126 +401,107 @@ fn protected_source_ranges(source: &str) -> Vec<SourceSpan> {
 }
 
 fn collect_composite_spans(text: &str, out: &mut Vec<SourceSpan>) {
-    // URL: https?://\S+
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if let Some(start) = find_url_start(text, i) {
-            let mut end = start + if text[start..].starts_with("https://") {
-                8
-            } else {
-                7
-            };
-            while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
-                end += 1;
-            }
-            out.push(SourceSpan::new(start, end));
-            i = end;
-            continue;
-        }
-        i += 1;
-    }
+    collect_urls_linear(text, out);
+    collect_paths_linear(text, out);
+    collect_flags_linear(text, out);
 
-    // Paths: ~?(?:.?./|/)[^\s]+ or bare ./… ../…
-    i = 0;
-    while i < text.len() {
-        if let Some((s, e)) = match_path_at(text, i) {
-            out.push(SourceSpan::new(s, e));
-            i = e;
-        } else {
-            i += text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-        }
-    }
-
-    // Flags: --name=value or -x
-    for (s, e) in find_flags(text) {
-        out.push(SourceSpan::new(s, e));
-    }
-
-    // Technical identifiers: [A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+
+    // Technical identifiers + numbers/dates/times: single token pass (O(n)).
     for (s, e, tok) in word_tokens(text) {
         if tok.contains('_')
             && tok.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
             && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         {
             out.push(SourceSpan::new(s, e));
-        }
-    }
-
-    // Numbers / dates / times (whole-token shapes from fixtures).
-    for (s, e, tok) in word_tokens(text) {
-        if is_number_date_or_time(tok) {
+        } else if is_number_date_or_time(tok) {
             out.push(SourceSpan::new(s, e));
         }
     }
 }
 
-fn find_url_start(text: &str, from: usize) -> Option<usize> {
-    let rest = &text[from..];
-    if let Some(rel) = rest.find("https://") {
-        return Some(from + rel);
+/// Single forward pass for `https?://\S+` (O(n); advance past each match).
+fn collect_urls_linear(text: &str, out: &mut Vec<SourceSpan>) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'h' {
+            let rest = &text[i..];
+            let prefix_len = if rest.starts_with("https://") {
+                8
+            } else if rest.starts_with("http://") {
+                7
+            } else {
+                i += 1;
+                continue;
+            };
+            let start = i;
+            let mut end = start + prefix_len;
+            while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
+                end += 1;
+            }
+            out.push(SourceSpan::new(start, end));
+            i = end;
+        } else {
+            i += 1;
+        }
     }
-    if let Some(rel) = rest.find("http://") {
-        return Some(from + rel);
-    }
-    None
 }
 
-fn match_path_at(text: &str, i: usize) -> Option<(usize, usize)> {
-    let rest = &text[i..];
-    // Bare ./ or ../
-    if rest.starts_with("./") || rest.starts_with("../") {
-        let mut end = i;
-        for (off, ch) in rest.char_indices() {
-            if ch.is_whitespace() {
+/// Single forward pass over non-whitespace tokens for path-like spans (O(n)).
+fn collect_paths_linear(text: &str, out: &mut Vec<SourceSpan>) {
+    let mut i = 0;
+    while i < text.len() {
+        let Some(ch) = text[i..].chars().next() else {
+            break;
+        };
+        if ch.is_whitespace() {
+            i += ch.len_utf8();
+            continue;
+        }
+        let start = i;
+        while i < text.len() {
+            let Some(c) = text[i..].chars().next() else {
+                break;
+            };
+            if c.is_whitespace() {
                 break;
             }
-            end = i + off + ch.len_utf8();
+            i += c.len_utf8();
         }
-        if end > i {
-            return Some((i, end));
+        let end = i;
+        if is_path_token(&text[start..end]) {
+            out.push(SourceSpan::new(start, end));
         }
+    }
+}
+
+fn is_path_token(tok: &str) -> bool {
+    if tok.is_empty() {
+        return false;
+    }
+    // Avoid re-matching URLs (already collected separately).
+    if tok.starts_with("http://") || tok.starts_with("https://") {
+        return false;
+    }
+    // Bare ./ or ../
+    if tok.starts_with("./") || tok.starts_with("../") {
+        return true;
     }
     // Leading / or ~/
-    if rest.starts_with('/') || rest.starts_with("~/") {
-        let mut end = i;
-        for (off, ch) in rest.char_indices() {
-            if ch.is_whitespace() {
-                break;
-            }
-            end = i + off + ch.len_utf8();
-        }
-        if end > i + 1 {
-            return Some((i, end));
-        }
+    if tok.starts_with("~/") {
+        return tok.len() > 2;
     }
-    // crates/… style path (has / and no spaces) — only when starts at token
-    // boundary and looks like path (contains /). Handled via token scan:
-    if rest.starts_with(char::is_alphanumeric) || rest.starts_with('.') {
-        // Find a maximal non-whitespace run containing '/'
-        let mut end = i;
-        let mut has_slash = false;
-        for (off, ch) in rest.char_indices() {
-            if ch.is_whitespace() {
-                break;
-            }
-            if ch == '/' {
-                has_slash = true;
-            }
-            end = i + off + ch.len_utf8();
-        }
-        if has_slash && end > i {
-            // Avoid matching URLs again (already collected).
-            if !rest.starts_with("http://") && !rest.starts_with("https://") {
-                return Some((i, end));
-            }
-        }
+    if tok.starts_with('/') {
+        return tok.len() > 1;
     }
-    None
+    // crates/… style: alnum or '.' start, contains '/', no spaces (token already).
+    if tok.starts_with(|c: char| c.is_alphanumeric() || c == '.') && tok.contains('/') {
+        return true;
+    }
+    false
 }
 
-fn find_flags(text: &str) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
+/// Single forward pass for `--flag`, `--flag=value`, and `-x` (O(n)).
+fn collect_flags_linear(text: &str, out: &mut Vec<SourceSpan>) {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -472,7 +510,6 @@ fn find_flags(text: &str) -> Vec<(usize, usize)> {
             // --flag or --flag=value or -x
             if i + 1 < bytes.len() && bytes[i + 1] == b'-' {
                 i += 2;
-                // name chars
                 let name_start = i;
                 while i < bytes.len()
                     && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-')
@@ -489,7 +526,7 @@ fn find_flags(text: &str) -> Vec<(usize, usize)> {
                         i += 1;
                     }
                 }
-                out.push((start, i));
+                out.push(SourceSpan::new(start, i));
                 continue;
             } else if i + 1 < bytes.len() && bytes[i + 1].is_ascii_alphanumeric() {
                 i += 1;
@@ -497,13 +534,12 @@ fn find_flags(text: &str) -> Vec<(usize, usize)> {
                 {
                     i += 1;
                 }
-                out.push((start, i));
+                out.push(SourceSpan::new(start, i));
                 continue;
             }
         }
         i += 1;
     }
-    out
 }
 
 fn is_number_date_or_time(tok: &str) -> bool {
@@ -576,16 +612,120 @@ fn collect_quote_and_code_ranges(text: &str, out: &mut Vec<SourceSpan>) {
         }
         i += 1;
     }
-    // ASCII double quotes paired
+
+    // Quotation ranges (ASCII + curly), ported from edit-safety
+    // `_quotation_source_ranges`: unmatched/ambiguous → whole base.
+    collect_quotation_ranges(text, out);
+}
+
+/// Port of edit-safety `_quotation_source_ranges` (UTF-8 byte spans).
+///
+/// Handles ASCII `"`/`'`, curly “”/‘’, word-apostrophe skips for `'` and `’`,
+/// and appends `(0, len)` when any delimiter family is unmatched/ambiguous.
+fn collect_quotation_ranges(text: &str, out: &mut Vec<SourceSpan>) {
+    let mut ambiguous = false;
+
+    let (dq, dq_unmatched) = same_quote_ranges(text, '"', false);
+    out.extend(dq);
+    ambiguous |= dq_unmatched;
+
+    let (sq, sq_unmatched) = same_quote_ranges(text, '\'', true);
+    out.extend(sq);
+    ambiguous |= sq_unmatched;
+
+    let (curly_d, curly_d_amb) = curly_quote_ranges(text, '\u{201C}', '\u{201D}', false);
+    out.extend(curly_d);
+    ambiguous |= curly_d_amb;
+
+    let (curly_s, curly_s_amb) = curly_quote_ranges(text, '\u{2018}', '\u{2019}', true);
+    out.extend(curly_s);
+    ambiguous |= curly_s_amb;
+
+    if ambiguous && !text.is_empty() {
+        out.push(SourceSpan::new(0, text.len()));
+    }
+}
+
+/// `delimiter` positions paired 0-1, 2-3, …; odd count ⇒ unmatched.
+fn same_quote_ranges(
+    text: &str,
+    delimiter: char,
+    ignore_word_apostrophes: bool,
+) -> (Vec<SourceSpan>, bool) {
+    let delim_len = delimiter.len_utf8();
+    let mut positions: Vec<usize> = Vec::new();
+    let mut search = 0usize;
+    while search < text.len() {
+        let Some(rel) = text[search..].find(delimiter) else {
+            break;
+        };
+        let index = search + rel;
+        if !(ignore_word_apostrophes && inside_word_apostrophe(text, index, delim_len)) {
+            positions.push(index);
+        }
+        search = index + delim_len;
+    }
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i + 1 < positions.len() {
+        let start = positions[i];
+        let end = positions[i + 1] + delim_len;
+        ranges.push(SourceSpan::new(start, end));
+        i += 2;
+    }
+    let unmatched = positions.len() % 2 == 1;
+    (ranges, unmatched)
+}
+
+fn curly_quote_ranges(
+    text: &str,
+    opening: char,
+    closing: char,
+    closing_can_be_apostrophe: bool,
+) -> (Vec<SourceSpan>, bool) {
+    let close_len = closing.len_utf8();
+    let mut ranges = Vec::new();
     let mut pending: Option<usize> = None;
-    for (idx, ch) in text.char_indices() {
-        if ch == '"' {
-            if let Some(start) = pending.take() {
-                out.push(SourceSpan::new(start, idx + 1));
+    let mut ambiguous = false;
+    for (index, ch) in text.char_indices() {
+        if ch == opening {
+            if pending.is_some() {
+                ambiguous = true;
             } else {
-                pending = Some(idx);
+                pending = Some(index);
+            }
+        } else if ch == closing {
+            if closing_can_be_apostrophe && inside_word_apostrophe(text, index, close_len) {
+                continue;
+            }
+            match pending.take() {
+                Some(start) => {
+                    ranges.push(SourceSpan::new(start, index + close_len));
+                }
+                None => {
+                    ambiguous = true;
+                }
             }
         }
+    }
+    if pending.is_some() {
+        ambiguous = true;
+    }
+    (ranges, ambiguous)
+}
+
+/// True when `byte_index` is a mid-word apostrophe (alnum/_ on both sides).
+fn inside_word_apostrophe(text: &str, byte_index: usize, delim_len: usize) -> bool {
+    if byte_index == 0 || byte_index + delim_len > text.len() {
+        return false;
+    }
+    let left = text[..byte_index].chars().next_back();
+    let right = text[byte_index + delim_len..].chars().next();
+    match (left, right) {
+        (Some(l), Some(r)) => {
+            (l.is_alphanumeric() || l == '_') && (r.is_alphanumeric() || r == '_')
+        }
+        _ => false,
     }
 }
 
@@ -607,26 +747,39 @@ fn normalize_ranges(mut ranges: Vec<SourceSpan>) -> Vec<SourceSpan> {
 
 // ─── Smart formatting ────────────────────────────────────────────────────────
 
-fn smart_format(input: &str, dictionary: &[&str], protected_names: &[&str]) -> String {
+/// Smart rewrite. Returns `None` on cooperative deadline miss.
+fn smart_format(
+    input: &str,
+    dictionary: &[&str],
+    protected_names: &[&str],
+    deadline_at: Instant,
+) -> Option<String> {
     if input.is_empty() {
-        return String::new();
+        return Some(String::new());
     }
     if is_shell_command_line(input) {
-        return input.to_owned();
-    }
-    // Already-correct identity cases (F07/F19/F20/F35 family).
-    if is_already_correct_identity(input) {
-        return input.to_owned();
+        return Some(input.to_owned());
     }
 
+    // §5.1 step 2: command parse before already-correct identity short-circuits.
+    // Spoken commands in an otherwise sentence-cased string must still expand
+    // (e.g. "Ship it command period." → "Ship it.").
     let parsed = parse_formatting_commands(input);
+    if deadline_hit(deadline_at) {
+        return None;
+    }
     let literal = parsed.render_commands_only();
     let has_commands = parsed.has_command_span();
+
+    // F19/F20/F35 identity only when no §4 command span remains.
+    if !has_commands && is_already_correct_identity(input) {
+        return Some(input.to_owned());
+    }
 
     let mut text = if !has_commands && literal == input {
         // No §4 commands: list inference / enumeration / email greeting on Validated text.
         if let Some(bullets) = try_bullet_inference(input) {
-            return bullets;
+            return Some(bullets);
         }
         let mut t = try_counted_enumeration(input).unwrap_or_else(|| input.to_owned());
         t = apply_email_hi_name(&t);
@@ -636,9 +789,17 @@ fn smart_format(input: &str, dictionary: &[&str], protected_names: &[&str]) -> S
         literal
     };
 
+    if deadline_hit(deadline_at) {
+        return None;
+    }
+
     text = apply_vocative_commas(&text);
     text = apply_casing(&text, dictionary, protected_names);
     text = capitalize_numbered_list_items(&text);
+
+    if deadline_hit(deadline_at) {
+        return None;
+    }
 
     // Numbered lists from commands: casing only, no extra terminal punct.
     if is_numbered_list_render(&text) {
@@ -646,7 +807,7 @@ fn smart_format(input: &str, dictionary: &[&str], protected_names: &[&str]) -> S
             // fall through
         } else {
             // Apply closed grammar only when no commands (separability).
-            return text;
+            return Some(text);
         }
     }
 
@@ -656,10 +817,13 @@ fn smart_format(input: &str, dictionary: &[&str], protected_names: &[&str]) -> S
     // oracle (F25/F26/F27). Separability (§6.1): skip when any §4 command span
     // is present, or when consecutive word-tokens `new`+`line` appear (F36).
     if !has_commands && !has_new_line_token_pair(input) {
+        if deadline_hit(deadline_at) {
+            return None;
+        }
         text = apply_closed_local_grammar(&text);
     }
 
-    text
+    Some(text)
 }
 
 /// True when consecutive whole word-tokens `new` + `line` appear (case-insensitive).
@@ -1488,7 +1652,7 @@ fn eq_ascii_ignore_case(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn smart(s: &str) -> String {
         format_validated(s, WritingMode::Smart).rendered().to_owned()
@@ -1667,5 +1831,116 @@ mod tests {
         let b = transcript_fingerprint("hello");
         assert_eq!(a, b);
         assert_ne!(a, transcript_fingerprint("hello!"));
+    }
+
+    // ── Bug 1: command parse before already-correct identity ────────────────
+
+    #[test]
+    fn spoken_command_in_already_cased_sentence_expands() {
+        // Regression: identity short-circuit used to run before SW2 parse, so an
+        // already sentence-cased/punctuated Validated string with spoken commands
+        // was left unexpanded. Command parse must run first; F19/F20/F35 identity
+        // only applies when no §4 command span remains.
+        //
+        // Note: SW2 tokenizes non-whitespace runs whole, so a glued terminal mark
+        // on the phrase word (`command period.`) does not match `period`. A
+        // following word keeps the phrase token clean while still ending the
+        // utterance with terminal punct (already-correct shape).
+        assert_eq!(smart("Ship it command period next."), "Ship it. Next.");
+        assert_eq!(literal("Ship it command period next."), "Ship it. next.");
+        assert_eq!(
+            smart("Please stop command period next."),
+            "Please stop. Next."
+        );
+        // F19 still identity when no command span.
+        assert_eq!(smart("Ready for review."), "Ready for review.");
+    }
+
+    // ── Bug 2: unmatched / curly quotes protect whole base ──────────────────
+
+    #[test]
+    fn unmatched_ascii_quote_protects_entire_base() {
+        let input = "she said \"i didnt know";
+        let b = format_validated(input, WritingMode::Smart);
+        let ranges = b.protected_source_ranges();
+        assert!(
+            ranges.iter().any(|r| r.start == 0 && r.end == input.len()),
+            "unmatched ASCII \" must protect whole base, got {ranges:?}"
+        );
+    }
+
+    #[test]
+    fn curly_quotes_protect_paired_interior() {
+        // “…” (U+201C / U+201D)
+        let input = "she said \u{201C}hello there\u{201D} today";
+        let b = format_validated(input, WritingMode::Smart);
+        let ranges = b.protected_source_ranges();
+        let open = input.find('\u{201C}').unwrap();
+        let close = input.find('\u{201D}').unwrap() + '\u{201D}'.len_utf8();
+        assert!(
+            ranges.iter().any(|r| r.start == open && r.end == close),
+            "paired curly double quotes must be protected, got {ranges:?}"
+        );
+    }
+
+    #[test]
+    fn unmatched_curly_quote_protects_entire_base() {
+        let input = "she said \u{201C}i didnt know";
+        let b = format_validated(input, WritingMode::Smart);
+        let ranges = b.protected_source_ranges();
+        assert!(
+            ranges.iter().any(|r| r.start == 0 && r.end == input.len()),
+            "unmatched curly quote must protect whole base, got {ranges:?}"
+        );
+    }
+
+    // ── Bug 3: cooperative deadline + linear scans at max size ──────────────
+
+    /// Synthetic tight deadline on 32 KiB must not burn multi-second CPU.
+    ///
+    /// With zero budget the entry path seals identity before heavy work; linear
+    /// composite scans keep any residual tokenization well under a second.
+    #[test]
+    fn max_size_zero_deadline_aborts_without_multi_second_cpu() {
+        let input = "x".repeat(MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES);
+        let t0 = Instant::now();
+        let baseline = format_validated_with(
+            &input,
+            WritingMode::Smart,
+            FormatOptions {
+                work_deadline: Some(Duration::ZERO),
+                ..FormatOptions::default()
+            },
+        );
+        let elapsed = t0.elapsed();
+        assert_eq!(
+            baseline.rendered(),
+            input,
+            "zero-deadline miss must preserve Validated identity"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "zero-deadline 32 KiB path must not burn multi-second CPU, took {elapsed:?}"
+        );
+    }
+
+    /// Full format of max-size input must stay linear (no multi-second O(n²)).
+    ///
+    /// Release builds are held to the normative 50 ms budget. Debug builds get a
+    /// looser 500 ms cap that still fails the pre-fix O(n²) multi-second path.
+    #[test]
+    fn max_size_full_format_stays_linear_budget() {
+        let input = "x".repeat(MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES);
+        let t0 = Instant::now();
+        let _baseline = format_validated(&input, WritingMode::Smart);
+        let elapsed = t0.elapsed();
+        #[cfg(not(debug_assertions))]
+        let cap = Duration::from_millis(50);
+        #[cfg(debug_assertions)]
+        let cap = Duration::from_millis(500);
+        assert!(
+            elapsed < cap,
+            "32 KiB full format must stay under {cap:?} (linear scans); took {elapsed:?}"
+        );
     }
 }
