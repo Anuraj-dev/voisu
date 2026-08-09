@@ -314,7 +314,6 @@ mod tests {
     fn constants_and_strict_schema_match_companion() {
         assert_eq!(MINIMAL_GRAMMAR_MODEL, "openai/gpt-oss-20b");
         assert_eq!(MINIMAL_GRAMMAR_REASONING_EFFORT, "low");
-        assert!(!MINIMAL_GRAMMAR_STREAM);
         assert_eq!(MAX_MINIMAL_GRAMMAR_COMPLETION_TOKENS, 2_048);
         assert_eq!(
             GRAMMAR_RESULT_CUTOFF_FROM_GATE_ENTRY,
@@ -341,6 +340,10 @@ mod tests {
             MINIMAL_GRAMMAR_REASONING_EFFORT
         );
         assert_eq!(
+            companion["model"]["MINIMAL_GRAMMAR_STREAM"],
+            MINIMAL_GRAMMAR_STREAM
+        );
+        assert_eq!(
             companion["limits"]["MAX_MINIMAL_GRAMMAR_COMPLETION_TOKENS"],
             MAX_MINIMAL_GRAMMAR_COMPLETION_TOKENS
         );
@@ -361,6 +364,7 @@ mod tests {
             assert!(!object.contains_key(omitted));
         }
         assert_eq!(request["model"], MINIMAL_GRAMMAR_MODEL);
+        assert_eq!(request["stream"], false);
         let messages = request["messages"].as_array().expect("messages");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["content"], MINIMAL_GRAMMAR_SYSTEM_INSTRUCTION);
