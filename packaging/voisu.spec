@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.14.0
+Version:        0.15.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,9 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Sun Aug 09 2026 Voisu maintainers <voisu@example.invalid> - 0.15.0-1
+- feat(app): SW7 CredentialPreparationOwner + reaper credential lane (#120) (#127)
+
 * Sun Aug 09 2026 Voisu maintainers <voisu@example.invalid> - 0.14.0-1
 - feat(app): SW5 drop-safe async grammar HTTP client (#118) (#126)
 
