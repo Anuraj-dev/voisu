@@ -5,26 +5,36 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::future::{select, Either};
+use futures_util::FutureExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use voisu_app::audio_level::{LevelRegistry, LevelRing};
+use voisu_app::grammar_http::GrammarHttpClient;
 use voisu_app::focus::SharedFocusProbe;
 use voisu_app::journal::{escape_journal_control, recording_journal_lines};
+use voisu_app::minimal_grammar::MinimalGrammarAdapter;
+use voisu_app::smart_writing::{
+    final_transform_and_deliver, CredentialGateEvidence, FinalTransformInput,
+    GrammarGateCapability, ResolvedRecordingLanguages,
+};
 use voisu_app::system::{
-    CAPTURE_FINALIZE_DEADLINE, DIAGNOSTIC_RESPONSE_DEADLINE, DeepgramProvider,
-    DesktopNotifier, FedoraShortcutPortal, GroqProvider, GuardedDelivery, MergeResultValidator,
-    PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture,
-    PortalClipboardDelivery, ProviderReaper,
+    groq_transcription_language, CredentialPreparationOwner, DeepgramProvider, DesktopNotifier,
+    FedoraShortcutPortal, GrammarCapability, GroqProvider, GuardedDelivery, MergeResultValidator,
+    PipeWireCapture, PortalClipboardDelivery, ProviderReaper, CAPTURE_FINALIZE_DEADLINE,
+    DEFAULT_TRANSCRIPTION_LANGUAGE, DIAGNOSTIC_RESPONSE_DEADLINE, PROCESSING_RESPONSE_DEADLINE,
+    PROVIDER_COMPLETION_DEADLINE,
     RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
-use voisu_app::config::DeliveryMode;
+use voisu_app::config::{DeliveryMode, WritingMode};
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
     CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonState, DeadlineClock,
@@ -33,12 +43,13 @@ use voisu_core::{
     LifecycleEvidence, LifecycleStage,
     OverlayEvent, OverlayOutcome,
     MergeResult, PROTOCOL_VERSION, Provider,
-    ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream, ProviderStreams,
+    ProviderCompletion, ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream,
+    ProviderStreams,
     ReconciliationKind, ReconciliationModel,
     ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SourceTranscript,
     SourceTranscriptRecord, Transcript, TranscriptDecision, TranscriptDecisionPipeline,
-    TranscriptProvider, TranscriptValidator, TriggerKeyBinding, VersionEnvelope, replay_capture,
-    socket_path,
+    TranscriptProvider, TranscriptValidator, TriggerKeyBinding, VersionEnvelope,
+    SmartWritingDiagnostic, replay_capture, socket_path,
 };
 
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
@@ -276,6 +287,7 @@ async fn shutdown(
     // All stream Drops and adoptions are complete now, so drain to completion:
     // a single bounded drain that timed out would retain the unfinished cleanup
     // only for this function to return and drop the runtime over it.
+    reaper.drain_credential_lane().await;
     reaper.drain_to_completion(RECOVERY_ABORT_DEADLINE).await;
     Ok(())
 }
@@ -455,6 +467,9 @@ struct StartupCompletion {
     groq: Box<dyn TranscriptProvider>,
     result: Result<(Box<dyn ActiveCapture>, ProviderStreams), StartFailure>,
     level_ring: Arc<LevelRing>,
+    writing_mode: WritingMode,
+    dictionary_terms: Vec<String>,
+    languages: ResolvedRecordingLanguages,
     reply: oneshot::Sender<Response>,
 }
 
@@ -483,6 +498,9 @@ struct ActiveRecording {
     /// start can block on the keyring for an unbounded time, which would make
     /// every warning late by exactly that stall. Reporting only.
     deadline_clock: DeadlineClock,
+    writing_mode: WritingMode,
+    dictionary_terms: Vec<String>,
+    languages: ResolvedRecordingLanguages,
     evidence: LifecycleEvidence,
 }
 
@@ -556,6 +574,20 @@ async fn actor_loop(
     let controlled = test_mode.as_deref() == Some(std::ffi::OsStr::new("controlled"));
     let controlled_deadlines = controlled
         || test_mode.as_deref() == Some(std::ffi::OsStr::new("system-boundaries"));
+    let grammar_adapter = if controlled {
+        std::env::var("VOISU_TEST_MINIMAL_GRAMMAR_ENDPOINT")
+            .ok()
+            .and_then(|endpoint| GrammarHttpClient::with_endpoint(endpoint).ok())
+            .map(MinimalGrammarAdapter::new)
+    } else {
+        match MinimalGrammarAdapter::production() {
+            Ok(adapter) => Some(adapter),
+            Err(error) => {
+                eprintln!("Minimal Grammar unavailable: {error}");
+                None
+            }
+        }
+    };
     let mut capture: Option<Box<dyn AudioCapture>> = Some(if controlled {
         Box::new(ControlledCapture::from_env(levels.clone()))
     } else {
@@ -576,7 +608,12 @@ async fn actor_loop(
         build_deepgram_provider(deepgram_enabled, true, &[], &reaper)
     });
     let mut groq: Option<Box<dyn TranscriptProvider>> = controlled.then(|| {
-        build_groq_provider(true, String::new(), &reaper)
+        build_groq_provider(
+            true,
+            String::new(),
+            DEFAULT_TRANSCRIPTION_LANGUAGE.to_owned(),
+            &reaper,
+        )
     });
     // The processing supervisor cannot inspect task-local provider state after a
     // panic, so retain the providers configured for this Recording beside the
@@ -712,6 +749,7 @@ async fn actor_loop(
                         groq = Some(build_groq_provider(
                             false,
                             replay_whisper_prompt.as_ref().clone(),
+                            groq_transcription_language(),
                             &reaper,
                         ));
                     }
@@ -778,9 +816,21 @@ async fn actor_loop(
                     // boundary, never mid-utterance. Both providers and the
                     // validator receive derivatives of exactly this one snapshot.
                     let session_terms = voisu_app::dictionary::merged_terms();
+                    let smart_dictionary_terms = session_terms.clone();
                     let session_keyterms = voisu_app::dictionary::deepgram_keyterms(&session_terms);
                     let session_whisper_prompt =
                         voisu_app::dictionary::whisper_prompt_for_terms(&session_terms);
+                    let writing_mode = voisu_app::config::writing_mode();
+                    let groq_language = groq_transcription_language();
+                    let mut language_declarations =
+                        vec![(Provider::Groq, groq_language.clone())];
+                    if deepgram_enabled {
+                        language_declarations.push((
+                            Provider::Deepgram,
+                            DEFAULT_TRANSCRIPTION_LANGUAGE.to_owned(),
+                        ));
+                    }
+                    let languages = ResolvedRecordingLanguages::new(language_declarations);
                     validator
                         .as_mut()
                         .expect("validator is available")
@@ -795,6 +845,7 @@ async fn actor_loop(
                         groq = Some(build_groq_provider(
                             false,
                             session_whisper_prompt,
+                            groq_language,
                             &reaper,
                         ));
                     }
@@ -833,6 +884,9 @@ async fn actor_loop(
                             groq: current_groq,
                             result,
                             level_ring,
+                            writing_mode,
+                            dictionary_terms: smart_dictionary_terms,
+                            languages,
                             reply,
                         })));
                     });
@@ -862,6 +916,7 @@ async fn actor_loop(
                                 false,
                                 tx.clone(),
                                 reaper.clone(),
+                                grammar_adapter.clone(),
                             ) {
                                 let _ = reply.send(*response);
                             }
@@ -900,6 +955,9 @@ async fn actor_loop(
                     groq: returned_groq,
                     result,
                     level_ring,
+                    writing_mode,
+                    dictionary_terms,
+                    languages,
                     reply,
                 } = *started;
                 capture = Some(returned_capture);
@@ -1090,6 +1148,9 @@ async fn actor_loop(
                                 level_ring,
                                 started_at,
                                 deadline_clock,
+                                writing_mode,
+                                dictionary_terms,
+                                languages,
                                 evidence,
                             });
                             let _ = reply.send(Response::success(
@@ -1263,6 +1324,7 @@ async fn actor_loop(
                             true,
                             tx.clone(),
                             reaper.clone(),
+                            grammar_adapter.clone(),
                         );
                     }
                 }
@@ -1393,6 +1455,7 @@ async fn actor_loop(
                             false,
                             tx.clone(),
                             reaper.clone(),
+                            grammar_adapter.clone(),
                         );
                     }
                 }
@@ -1441,6 +1504,7 @@ fn spawn_recording_processing(
     publish_terminal_outcome: bool,
     actor: mpsc::Sender<ActorMessage>,
     reaper: ProviderReaper,
+    grammar_adapter: Option<MinimalGrammarAdapter>,
 ) -> Result<(), (Box<Response>, Option<oneshot::Sender<Response>>)> {
     let (current_validator, current_delivery) = match (validator.take(), delivery.take()) {
         (Some(validator), Some(delivery)) => (validator, delivery),
@@ -1470,6 +1534,8 @@ fn spawn_recording_processing(
         diagnostics.clone(),
         debug_capture,
         deepgram_enabled,
+        reaper.clone(),
+        grammar_adapter,
     ));
     tokio::spawn(supervise_recording(
         processing,
@@ -1660,12 +1726,17 @@ fn build_deepgram_provider(
 fn build_groq_provider(
     controlled: bool,
     whisper_prompt: String,
+    language: String,
     reaper: &ProviderReaper,
 ) -> Box<dyn TranscriptProvider> {
     if controlled {
         Box::new(ControlledProvider::from_env(Provider::Groq))
     } else {
-        Box::new(GroqProvider::with_prompt(reaper.clone(), whisper_prompt))
+        Box::new(GroqProvider::with_prompt_and_language(
+            reaper.clone(),
+            whisper_prompt,
+            language,
+        ))
     }
 }
 
@@ -1920,6 +1991,8 @@ async fn process_recording(
     diagnostics: Option<Arc<DiagnosticStore>>,
     debug_capture: bool,
     deepgram_enabled: bool,
+    reaper: ProviderReaper,
+    grammar_adapter: Option<MinimalGrammarAdapter>,
 ) -> RecordingResult {
     let ActiveRecording {
         id,
@@ -1930,6 +2003,9 @@ async fn process_recording(
         level_ring: _,
         started_at,
         deadline_clock: _,
+        writing_mode,
+        dictionary_terms,
+        languages,
         mut evidence,
     } = recording;
     let _ = stop_tx.send(());
@@ -1965,6 +2041,7 @@ async fn process_recording(
                 provider_failures,
                 None,
                 None,
+                None,
                 Some(&error),
             );
             if let Some(store) = diagnostics.as_ref() {
@@ -1987,6 +2064,7 @@ async fn process_recording(
     let mut source_records: Vec<SourceTranscriptRecord> = Vec::new();
     let mut provider_failures: Vec<ProviderFailure> = Vec::new();
     let mut final_transcript: Option<String> = None;
+    let mut smart_writing: Option<SmartWritingDiagnostic> = None;
     let mut debug_audio = None;
 
     let result = async {
@@ -2016,7 +2094,15 @@ async fn process_recording(
                 }
             }
         }
-        let completed = providers.complete_with_timings(audio).await?;
+        let grammar_enabled = writing_mode == WritingMode::Smart && grammar_adapter.is_some();
+        let (completed, grammar_capability, credential_evidence) =
+            complete_with_grammar_capability(
+                providers,
+                audio,
+                grammar_enabled,
+                &reaper,
+            )
+            .await?;
         provider_failures = completed.provider_failures;
         evidence.provider_timings_ms = completed.timings_ms;
         let sources = completed.sources;
@@ -2044,8 +2130,32 @@ async fn process_recording(
         evidence.reconciliation_requested = decision.reconciliation_requested;
         evidence.recovery_attempted = decision.recovery_attempted;
         evidence.stages.push(LifecycleStage::ValidationCompleted);
-        final_transcript = Some(decision.transcript.0.clone());
-        let delivery_outcome = delivery.deliver(decision.transcript).await?;
+        let dictionary_refs: Vec<&str> = dictionary_terms.iter().map(String::as_str).collect();
+        let grammar = match (grammar_adapter.as_ref(), grammar_capability.as_ref()) {
+            (Some(adapter), Some(GrammarCapability::Ready(ready))) => {
+                GrammarGateCapability::Ready {
+                    boundary: adapter,
+                    bearer_token: ready.credential().expose_to_boundary(),
+                }
+            }
+            _ => GrammarGateCapability::Unavailable,
+        };
+        let transformed = final_transform_and_deliver(
+            FinalTransformInput {
+                validated_transcript: &decision.transcript.0,
+                writing_mode,
+                languages: &languages,
+                grammar,
+                dictionary_terms: &dictionary_refs,
+                protected_names: &[],
+                credential: credential_evidence,
+            },
+            delivery.as_mut(),
+        )
+        .await;
+        final_transcript = Some(transformed.rendered);
+        smart_writing = Some(transformed.diagnostic);
+        let delivery_outcome = transformed.delivery?;
         evidence.delivery_count += 1;
         evidence.delivery_method = Some(delivery_outcome.method);
         evidence.delivery_fallback_reason = delivery_outcome.fallback_reason;
@@ -2087,6 +2197,7 @@ async fn process_recording(
         provider_failures,
         final_transcript,
         debug_audio,
+        smart_writing,
         result.as_ref().err(),
     );
     if let Some(store) = diagnostics.as_ref() {
@@ -2101,6 +2212,93 @@ async fn process_recording(
         validator,
         delivery,
     }
+}
+
+/// Poll provider completion and Architecture A credential preparation in one
+/// owned concurrent machine. A provider error cancels and terminally reaps prep;
+/// a panic is caught, reaped, and converted to a processing error. Only a
+/// terminal Ready/Unavailable capability can escape toward Validation.
+async fn complete_with_grammar_capability(
+    providers: ProviderCoordinator,
+    audio: CapturedAudio,
+    grammar_enabled: bool,
+    reaper: &ProviderReaper,
+) -> Result<
+    (
+        ProviderCompletion,
+        Option<GrammarCapability>,
+        CredentialGateEvidence,
+    ),
+    BoundaryError,
+> {
+    if !grammar_enabled {
+        return Ok((
+            providers.complete_with_timings(audio).await?,
+            None,
+            CredentialGateEvidence::default(),
+        ));
+    }
+
+    let lane = reaper.credential_lane().clone();
+    let entry = lane.register();
+    let mut owner = CredentialPreparationOwner::new(
+        Arc::clone(&entry),
+        lane,
+        Provider::Groq,
+    );
+    let prep_started = Instant::now();
+    let provider_future = Box::pin(providers.complete_with_timings(audio));
+    let prep_future = Box::pin(owner.poll_outcome());
+
+    enum ConcurrentOutcome {
+        Complete(ProviderCompletion, GrammarCapability),
+        ProviderError(BoundaryError),
+        Panic,
+    }
+    let concurrent = {
+        let first = AssertUnwindSafe(select(provider_future, prep_future))
+            .catch_unwind()
+            .await;
+        match first {
+            Ok(Either::Left((provider_result, remaining_prep))) => match provider_result {
+                Ok(completed) => match AssertUnwindSafe(remaining_prep).catch_unwind().await {
+                    Ok(capability) => ConcurrentOutcome::Complete(completed, capability),
+                    Err(_) => ConcurrentOutcome::Panic,
+                },
+                Err(error) => {
+                    drop(remaining_prep);
+                    ConcurrentOutcome::ProviderError(error)
+                }
+            },
+            Ok(Either::Right((capability, remaining_provider))) => {
+                match AssertUnwindSafe(remaining_provider).catch_unwind().await {
+                    Ok(Ok(completed)) => ConcurrentOutcome::Complete(completed, capability),
+                    Ok(Err(error)) => ConcurrentOutcome::ProviderError(error),
+                    Err(_) => ConcurrentOutcome::Panic,
+                }
+            }
+            Err(_) => ConcurrentOutcome::Panic,
+        }
+    };
+    let (completed, capability) = match concurrent {
+        ConcurrentOutcome::Complete(completed, capability) => (completed, capability),
+        ConcurrentOutcome::ProviderError(error) => {
+            let _ = owner.cancel_and_drive_terminal().await;
+            return Err(error);
+        }
+        ConcurrentOutcome::Panic => {
+            let _ = owner.cancel_and_drive_terminal().await;
+            return Err(BoundaryError::new(
+                BoundaryKind::Validation,
+                "provider or grammar credential preparation panicked",
+            ));
+        }
+    };
+    let credential = CredentialGateEvidence {
+        prep_latency_ms: Some(elapsed_millis(prep_started)),
+        reap_watchdog_crossed: entry.watchdog_overrun_logged(),
+    };
+    Ok((completed, Some(capability), credential))
 }
 
 /// Awaits the supervised Recording processing task and reports Completed on
@@ -2154,6 +2352,7 @@ async fn supervise_recording(
                 provider_failures,
                 None,
                 None,
+                None,
                 Some(&error),
             );
             if let Some(store) = diagnostics.as_ref() {
@@ -2178,6 +2377,7 @@ async fn supervise_recording(
     // completion before acknowledging: Completed alone permits the Idle
     // transition, so a new Recording cannot overlap this Recording's blocking
     // cleanup even when one bounded drain pass expires.
+    reaper.drain_credential_lane().await;
     reaper.drain_to_completion(RECOVERY_ABORT_DEADLINE).await;
     let _ = actor
         .send(ActorMessage::Completed(Box::new(Completion {
@@ -2303,6 +2503,7 @@ fn diagnostic_record(
     provider_failures: Vec<ProviderFailure>,
     final_transcript: Option<String>,
     debug_audio: Option<voisu_core::DebugAudioRecord>,
+    smart_writing: Option<SmartWritingDiagnostic>,
     error: Option<&BoundaryError>,
 ) -> DiagnosticRecord {
     let mut record = DiagnosticRecord::new(evidence.correlation_id.clone(), evidence.recording_id);
@@ -2328,6 +2529,7 @@ fn diagnostic_record(
     record.release_to_text_ms = evidence.release_to_text_ms;
     record.error = error.map(|error| error.public_message().to_owned());
     record.debug_audio = debug_audio;
+    record.smart_writing = smart_writing;
     record
 }
 
@@ -2426,7 +2628,12 @@ fn rebuild_replay_adapters(
     } else {
         (
             deepgram,
-            build_groq_provider(false, whisper_prompt.to_owned(), reaper),
+            build_groq_provider(
+                false,
+                whisper_prompt.to_owned(),
+                groq_transcription_language(),
+                reaper,
+            ),
             Box::new(MergeResultValidator::new()),
         )
     }
