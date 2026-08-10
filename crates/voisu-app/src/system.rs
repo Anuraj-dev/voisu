@@ -50,7 +50,8 @@ pub const PROCESSING_RESPONSE_DEADLINE: Duration = Duration::from_secs(
         + LIBEI_DELIVERY_DEADLINE.as_secs()
         + RECOVERY_ABORT_DEADLINE.as_secs()
         + RECONCILIATION_DEADLINE.as_secs() * 2
-        + 1,
+        + 1
+        + crate::smart_writing::FINAL_TRANSFORM_GATE_DEADLINE.as_secs(),
 );
 /// Pre-validation credential preparation work budget (#103 / SW7). At expiry the
 /// owner stops retries, kills any credential process group, and begins terminal
@@ -61,6 +62,7 @@ pub const CREDENTIAL_PREP_WORK_DEADLINE: Duration = Duration::from_secs(13);
 /// expiry. Crossing it is not permission to detach: remain Processing, log once,
 /// and keep awaiting terminal child wait + pipe EOF.
 pub const CREDENTIAL_REAP_WATCHDOG: Duration = Duration::from_secs(2);
+pub const DEFAULT_TRANSCRIPTION_LANGUAGE: &str = "en";
 /// End-to-end budget shared by both sides of a paged history/export transfer.
 pub const DIAGNOSTIC_RESPONSE_DEADLINE: Duration = Duration::from_secs(15);
 const PROCESS_POLL: Duration = Duration::from_millis(10);
@@ -2989,6 +2991,7 @@ fn process_diagnostic(prefix: &str, stderr: &[u8]) -> String {
 pub struct GroqProvider {
     reaper: ProviderReaper,
     prompt: Option<String>,
+    language: Option<String>,
 }
 
 impl GroqProvider {
@@ -2996,7 +2999,11 @@ impl GroqProvider {
     /// stream dropped mid-abort hands its curl reap to the supervisor the actor
     /// drains before Idle.
     pub fn new(reaper: ProviderReaper) -> Self {
-        Self { reaper, prompt: None }
+        Self {
+            reaper,
+            prompt: None,
+            language: None,
+        }
     }
 
     /// Builds a provider with a Recording-start dictionary snapshot. Supplying
@@ -3006,6 +3013,22 @@ impl GroqProvider {
         Self {
             reaper,
             prompt: Some(prompt),
+            language: None,
+        }
+    }
+
+    /// Builds a provider from the exact Recording-start language snapshot that
+    /// EnglishEligibility also records. This prevents later environment changes
+    /// from making the declaration differ from what the request sends.
+    pub fn with_prompt_and_language(
+        reaper: ProviderReaper,
+        prompt: String,
+        language: String,
+    ) -> Self {
+        Self {
+            reaper,
+            prompt: Some(prompt),
+            language: Some(language),
         }
     }
 }
@@ -3024,10 +3047,13 @@ impl TranscriptProvider for GroqProvider {
         Ok(Box::new(GroqStream {
             credential,
             endpoint,
-            params: GroqRequestParams::from_config(
+            params: GroqRequestParams::from_config_with_language(
                 self.prompt
                     .clone()
                     .unwrap_or_else(crate::dictionary::whisper_prompt),
+                self.language
+                    .clone()
+                    .unwrap_or_else(groq_transcription_language),
             ),
             buffer: Vec::new(),
             streamed_bytes: 0,
@@ -3072,19 +3098,24 @@ struct GroqRequestParams {
 }
 
 impl GroqRequestParams {
-    /// Resolves the request tuning from config and a resolved dictionary prompt:
-    /// model from `VOISU_GROQ_MODEL` (default `whisper-large-v3`), language from
-    /// `VOISU_GROQ_LANGUAGE` (default `en`), and the Whisper vocabulary prompt.
-    fn from_config(prompt: String) -> Self {
+    /// Resolves model configuration while retaining the exact language snapshot
+    /// captured at the Recording boundary.
+    fn from_config_with_language(prompt: String, language: String) -> Self {
         let model = std::env::var("VOISU_GROQ_MODEL")
             .unwrap_or_else(|_| "whisper-large-v3".to_owned());
-        let language = std::env::var("VOISU_GROQ_LANGUAGE").unwrap_or_else(|_| "en".to_owned());
         Self {
             model,
             language,
             prompt,
         }
     }
+}
+
+/// Resolve the exact Groq transcription language once at a Recording boundary.
+#[must_use]
+pub fn groq_transcription_language() -> String {
+    std::env::var("VOISU_GROQ_LANGUAGE")
+        .unwrap_or_else(|_| DEFAULT_TRANSCRIPTION_LANGUAGE.to_owned())
 }
 
 /// Whether the Groq stream should pre-stream chunks yet. Recordings at or below
@@ -5239,6 +5270,7 @@ impl TranscriptProvider for DeepgramProvider {
 /// tuning for dictation pauses.
 const DEEPGRAM_STREAMING_PARAMS: &[(&str, &str)] = &[
     ("model", "nova-3"),
+    ("language", DEFAULT_TRANSCRIPTION_LANGUAGE),
     ("encoding", "linear16"),
     ("sample_rate", "16000"),
     ("channels", "1"),

@@ -157,6 +157,18 @@ impl Daemon {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        // An explicit test marker is the only harness path that removes a
+        // parent shell's inherited Groq key, allowing the child daemon to
+        // exercise the real credential cache-miss/helper path without changing
+        // production env semantics for the other lifecycle cases.
+        if environment
+            .iter()
+            .any(|(name, _)| *name == "VOISU_TEST_CLEAR_GROQ_API_KEY")
+        {
+            command.env_remove("VOISU_GROQ_API_KEY");
+            command.env_remove("VOISU_TEST_SECRET_STORE");
+            command.env_remove("VOISU_TEST_STORED_GROQ_CREDENTIAL");
+        }
         disable_shortcuts_unless_bus_injected(&mut command, environment);
         let config_dir = isolate_deepgram_config(&mut command, environment);
         for (name, value) in environment {
@@ -376,7 +388,7 @@ cat > "$dir/clipboard"
     assert!(stopped.status.success(), "{}", stderr(&stopped));
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
-        "hello from Groq"
+        "Hello from Groq."
     );
 
     let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -471,7 +483,7 @@ exit 0
     );
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
-        "hello from Groq"
+        "Hello from Groq."
     );
     server.join().unwrap();
 }
@@ -555,7 +567,7 @@ cat > "$dir/clipboard"
     assert!(stopped.status.success(), "{}", stderr(&stopped));
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
-        "hello from Groq"
+        "Hello from Groq."
     );
     let handshake = fs::read_to_string(commands.path().join("deepgram.handshake")).unwrap();
     let (uri, authorization) = handshake.split_once('\n').unwrap();
@@ -764,7 +776,7 @@ cat > /dev/null
     // The transcript reached xclip on its stdin, with the fixed clipboard argv.
     assert_eq!(
         fs::read_to_string(commands.path().join("xclip.stdin")).unwrap(),
-        "hello from Groq"
+        "Hello from Groq."
     );
     assert_eq!(
         fs::read_to_string(commands.path().join("xclip.args")).unwrap(),
@@ -902,7 +914,7 @@ cat > "$dir/xclip.stdin"
     );
     assert_eq!(
         fs::read_to_string(commands.path().join("xclip.stdin")).unwrap(),
-        "hello from Groq"
+        "Hello from Groq."
     );
 }
 
@@ -1107,7 +1119,7 @@ cat > "$dir/clipboard"
     );
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
-        "Deepgram fallback"
+        "Deepgram fallback."
     );
 }
 
@@ -1196,7 +1208,7 @@ printf '%s' "$((count + 1))" > "$dir/delivery.count"
         }
         assert_eq!(
             fs::read_to_string(commands.path().join("clipboard")).unwrap(),
-            "Provider fallback",
+            "Provider fallback.",
             "{failure}"
         );
         assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n", "{failure}");
@@ -1276,7 +1288,7 @@ cat > "$dir/clipboard"
     );
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
-        "alpha beta gamma"
+        "Alpha beta gamma."
     );
 }
 
@@ -1377,7 +1389,7 @@ cat > "$dir/clipboard"
     server.join().unwrap();
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
-        "recovered Transcript"
+        "Recovered Transcript"
     );
     let diagnostics = daemon.terminate_and_stderr();
     assert!(!diagnostics.contains("controlled-secret"));
@@ -1806,7 +1818,7 @@ cat > "$dir/clipboard"
     assert!(recovered.status.success(), "{}", stderr(&recovered));
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
-        "Recovered microphone"
+        "Recovered microphone."
     );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 }
@@ -1847,6 +1859,88 @@ fn local_groq_server(
 ) -> (String, mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
     let body = serde_json::json!({ "text": transcript }).to_string();
     local_groq_response_server("200 OK", body, Duration::ZERO)
+}
+
+/// A loopback OpenAI-compatible Minimal Grammar endpoint used through the
+/// daemon's actual SW10 wiring. The response copies the baseline identity from
+/// the transcript-only request body, so the test cannot bypass the adapter's
+/// request contract with a precomputed candidate.
+fn local_minimal_grammar_server(
+    expected_credential: &'static str,
+) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_tx, request_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut content_length = 0_usize;
+        let mut authorized = false;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            let lower = line.to_ascii_lowercase();
+            if let Some(value) = lower.strip_prefix("content-length:") {
+                content_length = value.trim().parse().unwrap();
+            }
+            if lower
+                .strip_prefix("authorization:")
+                .is_some_and(|value| value.trim() == format!("bearer {expected_credential}"))
+            {
+                authorized = true;
+            }
+        }
+        assert!(authorized, "Minimal Grammar credential must be ready before the gate");
+        let mut request_body = vec![0_u8; content_length];
+        reader.read_exact(&mut request_body).unwrap();
+        let request: Value = serde_json::from_slice(&request_body).unwrap();
+        request_tx.send(request.clone()).unwrap();
+        let user: Value = serde_json::from_str(
+            request["messages"][1]["content"]
+                .as_str()
+                .expect("transcript-only user body"),
+        )
+        .unwrap();
+        let candidate = serde_json::json!({
+            "base_version": user["base_version"],
+            "base_fingerprint": user["base_fingerprint"],
+            "edits": [{
+                "id": "there-plural-1",
+                "rule_id": "G_THERE_IS_PLURAL_QUANTITY",
+                "start_utf8": 6,
+                "end_utf8": 8,
+                "before": "is",
+                "after": "are"
+            }]
+        });
+        let response_body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": candidate.to_string()
+                }
+            }]
+        })
+        .to_string();
+        write!(
+            reader.get_mut(),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        )
+        .unwrap();
+    });
+    (
+        format!("http://{address}/openai/v1/chat/completions"),
+        request_rx,
+        server,
+    )
 }
 
 fn local_groq_response_server(
@@ -6614,7 +6708,7 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
-        "Portal recovery Transcript"
+        "Portal recovery Transcript."
     );
     assert_eq!(
         fs::read_to_string(commands.path().join("delivery.count")).unwrap(),
@@ -6678,7 +6772,7 @@ fn portal_restart_clears_the_stale_binding_and_rebinds_the_trigger_key() {
     wait_for_status(runtime.path(), "idle\n");
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
-        "Portal recovery Transcript"
+        "Portal recovery Transcript."
     );
 
     fs::remove_file(commands.path().join("pw-record.ready")).unwrap();
@@ -6692,7 +6786,7 @@ fn portal_restart_clears_the_stale_binding_and_rebinds_the_trigger_key() {
     );
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
-        "Portal recovery Transcript"
+        "Portal recovery Transcript."
     );
     assert_eq!(
         fs::read_to_string(commands.path().join("delivery.count")).unwrap(),
@@ -9507,7 +9601,7 @@ fn a_disabled_deepgram_runs_groq_only_and_records_the_disabled_diagnostic() {
     let sources = record["source_transcripts"].as_array().unwrap();
     assert_eq!(sources.len(), 1, "only Groq contributes a Source Transcript: {history}");
     assert_eq!(sources[0]["provider"], "groq", "{history}");
-    assert_eq!(record["final_transcript"], "the groq only transcript", "{history}");
+    assert_eq!(record["final_transcript"], "The groq only transcript.", "{history}");
 
     let failures = record["provider_failures"].as_array().unwrap();
     let disabled = failures
@@ -9679,7 +9773,7 @@ cat > "$dir/clipboard"
     );
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
-        "hello from Groq"
+        "Hello from Groq."
     );
     server.join().unwrap();
 }
@@ -9823,7 +9917,7 @@ cat > "$dir/clipboard"
     assert!(stopped.status.success(), "{}", stderr(&stopped));
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
-        "clipboard-only Transcript"
+        "Clipboard-only Transcript."
     );
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
@@ -10071,5 +10165,58 @@ fn a_chunk_delay_longer_than_the_ceiling_loses_to_the_clock() {
         "{history}"
     );
 
+    daemon.terminate();
+}
+
+/// SW10 production-boundary reproof: the daemon's real process_recording path
+/// must resolve a cache-miss credential through the owned helper, send the
+/// transcript-only Minimal Grammar request through the selected HTTP client,
+/// validate/compose the candidate, and persist the bounded evidence before its
+/// single Delivery.
+#[test]
+fn smart_writing_real_wiring_reproves_grammar_http_and_credential_cache_miss() {
+    let runtime = TempDir::new().unwrap();
+    let commands = FakeCommands::new();
+    let (endpoint, request_rx, server) = local_minimal_grammar_server("stored-credential");
+    let path = commands.path();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_DISABLE_DEEPGRAM", "1"),
+            ("VOISU_TEST_CLEAR_GROQ_API_KEY", "1"),
+            ("VOISU_TEST_MINIMAL_GRAMMAR_ENDPOINT", &endpoint),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "there is two issues"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
+
+    let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    server.join().unwrap();
+    assert_eq!(request["model"], "openai/gpt-oss-20b");
+    let user: Value = serde_json::from_str(
+        request["messages"][1]["content"]
+            .as_str()
+            .expect("transcript-only request body"),
+    )
+    .unwrap();
+    assert_eq!(user["validated_transcript"], "there is two issues");
+    assert!(user.get("audio").is_none());
+    assert!(user.get("dictionary").is_none());
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    assert_eq!(record["final_transcript"], "There are two issues.", "{history}");
+    let smart = &record["smart_writing"];
+    assert_eq!(smart["outcome"], "formatting_and_grammar", "{history}");
+    assert_eq!(smart["request_began"], true, "{history}");
+    assert_eq!(smart["model_id"], "openai/gpt-oss-20b", "{history}");
+    assert!(smart["credential_prep_latency_ms"].is_number(), "{history}");
+    assert_eq!(smart["edits"][0]["code"], "edit_accepted", "{history}");
+    assert_eq!(commands.read("secret-tool.args"), "lookup\nvoisu-provider\ngroq\n");
     daemon.terminate();
 }
