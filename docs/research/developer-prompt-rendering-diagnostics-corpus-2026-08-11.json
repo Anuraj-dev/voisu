@@ -1,0 +1,843 @@
+{
+  "corpus_id": "voisu-developer-prompt-rendering-diagnostics-2026-08-11",
+  "version": "1.0.0",
+  "issue": {
+    "github_number": 142,
+    "title": "Prototype fallback feedback and diagnostic evidence",
+    "parent_map": 133,
+    "blocked_by": 139,
+    "blocks": [144],
+    "url": "https://github.com/Anuraj-dev/voisu/issues/142"
+  },
+  "language": "en",
+  "governing": {
+    "contract_issue": 137,
+    "map_issue": 133,
+    "combined_call_issue": 139,
+    "behavior_corpus_issue": 138,
+    "intent_routing_issue": 141,
+    "delivery_deadline_ms": 1500,
+    "t0_basis": "utterance_end",
+    "network_on_decision_path": false,
+    "out_of_scope": [
+      "product Rust wiring",
+      "live cloud benchmark",
+      "redefining organize-only composition",
+      "redefining intent routing",
+      "auto-send",
+      "live typing",
+      "production late-result upgrade UI",
+      "telemetry upload"
+    ]
+  },
+  "modes": ["evaluation", "production"],
+  "feedback_kinds": ["silent", "minimal_status"],
+  "feedback_catalog": [
+    {
+      "feedback_kind": "silent",
+      "message": null,
+      "blocking": false,
+      "when": "default skip success soft salvage"
+    },
+    {
+      "feedback_kind": "minimal_status",
+      "message": "Local formatting used",
+      "blocking": false,
+      "when": "hard baseline fallback after cloud attempt"
+    }
+  ],
+  "event_names": [
+    "route_selected",
+    "cloud_skipped",
+    "cloud_request_started",
+    "cloud_response_received",
+    "cloud_deadline_exceeded",
+    "provider_failed",
+    "schema_validation_failed",
+    "source_derivation_failed",
+    "composition_accepted",
+    "fallback_baseline_selected",
+    "delivery_emitted",
+    "late_result_retained",
+    "late_result_discarded"
+  ],
+  "composition_decisions": [
+    "accept",
+    "accept_preserve_words",
+    "accept_natural_layout",
+    "fallback_baseline"
+  ],
+  "fallback_triggers": [
+    null,
+    "deadline_exceeded",
+    "provider_failure",
+    "response_schema_failure",
+    "unverifiable_source_derivation",
+    "unsafe_semantics",
+    "invalid_fixed_label",
+    "uncertain_backtracking",
+    "uncertain_layout"
+  ],
+  "error_codes": [
+    "E_DEADLINE",
+    "E_PROVIDER",
+    "E_SCHEMA",
+    "E_MALFORMED",
+    "E_UNVERIFIABLE",
+    "E_PROTECTED",
+    "E_UNSAFE_SEMANTICS",
+    "E_INVALID_LABEL",
+    "E_UNCERTAIN_BACKTRACK",
+    "E_UNCERTAIN_LAYOUT",
+    "E_INVENTED_CONTENT",
+    "E_OVERLAP",
+    "E_STALE",
+    "E_RECONCILE",
+    "E_UNKNOWN_CONVERSION",
+    "E_UNKNOWN_LABEL"
+  ],
+  "thresholds": {
+    "delivery_deadline_ms": 1500,
+    "max_events_per_recording": 24,
+    "max_event_detail_utf8_bytes": 256,
+    "max_feedback_message_utf8_bytes": 64,
+    "max_http_body_snippet_utf8_bytes": 256,
+    "max_retained_late_text_utf8_bytes": 2048,
+    "max_late_results_per_recording": 1,
+    "max_correlation_id_utf8_bytes": 128
+  },
+  "invariants": [
+    {
+      "id": "I-SILENT-OR-MINIMAL",
+      "summary": "Feedback is silent by default; at most one non-blocking minimal_status on hard fallback after cloud attempt."
+    },
+    {
+      "id": "I-NO-FALSE-CLOUD-SUCCESS",
+      "summary": "Feedback never claims cloud success when baseline was Delivered."
+    },
+    {
+      "id": "I-EVENT-ORDER",
+      "summary": "route_selected first; cloud start before response/deadline/failure; exactly one composition or fallback before delivery; late after delivery; non-decreasing t_ms."
+    },
+    {
+      "id": "I-ONE-CLOUD-CALL",
+      "summary": "At most one cloud_request_started per recording."
+    },
+    {
+      "id": "I-EVAL-LATE-RETAIN",
+      "summary": "late_result_retained only in evaluation mode and only after delivery_emitted."
+    },
+    {
+      "id": "I-PROD-NO-UPGRADE",
+      "summary": "Production never retains late text for upgrade and never sets replace_delivered."
+    },
+    {
+      "id": "I-UNSENT-DELIVERY",
+      "summary": "Delivery is always unsent with auto_send/live_type/replace_delivered false."
+    },
+    {
+      "id": "I-BOUNDED-PAYLOAD",
+      "summary": "Events and retained late text respect package thresholds; no secrets or unbounded HTTP bodies."
+    },
+    {
+      "id": "I-DEADLINE-1500",
+      "summary": "Final-only Delivery deadline is 1500ms from utterance_end."
+    }
+  ],
+  "production_cleanup": {
+    "evaluation_only": [
+      "event late_result_retained",
+      "candidate_text_clamped full late text",
+      "UI apply-late-result / upgrade transcript",
+      "user-facing offline compare export",
+      "mode defaulting to evaluation",
+      "late text retention beyond fingerprint for upgrade"
+    ],
+    "retained_forever": [
+      "ordered timing events",
+      "failure class and E_* codes",
+      "fallback trigger reason",
+      "late_result_discarded timing-only optional fingerprint",
+      "feedback kind",
+      "unsent Delivery flags",
+      "correlation id"
+    ]
+  },
+  "fixtures": [
+    {
+      "id": "DX-01",
+      "title": "Cloud accept success — silent feedback",
+      "mode": "production",
+      "roles": ["success", "silent"],
+      "related_behavior_fixture_ids": ["DPR-27"],
+      "related_combined_call_ids": ["CC-01"],
+      "route": "local_with_optional_cloud",
+      "cloud_request": "allowed",
+      "composition_decision": "accept",
+      "fallback_trigger": null,
+      "error_codes": [],
+      "feedback": { "feedback_kind": "silent", "message": null },
+      "delivery": {
+        "state": "unsent",
+        "auto_send": false,
+        "live_type": false,
+        "replace_delivered": false
+      },
+      "correlation_id": "dx-01-success",
+      "events": [
+        {
+          "name": "route_selected",
+          "t_ms": 0,
+          "route": "local_with_optional_cloud",
+          "cloud_request": "allowed"
+        },
+        { "name": "cloud_request_started", "t_ms": 12 },
+        { "name": "cloud_response_received", "t_ms": 420 },
+        {
+          "name": "composition_accepted",
+          "t_ms": 421,
+          "composition_decision": "accept"
+        },
+        { "name": "delivery_emitted", "t_ms": 422 }
+      ],
+      "late_result": null,
+      "rationale": "Happy path: cloud accepted; silent; unsent Delivery."
+    },
+    {
+      "id": "DX-02",
+      "title": "Deadline exceeded — minimal status + baseline",
+      "mode": "production",
+      "roles": ["deadline", "hard_fallback", "minimal_status"],
+      "related_behavior_fixture_ids": ["DPR-42"],
+      "related_combined_call_ids": ["CC-13"],
+      "route": "local_with_optional_cloud",
+      "cloud_request": "allowed",
+      "composition_decision": "fallback_baseline",
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": ["E_DEADLINE"],
+      "feedback": {
+        "feedback_kind": "minimal_status",
+        "message": "Local formatting used"
+      },
+      "delivery": {
+        "state": "unsent",
+        "auto_send": false,
+        "live_type": false,
+        "replace_delivered": false
+      },
+      "correlation_id": "dx-02-deadline",
+      "events": [
+        {
+          "name": "route_selected",
+          "t_ms": 0,
+          "route": "local_with_optional_cloud",
+          "cloud_request": "allowed"
+        },
+        { "name": "cloud_request_started", "t_ms": 10 },
+        {
+          "name": "cloud_deadline_exceeded",
+          "t_ms": 1500,
+          "error_codes": ["E_DEADLINE"]
+        },
+        {
+          "name": "fallback_baseline_selected",
+          "t_ms": 1500,
+          "fallback_trigger": "deadline_exceeded",
+          "error_codes": ["E_DEADLINE"]
+        },
+        { "name": "delivery_emitted", "t_ms": 1501 }
+      ],
+      "late_result": null,
+      "rationale": "Deadline miss at 1500ms; baseline Delivered; minimal non-blocking status."
+    },
+    {
+      "id": "DX-03",
+      "title": "Provider failure — minimal status",
+      "mode": "production",
+      "roles": ["provider_failure", "hard_fallback"],
+      "related_behavior_fixture_ids": ["DPR-40"],
+      "related_combined_call_ids": ["CC-12"],
+      "route": "local_with_optional_cloud",
+      "cloud_request": "allowed",
+      "composition_decision": "fallback_baseline",
+      "fallback_trigger": "provider_failure",
+      "error_codes": ["E_PROVIDER"],
+      "feedback": {
+        "feedback_kind": "minimal_status",
+        "message": "Local formatting used"
+      },
+      "delivery": {
+        "state": "unsent",
+        "auto_send": false,
+        "live_type": false,
+        "replace_delivered": false
+      },
+      "correlation_id": "dx-03-provider",
+      "events": [
+        {
+          "name": "route_selected",
+          "t_ms": 0,
+          "route": "local_with_optional_cloud",
+          "cloud_request": "allowed"
+        },
+        { "name": "cloud_request_started", "t_ms": 8 },
+        {
+          "name": "provider_failed",
+          "t_ms": 90,
+          "error_codes": ["E_PROVIDER"],
+          "detail": "upstream_5xx"
+        },
+        {
+          "name": "fallback_baseline_selected",
+          "t_ms": 91,
+          "fallback_trigger": "provider_failure",
+          "error_codes": ["E_PROVIDER"]
+        },
+        { "name": "delivery_emitted", "t_ms": 92 }
+      ],
+      "late_result": null,
+      "rationale": "Provider error; baseline; minimal status; truncated detail only."
+    },
+    {
+      "id": "DX-04",
+      "title": "Schema failure after response — minimal status",
+      "mode": "production",
+      "roles": ["schema_failure", "hard_fallback"],
+      "related_behavior_fixture_ids": ["DPR-47"],
+      "related_combined_call_ids": ["CC-11"],
+      "route": "local_with_optional_cloud",
+      "cloud_request": "allowed",
+      "composition_decision": "fallback_baseline",
+      "fallback_trigger": "response_schema_failure",
+      "error_codes": ["E_SCHEMA", "E_MALFORMED"],
+      "feedback": {
+        "feedback_kind": "minimal_status",
+        "message": "Local formatting used"
+      },
+      "delivery": {
+        "state": "unsent",
+        "auto_send": false,
+        "live_type": false,
+        "replace_delivered": false
+      },
+      "correlation_id": "dx-04-schema",
+      "events": [
+        {
+          "name": "route_selected",
+          "t_ms": 0,
+          "route": "local_with_optional_cloud",
+          "cloud_request": "allowed"
+        },
+        { "name": "cloud_request_started", "t_ms": 11 },
+        {
+          "name": "cloud_response_received",
+          "t_ms": 300,
+          "http_body_snippet": "{\"not\":\"a candidate\"}"
+        },
+        {
+          "name": "schema_validation_failed",
+          "t_ms": 301,
+          "error_codes": ["E_SCHEMA", "E_MALFORMED"]
+        },
+        {
+          "name": "fallback_baseline_selected",
+          "t_ms": 301,
+          "fallback_trigger": "response_schema_failure",
+          "error_codes": ["E_SCHEMA", "E_MALFORMED"]
+        },
+        { "name": "delivery_emitted", "t_ms": 302 }
+      ],
+      "late_result": null,
+      "rationale": "Response arrived but failed schema; baseline; snippet bounded."
+    },
+    {
+      "id": "DX-05",
+      "title": "Unverifiable derivation — hard reject",
+      "mode": "production",
+      "roles": ["source_derivation_failed", "hard_fallback"],
+      "related_behavior_fixture_ids": [],
+      "related_combined_call_ids": ["CC-18"],
+      "route": "local_with_optional_cloud",
+      "cloud_request": "allowed",
+      "composition_decision": "fallback_baseline",
+      "fallback_trigger": "unverifiable_source_derivation",
+      "error_codes": ["E_UNVERIFIABLE"],
+      "feedback": {
+        "feedback_kind": "minimal_status",
+        "message": "Local formatting used"
+      },
+      "delivery": {
+        "state": "unsent",
+        "auto_send": false,
+        "live_type": false,
+        "replace_delivered": false
+      },
+      "correlation_id": "dx-05-unverifiable",
+      "events": [
+        {
+          "name": "route_selected",
+          "t_ms": 0,
+          "route": "local_with_optional_cloud",
+          "cloud_request": "allowed"
+        },
+        { "name": "cloud_request_started", "t_ms": 9 },
+        { "name": "cloud_response_received", "t_ms": 380 },
+        {
+          "name": "source_derivation_failed",
+          "t_ms": 381,
+          "error_codes": ["E_UNVERIFIABLE"]
+        },
+        {
+          "name": "fallback_baseline_selected",
+          "t_ms": 381,
+          "fallback_trigger": "unverifiable_source_derivation",
+          "error_codes": ["E_UNVERIFIABLE"]
+        },
+        { "name": "delivery_emitted", "t_ms": 382 }
+      ],
+      "late_result": null,
+      "rationale": "Candidate omitted unremoved words; #139 gate rejects; baseline."
+    },
+    {
+      "id": "DX-06",
+      "title": "Cloud skipped local fast path — silent",
+      "mode": "production",
+      "roles": ["skipped", "silent", "local_fast_path"],
+      "related_behavior_fixture_ids": ["DPR-01"],
+      "related_combined_call_ids": ["CC-23"],
+      "route": "deterministic_local",
+      "cloud_request": "not_allowed",
+      "composition_decision": "fallback_baseline",
+      "fallback_trigger": null,
+      "error_codes": [],
+      "feedback": { "feedback_kind": "silent", "message": null },
+      "delivery": {
+        "state": "unsent",
+        "auto_send": false,
+        "live_type": false,
+        "replace_delivered": false
+      },
+      "correlation_id": "dx-06-skip",
+      "events": [
+        {
+          "name": "route_selected",
+          "t_ms": 0,
+          "route": "deterministic_local",
+          "cloud_request": "not_allowed"
+        },
+        { "name": "cloud_skipped", "t_ms": 0 },
+        {
+          "name": "fallback_baseline_selected",
+          "t_ms": 1,
+          "fallback_trigger": null
+        },
+        { "name": "delivery_emitted", "t_ms": 2 }
+      ],
+      "late_result": null,
+      "rationale": "No cloud attempt; silent success path with local baseline."
+    },
+    {
+      "id": "DX-07",
+      "title": "Soft uncertain backtrack — silent preserve words",
+      "mode": "production",
+      "roles": ["soft_salvage", "silent"],
+      "related_behavior_fixture_ids": [],
+      "related_combined_call_ids": ["CC-05"],
+      "route": "local_with_optional_cloud",
+      "cloud_request": "allowed",
+      "composition_decision": "accept_preserve_words",
+      "fallback_trigger": "uncertain_backtracking",
+      "error_codes": ["E_UNCERTAIN_BACKTRACK"],
+      "feedback": { "feedback_kind": "silent", "message": null },
+      "delivery": {
+        "state": "unsent",
+        "auto_send": false,
+        "live_type": false,
+        "replace_delivered": false
+      },
+      "correlation_id": "dx-07-soft-backtrack",
+      "events": [
+        {
+          "name": "route_selected",
+          "t_ms": 0,
+          "route": "local_with_optional_cloud",
+          "cloud_request": "allowed"
+        },
+        { "name": "cloud_request_started", "t_ms": 10 },
+        { "name": "cloud_response_received", "t_ms": 400 },
+        {
+          "name": "composition_accepted",
+          "t_ms": 401,
+          "composition_decision": "accept_preserve_words",
+          "error_codes": ["E_UNCERTAIN_BACKTRACK"]
+        },
+        { "name": "delivery_emitted", "t_ms": 402 }
+      ],
+      "late_result": null,
+      "rationale": "Soft salvage is usable text; feedback stays silent."
+    },
+    {
+      "id": "DX-08",
+      "title": "Evaluation: valid late result retained after deadline Delivery",
+      "mode": "evaluation",
+      "roles": ["deadline", "late_result", "evaluation"],
+      "related_behavior_fixture_ids": ["DPR-42"],
+      "related_combined_call_ids": ["CC-13"],
+      "route": "local_with_optional_cloud",
+      "cloud_request": "allowed",
+      "composition_decision": "fallback_baseline",
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": ["E_DEADLINE"],
+      "feedback": {
+        "feedback_kind": "minimal_status",
+        "message": "Local formatting used"
+      },
+      "delivery": {
+        "state": "unsent",
+        "auto_send": false,
+        "live_type": false,
+        "replace_delivered": false
+      },
+      "correlation_id": "dx-08-eval-late",
+      "events": [
+        {
+          "name": "route_selected",
+          "t_ms": 0,
+          "route": "local_with_optional_cloud",
+          "cloud_request": "allowed"
+        },
+        { "name": "cloud_request_started", "t_ms": 10 },
+        {
+          "name": "cloud_deadline_exceeded",
+          "t_ms": 1500,
+          "error_codes": ["E_DEADLINE"]
+        },
+        {
+          "name": "fallback_baseline_selected",
+          "t_ms": 1500,
+          "fallback_trigger": "deadline_exceeded",
+          "error_codes": ["E_DEADLINE"]
+        },
+        { "name": "delivery_emitted", "t_ms": 1501 },
+        {
+          "name": "late_result_retained",
+          "t_ms": 1675,
+          "arrived_t_ms": 1675,
+          "candidate_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "candidate_text_clamped": "Send the notes when you get a chance.",
+          "would_have_decision": "accept"
+        }
+      ],
+      "late_result": {
+        "lane": "late_result_evaluation",
+        "retained": true,
+        "arrived_t_ms": 1675,
+        "candidate_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "candidate_text_clamped": "Send the notes when you get a chance.",
+        "would_have_decision": "accept",
+        "compare_to_delivered": true
+      },
+      "rationale": "Evaluation retains valid late candidate for offline compare; never replaces Delivery."
+    },
+    {
+      "id": "DX-09",
+      "title": "Production: valid late result discarded after deadline",
+      "mode": "production",
+      "roles": ["deadline", "late_result", "production"],
+      "related_behavior_fixture_ids": ["DPR-42"],
+      "related_combined_call_ids": ["CC-13"],
+      "route": "local_with_optional_cloud",
+      "cloud_request": "allowed",
+      "composition_decision": "fallback_baseline",
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": ["E_DEADLINE"],
+      "feedback": {
+        "feedback_kind": "minimal_status",
+        "message": "Local formatting used"
+      },
+      "delivery": {
+        "state": "unsent",
+        "auto_send": false,
+        "live_type": false,
+        "replace_delivered": false
+      },
+      "correlation_id": "dx-09-prod-late",
+      "events": [
+        {
+          "name": "route_selected",
+          "t_ms": 0,
+          "route": "local_with_optional_cloud",
+          "cloud_request": "allowed"
+        },
+        { "name": "cloud_request_started", "t_ms": 10 },
+        {
+          "name": "cloud_deadline_exceeded",
+          "t_ms": 1500,
+          "error_codes": ["E_DEADLINE"]
+        },
+        {
+          "name": "fallback_baseline_selected",
+          "t_ms": 1500,
+          "fallback_trigger": "deadline_exceeded",
+          "error_codes": ["E_DEADLINE"]
+        },
+        { "name": "delivery_emitted", "t_ms": 1501 },
+        {
+          "name": "late_result_discarded",
+          "t_ms": 1675,
+          "arrived_t_ms": 1675,
+          "candidate_fingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "detail": "production_no_upgrade"
+        }
+      ],
+      "late_result": {
+        "lane": "late_result_evaluation",
+        "retained": false,
+        "arrived_t_ms": 1675,
+        "candidate_fingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "candidate_text_clamped": null,
+        "would_have_decision": "accept",
+        "compare_to_delivered": false
+      },
+      "rationale": "Production records timing + optional fingerprint only; no late text retention for upgrade."
+    },
+    {
+      "id": "DX-10",
+      "title": "Evaluation: invalid late result discarded",
+      "mode": "evaluation",
+      "roles": ["late_result", "invalid_late", "evaluation"],
+      "related_behavior_fixture_ids": [],
+      "related_combined_call_ids": ["CC-18"],
+      "route": "local_with_optional_cloud",
+      "cloud_request": "allowed",
+      "composition_decision": "fallback_baseline",
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": ["E_DEADLINE"],
+      "feedback": {
+        "feedback_kind": "minimal_status",
+        "message": "Local formatting used"
+      },
+      "delivery": {
+        "state": "unsent",
+        "auto_send": false,
+        "live_type": false,
+        "replace_delivered": false
+      },
+      "correlation_id": "dx-10-invalid-late",
+      "events": [
+        {
+          "name": "route_selected",
+          "t_ms": 0,
+          "route": "local_with_optional_cloud",
+          "cloud_request": "allowed"
+        },
+        { "name": "cloud_request_started", "t_ms": 10 },
+        {
+          "name": "cloud_deadline_exceeded",
+          "t_ms": 1500,
+          "error_codes": ["E_DEADLINE"]
+        },
+        {
+          "name": "fallback_baseline_selected",
+          "t_ms": 1500,
+          "fallback_trigger": "deadline_exceeded"
+        },
+        { "name": "delivery_emitted", "t_ms": 1501 },
+        {
+          "name": "late_result_discarded",
+          "t_ms": 1600,
+          "arrived_t_ms": 1600,
+          "detail": "late_validation_failed",
+          "error_codes": ["E_UNVERIFIABLE"]
+        }
+      ],
+      "late_result": {
+        "lane": "late_result_evaluation",
+        "retained": false,
+        "arrived_t_ms": 1600,
+        "candidate_fingerprint": null,
+        "candidate_text_clamped": null,
+        "would_have_decision": "fallback_baseline",
+        "compare_to_delivered": false
+      },
+      "rationale": "Even in evaluation, invalid late candidates are discarded."
+    },
+    {
+      "id": "DX-11",
+      "title": "Soft uncertain layout — silent natural layout",
+      "mode": "production",
+      "roles": ["soft_salvage", "silent", "layout"],
+      "related_behavior_fixture_ids": [],
+      "related_combined_call_ids": ["CC-06"],
+      "route": "local_with_optional_cloud",
+      "cloud_request": "allowed",
+      "composition_decision": "accept_natural_layout",
+      "fallback_trigger": "uncertain_layout",
+      "error_codes": ["E_UNCERTAIN_LAYOUT"],
+      "feedback": { "feedback_kind": "silent", "message": null },
+      "delivery": {
+        "state": "unsent",
+        "auto_send": false,
+        "live_type": false,
+        "replace_delivered": false
+      },
+      "correlation_id": "dx-11-soft-layout",
+      "events": [
+        {
+          "name": "route_selected",
+          "t_ms": 0,
+          "route": "local_with_optional_cloud",
+          "cloud_request": "allowed"
+        },
+        { "name": "cloud_request_started", "t_ms": 12 },
+        { "name": "cloud_response_received", "t_ms": 350 },
+        {
+          "name": "composition_accepted",
+          "t_ms": 351,
+          "composition_decision": "accept_natural_layout",
+          "error_codes": ["E_UNCERTAIN_LAYOUT"]
+        },
+        { "name": "delivery_emitted", "t_ms": 352 }
+      ],
+      "late_result": null,
+      "rationale": "Uncertain layout soft salvage is silent."
+    },
+    {
+      "id": "DX-12",
+      "title": "Protected-token dual-STT dispute cloud path recorded",
+      "mode": "production",
+      "roles": ["dispute", "required_cloud"],
+      "related_behavior_fixture_ids": [],
+      "related_combined_call_ids": ["CC-15"],
+      "route": "local_with_optional_cloud",
+      "cloud_request": "required",
+      "composition_decision": "accept",
+      "fallback_trigger": null,
+      "error_codes": [],
+      "feedback": { "feedback_kind": "silent", "message": null },
+      "delivery": {
+        "state": "unsent",
+        "auto_send": false,
+        "live_type": false,
+        "replace_delivered": false
+      },
+      "correlation_id": "dx-12-dispute",
+      "events": [
+        {
+          "name": "route_selected",
+          "t_ms": 0,
+          "route": "local_with_optional_cloud",
+          "cloud_request": "required",
+          "detail": "protected_token_disagreement"
+        },
+        { "name": "cloud_request_started", "t_ms": 15 },
+        { "name": "cloud_response_received", "t_ms": 500 },
+        {
+          "name": "composition_accepted",
+          "t_ms": 501,
+          "composition_decision": "accept"
+        },
+        { "name": "delivery_emitted", "t_ms": 502 }
+      ],
+      "late_result": null,
+      "rationale": "Dispute forces cloud eligibility; diagnostics record required cloud_request."
+    },
+    {
+      "id": "DX-13",
+      "title": "Unsafe semantics reject — minimal status",
+      "mode": "production",
+      "roles": ["unsafe", "hard_fallback"],
+      "related_behavior_fixture_ids": [],
+      "related_combined_call_ids": [],
+      "route": "local_with_optional_cloud",
+      "cloud_request": "allowed",
+      "composition_decision": "fallback_baseline",
+      "fallback_trigger": "unsafe_semantics",
+      "error_codes": ["E_PROTECTED", "E_UNSAFE_SEMANTICS"],
+      "feedback": {
+        "feedback_kind": "minimal_status",
+        "message": "Local formatting used"
+      },
+      "delivery": {
+        "state": "unsent",
+        "auto_send": false,
+        "live_type": false,
+        "replace_delivered": false
+      },
+      "correlation_id": "dx-13-unsafe",
+      "events": [
+        {
+          "name": "route_selected",
+          "t_ms": 0,
+          "route": "local_with_optional_cloud",
+          "cloud_request": "allowed"
+        },
+        { "name": "cloud_request_started", "t_ms": 10 },
+        { "name": "cloud_response_received", "t_ms": 410 },
+        {
+          "name": "source_derivation_failed",
+          "t_ms": 411,
+          "error_codes": ["E_PROTECTED", "E_UNSAFE_SEMANTICS"]
+        },
+        {
+          "name": "fallback_baseline_selected",
+          "t_ms": 411,
+          "fallback_trigger": "unsafe_semantics",
+          "error_codes": ["E_PROTECTED", "E_UNSAFE_SEMANTICS"]
+        },
+        { "name": "delivery_emitted", "t_ms": 412 }
+      ],
+      "late_result": null,
+      "rationale": "Protected token alteration fails closed to baseline."
+    },
+    {
+      "id": "DX-14",
+      "title": "Literal identity route — silent no cloud",
+      "mode": "production",
+      "roles": ["literal", "skipped", "silent"],
+      "related_behavior_fixture_ids": [],
+      "related_combined_call_ids": [],
+      "route": "literal_identity",
+      "cloud_request": "not_allowed",
+      "composition_decision": "fallback_baseline",
+      "fallback_trigger": null,
+      "error_codes": [],
+      "feedback": { "feedback_kind": "silent", "message": null },
+      "delivery": {
+        "state": "unsent",
+        "auto_send": false,
+        "live_type": false,
+        "replace_delivered": false
+      },
+      "correlation_id": "dx-14-literal",
+      "events": [
+        {
+          "name": "route_selected",
+          "t_ms": 0,
+          "route": "literal_identity",
+          "cloud_request": "not_allowed"
+        },
+        { "name": "cloud_skipped", "t_ms": 0 },
+        {
+          "name": "fallback_baseline_selected",
+          "t_ms": 0,
+          "fallback_trigger": null
+        },
+        { "name": "delivery_emitted", "t_ms": 1 }
+      ],
+      "late_result": null,
+      "rationale": "Literal/preformatted path never attempts cloud; silent."
+    }
+  ],
+  "dataset_counts": {
+    "fixtures_total": 14,
+    "evaluation": 2,
+    "production": 12,
+    "hard_fallback": 7,
+    "soft_salvage": 2,
+    "late_result_cases": 3,
+    "silent": 7,
+    "minimal_status": 7,
+    "notes": "Counts are package-level; prototype recomputes and must match."
+  }
+}

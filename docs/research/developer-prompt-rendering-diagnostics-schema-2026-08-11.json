@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Anuraj-dev/voisu/main/docs/research/developer-prompt-rendering-diagnostics-schema-2026-08-11.json",
+  "title": "Voisu Developer Prompt Rendering diagnostics package (#142)",
+  "description": "Structural schema for #142 fallback feedback + diagnostic event timeline fixtures. The paired stdlib prototype enforces exact owned key sets, event order, mode rules, and retention bounds; it is not a generic Draft 2020-12 engine.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "corpus_id",
+    "version",
+    "issue",
+    "language",
+    "governing",
+    "modes",
+    "feedback_kinds",
+    "feedback_catalog",
+    "event_names",
+    "composition_decisions",
+    "fallback_triggers",
+    "error_codes",
+    "thresholds",
+    "invariants",
+    "production_cleanup",
+    "fixtures",
+    "dataset_counts"
+  ],
+  "properties": {
+    "corpus_id": {
+      "const": "voisu-developer-prompt-rendering-diagnostics-2026-08-11"
+    },
+    "version": { "type": "string", "minLength": 1 },
+    "issue": { "$ref": "#/$defs/issue" },
+    "language": { "const": "en" },
+    "governing": { "type": "object" },
+    "modes": {
+      "const": ["evaluation", "production"]
+    },
+    "feedback_kinds": {
+      "const": ["silent", "minimal_status"]
+    },
+    "feedback_catalog": {
+      "type": "array",
+      "minItems": 1
+    },
+    "event_names": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" }
+    },
+    "composition_decisions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "fallback_triggers": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "error_codes": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "thresholds": { "type": "object" },
+    "invariants": {
+      "type": "array",
+      "minItems": 1
+    },
+    "production_cleanup": { "type": "object" },
+    "fixtures": {
+      "type": "array",
+      "minItems": 1
+    },
+    "dataset_counts": { "type": "object" }
+  },
+  "$defs": {
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "github_number",
+        "title",
+        "parent_map",
+        "blocked_by",
+        "blocks",
+        "url"
+      ],
+      "properties": {
+        "github_number": { "const": 142 },
+        "title": { "type": "string" },
+        "parent_map": { "const": 133 },
+        "blocked_by": { "const": 139 },
+        "blocks": {
+          "type": "array",
+          "items": { "type": "integer" }
+        },
+        "url": { "type": "string" }
+      }
+    },
+    "delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "auto_send", "live_type", "replace_delivered"],
+      "properties": {
+        "state": { "const": "unsent" },
+        "auto_send": { "const": false },
+        "live_type": { "const": false },
+        "replace_delivered": { "const": false }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "t_ms"],
+      "properties": {
+        "name": { "type": "string" },
+        "t_ms": { "type": "integer", "minimum": 0 },
+        "detail": { "type": "string" },
+        "error_codes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "fallback_trigger": { "type": ["string", "null"] },
+        "composition_decision": { "type": ["string", "null"] },
+        "http_body_snippet": { "type": "string" },
+        "candidate_fingerprint": { "type": "string" },
+        "candidate_text_clamped": { "type": "string" },
+        "arrived_t_ms": { "type": "integer", "minimum": 0 },
+        "would_have_decision": { "type": "string" },
+        "route": { "type": "string" },
+        "cloud_request": { "type": "string" }
+      }
+    }
+  }
+}
