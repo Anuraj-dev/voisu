@@ -1,0 +1,1842 @@
+{
+  "corpus_id": "voisu-developer-prompt-rendering-intent-routing-2026-08-11",
+  "version": "1.0.2",
+  "issue": {
+    "github_number": 141,
+    "title": "Prototype weighted intent routing and local fast paths",
+    "parent_map": 133,
+    "blocks": [
+      144
+    ],
+    "url": "https://github.com/Anuraj-dev/voisu/issues/141"
+  },
+  "language": "en",
+  "governing": {
+    "contract_issue": 137,
+    "map_issue": 133,
+    "behavior_corpus_issue": 138,
+    "delivery_deadline_ms": 1500,
+    "network_on_decision_path": false,
+    "out_of_scope": [
+      "grammar correction",
+      "prompt enrichment inventing requirements",
+      "cloud client or network I/O on the decision path",
+      "Structured label invention inside the router",
+      "auto-send",
+      "live typing",
+      "clipboard page or screenshot context",
+      "wall-clock sleeps in tests"
+    ]
+  },
+  "routes": [
+    "literal_identity",
+    "deterministic_local",
+    "local_with_optional_cloud"
+  ],
+  "cloud_request_states": [
+    "not_allowed",
+    "allowed",
+    "required"
+  ],
+  "policies": [
+    "natural",
+    "adaptive",
+    "structured"
+  ],
+  "provider_states": [
+    "exact_agreement",
+    "punctuation_only_agreement",
+    "safe_complementary",
+    "protected_token_disagreement",
+    "semantic_disagreement",
+    "single_provider"
+  ],
+  "surface_hints": [
+    "shell",
+    "terminal",
+    "coding_agent",
+    "gui_agent",
+    "messaging",
+    "browser",
+    "unknown",
+    null
+  ],
+  "process_classes": [
+    "shell",
+    "terminal",
+    "coding_agent",
+    "gui_agent",
+    "messaging",
+    "browser",
+    "unknown"
+  ],
+  "rule_ids": [
+    "R_DISPUTE_CLOUD",
+    "R_DISPUTE_POLICY_FORBID",
+    "R_LITERAL_PREFORMATTED",
+    "R_LITERAL_COMMAND",
+    "R_NATURAL_LOCAL",
+    "R_COMPLEX_CLOUD",
+    "R_DEFAULT_LOCAL"
+  ],
+  "weights": {
+    "section_goal": 12,
+    "section_context": 12,
+    "section_requirements": 12,
+    "section_constraints": 12,
+    "section_steps": 12,
+    "section_acceptance_criteria": 14,
+    "section_files": 10,
+    "section_notes": 10,
+    "words_ge_40": 4,
+    "words_ge_80": 6,
+    "surface_coding_agent_sections": 4,
+    "surface_gui_agent_sections": 3,
+    "surface_messaging_short": -6,
+    "surface_browser_short": -4,
+    "process_coding_boost": 2,
+    "timing_clear_pause": 0,
+    "timing_uncertain_pause": 0
+  },
+  "thresholds": {
+    "complexity_cloud": 24,
+    "messaging_short_words": 30,
+    "browser_short_words": 25,
+    "section_cues_for_length_assist": 2,
+    "delivery_deadline_ms": 1500
+  },
+  "closed_tags": [
+    "policy-natural",
+    "policy-adaptive",
+    "policy-structured",
+    "route-literal",
+    "route-local",
+    "route-cloud-optional",
+    "cloud-not-allowed",
+    "cloud-allowed",
+    "cloud-required",
+    "surface-shell",
+    "surface-terminal",
+    "surface-coding-agent",
+    "surface-gui-agent",
+    "surface-messaging",
+    "surface-browser",
+    "surface-unknown",
+    "surface-null",
+    "process-hint",
+    "speech-only",
+    "stt-exact",
+    "stt-punct",
+    "stt-complementary",
+    "stt-protected-disagreement",
+    "stt-semantic-disagreement",
+    "stt-single",
+    "complex-multi-section",
+    "simple-section",
+    "simple-everyday",
+    "preformatted",
+    "command-shaped",
+    "timing-clear",
+    "timing-uncertain",
+    "negative-n1",
+    "negative-n2",
+    "negative-n3",
+    "negative-n4",
+    "negative-n5",
+    "negative-n6",
+    "long-everyday-no-sections"
+  ],
+  "coverage_requirements": [
+    "policy-natural",
+    "policy-adaptive",
+    "policy-structured",
+    "route-literal",
+    "route-local",
+    "route-cloud-optional",
+    "cloud-not-allowed",
+    "cloud-allowed",
+    "cloud-required",
+    "surface-shell",
+    "surface-terminal",
+    "surface-coding-agent",
+    "surface-gui-agent",
+    "surface-messaging",
+    "surface-browser",
+    "surface-unknown",
+    "surface-null",
+    "process-hint",
+    "speech-only",
+    "stt-exact",
+    "stt-punct",
+    "stt-complementary",
+    "stt-protected-disagreement",
+    "stt-semantic-disagreement",
+    "stt-single",
+    "complex-multi-section",
+    "simple-section",
+    "simple-everyday",
+    "preformatted",
+    "command-shaped",
+    "timing-clear",
+    "timing-uncertain",
+    "negative-n1",
+    "negative-n2",
+    "negative-n3",
+    "negative-n4",
+    "negative-n5",
+    "negative-n6",
+    "long-everyday-no-sections"
+  ],
+  "coverage_matrix": {
+    "policy-natural": [
+      "IRI-02",
+      "IRI-12",
+      "IRI-15",
+      "IRI-37"
+    ],
+    "policy-adaptive": [
+      "IRI-01",
+      "IRI-03",
+      "IRI-04",
+      "IRI-05",
+      "IRI-06",
+      "IRI-07",
+      "IRI-08",
+      "IRI-09",
+      "IRI-10",
+      "IRI-11",
+      "IRI-13",
+      "IRI-16",
+      "IRI-18",
+      "IRI-19",
+      "IRI-20",
+      "IRI-21",
+      "IRI-22",
+      "IRI-23",
+      "IRI-24",
+      "IRI-25",
+      "IRI-26",
+      "IRI-27",
+      "IRI-29",
+      "IRI-30",
+      "IRI-31",
+      "IRI-32",
+      "IRI-33",
+      "IRI-34",
+      "IRI-35",
+      "IRI-36",
+      "IRI-38",
+      "IRI-39",
+      "IRI-40"
+    ],
+    "policy-structured": [
+      "IRI-14",
+      "IRI-17",
+      "IRI-28"
+    ],
+    "route-literal": [
+      "IRI-03",
+      "IRI-04",
+      "IRI-05",
+      "IRI-27",
+      "IRI-30",
+      "IRI-34"
+    ],
+    "route-local": [
+      "IRI-01",
+      "IRI-02",
+      "IRI-06",
+      "IRI-07",
+      "IRI-08",
+      "IRI-09",
+      "IRI-12",
+      "IRI-15",
+      "IRI-16",
+      "IRI-17",
+      "IRI-18",
+      "IRI-19",
+      "IRI-20",
+      "IRI-21",
+      "IRI-23",
+      "IRI-25",
+      "IRI-26",
+      "IRI-29",
+      "IRI-31",
+      "IRI-32",
+      "IRI-33",
+      "IRI-37",
+      "IRI-38",
+      "IRI-39",
+      "IRI-40"
+    ],
+    "route-cloud-optional": [
+      "IRI-10",
+      "IRI-11",
+      "IRI-13",
+      "IRI-14",
+      "IRI-22",
+      "IRI-24",
+      "IRI-28",
+      "IRI-35",
+      "IRI-36"
+    ],
+    "cloud-not-allowed": [
+      "IRI-01",
+      "IRI-02",
+      "IRI-03",
+      "IRI-04",
+      "IRI-05",
+      "IRI-06",
+      "IRI-07",
+      "IRI-08",
+      "IRI-09",
+      "IRI-12",
+      "IRI-15",
+      "IRI-16",
+      "IRI-17",
+      "IRI-18",
+      "IRI-19",
+      "IRI-20",
+      "IRI-21",
+      "IRI-23",
+      "IRI-25",
+      "IRI-26",
+      "IRI-27",
+      "IRI-29",
+      "IRI-30",
+      "IRI-31",
+      "IRI-32",
+      "IRI-33",
+      "IRI-34",
+      "IRI-37",
+      "IRI-38",
+      "IRI-39",
+      "IRI-40"
+    ],
+    "cloud-allowed": [
+      "IRI-10",
+      "IRI-11",
+      "IRI-13",
+      "IRI-22",
+      "IRI-24",
+      "IRI-35",
+      "IRI-36"
+    ],
+    "cloud-required": [
+      "IRI-14",
+      "IRI-28"
+    ],
+    "surface-shell": [
+      "IRI-04",
+      "IRI-26",
+      "IRI-31",
+      "IRI-32",
+      "IRI-33",
+      "IRI-34",
+      "IRI-36",
+      "IRI-38",
+      "IRI-39"
+    ],
+    "surface-terminal": [
+      "IRI-05"
+    ],
+    "surface-coding-agent": [
+      "IRI-13",
+      "IRI-14",
+      "IRI-15",
+      "IRI-16",
+      "IRI-17",
+      "IRI-25",
+      "IRI-28"
+    ],
+    "surface-gui-agent": [
+      "IRI-22"
+    ],
+    "surface-messaging": [
+      "IRI-01",
+      "IRI-02",
+      "IRI-20"
+    ],
+    "surface-browser": [
+      "IRI-21"
+    ],
+    "surface-unknown": [
+      "IRI-23"
+    ],
+    "surface-null": [
+      "IRI-03",
+      "IRI-06",
+      "IRI-07",
+      "IRI-08",
+      "IRI-09",
+      "IRI-10",
+      "IRI-11",
+      "IRI-12",
+      "IRI-18",
+      "IRI-19",
+      "IRI-24",
+      "IRI-27",
+      "IRI-29",
+      "IRI-35",
+      "IRI-37",
+      "IRI-40"
+    ],
+    "process-hint": [
+      "IRI-30"
+    ],
+    "speech-only": [
+      "IRI-03",
+      "IRI-06",
+      "IRI-24",
+      "IRI-29",
+      "IRI-40"
+    ],
+    "stt-exact": [
+      "IRI-06"
+    ],
+    "stt-punct": [
+      "IRI-07"
+    ],
+    "stt-complementary": [
+      "IRI-08"
+    ],
+    "stt-protected-disagreement": [
+      "IRI-10",
+      "IRI-12",
+      "IRI-35",
+      "IRI-36",
+      "IRI-37"
+    ],
+    "stt-semantic-disagreement": [
+      "IRI-11"
+    ],
+    "stt-single": [
+      "IRI-01",
+      "IRI-09",
+      "IRI-13"
+    ],
+    "complex-multi-section": [
+      "IRI-13",
+      "IRI-14",
+      "IRI-15",
+      "IRI-22",
+      "IRI-24",
+      "IRI-28"
+    ],
+    "simple-section": [
+      "IRI-16",
+      "IRI-17",
+      "IRI-25"
+    ],
+    "simple-everyday": [
+      "IRI-01",
+      "IRI-02",
+      "IRI-06",
+      "IRI-09",
+      "IRI-20",
+      "IRI-21",
+      "IRI-23",
+      "IRI-31",
+      "IRI-32",
+      "IRI-33",
+      "IRI-38",
+      "IRI-39",
+      "IRI-40"
+    ],
+    "preformatted": [
+      "IRI-03",
+      "IRI-35",
+      "IRI-37"
+    ],
+    "command-shaped": [
+      "IRI-04",
+      "IRI-05",
+      "IRI-27",
+      "IRI-30",
+      "IRI-34",
+      "IRI-36"
+    ],
+    "timing-clear": [
+      "IRI-18"
+    ],
+    "timing-uncertain": [
+      "IRI-19"
+    ],
+    "negative-n1": [
+      "IRI-01",
+      "IRI-20",
+      "IRI-40"
+    ],
+    "negative-n2": [
+      "IRI-06",
+      "IRI-09"
+    ],
+    "negative-n3": [
+      "IRI-10",
+      "IRI-12",
+      "IRI-35",
+      "IRI-36",
+      "IRI-37"
+    ],
+    "negative-n4": [
+      "IRI-15"
+    ],
+    "negative-n5": [
+      "IRI-18",
+      "IRI-19"
+    ],
+    "negative-n6": [
+      "IRI-24"
+    ],
+    "long-everyday-no-sections": [
+      "IRI-29"
+    ]
+  },
+  "fixtures": [
+    {
+      "id": "IRI-01",
+      "title": "Simple Adaptive messaging everyday stays local",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-messaging",
+        "simple-everyday",
+        "stt-single",
+        "negative-n1"
+      ],
+      "policy": "adaptive",
+      "primary_text": "hey can you send the notes when you get a chance",
+      "provider_state": "single_provider",
+      "surface_hint": "messaging",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 0
+      },
+      "negative_case_ids": [
+        "N1"
+      ],
+      "dpr_links": [
+        "DPR-01"
+      ],
+      "rationale": "Short everyday Adaptive messaging: score 0 after short-message assist clamp; never cloud."
+    },
+    {
+      "id": "IRI-02",
+      "title": "Natural everyday punctuation path is local",
+      "tags": [
+        "policy-natural",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-messaging",
+        "simple-everyday"
+      ],
+      "policy": "natural",
+      "primary_text": "hey can you send the notes when you get a chance",
+      "provider_state": "single_provider",
+      "surface_hint": "messaging",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_NATURAL_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 0
+      },
+      "negative_case_ids": [
+        "N4"
+      ],
+      "dpr_links": [
+        "DPR-02"
+      ],
+      "rationale": "Natural policy always selects local after literal gates."
+    },
+    {
+      "id": "IRI-03",
+      "title": "Already-formatted numbered list is literal identity",
+      "tags": [
+        "policy-adaptive",
+        "route-literal",
+        "cloud-not-allowed",
+        "surface-null",
+        "preformatted",
+        "speech-only"
+      ],
+      "policy": "adaptive",
+      "primary_text": "1. Build\n2. Test\n3. Ship",
+      "provider_state": "single_provider",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": null,
+      "expected": {
+        "route": "literal_identity",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_LITERAL_PREFORMATTED",
+        "min_complexity_score": 0,
+        "max_complexity_score": 50
+      },
+      "negative_case_ids": [],
+      "dpr_links": [
+        "DPR-04"
+      ],
+      "rationale": "Multi-line numbered list is already formatted; literal identity, no cloud."
+    },
+    {
+      "id": "IRI-04",
+      "title": "Shell cargo command is literal identity",
+      "tags": [
+        "policy-adaptive",
+        "route-literal",
+        "cloud-not-allowed",
+        "surface-shell",
+        "command-shaped"
+      ],
+      "policy": "adaptive",
+      "primary_text": "run cargo test --workspace -- --test-threads=4",
+      "provider_state": "single_provider",
+      "surface_hint": "shell",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": null,
+      "expected": {
+        "route": "literal_identity",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_LITERAL_COMMAND",
+        "min_complexity_score": 0,
+        "max_complexity_score": 20
+      },
+      "negative_case_ids": [],
+      "dpr_links": [
+        "DPR-18"
+      ],
+      "rationale": "Shell surface plus command-shaped speech → literal identity."
+    },
+    {
+      "id": "IRI-05",
+      "title": "Terminal harness command is literal identity",
+      "tags": [
+        "policy-adaptive",
+        "route-literal",
+        "cloud-not-allowed",
+        "surface-terminal",
+        "command-shaped"
+      ],
+      "policy": "adaptive",
+      "primary_text": "git status --short",
+      "provider_state": "single_provider",
+      "surface_hint": "terminal",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": null,
+      "expected": {
+        "route": "literal_identity",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_LITERAL_COMMAND",
+        "min_complexity_score": 0,
+        "max_complexity_score": 20
+      },
+      "negative_case_ids": [],
+      "dpr_links": [],
+      "rationale": "Terminal harness with git flags is command-shaped literal."
+    },
+    {
+      "id": "IRI-06",
+      "title": "Dual-STT exact agreement uses local fast path",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-null",
+        "stt-exact",
+        "simple-everyday",
+        "speech-only",
+        "negative-n2"
+      ],
+      "policy": "adaptive",
+      "primary_text": "please let me know if that timeline works",
+      "provider_state": "exact_agreement",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 0
+      },
+      "negative_case_ids": [
+        "N2"
+      ],
+      "dpr_links": [
+        "DPR-31"
+      ],
+      "rationale": "Exact dual-provider agreement never opens cloud by itself."
+    },
+    {
+      "id": "IRI-07",
+      "title": "Dual-STT punctuation-only agreement stays local",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-null",
+        "stt-punct"
+      ],
+      "policy": "adaptive",
+      "primary_text": "hey can you send the notes when you get a chance",
+      "provider_state": "punctuation_only_agreement",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 0
+      },
+      "negative_case_ids": [
+        "N2"
+      ],
+      "dpr_links": [
+        "DPR-32"
+      ],
+      "rationale": "Punctuation-only dual-STT differences stay on the local fast path."
+    },
+    {
+      "id": "IRI-08",
+      "title": "Dual-STT safe complementary stays local",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-null",
+        "stt-complementary"
+      ],
+      "policy": "adaptive",
+      "primary_text": "open crates/voisu-core/src/lib.rs please",
+      "provider_state": "safe_complementary",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 12
+      },
+      "negative_case_ids": [
+        "N2"
+      ],
+      "dpr_links": [
+        "DPR-33"
+      ],
+      "rationale": "Safe complementary dual-STT evidence merges locally; no cloud."
+    },
+    {
+      "id": "IRI-09",
+      "title": "Single provider simple speech stays local",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-null",
+        "stt-single",
+        "simple-everyday",
+        "negative-n2"
+      ],
+      "policy": "adaptive",
+      "primary_text": "please let me know if that timeline works",
+      "provider_state": "single_provider",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 0
+      },
+      "negative_case_ids": [
+        "N2"
+      ],
+      "dpr_links": [
+        "DPR-36"
+      ],
+      "rationale": "Single-provider availability remains usable without forcing cloud."
+    },
+    {
+      "id": "IRI-10",
+      "title": "Protected-token dual-STT disagreement allows optional cloud",
+      "tags": [
+        "policy-adaptive",
+        "route-cloud-optional",
+        "cloud-allowed",
+        "surface-null",
+        "stt-protected-disagreement",
+        "negative-n3"
+      ],
+      "policy": "adaptive",
+      "primary_text": "file the bug in voisu",
+      "provider_state": "protected_token_disagreement",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "local_with_optional_cloud",
+        "cloud_request": "allowed",
+        "rule_id": "R_DISPUTE_CLOUD",
+        "min_complexity_score": 0,
+        "max_complexity_score": 20
+      },
+      "negative_case_ids": [
+        "N3"
+      ],
+      "dpr_links": [
+        "DPR-34"
+      ],
+      "rationale": "Protected-token disagreement under Adaptive opens optional cloud; must not skip eligibility."
+    },
+    {
+      "id": "IRI-11",
+      "title": "Semantic dual-STT disagreement allows optional cloud",
+      "tags": [
+        "policy-adaptive",
+        "route-cloud-optional",
+        "cloud-allowed",
+        "surface-null",
+        "stt-semantic-disagreement",
+        "negative-n3"
+      ],
+      "policy": "adaptive",
+      "primary_text": "do not enable the feature flag in production",
+      "provider_state": "semantic_disagreement",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "local_with_optional_cloud",
+        "cloud_request": "allowed",
+        "rule_id": "R_DISPUTE_CLOUD",
+        "min_complexity_score": 0,
+        "max_complexity_score": 20
+      },
+      "negative_case_ids": [
+        "N3"
+      ],
+      "dpr_links": [
+        "DPR-35"
+      ],
+      "rationale": "Semantic disagreement is disputed speech; optional cloud allowed under Adaptive."
+    },
+    {
+      "id": "IRI-12",
+      "title": "Natural policy forbids cloud on protected-token disagreement",
+      "tags": [
+        "policy-natural",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-null",
+        "stt-protected-disagreement",
+        "negative-n3"
+      ],
+      "policy": "natural",
+      "primary_text": "file the bug in voisu",
+      "provider_state": "protected_token_disagreement",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DISPUTE_POLICY_FORBID",
+        "min_complexity_score": 0,
+        "max_complexity_score": 20
+      },
+      "negative_case_ids": [
+        "N3",
+        "N4"
+      ],
+      "dpr_links": [],
+      "rationale": "Policy forbids cloud: Natural keeps primary-rank local baseline despite protected-token dispute."
+    },
+    {
+      "id": "IRI-13",
+      "title": "Complex multi-section Adaptive coding agent allows cloud",
+      "tags": [
+        "policy-adaptive",
+        "route-cloud-optional",
+        "cloud-allowed",
+        "surface-coding-agent",
+        "complex-multi-section",
+        "stt-single"
+      ],
+      "policy": "adaptive",
+      "primary_text": "goal fix the flaky auth test context it fails on CI only requirements keep public API stable constraints no new dependencies steps one reproduce two isolate three fix four verify acceptance criteria CI is green on main files crates/voisu-core/src/auth.rs notes keep the change small",
+      "provider_state": "single_provider",
+      "surface_hint": "coding_agent",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "developer_prompt",
+      "expected": {
+        "route": "local_with_optional_cloud",
+        "cloud_request": "allowed",
+        "rule_id": "R_COMPLEX_CLOUD",
+        "min_complexity_score": 24,
+        "max_complexity_score": 200
+      },
+      "negative_case_ids": [],
+      "dpr_links": [
+        "DPR-37",
+        "DPR-46"
+      ],
+      "rationale": "Eight section cues plus length/surface assists exceed threshold under Adaptive → optional cloud."
+    },
+    {
+      "id": "IRI-14",
+      "title": "Complex multi-section Structured requires cloud attempt",
+      "tags": [
+        "policy-structured",
+        "route-cloud-optional",
+        "cloud-required",
+        "surface-coding-agent",
+        "complex-multi-section"
+      ],
+      "policy": "structured",
+      "primary_text": "goal fix the flaky auth test context it fails on CI only requirements keep public API stable constraints no new dependencies steps one reproduce two isolate three fix four verify acceptance criteria CI is green on main files crates/voisu-core/src/auth.rs notes keep the change small",
+      "provider_state": "single_provider",
+      "surface_hint": "coding_agent",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "developer_prompt",
+      "expected": {
+        "route": "local_with_optional_cloud",
+        "cloud_request": "required",
+        "rule_id": "R_COMPLEX_CLOUD",
+        "min_complexity_score": 24,
+        "max_complexity_score": 200
+      },
+      "negative_case_ids": [],
+      "dpr_links": [
+        "DPR-39",
+        "DPR-43"
+      ],
+      "rationale": "Structured complex multi-section speech requires a cloud organize attempt; labels applied later."
+    },
+    {
+      "id": "IRI-15",
+      "title": "Complex multi-section Natural stays local no cloud",
+      "tags": [
+        "policy-natural",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-coding-agent",
+        "complex-multi-section",
+        "negative-n4"
+      ],
+      "policy": "natural",
+      "primary_text": "goal fix the flaky auth test context it fails on CI only requirements keep public API stable constraints no new dependencies steps one reproduce two isolate three fix four verify acceptance criteria CI is green on main files crates/voisu-core/src/auth.rs notes keep the change small",
+      "provider_state": "single_provider",
+      "surface_hint": "coding_agent",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "developer_prompt",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_NATURAL_LOCAL",
+        "min_complexity_score": 24,
+        "max_complexity_score": 200
+      },
+      "negative_case_ids": [
+        "N4"
+      ],
+      "dpr_links": [
+        "DPR-26"
+      ],
+      "rationale": "Natural never attempts cloud even when speech is multi-section complex."
+    },
+    {
+      "id": "IRI-16",
+      "title": "Simple one-section developer Adaptive stays local",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-coding-agent",
+        "simple-section"
+      ],
+      "policy": "adaptive",
+      "primary_text": "goal fix the flaky auth test",
+      "provider_state": "single_provider",
+      "surface_hint": "coding_agent",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "developer_prompt",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 12,
+        "max_complexity_score": 20
+      },
+      "negative_case_ids": [
+        "N1"
+      ],
+      "dpr_links": [
+        "DPR-27"
+      ],
+      "rationale": "Single Goal cue (12) plus coding-agent assist (4) = 16 < 24 → local Natural-shaped."
+    },
+    {
+      "id": "IRI-17",
+      "title": "Simple one-section Structured stays local",
+      "tags": [
+        "policy-structured",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-coding-agent",
+        "simple-section"
+      ],
+      "policy": "structured",
+      "primary_text": "goal fix the flaky auth test",
+      "provider_state": "single_provider",
+      "surface_hint": "coding_agent",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "developer_prompt",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 12,
+        "max_complexity_score": 20
+      },
+      "negative_case_ids": [],
+      "dpr_links": [
+        "DPR-28"
+      ],
+      "rationale": "Structured simple section does not force cloud; local path may later emit source-supported Goal."
+    },
+    {
+      "id": "IRI-18",
+      "title": "Clear pause timing does not open cloud",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-null",
+        "timing-clear",
+        "negative-n5"
+      ],
+      "policy": "adaptive",
+      "primary_text": "the first thought is done the second thought is ready",
+      "provider_state": "single_provider",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": {
+        "certainty": "clear",
+        "max_pause_ms": 720
+      },
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 0
+      },
+      "negative_case_ids": [
+        "N5"
+      ],
+      "dpr_links": [
+        "DPR-06"
+      ],
+      "rationale": "Clear pause may affect local layout later; timing weight is 0 so cloud stays closed."
+    },
+    {
+      "id": "IRI-19",
+      "title": "Uncertain pause timing does not open cloud",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-null",
+        "timing-uncertain",
+        "negative-n5"
+      ],
+      "policy": "adaptive",
+      "primary_text": "the first thought is done the second thought is ready",
+      "provider_state": "single_provider",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": {
+        "certainty": "uncertain",
+        "max_pause_ms": 180
+      },
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 0
+      },
+      "negative_case_ids": [
+        "N5"
+      ],
+      "dpr_links": [
+        "DPR-07"
+      ],
+      "rationale": "Uncertain short pause stays local Natural-shaped; never cloud."
+    },
+    {
+      "id": "IRI-20",
+      "title": "Messaging short everyday is never clouded",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-messaging",
+        "simple-everyday",
+        "negative-n1"
+      ],
+      "policy": "adaptive",
+      "primary_text": "gonna ping you later ok",
+      "provider_state": "single_provider",
+      "surface_hint": "messaging",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 0
+      },
+      "negative_case_ids": [
+        "N1"
+      ],
+      "dpr_links": [],
+      "rationale": "Short slang messaging must stay local (N1)."
+    },
+    {
+      "id": "IRI-21",
+      "title": "Browser short form stays local",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-browser",
+        "simple-everyday"
+      ],
+      "policy": "adaptive",
+      "primary_text": "search for the release notes please",
+      "provider_state": "single_provider",
+      "surface_hint": "browser",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 0
+      },
+      "negative_case_ids": [
+        "N1"
+      ],
+      "dpr_links": [],
+      "rationale": "Browser short form has no section structure; local only."
+    },
+    {
+      "id": "IRI-22",
+      "title": "GUI agent complex multi-section Adaptive allows cloud",
+      "tags": [
+        "policy-adaptive",
+        "route-cloud-optional",
+        "cloud-allowed",
+        "surface-gui-agent",
+        "complex-multi-section"
+      ],
+      "policy": "adaptive",
+      "primary_text": "goal fix the flaky auth test context it fails on CI only requirements keep public API stable constraints no new dependencies steps one reproduce two isolate three fix four verify acceptance criteria CI is green on main files crates/voisu-core/src/auth.rs notes keep the change small",
+      "provider_state": "single_provider",
+      "surface_hint": "gui_agent",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "developer_prompt",
+      "expected": {
+        "route": "local_with_optional_cloud",
+        "cloud_request": "allowed",
+        "rule_id": "R_COMPLEX_CLOUD",
+        "min_complexity_score": 24,
+        "max_complexity_score": 200
+      },
+      "negative_case_ids": [],
+      "dpr_links": [],
+      "rationale": "GUI agent surface mildly assists complexity; multi-section speech still drives the cloud decision."
+    },
+    {
+      "id": "IRI-23",
+      "title": "Unknown app simple speech stays local",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-unknown",
+        "simple-everyday"
+      ],
+      "policy": "adaptive",
+      "primary_text": "Ready for review.",
+      "provider_state": "single_provider",
+      "surface_hint": "unknown",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 0
+      },
+      "negative_case_ids": [
+        "N1"
+      ],
+      "dpr_links": [],
+      "rationale": "Unknown surface contributes no assist; simple speech stays local."
+    },
+    {
+      "id": "IRI-24",
+      "title": "Speech-only missing surface still clouds complex multi-section",
+      "tags": [
+        "policy-adaptive",
+        "route-cloud-optional",
+        "cloud-allowed",
+        "surface-null",
+        "speech-only",
+        "complex-multi-section",
+        "negative-n6"
+      ],
+      "policy": "adaptive",
+      "primary_text": "goal fix the flaky auth test context it fails on CI only requirements keep public API stable constraints no new dependencies steps one reproduce two isolate three fix four verify acceptance criteria CI is green on main files crates/voisu-core/src/auth.rs notes keep the change small",
+      "provider_state": "single_provider",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": null,
+      "expected": {
+        "route": "local_with_optional_cloud",
+        "cloud_request": "allowed",
+        "rule_id": "R_COMPLEX_CLOUD",
+        "min_complexity_score": 24,
+        "max_complexity_score": 200
+      },
+      "negative_case_ids": [
+        "N6"
+      ],
+      "dpr_links": [],
+      "rationale": "Missing surface degrades to speech-only; multi-section cues alone still exceed threshold."
+    },
+    {
+      "id": "IRI-25",
+      "title": "Coding agent surface alone does not cloud simple speech",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-coding-agent",
+        "simple-section"
+      ],
+      "policy": "adaptive",
+      "primary_text": "please restart the auth service after deploy",
+      "provider_state": "single_provider",
+      "surface_hint": "coding_agent",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": null,
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 10
+      },
+      "negative_case_ids": [
+        "N1"
+      ],
+      "dpr_links": [],
+      "rationale": "coding_agent without section cues adds no complexity; stays local."
+    },
+    {
+      "id": "IRI-26",
+      "title": "Shell surface with prose is not literal command",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-shell"
+      ],
+      "policy": "adaptive",
+      "primary_text": "please restart the service when you can",
+      "provider_state": "single_provider",
+      "surface_hint": "shell",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 0
+      },
+      "negative_case_ids": [],
+      "dpr_links": [],
+      "rationale": "Prose in a shell window is not command-shaped; organize locally."
+    },
+    {
+      "id": "IRI-27",
+      "title": "Strong double-dash flags without surface still literal",
+      "tags": [
+        "policy-adaptive",
+        "route-literal",
+        "cloud-not-allowed",
+        "surface-null",
+        "command-shaped"
+      ],
+      "policy": "adaptive",
+      "primary_text": "cargo test --workspace --test-threads=4",
+      "provider_state": "single_provider",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": null,
+      "expected": {
+        "route": "literal_identity",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_LITERAL_COMMAND",
+        "min_complexity_score": 0,
+        "max_complexity_score": 20
+      },
+      "negative_case_ids": [],
+      "dpr_links": [],
+      "rationale": "Strong CLI double-dash evidence allows literal even when surface is missing."
+    },
+    {
+      "id": "IRI-28",
+      "title": "Two-section Structured speech requires cloud attempt",
+      "tags": [
+        "policy-structured",
+        "route-cloud-optional",
+        "cloud-required",
+        "surface-coding-agent",
+        "complex-multi-section"
+      ],
+      "policy": "structured",
+      "primary_text": "goal fix the flaky auth test context it fails on CI only",
+      "provider_state": "single_provider",
+      "surface_hint": "coding_agent",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "developer_prompt",
+      "expected": {
+        "route": "local_with_optional_cloud",
+        "cloud_request": "required",
+        "rule_id": "R_COMPLEX_CLOUD",
+        "min_complexity_score": 24,
+        "max_complexity_score": 40
+      },
+      "negative_case_ids": [],
+      "dpr_links": [],
+      "rationale": "Exactly two section cues (goal+context=24) meet threshold; Structured → required."
+    },
+    {
+      "id": "IRI-29",
+      "title": "Long everyday prose without section cues stays local",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-null",
+        "speech-only",
+        "long-everyday-no-sections"
+      ],
+      "policy": "adaptive",
+      "primary_text": "i wanted to check in about the timeline for friday and also see if anyone else had thoughts on the docs update before we ship the release candidate to the beta cohort later this week",
+      "provider_state": "single_provider",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 0
+      },
+      "negative_case_ids": [
+        "N1"
+      ],
+      "dpr_links": [],
+      "rationale": "Length alone without section structure never opens cloud."
+    },
+    {
+      "id": "IRI-30",
+      "title": "Process hint shell plus command is literal identity",
+      "tags": [
+        "policy-adaptive",
+        "route-literal",
+        "cloud-not-allowed",
+        "process-hint",
+        "command-shaped"
+      ],
+      "policy": "adaptive",
+      "primary_text": "npm test -- --runInBand",
+      "provider_state": "single_provider",
+      "surface_hint": null,
+      "process_hint": {
+        "class": "shell",
+        "name": "gnome-terminal"
+      },
+      "timing": null,
+      "kind_hint": null,
+      "expected": {
+        "route": "literal_identity",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_LITERAL_COMMAND",
+        "min_complexity_score": 0,
+        "max_complexity_score": 20
+      },
+      "negative_case_ids": [],
+      "dpr_links": [],
+      "rationale": "Already-available process class shell enables command literal without surface_hint."
+    },
+    {
+      "id": "IRI-31",
+      "title": "Shell prose make sure is not literal command",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-shell",
+        "simple-everyday"
+      ],
+      "policy": "adaptive",
+      "primary_text": "make sure the service restarts after deploy",
+      "provider_state": "single_provider",
+      "surface_hint": "shell",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 0
+      },
+      "negative_case_ids": [],
+      "dpr_links": [],
+      "rationale": "Leading make + prose sure is everyday English, not a make(1) invocation; shell surface alone does not force literal."
+    },
+    {
+      "id": "IRI-32",
+      "title": "Shell prose go ahead is not literal command",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-shell",
+        "simple-everyday"
+      ],
+      "policy": "adaptive",
+      "primary_text": "go ahead and restart when you can",
+      "provider_state": "single_provider",
+      "surface_hint": "shell",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 0
+      },
+      "negative_case_ids": [],
+      "dpr_links": [],
+      "rationale": "go ahead is English encouragement, not the Go toolchain; stays deterministic_local."
+    },
+    {
+      "id": "IRI-33",
+      "title": "Shell prose run this by is not literal command",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-shell",
+        "simple-everyday"
+      ],
+      "policy": "adaptive",
+      "primary_text": "run this by the team tomorrow",
+      "provider_state": "single_provider",
+      "surface_hint": "shell",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": "everyday_message",
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 0
+      },
+      "negative_case_ids": [],
+      "dpr_links": [],
+      "rationale": "run this by is idiomatic English (consult the team), not a shell run invocation."
+    },
+    {
+      "id": "IRI-34",
+      "title": "Shell cargo test --package is literal identity",
+      "tags": [
+        "policy-adaptive",
+        "route-literal",
+        "cloud-not-allowed",
+        "surface-shell",
+        "command-shaped"
+      ],
+      "policy": "adaptive",
+      "primary_text": "cargo test --package voisu-core",
+      "provider_state": "single_provider",
+      "surface_hint": "shell",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": null,
+      "expected": {
+        "route": "literal_identity",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_LITERAL_COMMAND",
+        "min_complexity_score": 0,
+        "max_complexity_score": 20
+      },
+      "negative_case_ids": [],
+      "dpr_links": [],
+      "rationale": "True CLI with leading cargo runner and double-dash flag remains literal_identity."
+    },
+    {
+      "id": "IRI-35",
+      "title": "Disputed preformatted Adaptive keeps cloud eligibility",
+      "tags": [
+        "policy-adaptive",
+        "route-cloud-optional",
+        "cloud-allowed",
+        "surface-null",
+        "preformatted",
+        "stt-protected-disagreement",
+        "negative-n3"
+      ],
+      "policy": "adaptive",
+      "primary_text": "1. Build\n2. Test\n3. Ship",
+      "provider_state": "protected_token_disagreement",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": null,
+      "expected": {
+        "route": "local_with_optional_cloud",
+        "cloud_request": "allowed",
+        "rule_id": "R_DISPUTE_CLOUD",
+        "min_complexity_score": 0,
+        "max_complexity_score": 20
+      },
+      "negative_case_ids": [
+        "N3"
+      ],
+      "dpr_links": [],
+      "rationale": "Dispute eligibility is evaluated before literal preformatted; Adaptive protected_token_disagreement on a numbered list stays cloud-eligible."
+    },
+    {
+      "id": "IRI-36",
+      "title": "Disputed cargo Adaptive keeps cloud eligibility",
+      "tags": [
+        "policy-adaptive",
+        "route-cloud-optional",
+        "cloud-allowed",
+        "surface-shell",
+        "command-shaped",
+        "stt-protected-disagreement",
+        "negative-n3"
+      ],
+      "policy": "adaptive",
+      "primary_text": "cargo test --package voisu-core",
+      "provider_state": "protected_token_disagreement",
+      "surface_hint": "shell",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": null,
+      "expected": {
+        "route": "local_with_optional_cloud",
+        "cloud_request": "allowed",
+        "rule_id": "R_DISPUTE_CLOUD",
+        "min_complexity_score": 0,
+        "max_complexity_score": 20
+      },
+      "negative_case_ids": [
+        "N3"
+      ],
+      "dpr_links": [],
+      "rationale": "Dispute before literal command: Adaptive protected_token_disagreement on cargo CLI stays cloud-eligible (not locked to literal_identity)."
+    },
+    {
+      "id": "IRI-37",
+      "title": "Disputed preformatted Natural still forbids cloud",
+      "tags": [
+        "policy-natural",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-null",
+        "preformatted",
+        "stt-protected-disagreement",
+        "negative-n3"
+      ],
+      "policy": "natural",
+      "primary_text": "1. Build\n2. Test\n3. Ship",
+      "provider_state": "protected_token_disagreement",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": null,
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DISPUTE_POLICY_FORBID",
+        "min_complexity_score": 0,
+        "max_complexity_score": 20
+      },
+      "negative_case_ids": [
+        "N3"
+      ],
+      "dpr_links": [],
+      "rationale": "Natural policy still forbids cloud on protected_token_disagreement even when text is preformatted; dispute policy gate wins before literal."
+    },
+    {
+      "id": "IRI-38",
+      "title": "Shell prose run errands is not literal command",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-shell",
+        "simple-everyday"
+      ],
+      "policy": "adaptive",
+      "primary_text": "run errands tomorrow",
+      "provider_state": "single_provider",
+      "surface_hint": "shell",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": null,
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 20
+      },
+      "negative_case_ids": [],
+      "dpr_links": [],
+      "rationale": "Bare word after runner without positive CLI evidence (flag/path/subcommand/nested runner) is prose, not literal."
+    },
+    {
+      "id": "IRI-39",
+      "title": "Shell prose make dinner is not literal command",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-shell",
+        "simple-everyday"
+      ],
+      "policy": "adaptive",
+      "primary_text": "make dinner later",
+      "provider_state": "single_provider",
+      "surface_hint": "shell",
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": null,
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 20
+      },
+      "negative_case_ids": [],
+      "dpr_links": [],
+      "rationale": "make dinner is everyday English; dinner is not a known CLI subcommand, so shell surface stays deterministic_local."
+    },
+    {
+      "id": "IRI-40",
+      "title": "Ordinary compound prose goal/context stays local",
+      "tags": [
+        "policy-adaptive",
+        "route-local",
+        "cloud-not-allowed",
+        "surface-null",
+        "speech-only",
+        "simple-everyday",
+        "negative-n1"
+      ],
+      "policy": "adaptive",
+      "primary_text": "the project goal depends on business context",
+      "provider_state": "single_provider",
+      "surface_hint": null,
+      "process_hint": null,
+      "timing": null,
+      "kind_hint": null,
+      "expected": {
+        "route": "deterministic_local",
+        "cloud_request": "not_allowed",
+        "rule_id": "R_DEFAULT_LOCAL",
+        "min_complexity_score": 0,
+        "max_complexity_score": 12
+      },
+      "negative_case_ids": [
+        "N1"
+      ],
+      "dpr_links": [],
+      "rationale": "Mid-sentence nouns goal/context without section-header structure must not score 24 or open cloud."
+    }
+  ],
+  "dataset_counts": {
+    "fixtures_total": 40,
+    "by_route": {
+      "literal_identity": 6,
+      "deterministic_local": 25,
+      "local_with_optional_cloud": 9
+    },
+    "by_cloud_request": {
+      "not_allowed": 31,
+      "allowed": 7,
+      "required": 2
+    },
+    "by_policy": {
+      "natural": 4,
+      "adaptive": 33,
+      "structured": 3
+    },
+    "by_surface": {
+      "shell": 9,
+      "terminal": 1,
+      "coding_agent": 7,
+      "gui_agent": 1,
+      "messaging": 3,
+      "browser": 1,
+      "unknown": 1,
+      "null": 17
+    },
+    "negative_case_count": 6,
+    "coverage_requirement_count": 39,
+    "closed_tag_count": 39
+  },
+  "invariants": [
+    {
+      "id": "I-PURE-LOCAL",
+      "summary": "Routing decision path performs zero network I/O and no wall-clock sleeps."
+    },
+    {
+      "id": "I-ORDERED-RULES",
+      "summary": "First matching ordered rule wins; scores are explicit integer weights with no randomness."
+    },
+    {
+      "id": "I-LITERAL-NO-CLOUD",
+      "summary": "literal_identity always pairs with cloud_request=not_allowed."
+    },
+    {
+      "id": "I-LOCAL-NO-CLOUD",
+      "summary": "deterministic_local always pairs with cloud_request=not_allowed."
+    },
+    {
+      "id": "I-OPTIONAL-CLOUD-PAIRING",
+      "summary": "local_with_optional_cloud pairs only with allowed or required cloud_request."
+    },
+    {
+      "id": "I-NATURAL-NO-CLOUD",
+      "summary": "Natural policy never selects a cloud attempt (dispute forbid and natural-local gates)."
+    },
+    {
+      "id": "I-STRUCTURED-NO-LABEL-INVENTION",
+      "summary": "Routing decides local vs cloud attempt only; it never invents Structured labels."
+    },
+    {
+      "id": "I-SPEECH-ONLY-FALLBACK",
+      "summary": "Missing surface/process hints degrade to speech-only without hard fail."
+    },
+    {
+      "id": "I-AGREEMENT-FAST-PATH",
+      "summary": "exact, punctuation-only, complementary, and single-provider states do not open cloud alone."
+    },
+    {
+      "id": "I-DISPUTE-ELIGIBILITY",
+      "summary": "Protected-token and semantic disagreement open optional cloud before literal gates unless policy forbids."
+    },
+    {
+      "id": "I-TIMING-ZERO-CLOUD",
+      "summary": "Pause timing weights are zero toward cloud selection."
+    },
+    {
+      "id": "I-DEADLINE-HEADROOM",
+      "summary": "Signal collection is O(local) under remaining headroom before 1.5s Delivery."
+    }
+  ],
+  "negative_cases": [
+    {
+      "id": "N1",
+      "summary": "Do not cloud simple short everyday messages."
+    },
+    {
+      "id": "N2",
+      "summary": "Do not force cloud when single provider or non-dispute agreement holds on simple speech."
+    },
+    {
+      "id": "N3",
+      "summary": "Do not skip cloud eligibility on protected-token dual-STT disagreement unless policy forbids."
+    },
+    {
+      "id": "N4",
+      "summary": "Natural policy never attempts cloud, including multi-section developer speech."
+    },
+    {
+      "id": "N5",
+      "summary": "Pause timing alone never selects cloud."
+    },
+    {
+      "id": "N6",
+      "summary": "Missing surface/process never hard-fails; speech-only path remains decisive."
+    }
+  ]
+}

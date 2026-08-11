@@ -1,0 +1,653 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Anuraj-dev/voisu/main/docs/research/developer-prompt-rendering-intent-routing-schema-2026-08-11.json",
+  "title": "Voisu Developer Prompt Rendering intent routing corpus (#141)",
+  "description": "Structural schema for #141 pure-local weighted intent-routing fixtures. The paired stdlib prototype enforces exact owned key sets and reproducible router decisions; it is not a generic Draft 2020-12 engine and performs zero network I/O on the decision path.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "corpus_id",
+    "version",
+    "issue",
+    "language",
+    "governing",
+    "routes",
+    "cloud_request_states",
+    "policies",
+    "provider_states",
+    "surface_hints",
+    "process_classes",
+    "rule_ids",
+    "weights",
+    "thresholds",
+    "closed_tags",
+    "coverage_requirements",
+    "coverage_matrix",
+    "fixtures",
+    "dataset_counts",
+    "invariants",
+    "negative_cases"
+  ],
+  "properties": {
+    "corpus_id": {
+      "const": "voisu-developer-prompt-rendering-intent-routing-2026-08-11"
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "issue": {
+      "$ref": "#/$defs/issue"
+    },
+    "language": {
+      "const": "en"
+    },
+    "governing": {
+      "$ref": "#/$defs/governing"
+    },
+    "routes": {
+      "const": [
+        "literal_identity",
+        "deterministic_local",
+        "local_with_optional_cloud"
+      ]
+    },
+    "cloud_request_states": {
+      "const": [
+        "not_allowed",
+        "allowed",
+        "required"
+      ]
+    },
+    "policies": {
+      "const": [
+        "natural",
+        "adaptive",
+        "structured"
+      ]
+    },
+    "provider_states": {
+      "const": [
+        "exact_agreement",
+        "punctuation_only_agreement",
+        "safe_complementary",
+        "protected_token_disagreement",
+        "semantic_disagreement",
+        "single_provider"
+      ]
+    },
+    "surface_hints": {
+      "const": [
+        "shell",
+        "terminal",
+        "coding_agent",
+        "gui_agent",
+        "messaging",
+        "browser",
+        "unknown",
+        null
+      ]
+    },
+    "process_classes": {
+      "const": [
+        "shell",
+        "terminal",
+        "coding_agent",
+        "gui_agent",
+        "messaging",
+        "browser",
+        "unknown"
+      ]
+    },
+    "rule_ids": {
+      "const": [
+        "R_DISPUTE_CLOUD",
+        "R_DISPUTE_POLICY_FORBID",
+        "R_LITERAL_PREFORMATTED",
+        "R_LITERAL_COMMAND",
+        "R_NATURAL_LOCAL",
+        "R_COMPLEX_CLOUD",
+        "R_DEFAULT_LOCAL"
+      ]
+    },
+    "weights": {
+      "$ref": "#/$defs/weights"
+    },
+    "thresholds": {
+      "$ref": "#/$defs/thresholds"
+    },
+    "closed_tags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "coverage_requirements": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "coverage_matrix": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "pattern": "^IRI-[0-9]{2}$"
+        },
+        "uniqueItems": true,
+        "minItems": 1
+      }
+    },
+    "fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/fixture"
+      }
+    },
+    "dataset_counts": {
+      "$ref": "#/$defs/dataset_counts"
+    },
+    "invariants": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/invariant"
+      }
+    },
+    "negative_cases": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/negative_case"
+      }
+    }
+  },
+  "$defs": {
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "github_number",
+        "title",
+        "parent_map",
+        "blocks",
+        "url"
+      ],
+      "properties": {
+        "github_number": {
+          "const": 141
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "parent_map": {
+          "const": 133
+        },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "governing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_issue",
+        "map_issue",
+        "behavior_corpus_issue",
+        "delivery_deadline_ms",
+        "network_on_decision_path",
+        "out_of_scope"
+      ],
+      "properties": {
+        "contract_issue": {
+          "const": 137
+        },
+        "map_issue": {
+          "const": 133
+        },
+        "behavior_corpus_issue": {
+          "const": 138
+        },
+        "delivery_deadline_ms": {
+          "const": 1500
+        },
+        "network_on_decision_path": {
+          "const": false
+        },
+        "out_of_scope": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "weights": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "section_goal",
+        "section_context",
+        "section_requirements",
+        "section_constraints",
+        "section_steps",
+        "section_acceptance_criteria",
+        "section_files",
+        "section_notes",
+        "words_ge_40",
+        "words_ge_80",
+        "surface_coding_agent_sections",
+        "surface_gui_agent_sections",
+        "surface_messaging_short",
+        "surface_browser_short",
+        "process_coding_boost",
+        "timing_clear_pause",
+        "timing_uncertain_pause"
+      ],
+      "properties": {
+        "section_goal": {
+          "const": 12
+        },
+        "section_context": {
+          "const": 12
+        },
+        "section_requirements": {
+          "const": 12
+        },
+        "section_constraints": {
+          "const": 12
+        },
+        "section_steps": {
+          "const": 12
+        },
+        "section_acceptance_criteria": {
+          "const": 14
+        },
+        "section_files": {
+          "const": 10
+        },
+        "section_notes": {
+          "const": 10
+        },
+        "words_ge_40": {
+          "const": 4
+        },
+        "words_ge_80": {
+          "const": 6
+        },
+        "surface_coding_agent_sections": {
+          "const": 4
+        },
+        "surface_gui_agent_sections": {
+          "const": 3
+        },
+        "surface_messaging_short": {
+          "const": -6
+        },
+        "surface_browser_short": {
+          "const": -4
+        },
+        "process_coding_boost": {
+          "const": 2
+        },
+        "timing_clear_pause": {
+          "const": 0
+        },
+        "timing_uncertain_pause": {
+          "const": 0
+        }
+      }
+    },
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "complexity_cloud",
+        "messaging_short_words",
+        "browser_short_words",
+        "section_cues_for_length_assist",
+        "delivery_deadline_ms"
+      ],
+      "properties": {
+        "complexity_cloud": {
+          "const": 24
+        },
+        "messaging_short_words": {
+          "const": 30
+        },
+        "browser_short_words": {
+          "const": 25
+        },
+        "section_cues_for_length_assist": {
+          "const": 2
+        },
+        "delivery_deadline_ms": {
+          "const": 1500
+        }
+      }
+    },
+    "process_hint": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "class",
+        "name"
+      ],
+      "properties": {
+        "class": {
+          "type": "string",
+          "enum": [
+            "shell",
+            "terminal",
+            "coding_agent",
+            "gui_agent",
+            "messaging",
+            "browser",
+            "unknown"
+          ]
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "timing": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "certainty",
+        "max_pause_ms"
+      ],
+      "properties": {
+        "certainty": {
+          "type": "string",
+          "enum": [
+            "clear",
+            "uncertain"
+          ]
+        },
+        "max_pause_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "route",
+        "cloud_request",
+        "rule_id",
+        "min_complexity_score",
+        "max_complexity_score"
+      ],
+      "properties": {
+        "route": {
+          "type": "string",
+          "enum": [
+            "literal_identity",
+            "deterministic_local",
+            "local_with_optional_cloud"
+          ]
+        },
+        "cloud_request": {
+          "type": "string",
+          "enum": [
+            "not_allowed",
+            "allowed",
+            "required"
+          ]
+        },
+        "rule_id": {
+          "type": "string",
+          "enum": [
+            "R_LITERAL_PREFORMATTED",
+            "R_LITERAL_COMMAND",
+            "R_DISPUTE_CLOUD",
+            "R_DISPUTE_POLICY_FORBID",
+            "R_NATURAL_LOCAL",
+            "R_COMPLEX_CLOUD",
+            "R_DEFAULT_LOCAL"
+          ]
+        },
+        "min_complexity_score": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_complexity_score": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "tags",
+        "policy",
+        "primary_text",
+        "provider_state",
+        "surface_hint",
+        "process_hint",
+        "timing",
+        "kind_hint",
+        "expected",
+        "negative_case_ids",
+        "dpr_links",
+        "rationale"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^IRI-[0-9]{2}$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "policy": {
+          "type": "string",
+          "enum": [
+            "natural",
+            "adaptive",
+            "structured"
+          ]
+        },
+        "primary_text": {
+          "type": "string"
+        },
+        "provider_state": {
+          "type": "string",
+          "enum": [
+            "exact_agreement",
+            "punctuation_only_agreement",
+            "safe_complementary",
+            "protected_token_disagreement",
+            "semantic_disagreement",
+            "single_provider"
+          ]
+        },
+        "surface_hint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "shell",
+            "terminal",
+            "coding_agent",
+            "gui_agent",
+            "messaging",
+            "browser",
+            "unknown",
+            null
+          ]
+        },
+        "process_hint": {
+          "$ref": "#/$defs/process_hint"
+        },
+        "timing": {
+          "$ref": "#/$defs/timing"
+        },
+        "kind_hint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "everyday_message",
+            "developer_prompt",
+            null
+          ]
+        },
+        "expected": {
+          "$ref": "#/$defs/expected"
+        },
+        "negative_case_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dpr_links": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^DPR-[0-9]{2}$"
+          }
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "dataset_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixtures_total",
+        "by_route",
+        "by_cloud_request",
+        "by_policy",
+        "by_surface",
+        "negative_case_count",
+        "coverage_requirement_count",
+        "closed_tag_count"
+      ],
+      "properties": {
+        "fixtures_total": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "by_route": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "by_cloud_request": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "by_policy": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "by_surface": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "negative_case_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "coverage_requirement_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "closed_tag_count": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "invariant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "summary"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "negative_case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "summary"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}
