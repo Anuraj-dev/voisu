@@ -1,6 +1,6 @@
 {
   "corpus_id": "voisu-developer-prompt-rendering-combined-call-2026-08-11",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "issue": {
     "github_number": 139,
     "title": "Prototype the structured combined-call contract",
@@ -126,7 +126,7 @@
     },
     {
       "code": "E_UNVERIFIABLE",
-      "summary": "A declared source span cannot be found in the named provider source."
+      "summary": "A declared source span cannot be found, spans are out of source order, or unremoved source content is omitted without a matching removal claim."
     },
     {
       "code": "E_PROTECTED",
@@ -207,7 +207,7 @@
     },
     {
       "id": "I-SOURCE-DERIVATION",
-      "summary": "Every keep/remove/convert/label span maps to a named provider source substring."
+      "summary": "Every keep/remove/convert/label span maps to a named provider source substring; spans are source-ordered; unremoved selected-source content must be fully claimed."
     },
     {
       "id": "I-PROTECTED",

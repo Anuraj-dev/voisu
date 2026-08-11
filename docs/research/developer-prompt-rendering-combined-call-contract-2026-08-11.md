@@ -140,6 +140,8 @@ For every derivation span with kind ∈ {`keep`, `remove`, `convert`, `label`}:
 6. `remove` spans must have empty `output_text` and **match a declared `removals[]` entry** (same provider + source span). A remove span without a matching declaration is `E_UNVERIFIABLE`.
 7. Consuming spans must not double-claim the same source region (`E_OVERLAP`).
 8. Accept-path **keep** spans are organize-only: `output_text` must preserve the ordered content-word sequence of `source_text` (case/punctuation/whitespace may change; free rephrase that drops span content words is `E_INVENTED_CONTENT` / `E_UNSAFE_SEMANTICS`).
+9. **Source order:** for each provider, consuming spans must be placed in non-decreasing source start order (`E_UNVERIFIABLE` if reversed).
+10. **Completeness:** every non-whitespace character of the host-selected provider source (and of any other provider that is consumed) must be covered by some keep/remove/convert/label claim. Omitting unremoved words without a matching removal is `E_UNVERIFIABLE`.
 
 **Invented-content check:** every ordinary lexical atom in the composed render must be licensed by (a) a source atom, (b) a closed conversion RHS, or (c) a closed label token. Anything else is `E_INVENTED_CONTENT` / `E_UNSAFE_SEMANTICS`.
 
