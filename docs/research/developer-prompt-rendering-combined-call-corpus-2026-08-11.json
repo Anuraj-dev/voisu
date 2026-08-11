@@ -1,0 +1,3216 @@
+{
+  "corpus_id": "voisu-developer-prompt-rendering-combined-call-2026-08-11",
+  "version": "1.1.1",
+  "issue": {
+    "github_number": 139,
+    "title": "Prototype the structured combined-call contract",
+    "parent_map": 133,
+    "blocked_by": 138,
+    "blocks": [
+      140,
+      142
+    ],
+    "url": "https://github.com/Anuraj-dev/voisu/issues/139"
+  },
+  "language": "en",
+  "governing": {
+    "contract_issue": 137,
+    "map_issue": 133,
+    "behavior_corpus_issue": 138,
+    "resolution_issues": [
+      134,
+      135,
+      136,
+      137,
+      138
+    ],
+    "superseded_mechanisms": [
+      "grammar correction subsystem",
+      "unchecked polished-string cloud final",
+      "whole-text rewrite candidate",
+      "auto-send / live-type / replace-delivered"
+    ],
+    "out_of_scope": [
+      "grammar correction",
+      "prompt enrichment inventing requirements or guidance",
+      "command/rewrite mode",
+      "translation and non-English rendering",
+      "surrounding page/clipboard/screenshot context",
+      "auto-send",
+      "live typing",
+      "production late-result replacement of delivered text",
+      "live cloud model benchmark (owned by #140)"
+    ]
+  },
+  "architecture": {
+    "call_budget": "at_most_one_structured_cloud_call",
+    "response_authority": "structured_decisions_plus_source_derivation_not_unchecked_string",
+    "local_baseline_authority": "deterministic_local_always_available",
+    "whole_text_rewrite_rule": "absent",
+    "grammar_subsystem": "absent",
+    "delivery_deadline_ms": 1500,
+    "delivery_mode": "final_only_unsent"
+  },
+  "closed_structured_labels": [
+    "Goal",
+    "Context",
+    "Requirements",
+    "Constraints",
+    "Steps",
+    "Acceptance Criteria",
+    "Files",
+    "Notes"
+  ],
+  "closed_conversions": [
+    "exclamation point→!",
+    "four→4.",
+    "new line→\\n",
+    "new paragraph→\\n\\n",
+    "one→1.",
+    "period→.",
+    "quote…unquote→\"…\"",
+    "spoken acceptance criteria cue→Acceptance Criteria label",
+    "spoken constraints cue→Constraints label",
+    "spoken context cue→Context label",
+    "spoken files cue→Files label",
+    "spoken goal cue→Goal label",
+    "spoken notes cue→Notes label",
+    "spoken requirements cue→Requirements label",
+    "spoken steps cue→numbered_lines",
+    "three→3.",
+    "two→2."
+  ],
+  "protected_token_kinds": [
+    "name",
+    "number_date_time",
+    "negation",
+    "command_flag",
+    "url_path",
+    "identifier",
+    "code",
+    "quote"
+  ],
+  "fallback_triggers": [
+    "none",
+    "unsafe_semantics",
+    "unverifiable_source_derivation",
+    "invalid_fixed_label",
+    "uncertain_backtracking",
+    "uncertain_layout",
+    "response_schema_failure",
+    "provider_failure",
+    "deadline_exceeded"
+  ],
+  "composition_decisions": [
+    "accept",
+    "accept_preserve_words",
+    "accept_natural_layout",
+    "fallback_baseline"
+  ],
+  "error_codes": [
+    {
+      "code": "E_MALFORMED",
+      "summary": "Candidate container or field shape is invalid."
+    },
+    {
+      "code": "E_STALE",
+      "summary": "Candidate base_fingerprint does not match selected source."
+    },
+    {
+      "code": "E_UNKNOWN_CONVERSION",
+      "summary": "Conversion id is outside the closed catalog."
+    },
+    {
+      "code": "E_UNKNOWN_LABEL",
+      "summary": "Label is outside the closed Structured label set."
+    },
+    {
+      "code": "E_UNVERIFIABLE",
+      "summary": "A declared source span cannot be found in the named provider source."
+    },
+    {
+      "code": "E_PROTECTED",
+      "summary": "A protected token is missing or altered in the composed output."
+    },
+    {
+      "code": "E_UNSAFE_SEMANTICS",
+      "summary": "Candidate changes meaning or invents content beyond organize-only."
+    },
+    {
+      "code": "E_INVALID_LABEL",
+      "summary": "Output contains a non-closed structural label header."
+    },
+    {
+      "code": "E_UNCERTAIN_BACKTRACK",
+      "summary": "Uncertain backtrack removal is not applied; words are preserved."
+    },
+    {
+      "code": "E_UNCERTAIN_LAYOUT",
+      "summary": "Uncertain layout is forced to Natural."
+    },
+    {
+      "code": "E_INVENTED_CONTENT",
+      "summary": "Output introduces lexical atoms not licensed by source, conversion, or label."
+    },
+    {
+      "code": "E_OVERLAP",
+      "summary": "Derivation/removal spans conflict or double-consume source text."
+    },
+    {
+      "code": "E_SCHEMA",
+      "summary": "Cloud response failed schema/parse validation."
+    },
+    {
+      "code": "E_PROVIDER",
+      "summary": "Provider/network failure prevented a usable response."
+    },
+    {
+      "code": "E_DEADLINE",
+      "summary": "Cloud response exceeded the 1.5s final-only Delivery deadline."
+    },
+    {
+      "code": "E_RECONCILE",
+      "summary": "Reconciliation decision conflicts with fixture source selection evidence."
+    }
+  ],
+  "model_prompt_contracts": [
+    {
+      "model_id": "gemini-3.5-flash-lite",
+      "provider": "google",
+      "system_prompt": "You organize English speech into text. Preserve wording and spoken grammar. Do not invent requirements, paraphrases, explanations, or technical assumptions. Allowed: punctuation/casing, clear filler or clear backtrack removals, closed symbol/format cue conversions, layout (natural / multi-paragraph / numbered / structured_sections), and closed labels only when Structured or clearly licensed. Never auto-send. Return structured JSON decisions only — never a free-form polished string as sole authority. Prefer minimal decisions. Default layout natural. Emit the fewest spans that prove the result.",
+      "response_instructions": "Return JSON with schema_version=\"1\", base_fingerprint (sha256 of selected source text), reconciliation{selected_provider,reason}, removals[{kind:filler|backtrack,certainty:clear|uncertain,source_provider,source_span_text}], conversions[{id from closed catalog,source_provider,source_span_text}], layout{decision:natural|multi_paragraph|numbered|structured_sections,certainty:clear|uncertain}, labels[{label from closed set,source_provider,source_span_text}], derivation[{kind:keep|remove|convert|label|layout_break,source_provider?,source_text?,output_text,conversion_id?,label?}]. derivation is ordered; concatenating output_text must reconstruct the proposal. Every keep/remove/convert/label source_text must be a substring of the named provider source. Uncertain backtrack: do not remove words. Uncertain layout: natural only. Closed labels: Goal,Context,Requirements,Constraints,Steps,Acceptance Criteria,Files,Notes. Closed conversions include period→., exclamation point→!, new line→\\n, new paragraph→\\n\\n, quote…unquote→\"…\", one→1.|two→2.|three→3.|four→4., spoken * cue→label, spoken steps cue→numbered_lines. Keep total response compact for Flash-Lite latency. Omit empty optional chatter.",
+      "notes": "Primary latency candidate. Structured-output JSON mode required. No live benchmark in #139 (#140 owns timing)."
+    },
+    {
+      "model_id": "gemini-3.6-flash",
+      "provider": "google",
+      "system_prompt": "You organize English speech into text. Preserve wording and spoken grammar. Do not invent requirements, paraphrases, explanations, or technical assumptions. Allowed: punctuation/casing, clear filler or clear backtrack removals, closed symbol/format cue conversions, layout (natural / multi-paragraph / numbered / structured_sections), and closed labels only when Structured or clearly licensed. Never auto-send. Return structured JSON decisions only — never a free-form polished string as sole authority. Use clear multi-section structured_sections only when every label is source-evidenced.",
+      "response_instructions": "Return JSON with schema_version=\"1\", base_fingerprint (sha256 of selected source text), reconciliation{selected_provider,reason}, removals[{kind:filler|backtrack,certainty:clear|uncertain,source_provider,source_span_text}], conversions[{id from closed catalog,source_provider,source_span_text}], layout{decision:natural|multi_paragraph|numbered|structured_sections,certainty:clear|uncertain}, labels[{label from closed set,source_provider,source_span_text}], derivation[{kind:keep|remove|convert|label|layout_break,source_provider?,source_text?,output_text,conversion_id?,label?}]. derivation is ordered; concatenating output_text must reconstruct the proposal. Every keep/remove/convert/label source_text must be a substring of the named provider source. Uncertain backtrack: do not remove words. Uncertain layout: natural only. Closed labels: Goal,Context,Requirements,Constraints,Steps,Acceptance Criteria,Files,Notes. Closed conversions include period→., exclamation point→!, new line→\\n, new paragraph→\\n\\n, quote…unquote→\"…\", one→1.|two→2.|three→3.|four→4., spoken * cue→label, spoken steps cue→numbered_lines. For complex multi-section speech, emit full label+derivation proof; never invent Requirements/Notes content.",
+      "notes": "Quality candidate for complex developer prompts. Same semantic contract as Flash-Lite."
+    },
+    {
+      "model_id": "openai/gpt-oss-20b",
+      "provider": "groq",
+      "system_prompt": "You organize English speech into text. Preserve wording and spoken grammar. Do not invent requirements, paraphrases, explanations, or technical assumptions. Allowed: punctuation/casing, clear filler or clear backtrack removals, closed symbol/format cue conversions, layout (natural / multi-paragraph / numbered / structured_sections), and closed labels only when Structured or clearly licensed. Never auto-send. Return structured JSON decisions only — never a free-form polished string as sole authority. Groq path: same organize-only contract. Do not run grammar correction.",
+      "response_instructions": "Return JSON with schema_version=\"1\", base_fingerprint (sha256 of selected source text), reconciliation{selected_provider,reason}, removals[{kind:filler|backtrack,certainty:clear|uncertain,source_provider,source_span_text}], conversions[{id from closed catalog,source_provider,source_span_text}], layout{decision:natural|multi_paragraph|numbered|structured_sections,certainty:clear|uncertain}, labels[{label from closed set,source_provider,source_span_text}], derivation[{kind:keep|remove|convert|label|layout_break,source_provider?,source_text?,output_text,conversion_id?,label?}]. derivation is ordered; concatenating output_text must reconstruct the proposal. Every keep/remove/convert/label source_text must be a substring of the named provider source. Uncertain backtrack: do not remove words. Uncertain layout: natural only. Closed labels: Goal,Context,Requirements,Constraints,Steps,Acceptance Criteria,Files,Notes. Closed conversions include period→., exclamation point→!, new line→\\n, new paragraph→\\n\\n, quote…unquote→\"…\", one→1.|two→2.|three→3.|four→4., spoken * cue→label, spoken steps cue→numbered_lines. Use Groq structured outputs / JSON schema binding when available. One call only.",
+      "notes": "Groq GPT-OSS-20B under one semantic contract. Benchmark and quota decisions are #140."
+    }
+  ],
+  "invariants": [
+    {
+      "id": "I-ORGANIZE-ONLY",
+      "summary": "Cloud may only punctuate/case, remove clear fillers/backtracks, convert closed cues, decide layout, and apply closed labels."
+    },
+    {
+      "id": "I-STRUCTURED-NOT-STRING",
+      "summary": "Authority is structured decisions plus derivation spans, not an unchecked polished string."
+    },
+    {
+      "id": "I-SOURCE-DERIVATION",
+      "summary": "Every keep/remove/convert/label span maps to a named provider source substring."
+    },
+    {
+      "id": "I-PROTECTED",
+      "summary": "Protected tokens appear exact and unaltered in accepted renders."
+    },
+    {
+      "id": "I-CLOSED-LABELS",
+      "summary": "Structural headers must be from the closed label set and source-evidenced."
+    },
+    {
+      "id": "I-ONE-CALL",
+      "summary": "At most one structured cloud call; skipped/failed paths use local baseline."
+    },
+    {
+      "id": "I-HIERARCHICAL-FALLBACK",
+      "summary": "Hard failures → baseline; uncertain backtrack → preserve words; uncertain layout → Natural."
+    },
+    {
+      "id": "I-NO-GRAMMAR",
+      "summary": "No grammar correction subsystem or grammar rule catalog."
+    },
+    {
+      "id": "I-NO-AUTOSEND",
+      "summary": "Delivery remains unsent; auto_send/live_type/replace_delivered are false."
+    },
+    {
+      "id": "I-DEADLINE",
+      "summary": "Final-only Delivery deadline is 1500ms; deadline_exceeded yields local baseline."
+    }
+  ],
+  "thresholds": {
+    "owner": "research_defaults_issue_140_owns_release_thresholds",
+    "max_file_bytes": 524288,
+    "max_json_depth": 14,
+    "max_json_nodes": 30000,
+    "max_source_utf8_bytes": 100000,
+    "max_removals": 32,
+    "max_conversions": 32,
+    "max_labels": 8,
+    "max_derivation_spans": 128,
+    "max_field_utf8_bytes": 2048,
+    "delivery_deadline_ms": 1500
+  },
+  "fixtures": [
+    {
+      "id": "CC-01",
+      "title": "Clear symbol conversion ships as structured convert spans",
+      "roles": [
+        "accept",
+        "conversion",
+        "behavior_138"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-09"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "ship it exclamation point",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Ship it!",
+      "base_fingerprint": "sha256:2af172901ba1ab4ff2ac0c16051d9f743dce96d197eb8d7c54896b40bb208324",
+      "protected_tokens": [],
+      "cloud_outcome": "succeeded",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:2af172901ba1ab4ff2ac0c16051d9f743dce96d197eb8d7c54896b40bb208324",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [
+          {
+            "id": "exclamation point→!",
+            "source_provider": "provider_a",
+            "source_span_text": "exclamation point"
+          }
+        ],
+        "layout": {
+          "decision": "natural",
+          "certainty": "clear"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "ship it",
+            "output_text": "Ship it",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "exclamation point",
+            "output_text": "!",
+            "conversion_id": "exclamation point→!",
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "accept",
+        "rendered": "Ship it!",
+        "fallback_trigger": null,
+        "error_codes": [],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Closed cue conversion with source-evidenced derivation."
+    },
+    {
+      "id": "CC-02",
+      "title": "Stacked period and new-line cues compose in order",
+      "roles": [
+        "accept",
+        "conversion",
+        "layout"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-10"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "stop period new line next item",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Stop.\nNext item",
+      "base_fingerprint": "sha256:bc77de8133e75a4115cdc341d92290761c03a886dd5ed853a8c9e66910e5ded6",
+      "protected_tokens": [],
+      "cloud_outcome": "succeeded",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:bc77de8133e75a4115cdc341d92290761c03a886dd5ed853a8c9e66910e5ded6",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [
+          {
+            "id": "period→.",
+            "source_provider": "provider_a",
+            "source_span_text": "period"
+          },
+          {
+            "id": "new line→\\n",
+            "source_provider": "provider_a",
+            "source_span_text": "new line"
+          }
+        ],
+        "layout": {
+          "decision": "natural",
+          "certainty": "clear"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "stop",
+            "output_text": "Stop",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "period",
+            "output_text": ".",
+            "conversion_id": "period→.",
+            "label": null
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "new line",
+            "output_text": "\n",
+            "conversion_id": "new line→\\n",
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "next item",
+            "output_text": "Next item",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "accept",
+        "rendered": "Stop.\nNext item",
+        "fallback_trigger": null,
+        "error_codes": [],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Stacked cues remain organize-only and source-ordered."
+    },
+    {
+      "id": "CC-03",
+      "title": "Clear filler removals drop only declared filler spans",
+      "roles": [
+        "accept",
+        "removal",
+        "filler"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-22"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "um uh I think we should ship friday",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "I think we should ship Friday.",
+      "base_fingerprint": "sha256:a792371cf933fe6eecfff7e6b878ffcbad2f394752ff151fa629559f9760e3bd",
+      "protected_tokens": [],
+      "cloud_outcome": "succeeded",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:a792371cf933fe6eecfff7e6b878ffcbad2f394752ff151fa629559f9760e3bd",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [
+          {
+            "kind": "filler",
+            "certainty": "clear",
+            "source_provider": "provider_a",
+            "source_span_text": "um"
+          },
+          {
+            "kind": "filler",
+            "certainty": "clear",
+            "source_provider": "provider_a",
+            "source_span_text": "uh"
+          }
+        ],
+        "conversions": [],
+        "layout": {
+          "decision": "natural",
+          "certainty": "clear"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "remove",
+            "source_provider": "provider_a",
+            "source_text": "um",
+            "output_text": "",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "remove",
+            "source_provider": "provider_a",
+            "source_text": "uh",
+            "output_text": "",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "I think we should ship friday",
+            "output_text": "I think we should ship Friday.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "accept",
+        "rendered": "I think we should ship Friday.",
+        "fallback_trigger": null,
+        "error_codes": [],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Clear fillers are removable when source-evidenced."
+    },
+    {
+      "id": "CC-04",
+      "title": "Clear backtrack removals drop corrected words only",
+      "roles": [
+        "accept",
+        "removal",
+        "backtrack"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-24"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "send it friday no wait monday",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Send it Monday.",
+      "base_fingerprint": "sha256:b08f4b27890386954068a911fe4b03c619191fe6e59e7ea6bf36b8d0a754efc8",
+      "protected_tokens": [
+        "Monday"
+      ],
+      "cloud_outcome": "succeeded",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:b08f4b27890386954068a911fe4b03c619191fe6e59e7ea6bf36b8d0a754efc8",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [
+          {
+            "kind": "backtrack",
+            "certainty": "clear",
+            "source_provider": "provider_a",
+            "source_span_text": "friday"
+          },
+          {
+            "kind": "backtrack",
+            "certainty": "clear",
+            "source_provider": "provider_a",
+            "source_span_text": "no wait"
+          }
+        ],
+        "conversions": [],
+        "layout": {
+          "decision": "natural",
+          "certainty": "clear"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "send it",
+            "output_text": "Send it ",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "remove",
+            "source_provider": "provider_a",
+            "source_text": "friday",
+            "output_text": "",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "remove",
+            "source_provider": "provider_a",
+            "source_text": "no wait",
+            "output_text": "",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "monday",
+            "output_text": "Monday.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "accept",
+        "rendered": "Send it Monday.",
+        "fallback_trigger": null,
+        "error_codes": [],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Clear spoken correction may drop the retracted words."
+    },
+    {
+      "id": "CC-05",
+      "title": "Uncertain backtrack preserves every word (soft salvage)",
+      "roles": [
+        "accept_preserve_words",
+        "backtrack",
+        "fallback_soft"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-25"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "send it friday actually monday",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Send it Friday actually Monday.",
+      "base_fingerprint": "sha256:06f33b8a0c34ad8fd8bed096aee076755e9583afd0536674a86746977d209a46",
+      "protected_tokens": [
+        "Friday",
+        "Monday",
+        "actually"
+      ],
+      "cloud_outcome": "succeeded",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:06f33b8a0c34ad8fd8bed096aee076755e9583afd0536674a86746977d209a46",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [
+          {
+            "kind": "backtrack",
+            "certainty": "uncertain",
+            "source_provider": "provider_a",
+            "source_span_text": "friday actually"
+          }
+        ],
+        "conversions": [],
+        "layout": {
+          "decision": "natural",
+          "certainty": "clear"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "send it",
+            "output_text": "Send it ",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "remove",
+            "source_provider": "provider_a",
+            "source_text": "friday actually",
+            "output_text": "",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "monday",
+            "output_text": "Monday.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "accept_preserve_words",
+        "rendered": "Send it Friday actually Monday.",
+        "fallback_trigger": "uncertain_backtracking",
+        "error_codes": [
+          "E_UNCERTAIN_BACKTRACK"
+        ],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Uncertain correction cannot delete words; compose Natural preserve-all."
+    },
+    {
+      "id": "CC-06",
+      "title": "Uncertain layout forces Natural (no multi-paragraph split)",
+      "roles": [
+        "accept_natural_layout",
+        "layout",
+        "fallback_soft"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-07"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "the first thought is done the second thought is ready",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "The first thought is done the second thought is ready.",
+      "base_fingerprint": "sha256:a94d854cb0249f35523f6f51119060ec3691bf7d9bb2ab11525dab58de6e3c28",
+      "protected_tokens": [],
+      "cloud_outcome": "succeeded",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:a94d854cb0249f35523f6f51119060ec3691bf7d9bb2ab11525dab58de6e3c28",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [],
+        "layout": {
+          "decision": "multi_paragraph",
+          "certainty": "uncertain"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "the first thought is done",
+            "output_text": "The first thought is done",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "the second thought is ready",
+            "output_text": "the second thought is ready.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "accept_natural_layout",
+        "rendered": "The first thought is done the second thought is ready.",
+        "fallback_trigger": "uncertain_layout",
+        "error_codes": [
+          "E_UNCERTAIN_LAYOUT"
+        ],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Uncertain pause cannot force multi-paragraph layout."
+    },
+    {
+      "id": "CC-07",
+      "title": "Structured complex developer prompt accepts all closed labels",
+      "roles": [
+        "accept",
+        "structured",
+        "labels",
+        "behavior_138"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-43"
+      ],
+      "policy": "structured",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "goal fix the flaky auth test context it fails on CI only requirements keep public API stable constraints no new dependencies steps one reproduce two isolate three fix four verify acceptance criteria CI is green on main files crates/voisu-core/src/auth.rs notes keep the change small",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+      "base_fingerprint": "sha256:127575fbf06d8c0889f55a93ad84768b9ecdd9e6e6a9ac420958bbfe5ffe8a5c",
+      "protected_tokens": [
+        "public API",
+        "CI",
+        "crates/voisu-core/src/auth.rs"
+      ],
+      "cloud_outcome": "succeeded",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:127575fbf06d8c0889f55a93ad84768b9ecdd9e6e6a9ac420958bbfe5ffe8a5c",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [
+          {
+            "id": "spoken goal cue→Goal label",
+            "source_provider": "provider_a",
+            "source_span_text": "goal"
+          },
+          {
+            "id": "spoken context cue→Context label",
+            "source_provider": "provider_a",
+            "source_span_text": "context"
+          },
+          {
+            "id": "spoken requirements cue→Requirements label",
+            "source_provider": "provider_a",
+            "source_span_text": "requirements"
+          },
+          {
+            "id": "spoken constraints cue→Constraints label",
+            "source_provider": "provider_a",
+            "source_span_text": "constraints"
+          },
+          {
+            "id": "spoken acceptance criteria cue→Acceptance Criteria label",
+            "source_provider": "provider_a",
+            "source_span_text": "acceptance criteria"
+          },
+          {
+            "id": "spoken files cue→Files label",
+            "source_provider": "provider_a",
+            "source_span_text": "files"
+          },
+          {
+            "id": "spoken notes cue→Notes label",
+            "source_provider": "provider_a",
+            "source_span_text": "notes"
+          },
+          {
+            "id": "spoken steps cue→numbered_lines",
+            "source_provider": "provider_a",
+            "source_span_text": "steps"
+          },
+          {
+            "id": "one→1.",
+            "source_provider": "provider_a",
+            "source_span_text": "one"
+          },
+          {
+            "id": "two→2.",
+            "source_provider": "provider_a",
+            "source_span_text": "two"
+          },
+          {
+            "id": "three→3.",
+            "source_provider": "provider_a",
+            "source_span_text": "three"
+          },
+          {
+            "id": "four→4.",
+            "source_provider": "provider_a",
+            "source_span_text": "four"
+          }
+        ],
+        "layout": {
+          "decision": "structured_sections",
+          "certainty": "clear"
+        },
+        "labels": [
+          {
+            "label": "Goal",
+            "source_provider": "provider_a",
+            "source_span_text": "goal fix the flaky auth test"
+          },
+          {
+            "label": "Context",
+            "source_provider": "provider_a",
+            "source_span_text": "context it fails on CI only"
+          },
+          {
+            "label": "Requirements",
+            "source_provider": "provider_a",
+            "source_span_text": "requirements keep public API stable"
+          },
+          {
+            "label": "Constraints",
+            "source_provider": "provider_a",
+            "source_span_text": "constraints no new dependencies"
+          },
+          {
+            "label": "Steps",
+            "source_provider": "provider_a",
+            "source_span_text": "steps one reproduce two isolate three fix four verify"
+          },
+          {
+            "label": "Acceptance Criteria",
+            "source_provider": "provider_a",
+            "source_span_text": "acceptance criteria CI is green on main"
+          },
+          {
+            "label": "Files",
+            "source_provider": "provider_a",
+            "source_span_text": "files crates/voisu-core/src/auth.rs"
+          },
+          {
+            "label": "Notes",
+            "source_provider": "provider_a",
+            "source_span_text": "notes keep the change small"
+          }
+        ],
+        "derivation": [
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "goal",
+            "output_text": "Goal:\n",
+            "conversion_id": null,
+            "label": "Goal"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "fix the flaky auth test",
+            "output_text": "Fix the flaky auth test.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "context",
+            "output_text": "Context:\n",
+            "conversion_id": null,
+            "label": "Context"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "it fails on CI only",
+            "output_text": "It fails on CI only.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "requirements",
+            "output_text": "Requirements:\n",
+            "conversion_id": null,
+            "label": "Requirements"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "keep public API stable",
+            "output_text": "Keep public API stable.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "constraints",
+            "output_text": "Constraints:\n",
+            "conversion_id": null,
+            "label": "Constraints"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "no new dependencies",
+            "output_text": "No new dependencies.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "steps",
+            "output_text": "Steps:\n",
+            "conversion_id": null,
+            "label": "Steps"
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "one",
+            "output_text": "1. ",
+            "conversion_id": "one→1.",
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "reproduce",
+            "output_text": "Reproduce",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "two",
+            "output_text": "2. ",
+            "conversion_id": "two→2.",
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "isolate",
+            "output_text": "Isolate",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "three",
+            "output_text": "3. ",
+            "conversion_id": "three→3.",
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "fix",
+            "output_text": "Fix",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "four",
+            "output_text": "4. ",
+            "conversion_id": "four→4.",
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "verify",
+            "output_text": "Verify",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "acceptance criteria",
+            "output_text": "Acceptance Criteria:\n",
+            "conversion_id": null,
+            "label": "Acceptance Criteria"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "CI is green on main",
+            "output_text": "CI is green on main.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "files",
+            "output_text": "Files:\n",
+            "conversion_id": null,
+            "label": "Files"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "crates/voisu-core/src/auth.rs",
+            "output_text": "crates/voisu-core/src/auth.rs",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "notes",
+            "output_text": "Notes:\n",
+            "conversion_id": null,
+            "label": "Notes"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "keep the change small",
+            "output_text": "Keep the change small.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "accept",
+        "rendered": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
+        "fallback_trigger": null,
+        "error_codes": [],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Source-supported closed labels and numbered steps are valid structured organize-only output."
+    },
+    {
+      "id": "CC-08",
+      "title": "Invented requirements atoms are unsafe semantics → baseline",
+      "roles": [
+        "fallback_baseline",
+        "unsafe",
+        "behavior_138"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-37"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "goal fix the flaky auth test context it fails on CI only requirements keep public API stable constraints no new dependencies steps one reproduce two isolate three fix four verify acceptance criteria CI is green on main files crates/voisu-core/src/auth.rs notes keep the change small",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+      "base_fingerprint": "sha256:127575fbf06d8c0889f55a93ad84768b9ecdd9e6e6a9ac420958bbfe5ffe8a5c",
+      "protected_tokens": [],
+      "cloud_outcome": "rejected_unsafe",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:127575fbf06d8c0889f55a93ad84768b9ecdd9e6e6a9ac420958bbfe5ffe8a5c",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [
+          {
+            "id": "spoken goal cue→Goal label",
+            "source_provider": "provider_a",
+            "source_span_text": "goal"
+          },
+          {
+            "id": "spoken context cue→Context label",
+            "source_provider": "provider_a",
+            "source_span_text": "context"
+          },
+          {
+            "id": "spoken requirements cue→Requirements label",
+            "source_provider": "provider_a",
+            "source_span_text": "requirements"
+          },
+          {
+            "id": "spoken constraints cue→Constraints label",
+            "source_provider": "provider_a",
+            "source_span_text": "constraints"
+          },
+          {
+            "id": "spoken acceptance criteria cue→Acceptance Criteria label",
+            "source_provider": "provider_a",
+            "source_span_text": "acceptance criteria"
+          },
+          {
+            "id": "spoken files cue→Files label",
+            "source_provider": "provider_a",
+            "source_span_text": "files"
+          },
+          {
+            "id": "spoken notes cue→Notes label",
+            "source_provider": "provider_a",
+            "source_span_text": "notes"
+          },
+          {
+            "id": "spoken steps cue→numbered_lines",
+            "source_provider": "provider_a",
+            "source_span_text": "steps"
+          },
+          {
+            "id": "one→1.",
+            "source_provider": "provider_a",
+            "source_span_text": "one"
+          },
+          {
+            "id": "two→2.",
+            "source_provider": "provider_a",
+            "source_span_text": "two"
+          },
+          {
+            "id": "three→3.",
+            "source_provider": "provider_a",
+            "source_span_text": "three"
+          },
+          {
+            "id": "four→4.",
+            "source_provider": "provider_a",
+            "source_span_text": "four"
+          }
+        ],
+        "layout": {
+          "decision": "structured_sections",
+          "certainty": "clear"
+        },
+        "labels": [
+          {
+            "label": "Goal",
+            "source_provider": "provider_a",
+            "source_span_text": "goal fix the flaky auth test"
+          },
+          {
+            "label": "Context",
+            "source_provider": "provider_a",
+            "source_span_text": "context it fails on CI only"
+          },
+          {
+            "label": "Requirements",
+            "source_provider": "provider_a",
+            "source_span_text": "requirements keep public API stable"
+          },
+          {
+            "label": "Constraints",
+            "source_provider": "provider_a",
+            "source_span_text": "constraints no new dependencies"
+          },
+          {
+            "label": "Steps",
+            "source_provider": "provider_a",
+            "source_span_text": "steps one reproduce two isolate three fix four verify"
+          },
+          {
+            "label": "Acceptance Criteria",
+            "source_provider": "provider_a",
+            "source_span_text": "acceptance criteria CI is green on main"
+          },
+          {
+            "label": "Files",
+            "source_provider": "provider_a",
+            "source_span_text": "files crates/voisu-core/src/auth.rs"
+          },
+          {
+            "label": "Notes",
+            "source_provider": "provider_a",
+            "source_span_text": "notes keep the change small"
+          }
+        ],
+        "derivation": [
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "goal",
+            "output_text": "Goal:\n",
+            "conversion_id": null,
+            "label": "Goal"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "fix the flaky auth test",
+            "output_text": "Fix the flaky auth test.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "context",
+            "output_text": "Context:\n",
+            "conversion_id": null,
+            "label": "Context"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "it fails on CI only",
+            "output_text": "It fails on CI only.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "requirements",
+            "output_text": "Requirements:\n",
+            "conversion_id": null,
+            "label": "Requirements"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "keep public API stable",
+            "output_text": "Keep public API stable.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "constraints",
+            "output_text": "Constraints:\n",
+            "conversion_id": null,
+            "label": "Constraints"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "no new dependencies",
+            "output_text": "No new dependencies.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "steps",
+            "output_text": "Steps:\n",
+            "conversion_id": null,
+            "label": "Steps"
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "one",
+            "output_text": "1. ",
+            "conversion_id": "one→1.",
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "reproduce",
+            "output_text": "Reproduce",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "two",
+            "output_text": "2. ",
+            "conversion_id": "two→2.",
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "isolate",
+            "output_text": "Isolate",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "three",
+            "output_text": "3. ",
+            "conversion_id": "three→3.",
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "fix",
+            "output_text": "Fix",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "four",
+            "output_text": "4. ",
+            "conversion_id": "four→4.",
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "verify",
+            "output_text": "Verify",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "acceptance criteria",
+            "output_text": "Acceptance Criteria:\n",
+            "conversion_id": null,
+            "label": "Acceptance Criteria"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "CI is green on main",
+            "output_text": "CI is green on main.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "files",
+            "output_text": "Files:\n",
+            "conversion_id": null,
+            "label": "Files"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "crates/voisu-core/src/auth.rs",
+            "output_text": "crates/voisu-core/src/auth.rs",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "notes",
+            "output_text": "Notes:\n",
+            "conversion_id": null,
+            "label": "Notes"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "keep the change small",
+            "output_text": "Keep the change small.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "requirements",
+            "output_text": "Requirements:\n",
+            "conversion_id": null,
+            "label": "Requirements"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "keep the change small",
+            "output_text": "Handle retries, timeouts, and partial failures.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "fallback_baseline",
+        "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+        "fallback_trigger": "unsafe_semantics",
+        "error_codes": [
+          "E_INVENTED_CONTENT",
+          "E_UNSAFE_SEMANTICS"
+        ],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Cloud enrichment inventing requirements is rejected; local baseline wins."
+    },
+    {
+      "id": "CC-09",
+      "title": "Unverifiable source span rejects whole candidate",
+      "roles": [
+        "fallback_baseline",
+        "unverifiable",
+        "behavior_138"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-38"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "goal fix the flaky auth test context it fails on CI only requirements keep public API stable constraints no new dependencies steps one reproduce two isolate three fix four verify acceptance criteria CI is green on main files crates/voisu-core/src/auth.rs notes keep the change small",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+      "base_fingerprint": "sha256:127575fbf06d8c0889f55a93ad84768b9ecdd9e6e6a9ac420958bbfe5ffe8a5c",
+      "protected_tokens": [],
+      "cloud_outcome": "rejected_unverifiable",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:127575fbf06d8c0889f55a93ad84768b9ecdd9e6e6a9ac420958bbfe5ffe8a5c",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [],
+        "layout": {
+          "decision": "natural",
+          "certainty": "clear"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "not in the source at all xyzzy",
+            "output_text": "Completely different output not in source.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "fallback_baseline",
+        "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+        "fallback_trigger": "unverifiable_source_derivation",
+        "error_codes": [
+          "E_UNVERIFIABLE"
+        ],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Derivation must map to actual source substrings."
+    },
+    {
+      "id": "CC-10",
+      "title": "Non-closed structural header is invalid fixed label → baseline",
+      "roles": [
+        "fallback_baseline",
+        "invalid_label",
+        "behavior_138"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-39"
+      ],
+      "policy": "structured",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "goal fix the flaky auth test context it fails on CI only requirements keep public API stable constraints no new dependencies steps one reproduce two isolate three fix four verify acceptance criteria CI is green on main files crates/voisu-core/src/auth.rs notes keep the change small",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+      "base_fingerprint": "sha256:127575fbf06d8c0889f55a93ad84768b9ecdd9e6e6a9ac420958bbfe5ffe8a5c",
+      "protected_tokens": [],
+      "cloud_outcome": "rejected_invalid_label",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:127575fbf06d8c0889f55a93ad84768b9ecdd9e6e6a9ac420958bbfe5ffe8a5c",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [],
+        "layout": {
+          "decision": "structured_sections",
+          "certainty": "clear"
+        },
+        "labels": [
+          {
+            "label": "Goal",
+            "source_provider": "provider_a",
+            "source_span_text": "goal fix the flaky auth test"
+          }
+        ],
+        "derivation": [
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "goal",
+            "output_text": "Edge Cases:\n",
+            "conversion_id": null,
+            "label": "Goal"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "fix the flaky auth test",
+            "output_text": "Invented.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "fallback_baseline",
+        "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+        "fallback_trigger": "invalid_fixed_label",
+        "error_codes": [
+          "E_INVALID_LABEL"
+        ],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Only closed labels may appear as structural headers."
+    },
+    {
+      "id": "CC-11",
+      "title": "Schema failure uses local baseline without candidate",
+      "roles": [
+        "fallback_baseline",
+        "schema",
+        "behavior_138"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-40"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "goal fix the flaky auth test context it fails on CI only requirements keep public API stable constraints no new dependencies steps one reproduce two isolate three fix four verify acceptance criteria CI is green on main files crates/voisu-core/src/auth.rs notes keep the change small",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+      "base_fingerprint": "sha256:127575fbf06d8c0889f55a93ad84768b9ecdd9e6e6a9ac420958bbfe5ffe8a5c",
+      "protected_tokens": [],
+      "cloud_outcome": "schema_failure",
+      "candidate": null,
+      "expected": {
+        "decision": "fallback_baseline",
+        "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+        "fallback_trigger": "response_schema_failure",
+        "error_codes": [
+          "E_SCHEMA"
+        ],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Malformed/unparseable cloud response never blocks Delivery."
+    },
+    {
+      "id": "CC-12",
+      "title": "Provider failure uses local baseline",
+      "roles": [
+        "fallback_baseline",
+        "provider",
+        "behavior_138"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-47"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "goal fix the flaky auth test context it fails on CI only requirements keep public API stable constraints no new dependencies steps one reproduce two isolate three fix four verify acceptance criteria CI is green on main files crates/voisu-core/src/auth.rs notes keep the change small",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+      "base_fingerprint": "sha256:127575fbf06d8c0889f55a93ad84768b9ecdd9e6e6a9ac420958bbfe5ffe8a5c",
+      "protected_tokens": [],
+      "cloud_outcome": "provider_failure",
+      "candidate": null,
+      "expected": {
+        "decision": "fallback_baseline",
+        "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+        "fallback_trigger": "provider_failure",
+        "error_codes": [
+          "E_PROVIDER"
+        ],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Network/model failure falls back to deterministic local baseline."
+    },
+    {
+      "id": "CC-13",
+      "title": "1.5s deadline exceeded uses local baseline",
+      "roles": [
+        "fallback_baseline",
+        "deadline",
+        "behavior_138"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-42"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "goal fix the flaky auth test context it fails on CI only requirements keep public API stable constraints no new dependencies steps one reproduce two isolate three fix four verify acceptance criteria CI is green on main files crates/voisu-core/src/auth.rs notes keep the change small",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+      "base_fingerprint": "sha256:127575fbf06d8c0889f55a93ad84768b9ecdd9e6e6a9ac420958bbfe5ffe8a5c",
+      "protected_tokens": [],
+      "cloud_outcome": "deadline_exceeded",
+      "candidate": null,
+      "expected": {
+        "decision": "fallback_baseline",
+        "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+        "fallback_trigger": "deadline_exceeded",
+        "error_codes": [
+          "E_DEADLINE"
+        ],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Final-only Delivery deadline is authoritative."
+    },
+    {
+      "id": "CC-14",
+      "title": "Protected name mutation is unsafe → baseline",
+      "roles": [
+        "fallback_baseline",
+        "protected",
+        "name"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-15"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "call Anuraj about the release",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Call Anuraj about the release.",
+      "base_fingerprint": "sha256:8f904cfd9d7dda6b7a00c8f773a26a0b6b94b0dfed53d5fdfdb3a3fe32dae99d",
+      "protected_tokens": [
+        "Anuraj"
+      ],
+      "cloud_outcome": "rejected_unsafe",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:8f904cfd9d7dda6b7a00c8f773a26a0b6b94b0dfed53d5fdfdb3a3fe32dae99d",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [],
+        "layout": {
+          "decision": "natural",
+          "certainty": "clear"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "call Anuraj about the release",
+            "output_text": "Call anuraj about the release.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "fallback_baseline",
+        "rendered": "Call Anuraj about the release.",
+        "fallback_trigger": "unsafe_semantics",
+        "error_codes": [
+          "E_PROTECTED",
+          "E_UNSAFE_SEMANTICS"
+        ],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Names are case-sensitive protected tokens."
+    },
+    {
+      "id": "CC-15",
+      "title": "Semantic negation disagreement cloud flip is unsafe → baseline",
+      "roles": [
+        "fallback_baseline",
+        "protected",
+        "negation",
+        "dual_stt",
+        "behavior_138"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-35"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "do not enable the feature flag in production",
+          "primary": true
+        },
+        {
+          "provider": "provider_b",
+          "available": true,
+          "text": "enable the feature flag in production",
+          "primary": false
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "configured_primary_rank"
+      },
+      "local_baseline": "Do not enable the feature flag in production.",
+      "base_fingerprint": "sha256:d6df43b134a303df10f4cdc21f2434a03175b66a2089cea902253e6ea032df4b",
+      "protected_tokens": [
+        "Do not enable"
+      ],
+      "cloud_outcome": "rejected_unsafe",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:d6df43b134a303df10f4cdc21f2434a03175b66a2089cea902253e6ea032df4b",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "configured_primary_rank"
+        },
+        "removals": [],
+        "conversions": [],
+        "layout": {
+          "decision": "natural",
+          "certainty": "clear"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "do not enable the feature flag in production",
+            "output_text": "Enable the feature flag in production.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "fallback_baseline",
+        "rendered": "Do not enable the feature flag in production.",
+        "fallback_trigger": "unsafe_semantics",
+        "error_codes": [
+          "E_PROTECTED",
+          "E_UNSAFE_SEMANTICS"
+        ],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Negation polarity cannot be flipped by cloud reconciliation."
+    },
+    {
+      "id": "CC-16",
+      "title": "Protected-token dual-STT disagreement confirms primary rank",
+      "roles": [
+        "accept",
+        "dual_stt",
+        "protected",
+        "behavior_138"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-34"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "file the bug in voisu",
+          "primary": true
+        },
+        {
+          "provider": "provider_b",
+          "available": true,
+          "text": "file the bug in voice so",
+          "primary": false
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "configured_primary_rank"
+      },
+      "local_baseline": "File the bug in voisu.",
+      "base_fingerprint": "sha256:44172aa76787c66b0cdca2ae95a072d39a3d87020ab2afcb8346193a47f4cbe1",
+      "protected_tokens": [
+        "voisu"
+      ],
+      "cloud_outcome": "succeeded",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:44172aa76787c66b0cdca2ae95a072d39a3d87020ab2afcb8346193a47f4cbe1",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "configured_primary_rank"
+        },
+        "removals": [],
+        "conversions": [],
+        "layout": {
+          "decision": "natural",
+          "certainty": "clear"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "file the bug in voisu",
+            "output_text": "File the bug in voisu.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "accept",
+        "rendered": "File the bug in voisu.",
+        "fallback_trigger": null,
+        "error_codes": [],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Primary-ranked protected token wins; secondary split form is not adopted."
+    },
+    {
+      "id": "CC-17",
+      "title": "Protected command, URL, identifier, and number tokens preserved",
+      "roles": [
+        "accept",
+        "protected",
+        "command",
+        "url",
+        "identifier",
+        "number"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-18",
+        "DPR-19",
+        "DPR-20"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "run curl -I --fail https://example.com and return status_code equals 404",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Run curl -I --fail https://example.com and return status_code equals 404.",
+      "base_fingerprint": "sha256:8fea5c990d48b2615ce401ab424589c4dcea85bba89a6cae66da552063350dc3",
+      "protected_tokens": [
+        "curl",
+        "-I",
+        "--fail",
+        "https://example.com",
+        "status_code",
+        "404"
+      ],
+      "cloud_outcome": "succeeded",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:8fea5c990d48b2615ce401ab424589c4dcea85bba89a6cae66da552063350dc3",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [],
+        "layout": {
+          "decision": "natural",
+          "certainty": "clear"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "run curl -I --fail https://example.com and return status_code equals 404",
+            "output_text": "Run curl -I --fail https://example.com and return status_code equals 404.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "accept",
+        "rendered": "Run curl -I --fail https://example.com and return status_code equals 404.",
+        "fallback_trigger": null,
+        "error_codes": [],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Commands, flags, URLs, identifiers, and numbers stay exact."
+    },
+    {
+      "id": "CC-18",
+      "title": "Simple everyday organize is keep-only Natural derivation",
+      "roles": [
+        "accept",
+        "natural",
+        "behavior_138"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-01"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "hey can you send the notes when you get a chance",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Hey, can you send the notes when you get a chance?",
+      "base_fingerprint": "sha256:599fa103ead6f2f49c078c3cdb14d9a57d659fe734ae57fce4f384271bb29fb2",
+      "protected_tokens": [],
+      "cloud_outcome": "succeeded",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:599fa103ead6f2f49c078c3cdb14d9a57d659fe734ae57fce4f384271bb29fb2",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [],
+        "layout": {
+          "decision": "natural",
+          "certainty": "clear"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "hey can you send the notes when you get a chance",
+            "output_text": "Hey, can you send the notes when you get a chance?",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "accept",
+        "rendered": "Hey, can you send the notes when you get a chance?",
+        "fallback_trigger": null,
+        "error_codes": [],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Casing and punctuation are allowed organize-only changes."
+    },
+    {
+      "id": "CC-19",
+      "title": "Invented ordinary wording without source is unsafe",
+      "roles": [
+        "fallback_baseline",
+        "unsafe",
+        "invented"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-01"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "hey can you send the notes when you get a chance",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Hey, can you send the notes when you get a chance?",
+      "base_fingerprint": "sha256:599fa103ead6f2f49c078c3cdb14d9a57d659fe734ae57fce4f384271bb29fb2",
+      "protected_tokens": [],
+      "cloud_outcome": "rejected_unsafe",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:599fa103ead6f2f49c078c3cdb14d9a57d659fe734ae57fce4f384271bb29fb2",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [],
+        "layout": {
+          "decision": "natural",
+          "certainty": "clear"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "hey can you send the notes when you get a chance",
+            "output_text": "Restart production immediately.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "fallback_baseline",
+        "rendered": "Hey, can you send the notes when you get a chance?",
+        "fallback_trigger": "unsafe_semantics",
+        "error_codes": [
+          "E_INVENTED_CONTENT",
+          "E_UNSAFE_SEMANTICS"
+        ],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Output atoms must be licensed by source, closed conversion, or closed label."
+    },
+    {
+      "id": "CC-20",
+      "title": "Simple Structured Goal label with source evidence",
+      "roles": [
+        "accept",
+        "structured",
+        "label",
+        "behavior_138"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-28"
+      ],
+      "policy": "structured",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "goal fix the flaky auth test",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Goal:\nFix the flaky auth test.",
+      "base_fingerprint": "sha256:4b0349ed26d8df0479ca014fedfa63d93567dc1e3a49c56b6077dfaf815a824e",
+      "protected_tokens": [],
+      "cloud_outcome": "succeeded",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:4b0349ed26d8df0479ca014fedfa63d93567dc1e3a49c56b6077dfaf815a824e",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [
+          {
+            "id": "spoken goal cue→Goal label",
+            "source_provider": "provider_a",
+            "source_span_text": "goal"
+          }
+        ],
+        "layout": {
+          "decision": "structured_sections",
+          "certainty": "clear"
+        },
+        "labels": [
+          {
+            "label": "Goal",
+            "source_provider": "provider_a",
+            "source_span_text": "goal fix the flaky auth test"
+          }
+        ],
+        "derivation": [
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "goal",
+            "output_text": "Goal:\n",
+            "conversion_id": null,
+            "label": "Goal"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "fix the flaky auth test",
+            "output_text": "Fix the flaky auth test.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "accept",
+        "rendered": "Goal:\nFix the flaky auth test.",
+        "fallback_trigger": null,
+        "error_codes": [],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Closed Goal label is source-evidenced."
+    },
+    {
+      "id": "CC-21",
+      "title": "Paired quote cues convert with protected interior",
+      "roles": [
+        "accept",
+        "conversion",
+        "quote",
+        "behavior_138"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-12"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "she said quote we ship friday unquote and hung up",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "She said \"we ship friday\" and hung up.",
+      "base_fingerprint": "sha256:145baf5bf0e3e3eb0c76673c039f3d2f6cc08bea0d5fec425e58314e72b48d76",
+      "protected_tokens": [
+        "we ship friday"
+      ],
+      "cloud_outcome": "succeeded",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:145baf5bf0e3e3eb0c76673c039f3d2f6cc08bea0d5fec425e58314e72b48d76",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [
+          {
+            "id": "quote…unquote→\"…\"",
+            "source_provider": "provider_a",
+            "source_span_text": "quote we ship friday unquote"
+          }
+        ],
+        "layout": {
+          "decision": "natural",
+          "certainty": "clear"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "she said",
+            "output_text": "She said ",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "quote we ship friday unquote",
+            "output_text": "\"we ship friday\"",
+            "conversion_id": "quote…unquote→\"…\"",
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "and hung up",
+            "output_text": " and hung up.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "accept",
+        "rendered": "She said \"we ship friday\" and hung up.",
+        "fallback_trigger": null,
+        "error_codes": [],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Quote conversion preserves interior casing."
+    },
+    {
+      "id": "CC-22",
+      "title": "Stale base fingerprint rejects candidate → baseline",
+      "roles": [
+        "fallback_baseline",
+        "stale"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-09"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "ship it exclamation point",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Ship it!",
+      "base_fingerprint": "sha256:2af172901ba1ab4ff2ac0c16051d9f743dce96d197eb8d7c54896b40bb208324",
+      "protected_tokens": [],
+      "cloud_outcome": "rejected_unverifiable",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [
+          {
+            "id": "exclamation point→!",
+            "source_provider": "provider_a",
+            "source_span_text": "exclamation point"
+          }
+        ],
+        "layout": {
+          "decision": "natural",
+          "certainty": "clear"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "ship it",
+            "output_text": "Ship it",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "exclamation point",
+            "output_text": "!",
+            "conversion_id": "exclamation point→!",
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "fallback_baseline",
+        "rendered": "Ship it!",
+        "fallback_trigger": "unverifiable_source_derivation",
+        "error_codes": [
+          "E_STALE"
+        ],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Candidate must bind to selected source fingerprint."
+    },
+    {
+      "id": "CC-23",
+      "title": "Cloud skipped path never applies candidate; baseline wins",
+      "roles": [
+        "fallback_baseline",
+        "skipped",
+        "behavior_138"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-46"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "goal fix the flaky auth test context it fails on CI only requirements keep public API stable constraints no new dependencies steps one reproduce two isolate three fix four verify acceptance criteria CI is green on main files crates/voisu-core/src/auth.rs notes keep the change small",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+      "base_fingerprint": "sha256:127575fbf06d8c0889f55a93ad84768b9ecdd9e6e6a9ac420958bbfe5ffe8a5c",
+      "protected_tokens": [],
+      "cloud_outcome": "skipped",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:127575fbf06d8c0889f55a93ad84768b9ecdd9e6e6a9ac420958bbfe5ffe8a5c",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [
+          {
+            "id": "spoken goal cue→Goal label",
+            "source_provider": "provider_a",
+            "source_span_text": "goal"
+          },
+          {
+            "id": "spoken context cue→Context label",
+            "source_provider": "provider_a",
+            "source_span_text": "context"
+          },
+          {
+            "id": "spoken requirements cue→Requirements label",
+            "source_provider": "provider_a",
+            "source_span_text": "requirements"
+          },
+          {
+            "id": "spoken constraints cue→Constraints label",
+            "source_provider": "provider_a",
+            "source_span_text": "constraints"
+          },
+          {
+            "id": "spoken acceptance criteria cue→Acceptance Criteria label",
+            "source_provider": "provider_a",
+            "source_span_text": "acceptance criteria"
+          },
+          {
+            "id": "spoken files cue→Files label",
+            "source_provider": "provider_a",
+            "source_span_text": "files"
+          },
+          {
+            "id": "spoken notes cue→Notes label",
+            "source_provider": "provider_a",
+            "source_span_text": "notes"
+          },
+          {
+            "id": "spoken steps cue→numbered_lines",
+            "source_provider": "provider_a",
+            "source_span_text": "steps"
+          },
+          {
+            "id": "one→1.",
+            "source_provider": "provider_a",
+            "source_span_text": "one"
+          },
+          {
+            "id": "two→2.",
+            "source_provider": "provider_a",
+            "source_span_text": "two"
+          },
+          {
+            "id": "three→3.",
+            "source_provider": "provider_a",
+            "source_span_text": "three"
+          },
+          {
+            "id": "four→4.",
+            "source_provider": "provider_a",
+            "source_span_text": "four"
+          }
+        ],
+        "layout": {
+          "decision": "structured_sections",
+          "certainty": "clear"
+        },
+        "labels": [
+          {
+            "label": "Goal",
+            "source_provider": "provider_a",
+            "source_span_text": "goal fix the flaky auth test"
+          },
+          {
+            "label": "Context",
+            "source_provider": "provider_a",
+            "source_span_text": "context it fails on CI only"
+          },
+          {
+            "label": "Requirements",
+            "source_provider": "provider_a",
+            "source_span_text": "requirements keep public API stable"
+          },
+          {
+            "label": "Constraints",
+            "source_provider": "provider_a",
+            "source_span_text": "constraints no new dependencies"
+          },
+          {
+            "label": "Steps",
+            "source_provider": "provider_a",
+            "source_span_text": "steps one reproduce two isolate three fix four verify"
+          },
+          {
+            "label": "Acceptance Criteria",
+            "source_provider": "provider_a",
+            "source_span_text": "acceptance criteria CI is green on main"
+          },
+          {
+            "label": "Files",
+            "source_provider": "provider_a",
+            "source_span_text": "files crates/voisu-core/src/auth.rs"
+          },
+          {
+            "label": "Notes",
+            "source_provider": "provider_a",
+            "source_span_text": "notes keep the change small"
+          }
+        ],
+        "derivation": [
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "goal",
+            "output_text": "Goal:\n",
+            "conversion_id": null,
+            "label": "Goal"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "fix the flaky auth test",
+            "output_text": "Fix the flaky auth test.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "context",
+            "output_text": "Context:\n",
+            "conversion_id": null,
+            "label": "Context"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "it fails on CI only",
+            "output_text": "It fails on CI only.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "requirements",
+            "output_text": "Requirements:\n",
+            "conversion_id": null,
+            "label": "Requirements"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "keep public API stable",
+            "output_text": "Keep public API stable.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "constraints",
+            "output_text": "Constraints:\n",
+            "conversion_id": null,
+            "label": "Constraints"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "no new dependencies",
+            "output_text": "No new dependencies.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "steps",
+            "output_text": "Steps:\n",
+            "conversion_id": null,
+            "label": "Steps"
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "one",
+            "output_text": "1. ",
+            "conversion_id": "one→1.",
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "reproduce",
+            "output_text": "Reproduce",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "two",
+            "output_text": "2. ",
+            "conversion_id": "two→2.",
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "isolate",
+            "output_text": "Isolate",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "three",
+            "output_text": "3. ",
+            "conversion_id": "three→3.",
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "fix",
+            "output_text": "Fix",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "convert",
+            "source_provider": "provider_a",
+            "source_text": "four",
+            "output_text": "4. ",
+            "conversion_id": "four→4.",
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "verify",
+            "output_text": "Verify",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "acceptance criteria",
+            "output_text": "Acceptance Criteria:\n",
+            "conversion_id": null,
+            "label": "Acceptance Criteria"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "CI is green on main",
+            "output_text": "CI is green on main.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "files",
+            "output_text": "Files:\n",
+            "conversion_id": null,
+            "label": "Files"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "crates/voisu-core/src/auth.rs",
+            "output_text": "crates/voisu-core/src/auth.rs",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "label",
+            "source_provider": "provider_a",
+            "source_text": "notes",
+            "output_text": "Notes:\n",
+            "conversion_id": null,
+            "label": "Notes"
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "keep the change small",
+            "output_text": "Keep the change small.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "fallback_baseline",
+        "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+        "fallback_trigger": null,
+        "error_codes": [],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Skipped optional cloud leaves deterministic local baseline as final."
+    },
+    {
+      "id": "CC-24",
+      "title": "Clear multi-paragraph layout break is accepted",
+      "roles": [
+        "accept",
+        "layout",
+        "multi_paragraph",
+        "behavior_138"
+      ],
+      "related_behavior_fixture_ids": [
+        "DPR-06"
+      ],
+      "policy": "adaptive",
+      "sources": [
+        {
+          "provider": "provider_a",
+          "available": true,
+          "text": "the first thought is done the second thought is ready",
+          "primary": true
+        }
+      ],
+      "source_selection": {
+        "selected_provider": "provider_a",
+        "reason": "only_available"
+      },
+      "local_baseline": "The first thought is done.\n\nThe second thought is ready.",
+      "base_fingerprint": "sha256:a94d854cb0249f35523f6f51119060ec3691bf7d9bb2ab11525dab58de6e3c28",
+      "protected_tokens": [],
+      "cloud_outcome": "succeeded",
+      "candidate": {
+        "schema_version": "1",
+        "base_fingerprint": "sha256:a94d854cb0249f35523f6f51119060ec3691bf7d9bb2ab11525dab58de6e3c28",
+        "reconciliation": {
+          "selected_provider": "provider_a",
+          "reason": "only_available"
+        },
+        "removals": [],
+        "conversions": [],
+        "layout": {
+          "decision": "multi_paragraph",
+          "certainty": "clear"
+        },
+        "labels": [],
+        "derivation": [
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "the first thought is done",
+            "output_text": "The first thought is done.",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "layout_break",
+            "source_provider": null,
+            "source_text": "",
+            "output_text": "\n\n",
+            "conversion_id": null,
+            "label": null
+          },
+          {
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": "the second thought is ready",
+            "output_text": "The second thought is ready.",
+            "conversion_id": null,
+            "label": null
+          }
+        ]
+      },
+      "expected": {
+        "decision": "accept",
+        "rendered": "The first thought is done.\n\nThe second thought is ready.",
+        "fallback_trigger": null,
+        "error_codes": [],
+        "delivery": {
+          "state": "unsent",
+          "auto_send": false,
+          "live_type": false,
+          "replace_delivered": false
+        }
+      },
+      "rationale": "Clear timing/layout evidence may insert paragraph breaks without changing words."
+    }
+  ],
+  "dataset_counts": {
+    "fixtures_total": 24,
+    "accept": 11,
+    "accept_preserve_words": 1,
+    "accept_natural_layout": 1,
+    "fallback_baseline": 11,
+    "related_behavior_links": 26,
+    "model_prompt_contracts": 3,
+    "notes": "Positive accepts cover conversion, removal, labels, dual-STT, and layout; soft salvage covers uncertain backtrack/layout; hard fallbacks cover unsafe/unverifiable/invalid/schema/provider/deadline/stale/skipped."
+  }
+}
