@@ -505,9 +505,20 @@ def ranges_overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:
 def claim_source_ranges(
     source_map: dict[str, str],
     derivation: list[dict[str, Any]],
+    selected_provider: str | None = None,
 ) -> list[str]:
-    """Claim source regions for consuming spans; return error codes if overlap."""
+    """Claim source regions for consuming spans.
+
+    Enforces:
+    - no double-consume (``E_OVERLAP``)
+    - derivation order is non-decreasing in source start offset per provider
+      (``E_UNVERIFIABLE``) — blocks reverse-span reorder accepts
+    - every non-whitespace character of the selected provider (and any other
+      provider that is consumed) is covered by some keep/remove/convert/label
+      claim (``E_UNVERIFIABLE``) — blocks undeclared word omission
+    """
     claimed: dict[str, list[tuple[int, int]]] = {p: [] for p in source_map}
+    prev_start: dict[str, int] = {p: -1 for p in source_map}
     for span in derivation:
         if not isinstance(span, dict):
             continue
@@ -519,19 +530,46 @@ def claim_source_ranges(
         if provider not in source_map or not source_text:
             continue
         hay = source_map[provider]
-        candidates = find_literal_spans(hay, source_text)
+        # Prefer leftmost free match so placement is deterministic and ordered.
+        candidates = sorted(find_literal_spans(hay, source_text), key=lambda r: r[0])
         if not candidates:
             # unverifiable is handled elsewhere; skip claim
             continue
-        placed = False
+        placed: tuple[int, int] | None = None
         for cand in candidates:
             if any(ranges_overlap(cand, used) for used in claimed[provider]):
                 continue
-            claimed[provider].append(cand)
-            placed = True
+            placed = cand
             break
-        if not placed:
+        if placed is None:
             return ["E_OVERLAP"]
+        start, end = placed
+        if start < prev_start[provider]:
+            # Later derivation span claims an earlier source region → reverse order.
+            return ["E_UNVERIFIABLE"]
+        prev_start[provider] = start
+        claimed[provider].append(placed)
+
+    providers_to_cover: set[str] = set()
+    if isinstance(selected_provider, str) and selected_provider in source_map:
+        providers_to_cover.add(selected_provider)
+    for provider, ranges in claimed.items():
+        if ranges:
+            providers_to_cover.add(provider)
+
+    for provider in providers_to_cover:
+        text = source_map[provider]
+        if not text:
+            continue
+        covered = [False] * len(text)
+        for start, end in claimed[provider]:
+            lo = max(0, start)
+            hi = min(len(text), end)
+            for i in range(lo, hi):
+                covered[i] = True
+        for i, ch in enumerate(text):
+            if not ch.isspace() and not covered[i]:
+                return ["E_UNVERIFIABLE"]
     return []
 
 
@@ -959,10 +997,19 @@ def compose_fixture(
                 ["E_PROTECTED", "E_UNSAFE_SEMANTICS"],
             )
 
-    # Accept-path source-region overlap (double-keep / double-consume).
-    overlap_codes = claim_source_ranges(source_map, candidate.get("derivation") or [])
-    if overlap_codes:
-        return baseline_result("unverifiable_source_derivation", overlap_codes)
+    # Accept-path source-region overlap, order, and full-source coverage.
+    selected_provider = None
+    if isinstance(selection, dict):
+        sp = selection.get("selected_provider")
+        if isinstance(sp, str):
+            selected_provider = sp
+    placement_codes = claim_source_ranges(
+        source_map,
+        candidate.get("derivation") or [],
+        selected_provider=selected_provider,
+    )
+    if placement_codes:
+        return baseline_result("unverifiable_source_derivation", placement_codes)
 
     # Accept-path output fidelity (stronger than bag-of-atoms alone).
     for span in candidate.get("derivation") or []:
@@ -1944,6 +1991,64 @@ def run_mutations(corpus: dict[str, Any], schema: Any) -> list[str]:
         keep_rephrase_drops_words,
     )
 
+    def omit_undeclared_source_words(c: dict[str, Any]) -> None:
+        """Keep only a middle phrase — drops unremoved source words without removals."""
+        f = find(c, lambda x: x.get("id") == "CC-18")
+        f["candidate"]["removals"] = []
+        f["candidate"]["derivation"] = [
+            {
+                "kind": "keep",
+                "source_provider": "provider_a",
+                "source_text": "send the notes",
+                "output_text": "Send the notes.",
+                "conversion_id": None,
+                "label": None,
+            }
+        ]
+        f["expected"]["decision"] = "accept"
+        f["expected"]["fallback_trigger"] = None
+        f["expected"]["error_codes"] = []
+        f["expected"]["rendered"] = "Send the notes."
+
+    mut(
+        "omit_undeclared_source_words",
+        ["composition decision", "E_UNVERIFIABLE"],
+        omit_undeclared_source_words,
+    )
+
+    def reverse_source_span_order(c: dict[str, Any]) -> None:
+        """Two keeps covering full source but emitted in reverse source order."""
+        f = find(c, lambda x: x.get("id") == "CC-18")
+        f["candidate"]["removals"] = []
+        f["candidate"]["derivation"] = [
+            {
+                "kind": "keep",
+                "source_provider": "provider_a",
+                "source_text": "when you get a chance",
+                "output_text": "When you get a chance ",
+                "conversion_id": None,
+                "label": None,
+            },
+            {
+                "kind": "keep",
+                "source_provider": "provider_a",
+                "source_text": "hey can you send the notes",
+                "output_text": "Hey can you send the notes",
+                "conversion_id": None,
+                "label": None,
+            },
+        ]
+        f["expected"]["decision"] = "accept"
+        f["expected"]["fallback_trigger"] = None
+        f["expected"]["error_codes"] = []
+        f["expected"]["rendered"] = "When you get a chance Hey can you send the notes"
+
+    mut(
+        "reverse_source_span_order",
+        ["composition decision", "E_UNVERIFIABLE"],
+        reverse_source_span_order,
+    )
+
     return failures
 
 
@@ -1987,7 +2092,7 @@ def main(argv: list[str]) -> int:
     print(f"  closed_conversions: {len(corpus['closed_conversions'])}")
     print(f"  error_codes: {len(corpus['error_codes'])}")
     print(f"  invariants: {len(corpus['invariants'])}")
-    print("  mutations: 34 property-bound")
+    print("  mutations: 36 property-bound")
     return 0
 
 
