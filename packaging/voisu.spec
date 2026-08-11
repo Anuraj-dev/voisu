@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.19.0
+Version:        0.19.1
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,12 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Tue Aug 11 2026 Voisu maintainers <voisu@example.invalid> - 0.19.1-1
+- fix(research): close #139 derivation completeness and source-order gates (#149)
+- docs(research): structured combined-call contract prototype (#139)
+- docs(research): Developer Prompt Rendering behavior corpus (#138)
+- docs(research): prototype weighted intent routing package (#141)
+
 * Mon Aug 10 2026 Voisu maintainers <voisu@example.invalid> - 0.19.0-1
 - feat(app): integrate Smart Writing final transform gate
 
