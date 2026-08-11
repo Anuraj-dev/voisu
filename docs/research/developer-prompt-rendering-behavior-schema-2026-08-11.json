@@ -1,0 +1,1143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Anuraj-dev/voisu/main/docs/research/developer-prompt-rendering-behavior-schema-2026-08-11.json",
+  "title": "Voisu Developer Prompt Rendering behavior corpus (#138)",
+  "description": "Structural schema for #138 spoken-input → final Transcript fixtures. Exact strings are product-behavior evidence for #139. Not a runtime renderer. The paired stdlib checker enforces exact owned key sets; it is not a generic Draft 2020-12 engine.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "corpus_id",
+    "version",
+    "issue",
+    "language",
+    "governing",
+    "closed_structured_labels",
+    "kinds",
+    "policies",
+    "routes",
+    "cloud_request_states",
+    "cloud_outcomes",
+    "provider_states",
+    "fallback_triggers",
+    "closed_tags",
+    "coverage_requirements",
+    "coverage_matrix",
+    "fixtures",
+    "dataset_counts",
+    "invariants"
+  ],
+  "properties": {
+    "corpus_id": {
+      "const": "voisu-developer-prompt-rendering-behavior-2026-08-11"
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "issue": {
+      "$ref": "#/$defs/issue"
+    },
+    "language": {
+      "const": "en"
+    },
+    "governing": {
+      "$ref": "#/$defs/governing"
+    },
+    "closed_structured_labels": {
+      "const": [
+        "Goal",
+        "Context",
+        "Requirements",
+        "Constraints",
+        "Steps",
+        "Acceptance Criteria",
+        "Files",
+        "Notes"
+      ]
+    },
+    "kinds": {
+      "const": [
+        "everyday_message",
+        "developer_prompt"
+      ]
+    },
+    "policies": {
+      "const": [
+        "natural",
+        "adaptive",
+        "structured"
+      ]
+    },
+    "routes": {
+      "const": [
+        "literal_identity",
+        "deterministic_local",
+        "local_with_optional_cloud"
+      ]
+    },
+    "cloud_request_states": {
+      "const": [
+        "not_allowed",
+        "allowed",
+        "required"
+      ]
+    },
+    "cloud_outcomes": {
+      "const": [
+        "not_attempted",
+        "skipped",
+        "succeeded",
+        "rejected_unsafe",
+        "rejected_unverifiable",
+        "rejected_invalid_label",
+        "schema_failure",
+        "provider_failure",
+        "deadline_exceeded"
+      ]
+    },
+    "provider_states": {
+      "const": [
+        "exact_agreement",
+        "punctuation_only_agreement",
+        "safe_complementary",
+        "protected_token_disagreement",
+        "semantic_disagreement",
+        "single_provider"
+      ]
+    },
+    "fallback_triggers": {
+      "const": [
+        "none",
+        "unsafe_semantics",
+        "unverifiable_source_derivation",
+        "invalid_fixed_label",
+        "uncertain_backtracking",
+        "uncertain_layout",
+        "response_schema_failure",
+        "provider_failure",
+        "deadline_exceeded"
+      ]
+    },
+    "closed_tags": {
+      "const": [
+        "policy-natural",
+        "policy-adaptive",
+        "policy-structured",
+        "everyday-message",
+        "developer-prompt",
+        "multi-paragraph",
+        "numbered-sequence",
+        "protected-name",
+        "protected-number",
+        "protected-negation",
+        "protected-command",
+        "protected-url-path",
+        "protected-identifier",
+        "protected-code",
+        "protected-quote",
+        "slang-dialect",
+        "already-formatted",
+        "filler-clear-remove",
+        "filler-preserve",
+        "backtrack-clear",
+        "backtrack-uncertain",
+        "timing-clear",
+        "timing-uncertain",
+        "symbol-convert",
+        "symbol-stacked",
+        "symbol-malformed",
+        "symbol-quoted-meta",
+        "dual-stt-exact",
+        "dual-stt-punct",
+        "dual-stt-complementary",
+        "dual-stt-protected-disagreement",
+        "dual-stt-semantic-disagreement",
+        "dual-stt-single-provider",
+        "route-literal",
+        "route-local",
+        "route-cloud-optional",
+        "cloud-succeeded",
+        "cloud-skipped",
+        "cloud-failed",
+        "fallback-unsafe-semantics",
+        "fallback-unverifiable",
+        "fallback-invalid-label",
+        "fallback-uncertain-backtrack",
+        "fallback-uncertain-layout",
+        "fallback-schema",
+        "fallback-provider",
+        "fallback-deadline",
+        "deadline-local-baseline-start",
+        "local-only",
+        "no-autosend",
+        "kind-everyday",
+        "kind-developer",
+        "label-goal",
+        "label-context",
+        "label-requirements",
+        "label-constraints",
+        "label-steps",
+        "label-acceptance-criteria",
+        "label-files",
+        "label-notes"
+      ]
+    },
+    "coverage_requirements": {
+      "const": [
+        "policy-natural",
+        "policy-adaptive",
+        "policy-structured",
+        "everyday-message",
+        "developer-prompt",
+        "multi-paragraph",
+        "numbered-sequence",
+        "protected-name",
+        "protected-number",
+        "protected-negation",
+        "protected-command",
+        "protected-url-path",
+        "protected-identifier",
+        "protected-code",
+        "protected-quote",
+        "slang-dialect",
+        "already-formatted",
+        "filler-clear-remove",
+        "filler-preserve",
+        "backtrack-clear",
+        "backtrack-uncertain",
+        "timing-clear",
+        "timing-uncertain",
+        "symbol-convert",
+        "symbol-stacked",
+        "symbol-malformed",
+        "symbol-quoted-meta",
+        "dual-stt-exact",
+        "dual-stt-punct",
+        "dual-stt-complementary",
+        "dual-stt-protected-disagreement",
+        "dual-stt-semantic-disagreement",
+        "dual-stt-single-provider",
+        "route-literal",
+        "route-local",
+        "route-cloud-optional",
+        "cloud-succeeded",
+        "cloud-skipped",
+        "cloud-failed",
+        "fallback-unsafe-semantics",
+        "fallback-unverifiable",
+        "fallback-invalid-label",
+        "fallback-uncertain-backtrack",
+        "fallback-uncertain-layout",
+        "fallback-schema",
+        "fallback-provider",
+        "fallback-deadline",
+        "deadline-local-baseline-start",
+        "local-only",
+        "no-autosend",
+        "kind-everyday",
+        "kind-developer",
+        "label-goal",
+        "label-context",
+        "label-requirements",
+        "label-constraints",
+        "label-steps",
+        "label-acceptance-criteria",
+        "label-files",
+        "label-notes"
+      ]
+    },
+    "coverage_matrix": {
+      "type": "object",
+      "description": "For every closed tag, the fixture ID set exactly equals all fixtures carrying that tag.",
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "propertyNames": {
+        "enum": [
+          "policy-natural",
+          "policy-adaptive",
+          "policy-structured",
+          "everyday-message",
+          "developer-prompt",
+          "multi-paragraph",
+          "numbered-sequence",
+          "protected-name",
+          "protected-number",
+          "protected-negation",
+          "protected-command",
+          "protected-url-path",
+          "protected-identifier",
+          "protected-code",
+          "protected-quote",
+          "slang-dialect",
+          "already-formatted",
+          "filler-clear-remove",
+          "filler-preserve",
+          "backtrack-clear",
+          "backtrack-uncertain",
+          "timing-clear",
+          "timing-uncertain",
+          "symbol-convert",
+          "symbol-stacked",
+          "symbol-malformed",
+          "symbol-quoted-meta",
+          "dual-stt-exact",
+          "dual-stt-punct",
+          "dual-stt-complementary",
+          "dual-stt-protected-disagreement",
+          "dual-stt-semantic-disagreement",
+          "dual-stt-single-provider",
+          "route-literal",
+          "route-local",
+          "route-cloud-optional",
+          "cloud-succeeded",
+          "cloud-skipped",
+          "cloud-failed",
+          "fallback-unsafe-semantics",
+          "fallback-unverifiable",
+          "fallback-invalid-label",
+          "fallback-uncertain-backtrack",
+          "fallback-uncertain-layout",
+          "fallback-schema",
+          "fallback-provider",
+          "fallback-deadline",
+          "deadline-local-baseline-start",
+          "local-only",
+          "no-autosend",
+          "kind-everyday",
+          "kind-developer",
+          "label-goal",
+          "label-context",
+          "label-requirements",
+          "label-constraints",
+          "label-steps",
+          "label-acceptance-criteria",
+          "label-files",
+          "label-notes"
+        ]
+      }
+    },
+    "fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/fixture"
+      }
+    },
+    "dataset_counts": {
+      "$ref": "#/$defs/counts"
+    },
+    "invariants": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "summary"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "github_number",
+        "title",
+        "parent_map",
+        "blocks",
+        "url"
+      ],
+      "properties": {
+        "github_number": {
+          "const": 138
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "parent_map": {
+          "const": 133
+        },
+        "blocks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "integer"
+          }
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "governing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_issue",
+        "map_issue",
+        "resolution_issues",
+        "superseded_sources",
+        "out_of_scope"
+      ],
+      "properties": {
+        "contract_issue": {
+          "const": 137
+        },
+        "map_issue": {
+          "const": 133
+        },
+        "resolution_issues": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "superseded_sources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "out_of_scope": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixtures_total",
+        "by_kind",
+        "by_policy",
+        "by_route",
+        "by_cloud_request",
+        "fallback_fixtures",
+        "coverage_requirement_count",
+        "closed_tag_count"
+      ],
+      "properties": {
+        "fixtures_total": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "by_kind": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "by_policy": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "by_route": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "by_cloud_request": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "fallback_fixtures": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "coverage_requirement_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "closed_tag_count": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "available",
+        "text",
+        "primary"
+      ],
+      "properties": {
+        "provider": {
+          "enum": [
+            "provider_a",
+            "provider_b"
+          ]
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "text": {
+          "type": "string"
+        },
+        "primary": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "available": {
+                "const": true
+              }
+            },
+            "required": [
+              "available"
+            ]
+          },
+          "then": {
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "primary": {
+                "const": true
+              }
+            },
+            "required": [
+              "primary"
+            ]
+          },
+          "then": {
+            "properties": {
+              "available": {
+                "const": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    "timing_boundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_provider",
+        "left_phrase",
+        "right_phrase",
+        "pause_ms"
+      ],
+      "properties": {
+        "source_provider": {
+          "enum": [
+            "provider_a",
+            "provider_b"
+          ]
+        },
+        "left_phrase": {
+          "type": "string",
+          "minLength": 1
+        },
+        "right_phrase": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pause_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "certainty",
+        "boundaries"
+      ],
+      "properties": {
+        "certainty": {
+          "enum": [
+            "clear",
+            "uncertain"
+          ]
+        },
+        "boundaries": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/timing_boundary"
+          }
+        }
+      }
+    },
+    "deadline_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deadline_ms",
+        "observed_elapsed_ms",
+        "local_baseline_delivery_start_by_ms"
+      ],
+      "properties": {
+        "deadline_ms": {
+          "const": 1500
+        },
+        "observed_elapsed_ms": {
+          "type": "integer",
+          "exclusiveMinimum": 1500
+        },
+        "local_baseline_delivery_start_by_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1500
+        }
+      }
+    },
+    "cloud_execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_policy",
+        "actual_requests",
+        "outcome",
+        "justification",
+        "deadline_evidence"
+      ],
+      "properties": {
+        "request_policy": {
+          "enum": [
+            "not_allowed",
+            "allowed",
+            "required"
+          ]
+        },
+        "actual_requests": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "outcome": {
+          "enum": [
+            "not_attempted",
+            "skipped",
+            "succeeded",
+            "rejected_unsafe",
+            "rejected_unverifiable",
+            "rejected_invalid_label",
+            "schema_failure",
+            "provider_failure",
+            "deadline_exceeded"
+          ]
+        },
+        "justification": {
+          "type": "string",
+          "minLength": 1
+        },
+        "deadline_evidence": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/deadline_evidence"
+            }
+          ]
+        },
+        "rejected_candidate_excerpt": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Typed excerpt from a rejected cloud candidate; valid only for rejected_* outcomes."
+        },
+        "rejected_labels": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Typed labels extracted from a rejected cloud candidate; invalid-label rejection must include a non-closed label."
+        }
+      }
+    },
+    "label_evidence": {
+      "type": "object",
+      "description": "Binds a closed label to its complete cue-bearing source section; the labeled final section must derive from this span.",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "source_provider",
+        "source_span_text"
+      ],
+      "properties": {
+        "label": {
+          "enum": [
+            "Goal",
+            "Context",
+            "Requirements",
+            "Constraints",
+            "Steps",
+            "Acceptance Criteria",
+            "Files",
+            "Notes"
+          ]
+        },
+        "source_provider": {
+          "enum": [
+            "provider_a",
+            "provider_b"
+          ]
+        },
+        "source_span_text": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "source_selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "selected_provider",
+        "reason"
+      ],
+      "properties": {
+        "selected_provider": {
+          "enum": [
+            "provider_a",
+            "provider_b"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "only_available",
+            "exact_agreement",
+            "configured_primary_rank",
+            "punctuation_local_render",
+            "safe_complementary_merge"
+          ]
+        }
+      }
+    },
+    "allowed_operations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "removals",
+        "conversions",
+        "layout",
+        "labels"
+      ],
+      "properties": {
+        "removals": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "conversions": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "exclamation point→!",
+              "four→4.",
+              "new line→\\n",
+              "new paragraph→\\n\\n",
+              "one→1.",
+              "period→.",
+              "quote…unquote→\"…\"",
+              "spoken acceptance criteria cue→Acceptance Criteria label",
+              "spoken constraints cue→Constraints label",
+              "spoken context cue→Context label",
+              "spoken files cue→Files label",
+              "spoken goal cue→Goal label",
+              "spoken notes cue→Notes label",
+              "spoken requirements cue→Requirements label",
+              "spoken steps cue→numbered_lines",
+              "three→3.",
+              "two→2."
+            ]
+          }
+        },
+        "layout": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "Goal",
+              "Context",
+              "Requirements",
+              "Constraints",
+              "Steps",
+              "Acceptance Criteria",
+              "Files",
+              "Notes"
+            ]
+          }
+        }
+      }
+    },
+    "delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "auto_send",
+        "live_type",
+        "replace_delivered"
+      ],
+      "properties": {
+        "state": {
+          "const": "unsent"
+        },
+        "auto_send": {
+          "const": false
+        },
+        "live_type": {
+          "const": false
+        },
+        "replace_delivered": {
+          "const": false
+        }
+      }
+    },
+    "fallback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trigger",
+        "result"
+      ],
+      "properties": {
+        "trigger": {
+          "enum": [
+            "unsafe_semantics",
+            "unverifiable_source_derivation",
+            "invalid_fixed_label",
+            "uncertain_backtracking",
+            "uncertain_layout",
+            "response_schema_failure",
+            "provider_failure",
+            "deadline_exceeded"
+          ]
+        },
+        "result": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "kind",
+        "tags",
+        "policy",
+        "surface_hint",
+        "sources",
+        "provider_state",
+        "source_selection",
+        "timing",
+        "route",
+        "cloud",
+        "local_baseline",
+        "expected_final",
+        "allowed_operations",
+        "label_evidence",
+        "protected_tokens",
+        "forbidden_outcomes",
+        "fallback",
+        "delivery",
+        "rationale"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^DPR-[0-9]{2}[a-z]?$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "enum": [
+            "everyday_message",
+            "developer_prompt"
+          ]
+        },
+        "tags": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "policy-natural",
+              "policy-adaptive",
+              "policy-structured",
+              "everyday-message",
+              "developer-prompt",
+              "multi-paragraph",
+              "numbered-sequence",
+              "protected-name",
+              "protected-number",
+              "protected-negation",
+              "protected-command",
+              "protected-url-path",
+              "protected-identifier",
+              "protected-code",
+              "protected-quote",
+              "slang-dialect",
+              "already-formatted",
+              "filler-clear-remove",
+              "filler-preserve",
+              "backtrack-clear",
+              "backtrack-uncertain",
+              "timing-clear",
+              "timing-uncertain",
+              "symbol-convert",
+              "symbol-stacked",
+              "symbol-malformed",
+              "symbol-quoted-meta",
+              "dual-stt-exact",
+              "dual-stt-punct",
+              "dual-stt-complementary",
+              "dual-stt-protected-disagreement",
+              "dual-stt-semantic-disagreement",
+              "dual-stt-single-provider",
+              "route-literal",
+              "route-local",
+              "route-cloud-optional",
+              "cloud-succeeded",
+              "cloud-skipped",
+              "cloud-failed",
+              "fallback-unsafe-semantics",
+              "fallback-unverifiable",
+              "fallback-invalid-label",
+              "fallback-uncertain-backtrack",
+              "fallback-uncertain-layout",
+              "fallback-schema",
+              "fallback-provider",
+              "fallback-deadline",
+              "deadline-local-baseline-start",
+              "local-only",
+              "no-autosend",
+              "kind-everyday",
+              "kind-developer",
+              "label-goal",
+              "label-context",
+              "label-requirements",
+              "label-constraints",
+              "label-steps",
+              "label-acceptance-criteria",
+              "label-files",
+              "label-notes"
+            ]
+          }
+        },
+        "policy": {
+          "enum": [
+            "natural",
+            "adaptive",
+            "structured"
+          ]
+        },
+        "surface_hint": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "enum": [
+                "coding_agent",
+                "messaging",
+                "shell",
+                "neutral"
+              ]
+            }
+          ]
+        },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/source"
+          },
+          "allOf": [
+            {
+              "if": {
+                "minItems": 2
+              },
+              "then": {
+                "allOf": [
+                  {
+                    "contains": {
+                      "type": "object",
+                      "required": [
+                        "provider"
+                      ],
+                      "properties": {
+                        "provider": {
+                          "const": "provider_a"
+                        }
+                      }
+                    },
+                    "minContains": 1,
+                    "maxContains": 1
+                  },
+                  {
+                    "contains": {
+                      "type": "object",
+                      "required": [
+                        "provider"
+                      ],
+                      "properties": {
+                        "provider": {
+                          "const": "provider_b"
+                        }
+                      }
+                    },
+                    "minContains": 1,
+                    "maxContains": 1
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "provider_state": {
+          "enum": [
+            "exact_agreement",
+            "punctuation_only_agreement",
+            "safe_complementary",
+            "protected_token_disagreement",
+            "semantic_disagreement",
+            "single_provider"
+          ]
+        },
+        "source_selection": {
+          "$ref": "#/$defs/source_selection"
+        },
+        "timing": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/timing"
+            }
+          ]
+        },
+        "route": {
+          "enum": [
+            "literal_identity",
+            "deterministic_local",
+            "local_with_optional_cloud"
+          ]
+        },
+        "cloud": {
+          "$ref": "#/$defs/cloud_execution"
+        },
+        "local_baseline": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_final": {
+          "type": "string",
+          "minLength": 1
+        },
+        "allowed_operations": {
+          "$ref": "#/$defs/allowed_operations"
+        },
+        "label_evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/label_evidence"
+          }
+        },
+        "protected_tokens": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "forbidden_outcomes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Exact forbidden Transcript strings; empty string means must not emit nothing."
+        },
+        "fallback": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/fallback"
+            }
+          ]
+        },
+        "delivery": {
+          "$ref": "#/$defs/delivery"
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}
