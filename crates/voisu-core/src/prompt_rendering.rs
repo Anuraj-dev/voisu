@@ -241,14 +241,13 @@ mod tests {
     }
 
     #[test]
-    fn rendering_policy_is_copy_and_stable_as_a_recording_snapshot() {
-        // A Recording snapshots policy at start; later config changes cannot
-        // mutate the held snapshot (full daemon wire is T5; pure resolution here).
-        let snapshot = RenderingPolicy::Natural;
-        let held_during_recording = snapshot;
-        let _later_config = RenderingPolicy::Structured;
-        assert_eq!(held_during_recording, RenderingPolicy::Natural);
-        assert_eq!(snapshot, RenderingPolicy::Natural);
-        assert_eq!(held_during_recording, snapshot);
+    fn rendering_policy_is_copy() {
+        // Domain type is Copy so Recording can hold a snapshot without shared
+        // ownership. File-backed snapshot stability is tested in voisu-app config.
+        let policy = RenderingPolicy::Natural;
+        let snapshot = policy;
+        let held = snapshot;
+        assert_eq!(held, RenderingPolicy::Natural);
+        assert_eq!(policy, RenderingPolicy::Natural);
     }
 }

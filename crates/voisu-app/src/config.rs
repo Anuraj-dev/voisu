@@ -422,8 +422,9 @@ fn parse_writing_mode(contents: &str) -> WritingModeLoad {
 
 /// Parses the root-scope `rendering_policy` string. Missing key →
 /// [`RenderingPolicyLoad::Missing`]; present but unrecognised →
-/// [`RenderingPolicyLoad::FailClosed`]; `natural`/`adaptive`/`structured` →
-/// Known. Tolerance and table scoping mirror [`parse_writing_mode`].
+/// [`RenderingPolicyLoad::FailClosed`] plus a bounded, value-free diagnostic;
+/// `natural`/`adaptive`/`structured` → Known. Tolerance and table scoping
+/// mirror [`parse_writing_mode`].
 fn parse_rendering_policy(contents: &str) -> RenderingPolicyLoad {
     for line in contents.lines() {
         let line = strip_comment(line).trim();
@@ -447,7 +448,14 @@ fn parse_rendering_policy(contents: &str) -> RenderingPolicyLoad {
             "\"structured\"" | "'structured'" => {
                 RenderingPolicyLoad::Known(RenderingPolicy::Structured)
             }
-            _ => RenderingPolicyLoad::FailClosed,
+            // Spec §12 / DAG T0: unknown or corrupt present value fails closed
+            // to Natural with one bounded diagnostic (no raw config dump).
+            _ => {
+                eprintln!(
+                    "voisu: unrecognized rendering_policy in config; failing closed to natural"
+                );
+                RenderingPolicyLoad::FailClosed
+            }
         };
     }
     RenderingPolicyLoad::Missing
@@ -1029,6 +1037,12 @@ other_key = 5
             parse_rendering_policy("rendering_policy = \"structured\"\n"),
             RenderingPolicyLoad::Known(RenderingPolicy::Structured)
         );
+        // Unknown present values emit a bounded diagnostic (stderr) and still
+        // resolve to Natural — diagnostic content is not asserted.
+        assert_eq!(
+            parse_rendering_policy("rendering_policy = \"future\"\n"),
+            RenderingPolicyLoad::FailClosed
+        );
         assert_eq!(
             resolve_rendering_policy(parse_rendering_policy(
                 "rendering_policy = \"future\"\n"
@@ -1046,6 +1060,27 @@ other_key = 5
         assert_eq!(
             resolve_rendering_policy(RenderingPolicyLoad::Known(RenderingPolicy::Structured)),
             RenderingPolicy::Structured
+        );
+    }
+
+    #[test]
+    fn fail_closed_rendering_policy_always_resolves_to_natural() {
+        // Spec §12 / DAG T0: FailClosed (unreadable or unknown value) → Natural.
+        // Bounded diagnostic is emitted on the load path; resolution is what we assert.
+        assert_eq!(
+            resolve_rendering_policy(RenderingPolicyLoad::FailClosed),
+            RenderingPolicy::Natural
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "rendering_policy = \"not-a-policy\"\n").unwrap();
+        assert_eq!(
+            read_rendering_policy(&path),
+            RenderingPolicyLoad::FailClosed
+        );
+        assert_eq!(
+            resolve_rendering_policy(read_rendering_policy(&path)),
+            RenderingPolicy::Natural
         );
     }
 
@@ -1120,15 +1155,30 @@ other_key = 5
     }
 
     #[test]
-    fn rendering_policy_is_copy_and_stable_as_a_recording_snapshot() {
-        // Snapshot at Recording start; mid-utterance config flip must not
-        // rewrite the held value (daemon wire is T5; pure resolution here).
-        let snapshot = RenderingPolicy::Natural;
-        let held_during_recording = snapshot;
-        let _later_config = RenderingPolicy::Structured;
-        assert_eq!(held_during_recording, RenderingPolicy::Natural);
+    fn rendering_policy_snapshot_stays_stable_when_config_file_changes() {
+        // Real resolution: snapshot Natural from disk, rewrite config to
+        // Structured, held snapshot must stay Natural while a fresh resolve
+        // returns Structured (daemon wire of the snapshot is T5).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voisu").join("config.toml");
+        write_rendering_policy(&path, RenderingPolicy::Natural).unwrap();
+
+        let snapshot =
+            resolve_rendering_policy(read_rendering_policy(&path));
         assert_eq!(snapshot, RenderingPolicy::Natural);
-        assert_eq!(held_during_recording, snapshot);
+
+        write_rendering_policy(&path, RenderingPolicy::Structured).unwrap();
+
+        let held_during_recording = snapshot;
+        assert_eq!(held_during_recording, RenderingPolicy::Natural);
+        assert_eq!(
+            resolve_rendering_policy(read_rendering_policy(&path)),
+            RenderingPolicy::Structured
+        );
+        assert_eq!(
+            read_rendering_policy(&path),
+            RenderingPolicyLoad::Known(RenderingPolicy::Structured)
+        );
     }
 
     #[test]
