@@ -539,9 +539,7 @@ fn apply_bare_spoken_cues(text: &str) -> String {
                 if let Some(j) = (i + 1..tokens.len()).find(|&j| ascii_lower(tokens[j].2) == "unquote")
                 {
                     quote_pairs.push((i, j));
-                    for k in i..=j {
-                        skip[k] = true;
-                    }
+                    skip[i..=j].fill(true);
                     i = j + 1;
                     continue;
                 }
@@ -639,10 +637,12 @@ fn apply_bare_spoken_cues(text: &str) -> String {
 /// `period` is a cue unless it is ordinary language ("the period of", mid-list, …).
 fn period_is_cue(tokens: &[(usize, usize, &str)], i: usize) -> bool {
     // "the period of …"
-    if i > 0 && ascii_lower(tokens[i - 1].2) == "the" {
-        if i + 1 < tokens.len() && ascii_lower(tokens[i + 1].2) == "of" {
-            return false;
-        }
+    if i > 0
+        && ascii_lower(tokens[i - 1].2) == "the"
+        && i + 1 < tokens.len()
+        && ascii_lower(tokens[i + 1].2) == "of"
+    {
+        return false;
     }
     // "a period …" ordinary noun
     if i > 0 {
