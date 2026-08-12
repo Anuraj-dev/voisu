@@ -1,0 +1,56 @@
+{
+  "spec_id": "voisu-developer-prompt-rendering-specification-2026-08-12",
+  "issue": 144,
+  "parent_map": 133,
+  "language": "en",
+  "default_policy": "adaptive",
+  "policies": ["natural", "adaptive", "structured"],
+  "delivery_deadline_ms": 1500,
+  "delivery_flags": {
+    "state": "unsent",
+    "auto_send": false,
+    "live_type": false,
+    "replace_delivered": false
+  },
+  "closed_structured_labels": [
+    "Goal",
+    "Context",
+    "Requirements",
+    "Constraints",
+    "Steps",
+    "Acceptance Criteria",
+    "Files",
+    "Notes"
+  ],
+  "preferred_in_budget_cloud": {
+    "provider": "groq",
+    "model_id": "openai/gpt-oss-20b",
+    "reasoning_effort": "low"
+  },
+  "latency_gated_cloud": [
+    {
+      "provider": "google",
+      "model_id": "gemini-3.5-flash-lite",
+      "role": "quality_or_eval_or_future_in_budget"
+    },
+    {
+      "provider": "google",
+      "model_id": "gemini-3.6-flash",
+      "role": "eval_or_optional"
+    }
+  ],
+  "max_cloud_calls_per_utterance": 1,
+  "user_feedback_catalog": {
+    "silent": null,
+    "hard_fallback_after_cloud": "Local formatting used"
+  },
+  "normative_research": {
+    "behavior": "developer-prompt-rendering-behavior-*-2026-08-11",
+    "combined_call": "developer-prompt-rendering-combined-call-*-2026-08-11",
+    "model_benchmark": "developer-prompt-rendering-model-benchmark-*-2026-08-11",
+    "intent_routing": "developer-prompt-rendering-intent-routing-*-2026-08-11",
+    "diagnostics": "developer-prompt-rendering-diagnostics-*-2026-08-11"
+  },
+  "config_key": "rendering_policy",
+  "cli_verb": "rendering"
+}
