@@ -78,6 +78,15 @@ pub use intent_routing::{
     COMPLEXITY_CLOUD_THRESHOLD, MESSAGING_SHORT_WORDS, SECTION_CUES_FOR_LENGTH_ASSIST,
 };
 
+mod compose_gate;
+pub use compose_gate::{
+    compose_structured_candidate, parse_structured_candidate_json, CloudOutcome, ComposeCertainty,
+    ComposeErrorCode, ComposeInput, ComposeOutcome, ComposeSource, CompositionDecision,
+    ConversionClaim, DeliveryFlags, DerivationSpan, FallbackTrigger, LabelClaim, LayoutClaim,
+    LayoutDecision, Reconciliation, RemovalClaim, RemovalKind, SourceSelection, SpanKind,
+    StructuredCandidate, SttProvider, CLOSED_CONVERSIONS, COMPOSE_GATE_CONTRACT_ID,
+};
+
 // Paged diagnostic responses are negotiated per REQUEST (see `Request::paged`),
 // never by protocol version. The version is interpolated into the socket path,
 // the single-instance lock, and the store directory, so bumping it partitions

@@ -87,6 +87,22 @@ pub struct LocalBaseline {
 }
 
 impl LocalBaseline {
+    /// Stamp already-organized baseline text with [`LOCAL_BASELINE_CONTRACT_ID`].
+    ///
+    /// **Crate-internal only.** External callers (e.g. `voisu-app`) must use
+    /// [`organize_local_baseline`] — the sole public constructor that produces
+    /// a sealed baseline from selected source text. This helper exists for
+    /// same-crate tests and compose-corpus fixtures that already hold organizer
+    /// output; it must not mint a public baseline from arbitrary model prose.
+    #[allow(dead_code)] // used by same-crate compose/local tests and corpus helpers
+    #[must_use]
+    pub(crate) fn from_organized_text(text: impl Into<String>) -> Self {
+        Self {
+            rendered: text.into(),
+            contract: LOCAL_BASELINE_CONTRACT_ID,
+        }
+    }
+
     /// Final Transcript text for the local path.
     #[must_use]
     pub fn rendered(&self) -> &str {
