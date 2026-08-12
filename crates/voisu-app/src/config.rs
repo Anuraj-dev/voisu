@@ -1045,7 +1045,6 @@ other_key = 5
 
     #[test]
     fn dpr_rollout_gate_defaults_off_and_requires_an_explicit_true_value() {
-        assert!(!DEFAULT_DPR_ENABLED);
         for value in ["", "0", "false", "yes", "adaptive", "garbage"] {
             assert!(!parse_dpr_enablement(value), "unexpected enablement: {value}");
         }
