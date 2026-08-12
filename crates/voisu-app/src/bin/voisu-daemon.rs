@@ -54,7 +54,7 @@ use voisu_core::{
     ReconciliationKind, ReconciliationModel,
     ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SourceTranscript,
     SourceTranscriptRecord, Transcript, TranscriptDecision, TranscriptDecisionPipeline,
-    TranscriptProvider, TranscriptValidator, TriggerKeyBinding, VersionEnvelope,
+    TranscriptProvider, TranscriptSelection, TranscriptValidator, TriggerKeyBinding, VersionEnvelope,
     SmartWritingDiagnostic, EnglishEligibilityOutcome, replay_capture, socket_path,
 };
 
@@ -2162,7 +2162,7 @@ async fn process_recording(
         source_records = sources.iter().map(SourceTranscriptRecord::new).collect();
         evidence.stages.push(LifecycleStage::ProvidersCompleted);
         let dpr_context = if dpr_enabled && english_eligible {
-            dpr_source_context(&dpr_source_snapshot)
+            dpr_source_context(&dpr_source_snapshot, &dictionary_terms)
         } else {
             None
         };
@@ -2170,9 +2170,15 @@ async fn process_recording(
             TranscriptDecision {
                 transcript: Transcript(context.selected_source.clone()),
                 selection: context.transcript_selection,
-                validation_reason:
+                validation_reason: if context.transcript_selection
+                    == TranscriptSelection::Complementary
+                {
+                    "DPR merged safe complementary Source Transcript evidence locally"
+                        .to_owned()
+                } else {
                     "DPR selected one real Source Transcript locally without model reconciliation"
-                        .to_owned(),
+                        .to_owned()
+                },
                 fallback_reason: None,
                 reconciliation_requested: false,
                 recovery_attempted: false,

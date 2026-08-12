@@ -120,7 +120,10 @@ pub struct DprSourceContext {
 }
 
 #[must_use]
-pub fn dpr_source_context(sources: &[SourceTranscript]) -> Option<DprSourceContext> {
+pub fn dpr_source_context(
+    sources: &[SourceTranscript],
+    dictionary_terms: &[String],
+) -> Option<DprSourceContext> {
     let available: Vec<&SourceTranscript> = sources
         .iter()
         .filter(|source| !source.text.is_empty())
@@ -140,12 +143,32 @@ pub fn dpr_source_context(sources: &[SourceTranscript]) -> Option<DprSourceConte
         && available
             .iter()
             .all(|source| normalized_source_words(&source.text) == normalized_source_words(&available[0].text));
+    let other = available
+        .iter()
+        .find(|source| source.provider != selected_provider)
+        .copied();
+    let safe_complementary = if available.len() == 2
+        && !exact_agreement
+        && !punctuation_only_agreement
+    {
+        other.and_then(|other| merge_insertion_only_sources(&selected.text, &other.text))
+    } else {
+        None
+    };
+    let protected_disagreement = safe_complementary.is_none()
+        && other.is_some_and(|other| {
+            protected_atoms_disagree(&selected.text, &other.text, dictionary_terms)
+        });
     let provider_state = if available.len() <= 1 {
         ProviderState::SingleProvider
     } else if exact_agreement {
         ProviderState::ExactAgreement
     } else if punctuation_only_agreement {
         ProviderState::PunctuationOnlyAgreement
+    } else if safe_complementary.is_some() {
+        ProviderState::SafeComplementary
+    } else if protected_disagreement {
+        ProviderState::ProtectedTokenDisagreement
     } else {
         ProviderState::SemanticDisagreement
     };
@@ -155,6 +178,8 @@ pub fn dpr_source_context(sources: &[SourceTranscript]) -> Option<DprSourceConte
         "exact_agreement"
     } else if punctuation_only_agreement {
         "punctuation_local_render"
+    } else if safe_complementary.is_some() {
+        "safe_complementary_merge"
     } else {
         "configured_primary_rank"
     };
@@ -166,10 +191,7 @@ pub fn dpr_source_context(sources: &[SourceTranscript]) -> Option<DprSourceConte
         text: selected.text.clone(),
         primary: true,
     });
-    if let Some(other) = available
-        .iter()
-        .find(|source| source.provider != selected_provider)
-    {
+    if let Some(other) = other {
         compose_sources.push(ComposeSource {
             provider: SttProvider::ProviderB,
             available: true,
@@ -179,19 +201,160 @@ pub fn dpr_source_context(sources: &[SourceTranscript]) -> Option<DprSourceConte
     }
 
     Some(DprSourceContext {
-        selected_source: selected.text.clone(),
+        selected_source: safe_complementary.unwrap_or_else(|| selected.text.clone()),
         sources: compose_sources,
         source_selection: SourceSelection {
             selected_provider: SttProvider::ProviderA,
             reason: reason.to_owned(),
         },
         provider_state,
-        transcript_selection: match selected_provider {
-            Provider::Groq if punctuation_only_agreement => TranscriptSelection::NearIdenticalGroq,
-            Provider::Groq => TranscriptSelection::SourceGroq,
-            Provider::Deepgram => TranscriptSelection::SourceDeepgram,
+        transcript_selection: if provider_state == ProviderState::SafeComplementary {
+            TranscriptSelection::Complementary
+        } else {
+            match selected_provider {
+                Provider::Groq if punctuation_only_agreement => {
+                    TranscriptSelection::NearIdenticalGroq
+                }
+                Provider::Groq => TranscriptSelection::SourceGroq,
+                Provider::Deepgram => TranscriptSelection::SourceDeepgram,
+            }
         },
     })
+}
+
+fn protected_atoms_disagree(left: &str, right: &str, dictionary_terms: &[String]) -> bool {
+    let left_protected: Vec<String> = dpr_protected_tokens(left, dictionary_terms)
+        .into_iter()
+        .filter(|token| !is_closed_negation(token))
+        .collect();
+    let right_protected: Vec<String> = dpr_protected_tokens(right, dictionary_terms)
+        .into_iter()
+        .filter(|token| !is_closed_negation(token))
+        .collect();
+    left_protected
+        .iter()
+        .any(|token| !right.contains(token))
+        || right_protected.iter().any(|token| !left.contains(token))
+}
+
+fn is_closed_negation(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "no"
+            | "not"
+            | "never"
+            | "cannot"
+            | "can't"
+            | "cant"
+            | "don't"
+            | "dont"
+            | "won't"
+            | "wont"
+            | "isn't"
+            | "isnt"
+            | "aren't"
+            | "arent"
+            | "ain't"
+            | "aint"
+    )
+}
+
+/// Conservatively merges two whitespace-token streams only when their shared
+/// anchors remain ordered and at most one provider contributes tokens in each
+/// gap. If both providers offer different text for the same gap, the evidence
+/// is disputed and no merge is produced. The token cap keeps the bounded
+/// look-ahead local even for an adversarially large Source Transcript.
+fn merge_insertion_only_sources(left: &str, right: &str) -> Option<String> {
+    const MAX_SAFE_COMPLEMENT_TOKENS: usize = 128;
+    let left_tokens: Vec<&str> = left.split_whitespace().collect();
+    let right_tokens: Vec<&str> = right.split_whitespace().collect();
+    if left_tokens.is_empty()
+        || right_tokens.is_empty()
+        || left_tokens.len() > MAX_SAFE_COMPLEMENT_TOKENS
+        || right_tokens.len() > MAX_SAFE_COMPLEMENT_TOKENS
+    {
+        return None;
+    }
+
+    let mut merged = Vec::with_capacity(left_tokens.len().saturating_add(right_tokens.len()));
+    let mut left_at = 0usize;
+    let mut right_at = 0usize;
+    let mut shared_anchors = 0usize;
+    let mut left_contributed = false;
+    let mut right_contributed = false;
+
+    while left_at < left_tokens.len() || right_at < right_tokens.len() {
+        let mut next_anchor = None;
+        let mut nearest_distance = usize::MAX;
+        for (left_index, left_token) in left_tokens.iter().enumerate().skip(left_at) {
+            for (right_index, right_token) in right_tokens.iter().enumerate().skip(right_at) {
+                if token_anchor_eq(left_token, right_token) {
+                    let distance = left_index.saturating_sub(left_at)
+                        + right_index.saturating_sub(right_at);
+                    if distance < nearest_distance {
+                        nearest_distance = distance;
+                        next_anchor = Some((left_index, right_index));
+                    }
+                }
+            }
+        }
+
+        let Some((left_anchor, right_anchor)) = next_anchor else {
+            let left_gap = &left_tokens[left_at..];
+            let right_gap = &right_tokens[right_at..];
+            if !left_gap.is_empty() && !right_gap.is_empty() {
+                return None;
+            }
+            if !left_gap.iter().chain(right_gap).all(|token| safe_complement_token(token)) {
+                return None;
+            }
+            left_contributed |= !left_gap.is_empty();
+            right_contributed |= !right_gap.is_empty();
+            merged.extend_from_slice(left_gap);
+            merged.extend_from_slice(right_gap);
+            break;
+        };
+
+        let left_gap = &left_tokens[left_at..left_anchor];
+        let right_gap = &right_tokens[right_at..right_anchor];
+        if !left_gap.is_empty() && !right_gap.is_empty() {
+            return None;
+        }
+        if !left_gap.iter().chain(right_gap).all(|token| safe_complement_token(token)) {
+            return None;
+        }
+        left_contributed |= !left_gap.is_empty();
+        right_contributed |= !right_gap.is_empty();
+        merged.extend_from_slice(left_gap);
+        merged.extend_from_slice(right_gap);
+        merged.push(left_tokens[left_anchor]);
+        shared_anchors += 1;
+        left_at = left_anchor + 1;
+        right_at = right_anchor + 1;
+    }
+
+    (shared_anchors >= 2 && left_contributed && right_contributed).then(|| merged.join(" "))
+}
+
+fn safe_complement_token(token: &str) -> bool {
+    token.bytes().any(|byte| byte.is_ascii_digit())
+        || token.contains("//")
+        || token.contains('/')
+        || token.contains('\\')
+        || token.starts_with('-')
+        || token.contains('_')
+        || token.contains("::")
+        || token.contains(['(', ')', '[', ']', '{', '}', '=', '@'])
+}
+
+fn token_anchor_eq(left: &str, right: &str) -> bool {
+    let normalize = |token: &str| {
+        token
+            .trim_matches(|character: char| !character.is_alphanumeric())
+            .to_ascii_lowercase()
+    };
+    let left = normalize(left);
+    !left.is_empty() && left == normalize(right)
 }
 
 fn normalized_source_words(text: &str) -> Vec<String> {
@@ -635,7 +798,7 @@ mod tests {
                 text: "hello from voisu".to_owned(),
             },
         ];
-        let context = dpr_source_context(&sources).expect("source context");
+        let context = dpr_source_context(&sources, &[]).expect("source context");
         assert_eq!(context.selected_source, "hello from voisu");
         assert_eq!(context.sources[0].provider, SttProvider::ProviderA);
         assert_eq!(context.sources[0].text, "hello from voisu");
@@ -644,7 +807,7 @@ mod tests {
         assert_eq!(context.provider_state, ProviderState::SemanticDisagreement);
         assert_eq!(context.source_selection.reason, "configured_primary_rank");
         assert_eq!(context.transcript_selection, TranscriptSelection::SourceGroq);
-        assert!(dpr_source_context(&[]).is_none());
+        assert!(dpr_source_context(&[], &[]).is_none());
     }
 
     #[test]

@@ -1083,6 +1083,7 @@ pub trait ReconciliationModel: Send {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptSelection {
+    Complementary,
     NearIdenticalGroq,
     Reconciled,
     Repaired,
