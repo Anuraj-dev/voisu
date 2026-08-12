@@ -10,8 +10,11 @@
 //! Local removals are fail-closed: only rule-justified, test-covered deletes fire.
 //! Implemented removes in v1:
 //! - leading clear fillers `um` / `uh` (whole tokens at the start only)
-//! - clear backtrack `X no wait Y` → drop `X` and `no wait`, keep `Y` (single
-//!   content token on each side of the marker)
+//! - clear backtrack `X no wait Y` → drop `X` and `no wait`, keep `Y` only when
+//!   both sides are single alphabetic content tokens **and** X is not part of a
+//!   multi-word left phrase (previous token is absent, non-content, or a closed
+//!   function/boundary word). Multi-word lefts (`new york no wait london`) keep
+//!   every word.
 //!
 //! Uncertain markers (`actually`, soft hedges) **preserve every word**. If a
 //! candidate remove cannot be proven by these closed rules, all words stay.
@@ -238,6 +241,10 @@ fn strip_leading_clear_fillers(text: &str) -> String {
 /// Clear correction: `… X no wait Y …` with single tokens X/Y → drop X and `no wait`.
 ///
 /// Uncertain forms (`actually`, multi-token left sides, missing Y) keep every word.
+///
+/// Multi-word left provenance (R1): if the token immediately before X is itself a
+/// content (non-function) word, X may be only the last token of a multi-word
+/// phrase (e.g. `new york no wait london`). Partial delete is unsafe → fail closed.
 fn apply_clear_backtrack(text: &str) -> String {
     let tokens = word_tokens(text);
     if tokens.len() < 4 {
@@ -251,6 +258,14 @@ fn apply_clear_backtrack(text: &str) -> String {
             let y = tokens[i + 2].2;
             // Fail closed: both sides must be single alphabetic content words.
             if is_content_word(x) && is_content_word(y) {
+                // Multi-word left: previous content (non-function) word means X is
+                // not a proven full correction span → preserve every word.
+                if i >= 2 {
+                    let prev = tokens[i - 2].2;
+                    if is_content_word(prev) && !is_function_or_boundary_word(prev) {
+                        return text.to_owned();
+                    }
+                }
                 // Rebuild: tokens[..i-1] + tokens[i+2..]
                 let mut out = String::new();
                 for (k, &(s, e, _)) in tokens.iter().enumerate() {
@@ -274,6 +289,80 @@ fn apply_clear_backtrack(text: &str) -> String {
 
 fn is_content_word(tok: &str) -> bool {
     !tok.is_empty() && tok.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// Closed-class / boundary words that do **not** form a multi-word left phrase
+/// with the following content token X. Used only for R1 backtrack provenance:
+/// `it friday no wait monday` is single-token left; `new york no wait london` is not.
+fn is_function_or_boundary_word(tok: &str) -> bool {
+    matches!(
+        ascii_lower(tok).as_str(),
+        "a" | "an"
+            | "the"
+            | "it"
+            | "this"
+            | "that"
+            | "these"
+            | "those"
+            | "my"
+            | "your"
+            | "our"
+            | "their"
+            | "his"
+            | "her"
+            | "its"
+            | "me"
+            | "him"
+            | "us"
+            | "them"
+            | "we"
+            | "you"
+            | "i"
+            | "to"
+            | "for"
+            | "of"
+            | "in"
+            | "on"
+            | "at"
+            | "by"
+            | "from"
+            | "with"
+            | "and"
+            | "or"
+            | "but"
+            | "as"
+            | "if"
+            | "so"
+            | "then"
+            | "than"
+            | "not"
+            | "just"
+            | "please"
+            | "is"
+            | "are"
+            | "was"
+            | "were"
+            | "be"
+            | "been"
+            | "being"
+            | "do"
+            | "does"
+            | "did"
+            | "has"
+            | "have"
+            | "had"
+            | "will"
+            | "would"
+            | "can"
+            | "could"
+            | "should"
+            | "may"
+            | "might"
+            | "must"
+            | "shall"
+            | "um"
+            | "uh"
+    )
 }
 
 // ─── Section organize ────────────────────────────────────────────────────────
@@ -1017,8 +1106,8 @@ fn capitalize_sentence_start(text: &str) -> String {
 /// sentence/weekday capitalisation (aligned with formatting protected spans).
 fn is_protected_case_token(tok: &str) -> bool {
     let t = tok
-        .trim_end_matches(|c: char| matches!(c, ',' | '.' | '!' | '?' | ';' | ')' | ']' | '}' | '"' | '\''))
-        .trim_start_matches(|c: char| matches!(c, '(' | '[' | '{' | '"' | '\''));
+        .trim_end_matches([',', '.', '!', '?', ';', ')', ']', '}', '"', '\''])
+        .trim_start_matches(['(', '[', '{', '"', '\'']);
     if t.is_empty() {
         return false;
     }
@@ -1202,11 +1291,43 @@ mod tests {
 
     #[test]
     fn r1_clear_backtrack_no_wait_is_justified() {
+        // Corpus DPR-24: single-token left after a function word ("it").
         let src = "send it friday no wait monday";
         let b = organize_local_baseline(src, &adaptive_opts());
         assert_eq!(b.rendered(), "Send it Monday.");
         assert!(!b.rendered().to_ascii_lowercase().contains("friday"));
         assert!(!b.rendered().to_ascii_lowercase().contains("wait"));
+    }
+
+    #[test]
+    fn r1_clear_backtrack_leading_single_token() {
+        // Isolated / leading single-token X — full correction span is proven.
+        let src = "foo no wait bar";
+        let b = organize_local_baseline(src, &adaptive_opts());
+        assert_eq!(b.rendered(), "Bar.");
+        assert!(!b.rendered().to_ascii_lowercase().contains("foo"));
+        assert!(!b.rendered().to_ascii_lowercase().contains("wait"));
+    }
+
+    #[test]
+    fn r1_multiword_left_backtrack_preserves_all_words() {
+        // R1: partial delete of multi-word left ("new york") is unsafe.
+        // Must not become "send it new london".
+        let src = "send it new york no wait london";
+        let b = organize_local_baseline(src, &adaptive_opts());
+        let lower = b.rendered().to_ascii_lowercase();
+        assert!(
+            lower.contains("new") && lower.contains("york") && lower.contains("london"),
+            "multi-word left must preserve all words, got {:?}",
+            b.rendered()
+        );
+        assert!(
+            !lower.contains("new london") && lower.contains("york"),
+            "must not partially delete york only → {:?}",
+            b.rendered()
+        );
+        // Full fail-closed: marker words stay too.
+        assert!(lower.contains("no") && lower.contains("wait"));
     }
 
     #[test]
