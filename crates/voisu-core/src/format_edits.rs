@@ -5,12 +5,17 @@
 //! string, and applying this contract never treats model prose as Delivery
 //! text. Reconciliation stays on its own prompt and schema.
 //!
-//! Invalid JSON, stale fingerprints, unknown kinds, overlapping ranges, or
-//! unanchored `before` text reject the whole candidate.
+//! Structural rejects: invalid JSON, stale fingerprints, unknown kinds,
+//! overlapping ranges, or unanchored `before` text. After compose, the
+//! formatting path keeps protected facts, heading-cue, prompt-artifact/outro,
+//! and empty/summary gates. It does **not** require every rendered word to
+//! appear in a Source Transcript — that invented-content rule stays on the
+//! #139 derivation path only.
 
 use serde_json::{Map, Value};
 
-use crate::{is_text_sha256_fingerprint, text_sha256_fingerprint};
+use crate::prompt_rendering::{RenderingPolicy, CLOSED_STRUCTURED_LABELS};
+use crate::{is_command_shaped, is_text_sha256_fingerprint, text_sha256_fingerprint};
 
 /// Contract id for diagnostics and later pipeline wiring.
 pub const FORMAT_EDIT_CONTRACT_ID: &str = "voisu-dpr-format-edits-v1";
@@ -96,6 +101,10 @@ pub enum FormatEditErrorCode {
     SpanNotCharBoundary,
     AnchorMismatch,
     Overlap,
+    Protected,
+    HeadingWithoutCue,
+    PromptArtifact,
+    EmptyOrSummary,
 }
 
 impl FormatEditErrorCode {
@@ -111,6 +120,10 @@ impl FormatEditErrorCode {
             Self::SpanNotCharBoundary => "E_SPAN_NOT_CHAR_BOUNDARY",
             Self::AnchorMismatch => "E_ANCHOR_MISMATCH",
             Self::Overlap => "E_OVERLAP",
+            Self::Protected => "E_PROTECTED",
+            Self::HeadingWithoutCue => "E_HEADING_WITHOUT_CUE",
+            Self::PromptArtifact => "E_PROMPT_ARTIFACT",
+            Self::EmptyOrSummary => "E_EMPTY_OR_SUMMARY",
         }
     }
 }
@@ -139,6 +152,25 @@ pub struct FormatEditOutcome {
     pub accepted: bool,
     pub rendered: String,
     pub error: Option<FormatEditErrorCode>,
+}
+
+/// Host-owned safety context for the formatting apply path.
+///
+/// Protected tokens are extra facts the caller already extracted (dictionary
+/// names, etc.). Mechanical families are also recognized from the base.
+#[derive(Clone, Copy, Debug)]
+pub struct FormatEditSafety<'a> {
+    pub protected_tokens: &'a [&'a str],
+    pub policy: RenderingPolicy,
+}
+
+impl Default for FormatEditSafety<'static> {
+    fn default() -> Self {
+        Self {
+            protected_tokens: &[],
+            policy: RenderingPolicy::Adaptive,
+        }
+    }
 }
 
 impl FormatEditOutcome {
@@ -181,6 +213,16 @@ pub fn parse_format_edit_candidate_json(raw: &[u8]) -> Result<FormatEditCandidat
 /// the unchanged base so the caller can fall back to the local baseline.
 #[must_use]
 pub fn apply_format_edits(base: &str, candidate: &FormatEditCandidate) -> FormatEditOutcome {
+    apply_format_edits_with(base, candidate, &FormatEditSafety::default())
+}
+
+/// Like [`apply_format_edits`], with caller policy and extra protected facts.
+#[must_use]
+pub fn apply_format_edits_with(
+    base: &str,
+    candidate: &FormatEditCandidate,
+    safety: &FormatEditSafety<'_>,
+) -> FormatEditOutcome {
     if candidate.version != FORMAT_EDIT_CONTRACT_VERSION {
         return FormatEditOutcome::rejected(base, FormatEditErrorCode::Malformed);
     }
@@ -192,14 +234,28 @@ pub fn apply_format_edits(base: &str, candidate: &FormatEditCandidate) -> Format
     if let Err(error) = validate_edits(base, &candidate.edits) {
         return FormatEditOutcome::rejected(base, error);
     }
-    FormatEditOutcome::accepted(compose_edits(base, &candidate.edits))
+    let rendered = compose_edits(base, &candidate.edits);
+    if let Err(error) = validate_format_render(base, &rendered, &candidate.edits, safety) {
+        return FormatEditOutcome::rejected(base, error);
+    }
+    FormatEditOutcome::accepted(rendered)
 }
 
 /// Parse, validate, and apply one raw formatting body against the host base.
 #[must_use]
 pub fn apply_format_edit_candidate_json(base: &str, raw: &[u8]) -> FormatEditOutcome {
+    apply_format_edit_candidate_json_with(base, raw, &FormatEditSafety::default())
+}
+
+/// Like [`apply_format_edit_candidate_json`], with caller safety context.
+#[must_use]
+pub fn apply_format_edit_candidate_json_with(
+    base: &str,
+    raw: &[u8],
+    safety: &FormatEditSafety<'_>,
+) -> FormatEditOutcome {
     match parse_format_edit_candidate_json(raw) {
-        Ok(candidate) => apply_format_edits(base, &candidate),
+        Ok(candidate) => apply_format_edits_with(base, &candidate, safety),
         Err(error) => FormatEditOutcome::rejected(base, error),
     }
 }
@@ -363,6 +419,434 @@ fn json_shape(value: &Value) -> (usize, usize) {
         }
         _ => (0, 1),
     }
+}
+
+const NEGATIONS: &[&str] = &[
+    "no", "not", "never", "cannot", "can't", "cant", "don't", "dont", "won't", "wont", "isn't",
+    "isnt", "aren't", "arent", "ain't", "aint",
+];
+
+const WEEKDAYS: &[&str] = &[
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+];
+
+const MONTHS: &[&str] = &[
+    "january", "february", "march", "april", "may", "june", "july", "august", "september",
+    "october", "november", "december",
+];
+
+const SECTION_CUES: &[(&[&str], &str)] = &[
+    (&["acceptance", "criteria"], "Acceptance Criteria"),
+    (&["requirements"], "Requirements"),
+    (&["constraints"], "Constraints"),
+    (&["context"], "Context"),
+    (&["steps"], "Steps"),
+    (&["files"], "Files"),
+    (&["notes"], "Notes"),
+    (&["goal"], "Goal"),
+];
+
+const PROMPT_ARTIFACTS: &[&str] = &[
+    "ignore previous instructions",
+    "ignore all instructions",
+    "system:",
+    "assistant:",
+    "<|system|>",
+    "<|assistant|>",
+    "### instruction",
+];
+
+const HALLUCINATED_OUTROS: &[&str] = &[
+    "thank you for watching",
+    "thanks for watching",
+    "like and subscribe",
+    "subtitles by",
+    "transcribed by",
+];
+
+const SUMMARY_SOURCE_WORD_FLOOR: usize = 12;
+
+fn validate_format_render(
+    base: &str,
+    rendered: &str,
+    edits: &[FormatEdit],
+    safety: &FormatEditSafety<'_>,
+) -> Result<(), FormatEditErrorCode> {
+    if is_empty_or_large_summary(base, rendered) {
+        return Err(FormatEditErrorCode::EmptyOrSummary);
+    }
+    if introduces_prompt_artifact_or_outro(base, rendered) {
+        return Err(FormatEditErrorCode::PromptArtifact);
+    }
+    if introduces_heading_without_cue(base, rendered, safety.policy) {
+        return Err(FormatEditErrorCode::HeadingWithoutCue);
+    }
+    if mutates_protected_fact(base, rendered, edits, safety.protected_tokens) {
+        return Err(FormatEditErrorCode::Protected);
+    }
+    Ok(())
+}
+
+fn is_empty_or_large_summary(base: &str, rendered: &str) -> bool {
+    if !base.trim().is_empty() && rendered.trim().is_empty() {
+        return true;
+    }
+    let source_words = lexical_word_count(base);
+    let rendered_words = lexical_word_count(rendered);
+    source_words >= SUMMARY_SOURCE_WORD_FLOOR && rendered_words.saturating_mul(2) < source_words
+}
+
+fn introduces_prompt_artifact_or_outro(base: &str, rendered: &str) -> bool {
+    let base_lower = base.to_ascii_lowercase();
+    let rendered_lower = rendered.to_ascii_lowercase();
+    let new_artifact = PROMPT_ARTIFACTS.iter().any(|marker| {
+        rendered_lower.contains(marker) && !base_lower.contains(marker)
+    });
+    new_artifact || (has_anchored_outro(rendered) && !has_anchored_outro(base))
+}
+
+fn has_anchored_outro(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let tail = lower.trim_end_matches(|character: char| !character.is_alphanumeric());
+    let outro = final_sentence(&lower);
+    HALLUCINATED_OUTROS
+        .iter()
+        .any(|suffix| outro.starts_with(suffix) || tail.ends_with(suffix))
+}
+
+fn final_sentence(text: &str) -> &str {
+    let trimmed = text.trim_end_matches(|character: char| !character.is_alphanumeric());
+    let after_terminator = trimmed
+        .char_indices()
+        .filter(|&(index, character)| {
+            matches!(character, '.' | '?' | '!')
+                && trimmed[index + character.len_utf8()..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_whitespace)
+        })
+        .map(|(index, character)| index + character.len_utf8())
+        .next_back()
+        .unwrap_or(0);
+    trimmed[after_terminator..].trim_start_matches(|character: char| !character.is_alphanumeric())
+}
+
+fn introduces_heading_without_cue(base: &str, rendered: &str, policy: RenderingPolicy) -> bool {
+    let source_headings = structural_headings(base);
+    let licensed = licensed_heading_labels(base);
+    for heading in structural_headings(rendered) {
+        if source_headings
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&heading))
+        {
+            continue;
+        }
+        if policy == RenderingPolicy::Natural {
+            return true;
+        }
+        let Some(canonical) = CLOSED_STRUCTURED_LABELS
+            .iter()
+            .copied()
+            .find(|label| *label == heading)
+        else {
+            return true;
+        };
+        if !licensed.iter().any(|label| *label == canonical) {
+            return true;
+        }
+    }
+    false
+}
+
+fn licensed_heading_labels(source: &str) -> Vec<&'static str> {
+    let tokens = lexical_words(source);
+    let mut licensed = Vec::new();
+    for &(phrase, label) in SECTION_CUES {
+        if tokens.windows(phrase.len()).any(|window| window == phrase) {
+            licensed.push(label);
+        }
+    }
+    licensed
+}
+
+fn structural_headings(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some((label, rest)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let label = label.trim();
+        if label.is_empty()
+            || !label
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_alphabetic())
+            || !label
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == ' ')
+        {
+            continue;
+        }
+        let closed = CLOSED_STRUCTURED_LABELS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(label));
+        if closed || rest.trim().is_empty() || is_title_case(label) {
+            found.push(label.to_owned());
+        }
+    }
+    found
+}
+
+fn is_title_case(value: &str) -> bool {
+    if value.is_empty() || !value.chars().any(|character| character.is_alphabetic()) {
+        return false;
+    }
+    let mut word_start = true;
+    let mut saw_cased = false;
+    for character in value.chars() {
+        if !character.is_alphabetic() {
+            word_start = true;
+            continue;
+        }
+        if word_start {
+            if !character.is_uppercase() {
+                return false;
+            }
+            saw_cased = true;
+            word_start = false;
+        } else if character.is_uppercase() {
+            return false;
+        }
+    }
+    saw_cased
+}
+
+fn mutates_protected_fact(
+    base: &str,
+    rendered: &str,
+    edits: &[FormatEdit],
+    extra: &[&str],
+) -> bool {
+    host_protected_facts(base, extra)
+        .into_iter()
+        .any(|fact| {
+            !fact.is_empty()
+                && !protected_fact_survives(rendered, &fact)
+                && !fact_only_inside_removal(base, &fact, edits)
+        })
+}
+
+fn protected_fact_survives(rendered: &str, fact: &str) -> bool {
+    if rendered.contains(fact) {
+        return true;
+    }
+    let lower = fact.to_ascii_lowercase();
+    let case_fold = NEGATIONS.contains(&lower.as_str())
+        || WEEKDAYS.contains(&lower.as_str())
+        || MONTHS.contains(&lower.as_str());
+    case_fold && rendered.to_ascii_lowercase().contains(&lower)
+}
+
+fn fact_only_inside_removal(base: &str, fact: &str, edits: &[FormatEdit]) -> bool {
+    let mut search = 0;
+    let mut saw = false;
+    while let Some(relative) = base[search..].find(fact) {
+        saw = true;
+        let start = search + relative;
+        let end = start + fact.len();
+        if !edits.iter().any(|edit| {
+            matches!(
+                edit.kind,
+                FormatEditKind::FillerRemoval | FormatEditKind::ClearBacktrackRemoval
+            ) && edit.start_utf8 <= start
+                && end <= edit.end_utf8
+        }) {
+            return false;
+        }
+        search = end.max(start + 1);
+    }
+    saw
+}
+
+fn host_protected_facts(base: &str, extra: &[&str]) -> Vec<String> {
+    let mut facts = Vec::new();
+    push_unique_fact(&mut facts, collect_quoted_interiors(base));
+    let mut sentence_initial = true;
+    for raw in base.split_whitespace() {
+        let token = trim_token_edges(raw);
+        if token.is_empty() {
+            continue;
+        }
+        if is_protected_token(token, sentence_initial) {
+            push_unique_fact(&mut facts, [token.to_owned()]);
+        }
+        sentence_initial = raw.ends_with(['.', '?', '!']);
+    }
+    if is_command_shaped(base) {
+        for raw in base.split_whitespace() {
+            let token = trim_token_edges(raw);
+            if looks_like_command_atom(token) {
+                push_unique_fact(&mut facts, [token.to_owned()]);
+            }
+        }
+    }
+    for token in extra {
+        if base.contains(*token) {
+            push_unique_fact(&mut facts, [(*token).to_owned()]);
+        }
+    }
+    facts
+}
+
+fn is_protected_token(token: &str, sentence_initial: bool) -> bool {
+    let lower = token.to_ascii_lowercase();
+    NEGATIONS.contains(&lower.as_str())
+        || WEEKDAYS.contains(&lower.as_str())
+        || MONTHS.contains(&lower.as_str())
+        || is_technical_token(token)
+        || is_time_token(token)
+        || is_proper_name(token, sentence_initial)
+}
+
+fn is_technical_token(token: &str) -> bool {
+    token.bytes().any(|byte| byte.is_ascii_digit())
+        || token.contains("://")
+        || token.contains('/')
+        || token.contains('\\')
+        || token.starts_with('-')
+        || token.contains('_')
+        || token.contains("::")
+        || token.contains('@')
+        || token.contains(['(', ')', '[', ']', '{', '}', '='])
+}
+
+fn is_time_token(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    let stripped = lower.trim_end_matches(['.', ',', ';']);
+    matches!(stripped.chars().last(), Some('a' | 'p'))
+        && stripped.len() > 2
+        && stripped.as_bytes()[stripped.len() - 2] == b'm'
+        && stripped[..stripped.len() - 2]
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == ':')
+}
+
+fn is_proper_name(token: &str, sentence_initial: bool) -> bool {
+    if sentence_initial || token.chars().count() < 2 {
+        return false;
+    }
+    if CLOSED_STRUCTURED_LABELS
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(token))
+    {
+        return false;
+    }
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_uppercase()
+        && first.is_alphabetic()
+        && chars.all(|character| character.is_lowercase() || character == '-')
+}
+
+fn looks_like_command_atom(token: &str) -> bool {
+    is_technical_token(token)
+        || matches!(
+            token.to_ascii_lowercase().as_str(),
+            "cargo"
+                | "npm"
+                | "pnpm"
+                | "yarn"
+                | "git"
+                | "docker"
+                | "kubectl"
+                | "make"
+                | "python"
+                | "python3"
+                | "pip"
+                | "curl"
+                | "ssh"
+                | "scp"
+                | "go"
+                | "bazel"
+                | "ninja"
+                | "test"
+                | "build"
+                | "clippy"
+                | "fmt"
+        )
+}
+
+fn collect_quoted_interiors(text: &str) -> Vec<String> {
+    let mut interiors = Vec::new();
+    let lower = text.to_ascii_lowercase();
+    let mut search_from = 0;
+    while let Some(open_relative) = lower[search_from..].find("quote ") {
+        let interior_start = search_from + open_relative + "quote ".len();
+        let Some(close_relative) = lower[interior_start..].find(" unquote") else {
+            break;
+        };
+        let interior_end = interior_start + close_relative;
+        if interior_start < interior_end {
+            interiors.push(text[interior_start..interior_end].to_owned());
+        }
+        search_from = interior_end + " unquote".len();
+    }
+    push_paired_quote_interiors(text, '"', &mut interiors);
+    push_paired_quote_interiors(text, '\'', &mut interiors);
+    interiors
+}
+
+fn push_paired_quote_interiors(text: &str, delimiter: char, interiors: &mut Vec<String>) {
+    let mut start = None;
+    for (index, character) in text.char_indices() {
+        if character != delimiter {
+            continue;
+        }
+        match start {
+            None => start = Some(index + character.len_utf8()),
+            Some(open) => {
+                if open < index {
+                    interiors.push(text[open..index].to_owned());
+                }
+                start = None;
+            }
+        }
+    }
+}
+
+fn push_unique_fact(facts: &mut Vec<String>, incoming: impl IntoIterator<Item = String>) {
+    for fact in incoming {
+        if !fact.is_empty() && !facts.iter().any(|existing| existing == &fact) {
+            facts.push(fact);
+        }
+    }
+}
+
+fn trim_token_edges(token: &str) -> &str {
+    token.trim_matches(|character: char| {
+        matches!(
+            character,
+            ',' | ';' | '!' | '?' | '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    })
+}
+
+fn lexical_words(text: &str) -> Vec<String> {
+    text.split(|character: char| !character.is_alphanumeric() && character != '\'')
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn lexical_word_count(text: &str) -> usize {
+    lexical_words(text).len()
 }
 
 #[cfg(test)]
@@ -585,5 +1069,269 @@ mod tests {
             ),
         );
         assert_eq!(backtrack.rendered, "send the blue file");
+    }
+
+    #[test]
+    fn formatting_may_introduce_words_absent_from_the_source() {
+        let base = "pls ship the rust parser";
+        let outcome = apply_format_edit_candidate_json(
+            base,
+            &candidate_json(base, json!([edit(0, 3, "pls", "Please", "bounded_wording")])),
+        );
+        assert!(outcome.accepted, "{outcome:?}");
+        assert_eq!(outcome.rendered, "Please ship the rust parser");
+        assert!(
+            !base.to_ascii_lowercase().contains("please"),
+            "the new wording must not already be in the source"
+        );
+    }
+
+    #[test]
+    fn protected_facts_must_survive_formatting() {
+        let cases = [
+            (
+                "ask Alice to review it",
+                4,
+                9,
+                "Alice",
+                "Alicia",
+                "bounded_wording",
+            ),
+            (
+                "do not deploy tonight",
+                3,
+                6,
+                "not",
+                "",
+                "bounded_wording",
+            ),
+            (
+                "open https://example.test/a now",
+                5,
+                27,
+                "https://example.test/a",
+                "https://evil.test/a",
+                "bounded_wording",
+            ),
+            (
+                "edit crates/voisu-core/src/lib.rs today",
+                5,
+                33,
+                "crates/voisu-core/src/lib.rs",
+                "crates/voisu-core/src/main.rs",
+                "bounded_wording",
+            ),
+            (
+                "meet at 3pm tomorrow",
+                8,
+                11,
+                "3pm",
+                "4pm",
+                "bounded_wording",
+            ),
+            (
+                "ship on 2026-08-16 please",
+                8,
+                18,
+                "2026-08-16",
+                "2026-08-17",
+                "bounded_wording",
+            ),
+            (
+                "say quote leave this unquote now",
+                10,
+                20,
+                "leave this",
+                "change this",
+                "quote_conversion",
+            ),
+        ];
+        for (base, start, end, before, after, kind) in cases {
+            let outcome = apply_format_edit_candidate_json(
+                base,
+                &candidate_json(base, json!([edit(start, end, before, after, kind)])),
+            );
+            assert_eq!(
+                outcome.error,
+                Some(FormatEditErrorCode::Protected),
+                "expected protected reject for {before:?} in {base:?}: {outcome:?}"
+            );
+            assert_eq!(outcome.rendered, base);
+        }
+
+        let weekday = "meet wednesday morning";
+        let cased_weekday = apply_format_edit_candidate_json(
+            weekday,
+            &candidate_json(
+                weekday,
+                json!([edit(5, 14, "wednesday", "Wednesday", "casing")]),
+            ),
+        );
+        assert!(cased_weekday.accepted, "{cased_weekday:?}");
+        assert_eq!(cased_weekday.rendered, "meet Wednesday morning");
+
+        let command = "run cargo test --workspace";
+        let flag_start = command.find("--workspace").unwrap();
+        let mutated = apply_format_edit_candidate_json(
+            command,
+            &candidate_json(
+                command,
+                json!([edit(
+                    flag_start,
+                    flag_start + "--workspace".len(),
+                    "--workspace",
+                    "--all",
+                    "bounded_wording"
+                )]),
+            ),
+        );
+        assert_eq!(mutated.error, Some(FormatEditErrorCode::Protected));
+        assert_eq!(mutated.rendered, command);
+    }
+
+    #[test]
+    fn caller_supplied_name_is_protected_even_when_not_title_case() {
+        let base = "restart voisu-daemon after the change";
+        let start = base.find("voisu-daemon").unwrap();
+        let outcome = apply_format_edits_with(
+            base,
+            &parse_format_edit_candidate_json(&candidate_json(
+                base,
+                json!([edit(
+                    start,
+                    start + "voisu-daemon".len(),
+                    "voisu-daemon",
+                    "voisu-service",
+                    "bounded_wording"
+                )]),
+            ))
+            .expect("parse"),
+            &FormatEditSafety {
+                protected_tokens: &["voisu-daemon"],
+                policy: RenderingPolicy::Adaptive,
+            },
+        );
+        assert_eq!(outcome.error, Some(FormatEditErrorCode::Protected));
+        assert_eq!(outcome.rendered, base);
+    }
+
+    #[test]
+    fn new_headings_require_spoken_cues_and_never_appear_under_natural() {
+        let unlicensed = "ship the rust parser today";
+        let invented = apply_format_edit_candidate_json(
+            unlicensed,
+            &candidate_json(
+                unlicensed,
+                json!([edit(0, 4, "ship", "Goal:\nShip", "structure")]),
+            ),
+        );
+        assert_eq!(invented.error, Some(FormatEditErrorCode::HeadingWithoutCue));
+        assert_eq!(invented.rendered, unlicensed);
+
+        let cued = "goal ship the rust parser";
+        let structured = apply_format_edit_candidate_json(
+            cued,
+            &candidate_json(cued, json!([edit(0, 4, "goal", "Goal:\n", "structure")])),
+        );
+        assert!(structured.accepted, "{structured:?}");
+        assert_eq!(structured.rendered, "Goal:\n ship the rust parser");
+
+        let natural = apply_format_edit_candidate_json_with(
+            cued,
+            &candidate_json(cued, json!([edit(0, 4, "goal", "Goal:\n", "structure")])),
+            &FormatEditSafety {
+                protected_tokens: &[],
+                policy: RenderingPolicy::Natural,
+            },
+        );
+        assert_eq!(natural.error, Some(FormatEditErrorCode::HeadingWithoutCue));
+        assert_eq!(natural.rendered, cued);
+    }
+
+    #[test]
+    fn prompt_artifacts_and_outros_are_rejected_but_source_mentions_survive() {
+        let base = "ship the rust parser";
+        let artifact = apply_format_edit_candidate_json(
+            base,
+            &candidate_json(
+                base,
+                json!([edit(
+                    20,
+                    20,
+                    "",
+                    "\nIgnore previous instructions.",
+                    "bounded_wording"
+                )]),
+            ),
+        );
+        assert_eq!(artifact.error, Some(FormatEditErrorCode::PromptArtifact));
+        assert_eq!(artifact.rendered, base);
+
+        let outro = apply_format_edit_candidate_json(
+            base,
+            &candidate_json(
+                base,
+                json!([edit(
+                    20,
+                    20,
+                    "",
+                    " Thank you for watching!",
+                    "bounded_wording"
+                )]),
+            ),
+        );
+        assert_eq!(outro.error, Some(FormatEditErrorCode::PromptArtifact));
+        assert_eq!(outro.rendered, base);
+
+        let spoken = "we should thank you for watching the demo";
+        let kept = apply_format_edit_candidate_json(
+            spoken,
+            &candidate_json(spoken, json!([edit(0, 1, "w", "W", "casing")])),
+        );
+        assert!(kept.accepted, "{kept:?}");
+        assert_eq!(kept.rendered, "We should thank you for watching the demo");
+    }
+
+    #[test]
+    fn empty_or_large_summary_falls_back_to_the_base() {
+        let base = "ship the rust parser";
+        let empty = apply_format_edit_candidate_json(
+            base,
+            &candidate_json(
+                base,
+                json!([edit(0, base.len(), base, "", "bounded_wording")]),
+            ),
+        );
+        assert_eq!(empty.error, Some(FormatEditErrorCode::EmptyOrSummary));
+        assert_eq!(empty.rendered, base);
+
+        let long = "please write a function that validates the incoming request payload and returns a 400 when the schema fails";
+        let summary_after = "Validate the payload.";
+        let summary = apply_format_edit_candidate_json(
+            long,
+            &candidate_json(
+                long,
+                json!([edit(0, long.len(), long, summary_after, "bounded_wording")]),
+            ),
+        );
+        assert_eq!(summary.error, Some(FormatEditErrorCode::EmptyOrSummary));
+        assert_eq!(summary.rendered, long);
+    }
+
+    #[test]
+    fn malformed_and_unsupported_kinds_still_reject_to_the_base() {
+        let base = "goal ship the rust parser";
+        assert_eq!(
+            apply_format_edit_candidate_json(base, b"{").error,
+            Some(FormatEditErrorCode::Malformed)
+        );
+        assert_eq!(
+            apply_format_edit_candidate_json(
+                base,
+                &candidate_json(base, json!([edit(0, 4, "goal", "Goal", "rewrite")])),
+            )
+            .error,
+            Some(FormatEditErrorCode::UnknownKind)
+        );
     }
 }

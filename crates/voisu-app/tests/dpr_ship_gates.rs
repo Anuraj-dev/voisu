@@ -25,13 +25,13 @@ use voisu_app::smart_writing::{
     GrammarGateCapability, ResolvedRecordingLanguages,
 };
 use voisu_core::{
-    compose_structured_candidate, organize_local_baseline, parse_structured_candidate_json,
-    BoundaryFuture, CloudOutcome, CloudRequest, ComposeInput, ComposeOutcome, ComposeSource,
-    CompositionDecision, Credential, DeliveryAdapter, DeliveryFlags, DeliveryOutcome,
-    DprDiagnosticMode, LocalBaseline, LocalBaselineOptions, LocalTiming, PauseBoundary, Provider,
-    ProviderState, RenderingPolicy, RenderingRoute, SourceSelection, SourceTranscript,
-    SttProvider, StructuredCandidate, SurfaceHint, TimingCertainty, Transcript,
-    TranscriptSelection,
+    compose_structured_candidate, organize_local_baseline, parse_format_edit_candidate_json,
+    parse_structured_candidate_json, BoundaryFuture, CloudOutcome, CloudRequest, ComposeInput,
+    ComposeOutcome, ComposeSource, CompositionDecision, Credential, DeliveryAdapter,
+    DeliveryFlags, DeliveryOutcome, DprDiagnosticMode, FormatEditCandidate, LocalBaseline,
+    LocalBaselineOptions, LocalTiming, PauseBoundary, Provider, ProviderState, RenderingPolicy,
+    RenderingRoute, SourceSelection, SourceTranscript, SttProvider, StructuredCandidate,
+    SurfaceHint, TimingCertainty, Transcript, TranscriptSelection,
 };
 
 const BEHAVIOR_CORPUS: &str = include_str!(
@@ -871,6 +871,156 @@ async fn cloud_call_budget_covers_zero_call_and_failed_attempt_paths() {
         assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
         assert_eq!(completion.cloud_error, Some(error));
     }
+}
+
+fn format_edit_candidate(
+    source: &str,
+    start: usize,
+    end: usize,
+    before: &str,
+    after: &str,
+    kind: &str,
+) -> FormatEditCandidate {
+    parse_format_edit_candidate_json(
+        serde_json::json!({
+            "version": "1",
+            "base_fingerprint": voisu_core::text_sha256_fingerprint(source),
+            "edits": [{
+                "start_utf8": start,
+                "end_utf8": end,
+                "before": before,
+                "after": after,
+                "kind": kind,
+            }],
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .expect("format edits")
+}
+
+/// Formatting apply may introduce wording that is not in the Source Transcript,
+/// but protected facts, unsupported headings, artifacts, and empty/summary
+/// still fall back to the local baseline.
+#[tokio::test]
+async fn formatting_apply_relaxes_lexical_source_words_without_dropping_safety() {
+    let credential = Credential::new("hermetic-secret".to_owned()).expect("credential");
+    let wording_source = "pls ship the rust parser";
+    let wording_sources = [ComposeSource {
+        provider: SttProvider::ProviderA,
+        available: true,
+        text: wording_source.to_owned(),
+        primary: true,
+    }];
+    let wording_selection = SourceSelection {
+        selected_provider: SttProvider::ProviderA,
+        reason: "only_available".to_owned(),
+    };
+    let clock = ControlledClock::at(0);
+    let cloud_calls = Arc::new(AtomicUsize::new(0));
+    let cloud = CannedCloud {
+        calls: Arc::clone(&cloud_calls),
+        clock: clock.clone(),
+        complete_at: 200,
+        result: Mutex::new(Some(DprCloudAttempt::format_edits(format_edit_candidate(
+            wording_source,
+            0,
+            3,
+            "pls",
+            "Please",
+            "bounded_wording",
+        )))),
+    };
+    let (mut wording_delivery, delivery_calls, _) = delivery(Some(clock.clone()));
+    let accepted = dpr_transform_and_deliver(
+        DprTransformInput {
+            selected_source: wording_source,
+            sources: &wording_sources,
+            source_selection: &wording_selection,
+            provider_state: ProviderState::SemanticDisagreement,
+            policy: RenderingPolicy::Adaptive,
+            english_eligible: true,
+            surface_hint: None,
+            process_hint: None,
+            timing: None,
+            protected_tokens: &[],
+            cloud: DprCloudCapability::Ready {
+                boundary: &cloud,
+                credential: &credential,
+            },
+            clock: &clock,
+            small_edit_contract: true,
+        },
+        &mut wording_delivery,
+    )
+    .await;
+    assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(accepted.rendered, "Please ship the rust parser");
+    assert_eq!(accepted.compose_decision, CompositionDecision::Accept);
+
+    let unsafe_source = "do not deploy https://example.test/a";
+    let unsafe_sources = [ComposeSource {
+        provider: SttProvider::ProviderA,
+        available: true,
+        text: unsafe_source.to_owned(),
+        primary: true,
+    }];
+    let unsafe_selection = SourceSelection {
+        selected_provider: SttProvider::ProviderA,
+        reason: "only_available".to_owned(),
+    };
+    let url_start = unsafe_source.find("https://example.test/a").unwrap();
+    let clock = ControlledClock::at(0);
+    let cloud_calls = Arc::new(AtomicUsize::new(0));
+    let cloud = CannedCloud {
+        calls: Arc::clone(&cloud_calls),
+        clock: clock.clone(),
+        complete_at: 200,
+        result: Mutex::new(Some(DprCloudAttempt::format_edits(format_edit_candidate(
+            unsafe_source,
+            url_start,
+            url_start + "https://example.test/a".len(),
+            "https://example.test/a",
+            "https://evil.test/a",
+            "bounded_wording",
+        )))),
+    };
+    let (mut unsafe_delivery, delivery_calls, _) = delivery(Some(clock.clone()));
+    let baseline = organize_local_baseline(
+        unsafe_source,
+        &LocalBaselineOptions {
+            policy: RenderingPolicy::Adaptive,
+            route: RenderingRoute::LocalWithOptionalCloud,
+            timing: None,
+        },
+    );
+    let rejected = dpr_transform_and_deliver(
+        DprTransformInput {
+            selected_source: unsafe_source,
+            sources: &unsafe_sources,
+            source_selection: &unsafe_selection,
+            provider_state: ProviderState::SemanticDisagreement,
+            policy: RenderingPolicy::Adaptive,
+            english_eligible: true,
+            surface_hint: None,
+            process_hint: None,
+            timing: None,
+            protected_tokens: &["not", "https://example.test/a"],
+            cloud: DprCloudCapability::Ready {
+                boundary: &cloud,
+                credential: &credential,
+            },
+            clock: &clock,
+            small_edit_contract: true,
+        },
+        &mut unsafe_delivery,
+    )
+    .await;
+    assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(rejected.rendered, baseline.rendered());
+    assert_eq!(rejected.compose_decision, CompositionDecision::FallbackBaseline);
 }
 
 /// Ship gate 6 persistence half: all policies round-trip through the real CLI.
