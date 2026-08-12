@@ -1,9 +1,9 @@
 //! Developer Prompt Rendering domain types (DPR-T0 / #155).
 //!
-//! Pure vocabulary for policies, intent routes, cloud request states, closed
-//! Structured labels, and Delivery constants. No network, no daemon wiring,
-//! and no Smart Writing path changes. Later tickets (baseline, router, compose)
-//! import from this module.
+//! Pure vocabulary for policies, intent routes, cloud request states, timing
+//! certainty, closed Structured labels, and Delivery constants. No network, no
+//! daemon wiring, and no Smart Writing path changes. Later tickets (baseline,
+//! router, compose) import from this module.
 
 use std::time::Duration;
 
@@ -154,6 +154,36 @@ impl CloudRequest {
     }
 }
 
+/// Certainty of optional pause-boundary timing shared by local baseline (T1)
+/// and intent routing (T2). Clear evidence may drive layout; Uncertain fails closed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimingCertainty {
+    /// Local rules may act on proven pause boundaries.
+    Clear,
+    /// Fail closed: no layout/route weight from pause timing.
+    Uncertain,
+}
+
+impl TimingCertainty {
+    /// Research / diagnostics wire value for this certainty.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Uncertain => "uncertain",
+        }
+    }
+
+    /// Parses a research wire string into a timing certainty.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "clear" => Some(Self::Clear),
+            "uncertain" => Some(Self::Uncertain),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +279,17 @@ mod tests {
         let held = snapshot;
         assert_eq!(held, RenderingPolicy::Natural);
         assert_eq!(policy, RenderingPolicy::Natural);
+    }
+
+    #[test]
+    fn timing_certainty_wire_names_round_trip() {
+        assert_eq!(TimingCertainty::Clear.as_str(), "clear");
+        assert_eq!(TimingCertainty::Uncertain.as_str(), "uncertain");
+        assert_eq!(TimingCertainty::parse("clear"), Some(TimingCertainty::Clear));
+        assert_eq!(
+            TimingCertainty::parse("uncertain"),
+            Some(TimingCertainty::Uncertain)
+        );
+        assert_eq!(TimingCertainty::parse("maybe"), None);
     }
 }

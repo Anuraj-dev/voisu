@@ -60,7 +60,7 @@ pub use grammar_safety::{
 
 mod prompt_rendering;
 pub use prompt_rendering::{
-    CloudRequest, RenderingPolicy, RenderingRoute, CLOSED_STRUCTURED_LABELS,
+    CloudRequest, RenderingPolicy, RenderingRoute, TimingCertainty, CLOSED_STRUCTURED_LABELS,
     DEFAULT_RENDERING_POLICY, DELIVERY_AUTO_SEND, DELIVERY_DEADLINE, DELIVERY_DEADLINE_MS,
     DELIVERY_LIVE_TYPE, DELIVERY_REPLACE_DELIVERED, DELIVERY_STATE_UNSENT,
 };
