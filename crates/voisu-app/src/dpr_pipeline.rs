@@ -25,6 +25,12 @@ use crate::dpr_cloud::{
 
 /// Maximum elapsed time from utterance end to initiating Delivery.
 pub const DPR_DELIVERY_DEADLINE: Duration = Duration::from_millis(1_500);
+/// Failure ceiling from ValidationCompleted to initiating formatting Delivery.
+pub const DPR_FORMAT_GATE: Duration = Duration::from_millis(5_000);
+/// Maximum time granted to the formatting Provider request.
+pub const DPR_FORMAT_PROVIDER_BUDGET: Duration = Duration::from_millis(4_750);
+/// Time reserved for host parsing, validation, composition, and Delivery initiation.
+pub const DPR_FORMAT_HOST_RESERVE: Duration = Duration::from_millis(250);
 
 pub type DprCloudFuture<'a> =
     Pin<Box<dyn Future<Output = DprCloudAttempt> + Send + 'a>>;
@@ -51,25 +57,52 @@ impl DprCloudBoundary for DprCloudClient {
     }
 }
 
-/// Monotonic elapsed time from the Recording's utterance-end snapshot.
+/// Monotonic elapsed time from the deadline origin selected by the daemon.
 pub trait DprPipelineClock: Send + Sync {
     fn elapsed(&self) -> Duration;
 }
 
 pub struct SystemDprPipelineClock {
-    utterance_end: Instant,
+    started_at: Instant,
+}
+
+/// Instant that starts the DPR deadline clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DprPipelineClockOrigin {
+    UtteranceEnd,
+    ValidationCompleted,
+}
+
+/// Formatting (`qwen_format_enabled`) is measured from ValidationCompleted.
+/// Derivation stays on utterance_end.
+#[must_use]
+pub const fn dpr_pipeline_clock_origin(qwen_format_enabled: bool) -> DprPipelineClockOrigin {
+    if qwen_format_enabled {
+        DprPipelineClockOrigin::ValidationCompleted
+    } else {
+        DprPipelineClockOrigin::UtteranceEnd
+    }
 }
 
 impl SystemDprPipelineClock {
     #[must_use]
     pub const fn from_utterance_end(utterance_end: Instant) -> Self {
-        Self { utterance_end }
+        Self {
+            started_at: utterance_end,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_validation_completed(validation_completed: Instant) -> Self {
+        Self {
+            started_at: validation_completed,
+        }
     }
 }
 
 impl DprPipelineClock for SystemDprPipelineClock {
     fn elapsed(&self) -> Duration {
-        self.utterance_end.elapsed()
+        self.started_at.elapsed()
     }
 }
 
@@ -456,6 +489,11 @@ pub async fn dpr_transform_and_deliver(
     input: DprTransformInput<'_>,
     delivery: &mut dyn DeliveryAdapter,
 ) -> DprTransformCompletion {
+    let delivery_deadline = if input.small_edit_contract {
+        DPR_FORMAT_GATE
+    } else {
+        DPR_DELIVERY_DEADLINE
+    };
     let routing = route_intent(&IntentObservation {
         policy: input.policy,
         primary_text: input.selected_source.to_owned(),
@@ -486,7 +524,19 @@ pub async fn dpr_transform_and_deliver(
         CloudOutcome::Skipped
     } else {
         let cloud_budget_elapsed = input.clock.elapsed();
-        if cloud_budget_elapsed >= DPR_DELIVERY_DEADLINE {
+        let provider_budget = delivery_deadline
+            .saturating_sub(cloud_budget_elapsed)
+            .saturating_sub(if input.small_edit_contract {
+                DPR_FORMAT_HOST_RESERVE
+            } else {
+                Duration::ZERO
+            })
+            .min(if input.small_edit_contract {
+                DPR_FORMAT_PROVIDER_BUDGET
+            } else {
+                DPR_DELIVERY_DEADLINE
+            });
+        if cloud_budget_elapsed >= delivery_deadline || provider_budget.is_zero() {
             cloud_error = Some(DprCloudErrorClass::DeadlineExceeded);
             diagnostic.cloud_skipped(cloud_budget_elapsed);
             CloudOutcome::DeadlineExceeded
@@ -503,7 +553,6 @@ pub async fn dpr_transform_and_deliver(
                 } => {
                     cloud_attempted = true;
                     diagnostic.cloud_request_started(cloud_budget_elapsed);
-                    let remaining = DPR_DELIVERY_DEADLINE - cloud_budget_elapsed;
                     let attempt = boundary
                         .attempt(
                             credential,
@@ -516,7 +565,7 @@ pub async fn dpr_transform_and_deliver(
                                 protected_tokens: input.protected_tokens,
                                 small_edit_contract: input.small_edit_contract,
                             },
-                            remaining,
+                            provider_budget,
                         )
                         .await;
                     let (attempt_candidate, attempt_format_edits, attempt_error) =
@@ -528,7 +577,7 @@ pub async fn dpr_transform_and_deliver(
                     {
                         diagnostic.cloud_response_received(attempt_completed_at);
                     }
-                    if attempt_completed_at >= DPR_DELIVERY_DEADLINE {
+                    if attempt_completed_at >= delivery_deadline {
                         cloud_error = Some(DprCloudErrorClass::DeadlineExceeded);
                         CloudOutcome::DeadlineExceeded
                     } else if input.small_edit_contract {
@@ -574,7 +623,7 @@ pub async fn dpr_transform_and_deliver(
     let compose_finished_at = input.clock.elapsed();
     let (rendered, delivery_flags, compose_decision, fallback_trigger, error_codes) =
         if let Some(host_rendered) = format_rendered {
-            if compose_finished_at >= DPR_DELIVERY_DEADLINE {
+            if compose_finished_at >= delivery_deadline {
                 cloud_error = Some(DprCloudErrorClass::DeadlineExceeded);
                 let composed = compose_structured_candidate(&ComposeInput {
                     local_baseline: &baseline,
@@ -614,7 +663,7 @@ pub async fn dpr_transform_and_deliver(
                 candidate: candidate.as_ref(),
             });
             if cloud_outcome == CloudOutcome::Succeeded
-                && compose_finished_at >= DPR_DELIVERY_DEADLINE
+                && compose_finished_at >= delivery_deadline
             {
                 cloud_error = Some(DprCloudErrorClass::DeadlineExceeded);
                 composed = compose_structured_candidate(&ComposeInput {
@@ -759,12 +808,27 @@ mod tests {
         Failure(DprCloudErrorClass),
     }
 
+    #[derive(Clone)]
+    enum CannedFormatCloudOutcome {
+        Success(FormatEditCandidate),
+        Failure(DprCloudErrorClass),
+    }
+
     struct CountingCloud {
         calls: Arc<AtomicUsize>,
         remaining_ms: Arc<AtomicU64>,
         clock: ControlledClock,
         completes_at_ms: u64,
         outcome: CannedCloudOutcome,
+    }
+
+    struct CountingFormatCloud {
+        calls: Arc<AtomicUsize>,
+        remaining_ms: Arc<AtomicU64>,
+        clock: ControlledClock,
+        completes_at_ms: u64,
+        honor_budget: bool,
+        outcome: CannedFormatCloudOutcome,
     }
 
     struct SequenceClock {
@@ -834,6 +898,43 @@ mod tests {
         }
     }
 
+    impl DprCloudBoundary for CountingFormatCloud {
+        fn attempt<'a>(
+            &'a self,
+            _credential: &'a Credential,
+            request: DprCloudRequest<'a>,
+            remaining: Duration,
+        ) -> DprCloudFuture<'a> {
+            assert!(request.small_edit_contract);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.remaining_ms.store(
+                u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
+            let current_ms = self.clock.0.load(Ordering::SeqCst);
+            let deadline_ms = current_ms.saturating_add(
+                u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+            );
+            let result = if self.honor_budget && self.completes_at_ms > deadline_ms {
+                self.clock.0.store(deadline_ms, Ordering::SeqCst);
+                DprCloudAttempt::failure(DprCloudErrorClass::DeadlineExceeded)
+            } else {
+                self.clock
+                    .0
+                    .store(self.completes_at_ms, Ordering::SeqCst);
+                match &self.outcome {
+                    CannedFormatCloudOutcome::Success(candidate) => {
+                        DprCloudAttempt::format_edits(candidate.clone())
+                    }
+                    CannedFormatCloudOutcome::Failure(error) => {
+                        DprCloudAttempt::failure(*error)
+                    }
+                }
+            };
+            Box::pin(async move { result })
+        }
+    }
+
     fn accepted_candidate(source: &str, output: &str, reason: &str) -> StructuredCandidate {
         let raw = serde_json::json!({
             "schema_version": "1",
@@ -862,6 +963,22 @@ mod tests {
             .iter()
             .map(|event| event.name())
             .collect()
+    }
+
+    #[test]
+    fn formatting_clock_origin_is_validation_completed() {
+        assert_eq!(
+            dpr_pipeline_clock_origin(true),
+            DprPipelineClockOrigin::ValidationCompleted
+        );
+    }
+
+    #[test]
+    fn derivation_clock_origin_is_utterance_end() {
+        assert_eq!(
+            dpr_pipeline_clock_origin(false),
+            DprPipelineClockOrigin::UtteranceEnd
+        );
     }
 
     #[test]
@@ -1708,6 +1825,7 @@ mod tests {
     struct FormatEditCloud {
         calls: Arc<AtomicUsize>,
         saw_small_edit_contract: Arc<Mutex<Option<bool>>>,
+        remaining_ms: Arc<AtomicU64>,
         candidate: FormatEditCandidate,
     }
 
@@ -1716,9 +1834,13 @@ mod tests {
             &'a self,
             _credential: &'a Credential,
             request: DprCloudRequest<'a>,
-            _remaining: Duration,
+            remaining: Duration,
         ) -> DprCloudFuture<'a> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.remaining_ms.store(
+                u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
             *self
                 .saw_small_edit_contract
                 .lock()
@@ -1743,6 +1865,48 @@ mod tests {
         parse_format_edit_candidate_json(raw.to_string().as_bytes()).expect("format edits")
     }
 
+    async fn run_timed_format_attempt(
+        cloud: &dyn DprCloudBoundary,
+        clock: &dyn DprPipelineClock,
+        delivery: &mut dyn DeliveryAdapter,
+    ) -> DprTransformCompletion {
+        let source = "goal ship the rust parser";
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".to_owned(),
+        };
+        let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
+
+        dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &selection,
+                provider_state: ProviderState::SemanticDisagreement,
+                policy: RenderingPolicy::Structured,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready {
+                    boundary: cloud,
+                    credential: &credential,
+                },
+                clock,
+                small_edit_contract: true,
+            },
+            delivery,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn small_edit_contract_delivers_host_applied_text_not_model_prose() {
         let source = "goal ship the rust parser";
@@ -1762,6 +1926,7 @@ mod tests {
         let cloud = FormatEditCloud {
             calls: Arc::clone(&calls),
             saw_small_edit_contract: Arc::clone(&saw_flag),
+            remaining_ms: Arc::new(AtomicU64::new(0)),
             candidate: format_edit_candidate(source, 0, 4, "goal", "Goal:\n", "structure"),
         };
         let delivery_calls = Arc::new(AtomicUsize::new(0));
@@ -1810,6 +1975,311 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn formatting_provider_attempt_is_capped_at_4750ms() {
+        let source = "goal ship the rust parser";
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".to_owned(),
+        };
+        let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
+        let remaining_ms = Arc::new(AtomicU64::new(0));
+        let cloud = FormatEditCloud {
+            calls: Arc::new(AtomicUsize::new(0)),
+            saw_small_edit_contract: Arc::new(Mutex::new(None)),
+            remaining_ms: Arc::clone(&remaining_ms),
+            candidate: format_edit_candidate(source, 0, 4, "goal", "Goal:\n", "structure"),
+        };
+        let delivery_calls = Arc::new(AtomicUsize::new(0));
+        let mut delivery = RecordingDelivery {
+            calls: Arc::clone(&delivery_calls),
+            rendered: Arc::new(Mutex::new(Vec::new())),
+            initiated_ms: None,
+        };
+        let clock = FixedClock(Duration::ZERO);
+
+        let _completion = dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &selection,
+                provider_state: ProviderState::SemanticDisagreement,
+                policy: RenderingPolicy::Structured,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready {
+                    boundary: &cloud,
+                    credential: &credential,
+                },
+                clock: &clock,
+                small_edit_contract: true,
+            },
+            &mut delivery,
+        )
+        .await;
+
+        assert_eq!(remaining_ms.load(Ordering::SeqCst), 4_750);
+    }
+
+    #[tokio::test]
+    async fn formatting_host_reserve_prevents_zero_budget_provider_attempt() {
+        let source = "goal ship the rust parser";
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".to_owned(),
+        };
+        let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
+        let cloud_calls = Arc::new(AtomicUsize::new(0));
+        let cloud = FormatEditCloud {
+            calls: Arc::clone(&cloud_calls),
+            saw_small_edit_contract: Arc::new(Mutex::new(None)),
+            remaining_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            candidate: format_edit_candidate(source, 0, 4, "goal", "Goal:\n", "structure"),
+        };
+        let delivery_calls = Arc::new(AtomicUsize::new(0));
+        let rendered = Arc::new(Mutex::new(Vec::new()));
+        let mut delivery = RecordingDelivery {
+            calls: Arc::clone(&delivery_calls),
+            rendered: Arc::clone(&rendered),
+            initiated_ms: None,
+        };
+        let clock = FixedClock(DPR_FORMAT_GATE - DPR_FORMAT_HOST_RESERVE);
+        let baseline = organize_local_baseline(
+            source,
+            &LocalBaselineOptions {
+                policy: RenderingPolicy::Structured,
+                route: voisu_core::RenderingRoute::LocalWithOptionalCloud,
+                timing: None,
+            },
+        );
+
+        let completion = dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &selection,
+                provider_state: ProviderState::SemanticDisagreement,
+                policy: RenderingPolicy::Structured,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready {
+                    boundary: &cloud,
+                    credential: &credential,
+                },
+                clock: &clock,
+                small_edit_contract: true,
+            },
+            &mut delivery,
+        )
+        .await;
+
+        assert_eq!(cloud_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(completion.rendered, baseline.rendered());
+        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(
+            completion.cloud_error,
+            Some(DprCloudErrorClass::DeadlineExceeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn formatting_provider_timeout_delivers_baseline_once() {
+        let source = "goal ship the rust parser";
+        let clock = ControlledClock::new(0);
+        let cloud_calls = Arc::new(AtomicUsize::new(0));
+        let remaining_ms = Arc::new(AtomicU64::new(0));
+        let cloud = CountingFormatCloud {
+            calls: Arc::clone(&cloud_calls),
+            remaining_ms: Arc::clone(&remaining_ms),
+            clock: clock.clone(),
+            completes_at_ms: 4_751,
+            honor_budget: true,
+            outcome: CannedFormatCloudOutcome::Success(format_edit_candidate(
+                source, 0, 4, "goal", "Goal:\n", "structure",
+            )),
+        };
+        let delivery_calls = Arc::new(AtomicUsize::new(0));
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let mut delivery = RecordingDelivery {
+            calls: Arc::clone(&delivery_calls),
+            rendered: Arc::clone(&delivered),
+            initiated_ms: None,
+        };
+
+        let completion = run_timed_format_attempt(&cloud, &clock, &mut delivery).await;
+
+        assert_eq!(remaining_ms.load(Ordering::SeqCst), 4_750);
+        assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            delivered.lock().expect("delivery").as_slice(),
+            ["Goal:\nShip the rust parser."]
+        );
+        assert_eq!(completion.rendered, "Goal:\nShip the rust parser.");
+        assert_eq!(
+            completion.cloud_error,
+            Some(DprCloudErrorClass::DeadlineExceeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn formatting_response_arriving_after_five_second_gate_is_discarded() {
+        let source = "goal ship the rust parser";
+        let clock = ControlledClock::new(0);
+        let cloud = CountingFormatCloud {
+            calls: Arc::new(AtomicUsize::new(0)),
+            remaining_ms: Arc::new(AtomicU64::new(0)),
+            clock: clock.clone(),
+            completes_at_ms: 5_001,
+            honor_budget: false,
+            outcome: CannedFormatCloudOutcome::Success(format_edit_candidate(
+                source, 0, 4, "goal", "Goal:\n", "structure",
+            )),
+        };
+        let delivery_calls = Arc::new(AtomicUsize::new(0));
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let mut delivery = RecordingDelivery {
+            calls: Arc::clone(&delivery_calls),
+            rendered: Arc::clone(&delivered),
+            initiated_ms: None,
+        };
+
+        let completion = run_timed_format_attempt(&cloud, &clock, &mut delivery).await;
+
+        assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            delivered.lock().expect("delivery").as_slice(),
+            ["Goal:\nShip the rust parser."]
+        );
+        assert_eq!(completion.rendered, "Goal:\nShip the rust parser.");
+        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(
+            completion.cloud_error,
+            Some(DprCloudErrorClass::DeadlineExceeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn formatting_success_after_legacy_deadline_before_five_second_gate_is_accepted() {
+        let source = "pls ship the rust parser";
+        let clock = ControlledClock::new(0);
+        let cloud_calls = Arc::new(AtomicUsize::new(0));
+        let cloud = CountingFormatCloud {
+            calls: Arc::clone(&cloud_calls),
+            remaining_ms: Arc::new(AtomicU64::new(0)),
+            clock: clock.clone(),
+            completes_at_ms: 2_000,
+            honor_budget: true,
+            outcome: CannedFormatCloudOutcome::Success(format_edit_candidate(
+                source, 0, 3, "pls", "Please", "bounded_wording",
+            )),
+        };
+        let delivery_calls = Arc::new(AtomicUsize::new(0));
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let mut delivery = RecordingDelivery {
+            calls: Arc::clone(&delivery_calls),
+            rendered: Arc::clone(&delivered),
+            initiated_ms: None,
+        };
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".to_owned(),
+        };
+        let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
+        let baseline = organize_local_baseline(
+            source,
+            &LocalBaselineOptions {
+                policy: RenderingPolicy::Structured,
+                route: voisu_core::RenderingRoute::LocalWithOptionalCloud,
+                timing: None,
+            },
+        );
+
+        let completion = dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &selection,
+                provider_state: ProviderState::SemanticDisagreement,
+                policy: RenderingPolicy::Structured,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready {
+                    boundary: &cloud,
+                    credential: &credential,
+                },
+                clock: &clock,
+                small_edit_contract: true,
+            },
+            &mut delivery,
+        )
+        .await;
+
+        assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(completion.rendered, "Please ship the rust parser");
+        assert_eq!(
+            delivered.lock().expect("delivery").as_slice(),
+            ["Please ship the rust parser"]
+        );
+        assert_ne!(completion.rendered, baseline.rendered());
+        assert_eq!(completion.compose_decision, CompositionDecision::Accept);
+        assert!(completion.cloud_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn formatting_rate_limit_delivers_baseline_once() {
+        let clock = ControlledClock::new(0);
+        let cloud = CountingFormatCloud {
+            calls: Arc::new(AtomicUsize::new(0)),
+            remaining_ms: Arc::new(AtomicU64::new(0)),
+            clock: clock.clone(),
+            completes_at_ms: 300,
+            honor_budget: true,
+            outcome: CannedFormatCloudOutcome::Failure(DprCloudErrorClass::RateLimited),
+        };
+        let delivery_calls = Arc::new(AtomicUsize::new(0));
+        let mut delivery = RecordingDelivery {
+            calls: Arc::clone(&delivery_calls),
+            rendered: Arc::new(Mutex::new(Vec::new())),
+            initiated_ms: None,
+        };
+
+        let completion = run_timed_format_attempt(&cloud, &clock, &mut delivery).await;
+
+        assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(completion.rendered, "Goal:\nShip the rust parser.");
+        assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::RateLimited));
+    }
+
+    #[tokio::test]
     async fn invalid_small_edits_fall_back_to_local_baseline() {
         let source = "goal ship the rust parser";
         let sources = [ComposeSource {
@@ -1828,10 +2298,12 @@ mod tests {
         let cloud = FormatEditCloud {
             calls: Arc::new(AtomicUsize::new(0)),
             saw_small_edit_contract: Arc::new(Mutex::new(None)),
+            remaining_ms: Arc::new(AtomicU64::new(0)),
             candidate: stale,
         };
+        let delivery_calls = Arc::new(AtomicUsize::new(0));
         let mut delivery = RecordingDelivery {
-            calls: Arc::new(AtomicUsize::new(0)),
+            calls: Arc::clone(&delivery_calls),
             rendered: Arc::new(Mutex::new(Vec::new())),
             initiated_ms: None,
         };
@@ -1869,6 +2341,7 @@ mod tests {
         .await;
 
         assert_eq!(completion.rendered, baseline.rendered());
+        assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
         assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
         assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::CandidateSchema));
         assert_eq!(completion.delivery_flags, DeliveryFlags::dpr_default());
@@ -1891,10 +2364,12 @@ mod tests {
         let cloud = FormatEditCloud {
             calls: Arc::new(AtomicUsize::new(0)),
             saw_small_edit_contract: Arc::new(Mutex::new(None)),
+            remaining_ms: Arc::new(AtomicU64::new(0)),
             candidate: format_edit_candidate(source, 0, 5, "hello", "Hello", "casing"),
         };
+        let delivery_calls = Arc::new(AtomicUsize::new(0));
         let mut delivery = RecordingDelivery {
-            calls: Arc::new(AtomicUsize::new(0)),
+            calls: Arc::clone(&delivery_calls),
             rendered: Arc::new(Mutex::new(Vec::new())),
             initiated_ms: None,
         };
@@ -1925,6 +2400,7 @@ mod tests {
         .await;
 
         assert_eq!(completion.rendered, baseline.rendered());
+        assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
         assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
         assert_eq!(
             *cloud.saw_small_edit_contract.lock().expect("flag"),
@@ -1949,6 +2425,7 @@ mod tests {
         let cloud = FormatEditCloud {
             calls: Arc::new(AtomicUsize::new(0)),
             saw_small_edit_contract: Arc::new(Mutex::new(None)),
+            remaining_ms: Arc::new(AtomicU64::new(0)),
             candidate: format_edit_candidate(source, 0, 3, "pls", "Please", "bounded_wording"),
         };
         let mut delivery = RecordingDelivery {
@@ -2004,6 +2481,7 @@ mod tests {
         let cloud = FormatEditCloud {
             calls: Arc::new(AtomicUsize::new(0)),
             saw_small_edit_contract: Arc::new(Mutex::new(None)),
+            remaining_ms: Arc::new(AtomicU64::new(0)),
             candidate: format_edit_candidate(
                 source,
                 url_start,
@@ -2013,8 +2491,9 @@ mod tests {
                 "bounded_wording",
             ),
         };
+        let delivery_calls = Arc::new(AtomicUsize::new(0));
         let mut delivery = RecordingDelivery {
-            calls: Arc::new(AtomicUsize::new(0)),
+            calls: Arc::clone(&delivery_calls),
             rendered: Arc::new(Mutex::new(Vec::new())),
             initiated_ms: None,
         };
@@ -2052,6 +2531,7 @@ mod tests {
         .await;
 
         assert_eq!(completion.rendered, baseline.rendered());
+        assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
         assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
         assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::CandidateSchema));
     }
