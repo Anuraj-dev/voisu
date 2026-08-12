@@ -235,7 +235,7 @@ pub fn apply_format_edits_with(
         return FormatEditOutcome::rejected(base, error);
     }
     let rendered = compose_edits(base, &candidate.edits);
-    if let Err(error) = validate_format_render(base, &rendered, &candidate.edits, safety) {
+    if let Err(error) = validate_format_render(base, &rendered, safety) {
         return FormatEditOutcome::rejected(base, error);
     }
     FormatEditOutcome::accepted(rendered)
@@ -469,7 +469,6 @@ const SUMMARY_SOURCE_WORD_FLOOR: usize = 12;
 fn validate_format_render(
     base: &str,
     rendered: &str,
-    edits: &[FormatEdit],
     safety: &FormatEditSafety<'_>,
 ) -> Result<(), FormatEditErrorCode> {
     if is_empty_or_large_summary(base, rendered) {
@@ -481,7 +480,7 @@ fn validate_format_render(
     if introduces_heading_without_cue(base, rendered, safety.policy) {
         return Err(FormatEditErrorCode::HeadingWithoutCue);
     }
-    if mutates_protected_fact(base, rendered, edits, safety.protected_tokens) {
+    if mutates_protected_fact(base, rendered, safety.protected_tokens) {
         return Err(FormatEditErrorCode::Protected);
     }
     Ok(())
@@ -626,19 +625,10 @@ fn is_title_case(value: &str) -> bool {
     saw_cased
 }
 
-fn mutates_protected_fact(
-    base: &str,
-    rendered: &str,
-    edits: &[FormatEdit],
-    extra: &[&str],
-) -> bool {
+fn mutates_protected_fact(base: &str, rendered: &str, extra: &[&str]) -> bool {
     host_protected_facts(base, extra)
         .into_iter()
-        .any(|fact| {
-            !fact.is_empty()
-                && !protected_fact_survives(rendered, &fact)
-                && !fact_only_inside_removal(base, &fact, edits)
-        })
+        .any(|fact| !fact.is_empty() && !protected_fact_survives(rendered, &fact))
 }
 
 fn protected_fact_survives(rendered: &str, fact: &str) -> bool {
@@ -650,27 +640,6 @@ fn protected_fact_survives(rendered: &str, fact: &str) -> bool {
         || WEEKDAYS.contains(&lower.as_str())
         || MONTHS.contains(&lower.as_str());
     case_fold && rendered.to_ascii_lowercase().contains(&lower)
-}
-
-fn fact_only_inside_removal(base: &str, fact: &str, edits: &[FormatEdit]) -> bool {
-    let mut search = 0;
-    let mut saw = false;
-    while let Some(relative) = base[search..].find(fact) {
-        saw = true;
-        let start = search + relative;
-        let end = start + fact.len();
-        if !edits.iter().any(|edit| {
-            matches!(
-                edit.kind,
-                FormatEditKind::FillerRemoval | FormatEditKind::ClearBacktrackRemoval
-            ) && edit.start_utf8 <= start
-                && end <= edit.end_utf8
-        }) {
-            return false;
-        }
-        search = end.max(start + 1);
-    }
-    saw
 }
 
 fn host_protected_facts(base: &str, extra: &[&str]) -> Vec<String> {
@@ -1045,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn punctuation_layout_and_backtrack_kinds_compose_locally() {
+    fn punctuation_and_layout_kinds_compose_locally() {
         let punct = apply_format_edit_candidate_json(
             "ship it",
             &candidate_json("ship it", json!([edit(7, 7, "", ".", "punctuation")])),
@@ -1060,15 +1029,72 @@ mod tests {
             ),
         );
         assert_eq!(layout.rendered, "one\ntwo");
+    }
 
-        let backtrack = apply_format_edit_candidate_json(
-            "send the red no the blue file",
+    #[test]
+    fn filler_removal_cannot_delete_negation() {
+        let base = "do not deploy";
+        let outcome = apply_format_edit_candidate_json(
+            base,
+            &candidate_json(base, json!([edit(3, 6, "not", "", "filler_removal")])),
+        );
+        assert_eq!(outcome.error, Some(FormatEditErrorCode::Protected));
+        assert_eq!(outcome.rendered, base);
+    }
+
+    #[test]
+    fn filler_removal_cannot_delete_url_path_or_name() {
+        let cases = [
+            ("open https://example.test/a now", "https://example.test/a"),
+            (
+                "edit crates/voisu-core/src/lib.rs today",
+                "crates/voisu-core/src/lib.rs",
+            ),
+            ("ask Alice to review it", "Alice"),
+        ];
+        for (base, protected) in cases {
+            let start = base.find(protected).expect("protected fact in base");
+            let outcome = apply_format_edit_candidate_json(
+                base,
+                &candidate_json(
+                    base,
+                    json!([edit(
+                        start,
+                        start + protected.len(),
+                        protected,
+                        "",
+                        "filler_removal"
+                    )]),
+                ),
+            );
+            assert_eq!(
+                outcome.error,
+                Some(FormatEditErrorCode::Protected),
+                "expected protected reject for {protected:?}: {outcome:?}"
+            );
+            assert_eq!(outcome.rendered, base);
+        }
+    }
+
+    #[test]
+    fn kind_labeled_backtrack_cannot_delete_negation() {
+        let base = "send X no wait Y";
+        let start = base.find("X no wait ").expect("backtrack in base");
+        let outcome = apply_format_edit_candidate_json(
+            base,
             &candidate_json(
-                "send the red no the blue file",
-                json!([edit(9, 20, "red no the ", "", "clear_backtrack_removal")]),
+                base,
+                json!([edit(
+                    start,
+                    start + "X no wait ".len(),
+                    "X no wait ",
+                    "",
+                    "clear_backtrack_removal"
+                )]),
             ),
         );
-        assert_eq!(backtrack.rendered, "send the blue file");
+        assert_eq!(outcome.error, Some(FormatEditErrorCode::Protected));
+        assert_eq!(outcome.rendered, base);
     }
 
     #[test]
