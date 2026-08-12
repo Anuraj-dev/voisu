@@ -2225,6 +2225,7 @@ async fn process_recording(
                     protected_tokens: &protected_token_refs,
                     cloud,
                     clock: &clock,
+                    small_edit_contract: voisu_app::config::qwen_format_enabled(),
                 },
                 delivery.as_mut(),
             )

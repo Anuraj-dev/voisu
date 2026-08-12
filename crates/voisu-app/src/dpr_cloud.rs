@@ -1,9 +1,9 @@
 //! Deadline-bounded structured cloud client for Developer Prompt Rendering.
 //!
 //! This module owns DPR-T4's single Groq HTTP attempt and provider envelope.
-//! It never produces a Final Transcript: successful bytes are parsed into the
-//! existing [`StructuredCandidate`], which still has to pass
-//! `voisu_core::compose_structured_candidate` before Delivery.
+//! The default job still parses the #139 [`StructuredCandidate`]. The flagged
+//! formatting job requests the small-edit contract instead and never treats a
+//! free-form model string as Delivery text.
 
 use std::fmt;
 use std::sync::Once;
@@ -11,11 +11,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use voisu_core::{
-    parse_structured_candidate_json, ComposeSource, Credential, Provider, RenderingPolicy,
-    SecretStore, SourceSelection, StructuredCandidate, CLOSED_CONVERSIONS,
-    CLOSED_SOURCE_SELECTION_REASONS, CLOSED_STRUCTURED_LABELS, MAX_COMPOSE_CONVERSIONS,
-    MAX_COMPOSE_DERIVATION_SPANS, MAX_COMPOSE_FIELD_UTF8_BYTES, MAX_COMPOSE_LABELS,
-    MAX_COMPOSE_REMOVALS,
+    parse_format_edit_candidate_json, parse_structured_candidate_json, ComposeSource, Credential,
+    FormatEditCandidate, Provider, RenderingPolicy, SecretStore, SourceSelection,
+    StructuredCandidate, CLOSED_CONVERSIONS, CLOSED_FORMAT_EDIT_KINDS,
+    CLOSED_SOURCE_SELECTION_REASONS, CLOSED_STRUCTURED_LABELS, FORMAT_EDIT_CONTRACT_VERSION,
+    MAX_COMPOSE_CONVERSIONS, MAX_COMPOSE_DERIVATION_SPANS, MAX_COMPOSE_FIELD_UTF8_BYTES,
+    MAX_COMPOSE_LABELS, MAX_COMPOSE_REMOVALS, MAX_FORMAT_EDITS, MAX_FORMAT_EDIT_FIELD_UTF8_BYTES,
 };
 
 /// Preferred in-budget candidate from the approved #140 matrix.
@@ -43,6 +44,10 @@ const DPR_MAX_COMPLETION_TOKENS: u32 = 4_096;
 const SYSTEM_INSTRUCTION: &str = "You organize English speech into text. Preserve wording and spoken grammar. Do not invent requirements, paraphrases, explanations, or technical assumptions. Allowed: punctuation/casing, clear filler or clear backtrack removals, closed symbol/format cue conversions, layout (natural / multi-paragraph / numbered / structured_sections), and closed labels only when Structured or clearly licensed. Never auto-send. Return structured JSON decisions only — never a free-form polished string as sole authority. Groq path: same organize-only contract. Do not run grammar correction.";
 
 const RESPONSE_INSTRUCTION: &str = "Return the smallest valid candidate under the supplied JSON schema. Derivation must be source ordered and complete: concatenating output_text reconstructs the proposal, and every non-layout span proves its source_text against the named provider. Uncertain backtrack preserves words. Uncertain layout stays natural. Use only the supplied closed labels and conversions. One call only.";
+
+const FORMAT_EDIT_SYSTEM_INSTRUCTION: &str = "You propose localized formatting edits for English speech. Preserve wording and spoken grammar. Do not invent requirements, paraphrases, explanations, or technical assumptions. Allowed kinds only: punctuation, casing, whitespace_layout, filler_removal, clear_backtrack_removal, quote_conversion, structure, bounded_wording. Never return a polished transcript or free-form Delivery string. Reconciliation is a different job — do not select sources or emit derivation spans. Return the small-edit JSON contract only.";
+
+const FORMAT_EDIT_RESPONSE_INSTRUCTION: &str = "Return the smallest valid edit list under the supplied JSON schema. Each edit must name a UTF-8 range on the supplied base, the exact before text, the replacement after text, and a closed kind. Empty edits means leave the base unchanged. One call only. Never emit a rendered or output_text field.";
 
 /// Closed diagnostic classification. Variants intentionally carry no provider
 /// response body, request content, transcript, or credential.
@@ -86,10 +91,12 @@ impl fmt::Display for DprCloudErrorClass {
     }
 }
 
-/// One T4 attempt result. A failed attempt always has `candidate: None`; T5
-/// maps that absence to the local baseline through the compose gate.
+/// One T4 attempt result. A failed attempt always has both payloads `None`; T5
+/// maps that absence to the local baseline. The small-edit payload is parsed
+/// JSON only — the host still has to apply it before Delivery.
 pub struct DprCloudAttempt {
     candidate: Option<StructuredCandidate>,
+    format_edits: Option<FormatEditCandidate>,
     error: Option<DprCloudErrorClass>,
 }
 
@@ -98,6 +105,16 @@ impl DprCloudAttempt {
     pub fn success(candidate: StructuredCandidate) -> Self {
         Self {
             candidate: Some(candidate),
+            format_edits: None,
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn format_edits(candidate: FormatEditCandidate) -> Self {
+        Self {
+            candidate: None,
+            format_edits: Some(candidate),
             error: None,
         }
     }
@@ -106,6 +123,7 @@ impl DprCloudAttempt {
     pub const fn failure(error: DprCloudErrorClass) -> Self {
         Self {
             candidate: None,
+            format_edits: None,
             error: Some(error),
         }
     }
@@ -116,13 +134,24 @@ impl DprCloudAttempt {
     }
 
     #[must_use]
+    pub const fn format_edits_candidate(&self) -> Option<&FormatEditCandidate> {
+        self.format_edits.as_ref()
+    }
+
+    #[must_use]
     pub const fn error(&self) -> Option<DprCloudErrorClass> {
         self.error
     }
 
     #[must_use]
-    pub fn into_parts(self) -> (Option<StructuredCandidate>, Option<DprCloudErrorClass>) {
-        (self.candidate, self.error)
+    pub fn into_parts(
+        self,
+    ) -> (
+        Option<StructuredCandidate>,
+        Option<FormatEditCandidate>,
+        Option<DprCloudErrorClass>,
+    ) {
+        (self.candidate, self.format_edits, self.error)
     }
 }
 
@@ -132,9 +161,13 @@ impl DprCloudAttempt {
 pub struct DprCloudRequest<'a> {
     pub sources: &'a [ComposeSource],
     pub source_selection: &'a SourceSelection,
+    pub selected_source: &'a str,
     pub base_fingerprint: &'a str,
     pub policy: RenderingPolicy,
     pub protected_tokens: &'a [&'a str],
+    /// When true, request/parse the small-edit formatting contract. When false,
+    /// keep the existing #139 derivation job. Off by default.
+    pub small_edit_contract: bool,
 }
 
 /// Process-owned DPR HTTP capability. Clone is cheap (`reqwest::Client` is
@@ -224,13 +257,16 @@ impl DprCloudClient {
 
             classify_status(response.status().as_u16())?;
             let envelope = read_bounded(response, self.max_body_bytes).await?;
-            extract_candidate(&envelope)
+            extract_payload(&envelope, request.small_edit_contract)
         };
 
         match tokio::time::timeout(remaining, operation).await {
             Err(_) => DprCloudAttempt::failure(DprCloudErrorClass::DeadlineExceeded),
             Ok(Err(error)) => DprCloudAttempt::failure(error),
-            Ok(Ok(candidate)) => DprCloudAttempt::success(candidate),
+            Ok(Ok(payload)) => match payload {
+                ParsedPayload::Derivation(candidate) => DprCloudAttempt::success(candidate),
+                ParsedPayload::FormatEdits(candidate) => DprCloudAttempt::format_edits(candidate),
+            },
         }
     }
 }
@@ -238,6 +274,7 @@ impl DprCloudClient {
 fn request_is_bounded(request: &DprCloudRequest<'_>) -> bool {
     if request.sources.is_empty()
         || request.sources.len() > MAX_DPR_SOURCES
+        || request.selected_source.len() > MAX_DPR_SOURCE_UTF8_BYTES
         || request.base_fingerprint.len() != "sha256:".len() + 64
         || !request.base_fingerprint.starts_with("sha256:")
         || !request.base_fingerprint["sha256:".len()..]
@@ -273,6 +310,9 @@ pub fn load_groq_credential(
 }
 
 fn build_groq_request(request: &DprCloudRequest<'_>) -> Value {
+    if request.small_edit_contract {
+        return build_format_edit_request(request);
+    }
     let sources: Vec<Value> = request
         .sources
         .iter()
@@ -316,6 +356,37 @@ fn build_groq_request(request: &DprCloudRequest<'_>) -> Value {
         },
         "messages": [
             {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {"role": "user", "content": payload.to_string()},
+        ],
+    })
+}
+
+fn build_format_edit_request(request: &DprCloudRequest<'_>) -> Value {
+    let payload = json!({
+        "version": FORMAT_EDIT_CONTRACT_VERSION,
+        "base_fingerprint": request.base_fingerprint,
+        "base_text": request.selected_source,
+        "policy": request.policy.as_str(),
+        "closed_kinds": CLOSED_FORMAT_EDIT_KINDS,
+        "response_instruction": FORMAT_EDIT_RESPONSE_INSTRUCTION,
+    });
+
+    json!({
+        "model": DPR_GROQ_MODEL,
+        "reasoning_effort": DPR_GROQ_REASONING_EFFORT,
+        "temperature": 0,
+        "stream": false,
+        "max_completion_tokens": DPR_MAX_COMPLETION_TOKENS,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "voisu_dpr_format_edits",
+                "strict": true,
+                "schema": format_edit_schema(),
+            }
+        },
+        "messages": [
+            {"role": "system", "content": FORMAT_EDIT_SYSTEM_INSTRUCTION},
             {"role": "user", "content": payload.to_string()},
         ],
     })
@@ -409,6 +480,34 @@ fn candidate_schema() -> Value {
     })
 }
 
+fn format_edit_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["version", "base_fingerprint", "edits"],
+        "properties": {
+            "version": {"type": "string", "const": FORMAT_EDIT_CONTRACT_VERSION},
+            "base_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "edits": {
+                "type": "array",
+                "maxItems": MAX_FORMAT_EDITS,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["start_utf8", "end_utf8", "before", "after", "kind"],
+                    "properties": {
+                        "start_utf8": {"type": "integer", "minimum": 0},
+                        "end_utf8": {"type": "integer", "minimum": 0},
+                        "before": {"type": "string", "maxLength": MAX_FORMAT_EDIT_FIELD_UTF8_BYTES},
+                        "after": {"type": "string", "maxLength": MAX_FORMAT_EDIT_FIELD_UTF8_BYTES},
+                        "kind": {"type": "string", "enum": CLOSED_FORMAT_EDIT_KINDS}
+                    }
+                }
+            }
+        }
+    })
+}
+
 fn classify_status(status: u16) -> Result<(), DprCloudErrorClass> {
     match status {
         200..=299 => Ok(()),
@@ -445,7 +544,28 @@ async fn read_bounded(
     Ok(body)
 }
 
-fn extract_candidate(envelope: &[u8]) -> Result<StructuredCandidate, DprCloudErrorClass> {
+enum ParsedPayload {
+    Derivation(StructuredCandidate),
+    FormatEdits(FormatEditCandidate),
+}
+
+fn extract_payload(
+    envelope: &[u8],
+    small_edit_contract: bool,
+) -> Result<ParsedPayload, DprCloudErrorClass> {
+    let content = extract_message_content(envelope)?;
+    if small_edit_contract {
+        parse_format_edit_candidate_json(content.as_bytes())
+            .map(ParsedPayload::FormatEdits)
+            .map_err(|_| DprCloudErrorClass::CandidateSchema)
+    } else {
+        parse_structured_candidate_json(content.as_bytes())
+            .map(ParsedPayload::Derivation)
+            .ok_or(DprCloudErrorClass::CandidateSchema)
+    }
+}
+
+fn extract_message_content(envelope: &[u8]) -> Result<String, DprCloudErrorClass> {
     let root: Value = serde_json::from_slice(envelope)
         .map_err(|_| DprCloudErrorClass::ProviderEnvelope)?;
     let choices = root
@@ -460,13 +580,12 @@ fn extract_candidate(envelope: &[u8]) -> Result<StructuredCandidate, DprCloudErr
     if message.get("refusal").is_some_and(|value| !value.is_null()) {
         return Err(DprCloudErrorClass::ProviderEnvelope);
     }
-    let content = message
+    message
         .get("content")
         .and_then(Value::as_str)
         .filter(|content| !content.trim().is_empty())
-        .ok_or(DprCloudErrorClass::ProviderEnvelope)?;
-    parse_structured_candidate_json(content.as_bytes())
-        .ok_or(DprCloudErrorClass::CandidateSchema)
+        .map(str::to_owned)
+        .ok_or(DprCloudErrorClass::ProviderEnvelope)
 }
 
 fn ensure_rustls_ring_provider() {
@@ -554,9 +673,11 @@ mod tests {
         DprCloudRequest {
             sources,
             source_selection: selection,
+            selected_source: "hello",
             base_fingerprint: HELLO_FINGERPRINT,
             policy: RenderingPolicy::Adaptive,
             protected_tokens: protected,
+            small_edit_contract: false,
         }
     }
 
@@ -912,5 +1033,124 @@ mod tests {
         assert!(DprCloudClient::with_endpoint("http://127.0.0.1:1234/test").is_ok());
         assert!(DprCloudClient::with_endpoint("http://example.com/test").is_err());
         assert!(DprCloudClient::with_endpoint("file:///tmp/socket").is_err());
+    }
+
+    fn valid_format_edits() -> Value {
+        json!({
+            "version": "1",
+            "base_fingerprint": HELLO_FINGERPRINT,
+            "edits": [{
+                "start_utf8": 0,
+                "end_utf8": 1,
+                "before": "h",
+                "after": "H",
+                "kind": "casing"
+            }]
+        })
+    }
+
+    fn format_request_fixture<'a>(
+        sources: &'a [ComposeSource],
+        selection: &'a SourceSelection,
+    ) -> DprCloudRequest<'a> {
+        DprCloudRequest {
+            sources,
+            source_selection: selection,
+            selected_source: "hello",
+            base_fingerprint: HELLO_FINGERPRINT,
+            policy: RenderingPolicy::Adaptive,
+            protected_tokens: &[],
+            small_edit_contract: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn small_edit_contract_requests_format_schema_not_derivation() {
+        let (endpoint, request_rx, count) = canned_server(
+            200,
+            provider_response(valid_format_edits()),
+            Duration::ZERO,
+        )
+        .await;
+        let client = DprCloudClient::with_endpoint(endpoint).expect("client");
+        let credential = Credential::new("secret".to_owned()).expect("credential");
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: "hello".to_owned(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".to_owned(),
+        };
+        let attempt = client
+            .attempt_groq(
+                &credential,
+                &format_request_fixture(&sources, &selection),
+                Duration::from_secs(1),
+            )
+            .await;
+
+        let edits = attempt.format_edits_candidate().expect("format edits");
+        assert!(attempt.candidate().is_none());
+        assert_eq!(attempt.error(), None);
+        assert_eq!(edits.version, "1");
+        assert_eq!(edits.edits.len(), 1);
+        assert_eq!(edits.edits[0].kind.as_str(), "casing");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        let body = body_from_request(&request_rx.await.expect("captured request"));
+        assert_eq!(
+            body["response_format"]["json_schema"]["name"],
+            "voisu_dpr_format_edits"
+        );
+        let schema = &body["response_format"]["json_schema"]["schema"];
+        assert!(schema["properties"].get("derivation").is_none());
+        assert!(schema["properties"].get("reconciliation").is_none());
+        assert_eq!(
+            schema["properties"]["edits"]["items"]["properties"]["kind"]["enum"],
+            json!(CLOSED_FORMAT_EDIT_KINDS)
+        );
+        let user = body["messages"][1]["content"].as_str().expect("user");
+        assert!(user.contains("closed_kinds"));
+        assert!(!user.contains("closed_conversions"));
+        assert!(!user.contains("host_selection"));
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .expect("system")
+            .contains("Reconciliation is a different job"));
+    }
+
+    #[tokio::test]
+    async fn small_edit_contract_rejects_derivation_and_free_form_payloads() {
+        for body in [
+            provider_response(valid_candidate()),
+            json!({"choices": [{"message": {"content": "Goal: ship it"}}]}).to_string(),
+        ] {
+            let (endpoint, _request_rx, _) = canned_server(200, body, Duration::ZERO).await;
+            let client = DprCloudClient::with_endpoint(endpoint).expect("client");
+            let credential = Credential::new("secret".to_owned()).expect("credential");
+            let sources = [ComposeSource {
+                provider: SttProvider::ProviderA,
+                available: true,
+                text: "hello".to_owned(),
+                primary: true,
+            }];
+            let selection = SourceSelection {
+                selected_provider: SttProvider::ProviderA,
+                reason: "only_available".to_owned(),
+            };
+            let attempt = client
+                .attempt_groq(
+                    &credential,
+                    &format_request_fixture(&sources, &selection),
+                    Duration::from_secs(1),
+                )
+                .await;
+            assert!(attempt.candidate().is_none());
+            assert!(attempt.format_edits_candidate().is_none());
+            assert_eq!(attempt.error(), Some(DprCloudErrorClass::CandidateSchema));
+        }
     }
 }

@@ -44,6 +44,11 @@ const RENDERING_POLICY_KEY: &str = "rendering_policy";
 /// missing, empty, or malformed values keep Smart Writing in production.
 pub const ENABLE_DPR_ENV: &str = "VOISU_ENABLE_DPR";
 
+/// Explicit rollout gate for the small-edit formatting job. Off by default so
+/// Tickets 1–2 can ship without enabling Qwen formatting. Only `1` or `true`
+/// switch the formatting cloud contract off #139 derivation.
+pub const ENABLE_QWEN_FORMAT_ENV: &str = "VOISU_ENABLE_QWEN_FORMAT";
+
 /// How Voisu delivers a final Transcript after preserving it on the clipboard.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DeliveryMode {
@@ -208,6 +213,15 @@ pub fn rendering_policy() -> RenderingPolicy {
 /// policy can be configured while the rollout gate remains off.
 pub fn dpr_enabled() -> bool {
     std::env::var(ENABLE_DPR_ENV)
+        .ok()
+        .is_some_and(|value| parse_dpr_enablement(&value))
+}
+
+/// Whether the small-edit formatting contract is active. Independent of
+/// [`dpr_enabled`]: DPR can run on the existing #139 derivation path while
+/// this formatter remains off.
+pub fn qwen_format_enabled() -> bool {
+    std::env::var(ENABLE_QWEN_FORMAT_ENV)
         .ok()
         .is_some_and(|value| parse_dpr_enablement(&value))
 }
@@ -1047,6 +1061,20 @@ other_key = 5
     fn dpr_rollout_gate_defaults_off_and_requires_an_explicit_true_value() {
         for value in ["", "0", "false", "yes", "adaptive", "garbage"] {
             assert!(!parse_dpr_enablement(value), "unexpected enablement: {value}");
+        }
+        for value in ["1", "true", " TRUE "] {
+            assert!(parse_dpr_enablement(value), "expected enablement: {value}");
+        }
+    }
+
+    #[test]
+    fn qwen_format_gate_defaults_off_and_shares_the_explicit_true_parser() {
+        assert_eq!(ENABLE_QWEN_FORMAT_ENV, "VOISU_ENABLE_QWEN_FORMAT");
+        for value in ["", "0", "false", "yes", "qwen", "garbage"] {
+            assert!(
+                !parse_dpr_enablement(value),
+                "qwen format must stay off for {value:?}"
+            );
         }
         for value in ["1", "true", " TRUE "] {
             assert!(parse_dpr_enablement(value), "expected enablement: {value}");

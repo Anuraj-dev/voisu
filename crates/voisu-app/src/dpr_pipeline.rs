@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use voisu_core::{
-    compose_structured_candidate, organize_local_baseline, route_intent,
+    apply_format_edits, compose_structured_candidate, organize_local_baseline, route_intent,
     sanitize_source_transcripts, text_sha256_fingerprint, CloudOutcome, CloudRequest, ComposeInput,
     ComposeSource, CompositionDecision, Credential, DeliveryAdapter, DeliveryFlags, DeliveryOutcome,
     DprDiagnostic, IntentObservation, LocalBaselineOptions, ProcessHint, ProviderState,
@@ -94,6 +94,9 @@ pub struct DprTransformInput<'a> {
     pub protected_tokens: &'a [&'a str],
     pub cloud: DprCloudCapability<'a>,
     pub clock: &'a dyn DprPipelineClock,
+    /// Request the small-edit formatting contract instead of #139 derivation.
+    /// Production leaves this false until the Qwen formatter flag is on.
+    pub small_edit_contract: bool,
 }
 
 pub struct DprTransformCompletion {
@@ -475,6 +478,7 @@ pub async fn dpr_transform_and_deliver(
     let mut cloud_attempted = false;
     let mut cloud_error = None;
     let mut candidate = None;
+    let mut format_rendered = None;
     let cloud_outcome = if !input.english_eligible
         || routing.cloud_request == CloudRequest::NotAllowed
     {
@@ -506,16 +510,20 @@ pub async fn dpr_transform_and_deliver(
                             DprCloudRequest {
                                 sources: input.sources,
                                 source_selection: input.source_selection,
+                                selected_source: input.selected_source,
                                 base_fingerprint: &base_fingerprint,
                                 policy: input.policy,
                                 protected_tokens: input.protected_tokens,
+                                small_edit_contract: input.small_edit_contract,
                             },
                             remaining,
                         )
                         .await;
-                    let (attempt_candidate, attempt_error) = attempt.into_parts();
+                    let (attempt_candidate, attempt_format_edits, attempt_error) =
+                        attempt.into_parts();
                     let attempt_completed_at = input.clock.elapsed();
                     if attempt_candidate.is_some()
+                        || attempt_format_edits.is_some()
                         || attempt_error.is_some_and(dpr_error_has_response)
                     {
                         diagnostic.cloud_response_received(attempt_completed_at);
@@ -523,6 +531,27 @@ pub async fn dpr_transform_and_deliver(
                     if attempt_completed_at >= DPR_DELIVERY_DEADLINE {
                         cloud_error = Some(DprCloudErrorClass::DeadlineExceeded);
                         CloudOutcome::DeadlineExceeded
+                    } else if input.small_edit_contract {
+                        match attempt_format_edits {
+                            Some(edits) => {
+                                let applied = apply_format_edits(input.selected_source, &edits);
+                                if applied.accepted && !edits.edits.is_empty() {
+                                    format_rendered = Some(applied.rendered);
+                                    CloudOutcome::Succeeded
+                                } else if applied.accepted {
+                                    CloudOutcome::Skipped
+                                } else {
+                                    cloud_error = Some(DprCloudErrorClass::CandidateSchema);
+                                    CloudOutcome::SchemaFailure
+                                }
+                            }
+                            None => {
+                                let error =
+                                    attempt_error.unwrap_or(DprCloudErrorClass::CandidateSchema);
+                                cloud_error = Some(error);
+                                cloud_outcome_for_error(error)
+                            }
+                        }
                     } else if let Some(accepted_candidate) = attempt_candidate {
                         candidate = Some(accepted_candidate);
                         CloudOutcome::Succeeded
@@ -535,37 +564,75 @@ pub async fn dpr_transform_and_deliver(
             }
         }
     };
-    let mut composed = compose_structured_candidate(&ComposeInput {
-        local_baseline: &baseline,
-        base_fingerprint: &base_fingerprint,
-        sources: input.sources,
-        source_selection: input.source_selection,
-        protected_tokens: input.protected_tokens,
-        policy: input.policy,
-        cloud_outcome,
-        candidate: candidate.as_ref(),
-    });
     let compose_finished_at = input.clock.elapsed();
-    if cloud_outcome == CloudOutcome::Succeeded && compose_finished_at >= DPR_DELIVERY_DEADLINE {
-        cloud_error = Some(DprCloudErrorClass::DeadlineExceeded);
-        composed = compose_structured_candidate(&ComposeInput {
-            local_baseline: &baseline,
-            base_fingerprint: &base_fingerprint,
-            sources: input.sources,
-            source_selection: input.source_selection,
-            protected_tokens: input.protected_tokens,
-            policy: input.policy,
-            cloud_outcome: CloudOutcome::DeadlineExceeded,
-            candidate: None,
-        });
-    }
-    let rendered = composed.rendered().to_owned();
-    let delivery_flags = composed.delivery();
-    let compose_decision = composed.decision();
+    let (rendered, delivery_flags, compose_decision, fallback_trigger, error_codes) =
+        if let Some(host_rendered) = format_rendered {
+            if compose_finished_at >= DPR_DELIVERY_DEADLINE {
+                cloud_error = Some(DprCloudErrorClass::DeadlineExceeded);
+                let composed = compose_structured_candidate(&ComposeInput {
+                    local_baseline: &baseline,
+                    base_fingerprint: &base_fingerprint,
+                    sources: input.sources,
+                    source_selection: input.source_selection,
+                    protected_tokens: input.protected_tokens,
+                    policy: input.policy,
+                    cloud_outcome: CloudOutcome::DeadlineExceeded,
+                    candidate: None,
+                });
+                (
+                    composed.rendered().to_owned(),
+                    composed.delivery(),
+                    composed.decision(),
+                    composed.fallback_trigger(),
+                    composed.error_codes().to_vec(),
+                )
+            } else {
+                (
+                    host_rendered,
+                    DeliveryFlags::dpr_default(),
+                    CompositionDecision::Accept,
+                    None,
+                    Vec::new(),
+                )
+            }
+        } else {
+            let mut composed = compose_structured_candidate(&ComposeInput {
+                local_baseline: &baseline,
+                base_fingerprint: &base_fingerprint,
+                sources: input.sources,
+                source_selection: input.source_selection,
+                protected_tokens: input.protected_tokens,
+                policy: input.policy,
+                cloud_outcome,
+                candidate: candidate.as_ref(),
+            });
+            if cloud_outcome == CloudOutcome::Succeeded
+                && compose_finished_at >= DPR_DELIVERY_DEADLINE
+            {
+                cloud_error = Some(DprCloudErrorClass::DeadlineExceeded);
+                composed = compose_structured_candidate(&ComposeInput {
+                    local_baseline: &baseline,
+                    base_fingerprint: &base_fingerprint,
+                    sources: input.sources,
+                    source_selection: input.source_selection,
+                    protected_tokens: input.protected_tokens,
+                    policy: input.policy,
+                    cloud_outcome: CloudOutcome::DeadlineExceeded,
+                    candidate: None,
+                });
+            }
+            (
+                composed.rendered().to_owned(),
+                composed.delivery(),
+                composed.decision(),
+                composed.fallback_trigger(),
+                composed.error_codes().to_vec(),
+            )
+        };
     diagnostic.composition_completed(
         compose_decision,
-        composed.fallback_trigger(),
-        composed.error_codes(),
+        fallback_trigger,
+        &error_codes,
         compose_finished_at,
     );
     diagnostic.delivery_emitted(input.clock.elapsed(), delivery_flags);
@@ -613,8 +680,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use voisu_core::{
-        parse_structured_candidate_json, text_sha256_fingerprint, BoundaryFuture,
-        DprDiagnosticEventName, DprFeedbackKind, SttProvider, StructuredCandidate, Transcript,
+        parse_format_edit_candidate_json, parse_structured_candidate_json,
+        text_sha256_fingerprint, BoundaryFuture, DprDiagnosticEventName, DprFeedbackKind,
+        FormatEditCandidate, SttProvider, StructuredCandidate, Transcript,
     };
 
     use super::*;
@@ -981,6 +1049,7 @@ mod tests {
                     credential: &credential,
                 },
                 clock: &clock,
+                small_edit_contract: false,
             },
             &mut delivery,
         )
@@ -1073,6 +1142,7 @@ mod tests {
                     credential: &credential,
                 },
                 clock: &clock,
+                small_edit_contract: false,
             },
             &mut delivery,
         )
@@ -1162,6 +1232,7 @@ mod tests {
                     credential: &credential,
                 },
                 clock: &clock,
+                small_edit_contract: false,
             },
             &mut delivery,
         )
@@ -1256,6 +1327,7 @@ mod tests {
                     credential: &credential,
                 },
                 clock: &clock,
+                small_edit_contract: false,
             },
             &mut delivery,
         )
@@ -1344,6 +1416,7 @@ mod tests {
                     credential: &credential,
                 },
                 clock: &clock,
+                small_edit_contract: false,
             },
             &mut delivery,
         )
@@ -1417,6 +1490,7 @@ mod tests {
                     credential: &credential,
                 },
                 clock: &clock,
+                small_edit_contract: false,
             },
             &mut delivery,
         )
@@ -1507,6 +1581,7 @@ mod tests {
                         credential: &credential,
                     },
                     clock: &clock,
+                    small_edit_contract: false,
                 },
                 &mut delivery,
             )
@@ -1559,6 +1634,7 @@ mod tests {
                     credential: &credential,
                 },
                 clock: &clock,
+                small_edit_contract: false,
             },
             &mut delivery,
         )
@@ -1605,6 +1681,7 @@ mod tests {
                 protected_tokens: &[],
                 cloud: DprCloudCapability::Unavailable,
                 clock: &clock,
+                small_edit_contract: false,
             },
             &mut delivery,
         )
@@ -1619,5 +1696,232 @@ mod tests {
             Some(DprCloudErrorClass::CredentialUnavailable)
         );
         assert_eq!(completion.delivery_flags, DeliveryFlags::dpr_default());
+    }
+
+    struct FormatEditCloud {
+        calls: Arc<AtomicUsize>,
+        saw_small_edit_contract: Arc<Mutex<Option<bool>>>,
+        candidate: FormatEditCandidate,
+    }
+
+    impl DprCloudBoundary for FormatEditCloud {
+        fn attempt<'a>(
+            &'a self,
+            _credential: &'a Credential,
+            request: DprCloudRequest<'a>,
+            _remaining: Duration,
+        ) -> DprCloudFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self
+                .saw_small_edit_contract
+                .lock()
+                .expect("flag lock") = Some(request.small_edit_contract);
+            let candidate = self.candidate.clone();
+            Box::pin(async move { DprCloudAttempt::format_edits(candidate) })
+        }
+    }
+
+    fn format_edit_candidate(source: &str, start: usize, end: usize, before: &str, after: &str, kind: &str) -> FormatEditCandidate {
+        let raw = serde_json::json!({
+            "version": "1",
+            "base_fingerprint": text_sha256_fingerprint(source),
+            "edits": [{
+                "start_utf8": start,
+                "end_utf8": end,
+                "before": before,
+                "after": after,
+                "kind": kind,
+            }]
+        });
+        parse_format_edit_candidate_json(raw.to_string().as_bytes()).expect("format edits")
+    }
+
+    #[tokio::test]
+    async fn small_edit_contract_delivers_host_applied_text_not_model_prose() {
+        let source = "goal ship the rust parser";
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".to_owned(),
+        };
+        let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let saw_flag = Arc::new(Mutex::new(None));
+        let cloud = FormatEditCloud {
+            calls: Arc::clone(&calls),
+            saw_small_edit_contract: Arc::clone(&saw_flag),
+            candidate: format_edit_candidate(source, 0, 4, "goal", "Goal:\n", "structure"),
+        };
+        let delivery_calls = Arc::new(AtomicUsize::new(0));
+        let rendered = Arc::new(Mutex::new(Vec::new()));
+        let mut delivery = RecordingDelivery {
+            calls: Arc::clone(&delivery_calls),
+            rendered: Arc::clone(&rendered),
+            initiated_ms: None,
+        };
+        let clock = FixedClock(Duration::ZERO);
+
+        let completion = dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &selection,
+                provider_state: ProviderState::SemanticDisagreement,
+                policy: RenderingPolicy::Structured,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready {
+                    boundary: &cloud,
+                    credential: &credential,
+                },
+                clock: &clock,
+                small_edit_contract: true,
+            },
+            &mut delivery,
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*saw_flag.lock().expect("flag"), Some(true));
+        assert_eq!(completion.rendered, "Goal:\n ship the rust parser");
+        assert_eq!(
+            rendered.lock().expect("delivery").as_slice(),
+            ["Goal:\n ship the rust parser"]
+        );
+        assert_eq!(completion.compose_decision, CompositionDecision::Accept);
+        assert_eq!(completion.delivery_flags, DeliveryFlags::dpr_default());
+        assert!(completion.cloud_error.is_none());
+        assert_ne!(completion.rendered, "invented polished model prose");
+    }
+
+    #[tokio::test]
+    async fn invalid_small_edits_fall_back_to_local_baseline() {
+        let source = "goal ship the rust parser";
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".to_owned(),
+        };
+        let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
+        let mut stale = format_edit_candidate(source, 0, 4, "goal", "Goal:\n", "structure");
+        stale.base_fingerprint = format!("sha256:{}", "0".repeat(64));
+        let cloud = FormatEditCloud {
+            calls: Arc::new(AtomicUsize::new(0)),
+            saw_small_edit_contract: Arc::new(Mutex::new(None)),
+            candidate: stale,
+        };
+        let mut delivery = RecordingDelivery {
+            calls: Arc::new(AtomicUsize::new(0)),
+            rendered: Arc::new(Mutex::new(Vec::new())),
+            initiated_ms: None,
+        };
+        let clock = FixedClock(Duration::ZERO);
+        let baseline = organize_local_baseline(
+            source,
+            &LocalBaselineOptions {
+                policy: RenderingPolicy::Structured,
+                route: voisu_core::RenderingRoute::LocalWithOptionalCloud,
+                timing: None,
+            },
+        );
+
+        let completion = dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &selection,
+                provider_state: ProviderState::SemanticDisagreement,
+                policy: RenderingPolicy::Structured,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready {
+                    boundary: &cloud,
+                    credential: &credential,
+                },
+                clock: &clock,
+                small_edit_contract: true,
+            },
+            &mut delivery,
+        )
+        .await;
+
+        assert_eq!(completion.rendered, baseline.rendered());
+        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::CandidateSchema));
+        assert_eq!(completion.delivery_flags, DeliveryFlags::dpr_default());
+    }
+
+    #[tokio::test]
+    async fn derivation_path_ignores_format_edit_payloads() {
+        let source = "hello from voisu";
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".to_owned(),
+        };
+        let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
+        let cloud = FormatEditCloud {
+            calls: Arc::new(AtomicUsize::new(0)),
+            saw_small_edit_contract: Arc::new(Mutex::new(None)),
+            candidate: format_edit_candidate(source, 0, 5, "hello", "Hello", "casing"),
+        };
+        let mut delivery = RecordingDelivery {
+            calls: Arc::new(AtomicUsize::new(0)),
+            rendered: Arc::new(Mutex::new(Vec::new())),
+            initiated_ms: None,
+        };
+        let clock = FixedClock(Duration::ZERO);
+        let baseline = organize_local_baseline(source, &LocalBaselineOptions::default());
+
+        let completion = dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &selection,
+                provider_state: ProviderState::SemanticDisagreement,
+                policy: RenderingPolicy::Adaptive,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready {
+                    boundary: &cloud,
+                    credential: &credential,
+                },
+                clock: &clock,
+                small_edit_contract: false,
+            },
+            &mut delivery,
+        )
+        .await;
+
+        assert_eq!(completion.rendered, baseline.rendered());
+        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(
+            *cloud.saw_small_edit_contract.lock().expect("flag"),
+            Some(false)
+        );
     }
 }

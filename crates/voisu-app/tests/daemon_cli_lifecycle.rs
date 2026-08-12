@@ -168,6 +168,12 @@ impl Daemon {
         {
             command.env_remove("VOISU_ENABLE_DPR");
         }
+        if !environment
+            .iter()
+            .any(|(name, _)| *name == "VOISU_ENABLE_QWEN_FORMAT")
+        {
+            command.env_remove("VOISU_ENABLE_QWEN_FORMAT");
+        }
         disable_shortcuts_unless_bus_injected(&mut command, environment);
         let config_dir = isolate_deepgram_config(&mut command, environment);
         for (name, value) in environment {
@@ -227,6 +233,12 @@ impl Daemon {
             .any(|(name, _)| *name == "VOISU_ENABLE_DPR")
         {
             command.env_remove("VOISU_ENABLE_DPR");
+        }
+        if !environment
+            .iter()
+            .any(|(name, _)| *name == "VOISU_ENABLE_QWEN_FORMAT")
+        {
+            command.env_remove("VOISU_ENABLE_QWEN_FORMAT");
         }
         disable_shortcuts_unless_bus_injected(&mut command, environment);
         let config_dir = isolate_deepgram_config(&mut command, environment);
