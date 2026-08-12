@@ -26,11 +26,12 @@ use voisu_app::smart_writing::{
 };
 use voisu_core::{
     compose_structured_candidate, organize_local_baseline, parse_structured_candidate_json,
-    BoundaryFuture, CloudOutcome, ComposeInput, ComposeOutcome, ComposeSource,
+    BoundaryFuture, CloudOutcome, CloudRequest, ComposeInput, ComposeOutcome, ComposeSource,
     CompositionDecision, Credential, DeliveryAdapter, DeliveryFlags, DeliveryOutcome,
     DprDiagnosticMode, LocalBaseline, LocalBaselineOptions, LocalTiming, PauseBoundary, Provider,
     ProviderState, RenderingPolicy, RenderingRoute, SourceSelection, SourceTranscript,
-    SttProvider, StructuredCandidate, TimingCertainty, Transcript, TranscriptSelection,
+    SttProvider, StructuredCandidate, SurfaceHint, TimingCertainty, Transcript,
+    TranscriptSelection,
 };
 
 const BEHAVIOR_CORPUS: &str = include_str!(
@@ -647,36 +648,91 @@ async fn orchestration_deadline_compose_call_count_delivery_and_diagnostics() {
 async fn cloud_call_budget_covers_zero_call_and_failed_attempt_paths() {
     let source = "hello from voisu";
     let credential = Credential::new("hermetic-secret".to_owned()).expect("credential");
-    for (name, sources, provider_state) in [
+    for (name, selected_source, alternate_source, policy, surface_hint, expected_route) in [
         (
             "natural-simple",
-            vec![ComposeSource {
-                provider: SttProvider::ProviderA,
-                available: true,
-                text: source.to_owned(),
-                primary: true,
-            }],
-            ProviderState::SingleProvider,
+            source,
+            None,
+            RenderingPolicy::Natural,
+            None,
+            RenderingRoute::DeterministicLocal,
         ),
         (
             "natural-dispute",
-            vec![
-                ComposeSource {
-                    provider: SttProvider::ProviderA,
-                    available: true,
-                    text: source.to_owned(),
-                    primary: true,
-                },
-                ComposeSource {
-                    provider: SttProvider::ProviderB,
-                    available: true,
-                    text: "hello from voice you".to_owned(),
-                    primary: false,
-                },
-            ],
-            ProviderState::SemanticDisagreement,
+            source,
+            Some("hello from voice you"),
+            RenderingPolicy::Natural,
+            None,
+            RenderingRoute::DeterministicLocal,
+        ),
+        (
+            "adaptive-default-local",
+            source,
+            None,
+            RenderingPolicy::Adaptive,
+            None,
+            RenderingRoute::DeterministicLocal,
+        ),
+        (
+            "structured-default-local",
+            source,
+            None,
+            RenderingPolicy::Structured,
+            None,
+            RenderingRoute::DeterministicLocal,
+        ),
+        (
+            "adaptive-preformatted-literal",
+            "1. first\n2. second",
+            None,
+            RenderingPolicy::Adaptive,
+            None,
+            RenderingRoute::LiteralIdentity,
+        ),
+        (
+            "structured-preformatted-literal",
+            "1. first\n2. second",
+            None,
+            RenderingPolicy::Structured,
+            None,
+            RenderingRoute::LiteralIdentity,
+        ),
+        (
+            "adaptive-command-literal",
+            "cargo test",
+            None,
+            RenderingPolicy::Adaptive,
+            Some(SurfaceHint::Terminal),
+            RenderingRoute::LiteralIdentity,
+        ),
+        (
+            "structured-command-literal",
+            "cargo test",
+            None,
+            RenderingPolicy::Structured,
+            Some(SurfaceHint::Terminal),
+            RenderingRoute::LiteralIdentity,
         ),
     ] {
+        let mut sources = vec![ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: selected_source.to_owned(),
+            primary: true,
+        }];
+        if let Some(alternate) = alternate_source {
+            sources.push(ComposeSource {
+                provider: SttProvider::ProviderB,
+                available: true,
+                text: alternate.to_owned(),
+                primary: false,
+            });
+        }
+        let provider_state = if alternate_source.is_some() {
+            ProviderState::SemanticDisagreement
+        } else {
+            ProviderState::SingleProvider
+        };
         let clock = ControlledClock::at(0);
         let cloud_calls = Arc::new(AtomicUsize::new(0));
         let cloud = CannedCloud {
@@ -690,16 +746,16 @@ async fn cloud_call_budget_covers_zero_call_and_failed_attempt_paths() {
         let (mut delivery, delivery_calls, _) = delivery(Some(clock.clone()));
         let completion = dpr_transform_and_deliver(
             DprTransformInput {
-                selected_source: source,
+                selected_source,
                 sources: &sources,
                 source_selection: &SourceSelection {
                     selected_provider: SttProvider::ProviderA,
                     reason: "configured_primary_rank".to_owned(),
                 },
                 provider_state,
-                policy: RenderingPolicy::Natural,
+                policy,
                 english_eligible: true,
-                surface_hint: None,
+                surface_hint,
                 process_hint: None,
                 timing: None,
                 protected_tokens: &[],
@@ -715,7 +771,17 @@ async fn cloud_call_budget_covers_zero_call_and_failed_attempt_paths() {
         assert_eq!(cloud_calls.load(Ordering::SeqCst), 0, "{name}: cloud");
         assert!(!completion.cloud_attempted, "{name}: attempted");
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1, "{name}: Delivery");
-        assert_eq!(completion.delivery_flags, DeliveryFlags::dpr_default());
+        assert_eq!(completion.routing.route, expected_route, "{name}: route");
+        assert_eq!(
+            completion.routing.cloud_request,
+            CloudRequest::NotAllowed,
+            "{name}: cloud permission"
+        );
+        assert_eq!(
+            completion.delivery_flags,
+            DeliveryFlags::dpr_default(),
+            "{name}: flags"
+        );
     }
 
     let sources = [
@@ -772,6 +838,11 @@ async fn cloud_call_budget_covers_zero_call_and_failed_attempt_paths() {
         .await;
         assert_eq!(cloud_calls.load(Ordering::SeqCst), 1, "{error:?}: attempts");
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1, "{error:?}: Delivery");
+        assert_eq!(
+            completion.delivery_flags,
+            DeliveryFlags::dpr_default(),
+            "{error:?}: flags"
+        );
         assert_eq!(completion.rendered, "Hello from voisu.");
         assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
         assert_eq!(completion.cloud_error, Some(error));
