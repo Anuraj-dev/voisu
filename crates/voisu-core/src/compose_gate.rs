@@ -1764,8 +1764,8 @@ fn claim_source_ranges(
         for &(start, end) in &claimed[&provider] {
             let lo = start.min(text.len());
             let hi = end.min(text.len());
-            for i in lo..hi {
-                covered[i] = true;
+            for flag in covered.iter_mut().take(hi).skip(lo) {
+                *flag = true;
             }
         }
         for (i, ch) in text.char_indices() {
