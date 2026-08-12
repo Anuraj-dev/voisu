@@ -163,7 +163,6 @@ impl FormatEditOutcome {
 
 /// Parse untrusted formatting JSON. Does not apply edits and does not take
 /// Delivery ownership of any model string.
-#[must_use]
 pub fn parse_format_edit_candidate_json(raw: &[u8]) -> Result<FormatEditCandidate, FormatEditErrorCode> {
     if raw.len() > MAX_FORMAT_EDIT_RESPONSE_BYTES {
         return Err(FormatEditErrorCode::Oversize);
