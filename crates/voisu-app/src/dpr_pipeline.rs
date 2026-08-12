@@ -66,6 +66,24 @@ pub struct SystemDprPipelineClock {
     started_at: Instant,
 }
 
+/// Instant that starts the DPR deadline clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DprPipelineClockOrigin {
+    UtteranceEnd,
+    ValidationCompleted,
+}
+
+/// Formatting (`qwen_format_enabled`) is measured from ValidationCompleted.
+/// Derivation stays on utterance_end.
+#[must_use]
+pub const fn dpr_pipeline_clock_origin(qwen_format_enabled: bool) -> DprPipelineClockOrigin {
+    if qwen_format_enabled {
+        DprPipelineClockOrigin::ValidationCompleted
+    } else {
+        DprPipelineClockOrigin::UtteranceEnd
+    }
+}
+
 impl SystemDprPipelineClock {
     #[must_use]
     pub const fn from_utterance_end(utterance_end: Instant) -> Self {
@@ -945,6 +963,22 @@ mod tests {
             .iter()
             .map(|event| event.name())
             .collect()
+    }
+
+    #[test]
+    fn formatting_clock_origin_is_validation_completed() {
+        assert_eq!(
+            dpr_pipeline_clock_origin(true),
+            DprPipelineClockOrigin::ValidationCompleted
+        );
+    }
+
+    #[test]
+    fn derivation_clock_origin_is_utterance_end() {
+        assert_eq!(
+            dpr_pipeline_clock_origin(false),
+            DprPipelineClockOrigin::UtteranceEnd
+        );
     }
 
     #[test]
@@ -2141,6 +2175,83 @@ mod tests {
             completion.cloud_error,
             Some(DprCloudErrorClass::DeadlineExceeded)
         );
+    }
+
+    #[tokio::test]
+    async fn formatting_success_after_legacy_deadline_before_five_second_gate_is_accepted() {
+        let source = "pls ship the rust parser";
+        let clock = ControlledClock::new(0);
+        let cloud_calls = Arc::new(AtomicUsize::new(0));
+        let cloud = CountingFormatCloud {
+            calls: Arc::clone(&cloud_calls),
+            remaining_ms: Arc::new(AtomicU64::new(0)),
+            clock: clock.clone(),
+            completes_at_ms: 2_000,
+            honor_budget: true,
+            outcome: CannedFormatCloudOutcome::Success(format_edit_candidate(
+                source, 0, 3, "pls", "Please", "bounded_wording",
+            )),
+        };
+        let delivery_calls = Arc::new(AtomicUsize::new(0));
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let mut delivery = RecordingDelivery {
+            calls: Arc::clone(&delivery_calls),
+            rendered: Arc::clone(&delivered),
+            initiated_ms: None,
+        };
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".to_owned(),
+        };
+        let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
+        let baseline = organize_local_baseline(
+            source,
+            &LocalBaselineOptions {
+                policy: RenderingPolicy::Structured,
+                route: voisu_core::RenderingRoute::LocalWithOptionalCloud,
+                timing: None,
+            },
+        );
+
+        let completion = dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &selection,
+                provider_state: ProviderState::SemanticDisagreement,
+                policy: RenderingPolicy::Structured,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready {
+                    boundary: &cloud,
+                    credential: &credential,
+                },
+                clock: &clock,
+                small_edit_contract: true,
+            },
+            &mut delivery,
+        )
+        .await;
+
+        assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(completion.rendered, "Please ship the rust parser");
+        assert_eq!(
+            delivered.lock().expect("delivery").as_slice(),
+            ["Please ship the rust parser"]
+        );
+        assert_ne!(completion.rendered, baseline.rendered());
+        assert_eq!(completion.compose_decision, CompositionDecision::Accept);
+        assert!(completion.cloud_error.is_none());
     }
 
     #[tokio::test]

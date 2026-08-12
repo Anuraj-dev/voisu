@@ -21,8 +21,8 @@ use voisu_app::audio_level::{LevelRegistry, LevelRing};
 use voisu_app::grammar_http::GrammarHttpClient;
 use voisu_app::dpr_cloud::DprCloudClient;
 use voisu_app::dpr_pipeline::{
-    dpr_protected_tokens, dpr_source_context, dpr_transform_and_deliver, DprCloudCapability,
-    DprTransformInput, SystemDprPipelineClock,
+    dpr_pipeline_clock_origin, dpr_protected_tokens, dpr_source_context, dpr_transform_and_deliver,
+    DprCloudCapability, DprPipelineClockOrigin, DprTransformInput, SystemDprPipelineClock,
 };
 use voisu_app::focus::SharedFocusProbe;
 use voisu_app::journal::{escape_journal_control, recording_journal_lines};
@@ -2212,10 +2212,13 @@ async fn process_recording(
                 _ => DprCloudCapability::Unavailable,
             };
             let small_edit_contract = voisu_app::config::qwen_format_enabled();
-            let clock = if small_edit_contract {
-                SystemDprPipelineClock::from_validation_completed(validation_completed)
-            } else {
-                SystemDprPipelineClock::from_utterance_end(utterance_end)
+            let clock = match dpr_pipeline_clock_origin(small_edit_contract) {
+                DprPipelineClockOrigin::ValidationCompleted => {
+                    SystemDprPipelineClock::from_validation_completed(validation_completed)
+                }
+                DprPipelineClockOrigin::UtteranceEnd => {
+                    SystemDprPipelineClock::from_utterance_end(utterance_end)
+                }
             };
             let transformed = dpr_transform_and_deliver(
                 DprTransformInput {
