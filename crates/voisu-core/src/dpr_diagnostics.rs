@@ -15,7 +15,10 @@ use crate::{
 };
 
 #[cfg(feature = "dpr-eval-late-retain")]
-use crate::{clamp_utf8_bytes, is_text_sha256_fingerprint, text_sha256_fingerprint};
+use crate::{
+    clamp_utf8_bytes, is_text_sha256_fingerprint, scrub_embedded_urls, scrub_secret_values,
+    text_sha256_fingerprint, ComposeOutcome,
+};
 
 /// Schema version for the persisted DPR diagnostic surface.
 pub const DPR_DIAGNOSTIC_VERSION: u32 = 1;
@@ -143,6 +146,33 @@ pub struct DprLateEvaluationRecord {
     pub(crate) candidate_text_clamped: String,
     pub(crate) would_have_decision: CompositionDecision,
     pub(crate) compare_to_delivered: bool,
+}
+
+/// Proof that the sole compose gate accepted a late candidate. Fields are
+/// private so evaluation code cannot manufacture acceptance from raw model text
+/// or a caller-supplied decision.
+#[cfg(feature = "dpr-eval-late-retain")]
+pub struct DprAcceptedLateCandidate {
+    rendered: String,
+    decision: CompositionDecision,
+}
+
+#[cfg(feature = "dpr-eval-late-retain")]
+impl DprAcceptedLateCandidate {
+    /// Converts only an actual accept/soft-salvage compose outcome into the
+    /// capability required by the evaluation retention lane.
+    #[must_use]
+    pub fn from_compose(outcome: &ComposeOutcome) -> Option<Self> {
+        match outcome.decision() {
+            CompositionDecision::Accept
+            | CompositionDecision::AcceptPreserveWords
+            | CompositionDecision::AcceptNaturalLayout => Some(Self {
+                rendered: outcome.rendered().to_owned(),
+                decision: outcome.decision(),
+            }),
+            CompositionDecision::FallbackBaseline => None,
+        }
+    }
 }
 
 #[cfg(feature = "dpr-eval-late-retain")]
@@ -349,8 +379,8 @@ impl DprDiagnostic {
     pub fn retain_late_candidate_for_compare(
         &mut self,
         at: Duration,
-        candidate_text: &str,
-        would_have_decision: CompositionDecision,
+        candidate: &DprAcceptedLateCandidate,
+        sensitive_values: &[String],
     ) -> bool {
         if self.mode != DprDiagnosticMode::Evaluation
             || self.late_evaluation.is_some()
@@ -362,14 +392,18 @@ impl DprDiagnostic {
             return false;
         }
         let arrived_t_ms = duration_ms(at);
+        let redacted = scrub_embedded_urls(&scrub_secret_values(
+            &candidate.rendered,
+            sensitive_values,
+        ));
         self.late_evaluation = Some(DprLateEvaluationRecord {
             arrived_t_ms,
-            candidate_fingerprint: text_sha256_fingerprint(candidate_text),
+            candidate_fingerprint: text_sha256_fingerprint(&candidate.rendered),
             candidate_text_clamped: clamp_utf8_bytes(
-                candidate_text,
+                &redacted,
                 MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES,
             ),
-            would_have_decision,
+            would_have_decision: candidate.decision,
             compare_to_delivered: true,
         });
         self.push_event(DprDiagnosticEventName::LateResultRetained, at);

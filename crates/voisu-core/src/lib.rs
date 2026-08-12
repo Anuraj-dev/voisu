@@ -44,7 +44,8 @@ pub use dpr_diagnostics::{
 };
 #[cfg(feature = "dpr-eval-late-retain")]
 pub use dpr_diagnostics::{
-    DprLateEvaluationRecord, MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES,
+    DprAcceptedLateCandidate, DprLateEvaluationRecord,
+    MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES,
 };
 #[cfg(not(feature = "dpr-eval-late-retain"))]
 pub use dpr_diagnostics::DPR_EVALUATION_LANE_COMPILE_GATED;

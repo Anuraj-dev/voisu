@@ -118,8 +118,65 @@ fn feedback_is_silent_without_an_attempt_or_when_composition_accepts() {
 #[test]
 fn evaluation_feature_retains_one_clamped_candidate_for_compare_without_delivery_mutation() {
     use voisu_core::{
-        export_record, DiagnosticRecord, MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES, REDACTED,
+        compose_structured_candidate, organize_local_baseline, parse_structured_candidate_json,
+        text_sha256_fingerprint, CloudOutcome, ComposeInput, ComposeSource, DiagnosticRecord,
+        DiagnosticStore, DprAcceptedLateCandidate, LocalBaselineOptions, RetentionPolicy,
+        SourceSelection, SttProvider, MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES, REDACTED,
     };
+
+    let secret = "eval-secret";
+    let source = "hello eval-secret from voisu";
+    let baseline = organize_local_baseline(
+        source,
+        &LocalBaselineOptions {
+            policy: voisu_core::RenderingPolicy::Adaptive,
+            route: RenderingRoute::LocalWithOptionalCloud,
+            timing: None,
+        },
+    );
+    let fingerprint = text_sha256_fingerprint(source);
+    let sources = [ComposeSource {
+        provider: SttProvider::ProviderA,
+        available: true,
+        text: source.to_owned(),
+        primary: true,
+    }];
+    let selection = SourceSelection {
+        selected_provider: SttProvider::ProviderA,
+        reason: "only_available".to_owned(),
+    };
+    let rendered = "Hello eval-secret from voisu!".to_owned();
+    let candidate_json = serde_json::json!({
+        "schema_version": "1",
+        "base_fingerprint": fingerprint,
+        "reconciliation": {"selected_provider": "provider_a", "reason": "only_available"},
+        "removals": [],
+        "conversions": [],
+        "layout": {"decision": "natural", "certainty": "clear"},
+        "labels": [],
+        "derivation": [{
+            "kind": "keep",
+            "source_provider": "provider_a",
+            "source_text": source,
+            "output_text": rendered,
+            "conversion_id": null,
+            "label": null
+        }]
+    });
+    let candidate = parse_structured_candidate_json(candidate_json.to_string().as_bytes())
+        .expect("structured candidate");
+    let accepted_outcome = compose_structured_candidate(&ComposeInput {
+        local_baseline: &baseline,
+        base_fingerprint: &fingerprint,
+        sources: &sources,
+        source_selection: &selection,
+        protected_tokens: &[],
+        policy: voisu_core::RenderingPolicy::Adaptive,
+        cloud_outcome: CloudOutcome::Succeeded,
+        candidate: Some(&candidate),
+    });
+    let accepted = DprAcceptedLateCandidate::from_compose(&accepted_outcome)
+        .expect("compose accept capability");
 
     let mut evaluation = DprDiagnostic::evaluation(&cloud_route(), Duration::ZERO);
     evaluation.cloud_request_started(Duration::from_millis(1));
@@ -134,47 +191,54 @@ fn evaluation_feature_retains_one_clamped_candidate_for_compare_without_delivery
         DeliveryFlags::dpr_default(),
     );
 
-    let secret = "eval-secret";
-    let candidate = format!(
-        "{secret}{}",
-        "x".repeat(MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES + 64)
-    );
     assert!(evaluation.retain_late_candidate_for_compare(
         Duration::from_millis(1_675),
-        &candidate,
-        CompositionDecision::Accept,
+        &accepted,
+        &[secret.to_owned()],
     ));
     assert!(!evaluation.retain_late_candidate_for_compare(
         Duration::from_millis(1_700),
-        "second candidate",
-        CompositionDecision::Accept,
+        &accepted,
+        &[secret.to_owned()],
     ));
 
     let late = evaluation.late_evaluation().expect("evaluation record");
     assert_eq!(late.arrived_t_ms(), 1_675);
-    assert_eq!(
-        late.candidate_text_clamped().len(),
-        MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES
-    );
-    assert!(late.candidate_fingerprint().starts_with("sha256:"));
+    assert!(late.candidate_text_clamped().len() <= MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES);
+    assert_eq!(late.candidate_fingerprint(), text_sha256_fingerprint(&rendered));
+    assert!(!late.candidate_text_clamped().contains(secret));
+    assert!(late.candidate_text_clamped().contains(REDACTED));
     assert!(late.compare_to_delivered());
     assert!(!evaluation.delivery_flags().replace_delivered());
 
+    let dir = tempfile::TempDir::new().expect("diagnostic tempdir");
+    let store = DiagnosticStore::open(dir.path().to_owned(), RetentionPolicy::default())
+        .expect("diagnostic store");
     let mut record = DiagnosticRecord::new("rec-eval-redaction".to_owned(), 7);
     record.dpr = Some(evaluation);
-    let exported = export_record(
-        record,
-        [("VOISU_GROQ_API_KEY".to_owned(), secret.to_owned())],
-    );
-    let encoded = serde_json::to_string(&exported).expect("serialize redacted export");
-    assert!(!encoded.contains(secret));
-    assert!(encoded.contains(REDACTED));
+    store.record(record).expect("persist evaluation diagnostic");
+    let on_disk = std::fs::read_to_string(dir.path().join("history.jsonl"))
+        .expect("read persisted history");
+    assert!(!on_disk.contains(secret), "secret persisted: {on_disk}");
+    assert!(on_disk.contains(REDACTED), "redaction absent: {on_disk}");
+
+    let fallback_outcome = compose_structured_candidate(&ComposeInput {
+        local_baseline: &baseline,
+        base_fingerprint: &fingerprint,
+        sources: &sources,
+        source_selection: &selection,
+        protected_tokens: &[],
+        policy: voisu_core::RenderingPolicy::Adaptive,
+        cloud_outcome: CloudOutcome::ProviderFailure,
+        candidate: None,
+    });
+    assert!(DprAcceptedLateCandidate::from_compose(&fallback_outcome).is_none());
 
     let mut production = DprDiagnostic::production(&cloud_route(), Duration::ZERO);
     assert!(!production.retain_late_candidate_for_compare(
         Duration::from_millis(1_675),
-        "must not be retained",
-        CompositionDecision::Accept,
+        &accepted,
+        &[secret.to_owned()],
     ));
     assert!(production.late_evaluation().is_none());
 }
