@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.22.0
+Version:        0.23.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,12 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Wed Aug 12 2026 Voisu maintainers <voisu@example.invalid> - 0.23.0-1
+- fix(dpr): silence needless_range_loop in compose coverage
+- fix(dpr): harden compose spans, seal, and exact-key parse (Sol R2 / #158)
+- fix(dpr): seal compose baseline and harden gates (Sol R1 / #158)
+- feat(dpr): #139 compose gate port (#158)
+
 * Wed Aug 12 2026 Voisu maintainers <voisu@example.invalid> - 0.22.0-1
 - feat(dpr): pure-local intent router (#157) (#168)
 
