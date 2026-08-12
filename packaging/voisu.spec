@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.29.0
+Version:        0.30.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,12 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Wed Aug 12 2026 Voisu maintainers <voisu@example.invalid> - 0.30.0-1
+- fix(dpr): const-assert Qwen formatter default stays off
+- test(dpr): lock independent Qwen and DPR flag matrix
+- feat(dpr): keep Qwen formatter flag-off with host rollback docs
+- test(dpr): add formatting regression and semantic corpus
+
 * Wed Aug 12 2026 Voisu maintainers <voisu@example.invalid> - 0.29.0-1
 - test(dpr): prove 5s accept window and validation clock
 - feat(dpr): enforce a five-second formatting gate
