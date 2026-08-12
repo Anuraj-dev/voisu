@@ -2187,6 +2187,7 @@ async fn process_recording(
         evidence.reconciliation_requested = decision.reconciliation_requested;
         evidence.recovery_attempted = decision.recovery_attempted;
         evidence.stages.push(LifecycleStage::ValidationCompleted);
+        let validation_completed = Instant::now();
         let dictionary_refs: Vec<&str> = dictionary_terms.iter().map(String::as_str).collect();
         // Formatting uses the validated Transcript text, not a re-selected raw
         // source. Compose evidence still comes from sanitized provider sources.
@@ -2210,7 +2211,12 @@ async fn process_recording(
                 }
                 _ => DprCloudCapability::Unavailable,
             };
-            let clock = SystemDprPipelineClock::from_utterance_end(utterance_end);
+            let small_edit_contract = voisu_app::config::qwen_format_enabled();
+            let clock = if small_edit_contract {
+                SystemDprPipelineClock::from_validation_completed(validation_completed)
+            } else {
+                SystemDprPipelineClock::from_utterance_end(utterance_end)
+            };
             let transformed = dpr_transform_and_deliver(
                 DprTransformInput {
                     selected_source,
@@ -2225,7 +2231,7 @@ async fn process_recording(
                     protected_tokens: &protected_token_refs,
                     cloud,
                     clock: &clock,
-                    small_edit_contract: voisu_app::config::qwen_format_enabled(),
+                    small_edit_contract,
                 },
                 delivery.as_mut(),
             )
