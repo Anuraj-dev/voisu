@@ -451,7 +451,11 @@ fn try_section_organize(text: &str, policy: RenderingPolicy) -> Option<String> {
             // Closed labels only — never invent outside CLOSED_STRUCTURED_LABELS.
             debug_assert!(CLOSED_STRUCTURED_LABELS.contains(&sec.label));
             let body_cased = capitalize_sentence_start(&body_text);
-            let body_punct = ensure_terminal_period(&body_cased);
+            let body_punct = if sec.label == "Files" {
+                body_cased
+            } else {
+                ensure_terminal_period(&body_cased)
+            };
             parts.push(format!("{}:\n{}", sec.label, body_punct));
         } else {
             // Natural-shaped: keep cue word as sentence start, no colon header.

@@ -120,7 +120,10 @@ pub struct DprSourceContext {
 }
 
 #[must_use]
-pub fn dpr_source_context(sources: &[SourceTranscript]) -> Option<DprSourceContext> {
+pub fn dpr_source_context(
+    sources: &[SourceTranscript],
+    dictionary_terms: &[String],
+) -> Option<DprSourceContext> {
     let available: Vec<&SourceTranscript> = sources
         .iter()
         .filter(|source| !source.text.is_empty())
@@ -140,14 +143,22 @@ pub fn dpr_source_context(sources: &[SourceTranscript]) -> Option<DprSourceConte
         && available
             .iter()
             .all(|source| normalized_source_words(&source.text) == normalized_source_words(&available[0].text));
+    let other = available
+        .iter()
+        .find(|source| source.provider != selected_provider)
+        .copied();
     let safe_complementary = if available.len() == 2
         && !exact_agreement
         && !punctuation_only_agreement
     {
-        merge_insertion_only_sources(&available[0].text, &available[1].text)
+        other.and_then(|other| merge_insertion_only_sources(&selected.text, &other.text))
     } else {
         None
     };
+    let protected_disagreement = safe_complementary.is_none()
+        && other.is_some_and(|other| {
+            protected_atoms_disagree(&selected.text, &other.text, dictionary_terms)
+        });
     let provider_state = if available.len() <= 1 {
         ProviderState::SingleProvider
     } else if exact_agreement {
@@ -156,6 +167,8 @@ pub fn dpr_source_context(sources: &[SourceTranscript]) -> Option<DprSourceConte
         ProviderState::PunctuationOnlyAgreement
     } else if safe_complementary.is_some() {
         ProviderState::SafeComplementary
+    } else if protected_disagreement {
+        ProviderState::ProtectedTokenDisagreement
     } else {
         ProviderState::SemanticDisagreement
     };
@@ -178,10 +191,7 @@ pub fn dpr_source_context(sources: &[SourceTranscript]) -> Option<DprSourceConte
         text: selected.text.clone(),
         primary: true,
     });
-    if let Some(other) = available
-        .iter()
-        .find(|source| source.provider != selected_provider)
-    {
+    if let Some(other) = other {
         compose_sources.push(ComposeSource {
             provider: SttProvider::ProviderB,
             available: true,
@@ -198,12 +208,55 @@ pub fn dpr_source_context(sources: &[SourceTranscript]) -> Option<DprSourceConte
             reason: reason.to_owned(),
         },
         provider_state,
-        transcript_selection: match selected_provider {
-            Provider::Groq if punctuation_only_agreement => TranscriptSelection::NearIdenticalGroq,
-            Provider::Groq => TranscriptSelection::SourceGroq,
-            Provider::Deepgram => TranscriptSelection::SourceDeepgram,
+        transcript_selection: if provider_state == ProviderState::SafeComplementary {
+            TranscriptSelection::Complementary
+        } else {
+            match selected_provider {
+                Provider::Groq if punctuation_only_agreement => {
+                    TranscriptSelection::NearIdenticalGroq
+                }
+                Provider::Groq => TranscriptSelection::SourceGroq,
+                Provider::Deepgram => TranscriptSelection::SourceDeepgram,
+            }
         },
     })
+}
+
+fn protected_atoms_disagree(left: &str, right: &str, dictionary_terms: &[String]) -> bool {
+    let left_protected: Vec<String> = dpr_protected_tokens(left, dictionary_terms)
+        .into_iter()
+        .filter(|token| !is_closed_negation(token))
+        .collect();
+    let right_protected: Vec<String> = dpr_protected_tokens(right, dictionary_terms)
+        .into_iter()
+        .filter(|token| !is_closed_negation(token))
+        .collect();
+    left_protected
+        .iter()
+        .any(|token| !right.contains(token))
+        || right_protected.iter().any(|token| !left.contains(token))
+}
+
+fn is_closed_negation(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "no"
+            | "not"
+            | "never"
+            | "cannot"
+            | "can't"
+            | "cant"
+            | "don't"
+            | "dont"
+            | "won't"
+            | "wont"
+            | "isn't"
+            | "isnt"
+            | "aren't"
+            | "arent"
+            | "ain't"
+            | "aint"
+    )
 }
 
 /// Conservatively merges two whitespace-token streams only when their shared
@@ -745,7 +798,7 @@ mod tests {
                 text: "hello from voisu".to_owned(),
             },
         ];
-        let context = dpr_source_context(&sources).expect("source context");
+        let context = dpr_source_context(&sources, &[]).expect("source context");
         assert_eq!(context.selected_source, "hello from voisu");
         assert_eq!(context.sources[0].provider, SttProvider::ProviderA);
         assert_eq!(context.sources[0].text, "hello from voisu");
@@ -754,7 +807,7 @@ mod tests {
         assert_eq!(context.provider_state, ProviderState::SemanticDisagreement);
         assert_eq!(context.source_selection.reason, "configured_primary_rank");
         assert_eq!(context.transcript_selection, TranscriptSelection::SourceGroq);
-        assert!(dpr_source_context(&[]).is_none());
+        assert!(dpr_source_context(&[], &[]).is_none());
     }
 
     #[test]

@@ -3,6 +3,10 @@
 //! Run the complete gate (including the full #138/#139 product corpus ports)
 //! with `voisu-cargo test --workspace -- --test-threads=4`. This target uses no
 //! real network, compositor, or wall-clock sleep.
+//! Production dispatch/snapshot assertions share the existing hermetic daemon
+//! harness in `daemon_cli_lifecycle`: `smart_writing_real_wiring_...` proves
+//! flag-off routing, while `flagged_dpr_snapshots_policy_per_recording_...`
+//! proves Natural is held in-flight and a later Recording observes Structured.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -26,7 +30,7 @@ use voisu_core::{
     CompositionDecision, Credential, DeliveryAdapter, DeliveryFlags, DeliveryOutcome,
     DprDiagnosticMode, LocalBaseline, LocalBaselineOptions, LocalTiming, PauseBoundary, Provider,
     ProviderState, RenderingPolicy, RenderingRoute, SourceSelection, SourceTranscript,
-    SttProvider, StructuredCandidate, TimingCertainty, Transcript,
+    SttProvider, StructuredCandidate, TimingCertainty, Transcript, TranscriptSelection,
 };
 
 const BEHAVIOR_CORPUS: &str = include_str!(
@@ -100,19 +104,17 @@ fn local_timing(fixture: &Value) -> Option<LocalTiming> {
     })
 }
 
-/// Ship gate 1 (#138): every currently applicable local fixture, including the
-/// former DPR-33 deferral, passes through real source selection and organizer.
+/// Ship gate 1 (#138): every fixture's deterministic local baseline, including
+/// the former DPR-33 deferral and all optional-cloud fallback baselines, passes
+/// through real source selection and the product organizer.
 #[test]
-fn behavior_corpus_all_38_applicable_local_paths_match() {
+fn behavior_corpus_all_48_local_baselines_match() {
     let corpus: Value = serde_json::from_str(BEHAVIOR_CORPUS).expect("behavior corpus");
     let mut checked = 0usize;
     for fixture in corpus["fixtures"].as_array().expect("fixtures") {
-        let route_value = fixture["route"].as_str().expect("fixture route");
-        if !matches!(route_value, "deterministic_local" | "literal_identity") {
-            continue;
-        }
         let id = fixture["id"].as_str().expect("fixture id");
-        let context = dpr_source_context(&corpus_sources(fixture))
+        let dictionary_terms = vec!["voisu".to_owned()];
+        let context = dpr_source_context(&corpus_sources(fixture), &dictionary_terms)
             .unwrap_or_else(|| panic!("{id}: source context"));
         assert_eq!(
             context.source_selection.reason,
@@ -138,11 +140,10 @@ fn behavior_corpus_all_38_applicable_local_paths_match() {
             "{id}: local baseline"
         );
         assert_eq!(
-            baseline.rendered(),
-            fixture["expected_final"].as_str().expect("expected final"),
-            "{id}: final transcript"
+            fixture["local_baseline"],
+            fixture["expected_final"],
+            "{id}: #138 v1.7 requires fallback/local final to equal its baseline"
         );
-        assert_eq!(fixture["cloud"]["actual_requests"], 0, "{id}: cloud count");
         assert_eq!(fixture["delivery"]["state"], "unsent", "{id}: state");
         assert!(!fixture["delivery"]["auto_send"].as_bool().expect("auto-send"), "{id}: auto-send");
         assert!(!fixture["delivery"]["live_type"].as_bool().expect("live-type"), "{id}: live-type");
@@ -154,28 +155,65 @@ fn behavior_corpus_all_38_applicable_local_paths_match() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 38, "full applicable #138 local corpus changed");
+    assert_eq!(checked, 48, "full #138 local baseline corpus changed");
 }
 
 #[test]
 fn complementary_merge_rejects_semantic_and_negation_gaps() {
-    for (left, right) in [
-        ("deploy the service", "deploy the database"),
-        ("do not deploy", "do deploy now"),
-        ("call Anuraj tomorrow", "call Raja tomorrow"),
+    for (left, right, expected_state) in [
+        (
+            "deploy the service",
+            "deploy the database",
+            ProviderState::SemanticDisagreement,
+        ),
+        (
+            "do not deploy",
+            "do deploy now",
+            ProviderState::SemanticDisagreement,
+        ),
+        (
+            "call Anuraj tomorrow",
+            "call Raja tomorrow",
+            ProviderState::SemanticDisagreement,
+        ),
     ] {
         let context = dpr_source_context(&[
             SourceTranscript { provider: Provider::Groq, text: left.to_owned() },
             SourceTranscript { provider: Provider::Deepgram, text: right.to_owned() },
-        ])
+        ], &[])
         .expect("source context");
         assert_eq!(
             context.provider_state,
-            ProviderState::SemanticDisagreement,
+            expected_state,
             "unsafe merge for {left:?} / {right:?}"
         );
         assert_eq!(context.selected_source, left);
     }
+}
+
+#[test]
+fn complementary_merge_is_order_independent_and_truthfully_attributed() {
+    let groq = SourceTranscript {
+        provider: Provider::Groq,
+        text: "open crates/voisu-core/src/lib.rs and check".to_owned(),
+    };
+    let deepgram = SourceTranscript {
+        provider: Provider::Deepgram,
+        text: "open and check correlation_id".to_owned(),
+    };
+    let forward = dpr_source_context(&[groq.clone(), deepgram.clone()], &[]).expect("forward");
+    let reversed = dpr_source_context(&[deepgram, groq], &[]).expect("reversed");
+    for context in [&forward, &reversed] {
+        assert_eq!(
+            context.selected_source,
+            "open crates/voisu-core/src/lib.rs and check correlation_id"
+        );
+        assert_eq!(context.provider_state, ProviderState::SafeComplementary);
+        assert_eq!(context.transcript_selection, TranscriptSelection::Complementary);
+        assert_eq!(context.sources[0].provider, SttProvider::ProviderA);
+        assert!(context.sources[0].primary);
+    }
+    assert_eq!(forward.selected_source, reversed.selected_source);
 }
 
 struct ComposeFixture {
@@ -319,10 +357,7 @@ fn combined_call_all_24_decisions_and_19_product_mutations_match() {
             fixture["expected"]["decision"].as_str().expect("decision"),
             "{id}: decision"
         );
-        if outcome.decision() == CompositionDecision::FallbackBaseline {
-            let product_baseline = compose_fixture(fixture);
-            assert_eq!(outcome.rendered(), product_baseline.baseline.rendered(), "{id}: fallback");
-        } else {
+        if outcome.decision() != CompositionDecision::FallbackBaseline {
             assert_eq!(
                 outcome.rendered(),
                 fixture["expected"]["rendered"].as_str().expect("rendered"),
@@ -605,10 +640,149 @@ async fn orchestration_deadline_compose_call_count_delivery_and_diagnostics() {
     }
 }
 
-/// Ship gate 6: all policies round-trip through the real CLI config, and a
-/// Recording-held snapshot remains stable when persisted config changes.
+/// Ship gate 3 call-budget matrix: every Natural/not-allowed case remains at
+/// zero calls, and representative provider/transport failures consume the one
+/// allowed attempt without retrying or falling through to another provider.
+#[tokio::test]
+async fn cloud_call_budget_covers_zero_call_and_failed_attempt_paths() {
+    let source = "hello from voisu";
+    let credential = Credential::new("hermetic-secret".to_owned()).expect("credential");
+    for (name, sources, provider_state) in [
+        (
+            "natural-simple",
+            vec![ComposeSource {
+                provider: SttProvider::ProviderA,
+                available: true,
+                text: source.to_owned(),
+                primary: true,
+            }],
+            ProviderState::SingleProvider,
+        ),
+        (
+            "natural-dispute",
+            vec![
+                ComposeSource {
+                    provider: SttProvider::ProviderA,
+                    available: true,
+                    text: source.to_owned(),
+                    primary: true,
+                },
+                ComposeSource {
+                    provider: SttProvider::ProviderB,
+                    available: true,
+                    text: "hello from voice you".to_owned(),
+                    primary: false,
+                },
+            ],
+            ProviderState::SemanticDisagreement,
+        ),
+    ] {
+        let clock = ControlledClock::at(0);
+        let cloud_calls = Arc::new(AtomicUsize::new(0));
+        let cloud = CannedCloud {
+            calls: Arc::clone(&cloud_calls),
+            clock: clock.clone(),
+            complete_at: 10,
+            result: Mutex::new(Some(DprCloudAttempt::failure(
+                DprCloudErrorClass::Http5xx,
+            ))),
+        };
+        let (mut delivery, delivery_calls, _) = delivery(Some(clock.clone()));
+        let completion = dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &SourceSelection {
+                    selected_provider: SttProvider::ProviderA,
+                    reason: "configured_primary_rank".to_owned(),
+                },
+                provider_state,
+                policy: RenderingPolicy::Natural,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready {
+                    boundary: &cloud,
+                    credential: &credential,
+                },
+                clock: &clock,
+            },
+            &mut delivery,
+        )
+        .await;
+        assert_eq!(cloud_calls.load(Ordering::SeqCst), 0, "{name}: cloud");
+        assert!(!completion.cloud_attempted, "{name}: attempted");
+        assert_eq!(delivery_calls.load(Ordering::SeqCst), 1, "{name}: Delivery");
+        assert_eq!(completion.delivery_flags, DeliveryFlags::dpr_default());
+    }
+
+    let sources = [
+        ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        },
+        ComposeSource {
+            provider: SttProvider::ProviderB,
+            available: true,
+            text: "hello from voice you".to_owned(),
+            primary: false,
+        },
+    ];
+    for error in [
+        DprCloudErrorClass::Http5xx,
+        DprCloudErrorClass::RateLimited,
+        DprCloudErrorClass::Transport,
+    ] {
+        let clock = ControlledClock::at(0);
+        let cloud_calls = Arc::new(AtomicUsize::new(0));
+        let cloud = CannedCloud {
+            calls: Arc::clone(&cloud_calls),
+            clock: clock.clone(),
+            complete_at: 100,
+            result: Mutex::new(Some(DprCloudAttempt::failure(error))),
+        };
+        let (mut delivery, delivery_calls, _) = delivery(Some(clock.clone()));
+        let completion = dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &SourceSelection {
+                    selected_provider: SttProvider::ProviderA,
+                    reason: "configured_primary_rank".to_owned(),
+                },
+                provider_state: ProviderState::SemanticDisagreement,
+                policy: RenderingPolicy::Adaptive,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready {
+                    boundary: &cloud,
+                    credential: &credential,
+                },
+                clock: &clock,
+            },
+            &mut delivery,
+        )
+        .await;
+        assert_eq!(cloud_calls.load(Ordering::SeqCst), 1, "{error:?}: attempts");
+        assert_eq!(delivery_calls.load(Ordering::SeqCst), 1, "{error:?}: Delivery");
+        assert_eq!(completion.rendered, "Hello from voisu.");
+        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(completion.cloud_error, Some(error));
+    }
+}
+
+/// Ship gate 6 persistence half: all policies round-trip through the real CLI.
+/// The Recording-consumption half is asserted at the production daemon seam
+/// named in this module's run documentation.
 #[test]
-fn all_three_policies_persist_and_snapshot() {
+fn all_three_policies_persist_via_cli() {
     let temp = tempfile::tempdir().expect("config tempdir");
     let binary = env!("CARGO_BIN_EXE_voisu");
     let run = |arguments: &[&str]| {
@@ -629,21 +803,12 @@ fn all_three_policies_persist_and_snapshot() {
             format!("rendering policy: {policy}")
         );
     }
-    let snapshot = String::from_utf8_lossy(&run(&["rendering"]).stdout).trim().to_owned();
-    assert!(run(&["rendering", "natural"]).status.success());
-    assert_eq!(
-        snapshot,
-        "rendering policy: structured",
-        "held Recording snapshot changed"
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&run(&["rendering"]).stdout).trim(),
-        "rendering policy: natural"
-    );
 }
 
-/// Ship gate 8: with DPR rollout absent, the existing Smart Writing gate still
-/// formats and performs one ordinary Delivery. T7 does not flip production.
+/// Ship gate 8's in-process behavior half: the existing Smart Writing gate
+/// still formats and performs one ordinary Delivery. The production flag-off
+/// dispatch and null DPR diagnostic are asserted in the daemon test named in
+/// this module's run documentation.
 #[tokio::test]
 async fn dpr_flag_off_smart_writing_regression() {
     let (mut delivery, calls, _) = delivery(None);

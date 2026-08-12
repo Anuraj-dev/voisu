@@ -10310,6 +10310,10 @@ fn smart_writing_real_wiring_reproves_grammar_http_and_credential_cache_miss() {
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
     assert_eq!(record["final_transcript"], "There are two issues.", "{history}");
+    assert!(
+        record["dpr"].is_null(),
+        "flag-off production dispatch must remain Smart Writing: {history}"
+    );
     let smart = &record["smart_writing"];
     assert_eq!(smart["outcome"], "formatting_and_grammar", "{history}");
     assert_eq!(smart["request_began"], true, "{history}");
@@ -10428,7 +10432,7 @@ fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
 }
 
 #[test]
-fn flagged_dpr_snapshots_natural_policy_at_recording_start_and_never_calls_cloud() {
+fn flagged_dpr_snapshots_policy_per_recording_and_observes_later_config_changes() {
     let runtime = TempDir::new().unwrap();
     let config = TempDir::new().unwrap();
     fs::create_dir_all(config.path().join("voisu")).unwrap();
@@ -10438,18 +10442,18 @@ fn flagged_dpr_snapshots_natural_policy_at_recording_start_and_never_calls_cloud
         "deepgram_enabled = false\nwriting_mode = \"smart\"\nrendering_policy = \"natural\"\n",
     )
     .unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!(
-        "http://{}/openai/v1/chat/completions",
-        listener.local_addr().unwrap()
-    );
+    let commands = FakeCommands::new();
+    let (endpoint, request_rx, server) = local_dpr_server("stored-credential");
+    let path = commands.path();
     let config_home = config.path().display().to_string();
     let daemon = Daemon::start_with_env(
         runtime.path(),
         &[
+            ("PATH", &path),
             ("XDG_CONFIG_HOME", &config_home),
             ("VOISU_DISABLE_DEEPGRAM", "1"),
             ("VOISU_ENABLE_DPR", "true"),
+            ("VOISU_TEST_CLEAR_GROQ_API_KEY", "1"),
             ("VOISU_TEST_DPR_ENDPOINT", &endpoint),
             (
                 "VOISU_TEST_GROQ_TRANSCRIPT",
@@ -10467,10 +10471,8 @@ fn flagged_dpr_snapshots_natural_policy_at_recording_start_and_never_calls_cloud
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
-    listener.set_nonblocking(true).unwrap();
-    assert_eq!(
-        listener.accept().unwrap_err().kind(),
-        std::io::ErrorKind::WouldBlock,
+    assert!(
+        request_rx.try_recv().is_err(),
         "Natural snapshot must forbid cloud despite the mid-Recording config edit"
     );
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
@@ -10496,6 +10498,29 @@ fn flagged_dpr_snapshots_natural_policy_at_recording_start_and_never_calls_cloud
             "delivery_emitted",
         ],
         "{history}"
+    );
+
+    // A subsequent Recording snapshots the newly persisted Structured policy
+    // and does use the configured one-call boundary.
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
+    let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    server.join().unwrap();
+    let user: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(user["policy"], "structured", "{request}");
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(history["history"].as_array().unwrap().len(), 2, "{history}");
+    assert!(
+        history["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["final_transcript"]
+                == "Goal build voisu. Context rust. Requirements fast!"),
+        "Structured policy was not observed by the subsequent Recording: {history}"
     );
     daemon.terminate();
 }

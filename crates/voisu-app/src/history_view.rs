@@ -364,6 +364,7 @@ fn failure_reason(record: &Value) -> Option<String> {
 
 fn selection_label(selection: Option<&str>) -> &'static str {
     match selection {
+        Some("complementary") => "Complementary (merged)",
         Some("near_identical_groq") => "Groq",
         Some("source_groq") => "Groq",
         Some("source_deepgram") => "Deepgram",
