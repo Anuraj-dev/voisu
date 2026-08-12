@@ -145,6 +145,12 @@ pub const DEFAULT_RENDERING_POLICY: RenderingPolicy = voisu_core::DEFAULT_RENDER
 /// Smart Writing remains the production path until an explicit rollout flag.
 pub const DEFAULT_DPR_ENABLED: bool = false;
 
+/// Qwen small-edit formatting stays off until a test host sets
+/// [`ENABLE_QWEN_FORMAT_ENV`] to `1` or `true`. Independent of
+/// [`DEFAULT_DPR_ENABLED`]: silence/outro and validate-before-format can
+/// ship while this remains false.
+pub const DEFAULT_QWEN_FORMAT_ENABLED: bool = false;
+
 /// Whether the Deepgram Provider is enabled for Recordings.
 ///
 /// The env override [`DISABLE_DEEPGRAM_ENV`] wins over the persisted file: when
@@ -212,22 +218,25 @@ pub fn rendering_policy() -> RenderingPolicy {
 /// daemon process. This is deliberately not inferred from `rendering_policy`:
 /// policy can be configured while the rollout gate remains off.
 pub fn dpr_enabled() -> bool {
-    std::env::var(ENABLE_DPR_ENV)
-        .ok()
-        .is_some_and(|value| parse_dpr_enablement(&value))
+    parse_optional_dpr_enablement(std::env::var(ENABLE_DPR_ENV).ok().as_deref())
 }
 
 /// Whether the small-edit formatting contract is active. Independent of
 /// [`dpr_enabled`]: DPR can run on the existing #139 derivation path while
-/// this formatter remains off.
+/// this formatter remains off. Unset, `0`, `false`, or any value other than
+/// `1`/`true` is the instant rollback switch ([`ENABLE_QWEN_FORMAT_ENV`]).
 pub fn qwen_format_enabled() -> bool {
-    std::env::var(ENABLE_QWEN_FORMAT_ENV)
-        .ok()
-        .is_some_and(|value| parse_dpr_enablement(&value))
+    parse_optional_dpr_enablement(std::env::var(ENABLE_QWEN_FORMAT_ENV).ok().as_deref())
 }
 
 fn parse_dpr_enablement(value: &str) -> bool {
     matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true")
+}
+
+/// Shared missing-or-explicit-true parser for independent rollout env flags.
+/// `None` is the packaged default (off). Each flag is parsed on its own.
+fn parse_optional_dpr_enablement(value: Option<&str>) -> bool {
+    value.is_some_and(parse_dpr_enablement)
 }
 
 /// Persists the Rendering Policy, creating the `voisu` config directory if
@@ -1069,7 +1078,9 @@ other_key = 5
 
     #[test]
     fn qwen_format_gate_defaults_off_and_shares_the_explicit_true_parser() {
+        const { assert!(!DEFAULT_QWEN_FORMAT_ENABLED) };
         assert_eq!(ENABLE_QWEN_FORMAT_ENV, "VOISU_ENABLE_QWEN_FORMAT");
+        assert!(!parse_optional_dpr_enablement(None));
         for value in ["", "0", "false", "yes", "qwen", "garbage"] {
             assert!(
                 !parse_dpr_enablement(value),
@@ -1078,6 +1089,37 @@ other_key = 5
         }
         for value in ["1", "true", " TRUE "] {
             assert!(parse_dpr_enablement(value), "expected enablement: {value}");
+        }
+    }
+
+    #[test]
+    fn qwen_format_gate_is_independent_of_the_dpr_pipeline_gate() {
+        assert_ne!(ENABLE_DPR_ENV, ENABLE_QWEN_FORMAT_ENV);
+        assert_eq!(ENABLE_DPR_ENV, "VOISU_ENABLE_DPR");
+        assert_eq!(ENABLE_QWEN_FORMAT_ENV, "VOISU_ENABLE_QWEN_FORMAT");
+
+        let parse_gates = |dpr: Option<&str>, qwen: Option<&str>| {
+            (
+                parse_optional_dpr_enablement(dpr),
+                parse_optional_dpr_enablement(qwen),
+            )
+        };
+
+        assert_eq!(parse_gates(Some("1"), None), (true, false));
+        assert_eq!(parse_gates(None, Some("true")), (false, true));
+        assert_eq!(parse_gates(Some("1"), Some("0")), (true, false));
+        assert_eq!(parse_gates(None, None), (false, false));
+        assert_eq!(parse_gates(Some("1"), Some("true")), (true, true));
+    }
+
+    #[test]
+    fn qwen_format_env_name_is_the_public_rollback_switch() {
+        assert_eq!(ENABLE_QWEN_FORMAT_ENV, "VOISU_ENABLE_QWEN_FORMAT");
+        for rollback in ["", "0", "false", "FALSE", "off", "2", "yes"] {
+            assert!(
+                !parse_dpr_enablement(rollback),
+                "rollback value {rollback:?} must disable the formatter"
+            );
         }
     }
 
