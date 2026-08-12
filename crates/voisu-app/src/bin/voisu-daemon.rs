@@ -54,7 +54,7 @@ use voisu_core::{
     ReconciliationKind, ReconciliationModel,
     ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SourceTranscript,
     SourceTranscriptRecord, Transcript, TranscriptDecision, TranscriptDecisionPipeline,
-    TranscriptProvider, TranscriptSelection, TranscriptValidator, TriggerKeyBinding, VersionEnvelope,
+    TranscriptProvider, TranscriptValidator, TriggerKeyBinding, VersionEnvelope,
     SmartWritingDiagnostic, EnglishEligibilityOutcome, replay_capture, sanitize_source_transcripts,
     socket_path,
 };
@@ -2162,47 +2162,23 @@ async fn process_recording(
             sources.iter().map(|source| source.provider).collect();
         source_records = sources.iter().map(SourceTranscriptRecord::new).collect();
         evidence.stages.push(LifecycleStage::ProvidersCompleted);
-        // Classify outro hallucinations before DPR selection so pure-outro Groq
-        // never becomes a successful Source Transcript under the DPR branch.
+        // Classify Source Transcripts (outro / pure-hallucination sanitization),
+        // then always validate before any Delivery or DPR formatting. The prior
+        // DPR branch synthesized a successful TranscriptDecision from local
+        // source selection and skipped the validator entirely.
         let sanitized_sources = sanitize_source_transcripts(dpr_source_snapshot.clone());
-        let dpr_context = if dpr_enabled && english_eligible {
-            dpr_source_context(&sanitized_sources, &dictionary_terms)
-        } else {
-            None
-        };
-        let decision = if let Some(context) = dpr_context.as_ref() {
-            TranscriptDecision {
-                transcript: Transcript(context.selected_source.clone()),
-                selection: context.transcript_selection,
-                validation_reason: if context.transcript_selection
-                    == TranscriptSelection::Complementary
-                {
-                    "DPR merged safe complementary Source Transcript evidence locally"
-                        .to_owned()
+        let decision = match validator.validate(sanitized_sources.clone()).await {
+            Ok(decision) => decision,
+            Err(error) => {
+                if let Some(failure) = error.transcript_failure() {
+                    evidence.validation_reason = Some(failure.validation_reason.clone());
+                    evidence.fallback_reason = failure.fallback_reason.clone();
+                    evidence.reconciliation_requested = failure.reconciliation_requested;
+                    evidence.recovery_attempted = failure.recovery_attempted;
                 } else {
-                    "DPR selected one real Source Transcript locally without model reconciliation"
-                        .to_owned()
-                },
-                fallback_reason: None,
-                reconciliation_requested: false,
-                recovery_attempted: false,
-            }
-        } else {
-            // Sanitized evidence goes to validation so pure-outro silence fails
-            // closed without a model call (decide strips/refuses the same list).
-            match validator.validate(sanitized_sources).await {
-                Ok(decision) => decision,
-                Err(error) => {
-                    if let Some(failure) = error.transcript_failure() {
-                        evidence.validation_reason = Some(failure.validation_reason.clone());
-                        evidence.fallback_reason = failure.fallback_reason.clone();
-                        evidence.reconciliation_requested = failure.reconciliation_requested;
-                        evidence.recovery_attempted = failure.recovery_attempted;
-                    } else {
-                        evidence.validation_reason = Some(error.diagnostic().to_owned());
-                    }
-                    return Err(error);
+                    evidence.validation_reason = Some(error.diagnostic().to_owned());
                 }
+                return Err(error);
             }
         };
         evidence.transcript_selection = Some(decision.selection);
@@ -2212,9 +2188,17 @@ async fn process_recording(
         evidence.recovery_attempted = decision.recovery_attempted;
         evidence.stages.push(LifecycleStage::ValidationCompleted);
         let dictionary_refs: Vec<&str> = dictionary_terms.iter().map(String::as_str).collect();
+        // Formatting uses the validated Transcript text, not a re-selected raw
+        // source. Compose evidence still comes from sanitized provider sources.
+        let dpr_context = if dpr_enabled && english_eligible {
+            dpr_source_context(&sanitized_sources, &dictionary_terms)
+        } else {
+            None
+        };
         let delivery_outcome = if let Some(context) = dpr_context {
+            let selected_source = decision.transcript.0.as_str();
             let protected_tokens =
-                dpr_protected_tokens(&context.selected_source, &dictionary_terms);
+                dpr_protected_tokens(selected_source, &dictionary_terms);
             let protected_token_refs: Vec<&str> =
                 protected_tokens.iter().map(String::as_str).collect();
             let cloud = match (dpr_client.as_ref(), grammar_capability.as_ref()) {
@@ -2229,7 +2213,7 @@ async fn process_recording(
             let clock = SystemDprPipelineClock::from_utterance_end(utterance_end);
             let transformed = dpr_transform_and_deliver(
                 DprTransformInput {
-                    selected_source: &context.selected_source,
+                    selected_source,
                     sources: &context.sources,
                     source_selection: &context.source_selection,
                     provider_state: context.provider_state,

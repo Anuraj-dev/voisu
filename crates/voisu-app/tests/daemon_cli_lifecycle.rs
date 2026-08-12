@@ -10328,6 +10328,10 @@ fn smart_writing_real_wiring_reproves_grammar_http_and_credential_cache_miss() {
 /// an eligible English Recording, issues one structured request, composes it,
 /// and performs the existing single Delivery. Without this env flag, the SW10
 /// test above proves the unchanged Smart Writing branch.
+///
+/// Validation always runs first (Ticket 2). Near-identical provider texts keep
+/// the path free of reconciliation so the one structured DPR cloud call remains
+/// the only model attempt after ValidationCompleted.
 #[test]
 fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
     let runtime = TempDir::new().unwrap();
@@ -10352,7 +10356,7 @@ fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
             ("VOISU_TEST_DPR_ENDPOINT", &endpoint),
             (
                 "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
-                "goal break voisu context javascript requirements slow",
+                "goal build voisu context rust requirements fast",
             ),
             (
                 "VOISU_TEST_GROQ_TRANSCRIPT",
@@ -10372,11 +10376,17 @@ fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
     assert_eq!(
         stopped["evidence"]["reconciliation_requested"],
         false,
-        "flagged DPR must not spend a legacy free-form model call: {stopped}"
+        "near-identical sources must validate locally without free-form reconciliation: {stopped}"
+    );
+    assert!(
+        stopped["evidence"]["validation_reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "DPR path must record a real validation reason, not a synthetic skip: {stopped}"
     );
     assert_eq!(
         stopped["evidence"]["transcript_selection"],
-        "source_groq",
+        "near_identical_groq",
         "{stopped}"
     );
 
@@ -10428,6 +10438,73 @@ fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
     assert!(!encoded.contains("candidate_text"), "{history}");
     assert!(!encoded.contains("apply_late"), "{history}");
     assert_eq!(commands.read("secret-tool.args"), "lookup\nvoisu-provider\ngroq\n");
+    daemon.terminate();
+}
+
+/// Ticket 2: even with DPR enabled, pure-outro silence must fail validation and
+/// never Deliver. The removed DPR bypass used to synthesize a successful
+/// TranscriptDecision from non-empty Groq text and skip the validator.
+#[test]
+fn flagged_dpr_refuses_pure_outro_silence_without_delivery() {
+    let runtime = TempDir::new().unwrap();
+    let config = TempDir::new().unwrap();
+    fs::create_dir_all(config.path().join("voisu")).unwrap();
+    fs::write(
+        config.path().join("voisu/config.toml"),
+        "deepgram_enabled = true\nwriting_mode = \"smart\"\nrendering_policy = \"adaptive\"\n",
+    )
+    .unwrap();
+    let commands = FakeCommands::new();
+    // Unreachable endpoint: validation must refuse before any DPR cloud attempt.
+    let endpoint = "http://127.0.0.1:9/openai/v1/chat/completions";
+    let path = commands.path();
+    let config_home = config.path().display().to_string();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("XDG_CONFIG_HOME", &config_home),
+            ("VOISU_ENABLE_DPR", "1"),
+            ("VOISU_TEST_CLEAR_GROQ_API_KEY", "1"),
+            ("VOISU_TEST_DPR_ENDPOINT", endpoint),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", ""),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Thank you for watching!"),
+            (
+                "VOISU_TEST_RECONCILIATION_RESULT",
+                "legacy free form reconciliation must not run",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(
+        stopped["ok"], false,
+        "pure-outro silence must fail closed under DPR: {stopped}"
+    );
+    assert_eq!(
+        stopped["evidence"]["delivery_count"], 0,
+        "validation failure must not Deliver: {stopped}"
+    );
+    assert!(
+        stopped["evidence"]["validation_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("hallucinated suffix")),
+        "expected hallucinated-suffix validation reason: {stopped}"
+    );
+    assert_eq!(
+        stopped["evidence"]["reconciliation_requested"],
+        false,
+        "pure-outro silence must not spend a model call: {stopped}"
+    );
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    assert!(
+        record["final_transcript"].is_null()
+            || record["final_transcript"].as_str() == Some(""),
+        "no Final Transcript after pure-outro refusal: {history}"
+    );
+    assert!(record["dpr"].is_null(), "DPR diagnostics only after format path: {history}");
     daemon.terminate();
 }
 
