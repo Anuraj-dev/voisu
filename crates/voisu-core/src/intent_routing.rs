@@ -4,13 +4,15 @@
 //! without re-deriving weights, thresholds, or rule order. No network, timers, I/O, or randomness
 //! on the decision path.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::prompt_rendering::{CloudRequest, RenderingPolicy, RenderingRoute};
+use crate::prompt_rendering::{
+    CloudRequest, RenderingPolicy, RenderingRoute, TimingCertainty,
+};
 
 // ---------------------------------------------------------------------------
 // Constants — fixed catalogs; must match #141 corpus weights/thresholds
@@ -208,25 +210,10 @@ pub struct ProcessHint {
     pub name: Option<String>,
 }
 
-/// Certainty of optional pause-boundary timing.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TimingCertainty {
-    Clear,
-    Uncertain,
-}
-
-impl TimingCertainty {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "clear" => Some(Self::Clear),
-            "uncertain" => Some(Self::Uncertain),
-            _ => None,
-        }
-    }
-}
-
 /// Optional pause timing; weight toward cloud is always 0.
+///
+/// [`TimingCertainty`] is shared from [`crate::prompt_rendering`] so T1 and T2
+/// do not define competing crate-root names.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TimingHint {
     pub certainty: TimingCertainty,
@@ -655,9 +642,12 @@ fn command_anchor_ok(
 }
 
 /// (signal_id, phrase, strength, detail_kind) for each distinct cue hit.
+///
+/// Uses [`BTreeMap`] keyed by `signal_id` so multi-cue contribution order is
+/// deterministic across runs (HashMap iteration order is not stable).
 fn collect_section_cue_hits(primary_text: &str) -> Vec<(String, String, Strength, &'static str)> {
-    // signal_id -> (phrase, strength, detail_kind)
-    let mut found: HashMap<String, (String, Strength, &'static str)> = HashMap::new();
+    // signal_id -> (phrase, strength, detail_kind); BTreeMap keeps signal_id order.
+    let mut found: BTreeMap<String, (String, Strength, &'static str)> = BTreeMap::new();
 
     for cue in SECTION_CUES.iter() {
         if cue.pattern.is_match(primary_text) {
@@ -1354,6 +1344,45 @@ mod tests {
         assert_eq!(d.route, RenderingRoute::DeterministicLocal);
         assert_eq!(d.complexity_score, 0);
         assert_eq!(d.section_cue_count, 0);
+    }
+
+    #[test]
+    fn multi_cue_contribution_signal_order_is_deterministic() {
+        // Header-shaped multi-section speech: several distinct section cues fire.
+        let text = "Goal: ship the fix. Context: CI is red. Requirements: keep the API stable. Constraints: no new deps.";
+        let obs = IntentObservation {
+            policy: RenderingPolicy::Adaptive,
+            primary_text: text.to_string(),
+            provider_state: ProviderState::SingleProvider,
+            surface_hint: None,
+            process_hint: None,
+            timing: None,
+        };
+        let a = route_intent(&obs);
+        let b = route_intent(&obs);
+        assert!(
+            a.section_cue_count >= 2,
+            "fixture must hit multi-cue path, got {}",
+            a.section_cue_count
+        );
+        let signals_a: Vec<&str> = a.contributions.iter().map(|c| c.signal.as_str()).collect();
+        let signals_b: Vec<&str> = b.contributions.iter().map(|c| c.signal.as_str()).collect();
+        assert_eq!(
+            signals_a, signals_b,
+            "contribution signal order must be stable across runs"
+        );
+        // Section cue signals themselves are ordered by signal_id (BTreeMap).
+        let section_signals: Vec<&str> = signals_a
+            .iter()
+            .copied()
+            .filter(|s| s.starts_with("section_"))
+            .collect();
+        let mut sorted = section_signals.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            section_signals, sorted,
+            "section cue contributions must follow signal_id order"
+        );
     }
 
     #[test]
