@@ -519,8 +519,9 @@ pub struct ComposeInput<'a> {
 /// Parse untrusted candidate JSON into a typed [`StructuredCandidate`].
 ///
 /// Fail-closed: returns `None` on invalid JSON, unknown fields, missing required
-/// keys, oversize body, excessive depth/nodes, or over-limit claim/span counts
-/// and field lengths. Caller passes `candidate: None` with
+/// keys (including nullable Option fields that must still be present as JSON
+/// `null`), oversize body, excessive depth/nodes, or over-limit claim/span
+/// counts and field lengths. Caller passes `candidate: None` with
 /// [`CloudOutcome::SchemaFailure`] (or similar).
 #[must_use]
 pub fn parse_structured_candidate_json(raw: &[u8]) -> Option<StructuredCandidate> {
@@ -532,11 +533,97 @@ pub fn parse_structured_candidate_json(raw: &[u8]) -> Option<StructuredCandidate
     if depth > MAX_COMPOSE_JSON_DEPTH || nodes > MAX_COMPOSE_JSON_NODES {
         return None;
     }
+    // Serde treats missing `Option` fields as `None`; product requires exact keys
+    // (nullable keys present as JSON null). Enforce before typed deserialize.
+    if !candidate_json_has_exact_keys(&value) {
+        return None;
+    }
     let candidate: StructuredCandidate = serde_json::from_value(value).ok()?;
     if !candidate_within_bounds(&candidate) {
         return None;
     }
     Some(candidate)
+}
+
+/// Exact required keys matching Python `exact_keys` / schema. Required keys must
+/// be **present** (may be JSON `null` for nullable Option fields). Unknown keys
+/// are already denied by `deny_unknown_fields` on typed deserialize.
+fn candidate_json_has_exact_keys(value: &serde_json::Value) -> bool {
+    const CANDIDATE_KEYS: &[&str] = &[
+        "schema_version",
+        "base_fingerprint",
+        "reconciliation",
+        "removals",
+        "conversions",
+        "layout",
+        "labels",
+        "derivation",
+    ];
+    const RECON_KEYS: &[&str] = &["selected_provider", "reason"];
+    const REMOVAL_KEYS: &[&str] = &[
+        "kind",
+        "certainty",
+        "source_provider",
+        "source_span_text",
+    ];
+    const CONVERSION_KEYS: &[&str] = &["id", "source_provider", "source_span_text"];
+    const LAYOUT_KEYS: &[&str] = &["decision", "certainty"];
+    const LABEL_KEYS: &[&str] = &["label", "source_provider", "source_span_text"];
+    const SPAN_KEYS: &[&str] = &[
+        "kind",
+        "source_provider",
+        "source_text",
+        "output_text",
+        "conversion_id",
+        "label",
+    ];
+
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    if !has_exact_keys(obj, CANDIDATE_KEYS) {
+        return false;
+    }
+    let Some(recon) = obj.get("reconciliation").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    if !has_exact_keys(recon, RECON_KEYS) {
+        return false;
+    }
+    let Some(layout) = obj.get("layout").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    if !has_exact_keys(layout, LAYOUT_KEYS) {
+        return false;
+    }
+    for key in ["removals", "conversions", "labels", "derivation"] {
+        let Some(arr) = obj.get(key).and_then(|v| v.as_array()) else {
+            return false;
+        };
+        let expected = match key {
+            "removals" => REMOVAL_KEYS,
+            "conversions" => CONVERSION_KEYS,
+            "labels" => LABEL_KEYS,
+            "derivation" => SPAN_KEYS,
+            _ => unreachable!(),
+        };
+        for item in arr {
+            let Some(item_obj) = item.as_object() else {
+                return false;
+            };
+            if !has_exact_keys(item_obj, expected) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn has_exact_keys(
+    object: &serde_json::Map<String, serde_json::Value>,
+    expected: &[&str],
+) -> bool {
+    object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
 }
 
 fn json_shape(value: &serde_json::Value) -> (usize, usize) {
@@ -692,6 +779,16 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
             vec![ComposeErrorCode::Schema, ComposeErrorCode::Malformed],
         );
     };
+
+    // Re-check bounds on any in-memory StructuredCandidate (not only parse path).
+    // Public type can be constructed oversized; compose must not accept it.
+    if !candidate_within_bounds(candidate) {
+        return baseline_result(
+            baseline,
+            Some(FallbackTrigger::ResponseSchemaFailure),
+            vec![ComposeErrorCode::Schema, ComposeErrorCode::Malformed],
+        );
+    }
 
     if let Some(codes) = validate_candidate_shape(candidate, &closed) {
         return baseline_result(
@@ -1485,6 +1582,11 @@ fn convert_output_matches(conversion_id: &str, source_text: &str, output_text: &
 /// Never panics on valid Unicode: does not slice mid-codepoint and does not
 /// map casefold byte offsets onto the original string (casefold can expand or
 /// contract). On unverifiable matches returns empty rather than wrong ranges.
+///
+/// Collects **exact and case-insensitive** char-window matches together (then
+/// dedupes ranges) so e.g. haystack `foo FOO` with needle `foo` yields both
+/// non-overlapping ranges. Falls to whitespace-atom matching only when both
+/// prior paths found nothing.
 fn find_literal_spans(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
     if needle.is_empty() || haystack.is_empty() {
         return vec![];
@@ -1492,7 +1594,7 @@ fn find_literal_spans(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
 
     let mut out = Vec::new();
 
-    // Exact (case-sensitive) first — offsets are identity on the original.
+    // Exact (case-sensitive) — offsets are identity on the original.
     {
         let mut search_from = 0;
         while search_from <= haystack.len() {
@@ -1512,12 +1614,11 @@ fn find_literal_spans(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
             search_from = start + step;
         }
     }
-    if !out.is_empty() {
-        return out;
-    }
 
     // Case-insensitive char-window match: compare per-char lowercase expansions
     // but claim original char-boundary ranges (never casefold offsets).
+    // Always run (do not early-return after exact-only) so mixed-case duplicates
+    // like `foo FOO` both resolve.
     let needle_chars: Vec<char> = needle.chars().collect();
     let hay_chars: Vec<(usize, char)> = haystack.char_indices().collect();
     let n_len = needle_chars.len();
@@ -1539,6 +1640,10 @@ fn find_literal_spans(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
             }
         }
     }
+
+    // Dedupe ranges from exact + case-insensitive paths.
+    out.sort_by_key(|r| (r.0, r.1));
+    out.dedup();
     if !out.is_empty() {
         return out;
     }
@@ -1559,7 +1664,13 @@ fn find_literal_spans(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
         .iter()
         .map(|m| m.as_str().to_lowercase())
         .collect();
-    for i in 0..=seq.len().saturating_sub(atoms.len()) {
+    // Fail closed when haystack has fewer atoms than needle (e.g. "İ" vs
+    // "i\u{307}" where norm contains matches but ASCII atom seq is empty).
+    // Never index empty `seq` / never `seq[i..i+atoms.len()]` when short.
+    if seq.len() < atoms.len() {
+        return out;
+    }
+    for i in 0..=seq.len() - atoms.len() {
         if seq[i..i + atoms.len()] == atoms[..] {
             let a0 = h_atoms[i].start();
             let a1 = h_atoms[i + atoms.len() - 1].end();
@@ -1989,8 +2100,8 @@ mod tests {
     }
 
     /// Fat label span: claims full source and rewrites body into `output_text`.
-    /// Product rejects (exact header only); Python oracle may still accept via
-    /// starts_with.
+    /// Product rejects with exact `InvalidLabel` (not a soft set of codes);
+    /// Python oracle may still accept via starts_with.
     #[test]
     fn mutation_label_fat_rewrite_body_rejects() {
         let mut fx = clone_fixture("CC-20");
@@ -2007,11 +2118,10 @@ mod tests {
         ]);
         let got = run_fx(fx);
         assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
-        assert!(
-            got.error_codes().contains(&ComposeErrorCode::InvalidLabel)
-                || got.error_codes().contains(&ComposeErrorCode::UnsafeSemantics)
-                || got.error_codes().contains(&ComposeErrorCode::InventedContent),
-            "codes={:?}",
+        assert_eq!(
+            got.error_codes(),
+            &[ComposeErrorCode::InvalidLabel],
+            "fat label must reject with exact InvalidLabel, codes={:?}",
             got.error_codes()
         );
         // Green path still: Goal:\n + keep body (corpus CC-20).
@@ -2268,6 +2378,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_missing_nullable_conversion_id_key() {
+        // Schema-required nullable: key must be present (null OK). Omitting the
+        // key entirely is rejected even though Option would serde to None.
+        let missing = br#"{
+            "schema_version": "1",
+            "base_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "reconciliation": {"selected_provider": "provider_a", "reason": "only_available"},
+            "removals": [],
+            "conversions": [],
+            "layout": {"decision": "natural", "certainty": "clear"},
+            "labels": [],
+            "derivation": [{
+                "kind": "keep",
+                "source_provider": "provider_a",
+                "source_text": "hi",
+                "output_text": "Hi",
+                "label": null
+            }]
+        }"#;
+        assert!(parse_structured_candidate_json(missing).is_none());
+
+        let present_null = br#"{
+            "schema_version": "1",
+            "base_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "reconciliation": {"selected_provider": "provider_a", "reason": "only_available"},
+            "removals": [],
+            "conversions": [],
+            "layout": {"decision": "natural", "certainty": "clear"},
+            "labels": [],
+            "derivation": [{
+                "kind": "keep",
+                "source_provider": "provider_a",
+                "source_text": "hi",
+                "output_text": "Hi",
+                "conversion_id": null,
+                "label": null
+            }]
+        }"#;
+        assert!(parse_structured_candidate_json(present_null).is_some());
+    }
+
+    #[test]
     fn parse_rejects_oversized_payload() {
         let mut raw = Vec::with_capacity(MAX_COMPOSE_CANDIDATE_BYTES + 8);
         raw.extend_from_slice(br#"{"schema_version":"1","pad":""#);
@@ -2277,6 +2429,67 @@ mod tests {
         raw.extend_from_slice(br#""}"#);
         assert!(raw.len() > MAX_COMPOSE_CANDIDATE_BYTES);
         assert!(parse_structured_candidate_json(&raw).is_none());
+    }
+
+    #[test]
+    fn compose_rejects_oversize_in_memory_candidate() {
+        // Bounds are rechecked at compose entry, not only at parse.
+        let huge = "x".repeat(MAX_COMPOSE_FIELD_UTF8_BYTES + 1);
+        let cand = StructuredCandidate {
+            schema_version: "1".into(),
+            base_fingerprint: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            reconciliation: Reconciliation {
+                selected_provider: "provider_a".into(),
+                reason: "only_available".into(),
+            },
+            removals: vec![],
+            conversions: vec![],
+            layout: LayoutClaim {
+                decision: LayoutDecision::Natural,
+                certainty: ComposeCertainty::Clear,
+            },
+            labels: vec![],
+            derivation: vec![DerivationSpan {
+                kind: SpanKind::Keep,
+                source_provider: Some("provider_a".into()),
+                source_text: huge.clone(),
+                output_text: huge,
+                conversion_id: None,
+                label: None,
+            }],
+        };
+        assert!(!candidate_within_bounds(&cand));
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: "hi".into(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".into(),
+        };
+        let baseline = LocalBaseline::from_organized_text("Hi.");
+        let input = ComposeInput {
+            local_baseline: &baseline,
+            base_fingerprint: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            sources: &sources,
+            source_selection: &selection,
+            protected_tokens: &[],
+            policy: RenderingPolicy::Adaptive,
+            cloud_outcome: CloudOutcome::Succeeded,
+            candidate: Some(&cand),
+        };
+        let got = compose_structured_candidate(&input);
+        assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
+        assert_eq!(
+            got.fallback_trigger(),
+            Some(FallbackTrigger::ResponseSchemaFailure)
+        );
+        assert!(got.error_codes().contains(&ComposeErrorCode::Schema));
+        assert!(got.error_codes().contains(&ComposeErrorCode::Malformed));
+        assert_eq!(got.rendered(), "Hi.");
     }
 
     #[test]
@@ -2306,6 +2519,79 @@ mod tests {
     }
 
     #[test]
+    fn find_literal_spans_dotted_i_empty_atom_seq_no_panic() {
+        // Sol repro: haystack "İ", needle "i\u{307}". After lowercase, norm
+        // contains may match while haystack has zero ASCII regex atoms and
+        // needle has non-empty atoms — must fail closed, never panic on empty seq.
+        let hay = "İ";
+        let needle = "i\u{307}";
+        let spans = find_literal_spans(hay, needle);
+        assert!(
+            spans.is_empty(),
+            "empty-atom haystack must not invent ranges, got {spans:?}"
+        );
+        // Empty-atom / punctuation-only edges never panic.
+        let _ = find_literal_spans("İ İ", "i\u{307}");
+        assert!(find_literal_spans("!!!", "i").is_empty());
+    }
+
+    #[test]
+    fn find_literal_spans_mixed_case_both_occurrences() {
+        // Exact-only early return used to drop case-folded second hit: source
+        // `foo FOO` with needle `foo` must yield both non-overlapping ranges.
+        let hay = "foo FOO";
+        let spans = find_literal_spans(hay, "foo");
+        assert_eq!(spans.len(), 2, "spans={spans:?}");
+        assert_eq!(&hay[spans[0].0..spans[0].1], "foo");
+        assert_eq!(&hay[spans[1].0..spans[1].1], "FOO");
+        assert!(!ranges_overlap(spans[0], spans[1]));
+    }
+
+    #[test]
+    fn claim_two_mixed_case_keeps_no_false_overlap() {
+        // Two non-overlapping keep claims on `foo` / `FOO` both place.
+        let mut fx = clone_fixture("CC-01");
+        fx["sources"] = serde_json::json!([{
+            "provider": "provider_a",
+            "available": true,
+            "text": "foo FOO",
+            "primary": true
+        }]);
+        fx["base_fingerprint"] = Value::String(crate::text_sha256_fingerprint("foo FOO"));
+        fx["candidate"]["base_fingerprint"] = fx["base_fingerprint"].clone();
+        fx["candidate"]["removals"] = Value::Array(vec![]);
+        fx["candidate"]["conversions"] = Value::Array(vec![]);
+        fx["candidate"]["labels"] = Value::Array(vec![]);
+        fx["candidate"]["derivation"] = serde_json::json!([
+            {
+                "kind": "keep",
+                "source_provider": "provider_a",
+                "source_text": "foo",
+                "output_text": "foo ",
+                "conversion_id": null,
+                "label": null
+            },
+            {
+                "kind": "keep",
+                "source_provider": "provider_a",
+                "source_text": "foo",
+                "output_text": "FOO",
+                "conversion_id": null,
+                "label": null
+            }
+        ]);
+        let got = run_fx(fx);
+        assert_ne!(
+            got.error_codes(),
+            &[ComposeErrorCode::Overlap],
+            "distinct mixed-case ranges must not false-overlap, codes={:?}",
+            got.error_codes()
+        );
+        // Accept if other gates pass; at minimum no Overlap.
+        assert!(!got.error_codes().contains(&ComposeErrorCode::Overlap));
+    }
+
+    #[test]
     fn find_literal_spans_no_mid_codepoint_advance_panic() {
         // Regression: advancing start by +1 byte after a multi-byte match used
         // to panic on the lowercased haystack slice.
@@ -2329,8 +2615,7 @@ mod tests {
         }]);
         // Shape validation runs on typed candidate — re-parse after mutation.
         let (owned, candidate) = fixture_input(&fx);
-        // fixture_input panics on unknown label in closed set during shape... 
-        // actually deserialize succeeds; validate_candidate_shape rejects.
+        // Deserialize succeeds; validate_candidate_shape rejects (label wins).
         let got = compose_owned(&owned, candidate.as_ref());
         assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
         assert!(
