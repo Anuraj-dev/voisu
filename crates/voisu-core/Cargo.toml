@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+dpr-eval-late-retain = []
+
 [dependencies]
 regex = "1.13.1"
 libc = "0.2"

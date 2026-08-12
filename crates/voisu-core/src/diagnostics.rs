@@ -22,9 +22,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    BoundaryError, CaptureLimit, CapturedAudio, DeliveryMethod, LifecycleStage, Provider, ProviderCoordinator,
-    ProviderFailure, ProviderTiming, SourceTranscript, TranscriptDecision, TranscriptSelection,
-    TranscriptValidator,
+    BoundaryError, CaptureLimit, CapturedAudio, DeliveryMethod, DprDiagnostic, LifecycleStage,
+    Provider, ProviderCoordinator, ProviderFailure, ProviderTiming, SourceTranscript,
+    TranscriptDecision, TranscriptSelection, TranscriptValidator,
 };
 
 /// A stored transcript text is clamped so a bounded history never grows without
@@ -631,6 +631,11 @@ pub struct DiagnosticRecord {
     /// history lines keep deserializing without a schema bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smart_writing: Option<SmartWritingDiagnostic>,
+    /// Optional Developer Prompt Rendering timeline. Default/release builds
+    /// persist only the production shape; the evaluation late-copy field does
+    /// not exist unless the crate is compiled with its explicit eval feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpr: Option<DprDiagnostic>,
 }
 
 impl DiagnosticRecord {
@@ -662,6 +667,7 @@ impl DiagnosticRecord {
             error: None,
             debug_audio: None,
             smart_writing: None,
+            dpr: None,
         }
     }
 
@@ -1025,6 +1031,14 @@ pub fn export_record(
     if let Some(smart) = record.smart_writing.as_mut() {
         scrub_smart_writing_diagnostic(smart, &secrets);
     }
+    if let Some(dpr) = record.dpr.as_mut() {
+        #[cfg(feature = "dpr-eval-late-retain")]
+        if let Some(late) = dpr.late_evaluation.as_mut() {
+            late.candidate_text_clamped =
+                scrub_free_text(&late.candidate_text_clamped, &secrets);
+        }
+        dpr.normalize();
+    }
     DiagnosticExport {
         record,
         environment: redacted_environment(vars),
@@ -1355,6 +1369,9 @@ impl DiagnosticStore {
     pub fn record(&self, mut record: DiagnosticRecord) -> io::Result<Vec<DiagnosticRecord>> {
         if let Some(smart) = record.smart_writing.as_mut() {
             smart.normalize();
+        }
+        if let Some(dpr) = record.dpr.as_mut() {
+            dpr.normalize();
         }
         let _guard = self.lock_store();
         let mut records = self.load_raw()?;

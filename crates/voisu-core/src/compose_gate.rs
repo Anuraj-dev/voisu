@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::local_baseline::LocalBaseline;
 use crate::prompt_rendering::{
@@ -77,7 +77,8 @@ pub const CLOSED_SOURCE_SELECTION_REASONS: &[&str] = &[
 // ─── Public enums / outcome ──────────────────────────────────────────────────
 
 /// Hierarchical composition decision (#139).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CompositionDecision {
     Accept,
     AcceptPreserveWords,
@@ -109,7 +110,8 @@ impl CompositionDecision {
 }
 
 /// Why the composer did not fully accept the structured candidate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FallbackTrigger {
     UnsafeSemantics,
     UnverifiableSourceDerivation,
@@ -153,23 +155,39 @@ impl FallbackTrigger {
 }
 
 /// Closed error-code set from #139 corpus.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum ComposeErrorCode {
+    #[serde(rename = "E_MALFORMED")]
     Malformed,
+    #[serde(rename = "E_STALE")]
     Stale,
+    #[serde(rename = "E_UNKNOWN_CONVERSION")]
     UnknownConversion,
+    #[serde(rename = "E_UNKNOWN_LABEL")]
     UnknownLabel,
+    #[serde(rename = "E_UNVERIFIABLE")]
     Unverifiable,
+    #[serde(rename = "E_PROTECTED")]
     Protected,
+    #[serde(rename = "E_UNSAFE_SEMANTICS")]
     UnsafeSemantics,
+    #[serde(rename = "E_INVALID_LABEL")]
     InvalidLabel,
+    #[serde(rename = "E_UNCERTAIN_BACKTRACK")]
     UncertainBacktrack,
+    #[serde(rename = "E_UNCERTAIN_LAYOUT")]
     UncertainLayout,
+    #[serde(rename = "E_INVENTED_CONTENT")]
     InventedContent,
+    #[serde(rename = "E_OVERLAP")]
     Overlap,
+    #[serde(rename = "E_SCHEMA")]
     Schema,
+    #[serde(rename = "E_PROVIDER")]
     Provider,
+    #[serde(rename = "E_DEADLINE")]
     Deadline,
+    #[serde(rename = "E_RECONCILE")]
     Reconcile,
 }
 
