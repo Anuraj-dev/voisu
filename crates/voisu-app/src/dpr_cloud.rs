@@ -22,6 +22,9 @@ use voisu_core::{
 /// Preferred in-budget candidate from the approved #140 matrix.
 pub const DPR_GROQ_MODEL: &str = "openai/gpt-oss-20b";
 pub const DPR_GROQ_REASONING_EFFORT: &str = "low";
+pub const DPR_FORMAT_GROQ_MODEL: &str = "qwen/qwen3.6-27b";
+pub const DPR_FORMAT_GROQ_REASONING_EFFORT: &str = "none";
+pub const DPR_FORMAT_GROQ_REASONING_FORMAT: &str = "hidden";
 pub const DPR_GROQ_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
 
 /// Retained only for explicit evaluation or a future measured in-budget path.
@@ -47,7 +50,7 @@ const RESPONSE_INSTRUCTION: &str = "Return the smallest valid candidate under th
 
 const FORMAT_EDIT_SYSTEM_INSTRUCTION: &str = "You propose localized formatting edits for English speech. Preserve wording and spoken grammar. Do not invent requirements, paraphrases, explanations, or technical assumptions. Allowed kinds only: punctuation, casing, whitespace_layout, filler_removal, clear_backtrack_removal, quote_conversion, structure, bounded_wording. Never return a polished transcript or free-form Delivery string. Reconciliation is a different job — do not select sources or emit derivation spans. Return the small-edit JSON contract only.";
 
-const FORMAT_EDIT_RESPONSE_INSTRUCTION: &str = "Return the smallest valid edit list under the supplied JSON schema. Each edit must name a UTF-8 range on the supplied base, the exact before text, the replacement after text, and a closed kind. Empty edits means leave the base unchanged. One call only. Never emit a rendered or output_text field.";
+const FORMAT_EDIT_RESPONSE_INSTRUCTION: &str = "Return the smallest valid edit list under the supplied JSON contract. Each edit must name a UTF-8 range on the supplied base, the exact before text, the replacement after text, and a closed kind. Empty edits means leave the base unchanged. One call only. Never emit a rendered or output_text field.";
 
 /// Closed diagnostic classification. Variants intentionally carry no provider
 /// response body, request content, transcript, or credential.
@@ -368,22 +371,19 @@ fn build_format_edit_request(request: &DprCloudRequest<'_>) -> Value {
         "base_text": request.selected_source,
         "policy": request.policy.as_str(),
         "closed_kinds": CLOSED_FORMAT_EDIT_KINDS,
+        "response_schema": format_edit_schema(),
         "response_instruction": FORMAT_EDIT_RESPONSE_INSTRUCTION,
     });
 
     json!({
-        "model": DPR_GROQ_MODEL,
-        "reasoning_effort": DPR_GROQ_REASONING_EFFORT,
+        "model": DPR_FORMAT_GROQ_MODEL,
+        "reasoning_effort": DPR_FORMAT_GROQ_REASONING_EFFORT,
+        "reasoning_format": DPR_FORMAT_GROQ_REASONING_FORMAT,
         "temperature": 0,
         "stream": false,
         "max_completion_tokens": DPR_MAX_COMPLETION_TOKENS,
         "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "voisu_dpr_format_edits",
-                "strict": true,
-                "schema": format_edit_schema(),
-            }
+            "type": "json_object",
         },
         "messages": [
             {"role": "system", "content": FORMAT_EDIT_SYSTEM_INSTRUCTION},
@@ -811,6 +811,8 @@ mod tests {
         let body = body_from_request(&raw_request);
         assert_eq!(body["model"], DPR_GROQ_MODEL);
         assert_eq!(body["reasoning_effort"], DPR_GROQ_REASONING_EFFORT);
+        assert!(body.get("reasoning_format").is_none());
+        assert_eq!(body["temperature"], 0);
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
         let schema = &body["response_format"]["json_schema"]["schema"];
@@ -1022,6 +1024,9 @@ mod tests {
     fn model_policy_matches_approved_constants_without_claiming_a_default() {
         assert_eq!(DPR_GROQ_MODEL, "openai/gpt-oss-20b");
         assert_eq!(DPR_GROQ_REASONING_EFFORT, "low");
+        assert_eq!(DPR_FORMAT_GROQ_MODEL, "qwen/qwen3.6-27b");
+        assert_eq!(DPR_FORMAT_GROQ_REASONING_EFFORT, "none");
+        assert_eq!(DPR_FORMAT_GROQ_REASONING_FORMAT, "hidden");
         assert_eq!(DPR_GEMINI_FLASH_LITE_MODEL, "gemini-3.5-flash-lite");
         assert_eq!(DPR_GEMINI_FLASH_MODEL, "gemini-3.6-flash");
         const { assert!(!DPR_HAS_SOLE_PRODUCTION_READY_CLOUD_DEFAULT) };
@@ -1065,7 +1070,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn small_edit_contract_requests_format_schema_not_derivation() {
+    async fn small_edit_contract_requests_qwen_json_object_not_derivation() {
         let (endpoint, request_rx, count) = canned_server(
             200,
             provider_response(valid_format_edits()),
@@ -1101,21 +1106,26 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
         let body = body_from_request(&request_rx.await.expect("captured request"));
+        assert_eq!(body["model"], DPR_FORMAT_GROQ_MODEL);
         assert_eq!(
-            body["response_format"]["json_schema"]["name"],
-            "voisu_dpr_format_edits"
+            body["reasoning_effort"],
+            DPR_FORMAT_GROQ_REASONING_EFFORT
         );
-        let schema = &body["response_format"]["json_schema"]["schema"];
-        assert!(schema["properties"].get("derivation").is_none());
-        assert!(schema["properties"].get("reconciliation").is_none());
         assert_eq!(
-            schema["properties"]["edits"]["items"]["properties"]["kind"]["enum"],
+            body["reasoning_format"],
+            DPR_FORMAT_GROQ_REASONING_FORMAT
+        );
+        assert_eq!(body["temperature"], 0);
+        assert_eq!(body["response_format"], json!({"type": "json_object"}));
+        let user = body["messages"][1]["content"].as_str().expect("user");
+        let payload: Value = serde_json::from_str(user).expect("user payload");
+        assert_eq!(
+            payload["response_schema"]["properties"]["edits"]["items"]["properties"]["kind"]
+                ["enum"],
             json!(CLOSED_FORMAT_EDIT_KINDS)
         );
-        let user = body["messages"][1]["content"].as_str().expect("user");
-        assert!(user.contains("closed_kinds"));
-        assert!(!user.contains("closed_conversions"));
-        assert!(!user.contains("host_selection"));
+        assert!(payload.get("closed_conversions").is_none());
+        assert!(payload.get("host_selection").is_none());
         assert!(body["messages"][0]["content"]
             .as_str()
             .expect("system")
