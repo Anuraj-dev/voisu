@@ -1,7 +1,7 @@
 //! Minimal persisted daemon configuration.
 //!
-//! Today this holds the Deepgram Provider switch, Delivery mode, and Writing
-//! Mode. It is persisted as TOML at
+//! Today this holds the Deepgram Provider switch, Delivery mode, Writing Mode,
+//! and Developer Prompt Rendering policy. It is persisted as TOML at
 //! `$XDG_CONFIG_HOME/voisu/config.toml` (default `~/.config/voisu/config.toml`),
 //! read once at daemon start.
 //!
@@ -10,13 +10,23 @@
 //! fast Groq-only path with `voisu deepgram off` (or the
 //! `VOISU_DISABLE_DEEPGRAM` env override). Writing Mode defaults to **Smart**
 //! on a fresh install; unreadable files and unknown values fail closed to
-//! Literal. The file is deliberately hand-parsed — a few small root keys do not
-//! justify a full TOML dependency, and the parser tolerates comments, blank
-//! lines, surrounding whitespace, and unrelated keys so a hand-edited file
-//! degrades to a defined default rather than erroring.
+//! Literal. Rendering Policy defaults to **Adaptive**; unreadable files and
+//! unknown values fail closed to **Natural** (local-only safest). The file is
+//! deliberately hand-parsed — a few small root keys do not justify a full TOML
+//! dependency, and the parser tolerates comments, blank lines, surrounding
+//! whitespace, and unrelated keys so a hand-edited file degrades to a defined
+//! default rather than erroring.
+//!
+//! **Snapshot rule (DPR):** `rendering_policy` is intended to be snapshotted at
+//! Recording start. Mid-utterance config flips must not affect in-flight work.
+//! Pure resolution tests cover the snapshot contract here; full daemon wire is
+//! DPR-T5. Persisting the policy does **not** change Smart Writing outcomes.
 
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+
+/// Re-export for CLI and callers that already import config modes.
+pub use voisu_core::RenderingPolicy;
 
 /// The single configuration key: whether the Deepgram Provider is enabled.
 const DEEPGRAM_ENABLED_KEY: &str = "deepgram_enabled";
@@ -26,6 +36,9 @@ const DELIVERY_MODE_KEY: &str = "delivery_mode";
 
 /// The root configuration key selecting Smart vs Literal Writing Mode.
 const WRITING_MODE_KEY: &str = "writing_mode";
+
+/// The root configuration key selecting Developer Prompt Rendering policy.
+const RENDERING_POLICY_KEY: &str = "rendering_policy";
 
 /// How Voisu delivers a final Transcript after preserving it on the clipboard.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -88,6 +101,19 @@ enum WritingModeLoad {
     Known(WritingMode),
 }
 
+/// Outcome of loading `rendering_policy` from a config source. Distinct from a
+/// plain `Option` so missing (Adaptive default) and fail-closed (Natural)
+/// never collapse into the same path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderingPolicyLoad {
+    /// File missing, or readable file with no root-scope `rendering_policy` key.
+    Missing,
+    /// Unreadable file, or a present root key with an unrecognised value.
+    FailClosed,
+    /// A recognised `natural`, `adaptive`, or `structured` value.
+    Known(RenderingPolicy),
+}
+
 /// Presence disables the Deepgram Provider regardless of the persisted file,
 /// mirroring `VOISU_DISABLE_DIRECT_DELIVERY`/`VOISU_DISABLE_SHORTCUTS`.
 const DISABLE_DEEPGRAM_ENV: &str = "VOISU_DISABLE_DEEPGRAM";
@@ -101,6 +127,11 @@ pub const DEFAULT_DEEPGRAM_ENABLED: bool = true;
 /// optional Minimal Grammar when eligible). Unreadable or invalid config fails
 /// closed to Literal instead — see [`resolve_writing_mode`].
 pub const DEFAULT_WRITING_MODE: WritingMode = WritingMode::Smart;
+
+/// Rendering Policy defaults to Adaptive (constants JSON / #144). Unreadable
+/// or invalid config fails closed to Natural (local-only safest) — see
+/// [`resolve_rendering_policy`].
+pub const DEFAULT_RENDERING_POLICY: RenderingPolicy = voisu_core::DEFAULT_RENDERING_POLICY;
 
 /// Whether the Deepgram Provider is enabled for Recordings.
 ///
@@ -154,6 +185,25 @@ pub fn set_writing_mode(mode: WritingMode) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// The configured Developer Prompt Rendering policy.
+///
+/// A missing file or missing key resolves to [`DEFAULT_RENDERING_POLICY`]
+/// (Adaptive). An unreadable file or a present but unrecognised value fails
+/// closed to [`RenderingPolicy::Natural`]. There is no environment override
+/// in v1. Callers that process a Recording should snapshot this value at
+/// Recording start so mid-utterance config flips do not affect in-flight work.
+pub fn rendering_policy() -> RenderingPolicy {
+    resolve_rendering_policy(read_rendering_policy(&config_path()))
+}
+
+/// Persists the Rendering Policy, creating the `voisu` config directory if
+/// needed, and returns the path written so the CLI can report it.
+pub fn set_rendering_policy(policy: RenderingPolicy) -> Result<PathBuf, String> {
+    let path = config_path();
+    write_rendering_policy(&path, policy)?;
+    Ok(path)
+}
+
 /// Resolves the effective setting from the env override and the persisted value.
 /// Pure so the precedence rule is testable without touching the process
 /// environment or the filesystem.
@@ -177,6 +227,16 @@ fn resolve_writing_mode(loaded: WritingModeLoad) -> WritingMode {
         WritingModeLoad::Missing => DEFAULT_WRITING_MODE,
         WritingModeLoad::FailClosed => WritingMode::Literal,
         WritingModeLoad::Known(mode) => mode,
+    }
+}
+
+/// Pure Rendering Policy resolution. Missing → Adaptive; fail-closed →
+/// Natural; known value → that policy. No environment override participates.
+fn resolve_rendering_policy(loaded: RenderingPolicyLoad) -> RenderingPolicy {
+    match loaded {
+        RenderingPolicyLoad::Missing => DEFAULT_RENDERING_POLICY,
+        RenderingPolicyLoad::FailClosed => RenderingPolicy::Natural,
+        RenderingPolicyLoad::Known(policy) => policy,
     }
 }
 
@@ -244,6 +304,24 @@ fn read_writing_mode(path: &Path) -> WritingModeLoad {
                 path.display()
             );
             WritingModeLoad::FailClosed
+        }
+    }
+}
+
+/// Reads the persisted Rendering Policy. A missing file is
+/// [`RenderingPolicyLoad::Missing`] (Adaptive default). A genuine read failure
+/// emits a bounded diagnostic and returns [`RenderingPolicyLoad::FailClosed`]
+/// (Natural).
+fn read_rendering_policy(path: &Path) -> RenderingPolicyLoad {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => parse_rendering_policy(&contents),
+        Err(error) if error.kind() == ErrorKind::NotFound => RenderingPolicyLoad::Missing,
+        Err(error) => {
+            eprintln!(
+                "voisu: ignoring unreadable config at {}: {error}",
+                path.display()
+            );
+            RenderingPolicyLoad::FailClosed
         }
     }
 }
@@ -342,6 +420,47 @@ fn parse_writing_mode(contents: &str) -> WritingModeLoad {
     WritingModeLoad::Missing
 }
 
+/// Parses the root-scope `rendering_policy` string. Missing key →
+/// [`RenderingPolicyLoad::Missing`]; present but unrecognised →
+/// [`RenderingPolicyLoad::FailClosed`] plus a bounded, value-free diagnostic;
+/// `natural`/`adaptive`/`structured` → Known. Tolerance and table scoping
+/// mirror [`parse_writing_mode`].
+fn parse_rendering_policy(contents: &str) -> RenderingPolicyLoad {
+    for line in contents.lines() {
+        let line = strip_comment(line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            return RenderingPolicyLoad::Missing;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != RENDERING_POLICY_KEY {
+            continue;
+        }
+        // Both TOML string forms are accepted so a hand-edited single-quoted
+        // literal string is honored rather than fail-closing to Natural.
+        return match value.trim() {
+            "\"natural\"" | "'natural'" => RenderingPolicyLoad::Known(RenderingPolicy::Natural),
+            "\"adaptive\"" | "'adaptive'" => RenderingPolicyLoad::Known(RenderingPolicy::Adaptive),
+            "\"structured\"" | "'structured'" => {
+                RenderingPolicyLoad::Known(RenderingPolicy::Structured)
+            }
+            // Spec §12 / DAG T0: unknown or corrupt present value fails closed
+            // to Natural with one bounded diagnostic (no raw config dump).
+            _ => {
+                eprintln!(
+                    "voisu: unrecognized rendering_policy in config; failing closed to natural"
+                );
+                RenderingPolicyLoad::FailClosed
+            }
+        };
+    }
+    RenderingPolicyLoad::Missing
+}
+
 /// Returns `line` with any comment removed. Supported values are simple
 /// booleans or fixed quoted strings, so a `#` anywhere begins a comment.
 fn strip_comment(line: &str) -> &str {
@@ -352,19 +471,22 @@ fn strip_comment(line: &str) -> &str {
 /// merging so a rewrite never accumulates duplicate headers.
 const MANAGED_LINES: [&str; 3] = [
     "# Voisu daemon configuration.",
-    "# Recording Provider, Delivery, and Writing Mode settings; read once at daemon start.",
-    "# Managed by the `voisu deepgram`, `voisu delivery`, and `voisu writing` commands.",
+    "# Recording Provider, Delivery, Writing Mode, and Rendering Policy settings; read once at daemon start.",
+    "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, and `voisu rendering` commands.",
 ];
 
 /// Managed header lines emitted by earlier releases. Stripped alongside
 /// [`MANAGED_LINES`] so upgrading an existing config never strands stale
 /// headers above the rewritten block.
-const LEGACY_MANAGED_LINES: [&str; 4] = [
+const LEGACY_MANAGED_LINES: [&str; 6] = [
     "# Whether the Deepgram Provider participates in a Recording.",
     "# Managed by `voisu deepgram on|off`; read once at daemon start.",
     // Pre-Writing-Mode managed body lines (delivery-only era).
     "# Recording Provider and Delivery settings; read once at daemon start.",
     "# Managed by the `voisu deepgram` and `voisu delivery` commands.",
+    // Pre-Rendering-Policy managed body lines (writing-mode era).
+    "# Recording Provider, Delivery, and Writing Mode settings; read once at daemon start.",
+    "# Managed by the `voisu deepgram`, `voisu delivery`, and `voisu writing` commands.",
 ];
 
 /// Persists the toggle, creating the parent `voisu` directory if needed and
@@ -372,17 +494,22 @@ const LEGACY_MANAGED_LINES: [&str; 4] = [
 /// same-directory temp file is fully written then renamed into place, so an
 /// interrupted write never leaves a partially written config.
 fn write_setting(path: &Path, enabled: bool) -> Result<(), String> {
-    write_config(path, Some(enabled), None, None)
+    write_config(path, Some(enabled), None, None, None)
 }
 
 /// Persists the Delivery mode without discarding the other managed root keys.
 fn write_delivery_mode(path: &Path, mode: DeliveryMode) -> Result<(), String> {
-    write_config(path, None, Some(mode), None)
+    write_config(path, None, Some(mode), None, None)
 }
 
 /// Persists the Writing Mode without discarding the other managed root keys.
 fn write_writing_mode(path: &Path, mode: WritingMode) -> Result<(), String> {
-    write_config(path, None, None, Some(mode))
+    write_config(path, None, None, Some(mode), None)
+}
+
+/// Persists the Rendering Policy without discarding the other managed root keys.
+fn write_rendering_policy(path: &Path, policy: RenderingPolicy) -> Result<(), String> {
+    write_config(path, None, None, None, Some(policy))
 }
 
 /// Rewrites managed root settings while preserving every other line. Only the
@@ -393,6 +520,7 @@ fn write_config(
     deepgram_enabled: Option<bool>,
     delivery_mode: Option<DeliveryMode>,
     writing_mode: Option<WritingMode>,
+    rendering_policy: Option<RenderingPolicy>,
 ) -> Result<(), String> {
     let parent = path
         .parent()
@@ -416,7 +544,13 @@ fn write_config(
     write_atomic(
         path,
         parent,
-        &merge_content(&existing, deepgram_enabled, delivery_mode, writing_mode),
+        &merge_content(
+            &existing,
+            deepgram_enabled,
+            delivery_mode,
+            writing_mode,
+            rendering_policy,
+        ),
     )
 }
 
@@ -445,6 +579,7 @@ fn merge_content(
     deepgram_enabled: Option<bool>,
     delivery_mode: Option<DeliveryMode>,
     writing_mode: Option<WritingMode>,
+    rendering_policy: Option<RenderingPolicy>,
 ) -> String {
     let mut in_root = true;
     let mut preserved: Vec<&str> = Vec::new();
@@ -470,16 +605,27 @@ fn merge_content(
             && trimmed
                 .split_once('=')
                 .is_some_and(|(key, _)| key.trim() == WRITING_MODE_KEY);
+        let is_root_rendering_policy = rendering_policy.is_some()
+            && in_root
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == RENDERING_POLICY_KEY);
         if is_managed_comment
             || is_root_deepgram_enabled
             || is_root_delivery_mode
             || is_root_writing_mode
+            || is_root_rendering_policy
         {
             continue;
         }
         preserved.push(line);
     }
-    let mut out = render(deepgram_enabled, delivery_mode, writing_mode);
+    let mut out = render(
+        deepgram_enabled,
+        delivery_mode,
+        writing_mode,
+        rendering_policy,
+    );
     let body = preserved.join("\n");
     let body = body.trim_matches('\n');
     if !body.is_empty() {
@@ -495,6 +641,7 @@ fn render(
     deepgram_enabled: Option<bool>,
     delivery_mode: Option<DeliveryMode>,
     writing_mode: Option<WritingMode>,
+    rendering_policy: Option<RenderingPolicy>,
 ) -> String {
     let mut out = String::new();
     for line in MANAGED_LINES {
@@ -509,6 +656,12 @@ fn render(
     }
     if let Some(mode) = writing_mode {
         out.push_str(&format!("{WRITING_MODE_KEY} = \"{}\"\n", mode.as_str()));
+    }
+    if let Some(policy) = rendering_policy {
+        out.push_str(&format!(
+            "{RENDERING_POLICY_KEY} = \"{}\"\n",
+            policy.as_str()
+        ));
     }
     out
 }
@@ -693,20 +846,38 @@ other_key = 5
     #[test]
     fn a_rendered_file_round_trips_through_the_parser() {
         assert_eq!(
-            parse_deepgram_enabled(&render(Some(true), None, None)),
+            parse_deepgram_enabled(&render(Some(true), None, None, None)),
             Some(true)
         );
         assert_eq!(
-            parse_deepgram_enabled(&render(Some(false), None, None)),
+            parse_deepgram_enabled(&render(Some(false), None, None, None)),
             Some(false)
         );
         assert_eq!(
-            parse_writing_mode(&render(None, None, Some(WritingMode::Literal))),
+            parse_writing_mode(&render(None, None, Some(WritingMode::Literal), None)),
             WritingModeLoad::Known(WritingMode::Literal)
         );
         assert_eq!(
-            parse_writing_mode(&render(None, None, Some(WritingMode::Smart))),
+            parse_writing_mode(&render(None, None, Some(WritingMode::Smart), None)),
             WritingModeLoad::Known(WritingMode::Smart)
+        );
+        assert_eq!(
+            parse_rendering_policy(&render(
+                None,
+                None,
+                None,
+                Some(RenderingPolicy::Structured)
+            )),
+            RenderingPolicyLoad::Known(RenderingPolicy::Structured)
+        );
+        assert_eq!(
+            parse_rendering_policy(&render(
+                None,
+                None,
+                None,
+                Some(RenderingPolicy::Adaptive)
+            )),
+            RenderingPolicyLoad::Known(RenderingPolicy::Adaptive)
         );
     }
 
@@ -832,6 +1003,222 @@ other_key = 5
         assert_eq!(held_during_recording, WritingMode::Literal);
         assert_eq!(snapshot, WritingMode::Literal);
         assert_eq!(held_during_recording, snapshot);
+    }
+
+    #[test]
+    fn rendering_policy_defaults_to_adaptive_when_nothing_is_persisted() {
+        assert_eq!(DEFAULT_RENDERING_POLICY, RenderingPolicy::Adaptive);
+        assert_eq!(RenderingPolicy::default(), RenderingPolicy::Adaptive);
+        assert_eq!(
+            resolve_rendering_policy(RenderingPolicyLoad::Missing),
+            RenderingPolicy::Adaptive
+        );
+        assert_eq!(
+            resolve_rendering_policy(parse_rendering_policy("other_key = true\n")),
+            RenderingPolicy::Adaptive
+        );
+        assert_eq!(
+            read_rendering_policy(Path::new("/nonexistent/voisu/config.toml")),
+            RenderingPolicyLoad::Missing
+        );
+    }
+
+    #[test]
+    fn rendering_policies_parse_and_invalid_values_fail_closed_to_natural() {
+        assert_eq!(
+            parse_rendering_policy("rendering_policy = \"natural\"\n"),
+            RenderingPolicyLoad::Known(RenderingPolicy::Natural)
+        );
+        assert_eq!(
+            parse_rendering_policy("rendering_policy = \"adaptive\"\n"),
+            RenderingPolicyLoad::Known(RenderingPolicy::Adaptive)
+        );
+        assert_eq!(
+            parse_rendering_policy("rendering_policy = \"structured\"\n"),
+            RenderingPolicyLoad::Known(RenderingPolicy::Structured)
+        );
+        // Unknown present values emit a bounded diagnostic (stderr) and still
+        // resolve to Natural — diagnostic content is not asserted.
+        assert_eq!(
+            parse_rendering_policy("rendering_policy = \"future\"\n"),
+            RenderingPolicyLoad::FailClosed
+        );
+        assert_eq!(
+            resolve_rendering_policy(parse_rendering_policy(
+                "rendering_policy = \"future\"\n"
+            )),
+            RenderingPolicy::Natural
+        );
+        assert_eq!(
+            resolve_rendering_policy(parse_rendering_policy("rendering_policy = maybe\n")),
+            RenderingPolicy::Natural
+        );
+        assert_eq!(
+            resolve_rendering_policy(RenderingPolicyLoad::FailClosed),
+            RenderingPolicy::Natural
+        );
+        assert_eq!(
+            resolve_rendering_policy(RenderingPolicyLoad::Known(RenderingPolicy::Structured)),
+            RenderingPolicy::Structured
+        );
+    }
+
+    #[test]
+    fn fail_closed_rendering_policy_always_resolves_to_natural() {
+        // Spec §12 / DAG T0: FailClosed (unreadable or unknown value) → Natural.
+        // Bounded diagnostic is emitted on the load path; resolution is what we assert.
+        assert_eq!(
+            resolve_rendering_policy(RenderingPolicyLoad::FailClosed),
+            RenderingPolicy::Natural
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "rendering_policy = \"not-a-policy\"\n").unwrap();
+        assert_eq!(
+            read_rendering_policy(&path),
+            RenderingPolicyLoad::FailClosed
+        );
+        assert_eq!(
+            resolve_rendering_policy(read_rendering_policy(&path)),
+            RenderingPolicy::Natural
+        );
+    }
+
+    #[test]
+    fn single_quoted_rendering_policies_are_honored() {
+        assert_eq!(
+            parse_rendering_policy("rendering_policy = 'natural'\n"),
+            RenderingPolicyLoad::Known(RenderingPolicy::Natural)
+        );
+        assert_eq!(
+            parse_rendering_policy("rendering_policy = 'structured'\n"),
+            RenderingPolicyLoad::Known(RenderingPolicy::Structured)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_config_fails_closed_to_natural_for_rendering_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, [0xff, 0xfe, 0x00, 0x42]).unwrap();
+        assert_eq!(
+            read_rendering_policy(&path),
+            RenderingPolicyLoad::FailClosed
+        );
+        assert_eq!(
+            resolve_rendering_policy(read_rendering_policy(&path)),
+            RenderingPolicy::Natural
+        );
+    }
+
+    #[test]
+    fn writing_then_reading_rendering_policy_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voisu").join("config.toml");
+        write_rendering_policy(&path, RenderingPolicy::Natural).unwrap();
+        assert_eq!(
+            read_rendering_policy(&path),
+            RenderingPolicyLoad::Known(RenderingPolicy::Natural)
+        );
+        write_rendering_policy(&path, RenderingPolicy::Structured).unwrap();
+        assert_eq!(
+            read_rendering_policy(&path),
+            RenderingPolicyLoad::Known(RenderingPolicy::Structured)
+        );
+        write_rendering_policy(&path, RenderingPolicy::Adaptive).unwrap();
+        assert_eq!(
+            read_rendering_policy(&path),
+            RenderingPolicyLoad::Known(RenderingPolicy::Adaptive)
+        );
+    }
+
+    #[test]
+    fn a_table_scoped_rendering_policy_is_not_read_as_the_root_setting() {
+        assert_eq!(
+            parse_rendering_policy("[other]\nrendering_policy = \"natural\"\n"),
+            RenderingPolicyLoad::Missing
+        );
+        assert_eq!(
+            resolve_rendering_policy(parse_rendering_policy(
+                "[other]\nrendering_policy = \"natural\"\n"
+            )),
+            RenderingPolicy::Adaptive
+        );
+    }
+
+    #[test]
+    fn a_root_rendering_policy_before_a_table_is_honoured() {
+        assert_eq!(
+            parse_rendering_policy("rendering_policy = \"natural\"\n[other]\nx = 1\n"),
+            RenderingPolicyLoad::Known(RenderingPolicy::Natural)
+        );
+    }
+
+    #[test]
+    fn rendering_policy_snapshot_stays_stable_when_config_file_changes() {
+        // Real resolution: snapshot Natural from disk, rewrite config to
+        // Structured, held snapshot must stay Natural while a fresh resolve
+        // returns Structured (daemon wire of the snapshot is T5).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voisu").join("config.toml");
+        write_rendering_policy(&path, RenderingPolicy::Natural).unwrap();
+
+        let snapshot =
+            resolve_rendering_policy(read_rendering_policy(&path));
+        assert_eq!(snapshot, RenderingPolicy::Natural);
+
+        write_rendering_policy(&path, RenderingPolicy::Structured).unwrap();
+
+        let held_during_recording = snapshot;
+        assert_eq!(held_during_recording, RenderingPolicy::Natural);
+        assert_eq!(
+            resolve_rendering_policy(read_rendering_policy(&path)),
+            RenderingPolicy::Structured
+        );
+        assert_eq!(
+            read_rendering_policy(&path),
+            RenderingPolicyLoad::Known(RenderingPolicy::Structured)
+        );
+    }
+
+    #[test]
+    fn setting_rendering_policy_preserves_the_other_root_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voisu").join("config.toml");
+
+        write_setting(&path, false).unwrap();
+        write_delivery_mode(&path, DeliveryMode::Clipboard).unwrap();
+        write_writing_mode(&path, WritingMode::Literal).unwrap();
+        write_rendering_policy(&path, RenderingPolicy::Structured).unwrap();
+
+        write_rendering_policy(&path, RenderingPolicy::Natural).unwrap();
+        assert_eq!(read_setting(&path), Some(false));
+        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Clipboard));
+        assert_eq!(
+            read_writing_mode(&path),
+            WritingModeLoad::Known(WritingMode::Literal)
+        );
+        assert_eq!(
+            read_rendering_policy(&path),
+            RenderingPolicyLoad::Known(RenderingPolicy::Natural)
+        );
+
+        write_setting(&path, true).unwrap();
+        assert_eq!(read_setting(&path), Some(true));
+        assert_eq!(
+            read_rendering_policy(&path),
+            RenderingPolicyLoad::Known(RenderingPolicy::Natural)
+        );
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.matches(DEEPGRAM_ENABLED_KEY).count(), 1, "{contents}");
+        assert_eq!(contents.matches(DELIVERY_MODE_KEY).count(), 1, "{contents}");
+        assert_eq!(contents.matches(WRITING_MODE_KEY).count(), 1, "{contents}");
+        assert_eq!(
+            contents.matches(RENDERING_POLICY_KEY).count(),
+            1,
+            "{contents}"
+        );
     }
 
     #[test]

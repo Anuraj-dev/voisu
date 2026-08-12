@@ -58,6 +58,13 @@ pub use grammar_safety::{
     MAX_GRAMMAR_JSON_NODES, MAX_GRAMMAR_RESPONSE_BYTES,
 };
 
+mod prompt_rendering;
+pub use prompt_rendering::{
+    CloudRequest, RenderingPolicy, RenderingRoute, TimingCertainty, CLOSED_STRUCTURED_LABELS,
+    DEFAULT_RENDERING_POLICY, DELIVERY_AUTO_SEND, DELIVERY_DEADLINE, DELIVERY_DEADLINE_MS,
+    DELIVERY_LIVE_TYPE, DELIVERY_REPLACE_DELIVERED, DELIVERY_STATE_UNSENT,
+};
+
 // Paged diagnostic responses are negotiated per REQUEST (see `Request::paged`),
 // never by protocol version. The version is interpolated into the socket path,
 // the single-instance lock, and the store directory, so bumping it partitions
