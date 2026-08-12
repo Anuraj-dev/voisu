@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use regex::Regex;
 use serde::Deserialize;
 
+use crate::local_baseline::LocalBaseline;
 use crate::prompt_rendering::{
     RenderingPolicy, CLOSED_STRUCTURED_LABELS, DELIVERY_AUTO_SEND, DELIVERY_LIVE_TYPE,
     DELIVERY_REPLACE_DELIVERED, DELIVERY_STATE_UNSENT,
@@ -21,6 +22,25 @@ use crate::text_sha256_fingerprint;
 
 /// Contract id for diagnostics / later pipeline wiring.
 pub const COMPOSE_GATE_CONTRACT_ID: &str = "voisu-dpr-compose-gate-v1.1.2:#158";
+
+// ─── Untrusted candidate JSON bounds (grammar_safety spirit; research thresholds) ──
+
+/// Max raw candidate JSON body (tighter than corpus file bound; mirrors grammar).
+pub const MAX_COMPOSE_CANDIDATE_BYTES: usize = 65_536;
+/// Max JSON nesting depth for a candidate body.
+pub const MAX_COMPOSE_JSON_DEPTH: usize = 14;
+/// Max JSON nodes (objects/arrays/scalars) in a candidate body.
+pub const MAX_COMPOSE_JSON_NODES: usize = 30_000;
+/// Max `removals[]` entries.
+pub const MAX_COMPOSE_REMOVALS: usize = 32;
+/// Max `conversions[]` entries.
+pub const MAX_COMPOSE_CONVERSIONS: usize = 32;
+/// Max `labels[]` entries (closed catalog size).
+pub const MAX_COMPOSE_LABELS: usize = 8;
+/// Max `derivation[]` spans.
+pub const MAX_COMPOSE_DERIVATION_SPANS: usize = 128;
+/// Max UTF-8 bytes per string field on the candidate.
+pub const MAX_COMPOSE_FIELD_UTF8_BYTES: usize = 2_048;
 
 /// Closed conversion catalog (corpus v1.1.2 / #139 prototype `DEFAULT_CONVERSIONS`).
 ///
@@ -403,6 +423,7 @@ pub enum SpanKind {
 
 /// Untrusted structured candidate (typed). No free-form `final` field exists.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct StructuredCandidate {
     pub schema_version: String,
     pub base_fingerprint: String,
@@ -415,12 +436,14 @@ pub struct StructuredCandidate {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Reconciliation {
     pub selected_provider: String,
     pub reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RemovalClaim {
     pub kind: RemovalKind,
     pub certainty: ComposeCertainty,
@@ -429,6 +452,7 @@ pub struct RemovalClaim {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ConversionClaim {
     pub id: String,
     pub source_provider: String,
@@ -436,12 +460,14 @@ pub struct ConversionClaim {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LayoutClaim {
     pub decision: LayoutDecision,
     pub certainty: ComposeCertainty,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LabelClaim {
     pub label: String,
     pub source_provider: String,
@@ -449,16 +475,15 @@ pub struct LabelClaim {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DerivationSpan {
     pub kind: SpanKind,
-    #[serde(default)]
+    /// Null for `layout_break`; required evidence for keep/remove/convert/label.
     pub source_provider: Option<String>,
-    #[serde(default)]
+    /// Empty only for `layout_break`; required for consuming spans (no silent default).
     pub source_text: String,
     pub output_text: String,
-    #[serde(default)]
     pub conversion_id: Option<String>,
-    #[serde(default)]
     pub label: Option<String>,
 }
 
@@ -466,10 +491,13 @@ pub struct DerivationSpan {
 ///
 /// All model influence arrives only as [`StructuredCandidate`] (or its absence).
 /// There is no field for free-form model final prose.
+///
+/// `local_baseline` is a sealed [`LocalBaseline`] (host-organized text), never a
+/// free model `&str`.
 #[derive(Clone, Debug)]
 pub struct ComposeInput<'a> {
-    /// Deterministic local baseline (always Delivery-ready).
-    pub local_baseline: &'a str,
+    /// Deterministic local baseline (always Delivery-ready; host-sealed).
+    pub local_baseline: &'a LocalBaseline,
     /// Host-selected source fingerprint (`sha256:…` of selected source UTF-8).
     pub base_fingerprint: &'a str,
     /// Available STT sources.
@@ -490,12 +518,113 @@ pub struct ComposeInput<'a> {
 
 /// Parse untrusted candidate JSON into a typed [`StructuredCandidate`].
 ///
-/// On any parse/shape failure returns `None` so the caller can pass
-/// `candidate: None` with an appropriate [`CloudOutcome`] (typically
-/// [`CloudOutcome::SchemaFailure`]).
+/// Fail-closed: returns `None` on invalid JSON, unknown fields, missing required
+/// keys, oversize body, excessive depth/nodes, or over-limit claim/span counts
+/// and field lengths. Caller passes `candidate: None` with
+/// [`CloudOutcome::SchemaFailure`] (or similar).
 #[must_use]
 pub fn parse_structured_candidate_json(raw: &[u8]) -> Option<StructuredCandidate> {
-    serde_json::from_slice(raw).ok()
+    if raw.len() > MAX_COMPOSE_CANDIDATE_BYTES {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let (depth, nodes) = json_shape(&value);
+    if depth > MAX_COMPOSE_JSON_DEPTH || nodes > MAX_COMPOSE_JSON_NODES {
+        return None;
+    }
+    let candidate: StructuredCandidate = serde_json::from_value(value).ok()?;
+    if !candidate_within_bounds(&candidate) {
+        return None;
+    }
+    Some(candidate)
+}
+
+fn json_shape(value: &serde_json::Value) -> (usize, usize) {
+    match value {
+        serde_json::Value::Array(values) => {
+            let mut depth: usize = 1;
+            let mut nodes: usize = 1;
+            for child in values {
+                let (child_depth, child_nodes) = json_shape(child);
+                depth = depth.max(child_depth.saturating_add(1));
+                nodes = nodes.saturating_add(child_nodes);
+            }
+            (depth, nodes)
+        }
+        serde_json::Value::Object(values) => {
+            let mut depth: usize = 1;
+            let mut nodes: usize = 1;
+            for child in values.values() {
+                let (child_depth, child_nodes) = json_shape(child);
+                depth = depth.max(child_depth.saturating_add(1));
+                nodes = nodes.saturating_add(child_nodes);
+            }
+            (depth, nodes)
+        }
+        _ => (1, 1),
+    }
+}
+
+fn candidate_within_bounds(candidate: &StructuredCandidate) -> bool {
+    if candidate.removals.len() > MAX_COMPOSE_REMOVALS
+        || candidate.conversions.len() > MAX_COMPOSE_CONVERSIONS
+        || candidate.labels.len() > MAX_COMPOSE_LABELS
+        || candidate.derivation.len() > MAX_COMPOSE_DERIVATION_SPANS
+    {
+        return false;
+    }
+    if exceeds_field_bound(&candidate.schema_version)
+        || exceeds_field_bound(&candidate.base_fingerprint)
+        || exceeds_field_bound(&candidate.reconciliation.selected_provider)
+        || exceeds_field_bound(&candidate.reconciliation.reason)
+    {
+        return false;
+    }
+    for removal in &candidate.removals {
+        if exceeds_field_bound(&removal.source_provider)
+            || exceeds_field_bound(&removal.source_span_text)
+        {
+            return false;
+        }
+    }
+    for conversion in &candidate.conversions {
+        if exceeds_field_bound(&conversion.id)
+            || exceeds_field_bound(&conversion.source_provider)
+            || exceeds_field_bound(&conversion.source_span_text)
+        {
+            return false;
+        }
+    }
+    for label in &candidate.labels {
+        if exceeds_field_bound(&label.label)
+            || exceeds_field_bound(&label.source_provider)
+            || exceeds_field_bound(&label.source_span_text)
+        {
+            return false;
+        }
+    }
+    for span in &candidate.derivation {
+        if exceeds_field_bound(&span.source_text) || exceeds_field_bound(&span.output_text) {
+            return false;
+        }
+        if span
+            .source_provider
+            .as_deref()
+            .is_some_and(exceeds_field_bound)
+            || span
+                .conversion_id
+                .as_deref()
+                .is_some_and(exceeds_field_bound)
+            || span.label.as_deref().is_some_and(exceeds_field_bound)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn exceeds_field_bound(s: &str) -> bool {
+    s.len() > MAX_COMPOSE_FIELD_UTF8_BYTES
 }
 
 // ─── Sole public compose entry ───────────────────────────────────────────────
@@ -540,7 +669,7 @@ fn baseline_result(
 }
 
 fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
-    let baseline = input.local_baseline;
+    let baseline = input.local_baseline.rendered();
     let outcome_cloud = input.cloud_outcome;
     let source_map = provider_text_map(input.sources);
     let selected = selected_source_text(input);
@@ -825,7 +954,15 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
                         );
                     }
                     let out = span.output_text.as_str();
-                    if !out.to_lowercase().starts_with(&lab.to_lowercase()) {
+                    // Contract: label output_text must be the exact closed header
+                    // form `Label:\n` or `Label:` (not a prefix check). Product is
+                    // stricter than the Python oracle's starts_with here so a fat
+                    // label span cannot rewrite body words — body must be separate
+                    // ordered keep/convert spans; source_text should cover the
+                    // spoken cue only.
+                    let header_nl = format!("{lab}:\n");
+                    let header_inline = format!("{lab}:");
+                    if out != header_nl && out != header_inline {
                         return baseline_result(
                             baseline,
                             Some(FallbackTrigger::InvalidFixedLabel),
@@ -1104,15 +1241,17 @@ fn validate_candidate_shape(
     if !unknown_conversion && !unknown_label && !malformed {
         return None;
     }
-    if unknown_conversion {
-        return Some(vec![
-            ComposeErrorCode::UnknownConversion,
-            ComposeErrorCode::Malformed,
-        ]);
-    }
+    // Match Python last-write: when both unknown conversion and unknown label
+    // are present, label codes win.
     if unknown_label {
         return Some(vec![
             ComposeErrorCode::UnknownLabel,
+            ComposeErrorCode::Malformed,
+        ]);
+    }
+    if unknown_conversion {
+        return Some(vec![
+            ComposeErrorCode::UnknownConversion,
             ComposeErrorCode::Malformed,
         ]);
     }
@@ -1340,24 +1479,71 @@ fn convert_output_matches(conversion_id: &str, source_text: &str, output_text: &
     false
 }
 
+/// Case-insensitive literal occurrences of `needle` in `haystack` as original
+/// UTF-8 byte ranges `(start, end)` on char boundaries.
+///
+/// Never panics on valid Unicode: does not slice mid-codepoint and does not
+/// map casefold byte offsets onto the original string (casefold can expand or
+/// contract). On unverifiable matches returns empty rather than wrong ranges.
 fn find_literal_spans(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
     if needle.is_empty() || haystack.is_empty() {
         return vec![];
     }
-    let h = haystack.to_lowercase();
-    let n = needle.to_lowercase();
+
     let mut out = Vec::new();
-    let mut start = 0;
-    while let Some(rel) = h[start..].find(&n) {
-        let idx = start + rel;
-        // Map lowercased byte offsets carefully: for ASCII-only research text
-        // casefold length equals original for A-Za-z0-9 and spaces.
-        out.push((idx, idx + n.len()));
-        start = idx + 1;
+
+    // Exact (case-sensitive) first — offsets are identity on the original.
+    {
+        let mut search_from = 0;
+        while search_from <= haystack.len() {
+            let Some(rel) = haystack[search_from..].find(needle) else {
+                break;
+            };
+            let start = search_from + rel;
+            let end = start + needle.len();
+            debug_assert!(haystack.is_char_boundary(start) && haystack.is_char_boundary(end));
+            out.push((start, end));
+            // Advance by one original char so multi-byte starts stay in bounds.
+            let step = haystack[start..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
+            search_from = start + step;
+        }
     }
     if !out.is_empty() {
         return out;
     }
+
+    // Case-insensitive char-window match: compare per-char lowercase expansions
+    // but claim original char-boundary ranges (never casefold offsets).
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let hay_chars: Vec<(usize, char)> = haystack.char_indices().collect();
+    let n_len = needle_chars.len();
+    if n_len > 0 && hay_chars.len() >= n_len {
+        for i in 0..=hay_chars.len() - n_len {
+            let equal = needle_chars
+                .iter()
+                .zip(hay_chars[i..i + n_len].iter().map(|(_, c)| c))
+                .all(|(nc, hc)| chars_eq_ignore_case(*nc, *hc));
+            if equal {
+                let start = hay_chars[i].0;
+                let end = if i + n_len < hay_chars.len() {
+                    hay_chars[i + n_len].0
+                } else {
+                    haystack.len()
+                };
+                debug_assert!(haystack.is_char_boundary(start) && haystack.is_char_boundary(end));
+                out.push((start, end));
+            }
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+
+    // Whitespace-normalized multi-word fallback via lexical atom runs.
     let norm_n = normalize_ws(needle).to_lowercase();
     let norm_h = normalize_ws(haystack).to_lowercase();
     if norm_n.is_empty() || !norm_h.contains(&norm_n) {
@@ -1377,10 +1563,20 @@ fn find_literal_spans(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
         if seq[i..i + atoms.len()] == atoms[..] {
             let a0 = h_atoms[i].start();
             let a1 = h_atoms[i + atoms.len() - 1].end();
-            out.push((a0, a1));
+            if haystack.is_char_boundary(a0) && haystack.is_char_boundary(a1) {
+                out.push((a0, a1));
+            }
         }
     }
     out
+}
+
+fn chars_eq_ignore_case(a: char, b: char) -> bool {
+    if a == b || a.eq_ignore_ascii_case(&b) {
+        return true;
+    }
+    // Full Unicode: compare lowercase iterators (may be multi-char, e.g. İ).
+    a.to_lowercase().eq(b.to_lowercase())
 }
 
 fn ranges_overlap(a: (usize, usize), b: (usize, usize)) -> bool {
@@ -1596,7 +1792,9 @@ mod tests {
             )
         };
         let owned = ComposeInputOwned {
-            local_baseline: fx["local_baseline"].as_str().unwrap().to_owned(),
+            local_baseline: LocalBaseline::from_organized_text(
+                fx["local_baseline"].as_str().unwrap(),
+            ),
             base_fingerprint: fx["base_fingerprint"].as_str().unwrap().to_owned(),
             sources,
             source_selection: selection,
@@ -1608,7 +1806,7 @@ mod tests {
     }
 
     struct ComposeInputOwned {
-        local_baseline: String,
+        local_baseline: LocalBaseline,
         base_fingerprint: String,
         sources: Vec<ComposeSource>,
         source_selection: SourceSelection,
@@ -1782,15 +1980,53 @@ mod tests {
 
     #[test]
     fn mutation_illegal_label_rejects() {
-        let fx = clone_fixture("CC-10");
+        // Mutate green structured fixture (CC-20), not the stock reject fixture.
+        let mut fx = clone_fixture("CC-20");
+        fx["candidate"]["derivation"][0]["output_text"] = Value::String("Edge Cases:\n".into());
         let got = run_fx(fx);
         assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
         assert!(got.error_codes().contains(&ComposeErrorCode::InvalidLabel));
     }
 
+    /// Fat label span: claims full source and rewrites body into `output_text`.
+    /// Product rejects (exact header only); Python oracle may still accept via
+    /// starts_with.
+    #[test]
+    fn mutation_label_fat_rewrite_body_rejects() {
+        let mut fx = clone_fixture("CC-20");
+        // Single label span covers whole source with header+rewritten body.
+        fx["candidate"]["derivation"] = serde_json::json!([
+            {
+                "kind": "label",
+                "source_provider": "provider_a",
+                "source_text": "goal fix the flaky auth test",
+                "output_text": "Goal:\nPlease invent a rewritten body here.",
+                "conversion_id": null,
+                "label": "Goal"
+            }
+        ]);
+        let got = run_fx(fx);
+        assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
+        assert!(
+            got.error_codes().contains(&ComposeErrorCode::InvalidLabel)
+                || got.error_codes().contains(&ComposeErrorCode::UnsafeSemantics)
+                || got.error_codes().contains(&ComposeErrorCode::InventedContent),
+            "codes={:?}",
+            got.error_codes()
+        );
+        // Green path still: Goal:\n + keep body (corpus CC-20).
+        let green = run_fx(clone_fixture("CC-20"));
+        assert_eq!(green.decision(), CompositionDecision::Accept);
+        assert_eq!(green.rendered(), "Goal:\nFix the flaky auth test.");
+    }
+
     #[test]
     fn mutation_uncertain_backtrack_preserves_words() {
-        let fx = clone_fixture("CC-05");
+        // Mutate clear-backtrack accept fixture (CC-04) → uncertain.
+        let mut fx = clone_fixture("CC-04");
+        for rem in fx["candidate"]["removals"].as_array_mut().unwrap() {
+            rem["certainty"] = Value::String("uncertain".into());
+        }
         let got = run_fx(fx);
         assert_eq!(got.decision(), CompositionDecision::AcceptPreserveWords);
         assert_eq!(
@@ -1798,8 +2034,8 @@ mod tests {
             Some(FallbackTrigger::UncertainBacktracking)
         );
         assert_eq!(got.error_codes(), &[ComposeErrorCode::UncertainBacktrack]);
-        // Preserve-all words: local baseline, not the remove-applied compose
-        assert_eq!(got.rendered(), "Send it Friday actually Monday.");
+        // Soft path renders host local baseline (preserve-words salvage).
+        assert_eq!(got.rendered(), "Send it Monday.");
     }
 
     #[test]
@@ -1896,6 +2132,7 @@ mod tests {
     /// - [`compose_structured_candidate`]
     /// - [`parse_structured_candidate_json`]
     /// - [`StructuredCandidate`] (no `final` / free-form field)
+    /// - [`ComposeInput::local_baseline`] is [`LocalBaseline`], not `&str`
     #[test]
     fn invariant_no_public_raw_prose_accept_path() {
         // StructuredCandidate has no final/prose field — only derivation spans.
@@ -1919,7 +2156,47 @@ mod tests {
         let cand = parse_structured_candidate_json(json).expect("parse");
         // Confirm we cannot construct an accept path from raw prose alone:
         // without a structured candidate that passes gates, free-form strings
-        // only appear as host-supplied local_baseline.
+        // only appear sealed as host-supplied LocalBaseline.
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: "hi".into(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".into(),
+        };
+        let baseline = LocalBaseline::from_organized_text("Hi.");
+        let input = ComposeInput {
+            local_baseline: &baseline,
+            base_fingerprint: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            sources: &sources,
+            source_selection: &selection,
+            protected_tokens: &[],
+            policy: RenderingPolicy::Adaptive,
+            cloud_outcome: CloudOutcome::Succeeded,
+            candidate: Some(&cand),
+        };
+        let _ = compose_structured_candidate(&input);
+        // API surface: ComposeInput requires &LocalBaseline (not free &str).
+        let _: fn(&ComposeInput<'_>) -> ComposeOutcome = compose_structured_candidate;
+        let _: &LocalBaseline = input.local_baseline;
+        assert_eq!(
+            input.local_baseline.contract(),
+            crate::local_baseline::LOCAL_BASELINE_CONTRACT_ID
+        );
+        assert!(std::mem::size_of_val(&cand.derivation) > 0);
+    }
+
+    #[test]
+    fn compose_input_requires_local_baseline_type() {
+        let baseline = LocalBaseline::from_organized_text("organized host text");
+        assert_eq!(baseline.rendered(), "organized host text");
+        assert_eq!(
+            baseline.contract(),
+            crate::local_baseline::LOCAL_BASELINE_CONTRACT_ID
+        );
         let sources = [ComposeSource {
             provider: SttProvider::ProviderA,
             available: true,
@@ -1931,20 +2208,137 @@ mod tests {
             reason: "only_available".into(),
         };
         let input = ComposeInput {
-            local_baseline: "Hi.",
+            local_baseline: &baseline,
             base_fingerprint: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             sources: &sources,
             source_selection: &selection,
             protected_tokens: &[],
             policy: RenderingPolicy::Adaptive,
-            cloud_outcome: CloudOutcome::Succeeded,
-            candidate: Some(&cand),
+            cloud_outcome: CloudOutcome::Skipped,
+            candidate: None,
         };
-        let _ = compose_structured_candidate(&input);
-        // API surface check: ComposeInput has candidate: Option<&StructuredCandidate>
-        // and local_baseline is host-owned, not model final prose.
-        let _: fn(&ComposeInput<'_>) -> ComposeOutcome = compose_structured_candidate;
-        assert!(std::mem::size_of_val(&cand.derivation) > 0);
+        let got = compose_structured_candidate(&input);
+        assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
+        assert_eq!(got.rendered(), "organized host text");
+    }
+
+    #[test]
+    fn parse_rejects_unknown_final_field() {
+        let json = br#"{
+            "schema_version": "1",
+            "base_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "reconciliation": {"selected_provider": "provider_a", "reason": "only_available"},
+            "removals": [],
+            "conversions": [],
+            "layout": {"decision": "natural", "certainty": "clear"},
+            "labels": [],
+            "derivation": [{
+                "kind": "keep",
+                "source_provider": "provider_a",
+                "source_text": "hi",
+                "output_text": "Hi",
+                "conversion_id": null,
+                "label": null
+            }],
+            "final": "smuggled model prose"
+        }"#;
+        assert!(parse_structured_candidate_json(json).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_missing_required_key() {
+        // Missing required `output_text` on derivation span.
+        let json = br#"{
+            "schema_version": "1",
+            "base_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "reconciliation": {"selected_provider": "provider_a", "reason": "only_available"},
+            "removals": [],
+            "conversions": [],
+            "layout": {"decision": "natural", "certainty": "clear"},
+            "labels": [],
+            "derivation": [{
+                "kind": "keep",
+                "source_provider": "provider_a",
+                "source_text": "hi",
+                "conversion_id": null,
+                "label": null
+            }]
+        }"#;
+        assert!(parse_structured_candidate_json(json).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_oversized_payload() {
+        let mut raw = Vec::with_capacity(MAX_COMPOSE_CANDIDATE_BYTES + 8);
+        raw.extend_from_slice(br#"{"schema_version":"1","pad":""#);
+        while raw.len() <= MAX_COMPOSE_CANDIDATE_BYTES {
+            raw.push(b'x');
+        }
+        raw.extend_from_slice(br#""}"#);
+        assert!(raw.len() > MAX_COMPOSE_CANDIDATE_BYTES);
+        assert!(parse_structured_candidate_json(&raw).is_none());
+    }
+
+    #[test]
+    fn find_literal_spans_unicode_accented_no_panic() {
+        let hay = "call Émile about the release";
+        let spans = find_literal_spans(hay, "Émile");
+        assert_eq!(spans.len(), 1);
+        let (s, e) = spans[0];
+        assert!(hay.is_char_boundary(s) && hay.is_char_boundary(e));
+        assert_eq!(&hay[s..e], "Émile");
+
+        // Case-insensitive path must also stay on char boundaries.
+        let spans_ci = find_literal_spans(hay, "émile");
+        assert_eq!(spans_ci.len(), 1);
+        let (s, e) = spans_ci[0];
+        assert!(hay.is_char_boundary(s) && hay.is_char_boundary(e));
+        assert_eq!(&hay[s..e], "Émile");
+
+        // Combining mark sequence (e + combining acute) — fail closed or match
+        // without panicking.
+        let combining = "cafe\u{0301}"; // café via combining acute
+        let _ = find_literal_spans(combining, "cafe\u{0301}");
+        let _ = find_literal_spans(combining, "CAFÉ");
+        // Overlapping / empty never panic
+        assert!(find_literal_spans("", "x").is_empty());
+        assert!(find_literal_spans("x", "").is_empty());
+    }
+
+    #[test]
+    fn find_literal_spans_no_mid_codepoint_advance_panic() {
+        // Regression: advancing start by +1 byte after a multi-byte match used
+        // to panic on the lowercased haystack slice.
+        let hay = "Émile Émile";
+        let spans = find_literal_spans(hay, "Émile");
+        assert_eq!(spans.len(), 2);
+        for (s, e) in spans {
+            assert!(hay.is_char_boundary(s) && hay.is_char_boundary(e));
+            assert_eq!(&hay[s..e], "Émile");
+        }
+    }
+
+    #[test]
+    fn unknown_label_wins_over_unknown_conversion() {
+        let mut fx = clone_fixture("CC-01");
+        fx["candidate"]["conversions"][0]["id"] = Value::String("nope→X".into());
+        fx["candidate"]["labels"] = serde_json::json!([{
+            "label": "NotAClosedLabel",
+            "source_provider": "provider_a",
+            "source_span_text": "ship"
+        }]);
+        // Shape validation runs on typed candidate — re-parse after mutation.
+        let (owned, candidate) = fixture_input(&fx);
+        // fixture_input panics on unknown label in closed set during shape... 
+        // actually deserialize succeeds; validate_candidate_shape rejects.
+        let got = compose_owned(&owned, candidate.as_ref());
+        assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
+        assert!(
+            got.error_codes().contains(&ComposeErrorCode::UnknownLabel),
+            "label should win last-write, codes={:?}",
+            got.error_codes()
+        );
+        assert!(!got.error_codes().contains(&ComposeErrorCode::UnknownConversion));
     }
 
     #[test]

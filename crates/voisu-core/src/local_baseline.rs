@@ -87,6 +87,20 @@ pub struct LocalBaseline {
 }
 
 impl LocalBaseline {
+    /// Host-owned baseline text already produced by the local organizer (or a
+    /// corpus/host fixture that stands in for that organizer output).
+    ///
+    /// Stamps [`LOCAL_BASELINE_CONTRACT_ID`]. Compose and other consumers take
+    /// [`LocalBaseline`] rather than free `&str`, so model prose cannot be
+    /// smuggled in as an unsealed baseline.
+    #[must_use]
+    pub fn from_organized_text(text: impl Into<String>) -> Self {
+        Self {
+            rendered: text.into(),
+            contract: LOCAL_BASELINE_CONTRACT_ID,
+        }
+    }
+
     /// Final Transcript text for the local path.
     #[must_use]
     pub fn rendered(&self) -> &str {
