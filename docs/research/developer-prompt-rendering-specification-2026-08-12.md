@@ -182,8 +182,8 @@ Authoritative gate research: combined-call package **#139** (v1.1.2 completeness
 | Cloud skipped / not attempted | Local baseline |
 | Timeout, provider error, bad schema | Local baseline |
 | Unverifiable / unsafe / bad label / protected hit | Local baseline |
-| Uncertain backtrack only | Soft: keep words (safe local-shaped text) |
-| Uncertain layout only | Soft: Natural layout |
+| Uncertain backtrack only | Soft: local baseline Natural, **preserve all words** (`accept_preserve_words`) |
+| Uncertain layout only | Soft: Natural layout only (`accept_natural_layout`) |
 | All checks pass in time | Composed cloud render |
 
 Hard failures never “half apply” a bad rewrite.
@@ -192,7 +192,8 @@ Hard failures never “half apply” a bad rewrite.
 
 ## 9. Model policy (latency first)
 
-Research live matrix: model benchmark **#140** (PR #152).
+Research live matrix: model benchmark **#140** (PR #152).  
+On that matrix the recommendation was **`three_way_no_production_ready_default`** (no sole production-ready cloud default). Local baseline remains Delivery authority whenever cloud is late or rejected.
 
 | Model | Role in v1 |
 |---|---|
@@ -297,7 +298,7 @@ These packages are **accepted inputs**. Implementation must not contradict them 
 | Package | Role |
 |---|---|
 | [#138](https://github.com/Anuraj-dev/voisu/issues/138) behavior corpus + schema | What correct finals look like |
-| [#139](https://github.com/Anuraj-dev/voisu/issues/139) combined-call contract + prototype | Cloud JSON + compose / fallback gate |
+| [#139](https://github.com/Anuraj-dev/voisu/issues/139) combined-call contract + prototype (**v1.1.2** completeness + source-order) | Cloud JSON + compose / fallback gate |
 | [#140](https://github.com/Anuraj-dev/voisu/issues/140) model benchmark | Latency / quality evidence; model policy above |
 | [#141](https://github.com/Anuraj-dev/voisu/issues/141) intent routing | Local route + cloud allow/require |
 | [#142](https://github.com/Anuraj-dev/voisu/issues/142) diagnostics | Feedback + event timeline + eval vs prod |
@@ -365,14 +366,14 @@ Residuals allowed into #145 as explicit tasks (not silent “approved safe”):
 | #145 | Only after this document is accepted as the planning baseline |
 | Product code | Only under #145’s approved DAG (or explicit follow-on tickets) |
 
-**Ballot (to be filled on approval):**
+**Ballot:**
 
+- [x] Independent residual-land review: **APPROVE_WITH_NITS** (P2 polish only; no product-lock changes)  
 - [ ] Raja accepts §§1–12 product locks  
 - [ ] Model policy §9 accepted (Groq in-budget preferred; Gemini retained, latency-gated)  
 - [ ] Ship gates §15 accepted  
-- [ ] Independent review APPROVE / APPROVE_WITH_NITS  
 
-Until that ballot is closed, this file is a **draft specification**, not a license to rewrite production behavior.
+Until Raja closes the ballot, this file is a **draft specification**, not a license to rewrite production behavior.
 
 ---
 
