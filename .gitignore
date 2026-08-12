@@ -17,3 +17,8 @@ _copr_srpm/
 /internal/
 /CLAUDE.md
 /AGENTS.md
+
+# Local secrets
+.env
+.env.*
+!.env.example

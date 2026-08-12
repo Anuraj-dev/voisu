@@ -1,7 +1,7 @@
 {
   "benchmark_id": "voisu-developer-prompt-rendering-model-benchmark-2026-08-11",
   "issue": 140,
-  "generated_at": "2026-08-11T18:17:48+00:00",
+  "generated_at": "2026-08-12T02:14:56+00:00",
   "governing": {
     "combined_call_corpus": "developer-prompt-rendering-combined-call-corpus-2026-08-11.json",
     "combined_call_version": "1.1.2",
@@ -25,12 +25,26 @@
     {
       "model_id": "gemini-3.5-flash-lite",
       "provider": "google",
-      "prompt_contract": true
+      "prompt_contract": true,
+      "live_config": {
+        "temperature": 0.0,
+        "responseMimeType": "application/json",
+        "endpoint_family": "generativelanguage.googleapis.com/v1beta generateContent",
+        "maxOutputTokens": 3500,
+        "preferred_schema_field": "responseJsonSchema"
+      }
     },
     {
       "model_id": "gemini-3.6-flash",
       "provider": "google",
-      "prompt_contract": true
+      "prompt_contract": true,
+      "live_config": {
+        "temperature": 0.0,
+        "responseMimeType": "application/json",
+        "endpoint_family": "generativelanguage.googleapis.com/v1beta generateContent",
+        "maxOutputTokens": 3500,
+        "preferred_schema_field": "responseJsonSchema"
+      }
     }
   ],
   "matrix": {
@@ -177,7 +191,7 @@
       "rendered": "Ship it!",
       "oracle_expected": "Ship it!",
       "semantic_match_oracle": true,
-      "latency_ms": 0.359,
+      "latency_ms": 0.324,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -200,7 +214,7 @@
       "rendered": "Stop.\nNext item",
       "oracle_expected": "Stop.\nNext item",
       "semantic_match_oracle": true,
-      "latency_ms": 0.145,
+      "latency_ms": 0.104,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -223,7 +237,7 @@
       "rendered": "I think we should ship Friday.",
       "oracle_expected": "I think we should ship Friday.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.112,
+      "latency_ms": 0.098,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -246,7 +260,7 @@
       "rendered": "Send it Monday.",
       "oracle_expected": "Send it Monday.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.069,
+      "latency_ms": 0.064,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -271,7 +285,7 @@
       "rendered": "Send it Friday actually Monday.",
       "oracle_expected": "Send it Friday actually Monday.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.038,
+      "latency_ms": 0.037,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -319,7 +333,7 @@
       "rendered": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
       "oracle_expected": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.38,
+      "latency_ms": 0.42,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -345,7 +359,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.277,
+      "latency_ms": 0.281,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -370,7 +384,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.034,
+      "latency_ms": 0.035,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -395,7 +409,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
       "semantic_match_oracle": false,
-      "latency_ms": 0.018,
+      "latency_ms": 0.024,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -420,7 +434,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.005,
+      "latency_ms": 0.006,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -445,7 +459,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.003,
+      "latency_ms": 0.004,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -496,7 +510,7 @@
       "rendered": "Call Anuraj about the release.",
       "oracle_expected": "File the bug in voisu not voice so.",
       "semantic_match_oracle": false,
-      "latency_ms": 0.021,
+      "latency_ms": 0.028,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -522,7 +536,7 @@
       "rendered": "Do not enable the feature flag in production.",
       "oracle_expected": "Do not enable the feature flag in production.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.018,
+      "latency_ms": 0.025,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -545,7 +559,7 @@
       "rendered": "File the bug in voisu.",
       "oracle_expected": "File the bug in voisu.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.039,
+      "latency_ms": 0.057,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -568,7 +582,7 @@
       "rendered": "Run curl -I --fail https://example.com and return status_code equals 404.",
       "oracle_expected": "run cargo test --workspace -- --test-threads=4",
       "semantic_match_oracle": false,
-      "latency_ms": 0.046,
+      "latency_ms": 0.061,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -591,7 +605,7 @@
       "rendered": "Hey, can you send the notes when you get a chance?",
       "oracle_expected": "Hey, can you send the notes when you get a chance?",
       "semantic_match_oracle": true,
-      "latency_ms": 0.042,
+      "latency_ms": 0.065,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -617,7 +631,7 @@
       "rendered": "Hey, can you send the notes when you get a chance?",
       "oracle_expected": "Hey, can you send the notes when you get a chance?",
       "semantic_match_oracle": true,
-      "latency_ms": 0.025,
+      "latency_ms": 0.036,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -640,7 +654,7 @@
       "rendered": "Goal:\nFix the flaky auth test.",
       "oracle_expected": "Goal:\nFix the flaky auth test.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.066,
+      "latency_ms": 0.1,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -663,7 +677,7 @@
       "rendered": "She said \"we ship friday\" and hung up.",
       "oracle_expected": "Use the exact error \"connection refused\" in the ticket.",
       "semantic_match_oracle": false,
-      "latency_ms": 0.152,
+      "latency_ms": 0.221,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -688,7 +702,7 @@
       "rendered": "Ship it!",
       "oracle_expected": "Ship it!",
       "semantic_match_oracle": true,
-      "latency_ms": 0.015,
+      "latency_ms": 0.021,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -711,7 +725,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.003,
+      "latency_ms": 0.004,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -734,7 +748,7 @@
       "rendered": "The first thought is done.\n\nThe second thought is ready.",
       "oracle_expected": "The first thought is done.\n\nThe second thought is ready.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.053,
+      "latency_ms": 0.081,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -758,7 +772,7 @@
       "rendered": "Hey, can you send the notes when you get a chance?",
       "oracle_expected": "Hey, can you send the notes when you get a chance?",
       "semantic_match_oracle": true,
-      "latency_ms": 0.056,
+      "latency_ms": 0.08,
       "within_1500ms": true,
       "would_deliver_model_text": false,
       "notes": "local malformed candidate → fallback_baseline + E_SCHEMA/E_MALFORMED"
@@ -783,7 +797,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.02,
+      "latency_ms": 0.029,
       "within_1500ms": true,
       "would_deliver_model_text": false,
       "notes": "hard cloud_outcome deadline_exceeded → baseline + E_DEADLINE"
@@ -808,7 +822,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.017,
+      "latency_ms": 0.025,
       "within_1500ms": true,
       "would_deliver_model_text": false,
       "notes": "hard provider_failure → baseline + E_PROVIDER"
@@ -831,7 +845,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.137,
+      "latency_ms": 0.171,
       "within_1500ms": true,
       "would_deliver_model_text": false,
       "notes": "cloud skipped → baseline without error"
@@ -845,40 +859,43 @@
       "model_id": "openai/gpt-oss-20b",
       "status": "ok",
       "trial": 1,
-      "http_code": 429,
-      "rate_limited": true,
+      "http_code": 200,
+      "rate_limited": false,
       "timed_out": false,
-      "structured_parse_ok": false,
+      "structured_parse_ok": true,
       "parse_error": null,
-      "compose_decision": "fallback_baseline",
-      "production_decision": "fallback_baseline",
+      "compose_decision": "accept",
+      "production_decision": "accept",
       "deadline_overrode_accept": false,
-      "fallback_trigger": "provider_failure",
-      "error_codes": [
-        "E_PROVIDER"
-      ],
-      "content_error_codes": [
-        "E_PROVIDER"
-      ],
-      "error_class": "rate_limited",
+      "fallback_trigger": null,
+      "error_codes": [],
+      "content_error_codes": [],
+      "error_class": null,
       "rendered": "Ship it!",
       "content_rendered": "Ship it!",
       "oracle_expected": "Ship it!",
       "semantic_match_oracle": true,
       "content_semantic_match_oracle": true,
-      "latency_ms": 233.46,
-      "curl_time_total_ms": 224.24,
+      "latency_ms": 878.42,
+      "curl_time_total_ms": 869.85,
       "within_1500ms": true,
-      "would_deliver_model_text": false,
-      "usage": null,
-      "raw_response_truncated": null,
-      "transport_error": {
-        "message": "Rate limit reached for model `openai/gpt-oss-20b` in organization `org_01kxp7yf2hf1nt8v8tgpcmwqbj` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 3546, Requested 5041. Please try again in 4.4025s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing",
-        "type": "tokens",
-        "code": "rate_limit_exceeded"
+      "would_deliver_model_text": true,
+      "usage": {
+        "queue_time": 0.157056804,
+        "prompt_tokens": 1871,
+        "prompt_time": 0.113107201,
+        "completion_tokens": 370,
+        "completion_time": 0.429836243,
+        "total_tokens": 2241,
+        "total_time": 0.542943444,
+        "completion_tokens_details": {
+          "reasoning_tokens": 174
+        }
       },
+      "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:2af172901ba1ab4ff2ac0c16051d9f743dce96d197eb8d7c54896b40bb208324\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[{\"id\":\"exclamation point→!\",\"source_provider\":\"provider_a\",\"source_span_text\":\"exclamation point\"}],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"ship it\",\"output_text\":\"Ship it\",\"conversion_id\":null,\"label\":null},{\"kind\":\"convert\",\"source_provider\":\"provider_a\",\"source_text\":\"exclamation point\",\"output_text\":\"!\",\"conversion_id\":\"exclamation point→!\",\"label\":null}]}",
+      "transport_error": null,
       "notes": "exclamation point → !",
-      "attempts": 5
+      "attempts": 1
     },
     {
       "vector_id": "V-sym-period-newline",
@@ -912,23 +929,23 @@
       "oracle_expected": "Stop.\nNext item",
       "semantic_match_oracle": true,
       "content_semantic_match_oracle": true,
-      "latency_ms": 1243.79,
-      "curl_time_total_ms": 1234.56,
+      "latency_ms": 1193.3,
+      "curl_time_total_ms": 1185.28,
       "within_1500ms": true,
       "would_deliver_model_text": false,
       "usage": {
-        "queue_time": 0.283845591,
+        "queue_time": 0.28286159,
         "prompt_tokens": 1871,
-        "prompt_time": 0.105219127,
-        "completion_tokens": 596,
-        "completion_time": 0.621806045,
-        "total_tokens": 2467,
-        "total_time": 0.727025172,
+        "prompt_time": 0.111308173,
+        "completion_tokens": 599,
+        "completion_time": 0.62399762,
+        "total_tokens": 2470,
+        "total_time": 0.735305793,
         "completion_tokens_details": {
-          "reasoning_tokens": 299
+          "reasoning_tokens": 329
         }
       },
-      "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:bc77de8133e75a4115cdc341d92290761c03a886dd5ed853a8c9e66910e5ded6\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[{\"id\":\"period→.\",\"source_provider\":\"provider_a\",\"source_span_text\":\"period\"},{\"id\":\"new line→\\\\n\",\"source_provider\":\"provider_a\",\"source_span_text\":\"new line\"}],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"stop\",\"output_text\":\"stop\",\"conversion_id\":null,\"label\":null},{\"kind\":\"convert\",\"source_provider\":\"provider_a\",\"source_text\":\"period\",\"output_text\":\".\",\"conversion_id\":\"period→.\",\"label\":null},{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\" \",\"output_text\":\" \",\"conversion_id\":null,\"label\":null},{\"kind\":\"convert\",\"source_provider\":\"provider_a\",\"source_text\":\"new line\",\"output_text\":\"\\\\n\",\"conversion_id\":\"new line→\\\\n\",\"label\":null},{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\" next item\",\"output_text\":\" next item\",\"conversion_id\":null,\"label\":null}]}",
+      "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:bc77de8133e75a4115cdc341d92290761c03a886dd5ed853a8c9e66910e5ded6\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[{\"id\":\"period→.\",\"source_provider\":\"provider_a\",\"source_span_text\":\"period\"},{\"id\":\"new line→\\\\n\",\"source_provider\":\"provider_a\",\"source_span_text\":\"new line\"}],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"stop\",\"output_text\":\"Stop\",\"conversion_id\":null,\"label\":null},{\"kind\":\"convert\",\"source_provider\":\"provider_a\",\"source_text\":\"period\",\"output_text\":\".\",\"conversion_id\":\"period→.\",\"label\":null},{\"kind\":\"convert\",\"source_provider\":\"provider_a\",\"source_text\":\"new line\",\"output_text\":\"\\\\n\",\"conversion_id\":\"new line→\\\\n\",\"label\":null},{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"next item\",\"output_text\":\"Next item\",\"conversion_id\":null,\"label\":null}]}",
       "transport_error": null,
       "notes": "period + new line stack",
       "attempts": 1
@@ -942,50 +959,40 @@
       "model_id": "openai/gpt-oss-20b",
       "status": "ok",
       "trial": 1,
-      "http_code": 200,
-      "rate_limited": false,
+      "http_code": 429,
+      "rate_limited": true,
       "timed_out": false,
-      "structured_parse_ok": true,
+      "structured_parse_ok": false,
       "parse_error": null,
       "compose_decision": "fallback_baseline",
       "production_decision": "fallback_baseline",
       "deadline_overrode_accept": false,
-      "fallback_trigger": "unverifiable_source_derivation",
+      "fallback_trigger": "provider_failure",
       "error_codes": [
-        "E_UNVERIFIABLE"
+        "E_PROVIDER"
       ],
       "content_error_codes": [
-        "E_UNVERIFIABLE"
+        "E_PROVIDER"
       ],
-      "error_class": "E_UNVERIFIABLE",
+      "error_class": "rate_limited",
       "rendered": "I think we should ship Friday.",
       "content_rendered": "I think we should ship Friday.",
       "oracle_expected": "I think we should ship Friday.",
       "semantic_match_oracle": true,
       "content_semantic_match_oracle": true,
-      "latency_ms": 1192.3,
-      "curl_time_total_ms": 1182.84,
+      "latency_ms": 196.39,
+      "curl_time_total_ms": 181.84,
       "within_1500ms": true,
       "would_deliver_model_text": false,
-      "usage": {
-        "queue_time": 0.247047807,
-        "prompt_tokens": 1870,
-        "prompt_time": 0.244062591,
-        "completion_tokens": 406,
-        "completion_time": 0.476683255,
-        "total_tokens": 2276,
-        "total_time": 0.720745846,
-        "prompt_tokens_details": {
-          "cached_tokens": 768
-        },
-        "completion_tokens_details": {
-          "reasoning_tokens": 241
-        }
+      "usage": null,
+      "raw_response_truncated": null,
+      "transport_error": {
+        "message": "Rate limit reached for model `openai/gpt-oss-20b` in organization `org_01kxp7yf2hf1nt8v8tgpcmwqbj` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 3796, Requested 5370. Please try again in 8.745s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing",
+        "type": "tokens",
+        "code": "rate_limit_exceeded"
       },
-      "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:a792371cf933fe6eecfff7e6b878ffcbad2f394752ff151fa629559f9760e3bd\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[{\"kind\":\"filler\",\"certainty\":\"clear\",\"source_provider\":\"provider_a\",\"source_span_text\":\"um uh\"}],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"I think we should ship friday\",\"output_text\":\"I think we should ship friday\",\"conversion_id\":null,\"label\":null}]}",
-      "transport_error": null,
       "notes": "clear um/uh removal",
-      "attempts": 1
+      "attempts": 5
     },
     {
       "vector_id": "V-backtrack-clear",
@@ -1008,28 +1015,28 @@
       "error_codes": [],
       "content_error_codes": [],
       "error_class": null,
-      "rendered": "Send it friday no wait Monday",
-      "content_rendered": "Send it friday no wait Monday",
+      "rendered": "Send it Friday no wait Monday",
+      "content_rendered": "Send it Friday no wait Monday",
       "oracle_expected": "Send it Monday.",
       "semantic_match_oracle": false,
       "content_semantic_match_oracle": false,
-      "latency_ms": 985.02,
-      "curl_time_total_ms": 976.27,
+      "latency_ms": 929.14,
+      "curl_time_total_ms": 920.59,
       "within_1500ms": true,
       "would_deliver_model_text": true,
       "usage": {
-        "queue_time": 0.282805112,
+        "queue_time": 0.315064864,
         "prompt_tokens": 1875,
-        "prompt_time": 0.101654816,
-        "completion_tokens": 337,
-        "completion_time": 0.373373676,
-        "total_tokens": 2212,
-        "total_time": 0.475028492,
+        "prompt_time": 0.100697003,
+        "completion_tokens": 332,
+        "completion_time": 0.336645825,
+        "total_tokens": 2207,
+        "total_time": 0.437342828,
         "completion_tokens_details": {
-          "reasoning_tokens": 190
+          "reasoning_tokens": 185
         }
       },
-      "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:b08f4b27890386954068a911fe4b03c619191fe6e59e7ea6bf36b8d0a754efc8\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"send it friday no wait monday\",\"output_text\":\"Send it friday no wait Monday\",\"conversion_id\":null,\"label\":null}]}",
+      "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:b08f4b27890386954068a911fe4b03c619191fe6e59e7ea6bf36b8d0a754efc8\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"send it friday no wait monday\",\"output_text\":\"Send it Friday no wait Monday\",\"conversion_id\":null,\"label\":null}]}",
       "transport_error": null,
       "notes": "clear friday→monday backtrack",
       "attempts": 1
@@ -1060,85 +1067,31 @@
       "oracle_expected": "Send it Friday actually Monday.",
       "semantic_match_oracle": false,
       "content_semantic_match_oracle": false,
-      "latency_ms": 940.09,
-      "curl_time_total_ms": 932.33,
+      "latency_ms": 876.31,
+      "curl_time_total_ms": 868.96,
       "within_1500ms": true,
       "would_deliver_model_text": true,
       "usage": {
-        "queue_time": 0.247261616,
+        "queue_time": 0.318481965,
         "prompt_tokens": 1877,
-        "prompt_time": 0.12691816,
-        "completion_tokens": 323,
-        "completion_time": 0.335871125,
-        "total_tokens": 2200,
-        "total_time": 0.462789285,
+        "prompt_time": 0.101179126,
+        "completion_tokens": 279,
+        "completion_time": 0.28204409,
+        "total_tokens": 2156,
+        "total_time": 0.383223216,
         "completion_tokens_details": {
-          "reasoning_tokens": 181
+          "reasoning_tokens": 137
         }
       },
       "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:06f33b8a0c34ad8fd8bed096aee076755e9583afd0536674a86746977d209a46\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"send it friday actually monday\",\"output_text\":\"Send it Friday actually Monday\",\"conversion_id\":null,\"label\":null}]}",
       "transport_error": null,
       "notes": "uncertain backtrack → preserve words soft salvage",
-      "attempts": 5
+      "attempts": 4
     },
     {
       "vector_id": "V-structured-multi",
       "fixture_id": "CC-07",
       "category": "structured_multi_label",
-      "mode": "live",
-      "provider": "groq",
-      "model_id": "openai/gpt-oss-20b",
-      "status": "ok",
-      "trial": 1,
-      "http_code": 200,
-      "rate_limited": false,
-      "timed_out": false,
-      "structured_parse_ok": true,
-      "parse_error": null,
-      "compose_decision": "fallback_baseline",
-      "production_decision": "fallback_baseline",
-      "deadline_overrode_accept": true,
-      "fallback_trigger": "deadline_exceeded",
-      "error_codes": [
-        "E_DEADLINE",
-        "E_INVENTED_CONTENT",
-        "E_UNSAFE_SEMANTICS"
-      ],
-      "content_error_codes": [
-        "E_INVENTED_CONTENT",
-        "E_UNSAFE_SEMANTICS"
-      ],
-      "error_class": "E_INVENTED_CONTENT",
-      "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
-      "content_rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
-      "oracle_expected": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
-      "semantic_match_oracle": false,
-      "content_semantic_match_oracle": false,
-      "latency_ms": 4466.92,
-      "curl_time_total_ms": 4459.77,
-      "within_1500ms": false,
-      "would_deliver_model_text": false,
-      "usage": {
-        "queue_time": 0.319845947,
-        "prompt_tokens": 1937,
-        "prompt_time": 0.096924653,
-        "completion_tokens": 3270,
-        "completion_time": 3.805932134,
-        "total_tokens": 5207,
-        "total_time": 3.902856787,
-        "completion_tokens_details": {
-          "reasoning_tokens": 2207
-        }
-      },
-      "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:127575fbf06d8c0889f55a93ad84768b9ecdd9e6e6a9ac420958bbfe5ffe8a5c\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[{\"id\":\"one→1.\",\"source_provider\":\"provider_a\",\"source_span_text\":\"one\"},{\"id\":\"two→2.\",\"source_provider\":\"provider_a\",\"source_span_text\":\"two\"},{\"id\":\"three→3.\",\"source_provider\":\"provider_a\",\"source_span_text\":\"three\"},{\"id\":\"four→4.\",\"source_provider\":\"provider_a\",\"source_span_text\":\"four\"}],\"layout\":{\"decision\":\"structured_sections\",\"certainty\":\"clear\"},\"labels\":[{\"label\":\"Goal\",\"source_provider\":\"provider_a\",\"source_span_text\":\"goal\"},{\"label\":\"Context\",\"source_provider\":\"provider_a\",\"source_span_text\":\"context\"},{\"label\":\"Requirements\",\"source_provider\":\"provider_a\",\"source_span_text\":\"requirements\"},{\"label\":\"Constraints\",\"source_provider\":\"provider_a\",\"source_span_text\":\"constraints\"},{\"label\":\"Steps\",\"source_provider\":\"provider_a\",\"source_span_text\":\"steps\"},{\"label\":\"Acceptance Criteria\",\"source_provider\":\"provider_a\",\"source_span_text\":\"acceptance criteria\"},{\"label\":\"Files\",\"source_provider\":\"provider_a\",\"source_span_text\":\"files\"},{\"label\":\"Notes\",\"source_provider\":\"provider_a\",\"source_span_text\":\"notes\"}],\"derivation\":[{\"kind\":\"label\",\"source_provider\":\"provider_a\",\"source_text\":\"goal\",\"output_text\":\"Goal:\",\"conversion_id\":null,\"label\":\"Goal\"},{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"fix the flaky auth test\",\"output_text\":\"fix the flaky auth test\",\"conversion_id\":null,\"label\":null},{\"kind\":\"label\",\"source_provider\":\"provider_a\",\"source_text\":\"context\",\"output_text\":\"Context:\",\"conversion_id\":null,\"label\":\"Context\"},{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"it fails on CI only\",\"output_text\":\"it fails on CI only\",\"conversion_id\":null,\"label\":null},{\"kind\":\"label\",\"source_provider\":\"provider_a\",\"source_text\":\"requirements\",\"output_text\":\"Requirements:\",\"conversion_id\":null,\"label\":\"Requirements\"},{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"keep public API stable\",\"output_text\":\"keep public API stable\",\"conversion_id\":null,\"label\":null},{\"kind\":\"label\",\"source_provider\":\"provider_a\",\"source_text\":\"constraints\",\"output_text\":\"Constraints:\",\"conversion_id\":null,\"label\":\"Constraints\"},{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"no new dependencies\",\"output_text\":\"no new dependencies\",\"conversion_id\":null,\"label\":null},{\"kind\":\"label\",\"source_provider\":\"provider_a\",\"source_text\":\"steps\",\"output_text\":\"Steps:\",\"conversion_id\":null,\"label\":\"Steps\"},{\"kind\":\"convert\",\"source_provider\":\"provider_a\",\"source_text\":\"one\",\"output_text\":\"1.\",\"conversion_id\":\"one→1.\",\"label\":null},{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"reproduce\",\"output_text\":\"reproduce\",\"conversion_id\":null,\"label\":null},{\"kind\":\"convert\",\"source_provider\":\"provider_a\",\"source_text\":\"two\",\"output_text\":\"2.\",\"conversion_id\":\"two→2.\",\"label\":null},{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"isolate\",\"output_text\":\"isolate\",\"conversion_id\":null,\"label\":null},{\"kind\":\"convert\",\"source_provider\":\"provider_a\",\"source_text\":\"three\",\"output_text\":\"3.\",\"conversion_id\":\"three→3.\",\"label\":null},{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"fix\",\"output_text\":\"fix\",\"conversion_id\":null,\"label\":null},{\"kind\":\"convert\",\"source_provider\":\"provider_a\",\"source_text\":\"four\",\"output_text\":\"4.\",\"conversion_id\":\"four→4.\",\"label\":null},{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"verify\",\"output_text\":\"verify\",\"conversion_id\":null,\"label\":null},{\"kind\":\"label\",\"source_provider\":\"provider_a\",\"source_text\":\"acceptance criteria\",\"output_text\":\"Acceptance Criteria:\",\"conversion_id\":null,\"label\":\"Acceptance Criteria\"},{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"CI is green on main\",\"output_text\":\"CI is green on main\",\"conversion_id\":null,\"label\":null},{\"kind\":\"label\",\"source_provider\":\"provider_a\",\"source_text\":\"f…[truncated 528 chars]",
-      "transport_error": null,
-      "notes": "CC-07 / DPR structured multi-label developer prompt",
-      "attempts": 1
-    },
-    {
-      "vector_id": "V-dual-stt-name",
-      "fixture_id": "CC-16",
-      "category": "dual_stt_reconciliation",
       "mode": "live",
       "provider": "groq",
       "model_id": "openai/gpt-oss-20b",
@@ -1160,24 +1113,71 @@
         "E_PROVIDER"
       ],
       "error_class": "rate_limited",
-      "rendered": "File the bug in voisu.",
-      "content_rendered": "File the bug in voisu.",
-      "oracle_expected": "File the bug in voisu.",
-      "semantic_match_oracle": true,
-      "content_semantic_match_oracle": true,
-      "latency_ms": 215.47,
-      "curl_time_total_ms": 208.42,
+      "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+      "content_rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+      "oracle_expected": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
+      "semantic_match_oracle": false,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 177.42,
+      "curl_time_total_ms": 168.38,
       "within_1500ms": true,
       "would_deliver_model_text": false,
       "usage": null,
       "raw_response_truncated": null,
       "transport_error": {
-        "message": "Rate limit reached for model `openai/gpt-oss-20b` in organization `org_01kxp7yf2hf1nt8v8tgpcmwqbj` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 3829, Requested 5083. Please try again in 6.84s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing",
+        "message": "Rate limit reached for model `openai/gpt-oss-20b` in organization `org_01kxp7yf2hf1nt8v8tgpcmwqbj` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 2627, Requested 5437. Please try again in 480ms. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing",
         "type": "tokens",
         "code": "rate_limit_exceeded"
       },
-      "notes": "voisu vs voice so; primary rank + protected name",
+      "notes": "CC-07 / DPR structured multi-label developer prompt",
       "attempts": 5
+    },
+    {
+      "vector_id": "V-dual-stt-name",
+      "fixture_id": "CC-16",
+      "category": "dual_stt_reconciliation",
+      "mode": "live",
+      "provider": "groq",
+      "model_id": "openai/gpt-oss-20b",
+      "status": "ok",
+      "trial": 1,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "accept",
+      "production_decision": "accept",
+      "deadline_overrode_accept": false,
+      "fallback_trigger": null,
+      "error_codes": [],
+      "content_error_codes": [],
+      "error_class": null,
+      "rendered": "File the bug in voisu",
+      "content_rendered": "File the bug in voisu",
+      "oracle_expected": "File the bug in voisu.",
+      "semantic_match_oracle": false,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 835.49,
+      "curl_time_total_ms": 827.07,
+      "within_1500ms": true,
+      "would_deliver_model_text": true,
+      "usage": {
+        "queue_time": 0.247012183,
+        "prompt_tokens": 1913,
+        "prompt_time": 0.113223524,
+        "completion_tokens": 282,
+        "completion_time": 0.300234545,
+        "total_tokens": 2195,
+        "total_time": 0.413458069,
+        "completion_tokens_details": {
+          "reasoning_tokens": 134
+        }
+      },
+      "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:44172aa76787c66b0cdca2ae95a072d39a3d87020ab2afcb8346193a47f4cbe1\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"configured_primary_rank\"},\"removals\":[],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"file the bug in voisu\",\"output_text\":\"File the bug in voisu\",\"conversion_id\":null,\"label\":null}]}",
+      "transport_error": null,
+      "notes": "voisu vs voice so; primary rank + protected name",
+      "attempts": 1
     },
     {
       "vector_id": "V-protected-command-url",
@@ -1200,34 +1200,34 @@
       "error_codes": [],
       "content_error_codes": [],
       "error_class": null,
-      "rendered": "run curl -I --fail https://example.com and return status_code equals 404",
-      "content_rendered": "run curl -I --fail https://example.com and return status_code equals 404",
+      "rendered": "Run curl -I --fail https://example.com and return status_code equals 404",
+      "content_rendered": "Run curl -I --fail https://example.com and return status_code equals 404",
       "oracle_expected": "run cargo test --workspace -- --test-threads=4",
       "semantic_match_oracle": false,
       "content_semantic_match_oracle": false,
-      "latency_ms": 998.46,
-      "curl_time_total_ms": 991.25,
+      "latency_ms": 1143.34,
+      "curl_time_total_ms": 1133.96,
       "within_1500ms": true,
       "would_deliver_model_text": true,
       "usage": {
-        "queue_time": 0.250283419,
+        "queue_time": 0.256669005,
         "prompt_tokens": 1902,
-        "prompt_time": 0.108187027,
-        "completion_tokens": 343,
-        "completion_time": 0.410759511,
-        "total_tokens": 2245,
-        "total_time": 0.518946538,
+        "prompt_time": 0.35601425,
+        "completion_tokens": 312,
+        "completion_time": 0.356294768,
+        "total_tokens": 2214,
+        "total_time": 0.712309018,
         "prompt_tokens_details": {
           "cached_tokens": 768
         },
         "completion_tokens_details": {
-          "reasoning_tokens": 177
+          "reasoning_tokens": 146
         }
       },
-      "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:8fea5c990d48b2615ce401ab424589c4dcea85bba89a6cae66da552063350dc3\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"run curl -I --fail https://example.com and return status_code equals 404\",\"output_text\":\"run curl -I --fail https://example.com and return status_code equals 404\",\"conversion_id\":null,\"label\":null}]}",
+      "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:8fea5c990d48b2615ce401ab424589c4dcea85bba89a6cae66da552063350dc3\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"run curl -I --fail https://example.com and return status_code equals 404\",\"output_text\":\"Run curl -I --fail https://example.com and return status_code equals 404\",\"conversion_id\":null,\"label\":null}]}",
       "transport_error": null,
       "notes": "curl flags URL status_code 404",
-      "attempts": 1
+      "attempts": 2
     },
     {
       "vector_id": "V-everyday-short",
@@ -1259,29 +1259,26 @@
       "oracle_expected": "Hey, can you send the notes when you get a chance?",
       "semantic_match_oracle": true,
       "content_semantic_match_oracle": true,
-      "latency_ms": 1395.02,
-      "curl_time_total_ms": 1387.71,
+      "latency_ms": 953.97,
+      "curl_time_total_ms": 945.77,
       "within_1500ms": true,
       "would_deliver_model_text": false,
       "usage": {
-        "queue_time": 0.280191954,
+        "queue_time": 0.283402461,
         "prompt_tokens": 1877,
-        "prompt_time": 0.467759162,
-        "completion_tokens": 379,
-        "completion_time": 0.424622607,
-        "total_tokens": 2256,
-        "total_time": 0.892381769,
-        "prompt_tokens_details": {
-          "cached_tokens": 768
-        },
+        "prompt_time": 0.122734685,
+        "completion_tokens": 346,
+        "completion_time": 0.37108201,
+        "total_tokens": 2223,
+        "total_time": 0.493816695,
         "completion_tokens_details": {
-          "reasoning_tokens": 203
+          "reasoning_tokens": 170
         }
       },
       "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:599fa103ead6f2f49c078c3cdb14d9a57d659fe734ae57fce4f384271bb29fb2\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[{\"kind\":\"filler\",\"certainty\":\"clear\",\"source_provider\":\"provider_a\",\"source_span_text\":\"hey\"}],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"can you send the notes when you get a chance\",\"output_text\":\"Can you send the notes when you get a chance\",\"conversion_id\":null,\"label\":null}]}",
       "transport_error": null,
       "notes": "short everyday message; organize-only",
-      "attempts": 1
+      "attempts": 4
     },
     {
       "vector_id": "V-structured-goal",
@@ -1304,31 +1301,34 @@
       "error_codes": [],
       "content_error_codes": [],
       "error_class": null,
-      "rendered": "Goal fix the flaky auth test",
-      "content_rendered": "Goal fix the flaky auth test",
+      "rendered": "Goal:\nFix the flaky auth test",
+      "content_rendered": "Goal:\nFix the flaky auth test",
       "oracle_expected": "Goal:\nFix the flaky auth test.",
       "semantic_match_oracle": false,
       "content_semantic_match_oracle": false,
-      "latency_ms": 993.71,
-      "curl_time_total_ms": 984.76,
+      "latency_ms": 1153.34,
+      "curl_time_total_ms": 1142.94,
       "within_1500ms": true,
       "would_deliver_model_text": true,
       "usage": {
-        "queue_time": 0.381640286,
+        "queue_time": 0.285315091,
         "prompt_tokens": 1872,
-        "prompt_time": 0.112340631,
-        "completion_tokens": 257,
-        "completion_time": 0.282873186,
-        "total_tokens": 2129,
-        "total_time": 0.395213817,
+        "prompt_time": 0.099651995,
+        "completion_tokens": 469,
+        "completion_time": 0.57926987,
+        "total_tokens": 2341,
+        "total_time": 0.678921865,
+        "prompt_tokens_details": {
+          "cached_tokens": 768
+        },
         "completion_tokens_details": {
-          "reasoning_tokens": 111
+          "reasoning_tokens": 277
         }
       },
-      "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:4b0349ed26d8df0479ca014fedfa63d93567dc1e3a49c56b6077dfaf815a824e\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"goal fix the flaky auth test\",\"output_text\":\"Goal fix the flaky auth test\",\"conversion_id\":null,\"label\":null}]}",
+      "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:4b0349ed26d8df0479ca014fedfa63d93567dc1e3a49c56b6077dfaf815a824e\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[{\"label\":\"Goal\",\"source_provider\":\"provider_a\",\"source_span_text\":\"goal\"}],\"derivation\":[{\"kind\":\"label\",\"source_provider\":\"provider_a\",\"source_text\":\"goal\",\"output_text\":\"Goal:\\n\",\"conversion_id\":null,\"label\":\"Goal\"},{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"fix the flaky auth test\",\"output_text\":\"Fix the flaky auth test\",\"conversion_id\":null,\"label\":null}]}",
       "transport_error": null,
       "notes": "simple Structured Goal label",
-      "attempts": 2
+      "attempts": 4
     },
     {
       "vector_id": "V-quote-convert",
@@ -1345,37 +1345,42 @@
       "structured_parse_ok": true,
       "parse_error": null,
       "compose_decision": "accept",
-      "production_decision": "accept",
-      "deadline_overrode_accept": false,
-      "fallback_trigger": null,
-      "error_codes": [],
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
       "content_error_codes": [],
       "error_class": null,
-      "rendered": "she said quote we ship friday unquote and hung up",
+      "rendered": "She said \"we ship friday\" and hung up.",
       "content_rendered": "she said quote we ship friday unquote and hung up",
       "oracle_expected": "Use the exact error \"connection refused\" in the ticket.",
       "semantic_match_oracle": false,
       "content_semantic_match_oracle": false,
-      "latency_ms": 1127.13,
-      "curl_time_total_ms": 1119.64,
-      "within_1500ms": true,
-      "would_deliver_model_text": true,
+      "latency_ms": 3502.2,
+      "curl_time_total_ms": 3494.5,
+      "within_1500ms": false,
+      "would_deliver_model_text": false,
       "usage": {
-        "queue_time": 0.283458141,
+        "queue_time": 0.156831766,
         "prompt_tokens": 1885,
-        "prompt_time": 0.094065697,
-        "completion_tokens": 407,
-        "completion_time": 0.524204553,
-        "total_tokens": 2292,
-        "total_time": 0.61827025,
+        "prompt_time": 2.365582167,
+        "completion_tokens": 397,
+        "completion_time": 0.803782719,
+        "total_tokens": 2282,
+        "total_time": 3.169364886,
+        "prompt_tokens_details": {
+          "cached_tokens": 768
+        },
         "completion_tokens_details": {
-          "reasoning_tokens": 247
+          "reasoning_tokens": 237
         }
       },
       "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:145baf5bf0e3e3eb0c76673c039f3d2f6cc08bea0d5fec425e58314e72b48d76\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"she said quote we ship friday unquote and hung up\",\"output_text\":\"she said quote we ship friday unquote and hung up\",\"conversion_id\":null,\"label\":null}]}",
       "transport_error": null,
       "notes": "quote…unquote with protected interior",
-      "attempts": 4
+      "attempts": 3
     },
     {
       "vector_id": "V-protected-name",
@@ -1403,26 +1408,26 @@
       "oracle_expected": "File the bug in voisu not voice so.",
       "semantic_match_oracle": false,
       "content_semantic_match_oracle": false,
-      "latency_ms": 944.78,
-      "curl_time_total_ms": 936.74,
+      "latency_ms": 848.49,
+      "curl_time_total_ms": 840.02,
       "within_1500ms": true,
       "would_deliver_model_text": true,
       "usage": {
-        "queue_time": 0.284136191,
+        "queue_time": 0.319657462,
         "prompt_tokens": 1885,
-        "prompt_time": 0.111016155,
-        "completion_tokens": 293,
-        "completion_time": 0.320122989,
-        "total_tokens": 2178,
-        "total_time": 0.431139144,
+        "prompt_time": 0.121845804,
+        "completion_tokens": 213,
+        "completion_time": 0.226367716,
+        "total_tokens": 2098,
+        "total_time": 0.34821352,
         "completion_tokens_details": {
-          "reasoning_tokens": 137
+          "reasoning_tokens": 57
         }
       },
       "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:8f904cfd9d7dda6b7a00c8f773a26a0b6b94b0dfed53d5fdfdb3a3fe32dae99d\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"call Anuraj about the release\",\"output_text\":\"Call Anuraj about the release\",\"conversion_id\":null,\"label\":null}]}",
       "transport_error": null,
       "notes": "live: preserve name Anuraj (corpus candidate was unsafe flip)",
-      "attempts": 5
+      "attempts": 3
     },
     {
       "vector_id": "V-negation-dual",
@@ -1450,26 +1455,26 @@
       "oracle_expected": "Do not enable the feature flag in production.",
       "semantic_match_oracle": false,
       "content_semantic_match_oracle": false,
-      "latency_ms": 854.69,
-      "curl_time_total_ms": 846.65,
+      "latency_ms": 854.27,
+      "curl_time_total_ms": 846.48,
       "within_1500ms": true,
       "would_deliver_model_text": true,
       "usage": {
-        "queue_time": 0.256525122,
+        "queue_time": 0.247408907,
         "prompt_tokens": 1913,
-        "prompt_time": 0.114217576,
-        "completion_tokens": 260,
-        "completion_time": 0.26909777,
-        "total_tokens": 2173,
-        "total_time": 0.383315346,
+        "prompt_time": 0.09558998,
+        "completion_tokens": 263,
+        "completion_time": 0.292255433,
+        "total_tokens": 2176,
+        "total_time": 0.387845413,
         "completion_tokens_details": {
-          "reasoning_tokens": 111
+          "reasoning_tokens": 114
         }
       },
       "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:d6df43b134a303df10f4cdc21f2434a03175b66a2089cea902253e6ea032df4b\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"configured_primary_rank\"},\"removals\":[],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"do not enable the feature flag in production\",\"output_text\":\"Do not enable the feature flag in production\",\"conversion_id\":null,\"label\":null}]}",
       "transport_error": null,
       "notes": "preserve Do not enable under dual-STT disagreement",
-      "attempts": 1
+      "attempts": 4
     },
     {
       "vector_id": "V-multiparagraph",
@@ -1497,18 +1502,21 @@
       "oracle_expected": "The first thought is done.\n\nThe second thought is ready.",
       "semantic_match_oracle": false,
       "content_semantic_match_oracle": false,
-      "latency_ms": 1353.61,
-      "curl_time_total_ms": 1344.27,
+      "latency_ms": 710.28,
+      "curl_time_total_ms": 700.12,
       "within_1500ms": true,
       "would_deliver_model_text": true,
       "usage": {
-        "queue_time": 0.331030811,
+        "queue_time": 0.157677121,
         "prompt_tokens": 1875,
-        "prompt_time": 0.518751864,
+        "prompt_time": 0.061290757,
         "completion_tokens": 206,
-        "completion_time": 0.265941378,
+        "completion_time": 0.318163236,
         "total_tokens": 2081,
-        "total_time": 0.784693242,
+        "total_time": 0.379453993,
+        "prompt_tokens_details": {
+          "cached_tokens": 768
+        },
         "completion_tokens_details": {
           "reasoning_tokens": 53
         }
@@ -1516,7 +1524,7 @@
       "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:a94d854cb0249f35523f6f51119060ec3691bf7d9bb2ab11525dab58de6e3c28\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"the first thought is done the second thought is ready\",\"output_text\":\"The first thought is done the second thought is ready\",\"conversion_id\":null,\"label\":null}]}",
       "transport_error": null,
       "notes": "clear multi-paragraph layout",
-      "attempts": 2
+      "attempts": 4
     },
     {
       "vector_id": "V-sym-exclamation",
@@ -1525,17 +1533,48 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.5-flash-lite",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "accept",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [],
+      "error_class": null,
+      "rendered": "Ship it!",
+      "content_rendered": "Ship it!",
+      "oracle_expected": "Ship it!",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": true,
+      "latency_ms": 1936.01,
+      "curl_time_total_ms": 1926.95,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1499,
+        "candidatesTokenCount": 348,
+        "totalTokenCount": 1847,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1499
+          }
+        ],
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:2af172901ba1ab4ff2ac0c16051d9f743dce96d197eb8d7c54896b40bb208324\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"only_available\"\n  },\n  \"removals\": [],\n  \"conversions\": [\n    {\n      \"id\": \"exclamation point→!\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"exclamation point\"\n    }\n  ],\n  \"layout\": {\n    \"decision\": \"natural\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [],\n  \"derivation\": [\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"ship it\",\n      \"output_text\": \"Ship it\",\n      \"conversion_id\": null,\n      \"label\": null\n    },\n    {\n      \"kind\": \"convert\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"exclamation point\",\n      \"output_text\": \"!\",\n      \"conversion_id\": \"exclamation point→!\",\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "exclamation point → !",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-sym-period-newline",
@@ -1544,17 +1583,48 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.5-flash-lite",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "accept",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [],
+      "error_class": null,
+      "rendered": "Stop.\nNext item",
+      "content_rendered": "Stop.\nnext item",
+      "oracle_expected": "Stop.\nNext item",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 2626.69,
+      "curl_time_total_ms": 2616.99,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1501,
+        "candidatesTokenCount": 510,
+        "totalTokenCount": 2011,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1501
+          }
+        ],
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:bc77de8133e75a4115cdc341d92290761c03a886dd5ed853a8c9e66910e5ded6\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"only_available\"\n  },\n  \"removals\": [],\n  \"conversions\": [\n    {\n      \"id\": \"period→.\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"period\"\n    },\n    {\n      \"id\": \"new line→\\\\n\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"new line\"\n    }\n  ],\n  \"layout\": {\n    \"decision\": \"natural\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [],\n  \"derivation\": [\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"stop\",\n      \"output_text\": \"Stop\",\n      \"conversion_id\": null,\n      \"label\": null\n    },\n    {\n      \"kind\": \"convert\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"period\",\n      \"output_text\": \".\",\n      \"conversion_id\": \"period→.\",\n      \"label\": null\n    },\n    {\n      \"kind\": \"convert\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"new line\",\n      \"output_text\": \"\\n\",\n      \"conversion_id\": \"new line→\\\\n\",\n      \"label\": null\n    },\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"next item\",\n      \"output_text\": \"next item\",\n      \"conversion_id\": null,\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "period + new line stack",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-filler-clear",
@@ -1563,17 +1633,51 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.5-flash-lite",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE",
+        "E_MALFORMED"
+      ],
+      "content_error_codes": [
+        "E_MALFORMED"
+      ],
+      "error_class": "E_MALFORMED",
+      "rendered": "I think we should ship Friday.",
+      "content_rendered": "I think we should ship Friday.",
+      "oracle_expected": "I think we should ship Friday.",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": true,
+      "latency_ms": 2268.42,
+      "curl_time_total_ms": 2260.94,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1500,
+        "candidatesTokenCount": 497,
+        "totalTokenCount": 1997,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1500
+          }
+        ],
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:a792371cf933fe6eecfff7e6b878ffcbad2f394752ff151fa629559f9760e3bd\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"only_available\"\n  },\n  \"removals\": [\n    {\n      \"kind\": \"filler\",\n      \"certainty\": \"clear\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"um\"\n    },\n    {\n      \"kind\": \"filler\",\n      \"certainty\": \"clear\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"uh\"\n    }\n  ],\n  \"conversions\": [\n    {\n      \"id\": \"period→.\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"\"\n    }\n  ],\n  \"layout\": {\n    \"decision\": \"natural\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [],\n  \"derivation\": [\n    {\n      \"kind\": \"remove\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"um\",\n      \"output_text\": \"\",\n      \"conversion_id\": null,\n      \"label\": null\n    },\n    {\n      \"kind\": \"remove\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \" uh\",\n      \"output_text\": \"\",\n      \"conversion_id\": null,\n      \"label\": null\n    },\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \" I think we should ship friday\",\n      \"output_text\": \"I think we should ship Friday.\",\n      \"conversion_id\": null,\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "clear um/uh removal",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-backtrack-clear",
@@ -1582,17 +1686,48 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.5-flash-lite",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "accept",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [],
+      "error_class": null,
+      "rendered": "Send it Monday.",
+      "content_rendered": "Send it Friday Monday.",
+      "oracle_expected": "Send it Monday.",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 2418.29,
+      "curl_time_total_ms": 2406.06,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1506,
+        "candidatesTokenCount": 414,
+        "totalTokenCount": 1920,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1506
+          }
+        ],
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:b08f4b27890386954068a911fe4b03c619191fe6e59e7ea6bf36b8d0a754efc8\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"only_available\"\n  },\n  \"removals\": [\n    {\n      \"kind\": \"backtrack\",\n      \"certainty\": \"clear\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"no wait\"\n    }\n  ],\n  \"conversions\": [],\n  \"layout\": {\n    \"decision\": \"natural\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [],\n  \"derivation\": [\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"send it friday \",\n      \"output_text\": \"Send it Friday \",\n      \"conversion_id\": null,\n      \"label\": null\n    },\n    {\n      \"kind\": \"remove\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"no wait \",\n      \"output_text\": \"\",\n      \"conversion_id\": null,\n      \"label\": null\n    },\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"monday\",\n      \"output_text\": \"Monday.\",\n      \"conversion_id\": null,\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "clear friday→monday backtrack",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-backtrack-uncertain",
@@ -1601,17 +1736,51 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.5-flash-lite",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE",
+        "E_MALFORMED"
+      ],
+      "content_error_codes": [
+        "E_MALFORMED"
+      ],
+      "error_class": "E_MALFORMED",
+      "rendered": "Send it Friday actually Monday.",
+      "content_rendered": "Send it Friday actually Monday.",
+      "oracle_expected": "Send it Friday actually Monday.",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": true,
+      "latency_ms": 2048.48,
+      "curl_time_total_ms": 2038.7,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1509,
+        "candidatesTokenCount": 284,
+        "totalTokenCount": 1793,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1509
+          }
+        ],
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:06f33b8a0c34ad8fd8bed096aee076755e9583afd0536674a86746977d209a46\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"only_available\"\n  },\n  \"removals\": [],\n  \"conversions\": [\n    {\n      \"id\": \"period→.\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"\"\n    }\n  ],\n  \"layout\": {\n    \"decision\": \"natural\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [],\n  \"derivation\": [\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"send it friday actually monday\",\n      \"output_text\": \"Send it Friday, actually Monday.\",\n      \"conversion_id\": null,\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "uncertain backtrack → preserve words soft salvage",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-structured-multi",
@@ -1620,17 +1789,53 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.5-flash-lite",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE",
+        "E_INVENTED_CONTENT",
+        "E_UNSAFE_SEMANTICS"
+      ],
+      "content_error_codes": [
+        "E_INVENTED_CONTENT",
+        "E_UNSAFE_SEMANTICS"
+      ],
+      "error_class": "E_INVENTED_CONTENT",
+      "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+      "content_rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+      "oracle_expected": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
+      "semantic_match_oracle": false,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 7914.19,
+      "curl_time_total_ms": 7906.2,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1569,
+        "candidatesTokenCount": 3162,
+        "totalTokenCount": 4731,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1569
+          }
+        ],
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:127575fbf06d8c0889f55a93ad84768b9ecdd9e6e6a9ac420958bbfe5ffe8a5c\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"only_available\"\n  },\n  \"removals\": [],\n  \"conversions\": [\n    {\n      \"id\": \"spoken goal cue→Goal label\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"goal\"\n    },\n    {\n      \"id\": \"spoken context cue→Context label\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"context\"\n    },\n    {\n      \"id\": \"spoken requirements cue→Requirements label\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"requirements\"\n    },\n    {\n      \"id\": \"spoken constraints cue→Constraints label\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"constraints\"\n    },\n    {\n      \"id\": \"spoken steps cue→numbered_lines\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"steps\"\n    },\n    {\n      \"id\": \"one→1.\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"one\"\n    },\n    {\n      \"id\": \"two→2.\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"two\"\n    },\n    {\n      \"id\": \"three→3.\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"three\"\n    },\n    {\n      \"id\": \"four→4.\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"four\"\n    },\n    {\n      \"id\": \"spoken acceptance criteria cue→Acceptance Criteria label\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"acceptance criteria\"\n    },\n    {\n      \"id\": \"spoken files cue→Files label\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"files\"\n    },\n    {\n      \"id\": \"spoken notes cue→Notes label\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"notes\"\n    }\n  ],\n  \"layout\": {\n    \"decision\": \"structured_sections\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [\n    {\n      \"label\": \"Goal\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"goal\"\n    },\n    {\n      \"label\": \"Context\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"context\"\n    },\n    {\n      \"label\": \"Requirements\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"requirements\"\n    },\n    {\n      \"label\": \"Constraints\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"constraints\"\n    },\n    {\n      \"label\": \"Steps\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"steps\"\n    },\n    {\n      \"label\": \"Acceptance Criteria\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"acceptance criteria\"\n    },\n    {\n      \"label\": \"Files\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"files\"\n    },\n    {\n      \"label\": \"Notes\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"notes\"\n    }\n  ],\n  \"derivation\": [\n    {\n      \"kind\": \"convert\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"goal\",\n      \"output_text\": \"Goal:\\n\",\n      \"conversion_id\": \"spoken goal cue→Goal label\",\n      \"label\": \"Goal\"\n    },\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"fix the flaky auth test\",\n      \"output_text\": \"fix the flaky auth test\",\n      \"conversion_id\": null,\n      \"label\": null\n    },\n    {\n      \"kind\": \"layout_break\",\n      \"source_provider\": null,\n      \"source_text\": \"\",\n      \"output_text\": \"\\n\\n\",\n      \"conversion_id\": null,\n      \"label\": null\n    },\n    {\n      \"kind\": \"convert\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"context\",\n      \"output_text\": \"Context:\\n\",\n      \"conversion_id\": \"spoken context cue→Context label\",\n      \"label\": \"Context\"\n    },\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"it fails on CI only\",\n      \"output_text\": \"it fails on CI only\",\n      \"conversion_id\": null,\n      \"label\": null\n    },\n    {\n      \"kind\": \"layout_break\",\n      \"source_provider\": null,\n      \"sour…[truncated 5536 chars]",
+      "transport_error": null,
+      "notes": "CC-07 / DPR structured multi-label developer prompt",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-dual-stt-name",
@@ -1639,17 +1844,51 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.5-flash-lite",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE",
+        "E_MALFORMED"
+      ],
+      "content_error_codes": [
+        "E_MALFORMED"
+      ],
+      "error_class": "E_MALFORMED",
+      "rendered": "File the bug in voisu.",
+      "content_rendered": "File the bug in voisu.",
+      "oracle_expected": "File the bug in voisu.",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": true,
+      "latency_ms": 1831.06,
+      "curl_time_total_ms": 1822.24,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1548,
+        "candidatesTokenCount": 286,
+        "totalTokenCount": 1834,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1548
+          }
+        ],
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:44172aa76787c66b0cdca2ae95a072d39a3d87020ab2afcb8346193a47f4cbe1\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"configured_primary_rank\"\n  },\n  \"removals\": [],\n  \"conversions\": [\n    {\n      \"id\": \"period→.\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"\"\n    }\n  ],\n  \"layout\": {\n    \"decision\": \"natural\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [],\n  \"derivation\": [\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"file the bug in voisu\",\n      \"output_text\": \"File the bug in voisu.\",\n      \"conversion_id\": null,\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "voisu vs voice so; primary rank + protected name",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-protected-command-url",
@@ -1658,17 +1897,48 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.5-flash-lite",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "accept",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [],
+      "error_class": null,
+      "rendered": "Run curl -I --fail https://example.com and return status_code equals 404.",
+      "content_rendered": "Run curl -I --fail https://example.com and return status_code equals 404.",
+      "oracle_expected": "run cargo test --workspace -- --test-threads=4",
+      "semantic_match_oracle": false,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 2037.6,
+      "curl_time_total_ms": 2028.78,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1539,
+        "candidatesTokenCount": 272,
+        "totalTokenCount": 1811,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1539
+          }
+        ],
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:8fea5c990d48b2615ce401ab424589c4dcea85bba89a6cae66da552063350dc3\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"only_available\"\n  },\n  \"removals\": [],\n  \"conversions\": [],\n  \"layout\": {\n    \"decision\": \"natural\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [],\n  \"derivation\": [\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"run curl -I --fail https://example.com and return status_code equals 404\",\n      \"output_text\": \"Run curl -I --fail https://example.com and return status_code equals 404.\",\n      \"conversion_id\": null,\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "curl flags URL status_code 404",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-everyday-short",
@@ -1677,17 +1947,51 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.5-flash-lite",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE",
+        "E_MALFORMED"
+      ],
+      "content_error_codes": [
+        "E_MALFORMED"
+      ],
+      "error_class": "E_MALFORMED",
+      "rendered": "Hey, can you send the notes when you get a chance?",
+      "content_rendered": "Hey, can you send the notes when you get a chance?",
+      "oracle_expected": "Hey, can you send the notes when you get a chance?",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": true,
+      "latency_ms": 2035.91,
+      "curl_time_total_ms": 2028.05,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1505,
+        "candidatesTokenCount": 353,
+        "totalTokenCount": 1858,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1505
+          }
+        ],
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:599fa103ead6f2f49c078c3cdb14d9a57d659fe734ae57fce4f384271bb29fb2\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"only_available\"\n  },\n  \"removals\": [],\n  \"conversions\": [\n    {\n      \"id\": \"period→.\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"\"\n    }\n  ],\n  \"layout\": {\n    \"decision\": \"natural\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [],\n  \"derivation\": [\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"hey can you send the notes when you get a chance\",\n      \"output_text\": \"Hey, can you send the notes when you get a chance.\",\n      \"conversion_id\": null,\n      \"label\": null\n    },\n    {\n      \"kind\": \"convert\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"\",\n      \"output_text\": \".\",\n      \"conversion_id\": \"period→.\",\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "short everyday message; organize-only",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-structured-goal",
@@ -1696,17 +2000,48 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.5-flash-lite",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "accept",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [],
+      "error_class": null,
+      "rendered": "Goal:\nFix the flaky auth test.",
+      "content_rendered": "Goal:\nfix the flaky auth test",
+      "oracle_expected": "Goal:\nFix the flaky auth test.",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 2433.33,
+      "curl_time_total_ms": 2425.98,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1500,
+        "candidatesTokenCount": 395,
+        "totalTokenCount": 1895,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1500
+          }
+        ],
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:4b0349ed26d8df0479ca014fedfa63d93567dc1e3a49c56b6077dfaf815a824e\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"only_available\"\n  },\n  \"removals\": [],\n  \"conversions\": [\n    {\n      \"id\": \"spoken goal cue→Goal label\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"goal\"\n    }\n  ],\n  \"layout\": {\n    \"decision\": \"structured_sections\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [\n    {\n      \"label\": \"Goal\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"goal\"\n    }\n  ],\n  \"derivation\": [\n    {\n      \"kind\": \"label\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"goal\",\n      \"output_text\": \"Goal:\\n\",\n      \"conversion_id\": null,\n      \"label\": \"Goal\"\n    },\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"fix the flaky auth test\",\n      \"output_text\": \"fix the flaky auth test\",\n      \"conversion_id\": null,\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "simple Structured Goal label",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-quote-convert",
@@ -1715,17 +2050,48 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.5-flash-lite",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "accept",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [],
+      "error_class": null,
+      "rendered": "She said \"we ship friday\" and hung up.",
+      "content_rendered": "She said \"we ship friday\" and hung up.",
+      "oracle_expected": "Use the exact error \"connection refused\" in the ticket.",
+      "semantic_match_oracle": false,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 2147.78,
+      "curl_time_total_ms": 2140.08,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1511,
+        "candidatesTokenCount": 429,
+        "totalTokenCount": 1940,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1511
+          }
+        ],
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:145baf5bf0e3e3eb0c76673c039f3d2f6cc08bea0d5fec425e58314e72b48d76\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"only_available\"\n  },\n  \"removals\": [],\n  \"conversions\": [\n    {\n      \"id\": \"quote…unquote→\\\"…\\\"\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"quote we ship friday unquote\"\n    }\n  ],\n  \"layout\": {\n    \"decision\": \"natural\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [],\n  \"derivation\": [\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"she said \",\n      \"output_text\": \"She said \",\n      \"conversion_id\": null,\n      \"label\": null\n    },\n    {\n      \"kind\": \"convert\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"quote we ship friday unquote\",\n      \"output_text\": \"\\\"we ship friday\\\"\",\n      \"conversion_id\": \"quote…unquote→\\\"…\\\"\",\n      \"label\": null\n    },\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \" and hung up\",\n      \"output_text\": \" and hung up.\",\n      \"conversion_id\": null,\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "quote…unquote with protected interior",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-protected-name",
@@ -1734,17 +2100,51 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.5-flash-lite",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE",
+        "E_MALFORMED"
+      ],
+      "content_error_codes": [
+        "E_MALFORMED"
+      ],
+      "error_class": "E_MALFORMED",
+      "rendered": "Call Anuraj about the release.",
+      "content_rendered": "Call Anuraj about the release.",
+      "oracle_expected": "File the bug in voisu not voice so.",
+      "semantic_match_oracle": false,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 2159.86,
+      "curl_time_total_ms": 2152.27,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1504,
+        "candidatesTokenCount": 283,
+        "totalTokenCount": 1787,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1504
+          }
+        ],
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:8f904cfd9d7dda6b7a00c8f773a26a0b6b94b0dfed53d5fdfdb3a3fe32dae99d\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"only_available\"\n  },\n  \"removals\": [],\n  \"conversions\": [\n    {\n      \"id\": \"period→.\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"\"\n    }\n  ],\n  \"layout\": {\n    \"decision\": \"natural\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [],\n  \"derivation\": [\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"call Anuraj about the release\",\n      \"output_text\": \"Call Anuraj about the release.\",\n      \"conversion_id\": null,\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "live: preserve name Anuraj (corpus candidate was unsafe flip)",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-negation-dual",
@@ -1753,17 +2153,51 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.5-flash-lite",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE",
+        "E_MALFORMED"
+      ],
+      "content_error_codes": [
+        "E_MALFORMED"
+      ],
+      "error_class": "E_MALFORMED",
+      "rendered": "Do not enable the feature flag in production.",
+      "content_rendered": "Do not enable the feature flag in production.",
+      "oracle_expected": "Do not enable the feature flag in production.",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": true,
+      "latency_ms": 1955.91,
+      "curl_time_total_ms": 1947.23,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1551,
+        "candidatesTokenCount": 290,
+        "totalTokenCount": 1841,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1551
+          }
+        ],
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:d6df43b134a303df10f4cdc21f2434a03175b66a2089cea902253e6ea032df4b\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"configured_primary_rank\"\n  },\n  \"removals\": [],\n  \"conversions\": [\n    {\n      \"id\": \"period→.\",\n      \"source_provider\": \"provider_a\",\n      \"source_span_text\": \"\"\n    }\n  ],\n  \"layout\": {\n    \"decision\": \"natural\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [],\n  \"derivation\": [\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"do not enable the feature flag in production\",\n      \"output_text\": \"Do not enable the feature flag in production.\",\n      \"conversion_id\": null,\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "preserve Do not enable under dual-STT disagreement",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-multiparagraph",
@@ -1772,17 +2206,48 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.5-flash-lite",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "accept",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [],
+      "error_class": null,
+      "rendered": "The first thought is done.\n\nThe second thought is ready.",
+      "content_rendered": "The first thought is done. The second thought is ready.",
+      "oracle_expected": "The first thought is done.\n\nThe second thought is ready.",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 2047.09,
+      "curl_time_total_ms": 2038.76,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1505,
+        "candidatesTokenCount": 253,
+        "totalTokenCount": 1758,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1505
+          }
+        ],
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:a94d854cb0249f35523f6f51119060ec3691bf7d9bb2ab11525dab58de6e3c28\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"only_available\"\n  },\n  \"removals\": [],\n  \"conversions\": [],\n  \"layout\": {\n    \"decision\": \"natural\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [],\n  \"derivation\": [\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"the first thought is done the second thought is ready\",\n      \"output_text\": \"The first thought is done. The second thought is ready.\",\n      \"conversion_id\": null,\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "clear multi-paragraph layout",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-sym-exclamation",
@@ -1791,17 +2256,39 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.6-flash",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 0,
+      "rate_limited": false,
+      "timed_out": true,
+      "structured_parse_ok": false,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": false,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [
+        "E_DEADLINE"
+      ],
+      "error_class": "deadline_timeout",
+      "rendered": "Ship it!",
+      "content_rendered": "Ship it!",
+      "oracle_expected": "Ship it!",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": true,
+      "latency_ms": 8010.15,
+      "curl_time_total_ms": 8001.29,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": null,
+      "raw_response_truncated": null,
+      "transport_error": null,
+      "notes": "exclamation point → !",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-sym-period-newline",
@@ -1810,17 +2297,39 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.6-flash",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 0,
+      "rate_limited": false,
+      "timed_out": true,
+      "structured_parse_ok": false,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": false,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [
+        "E_DEADLINE"
+      ],
+      "error_class": "deadline_timeout",
+      "rendered": "Stop.\nNext item",
+      "content_rendered": "Stop.\nNext item",
+      "oracle_expected": "Stop.\nNext item",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": true,
+      "latency_ms": 8010.5,
+      "curl_time_total_ms": 8002.5,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": null,
+      "raw_response_truncated": null,
+      "transport_error": null,
+      "notes": "period + new line stack",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-filler-clear",
@@ -1829,17 +2338,39 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.6-flash",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 0,
+      "rate_limited": false,
+      "timed_out": true,
+      "structured_parse_ok": false,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": false,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [
+        "E_DEADLINE"
+      ],
+      "error_class": "deadline_timeout",
+      "rendered": "I think we should ship Friday.",
+      "content_rendered": "I think we should ship Friday.",
+      "oracle_expected": "I think we should ship Friday.",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": true,
+      "latency_ms": 8010.25,
+      "curl_time_total_ms": 8002.92,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": null,
+      "raw_response_truncated": null,
+      "transport_error": null,
+      "notes": "clear um/uh removal",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-backtrack-clear",
@@ -1848,17 +2379,39 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.6-flash",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 0,
+      "rate_limited": false,
+      "timed_out": true,
+      "structured_parse_ok": false,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": false,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [
+        "E_DEADLINE"
+      ],
+      "error_class": "deadline_timeout",
+      "rendered": "Send it Monday.",
+      "content_rendered": "Send it Monday.",
+      "oracle_expected": "Send it Monday.",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": true,
+      "latency_ms": 8010.04,
+      "curl_time_total_ms": 8002.22,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": null,
+      "raw_response_truncated": null,
+      "transport_error": null,
+      "notes": "clear friday→monday backtrack",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-backtrack-uncertain",
@@ -1867,17 +2420,49 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.6-flash",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "accept",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [],
+      "error_class": null,
+      "rendered": "Send it Friday actually Monday.",
+      "content_rendered": "Send it Friday, actually Monday.",
+      "oracle_expected": "Send it Friday actually Monday.",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 6104.97,
+      "curl_time_total_ms": 6095.38,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1517,
+        "candidatesTokenCount": 164,
+        "totalTokenCount": 2596,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1517
+          }
+        ],
+        "thoughtsTokenCount": 915,
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:06f33b8a0c34ad8fd8bed096aee076755e9583afd0536674a86746977d209a46\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"send it friday actually monday\",\"output_text\":\"Send it Friday, actually Monday.\",\"conversion_id\":null,\"label\":null}]}",
+      "transport_error": null,
+      "notes": "uncertain backtrack → preserve words soft salvage",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-structured-multi",
@@ -1886,17 +2471,39 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.6-flash",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 0,
+      "rate_limited": false,
+      "timed_out": true,
+      "structured_parse_ok": false,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": false,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [
+        "E_DEADLINE"
+      ],
+      "error_class": "deadline_timeout",
+      "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+      "content_rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
+      "oracle_expected": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
+      "semantic_match_oracle": false,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 8011.42,
+      "curl_time_total_ms": 8002.46,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": null,
+      "raw_response_truncated": null,
+      "transport_error": null,
+      "notes": "CC-07 / DPR structured multi-label developer prompt",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-dual-stt-name",
@@ -1905,17 +2512,49 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.6-flash",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "accept",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [],
+      "error_class": null,
+      "rendered": "File the bug in voisu.",
+      "content_rendered": "File the bug in voisu.",
+      "oracle_expected": "File the bug in voisu.",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": true,
+      "latency_ms": 6952.83,
+      "curl_time_total_ms": 6944.6,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1556,
+        "candidatesTokenCount": 246,
+        "totalTokenCount": 2651,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1556
+          }
+        ],
+        "thoughtsTokenCount": 849,
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:44172aa76787c66b0cdca2ae95a072d39a3d87020ab2afcb8346193a47f4cbe1\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"configured_primary_rank\"\n  },\n  \"removals\": [],\n  \"conversions\": [],\n  \"layout\": {\n    \"decision\": \"natural\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [],\n  \"derivation\": [\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"file the bug in voisu\",\n      \"output_text\": \"File the bug in voisu.\",\n      \"conversion_id\": null,\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "voisu vs voice so; primary rank + protected name",
+      "attempts": 4,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-protected-command-url",
@@ -1924,17 +2563,39 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.6-flash",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 0,
+      "rate_limited": false,
+      "timed_out": true,
+      "structured_parse_ok": false,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": false,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [
+        "E_DEADLINE"
+      ],
+      "error_class": "deadline_timeout",
+      "rendered": "Run curl -I --fail https://example.com and return status_code equals 404.",
+      "content_rendered": "Run curl -I --fail https://example.com and return status_code equals 404.",
+      "oracle_expected": "run cargo test --workspace -- --test-threads=4",
+      "semantic_match_oracle": false,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 8010.1,
+      "curl_time_total_ms": 8001.94,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": null,
+      "raw_response_truncated": null,
+      "transport_error": null,
+      "notes": "curl flags URL status_code 404",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-everyday-short",
@@ -1943,17 +2604,49 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.6-flash",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "accept",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [],
+      "error_class": null,
+      "rendered": "Hey, can you send the notes when you get a chance?",
+      "content_rendered": "Hey, can you send the notes when you get a chance?",
+      "oracle_expected": "Hey, can you send the notes when you get a chance?",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": true,
+      "latency_ms": 7973.9,
+      "curl_time_total_ms": 7964.46,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1513,
+        "candidatesTokenCount": 174,
+        "totalTokenCount": 2539,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1513
+          }
+        ],
+        "thoughtsTokenCount": 852,
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\"schema_version\":\"1\",\"base_fingerprint\":\"sha256:599fa103ead6f2f49c078c3cdb14d9a57d659fe734ae57fce4f384271bb29fb2\",\"reconciliation\":{\"selected_provider\":\"provider_a\",\"reason\":\"only_available\"},\"removals\":[],\"conversions\":[],\"layout\":{\"decision\":\"natural\",\"certainty\":\"clear\"},\"labels\":[],\"derivation\":[{\"kind\":\"keep\",\"source_provider\":\"provider_a\",\"source_text\":\"hey can you send the notes when you get a chance\",\"output_text\":\"Hey, can you send the notes when you get a chance?\",\"conversion_id\":null,\"label\":null}]}",
+      "transport_error": null,
+      "notes": "short everyday message; organize-only",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-structured-goal",
@@ -1962,17 +2655,39 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.6-flash",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 0,
+      "rate_limited": false,
+      "timed_out": true,
+      "structured_parse_ok": false,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": false,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [
+        "E_DEADLINE"
+      ],
+      "error_class": "deadline_timeout",
+      "rendered": "Goal:\nFix the flaky auth test.",
+      "content_rendered": "Goal:\nFix the flaky auth test.",
+      "oracle_expected": "Goal:\nFix the flaky auth test.",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": true,
+      "latency_ms": 8012.96,
+      "curl_time_total_ms": 8002.8,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": null,
+      "raw_response_truncated": null,
+      "transport_error": null,
+      "notes": "simple Structured Goal label",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-quote-convert",
@@ -1981,17 +2696,39 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.6-flash",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 0,
+      "rate_limited": false,
+      "timed_out": true,
+      "structured_parse_ok": false,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": false,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [
+        "E_DEADLINE"
+      ],
+      "error_class": "deadline_timeout",
+      "rendered": "She said \"we ship friday\" and hung up.",
+      "content_rendered": "She said \"we ship friday\" and hung up.",
+      "oracle_expected": "Use the exact error \"connection refused\" in the ticket.",
+      "semantic_match_oracle": false,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 8012.54,
+      "curl_time_total_ms": 8002.91,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": null,
+      "raw_response_truncated": null,
+      "transport_error": null,
+      "notes": "quote…unquote with protected interior",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-protected-name",
@@ -2000,17 +2737,49 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.6-flash",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "accept",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [],
+      "error_class": null,
+      "rendered": "Call Anuraj about the release.",
+      "content_rendered": "Call Anuraj about the release.",
+      "oracle_expected": "File the bug in voisu not voice so.",
+      "semantic_match_oracle": false,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 4514.8,
+      "curl_time_total_ms": 4504.71,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1512,
+        "candidatesTokenCount": 243,
+        "totalTokenCount": 2295,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1512
+          }
+        ],
+        "thoughtsTokenCount": 540,
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:8f904cfd9d7dda6b7a00c8f773a26a0b6b94b0dfed53d5fdfdb3a3fe32dae99d\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"only_available\"\n  },\n  \"removals\": [],\n  \"conversions\": [],\n  \"layout\": {\n    \"decision\": \"natural\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [],\n  \"derivation\": [\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"call Anuraj about the release\",\n      \"output_text\": \"Call Anuraj about the release.\",\n      \"conversion_id\": null,\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "live: preserve name Anuraj (corpus candidate was unsafe flip)",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-negation-dual",
@@ -2019,17 +2788,39 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.6-flash",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 0,
+      "rate_limited": false,
+      "timed_out": true,
+      "structured_parse_ok": false,
+      "parse_error": null,
+      "compose_decision": "fallback_baseline",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": false,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [
+        "E_DEADLINE"
+      ],
+      "error_class": "deadline_timeout",
+      "rendered": "Do not enable the feature flag in production.",
+      "content_rendered": "Do not enable the feature flag in production.",
+      "oracle_expected": "Do not enable the feature flag in production.",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": true,
+      "latency_ms": 8011.43,
+      "curl_time_total_ms": 8002.6,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": null,
+      "raw_response_truncated": null,
+      "transport_error": null,
+      "notes": "preserve Do not enable under dual-STT disagreement",
+      "attempts": 4,
+      "schema_binding": "responseJsonSchema"
     },
     {
       "vector_id": "V-multiparagraph",
@@ -2038,17 +2829,49 @@
       "mode": "live",
       "provider": "google",
       "model_id": "gemini-3.6-flash",
-      "status": "not_run_missing_credentials",
+      "status": "ok",
       "trial": 1,
-      "structured_parse_ok": null,
-      "compose_decision": null,
-      "production_decision": null,
-      "error_codes": [],
-      "semantic_match_oracle": null,
-      "latency_ms": null,
-      "within_1500ms": null,
+      "http_code": 200,
+      "rate_limited": false,
+      "timed_out": false,
+      "structured_parse_ok": true,
+      "parse_error": null,
+      "compose_decision": "accept",
+      "production_decision": "fallback_baseline",
+      "deadline_overrode_accept": true,
+      "fallback_trigger": "deadline_exceeded",
+      "error_codes": [
+        "E_DEADLINE"
+      ],
+      "content_error_codes": [],
+      "error_class": null,
+      "rendered": "The first thought is done.\n\nThe second thought is ready.",
+      "content_rendered": "The first thought is done; the second thought is ready.",
+      "oracle_expected": "The first thought is done.\n\nThe second thought is ready.",
+      "semantic_match_oracle": true,
+      "content_semantic_match_oracle": false,
+      "latency_ms": 6076.18,
+      "curl_time_total_ms": 6065.69,
+      "within_1500ms": false,
       "would_deliver_model_text": false,
-      "notes": "Gemini path defined (prompt contract + same #139 compose gate) but GOOGLE_API_KEY/GEMINI_API_KEY and secret-tool google keys unavailable on this host. No fabricated scores."
+      "usage": {
+        "promptTokenCount": 1513,
+        "candidatesTokenCount": 253,
+        "totalTokenCount": 2353,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 1513
+          }
+        ],
+        "thoughtsTokenCount": 587,
+        "serviceTier": "standard"
+      },
+      "raw_response_truncated": "{\n  \"schema_version\": \"1\",\n  \"base_fingerprint\": \"sha256:a94d854cb0249f35523f6f51119060ec3691bf7d9bb2ab11525dab58de6e3c28\",\n  \"reconciliation\": {\n    \"selected_provider\": \"provider_a\",\n    \"reason\": \"only_available\"\n  },\n  \"removals\": [],\n  \"conversions\": [],\n  \"layout\": {\n    \"decision\": \"natural\",\n    \"certainty\": \"clear\"\n  },\n  \"labels\": [],\n  \"derivation\": [\n    {\n      \"kind\": \"keep\",\n      \"source_provider\": \"provider_a\",\n      \"source_text\": \"the first thought is done the second thought is ready\",\n      \"output_text\": \"The first thought is done; the second thought is ready.\",\n      \"conversion_id\": null,\n      \"label\": null\n    }\n  ]\n}",
+      "transport_error": null,
+      "notes": "clear multi-paragraph layout",
+      "attempts": 1,
+      "schema_binding": "responseJsonSchema"
     }
   ],
   "offline_replay": {
@@ -2063,16 +2886,16 @@
       "n_rows": 14,
       "n_vectors": 14,
       "structured_parse_ok_rate": 0.8571428571428571,
-      "content_accept_rate": 0.5714285714285714,
-      "production_accept_rate": 0.5714285714285714,
-      "semantic_match_rate": 0.35714285714285715,
-      "content_semantic_match_rate": 0.35714285714285715,
+      "content_accept_rate": 0.7142857142857143,
+      "production_accept_rate": 0.6428571428571429,
+      "semantic_match_rate": 0.2857142857142857,
+      "content_semantic_match_rate": 0.2857142857142857,
       "within_1500ms_rate": 0.9285714285714286,
       "unsafe_deliver_count": 8,
-      "latency_p50_ms": 996.085,
-      "latency_p95_ms": 2470.184999999999,
-      "latency_max_ms": 4466.92,
-      "latency_min_ms": 215.47,
+      "latency_p50_ms": 877.365,
+      "latency_p95_ms": 2001.414999999999,
+      "latency_max_ms": 3502.2,
+      "latency_min_ms": 177.42,
       "vectors": [
         {
           "vector_id": "V-backtrack-clear",
@@ -2086,12 +2909,12 @@
           "content_semantic_match": 0,
           "within_1500ms": 1,
           "unsafe_deliver": 1,
-          "p50_ms": 985.02,
-          "p95_ms": 985.02,
-          "max_ms": 985.02,
+          "p50_ms": 929.14,
+          "p95_ms": 929.14,
+          "max_ms": 929.14,
           "sample_decision": "accept",
           "sample_error_codes": [],
-          "sample_rendered": "Send it friday no wait Monday"
+          "sample_rendered": "Send it Friday no wait Monday"
         },
         {
           "vector_id": "V-backtrack-uncertain",
@@ -2105,9 +2928,9 @@
           "content_semantic_match": 0,
           "within_1500ms": 1,
           "unsafe_deliver": 1,
-          "p50_ms": 940.09,
-          "p95_ms": 940.09,
-          "max_ms": 940.09,
+          "p50_ms": 876.31,
+          "p95_ms": 876.31,
+          "max_ms": 876.31,
           "sample_decision": "accept",
           "sample_error_codes": [],
           "sample_rendered": "Send it Friday actually Monday"
@@ -2117,21 +2940,19 @@
           "fixture_id": "CC-16",
           "category": "dual_stt_reconciliation",
           "n_trials": 1,
-          "parse_ok": 0,
-          "content_accept": 0,
-          "production_accept": 0,
-          "semantic_match": 1,
-          "content_semantic_match": 1,
+          "parse_ok": 1,
+          "content_accept": 1,
+          "production_accept": 1,
+          "semantic_match": 0,
+          "content_semantic_match": 0,
           "within_1500ms": 1,
-          "unsafe_deliver": 0,
-          "p50_ms": 215.47,
-          "p95_ms": 215.47,
-          "max_ms": 215.47,
-          "sample_decision": "fallback_baseline",
-          "sample_error_codes": [
-            "E_PROVIDER"
-          ],
-          "sample_rendered": "File the bug in voisu."
+          "unsafe_deliver": 1,
+          "p50_ms": 835.49,
+          "p95_ms": 835.49,
+          "max_ms": 835.49,
+          "sample_decision": "accept",
+          "sample_error_codes": [],
+          "sample_rendered": "File the bug in voisu"
         },
         {
           "vector_id": "V-everyday-short",
@@ -2145,9 +2966,9 @@
           "content_semantic_match": 1,
           "within_1500ms": 1,
           "unsafe_deliver": 0,
-          "p50_ms": 1395.02,
-          "p95_ms": 1395.02,
-          "max_ms": 1395.02,
+          "p50_ms": 953.97,
+          "p95_ms": 953.97,
+          "max_ms": 953.97,
           "sample_decision": "fallback_baseline",
           "sample_error_codes": [
             "E_UNVERIFIABLE"
@@ -2159,19 +2980,19 @@
           "fixture_id": "CC-03",
           "category": "filler_removal",
           "n_trials": 1,
-          "parse_ok": 1,
+          "parse_ok": 0,
           "content_accept": 0,
           "production_accept": 0,
           "semantic_match": 1,
           "content_semantic_match": 1,
           "within_1500ms": 1,
           "unsafe_deliver": 0,
-          "p50_ms": 1192.3,
-          "p95_ms": 1192.3,
-          "max_ms": 1192.3,
+          "p50_ms": 196.39,
+          "p95_ms": 196.39,
+          "max_ms": 196.39,
           "sample_decision": "fallback_baseline",
           "sample_error_codes": [
-            "E_UNVERIFIABLE"
+            "E_PROVIDER"
           ],
           "sample_rendered": "I think we should ship Friday."
         },
@@ -2187,9 +3008,9 @@
           "content_semantic_match": 0,
           "within_1500ms": 1,
           "unsafe_deliver": 1,
-          "p50_ms": 1353.61,
-          "p95_ms": 1353.61,
-          "max_ms": 1353.61,
+          "p50_ms": 710.28,
+          "p95_ms": 710.28,
+          "max_ms": 710.28,
           "sample_decision": "accept",
           "sample_error_codes": [],
           "sample_rendered": "The first thought is done the second thought is ready"
@@ -2206,9 +3027,9 @@
           "content_semantic_match": 0,
           "within_1500ms": 1,
           "unsafe_deliver": 1,
-          "p50_ms": 854.69,
-          "p95_ms": 854.69,
-          "max_ms": 854.69,
+          "p50_ms": 854.27,
+          "p95_ms": 854.27,
+          "max_ms": 854.27,
           "sample_decision": "accept",
           "sample_error_codes": [],
           "sample_rendered": "Do not enable the feature flag in production"
@@ -2225,12 +3046,12 @@
           "content_semantic_match": 0,
           "within_1500ms": 1,
           "unsafe_deliver": 1,
-          "p50_ms": 998.46,
-          "p95_ms": 998.46,
-          "max_ms": 998.46,
+          "p50_ms": 1143.34,
+          "p95_ms": 1143.34,
+          "max_ms": 1143.34,
           "sample_decision": "accept",
           "sample_error_codes": [],
-          "sample_rendered": "run curl -I --fail https://example.com and return status_code equals 404"
+          "sample_rendered": "Run curl -I --fail https://example.com and return status_code equals 404"
         },
         {
           "vector_id": "V-protected-name",
@@ -2244,9 +3065,9 @@
           "content_semantic_match": 0,
           "within_1500ms": 1,
           "unsafe_deliver": 1,
-          "p50_ms": 944.78,
-          "p95_ms": 944.78,
-          "max_ms": 944.78,
+          "p50_ms": 848.49,
+          "p95_ms": 848.49,
+          "max_ms": 848.49,
           "sample_decision": "accept",
           "sample_error_codes": [],
           "sample_rendered": "Call Anuraj about the release"
@@ -2258,16 +3079,18 @@
           "n_trials": 1,
           "parse_ok": 1,
           "content_accept": 1,
-          "production_accept": 1,
+          "production_accept": 0,
           "semantic_match": 0,
           "content_semantic_match": 0,
-          "within_1500ms": 1,
-          "unsafe_deliver": 1,
-          "p50_ms": 1127.13,
-          "p95_ms": 1127.13,
-          "max_ms": 1127.13,
+          "within_1500ms": 0,
+          "unsafe_deliver": 0,
+          "p50_ms": 3502.2,
+          "p95_ms": 3502.2,
+          "max_ms": 3502.2,
           "sample_decision": "accept",
-          "sample_error_codes": [],
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
           "sample_rendered": "she said quote we ship friday unquote and hung up"
         },
         {
@@ -2282,33 +3105,31 @@
           "content_semantic_match": 0,
           "within_1500ms": 1,
           "unsafe_deliver": 1,
-          "p50_ms": 993.71,
-          "p95_ms": 993.71,
-          "max_ms": 993.71,
+          "p50_ms": 1153.34,
+          "p95_ms": 1153.34,
+          "max_ms": 1153.34,
           "sample_decision": "accept",
           "sample_error_codes": [],
-          "sample_rendered": "Goal fix the flaky auth test"
+          "sample_rendered": "Goal:\nFix the flaky auth test"
         },
         {
           "vector_id": "V-structured-multi",
           "fixture_id": "CC-07",
           "category": "structured_multi_label",
           "n_trials": 1,
-          "parse_ok": 1,
+          "parse_ok": 0,
           "content_accept": 0,
           "production_accept": 0,
           "semantic_match": 0,
           "content_semantic_match": 0,
-          "within_1500ms": 0,
+          "within_1500ms": 1,
           "unsafe_deliver": 0,
-          "p50_ms": 4466.92,
-          "p95_ms": 4466.92,
-          "max_ms": 4466.92,
+          "p50_ms": 177.42,
+          "p95_ms": 177.42,
+          "max_ms": 177.42,
           "sample_decision": "fallback_baseline",
           "sample_error_codes": [
-            "E_DEADLINE",
-            "E_INVENTED_CONTENT",
-            "E_UNSAFE_SEMANTICS"
+            "E_PROVIDER"
           ],
           "sample_rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is gree…[truncated 76 chars]"
         },
@@ -2317,20 +3138,18 @@
           "fixture_id": "CC-01",
           "category": "symbol_conversion",
           "n_trials": 1,
-          "parse_ok": 0,
-          "content_accept": 0,
-          "production_accept": 0,
+          "parse_ok": 1,
+          "content_accept": 1,
+          "production_accept": 1,
           "semantic_match": 1,
           "content_semantic_match": 1,
           "within_1500ms": 1,
           "unsafe_deliver": 0,
-          "p50_ms": 233.46,
-          "p95_ms": 233.46,
-          "max_ms": 233.46,
-          "sample_decision": "fallback_baseline",
-          "sample_error_codes": [
-            "E_PROVIDER"
-          ],
+          "p50_ms": 878.42,
+          "p95_ms": 878.42,
+          "max_ms": 878.42,
+          "sample_decision": "accept",
+          "sample_error_codes": [],
           "sample_rendered": "Ship it!"
         },
         {
@@ -2345,9 +3164,9 @@
           "content_semantic_match": 1,
           "within_1500ms": 1,
           "unsafe_deliver": 0,
-          "p50_ms": 1243.79,
-          "p95_ms": 1243.79,
-          "max_ms": 1243.79,
+          "p50_ms": 1193.3,
+          "p95_ms": 1193.3,
+          "max_ms": 1193.3,
           "sample_decision": "fallback_baseline",
           "sample_error_codes": [
             "E_INVENTED_CONTENT",
@@ -2366,312 +3185,349 @@
     },
     "gemini-3.5-flash-lite": {
       "model_id": "gemini-3.5-flash-lite",
-      "status": "live_partial",
+      "status": "live",
       "n_rows": 14,
       "n_vectors": 14,
-      "structured_parse_ok_rate": 0.0,
-      "content_accept_rate": 0.0,
+      "structured_parse_ok_rate": 1.0,
+      "content_accept_rate": 0.5,
       "production_accept_rate": 0.0,
-      "semantic_match_rate": 0.0,
-      "content_semantic_match_rate": 0.0,
+      "semantic_match_rate": 0.7142857142857143,
+      "content_semantic_match_rate": 0.42857142857142855,
       "within_1500ms_rate": 0.0,
       "unsafe_deliver_count": 0,
-      "latency_p50_ms": null,
-      "latency_p95_ms": null,
-      "latency_max_ms": null,
-      "latency_min_ms": null,
+      "latency_p50_ms": 2098.13,
+      "latency_p95_ms": 4477.314999999999,
+      "latency_max_ms": 7914.19,
+      "latency_min_ms": 1831.06,
       "vectors": [
         {
           "vector_id": "V-backtrack-clear",
           "fixture_id": "CC-04",
           "category": "backtrack_removal",
           "n_trials": 1,
-          "parse_ok": 0,
-          "content_accept": 0,
+          "parse_ok": 1,
+          "content_accept": 1,
           "production_accept": 0,
-          "semantic_match": 0,
+          "semantic_match": 1,
           "content_semantic_match": 0,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 2418.29,
+          "p95_ms": 2418.29,
+          "max_ms": 2418.29,
+          "sample_decision": "accept",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "Send it Friday Monday."
         },
         {
           "vector_id": "V-backtrack-uncertain",
           "fixture_id": "CC-05",
           "category": "backtrack_uncertain",
           "n_trials": 1,
-          "parse_ok": 0,
+          "parse_ok": 1,
           "content_accept": 0,
           "production_accept": 0,
-          "semantic_match": 0,
-          "content_semantic_match": 0,
+          "semantic_match": 1,
+          "content_semantic_match": 1,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 2048.48,
+          "p95_ms": 2048.48,
+          "max_ms": 2048.48,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE",
+            "E_MALFORMED"
+          ],
+          "sample_rendered": "Send it Friday actually Monday."
         },
         {
           "vector_id": "V-dual-stt-name",
           "fixture_id": "CC-16",
           "category": "dual_stt_reconciliation",
           "n_trials": 1,
-          "parse_ok": 0,
+          "parse_ok": 1,
           "content_accept": 0,
           "production_accept": 0,
-          "semantic_match": 0,
-          "content_semantic_match": 0,
+          "semantic_match": 1,
+          "content_semantic_match": 1,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 1831.06,
+          "p95_ms": 1831.06,
+          "max_ms": 1831.06,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE",
+            "E_MALFORMED"
+          ],
+          "sample_rendered": "File the bug in voisu."
         },
         {
           "vector_id": "V-everyday-short",
           "fixture_id": "CC-18",
           "category": "everyday_organize",
           "n_trials": 1,
-          "parse_ok": 0,
+          "parse_ok": 1,
           "content_accept": 0,
           "production_accept": 0,
-          "semantic_match": 0,
-          "content_semantic_match": 0,
+          "semantic_match": 1,
+          "content_semantic_match": 1,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 2035.91,
+          "p95_ms": 2035.91,
+          "max_ms": 2035.91,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE",
+            "E_MALFORMED"
+          ],
+          "sample_rendered": "Hey, can you send the notes when you get a chance?"
         },
         {
           "vector_id": "V-filler-clear",
           "fixture_id": "CC-03",
           "category": "filler_removal",
           "n_trials": 1,
-          "parse_ok": 0,
+          "parse_ok": 1,
           "content_accept": 0,
           "production_accept": 0,
-          "semantic_match": 0,
-          "content_semantic_match": 0,
+          "semantic_match": 1,
+          "content_semantic_match": 1,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 2268.42,
+          "p95_ms": 2268.42,
+          "max_ms": 2268.42,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE",
+            "E_MALFORMED"
+          ],
+          "sample_rendered": "I think we should ship Friday."
         },
         {
           "vector_id": "V-multiparagraph",
           "fixture_id": "CC-24",
           "category": "layout_multiparagraph",
           "n_trials": 1,
-          "parse_ok": 0,
-          "content_accept": 0,
+          "parse_ok": 1,
+          "content_accept": 1,
           "production_accept": 0,
-          "semantic_match": 0,
+          "semantic_match": 1,
           "content_semantic_match": 0,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 2047.09,
+          "p95_ms": 2047.09,
+          "max_ms": 2047.09,
+          "sample_decision": "accept",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "The first thought is done. The second thought is ready."
         },
         {
           "vector_id": "V-negation-dual",
           "fixture_id": "CC-15",
           "category": "protected_negation_dual_stt",
           "n_trials": 1,
-          "parse_ok": 0,
+          "parse_ok": 1,
           "content_accept": 0,
           "production_accept": 0,
-          "semantic_match": 0,
-          "content_semantic_match": 0,
+          "semantic_match": 1,
+          "content_semantic_match": 1,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 1955.91,
+          "p95_ms": 1955.91,
+          "max_ms": 1955.91,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE",
+            "E_MALFORMED"
+          ],
+          "sample_rendered": "Do not enable the feature flag in production."
         },
         {
           "vector_id": "V-protected-command-url",
           "fixture_id": "CC-17",
           "category": "protected_tokens",
           "n_trials": 1,
-          "parse_ok": 0,
-          "content_accept": 0,
+          "parse_ok": 1,
+          "content_accept": 1,
           "production_accept": 0,
           "semantic_match": 0,
           "content_semantic_match": 0,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 2037.6,
+          "p95_ms": 2037.6,
+          "max_ms": 2037.6,
+          "sample_decision": "accept",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "Run curl -I --fail https://example.com and return status_code equals 404."
         },
         {
           "vector_id": "V-protected-name",
           "fixture_id": "CC-14",
           "category": "protected_tokens",
           "n_trials": 1,
-          "parse_ok": 0,
+          "parse_ok": 1,
           "content_accept": 0,
           "production_accept": 0,
           "semantic_match": 0,
           "content_semantic_match": 0,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 2159.86,
+          "p95_ms": 2159.86,
+          "max_ms": 2159.86,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE",
+            "E_MALFORMED"
+          ],
+          "sample_rendered": "Call Anuraj about the release."
         },
         {
           "vector_id": "V-quote-convert",
           "fixture_id": "CC-21",
           "category": "symbol_conversion",
           "n_trials": 1,
-          "parse_ok": 0,
-          "content_accept": 0,
+          "parse_ok": 1,
+          "content_accept": 1,
           "production_accept": 0,
           "semantic_match": 0,
           "content_semantic_match": 0,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 2147.78,
+          "p95_ms": 2147.78,
+          "max_ms": 2147.78,
+          "sample_decision": "accept",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "She said \"we ship friday\" and hung up."
         },
         {
           "vector_id": "V-structured-goal",
           "fixture_id": "CC-20",
           "category": "structured_label",
           "n_trials": 1,
-          "parse_ok": 0,
-          "content_accept": 0,
+          "parse_ok": 1,
+          "content_accept": 1,
           "production_accept": 0,
-          "semantic_match": 0,
+          "semantic_match": 1,
           "content_semantic_match": 0,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 2433.33,
+          "p95_ms": 2433.33,
+          "max_ms": 2433.33,
+          "sample_decision": "accept",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "Goal:\nfix the flaky auth test"
         },
         {
           "vector_id": "V-structured-multi",
           "fixture_id": "CC-07",
           "category": "structured_multi_label",
           "n_trials": 1,
-          "parse_ok": 0,
+          "parse_ok": 1,
           "content_accept": 0,
           "production_accept": 0,
           "semantic_match": 0,
           "content_semantic_match": 0,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 7914.19,
+          "p95_ms": 7914.19,
+          "max_ms": 7914.19,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE",
+            "E_INVENTED_CONTENT",
+            "E_UNSAFE_SEMANTICS"
+          ],
+          "sample_rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is gree…[truncated 76 chars]"
         },
         {
           "vector_id": "V-sym-exclamation",
           "fixture_id": "CC-01",
           "category": "symbol_conversion",
           "n_trials": 1,
-          "parse_ok": 0,
-          "content_accept": 0,
+          "parse_ok": 1,
+          "content_accept": 1,
           "production_accept": 0,
-          "semantic_match": 0,
-          "content_semantic_match": 0,
+          "semantic_match": 1,
+          "content_semantic_match": 1,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 1936.01,
+          "p95_ms": 1936.01,
+          "max_ms": 1936.01,
+          "sample_decision": "accept",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "Ship it!"
         },
         {
           "vector_id": "V-sym-period-newline",
           "fixture_id": "CC-02",
           "category": "symbol_conversion",
           "n_trials": 1,
-          "parse_ok": 0,
-          "content_accept": 0,
+          "parse_ok": 1,
+          "content_accept": 1,
           "production_accept": 0,
-          "semantic_match": 0,
+          "semantic_match": 1,
           "content_semantic_match": 0,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 2626.69,
+          "p95_ms": 2626.69,
+          "max_ms": 2626.69,
+          "sample_decision": "accept",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "Stop.\nnext item"
         }
       ],
       "config": {
-        "reasoning_effort": "low",
         "temperature": 0.0,
-        "response_format": "json_schema.strict",
+        "responseMimeType": "application/json",
+        "endpoint_family": "generativelanguage.googleapis.com/v1beta generateContent",
+        "maxOutputTokens": 3500,
         "delivery_deadline_ms": 1500,
         "curl_max_time_s": 8.0
       }
     },
     "gemini-3.6-flash": {
       "model_id": "gemini-3.6-flash",
-      "status": "live_partial",
+      "status": "live",
       "n_rows": 14,
       "n_vectors": 14,
-      "structured_parse_ok_rate": 0.0,
-      "content_accept_rate": 0.0,
+      "structured_parse_ok_rate": 0.35714285714285715,
+      "content_accept_rate": 0.35714285714285715,
       "production_accept_rate": 0.0,
-      "semantic_match_rate": 0.0,
-      "content_semantic_match_rate": 0.0,
+      "semantic_match_rate": 0.7142857142857143,
+      "content_semantic_match_rate": 0.5714285714285714,
       "within_1500ms_rate": 0.0,
       "unsafe_deliver_count": 0,
-      "latency_p50_ms": null,
-      "latency_p95_ms": null,
-      "latency_max_ms": null,
-      "latency_min_ms": null,
+      "latency_p50_ms": 8010.125,
+      "latency_p95_ms": 8012.687,
+      "latency_max_ms": 8012.96,
+      "latency_min_ms": 4514.8,
       "vectors": [
         {
           "vector_id": "V-backtrack-clear",
@@ -2681,73 +3537,81 @@
           "parse_ok": 0,
           "content_accept": 0,
           "production_accept": 0,
-          "semantic_match": 0,
-          "content_semantic_match": 0,
+          "semantic_match": 1,
+          "content_semantic_match": 1,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 8010.04,
+          "p95_ms": 8010.04,
+          "max_ms": 8010.04,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "Send it Monday."
         },
         {
           "vector_id": "V-backtrack-uncertain",
           "fixture_id": "CC-05",
           "category": "backtrack_uncertain",
           "n_trials": 1,
-          "parse_ok": 0,
-          "content_accept": 0,
+          "parse_ok": 1,
+          "content_accept": 1,
           "production_accept": 0,
-          "semantic_match": 0,
+          "semantic_match": 1,
           "content_semantic_match": 0,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 6104.97,
+          "p95_ms": 6104.97,
+          "max_ms": 6104.97,
+          "sample_decision": "accept",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "Send it Friday, actually Monday."
         },
         {
           "vector_id": "V-dual-stt-name",
           "fixture_id": "CC-16",
           "category": "dual_stt_reconciliation",
           "n_trials": 1,
-          "parse_ok": 0,
-          "content_accept": 0,
+          "parse_ok": 1,
+          "content_accept": 1,
           "production_accept": 0,
-          "semantic_match": 0,
-          "content_semantic_match": 0,
+          "semantic_match": 1,
+          "content_semantic_match": 1,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 6952.83,
+          "p95_ms": 6952.83,
+          "max_ms": 6952.83,
+          "sample_decision": "accept",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "File the bug in voisu."
         },
         {
           "vector_id": "V-everyday-short",
           "fixture_id": "CC-18",
           "category": "everyday_organize",
           "n_trials": 1,
-          "parse_ok": 0,
-          "content_accept": 0,
+          "parse_ok": 1,
+          "content_accept": 1,
           "production_accept": 0,
-          "semantic_match": 0,
-          "content_semantic_match": 0,
+          "semantic_match": 1,
+          "content_semantic_match": 1,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 7973.9,
+          "p95_ms": 7973.9,
+          "max_ms": 7973.9,
+          "sample_decision": "accept",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "Hey, can you send the notes when you get a chance?"
         },
         {
           "vector_id": "V-filler-clear",
@@ -2757,35 +3621,39 @@
           "parse_ok": 0,
           "content_accept": 0,
           "production_accept": 0,
-          "semantic_match": 0,
-          "content_semantic_match": 0,
+          "semantic_match": 1,
+          "content_semantic_match": 1,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 8010.25,
+          "p95_ms": 8010.25,
+          "max_ms": 8010.25,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "I think we should ship Friday."
         },
         {
           "vector_id": "V-multiparagraph",
           "fixture_id": "CC-24",
           "category": "layout_multiparagraph",
           "n_trials": 1,
-          "parse_ok": 0,
-          "content_accept": 0,
+          "parse_ok": 1,
+          "content_accept": 1,
           "production_accept": 0,
-          "semantic_match": 0,
+          "semantic_match": 1,
           "content_semantic_match": 0,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 6076.18,
+          "p95_ms": 6076.18,
+          "max_ms": 6076.18,
+          "sample_decision": "accept",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "The first thought is done; the second thought is ready."
         },
         {
           "vector_id": "V-negation-dual",
@@ -2795,16 +3663,18 @@
           "parse_ok": 0,
           "content_accept": 0,
           "production_accept": 0,
-          "semantic_match": 0,
-          "content_semantic_match": 0,
+          "semantic_match": 1,
+          "content_semantic_match": 1,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 8011.43,
+          "p95_ms": 8011.43,
+          "max_ms": 8011.43,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "Do not enable the feature flag in production."
         },
         {
           "vector_id": "V-protected-command-url",
@@ -2818,31 +3688,35 @@
           "content_semantic_match": 0,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 8010.1,
+          "p95_ms": 8010.1,
+          "max_ms": 8010.1,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "Run curl -I --fail https://example.com and return status_code equals 404."
         },
         {
           "vector_id": "V-protected-name",
           "fixture_id": "CC-14",
           "category": "protected_tokens",
           "n_trials": 1,
-          "parse_ok": 0,
-          "content_accept": 0,
+          "parse_ok": 1,
+          "content_accept": 1,
           "production_accept": 0,
           "semantic_match": 0,
           "content_semantic_match": 0,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 4514.8,
+          "p95_ms": 4514.8,
+          "max_ms": 4514.8,
+          "sample_decision": "accept",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "Call Anuraj about the release."
         },
         {
           "vector_id": "V-quote-convert",
@@ -2856,12 +3730,14 @@
           "content_semantic_match": 0,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 8012.54,
+          "p95_ms": 8012.54,
+          "max_ms": 8012.54,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "She said \"we ship friday\" and hung up."
         },
         {
           "vector_id": "V-structured-goal",
@@ -2871,16 +3747,18 @@
           "parse_ok": 0,
           "content_accept": 0,
           "production_accept": 0,
-          "semantic_match": 0,
-          "content_semantic_match": 0,
+          "semantic_match": 1,
+          "content_semantic_match": 1,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 8012.96,
+          "p95_ms": 8012.96,
+          "max_ms": 8012.96,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "Goal:\nFix the flaky auth test."
         },
         {
           "vector_id": "V-structured-multi",
@@ -2894,12 +3772,14 @@
           "content_semantic_match": 0,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 8011.42,
+          "p95_ms": 8011.42,
+          "max_ms": 8011.42,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is gree…[truncated 76 chars]"
         },
         {
           "vector_id": "V-sym-exclamation",
@@ -2909,16 +3789,18 @@
           "parse_ok": 0,
           "content_accept": 0,
           "production_accept": 0,
-          "semantic_match": 0,
-          "content_semantic_match": 0,
+          "semantic_match": 1,
+          "content_semantic_match": 1,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 8010.15,
+          "p95_ms": 8010.15,
+          "max_ms": 8010.15,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "Ship it!"
         },
         {
           "vector_id": "V-sym-period-newline",
@@ -2928,51 +3810,100 @@
           "parse_ok": 0,
           "content_accept": 0,
           "production_accept": 0,
-          "semantic_match": 0,
-          "content_semantic_match": 0,
+          "semantic_match": 1,
+          "content_semantic_match": 1,
           "within_1500ms": 0,
           "unsafe_deliver": 0,
-          "p50_ms": null,
-          "p95_ms": null,
-          "max_ms": null,
-          "sample_decision": null,
-          "sample_error_codes": [],
-          "sample_rendered": ""
+          "p50_ms": 8010.5,
+          "p95_ms": 8010.5,
+          "max_ms": 8010.5,
+          "sample_decision": "fallback_baseline",
+          "sample_error_codes": [
+            "E_DEADLINE"
+          ],
+          "sample_rendered": "Stop.\nNext item"
         }
       ],
       "config": {
-        "reasoning_effort": "low",
         "temperature": 0.0,
-        "response_format": "json_schema.strict",
+        "responseMimeType": "application/json",
+        "endpoint_family": "generativelanguage.googleapis.com/v1beta generateContent",
+        "maxOutputTokens": 3500,
         "delivery_deadline_ms": 1500,
         "curl_max_time_s": 8.0
       }
     }
   },
   "recommendation": {
-    "status": "provisional_groq_only",
-    "summary": "Groq `openai/gpt-oss-20b` (reasoning_effort=low) achieved structured_parse_ok=0.86, content_semantic=0.36, production_semantic=0.36, within_1500ms=0.93, production_accept=0.57, unsafe_deliver=8, p50=996.1ms, p95=2470.2ms. Non-zero unsafe delivers observed under production decision mirror — do **not** ship as default without guard tightening or prompt revision. **Final three-way pick is blocked** until Gemini Flash-Lite and 3.6 Flash are live-benchmarked on this matrix.",
+    "status": "three_way_no_production_ready_default",
+    "summary": "`openai/gpt-oss-20b`: parse=0.9, content_sem=0.3, prod_sem=0.3, within_1500ms=0.9, prod_accept=0.6, unsafe=8, p50=877.4ms, p95=2001.4ms `gemini-3.5-flash-lite`: parse=1.0, content_sem=0.4, prod_sem=0.7, within_1500ms=0.0, prod_accept=0.0, unsafe=0, p50=2098.1ms, p95=4477.3ms `gemini-3.6-flash`: parse=0.4, content_sem=0.6, prod_sem=0.7, within_1500ms=0.0, prod_accept=0.0, unsafe=0, p50=8010.1ms, p95=8012.7ms Ranked first under research scoring: `gemini-3.5-flash-lite` — but **no production-ready default** on this matrix (production_accept_rate=0 (no in-budget cloud accepts); within_1500ms=0.00). For #144: keep local baseline as Delivery default; treat cloud as optional only when in-budget + compose accept; document Adaptive cloud-skip vs Structured-only cloud if Gemini quality wins past 1.5s.",
     "caveats": [
-      "Gemini 3.5 Flash-Lite and Gemini 3.6 Flash were **not live-run** (missing credentials). No comparative winner across the three ticket models can be finalized.",
-      "Recommendation below is **provisional** and conditioned on Groq-only evidence plus local #139/#138 gates."
+      "Three-way comparison uses the same #139 compose gates and #138 oracles.",
+      "Latency includes network/queue; production must still enforce 1.5s deadline.",
+      "Oracle match is exact string equality after light whitespace normalize.",
+      "Ranking uses unsafe↓ → prod_accept → within_1500ms → parse → content_semantic. Production semantic alone is not used (baseline fallback can inflate it)."
     ],
     "follow_ups": [
-      "Obtain Google/Gemini API credentials and re-run `--provider gemini --live` (or `--provider all --live`).",
-      "Compare Gemini Flash-Lite vs 3.6 Flash vs Groq on the same matrix (semantic, unsafe deliver, p50/p95, ≤1.5s rate).",
-      "If Gemini wins quality but loses p95>1500ms, document Adaptive cloud skip vs Structured-only cloud policy for #144."
+      "Research rank leader was `gemini-3.5-flash-lite` (not production-ready).",
+      "If a Gemini model wins quality but loses p95>1500ms, document Adaptive cloud skip vs Structured-only cloud policy for #144.",
+      "Re-run with higher trials if free-tier throttling produced sparse ok rows.",
+      "Bind the chosen model in product only behind #139 compose_fixture accept."
     ],
-    "provisional_default": {
-      "model_id": "openai/gpt-oss-20b",
-      "provider": "groq",
-      "reasoning_effort": "low",
-      "condition": "Only if Gemini remains unavailable and product accepts fallback-heavy behavior on vectors the model cannot prove; revisit when Gemini numbers exist."
+    "provisional_default": null,
+    "research_rank_leader": {
+      "model_id": "gemini-3.5-flash-lite",
+      "provider": "google",
+      "production_ready": false
     },
-    "gemini_required_for_final": true
+    "gemini_required_for_final": false,
+    "ranking": [
+      {
+        "model_id": "gemini-3.5-flash-lite",
+        "provider": "google",
+        "score_tuple": [
+          -0.0,
+          0.0,
+          0.0,
+          1.0,
+          0.42857142857142855
+        ],
+        "status": "live"
+      },
+      {
+        "model_id": "gemini-3.6-flash",
+        "provider": "google",
+        "score_tuple": [
+          -0.0,
+          0.0,
+          0.0,
+          0.35714285714285715,
+          0.5714285714285714
+        ],
+        "status": "live"
+      },
+      {
+        "model_id": "openai/gpt-oss-20b",
+        "provider": "groq",
+        "score_tuple": [
+          -8.0,
+          0.6428571428571429,
+          0.9285714285714286,
+          0.8571428571428571,
+          0.2857142857142857
+        ],
+        "status": "live"
+      }
+    ]
   },
   "limitations": [
-    "Gemini models not live-run without credentials; recommendation provisional.",
-    "Live wall latency includes queue_time; production must still enforce 1.5s.",
-    "Oracle match is string equality (light whitespace normalize) against #138/#139 expected finals — not a soft BLEU score.",
+    "Live three-way matrix completed (Groq + both Gemini models); trials=1.",
+    "No model is production-ready as unconditional cloud default on this matrix.",
+    "Gemini 3.5 Flash-Lite: parse=1.0, unsafe=0, but p50>~2s so production always deadline-falls-back.",
+    "Gemini 3.6 Flash: often hits ~8s curl ceiling; low parse rate on this host/run.",
+    "Groq gpt-oss-20b: within 1.5s often, but non-zero unsafe delivers under oracle equality.",
+    "Live wall latency includes network/queue; production must still enforce 1.5s.",
+    "Oracle match is string equality (light whitespace normalize) against #138/#139 finals.",
     "No product Rust changes; research package only."
-  ]
+  ],
+  "gemini_ran": true
 }
