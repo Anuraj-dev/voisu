@@ -1,6 +1,6 @@
 # Developer Prompt Rendering model benchmark (#140)
 
-**Date:** 2026-08-12T02:14:56+00:00
+**Date:** 2026-08-12T02:22:15+00:00
 **Issue:** [#140](https://github.com/Anuraj-dev/voisu/issues/140)
 **Governing:** #139 combined-call contract v1.1.2 (completeness + source-order gates intact); #138 behavior oracles.
 **Companion JSON:** [`developer-prompt-rendering-model-benchmark-2026-08-11.json`](./developer-prompt-rendering-model-benchmark-2026-08-11.json)

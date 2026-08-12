@@ -2294,23 +2294,31 @@ def main(argv: list[str] | None = None) -> int:
             f"live matrix {len(LIVE_VECTORS)} vectors, "
             f"contracts {len(corpus.get('model_prompt_contracts') or [])}"
         )
-        # If only self-check, still optionally refresh results with offline data
-        if args.provider == "none" and not args.live and not args.dry_run:
-            # write offline-only snapshot for package completeness
+        # Self-check validates offline health only. Do NOT rewrite result assets
+        # by default — rewriting used to hardcode gemini_ran=False and demote a
+        # completed three-way package to provisional_groq_only with an unsafe
+        # Groq provisional_default. Pass --write explicitly to refresh offline
+        # snapshot while preserving prior live rows and deriving gemini_ran.
+        if (
+            args.provider == "none"
+            and not args.live
+            and not args.dry_run
+            and not args.no_write
+            and "--write" in (argv if argv is not None else sys.argv[1:])
+        ):
             offline_rows = offline_replay_rows(mod, corpus, behavior_oracles)
             synth_rows = [
                 run_synthetic_vector(mod, corpus, v, behavior_oracles)
                 for v in SYNTHETIC_VECTORS
             ]
-            gemini_rows = gemini_blocked_rows()
             offline_pass = sum(1 for r in offline_rows if r["status"] == "ok")
             offline_meta = {
                 "total": len(offline_rows),
                 "pass": offline_pass,
                 "fail": len(offline_rows) - offline_pass,
             }
-            # Preserve any prior live rows if results exist
             prior_live: list[dict[str, Any]] = []
+            prior_limitations: list[str] = []
             if RESULTS_JSON_PATH.is_file():
                 try:
                     prior = load_json(RESULTS_JSON_PATH)
@@ -2325,14 +2333,32 @@ def main(argv: list[str] | None = None) -> int:
                             "dry_run",
                         )
                     ]
+                    if isinstance(prior.get("limitations"), list):
+                        prior_limitations = [
+                            str(x) for x in prior["limitations"] if x is not None
+                        ]
                 except Exception:
                     prior_live = []
-            rows = offline_rows + synth_rows + gemini_rows + prior_live
+            gemini_ran = any(
+                r.get("provider") == "google"
+                and r.get("status") in ("ok", "transport_error", "rate_limited")
+                for r in prior_live
+            )
+            # Only inject blocked Gemini placeholders when no real Gemini live rows.
+            gemini_placeholder = [] if gemini_ran else gemini_blocked_rows()
+            rows = offline_rows + synth_rows + gemini_placeholder + prior_live
             aggregates = {
                 GROQ_MODEL_ID: aggregate_model(rows, GROQ_MODEL_ID),
                 "gemini-3.5-flash-lite": aggregate_model(rows, "gemini-3.5-flash-lite"),
                 "gemini-3.6-flash": aggregate_model(rows, "gemini-3.6-flash"),
             }
+            limitations = prior_limitations or [
+                "Self-check --write refresh preserved prior live rows if present.",
+            ]
+            if not gemini_ran:
+                limitations = list(limitations) + [
+                    "Gemini not live-run in preserved rows; recommendation provisional.",
+                ]
             results = {
                 "benchmark_id": "voisu-developer-prompt-rendering-model-benchmark-2026-08-11",
                 "issue": 140,
@@ -2371,21 +2397,17 @@ def main(argv: list[str] | None = None) -> int:
                 "offline_replay": offline_meta,
                 "aggregates": aggregates,
                 "recommendation": build_recommendation(
-                    aggregates, offline_meta, gemini_ran=False
+                    aggregates, offline_meta, gemini_ran=gemini_ran
                 ),
-                "limitations": [
-                    "Self-check path may preserve prior live rows if present.",
-                    "Gemini not run without credentials.",
-                ],
+                "limitations": limitations,
             }
-            if not args.no_write:
-                RESULTS_JSON_PATH.write_text(
-                    json.dumps(results, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                write_markdown(results)
-                print(f"Wrote {RESULTS_JSON_PATH.name} and {RESULTS_MD_PATH.name}")
-            return 0
+            RESULTS_JSON_PATH.write_text(
+                json.dumps(results, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            write_markdown(results)
+            print(f"Wrote {RESULTS_JSON_PATH.name} and {RESULTS_MD_PATH.name}")
+        return 0
 
     do_live = args.live and not args.dry_run
     do_dry = args.dry_run
@@ -2465,11 +2487,16 @@ def main(argv: list[str] | None = None) -> int:
         "No product Rust changes; research package only.",
     ]
     if gemini_ran:
-        limitations.insert(
-            0,
+        limitations = [
             "Gemini live-run via curl generateContent; schema binding may fall back "
             "to responseMimeType=application/json only if responseJsonSchema rejected.",
-        )
+            "No model is an unconditional production cloud default on this matrix "
+            "unless recommendation.provisional_default is set and status is "
+            "three_way_compared.",
+            "Gemini often exceeds 1.5s (deadline forces baseline); Groq may accept "
+            "in-budget but can still unsafe-deliver under oracle equality.",
+            *limitations,
+        ]
     else:
         limitations.insert(
             0,

@@ -1,50 +1,30 @@
 {
   "benchmark_id": "voisu-developer-prompt-rendering-model-benchmark-2026-08-11",
   "issue": 140,
-  "generated_at": "2026-08-12T02:14:56+00:00",
+  "generated_at": "2026-08-12T02:22:15+00:00",
   "governing": {
     "combined_call_corpus": "developer-prompt-rendering-combined-call-corpus-2026-08-11.json",
     "combined_call_version": "1.1.2",
     "behavior_corpus": "developer-prompt-rendering-behavior-corpus-2026-08-11.json",
     "behavior_version": "1.7.0",
     "delivery_deadline_ms": 1500,
-    "compose_gates": "v1.1.2 completeness+source_order+protected+invented",
-    "prior_method": "groq-reconciliation-model-benchmark-2026-08-09.md"
+    "compose_gates": "v1.1.2 completeness+source_order+protected+invented"
   },
   "models": [
     {
       "model_id": "openai/gpt-oss-20b",
       "provider": "groq",
-      "prompt_contract": true,
-      "live_config": {
-        "reasoning_effort": "low",
-        "temperature": 0.0,
-        "response_format": "json_schema.strict"
-      }
+      "prompt_contract": true
     },
     {
       "model_id": "gemini-3.5-flash-lite",
       "provider": "google",
-      "prompt_contract": true,
-      "live_config": {
-        "temperature": 0.0,
-        "responseMimeType": "application/json",
-        "endpoint_family": "generativelanguage.googleapis.com/v1beta generateContent",
-        "maxOutputTokens": 3500,
-        "preferred_schema_field": "responseJsonSchema"
-      }
+      "prompt_contract": true
     },
     {
       "model_id": "gemini-3.6-flash",
       "provider": "google",
-      "prompt_contract": true,
-      "live_config": {
-        "temperature": 0.0,
-        "responseMimeType": "application/json",
-        "endpoint_family": "generativelanguage.googleapis.com/v1beta generateContent",
-        "maxOutputTokens": 3500,
-        "preferred_schema_field": "responseJsonSchema"
-      }
+      "prompt_contract": true
     }
   ],
   "matrix": {
@@ -169,7 +149,7 @@
         "notes": "cloud skipped → baseline without error"
       }
     ],
-    "trials": 1
+    "trials_default": 3
   },
   "rows": [
     {
@@ -191,7 +171,7 @@
       "rendered": "Ship it!",
       "oracle_expected": "Ship it!",
       "semantic_match_oracle": true,
-      "latency_ms": 0.324,
+      "latency_ms": 0.082,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -214,7 +194,7 @@
       "rendered": "Stop.\nNext item",
       "oracle_expected": "Stop.\nNext item",
       "semantic_match_oracle": true,
-      "latency_ms": 0.104,
+      "latency_ms": 0.086,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -237,7 +217,7 @@
       "rendered": "I think we should ship Friday.",
       "oracle_expected": "I think we should ship Friday.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.098,
+      "latency_ms": 0.066,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -260,7 +240,7 @@
       "rendered": "Send it Monday.",
       "oracle_expected": "Send it Monday.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.064,
+      "latency_ms": 0.066,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -285,7 +265,7 @@
       "rendered": "Send it Friday actually Monday.",
       "oracle_expected": "Send it Friday actually Monday.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.037,
+      "latency_ms": 0.046,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -310,7 +290,7 @@
       "rendered": "The first thought is done the second thought is ready.",
       "oracle_expected": "The first thought is done the second thought is ready.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.034,
+      "latency_ms": 0.053,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -333,7 +313,7 @@
       "rendered": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
       "oracle_expected": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.42,
+      "latency_ms": 0.418,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -359,7 +339,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.281,
+      "latency_ms": 0.304,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -384,7 +364,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.035,
+      "latency_ms": 0.039,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -409,7 +389,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
       "semantic_match_oracle": false,
-      "latency_ms": 0.024,
+      "latency_ms": 0.02,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -434,7 +414,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.006,
+      "latency_ms": 0.004,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -459,7 +439,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.004,
+      "latency_ms": 0.003,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -510,7 +490,7 @@
       "rendered": "Call Anuraj about the release.",
       "oracle_expected": "File the bug in voisu not voice so.",
       "semantic_match_oracle": false,
-      "latency_ms": 0.028,
+      "latency_ms": 0.024,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -536,7 +516,7 @@
       "rendered": "Do not enable the feature flag in production.",
       "oracle_expected": "Do not enable the feature flag in production.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.025,
+      "latency_ms": 0.021,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -559,7 +539,7 @@
       "rendered": "File the bug in voisu.",
       "oracle_expected": "File the bug in voisu.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.057,
+      "latency_ms": 0.055,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -582,7 +562,7 @@
       "rendered": "Run curl -I --fail https://example.com and return status_code equals 404.",
       "oracle_expected": "run cargo test --workspace -- --test-threads=4",
       "semantic_match_oracle": false,
-      "latency_ms": 0.061,
+      "latency_ms": 0.053,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -605,7 +585,7 @@
       "rendered": "Hey, can you send the notes when you get a chance?",
       "oracle_expected": "Hey, can you send the notes when you get a chance?",
       "semantic_match_oracle": true,
-      "latency_ms": 0.065,
+      "latency_ms": 0.049,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -631,7 +611,7 @@
       "rendered": "Hey, can you send the notes when you get a chance?",
       "oracle_expected": "Hey, can you send the notes when you get a chance?",
       "semantic_match_oracle": true,
-      "latency_ms": 0.036,
+      "latency_ms": 0.029,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -654,7 +634,7 @@
       "rendered": "Goal:\nFix the flaky auth test.",
       "oracle_expected": "Goal:\nFix the flaky auth test.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.1,
+      "latency_ms": 0.067,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -677,7 +657,7 @@
       "rendered": "She said \"we ship friday\" and hung up.",
       "oracle_expected": "Use the exact error \"connection refused\" in the ticket.",
       "semantic_match_oracle": false,
-      "latency_ms": 0.221,
+      "latency_ms": 0.093,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -702,7 +682,7 @@
       "rendered": "Ship it!",
       "oracle_expected": "Ship it!",
       "semantic_match_oracle": true,
-      "latency_ms": 0.021,
+      "latency_ms": 0.016,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -725,7 +705,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.004,
+      "latency_ms": 0.003,
       "within_1500ms": true,
       "would_deliver_model_text": false
     },
@@ -748,7 +728,7 @@
       "rendered": "The first thought is done.\n\nThe second thought is ready.",
       "oracle_expected": "The first thought is done.\n\nThe second thought is ready.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.081,
+      "latency_ms": 0.058,
       "within_1500ms": true,
       "would_deliver_model_text": true
     },
@@ -772,7 +752,7 @@
       "rendered": "Hey, can you send the notes when you get a chance?",
       "oracle_expected": "Hey, can you send the notes when you get a chance?",
       "semantic_match_oracle": true,
-      "latency_ms": 0.08,
+      "latency_ms": 0.048,
       "within_1500ms": true,
       "would_deliver_model_text": false,
       "notes": "local malformed candidate → fallback_baseline + E_SCHEMA/E_MALFORMED"
@@ -797,7 +777,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.029,
+      "latency_ms": 0.02,
       "within_1500ms": true,
       "would_deliver_model_text": false,
       "notes": "hard cloud_outcome deadline_exceeded → baseline + E_DEADLINE"
@@ -822,7 +802,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.025,
+      "latency_ms": 0.018,
       "within_1500ms": true,
       "would_deliver_model_text": false,
       "notes": "hard provider_failure → baseline + E_PROVIDER"
@@ -845,7 +825,7 @@
       "rendered": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "oracle_expected": "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.",
       "semantic_match_oracle": true,
-      "latency_ms": 0.171,
+      "latency_ms": 0.125,
       "within_1500ms": true,
       "would_deliver_model_text": false,
       "notes": "cloud skipped → baseline without error"
@@ -3904,6 +3884,5 @@
     "Live wall latency includes network/queue; production must still enforce 1.5s.",
     "Oracle match is string equality (light whitespace normalize) against #138/#139 finals.",
     "No product Rust changes; research package only."
-  ],
-  "gemini_ran": true
+  ]
 }
