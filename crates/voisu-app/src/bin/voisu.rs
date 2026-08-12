@@ -14,7 +14,7 @@ use voisu_app::system::{
     DIAGNOSTIC_RESPONSE_DEADLINE, FedoraReadiness, PROCESSING_RESPONSE_DEADLINE,
     ProviderHttpClient, SecretToolStore,
 };
-use voisu_app::config::{DeliveryMode, WritingMode};
+use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
 
 /// The most response the CLI will buffer — per transport frame, and in total
 /// across the pages of one diagnostic payload.
@@ -47,6 +47,7 @@ enum CliAction {
     SetDeepgram(bool),
     Delivery(Option<DeliveryMode>),
     Writing(Option<WritingMode>),
+    Rendering(Option<RenderingPolicy>),
     DictionaryAdd(String),
     DictionaryRemove(String),
     DictionaryList { json: bool },
@@ -69,6 +70,7 @@ fn main() -> ExitCode {
         Ok(CliAction::SetDeepgram(enabled)) => set_deepgram(enabled),
         Ok(CliAction::Delivery(mode)) => delivery(mode),
         Ok(CliAction::Writing(mode)) => writing(mode),
+        Ok(CliAction::Rendering(policy)) => rendering(policy),
         Ok(CliAction::DictionaryAdd(term)) => dictionary_add(&term),
         Ok(CliAction::DictionaryRemove(term)) => dictionary_remove(&term),
         Ok(CliAction::DictionaryList { json }) => dictionary_list(json),
@@ -571,6 +573,29 @@ fn writing(mode: Option<WritingMode>) -> ExitCode {
     }
 }
 
+/// Reads or persists the Developer Prompt Rendering policy. A running daemon
+/// resolves configuration only at start, so writes apply after the next restart.
+fn rendering(policy: Option<RenderingPolicy>) -> ExitCode {
+    let Some(policy) = policy else {
+        println!(
+            "rendering policy: {}",
+            voisu_app::config::rendering_policy().as_str()
+        );
+        return ExitCode::SUCCESS;
+    };
+    match voisu_app::config::set_rendering_policy(policy) {
+        Ok(_) => {
+            println!(
+                "Rendering policy set to {} for new Recordings; restart the daemon to apply \
+                 (voisu service restart)",
+                policy.as_str()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(message) => fail(4, &message),
+    }
+}
+
 fn dictionary_add(term: &str) -> ExitCode {
     match voisu_app::dictionary::add_user_term(term) {
         Ok(true) => {
@@ -808,6 +833,10 @@ fn parse_command() -> Result<CliAction, String> {
         [command, mode] if command == "writing" => {
             Ok(CliAction::Writing(Some(parse_writing_mode(mode)?)))
         }
+        [command] if command == "rendering" => Ok(CliAction::Rendering(None)),
+        [command, policy] if command == "rendering" => {
+            Ok(CliAction::Rendering(Some(parse_rendering_policy(policy)?)))
+        }
         [dictionary, action, term] if dictionary == "dictionary" && action == "add" => {
             Ok(CliAction::DictionaryAdd(term.clone()))
         }
@@ -868,6 +897,11 @@ fn parse_writing_mode(value: &str) -> Result<WritingMode, String> {
     }
 }
 
+fn parse_rendering_policy(value: &str) -> Result<RenderingPolicy, String> {
+    RenderingPolicy::parse(value)
+        .ok_or_else(|| "rendering policy must be natural, adaptive, or structured".to_owned())
+}
+
 fn parse_provider(value: &str) -> Result<Provider, String> {
     match value {
         "groq" => Ok(Provider::Groq),
@@ -877,7 +911,7 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: voisu <setup|start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|delivery|writing|dictionary|service>\n\n  voisu setup  # guided, re-runnable wizard: validate and store your Deepgram and Groq keys\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor [--verbose]  # capability, focus-guard, and live per-key round-trip checks; --verbose adds the reasoning behind each line\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu delivery [type|clipboard|guarded]  # choose Transcript Delivery (default type); no argument shows the persisted mode\n  voisu writing [smart|literal]  # choose Writing Mode (default smart); no argument shows the persisted mode\n  voisu dictionary add <term>\n  voisu dictionary remove <term>\n  voisu dictionary list [--json]\n  voisu service <install|start|stop|restart|status|uninstall>"
+    "usage: voisu <setup|start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|delivery|writing|rendering|dictionary|service>\n\n  voisu setup  # guided, re-runnable wizard: validate and store your Deepgram and Groq keys\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor [--verbose]  # capability, focus-guard, and live per-key round-trip checks; --verbose adds the reasoning behind each line\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu delivery [type|clipboard|guarded]  # choose Transcript Delivery (default type); no argument shows the persisted mode\n  voisu writing [smart|literal]  # choose Writing Mode (default smart); no argument shows the persisted mode\n  voisu rendering [natural|adaptive|structured]  # choose Rendering Policy (default adaptive); no argument shows the persisted policy\n  voisu dictionary add <term>\n  voisu dictionary remove <term>\n  voisu dictionary list [--json]\n  voisu service <install|start|stop|restart|status|uninstall>"
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {
