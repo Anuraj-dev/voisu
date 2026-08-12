@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.27.0
+Version:        0.28.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,13 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Wed Aug 12 2026 Voisu maintainers <voisu@example.invalid> - 0.28.0-1
+- feat(dpr): send Qwen formatting requests as json_object
+- fix(dpr): use contains for licensed heading lookup
+- fix(dpr): count protected facts, curly quotes, and heading artifacts
+- fix(dpr): keep protected facts through filler and backtrack labels
+- feat(dpr): relax formatting lexical gates safely
+
 * Wed Aug 12 2026 Voisu maintainers <voisu@example.invalid> - 0.27.0-1
 - fix(dpr): drop redundant must_use on Result parser
 - feat(dpr): replace derivation contract with small edits
