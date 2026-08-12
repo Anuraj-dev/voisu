@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.26.3
+Version:        0.27.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,10 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Wed Aug 12 2026 Voisu maintainers <voisu@example.invalid> - 0.27.0-1
+- fix(dpr): drop redundant must_use on Result parser
+- feat(dpr): replace derivation contract with small edits
+
 * Wed Aug 12 2026 Voisu maintainers <voisu@example.invalid> - 0.26.3-1
 - fix(dpr): validate transcript before formatting
 
