@@ -103,6 +103,15 @@ pub use compose_gate::{
     MAX_COMPOSE_FIELD_UTF8_BYTES, MAX_COMPOSE_LABELS, MAX_COMPOSE_REMOVALS,
 };
 
+mod format_edits;
+pub use format_edits::{
+    apply_format_edit_candidate_json, apply_format_edits, parse_format_edit_candidate_json,
+    FormatEdit, FormatEditCandidate, FormatEditErrorCode, FormatEditKind, FormatEditOutcome,
+    CLOSED_FORMAT_EDIT_KINDS, FORMAT_EDIT_CONTRACT_ID, FORMAT_EDIT_CONTRACT_VERSION,
+    MAX_FORMAT_EDITS, MAX_FORMAT_EDIT_FIELD_UTF8_BYTES, MAX_FORMAT_EDIT_JSON_DEPTH,
+    MAX_FORMAT_EDIT_JSON_NODES, MAX_FORMAT_EDIT_RESPONSE_BYTES,
+};
+
 // Paged diagnostic responses are negotiated per REQUEST (see `Request::paged`),
 // never by protocol version. The version is interpolated into the socket path,
 // the single-instance lock, and the store directory, so bumping it partitions

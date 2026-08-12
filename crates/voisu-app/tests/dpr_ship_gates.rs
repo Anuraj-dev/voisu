@@ -645,6 +645,7 @@ async fn orchestration_deadline_compose_call_count_delivery_and_diagnostics() {
                 protected_tokens: &[],
                 cloud: DprCloudCapability::Ready { boundary: &cloud, credential: &credential },
                 clock: &clock,
+                small_edit_contract: false,
             },
             &mut delivery,
         ).await;
@@ -785,6 +786,7 @@ async fn cloud_call_budget_covers_zero_call_and_failed_attempt_paths() {
                     credential: &credential,
                 },
                 clock: &clock,
+                small_edit_contract: false,
             },
             &mut delivery,
         )
@@ -853,6 +855,7 @@ async fn cloud_call_budget_covers_zero_call_and_failed_attempt_paths() {
                     credential: &credential,
                 },
                 clock: &clock,
+                small_edit_contract: false,
             },
             &mut delivery,
         )
@@ -882,6 +885,7 @@ fn all_three_policies_persist_via_cli() {
             .args(arguments)
             .env("XDG_CONFIG_HOME", temp.path())
             .env_remove("VOISU_ENABLE_DPR")
+            .env_remove("VOISU_ENABLE_QWEN_FORMAT")
             .output()
             .expect("run voisu CLI")
     };
