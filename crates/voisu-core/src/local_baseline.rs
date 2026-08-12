@@ -25,19 +25,12 @@
 //! All other `deterministic_local` / `literal_identity` fixtures with a defined
 //! `local_baseline` are promoted as product corpus tests (see module tests).
 
-use crate::prompt_rendering::{RenderingPolicy, RenderingRoute, CLOSED_STRUCTURED_LABELS};
+use crate::prompt_rendering::{
+    RenderingPolicy, RenderingRoute, TimingCertainty, CLOSED_STRUCTURED_LABELS,
+};
 
 /// Contract id bound into baseline metadata for diagnostics / later compose.
 pub const LOCAL_BASELINE_CONTRACT_ID: &str = "voisu-dpr-local-baseline-v1:#156";
-
-/// Pause certainty for layout that depends on timing evidence.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TimingCertainty {
-    /// Local rules may insert paragraph breaks at proven boundaries.
-    Clear,
-    /// Fail closed: no layout break from pause; preserve words as one stream.
-    Uncertain,
-}
 
 /// One clear or uncertain pause boundary supplied by the host/router.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -839,6 +832,12 @@ fn apply_sentence_and_weekday_casing(text: &str, capitalize_weekdays: bool) -> S
         let cs = byte_to_char[s];
         // Strip trailing punctuation for weekday / pronoun checks (`Hey,` → `Hey`).
         let core = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        // Paths/URLs/code-like tokens keep their source case even at line/sentence start
+        // (same mid-sentence protection: never force-uppercase the first character).
+        if is_protected_case_token(tok) {
+            let _ = e;
+            continue;
+        }
         if is_sentence_or_line_start(text, s) {
             if let Some(c) = chars.get_mut(cs) {
                 if c.is_alphabetic() {
@@ -999,17 +998,58 @@ fn capitalize_sentence_start(text: &str) -> String {
     match chars.next() {
         None => String::new(),
         Some(f) => {
+            // If the whole leading token is path/URL/code-like, preserve case.
+            let first_tok = text.split_whitespace().next().unwrap_or(text);
             let mut out = String::new();
-            if f.is_alphabetic() {
+            if f.is_alphabetic() && !is_protected_case_token(first_tok) {
                 out.push(f.to_ascii_uppercase());
             } else {
                 out.push(f);
             }
             out.push_str(chars.as_str());
-            // Also capitalize weekdays inside.
+            // Also capitalize weekdays inside (protected tokens stay untouched).
             apply_sentence_and_weekday_casing(&out, true)
         }
     }
+}
+
+/// Path, URL, and code-like tokens whose casing must not be rewritten by
+/// sentence/weekday capitalisation (aligned with formatting protected spans).
+fn is_protected_case_token(tok: &str) -> bool {
+    let t = tok
+        .trim_end_matches(|c: char| matches!(c, ',' | '.' | '!' | '?' | ';' | ')' | ']' | '}' | '"' | '\''))
+        .trim_start_matches(|c: char| matches!(c, '(' | '[' | '{' | '"' | '\''));
+    if t.is_empty() {
+        return false;
+    }
+    if t.starts_with("http://") || t.starts_with("https://") {
+        return true;
+    }
+    if t.starts_with("./") || t.starts_with("../") || t.starts_with("~/") {
+        return true;
+    }
+    if t.starts_with('/') && t.len() > 1 {
+        return true;
+    }
+    // crates/…, src/lib.rs, etc.
+    if t.contains('/') && t.starts_with(|c: char| c.is_alphanumeric() || c == '.') {
+        return true;
+    }
+    // Rust paths / qualified identifiers.
+    if t.contains("::") {
+        return true;
+    }
+    // CLI flags (`--workspace`, `-v`).
+    if t.starts_with("--") {
+        return true;
+    }
+    if t.starts_with('-') && t.len() > 1 {
+        let b = t.as_bytes()[1];
+        if b.is_ascii_alphanumeric() {
+            return true;
+        }
+    }
+    false
 }
 
 // ─── Token helpers ───────────────────────────────────────────────────────────
@@ -1282,6 +1322,23 @@ mod tests {
         let b = organize_local_baseline(src, &adaptive_opts());
         assert!(b.rendered().contains("https://github.com/Anuraj-dev/voisu"));
         assert!(b.rendered().contains("crates/voisu-core/src/lib.rs"));
+    }
+
+    #[test]
+    fn protected_path_at_utterance_start_keeps_case() {
+        // Sentence-start casing must not rewrite path/URL/code-like tokens.
+        let src = "crates/voisu-core/src/lib.rs is failing";
+        let b = organize_local_baseline(src, &adaptive_opts());
+        assert!(
+            b.rendered().starts_with("crates/voisu-core/src/lib.rs"),
+            "path case rewritten at utterance start: {:?}",
+            b.rendered()
+        );
+        assert!(
+            !b.rendered().starts_with("Crates/"),
+            "path first letter uppercased: {:?}",
+            b.rendered()
+        );
     }
 
     #[test]
