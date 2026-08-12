@@ -93,6 +93,7 @@ required-features = ["overlay"]
 
 [features]
 overlay = ["dep:gtk4", "dep:gtk4-layer-shell"]
+dpr-eval-late-retain = ["voisu-core/dpr-eval-late-retain"]
 
 [dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

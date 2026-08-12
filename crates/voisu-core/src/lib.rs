@@ -36,6 +36,20 @@ pub use diagnostics::{
     MAX_STORED_TEXT, REDACTED, SMART_WRITING_DIAGNOSTIC_VERSION, TEXT_SHA256_FINGERPRINT_LEN,
 };
 
+mod dpr_diagnostics;
+pub use dpr_diagnostics::{
+    DprDeliveryEvidence, DprDiagnostic, DprDiagnosticEvent, DprDiagnosticEventName,
+    DprDiagnosticMode, DprFeedbackKind, DPR_DIAGNOSTIC_VERSION,
+    DPR_LOCAL_FALLBACK_MESSAGE, MAX_DPR_DIAGNOSTIC_EVENTS,
+};
+#[cfg(feature = "dpr-eval-late-retain")]
+pub use dpr_diagnostics::{
+    DprAcceptedLateCandidate, DprLateEvaluationRecord,
+    MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES,
+};
+#[cfg(not(feature = "dpr-eval-late-retain"))]
+pub use dpr_diagnostics::DPR_EVALUATION_LANE_COMPILE_GATED;
+
 mod formatting_commands;
 pub use formatting_commands::{
     parse_formatting_commands, CommandEvent, CommandKind, NumberedListItem, ParsedCommands,

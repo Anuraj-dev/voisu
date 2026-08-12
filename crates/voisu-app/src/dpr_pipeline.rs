@@ -12,9 +12,9 @@ use voisu_core::{
     compose_structured_candidate, organize_local_baseline, route_intent,
     text_sha256_fingerprint, CloudOutcome, CloudRequest, ComposeInput, ComposeSource,
     CompositionDecision, Credential, DeliveryAdapter, DeliveryFlags, DeliveryOutcome,
-    IntentObservation, LocalBaselineOptions, ProcessHint, ProviderState, RenderingPolicy,
-    RoutingDecision, SourceSelection, SourceTranscript, SttProvider, SurfaceHint, TimingHint,
-    Transcript, TranscriptSelection, Provider,
+    DprDiagnostic, IntentObservation, LocalBaselineOptions, ProcessHint, ProviderState,
+    RenderingPolicy, RoutingDecision, SourceSelection, SourceTranscript, SttProvider, SurfaceHint,
+    TimingHint, Transcript, TranscriptSelection, Provider,
     MAX_COMPOSE_FIELD_UTF8_BYTES,
 };
 
@@ -104,6 +104,7 @@ pub struct DprTransformCompletion {
     pub compose_decision: CompositionDecision,
     pub cloud_attempted: bool,
     pub cloud_error: Option<DprCloudErrorClass>,
+    pub diagnostic: DprDiagnostic,
 }
 
 /// Owned adapter from the daemon's Source Transcripts into the generic
@@ -294,6 +295,8 @@ pub async fn dpr_transform_and_deliver(
         process_hint: input.process_hint,
         timing: input.timing,
     });
+    let route_selected_at = input.clock.elapsed();
+    let mut diagnostic = DprDiagnostic::production(&routing, route_selected_at);
     let baseline = organize_local_baseline(
         input.selected_source,
         &LocalBaselineOptions {
@@ -309,16 +312,19 @@ pub async fn dpr_transform_and_deliver(
     let cloud_outcome = if !input.english_eligible
         || routing.cloud_request == CloudRequest::NotAllowed
     {
+        diagnostic.cloud_skipped(route_selected_at);
         CloudOutcome::Skipped
     } else {
         let cloud_budget_elapsed = input.clock.elapsed();
         if cloud_budget_elapsed >= DPR_DELIVERY_DEADLINE {
             cloud_error = Some(DprCloudErrorClass::DeadlineExceeded);
+            diagnostic.cloud_skipped(cloud_budget_elapsed);
             CloudOutcome::DeadlineExceeded
         } else {
             match input.cloud {
                 DprCloudCapability::Unavailable => {
                     cloud_error = Some(DprCloudErrorClass::CredentialUnavailable);
+                    diagnostic.cloud_skipped(cloud_budget_elapsed);
                     CloudOutcome::ProviderFailure
                 }
                 DprCloudCapability::Ready {
@@ -326,6 +332,7 @@ pub async fn dpr_transform_and_deliver(
                     credential,
                 } => {
                     cloud_attempted = true;
+                    diagnostic.cloud_request_started(cloud_budget_elapsed);
                     let remaining = DPR_DELIVERY_DEADLINE - cloud_budget_elapsed;
                     let attempt = boundary
                         .attempt(
@@ -341,7 +348,13 @@ pub async fn dpr_transform_and_deliver(
                         )
                         .await;
                     let (attempt_candidate, attempt_error) = attempt.into_parts();
-                    if input.clock.elapsed() >= DPR_DELIVERY_DEADLINE {
+                    let attempt_completed_at = input.clock.elapsed();
+                    if attempt_candidate.is_some()
+                        || attempt_error.is_some_and(dpr_error_has_response)
+                    {
+                        diagnostic.cloud_response_received(attempt_completed_at);
+                    }
+                    if attempt_completed_at >= DPR_DELIVERY_DEADLINE {
                         cloud_error = Some(DprCloudErrorClass::DeadlineExceeded);
                         CloudOutcome::DeadlineExceeded
                     } else if let Some(accepted_candidate) = attempt_candidate {
@@ -366,9 +379,8 @@ pub async fn dpr_transform_and_deliver(
         cloud_outcome,
         candidate: candidate.as_ref(),
     });
-    if cloud_outcome == CloudOutcome::Succeeded
-        && input.clock.elapsed() >= DPR_DELIVERY_DEADLINE
-    {
+    let compose_finished_at = input.clock.elapsed();
+    if cloud_outcome == CloudOutcome::Succeeded && compose_finished_at >= DPR_DELIVERY_DEADLINE {
         cloud_error = Some(DprCloudErrorClass::DeadlineExceeded);
         composed = compose_structured_candidate(&ComposeInput {
             local_baseline: &baseline,
@@ -384,6 +396,13 @@ pub async fn dpr_transform_and_deliver(
     let rendered = composed.rendered().to_owned();
     let delivery_flags = composed.delivery();
     let compose_decision = composed.decision();
+    diagnostic.composition_completed(
+        compose_decision,
+        composed.fallback_trigger(),
+        composed.error_codes(),
+        compose_finished_at,
+    );
+    diagnostic.delivery_emitted(input.clock.elapsed(), delivery_flags);
     let delivery = delivery.deliver(Transcript(rendered.clone())).await;
     DprTransformCompletion {
         rendered,
@@ -393,7 +412,17 @@ pub async fn dpr_transform_and_deliver(
         compose_decision,
         cloud_attempted,
         cloud_error,
+        diagnostic,
     }
+}
+
+fn dpr_error_has_response(error: DprCloudErrorClass) -> bool {
+    matches!(
+        error,
+        DprCloudErrorClass::ResponseTooLarge
+            | DprCloudErrorClass::ProviderEnvelope
+            | DprCloudErrorClass::CandidateSchema
+    )
 }
 
 fn cloud_outcome_for_error(error: DprCloudErrorClass) -> CloudOutcome {
@@ -418,8 +447,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use voisu_core::{
-        parse_structured_candidate_json, text_sha256_fingerprint, BoundaryFuture, SttProvider,
-        StructuredCandidate, Transcript,
+        parse_structured_candidate_json, text_sha256_fingerprint, BoundaryFuture,
+        DprDiagnosticEventName, DprFeedbackKind, SttProvider, StructuredCandidate, Transcript,
     };
 
     use super::*;
@@ -585,6 +614,15 @@ mod tests {
         parse_structured_candidate_json(raw.to_string().as_bytes()).expect("candidate")
     }
 
+    fn diagnostic_event_names(completion: &DprTransformCompletion) -> Vec<DprDiagnosticEventName> {
+        completion
+            .diagnostic
+            .events()
+            .iter()
+            .map(|event| event.name())
+            .collect()
+    }
+
     #[test]
     fn daemon_source_adapter_selects_a_real_source_without_model_reconciliation() {
         let sources = vec![
@@ -691,6 +729,16 @@ mod tests {
             completion.compose_decision,
             CompositionDecision::FallbackBaseline
         );
+        assert_eq!(completion.diagnostic.feedback_kind(), DprFeedbackKind::Silent);
+        assert_eq!(
+            diagnostic_event_names(&completion),
+            vec![
+                DprDiagnosticEventName::RouteSelected,
+                DprDiagnosticEventName::CloudSkipped,
+                DprDiagnosticEventName::FallbackBaselineSelected,
+                DprDiagnosticEventName::DeliveryEmitted,
+            ]
+        );
     }
 
     #[tokio::test]
@@ -768,6 +816,17 @@ mod tests {
         assert_eq!(completion.compose_decision, CompositionDecision::Accept);
         assert_eq!(completion.delivery_flags, DeliveryFlags::dpr_default());
         assert_eq!(completion.cloud_error, None);
+        assert_eq!(completion.diagnostic.feedback_kind(), DprFeedbackKind::Silent);
+        assert_eq!(
+            diagnostic_event_names(&completion),
+            vec![
+                DprDiagnosticEventName::RouteSelected,
+                DprDiagnosticEventName::CloudRequestStarted,
+                DprDiagnosticEventName::CloudResponseReceived,
+                DprDiagnosticEventName::CompositionAccepted,
+                DprDiagnosticEventName::DeliveryEmitted,
+            ]
+        );
     }
 
     #[tokio::test]
@@ -848,6 +907,20 @@ mod tests {
             Some(DprCloudErrorClass::DeadlineExceeded)
         );
         assert_eq!(completion.delivery_flags, DeliveryFlags::dpr_default());
+        assert_eq!(
+            completion.diagnostic.feedback_kind(),
+            DprFeedbackKind::MinimalStatus
+        );
+        assert_eq!(
+            diagnostic_event_names(&completion),
+            vec![
+                DprDiagnosticEventName::RouteSelected,
+                DprDiagnosticEventName::CloudRequestStarted,
+                DprDiagnosticEventName::CloudDeadlineExceeded,
+                DprDiagnosticEventName::FallbackBaselineSelected,
+                DprDiagnosticEventName::DeliveryEmitted,
+            ]
+        );
     }
 
     #[tokio::test]
@@ -923,6 +996,21 @@ mod tests {
         assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
         assert_eq!(completion.cloud_error, None);
         assert_eq!(completion.delivery_flags, DeliveryFlags::dpr_default());
+        assert_eq!(
+            completion.diagnostic.feedback_kind(),
+            DprFeedbackKind::MinimalStatus
+        );
+        assert_eq!(
+            diagnostic_event_names(&completion),
+            vec![
+                DprDiagnosticEventName::RouteSelected,
+                DprDiagnosticEventName::CloudRequestStarted,
+                DprDiagnosticEventName::CloudResponseReceived,
+                DprDiagnosticEventName::SourceDerivationFailed,
+                DprDiagnosticEventName::FallbackBaselineSelected,
+                DprDiagnosticEventName::DeliveryEmitted,
+            ]
+        );
     }
 
     #[tokio::test]
@@ -948,7 +1036,7 @@ mod tests {
         };
         let clock = SequenceClock {
             calls: AtomicUsize::new(0),
-            elapsed_ms: vec![100, 700, 1_500],
+            elapsed_ms: vec![0, 100, 700, 1_500],
         };
         let cloud_calls = Arc::new(AtomicUsize::new(0));
         let cloud = ImmediateCandidateCloud {
@@ -1068,6 +1156,20 @@ mod tests {
         assert_eq!(completion.rendered, "Hello from voisu.");
         assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::Http5xx));
         assert_eq!(completion.delivery_flags, DeliveryFlags::dpr_default());
+        assert_eq!(
+            completion.diagnostic.feedback_kind(),
+            DprFeedbackKind::MinimalStatus
+        );
+        assert_eq!(
+            diagnostic_event_names(&completion),
+            vec![
+                DprDiagnosticEventName::RouteSelected,
+                DprDiagnosticEventName::CloudRequestStarted,
+                DprDiagnosticEventName::ProviderFailed,
+                DprDiagnosticEventName::FallbackBaselineSelected,
+                DprDiagnosticEventName::DeliveryEmitted,
+            ]
+        );
     }
 
     #[tokio::test]

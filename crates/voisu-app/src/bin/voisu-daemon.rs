@@ -45,6 +45,7 @@ use voisu_core::{
     CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonState, DeadlineClock,
     DeliveryAdapter,
     DeliveryMethod, DeliveryOutcome, DiagnosticPage, DiagnosticRecord, DiagnosticStore,
+    DprDiagnostic,
     LifecycleEvidence, LifecycleStage,
     OverlayEvent, OverlayOutcome,
     MergeResult, PROTOCOL_VERSION, Provider,
@@ -2083,6 +2084,7 @@ async fn process_recording(
                 None,
                 None,
                 None,
+                None,
                 Some(&error),
             );
             if let Some(store) = diagnostics.as_ref() {
@@ -2106,6 +2108,7 @@ async fn process_recording(
     let mut provider_failures: Vec<ProviderFailure> = Vec::new();
     let mut final_transcript: Option<String> = None;
     let mut smart_writing: Option<SmartWritingDiagnostic> = None;
+    let mut dpr: Option<DprDiagnostic> = None;
     let mut debug_audio = None;
 
     let result = async {
@@ -2230,6 +2233,7 @@ async fn process_recording(
                 delivery.as_mut(),
             )
             .await;
+            dpr = Some(transformed.diagnostic);
             final_transcript = Some(transformed.rendered);
             transformed.delivery?
         } else {
@@ -2301,6 +2305,7 @@ async fn process_recording(
         final_transcript,
         debug_audio,
         smart_writing,
+        dpr,
         result.as_ref().err(),
     );
     if let Some(store) = diagnostics.as_ref() {
@@ -2456,6 +2461,7 @@ async fn supervise_recording(
                 None,
                 None,
                 None,
+                None,
                 Some(&error),
             );
             if let Some(store) = diagnostics.as_ref() {
@@ -2607,6 +2613,7 @@ fn diagnostic_record(
     final_transcript: Option<String>,
     debug_audio: Option<voisu_core::DebugAudioRecord>,
     smart_writing: Option<SmartWritingDiagnostic>,
+    dpr: Option<DprDiagnostic>,
     error: Option<&BoundaryError>,
 ) -> DiagnosticRecord {
     let mut record = DiagnosticRecord::new(evidence.correlation_id.clone(), evidence.recording_id);
@@ -2633,6 +2640,7 @@ fn diagnostic_record(
     record.error = error.map(|error| error.public_message().to_owned());
     record.debug_audio = debug_audio;
     record.smart_writing = smart_writing;
+    record.dpr = dpr;
     record
 }
 

@@ -10394,6 +10394,35 @@ fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
         "{history}"
     );
     assert!(record["smart_writing"].is_null(), "{history}");
+    let dpr = &record["dpr"];
+    assert_eq!(dpr["mode"], "production", "{history}");
+    assert_eq!(dpr["feedback_kind"], "silent", "{history}");
+    assert!(dpr["feedback_message"].is_null(), "{history}");
+    assert_eq!(dpr["delivery"]["state"], "unsent", "{history}");
+    assert_eq!(dpr["delivery"]["auto_send"], false, "{history}");
+    assert_eq!(dpr["delivery"]["live_type"], false, "{history}");
+    assert_eq!(dpr["delivery"]["replace_delivered"], false, "{history}");
+    assert_eq!(
+        dpr["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "route_selected",
+            "cloud_request_started",
+            "cloud_response_received",
+            "composition_accepted",
+            "delivery_emitted",
+        ],
+        "{history}"
+    );
+    let encoded = history.to_string();
+    assert!(!encoded.contains("stored-credential"), "{history}");
+    assert!(!encoded.contains("late_result_retained"), "{history}");
+    assert!(!encoded.contains("candidate_text"), "{history}");
+    assert!(!encoded.contains("apply_late"), "{history}");
     assert_eq!(commands.read("secret-tool.args"), "lookup\nvoisu-provider\ngroq\n");
     daemon.terminate();
 }
@@ -10448,6 +10477,24 @@ fn flagged_dpr_snapshots_natural_policy_at_recording_start_and_never_calls_cloud
     assert_eq!(
         history["history"][0]["final_transcript"],
         "Goal build voisu. Context rust. Requirements fast.",
+        "{history}"
+    );
+    let dpr = &history["history"][0]["dpr"];
+    assert_eq!(dpr["mode"], "production", "{history}");
+    assert_eq!(dpr["feedback_kind"], "silent", "{history}");
+    assert_eq!(
+        dpr["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "route_selected",
+            "cloud_skipped",
+            "fallback_baseline_selected",
+            "delivery_emitted",
+        ],
         "{history}"
     );
     daemon.terminate();
