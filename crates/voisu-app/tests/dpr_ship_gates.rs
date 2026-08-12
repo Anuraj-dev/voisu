@@ -1,0 +1,667 @@
+//! DPR-T7 hermetic ship gates from specification §15.
+//!
+//! Run the complete gate (including the full #138/#139 product corpus ports)
+//! with `voisu-cargo test --workspace -- --test-threads=4`. This target uses no
+//! real network, compositor, or wall-clock sleep.
+
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use serde_json::Value;
+use voisu_app::config::WritingMode;
+use voisu_app::dpr_cloud::{DprCloudAttempt, DprCloudErrorClass, DprCloudRequest};
+use voisu_app::dpr_pipeline::{
+    dpr_source_context, dpr_transform_and_deliver, DprCloudBoundary, DprCloudCapability,
+    DprCloudFuture, DprPipelineClock, DprTransformInput,
+};
+use voisu_app::smart_writing::{
+    final_transform_and_deliver, CredentialGateEvidence, FinalTransformInput,
+    GrammarGateCapability, ResolvedRecordingLanguages,
+};
+use voisu_core::{
+    compose_structured_candidate, organize_local_baseline, parse_structured_candidate_json,
+    BoundaryFuture, CloudOutcome, ComposeInput, ComposeOutcome, ComposeSource,
+    CompositionDecision, Credential, DeliveryAdapter, DeliveryFlags, DeliveryOutcome,
+    DprDiagnosticMode, LocalBaseline, LocalBaselineOptions, LocalTiming, PauseBoundary, Provider,
+    ProviderState, RenderingPolicy, RenderingRoute, SourceSelection, SourceTranscript,
+    SttProvider, StructuredCandidate, TimingCertainty, Transcript,
+};
+
+const BEHAVIOR_CORPUS: &str = include_str!(
+    "../../../docs/research/developer-prompt-rendering-behavior-corpus-2026-08-11.json"
+);
+const COMPOSE_CORPUS: &str = include_str!(
+    "../../../docs/research/developer-prompt-rendering-combined-call-corpus-2026-08-11.json"
+);
+
+fn policy(value: &Value) -> RenderingPolicy {
+    RenderingPolicy::parse(value.as_str().expect("policy string")).expect("known policy")
+}
+
+fn route(value: &Value) -> RenderingRoute {
+    RenderingRoute::parse(value.as_str().expect("route string")).expect("known route")
+}
+
+fn stt_provider(value: &Value) -> SttProvider {
+    match value.as_str().expect("provider string") {
+        "provider_a" => SttProvider::ProviderA,
+        "provider_b" => SttProvider::ProviderB,
+        provider => panic!("unknown provider {provider}"),
+    }
+}
+
+fn corpus_sources(fixture: &Value) -> Vec<SourceTranscript> {
+    fixture["sources"]
+        .as_array()
+        .expect("sources")
+        .iter()
+        .filter(|source| source["available"] == true)
+        .map(|source| SourceTranscript {
+            provider: match source["provider"].as_str().expect("provider") {
+                "provider_a" => Provider::Groq,
+                "provider_b" => Provider::Deepgram,
+                provider => panic!("unknown provider {provider}"),
+            },
+            text: source["text"].as_str().expect("source text").to_owned(),
+        })
+        .collect()
+}
+
+fn local_timing(fixture: &Value) -> Option<LocalTiming> {
+    let timing = fixture.get("timing")?;
+    if timing.is_null() {
+        return None;
+    }
+    Some(LocalTiming {
+        certainty: match timing["certainty"].as_str().expect("timing certainty") {
+            "clear" => TimingCertainty::Clear,
+            "uncertain" => TimingCertainty::Uncertain,
+            certainty => panic!("unknown timing certainty {certainty}"),
+        },
+        boundaries: timing["boundaries"]
+            .as_array()
+            .expect("timing boundaries")
+            .iter()
+            .map(|boundary| PauseBoundary {
+                left_phrase: boundary["left_phrase"]
+                    .as_str()
+                    .expect("left phrase")
+                    .to_owned(),
+                right_phrase: boundary["right_phrase"]
+                    .as_str()
+                    .expect("right phrase")
+                    .to_owned(),
+                pause_ms: u32::try_from(boundary["pause_ms"].as_u64().expect("pause ms"))
+                    .expect("pause fits u32"),
+            })
+            .collect(),
+    })
+}
+
+/// Ship gate 1 (#138): every currently applicable local fixture, including the
+/// former DPR-33 deferral, passes through real source selection and organizer.
+#[test]
+fn behavior_corpus_all_38_applicable_local_paths_match() {
+    let corpus: Value = serde_json::from_str(BEHAVIOR_CORPUS).expect("behavior corpus");
+    let mut checked = 0usize;
+    for fixture in corpus["fixtures"].as_array().expect("fixtures") {
+        let route_value = fixture["route"].as_str().expect("fixture route");
+        if !matches!(route_value, "deterministic_local" | "literal_identity") {
+            continue;
+        }
+        let id = fixture["id"].as_str().expect("fixture id");
+        let context = dpr_source_context(&corpus_sources(fixture))
+            .unwrap_or_else(|| panic!("{id}: source context"));
+        assert_eq!(
+            context.source_selection.reason,
+            fixture["source_selection"]["reason"].as_str().expect("reason"),
+            "{id}: selection reason"
+        );
+        assert_eq!(
+            context.provider_state.as_str(),
+            fixture["provider_state"].as_str().expect("provider state"),
+            "{id}: provider state"
+        );
+        let baseline = organize_local_baseline(
+            &context.selected_source,
+            &LocalBaselineOptions {
+                policy: policy(&fixture["policy"]),
+                route: route(&fixture["route"]),
+                timing: local_timing(fixture),
+            },
+        );
+        assert_eq!(
+            baseline.rendered(),
+            fixture["local_baseline"].as_str().expect("local baseline"),
+            "{id}: local baseline"
+        );
+        assert_eq!(
+            baseline.rendered(),
+            fixture["expected_final"].as_str().expect("expected final"),
+            "{id}: final transcript"
+        );
+        assert_eq!(fixture["cloud"]["actual_requests"], 0, "{id}: cloud count");
+        assert_eq!(fixture["delivery"]["state"], "unsent", "{id}: state");
+        assert!(!fixture["delivery"]["auto_send"].as_bool().expect("auto-send"), "{id}: auto-send");
+        assert!(!fixture["delivery"]["live_type"].as_bool().expect("live-type"), "{id}: live-type");
+        assert!(
+            !fixture["delivery"]["replace_delivered"]
+                .as_bool()
+                .expect("replace-delivered"),
+            "{id}: replace"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 38, "full applicable #138 local corpus changed");
+}
+
+#[test]
+fn complementary_merge_rejects_semantic_and_negation_gaps() {
+    for (left, right) in [
+        ("deploy the service", "deploy the database"),
+        ("do not deploy", "do deploy now"),
+        ("call Anuraj tomorrow", "call Raja tomorrow"),
+    ] {
+        let context = dpr_source_context(&[
+            SourceTranscript { provider: Provider::Groq, text: left.to_owned() },
+            SourceTranscript { provider: Provider::Deepgram, text: right.to_owned() },
+        ])
+        .expect("source context");
+        assert_eq!(
+            context.provider_state,
+            ProviderState::SemanticDisagreement,
+            "unsafe merge for {left:?} / {right:?}"
+        );
+        assert_eq!(context.selected_source, left);
+    }
+}
+
+struct ComposeFixture {
+    baseline: LocalBaseline,
+    fingerprint: String,
+    sources: Vec<ComposeSource>,
+    selection: SourceSelection,
+    protected: Vec<String>,
+    policy: RenderingPolicy,
+    cloud: CloudOutcome,
+    candidate: Option<StructuredCandidate>,
+}
+
+fn compose_fixture(fixture: &Value) -> ComposeFixture {
+    let sources: Vec<ComposeSource> = fixture["sources"]
+        .as_array()
+        .expect("compose sources")
+        .iter()
+        .map(|source| ComposeSource {
+            provider: stt_provider(&source["provider"]),
+            available: source["available"].as_bool().expect("available"),
+            text: source["text"].as_str().unwrap_or_default().to_owned(),
+            primary: source["primary"].as_bool().expect("primary"),
+        })
+        .collect();
+    let selected_provider = stt_provider(&fixture["source_selection"]["selected_provider"]);
+    let source = sources
+        .iter()
+        .find(|source| source.provider == selected_provider && source.available)
+        .expect("selected source");
+    let policy = policy(&fixture["policy"]);
+    let baseline = organize_local_baseline(
+        &source.text,
+        &LocalBaselineOptions {
+            policy,
+            route: RenderingRoute::LocalWithOptionalCloud,
+            timing: None,
+        },
+    );
+    let candidate = if fixture["candidate"].is_null() {
+        None
+    } else {
+        Some(
+            parse_structured_candidate_json(
+                &serde_json::to_vec(&fixture["candidate"]).expect("candidate JSON"),
+            )
+            .unwrap_or_else(|| panic!("{}: candidate rejected", fixture["id"])),
+        )
+    };
+    ComposeFixture {
+        baseline,
+        fingerprint: fixture["base_fingerprint"]
+            .as_str()
+            .expect("fingerprint")
+            .to_owned(),
+        sources,
+        selection: SourceSelection {
+            selected_provider,
+            reason: fixture["source_selection"]["reason"]
+                .as_str()
+                .expect("reason")
+                .to_owned(),
+        },
+        protected: fixture["protected_tokens"]
+            .as_array()
+            .expect("protected")
+            .iter()
+            .map(|token| token.as_str().expect("protected token").to_owned())
+            .collect(),
+        policy,
+        cloud: CloudOutcome::parse(
+            fixture["cloud_outcome"].as_str().expect("cloud outcome"),
+        )
+        .expect("known cloud outcome"),
+        candidate,
+    }
+}
+
+fn compose(fixture: &Value) -> ComposeOutcome {
+    let fixture = compose_fixture(fixture);
+    let protected: Vec<&str> = fixture.protected.iter().map(String::as_str).collect();
+    compose_structured_candidate(&ComposeInput {
+        local_baseline: &fixture.baseline,
+        base_fingerprint: &fixture.fingerprint,
+        sources: &fixture.sources,
+        source_selection: &fixture.selection,
+        protected_tokens: &protected,
+        policy: fixture.policy,
+        cloud_outcome: fixture.cloud,
+        candidate: fixture.candidate.as_ref(),
+    })
+}
+
+fn corpus_fixture(corpus: &Value, id: &str) -> Value {
+    corpus["fixtures"]
+        .as_array()
+        .expect("fixtures")
+        .iter()
+        .find(|fixture| fixture["id"] == id)
+        .unwrap_or_else(|| panic!("missing fixture {id}"))
+        .clone()
+}
+
+fn rejected_mutation(
+    corpus: &Value,
+    id: &str,
+    name: &str,
+    mutate: impl FnOnce(&mut Value),
+) {
+    let mut fixture = corpus_fixture(corpus, id);
+    mutate(&mut fixture);
+    let outcome = compose(&fixture);
+    assert_eq!(
+        outcome.decision(),
+        CompositionDecision::FallbackBaseline,
+        "#139 mutation {name} accepted: {:?}",
+        outcome.error_codes()
+    );
+    assert_eq!(
+        outcome.delivery(),
+        DeliveryFlags::dpr_default(),
+        "#139 mutation {name} delivery flags"
+    );
+}
+
+/// Ship gates 1/3/4 (#139): all 24 normative decisions/error codes, accepted
+/// renders, and the 19 product-compose mutations from the v1.1.2 oracle stay
+/// fail-closed. Under specification §14 precedence, fallback renders are
+/// asserted against the current #138 Final Transcript authority; #139 owns the
+/// structured compose decision rather than an independently rebuilt baseline.
+#[test]
+fn combined_call_all_24_decisions_and_19_product_mutations_match() {
+    let corpus: Value = serde_json::from_str(COMPOSE_CORPUS).expect("compose corpus");
+    let fixtures = corpus["fixtures"].as_array().expect("fixtures");
+    assert_eq!(fixtures.len(), 24, "full #139 corpus changed");
+    for fixture in fixtures {
+        let id = fixture["id"].as_str().expect("id");
+        let outcome = compose(fixture);
+        assert_eq!(
+            outcome.decision().as_str(),
+            fixture["expected"]["decision"].as_str().expect("decision"),
+            "{id}: decision"
+        );
+        if outcome.decision() == CompositionDecision::FallbackBaseline {
+            let product_baseline = compose_fixture(fixture);
+            assert_eq!(outcome.rendered(), product_baseline.baseline.rendered(), "{id}: fallback");
+        } else {
+            assert_eq!(
+                outcome.rendered(),
+                fixture["expected"]["rendered"].as_str().expect("rendered"),
+                "{id}: rendered"
+            );
+        }
+        let expected_codes: Vec<&str> = fixture["expected"]["error_codes"]
+            .as_array()
+            .expect("error codes")
+            .iter()
+            .map(|code| code.as_str().expect("error code"))
+            .collect();
+        assert_eq!(outcome.error_code_strs(), expected_codes, "{id}: error codes");
+        assert_eq!(outcome.delivery(), DeliveryFlags::dpr_default(), "{id}: flags");
+    }
+
+    rejected_mutation(&corpus, "CC-14", "protected_missing", |fixture| {
+        fixture["candidate"]["derivation"][0]["output_text"] = "Call anuraj.".into();
+    });
+    rejected_mutation(&corpus, "CC-01", "invented_content_accept", |fixture| {
+        fixture["candidate"]["derivation"] = serde_json::json!([{
+            "kind": "keep", "source_provider": "provider_a",
+            "source_text": "ship it exclamation point",
+            "output_text": "Deploy to production now!",
+            "conversion_id": null, "label": null
+        }]);
+    });
+    rejected_mutation(&corpus, "CC-01", "stale_fingerprint", |fixture| {
+        fixture["candidate"]["base_fingerprint"] = format!("sha256:{}", "a".repeat(64)).into();
+    });
+    rejected_mutation(&corpus, "CC-01", "unknown_conversion", |fixture| {
+        fixture["candidate"]["conversions"][0]["id"] = "hey→Restart".into();
+    });
+    rejected_mutation(&corpus, "CC-20", "non_closed_header", |fixture| {
+        fixture["candidate"]["derivation"][0]["output_text"] = "Edge Cases:\n".into();
+    });
+    rejected_mutation(&corpus, "CC-01", "empty_derivation", |fixture| {
+        fixture["candidate"]["derivation"] = serde_json::json!([]);
+    });
+    rejected_mutation(&corpus, "CC-18", "natural_structural_label", |fixture| {
+        fixture["policy"] = "natural".into();
+        fixture["candidate"]["derivation"][0]["output_text"] = "Goal:\nPlease send notes.".into();
+    });
+    rejected_mutation(&corpus, "CC-01", "unverifiable_span", |fixture| {
+        fixture["candidate"]["derivation"][0]["source_text"] = "not present in source xyz".into();
+    });
+    rejected_mutation(&corpus, "CC-14", "protected_name", |fixture| {
+        fixture["cloud_outcome"] = "succeeded".into();
+        fixture["candidate"]["derivation"][0]["output_text"] = "Call anuraj about the release.".into();
+    });
+    rejected_mutation(&corpus, "CC-01", "remove_without_removals", |fixture| {
+        fixture["candidate"]["removals"] = serde_json::json!([]);
+        fixture["candidate"]["derivation"] = serde_json::json!([
+            {"kind":"remove","source_provider":"provider_a","source_text":"ship","output_text":"","conversion_id":null,"label":null},
+            {"kind":"keep","source_provider":"provider_a","source_text":"it exclamation point","output_text":"It!","conversion_id":null,"label":null}
+        ]);
+    });
+    rejected_mutation(&corpus, "CC-01", "convert_cue_missing", |fixture| {
+        fixture["candidate"]["conversions"][0]["source_span_text"] = "ship it".into();
+        fixture["candidate"]["derivation"][1]["source_text"] = "ship it".into();
+    });
+    rejected_mutation(&corpus, "CC-01", "double_keep_overlap", |fixture| {
+        fixture["candidate"]["conversions"] = serde_json::json!([]);
+        fixture["candidate"]["derivation"] = serde_json::json!([
+            {"kind":"keep","source_provider":"provider_a","source_text":"ship it","output_text":"Ship it","conversion_id":null,"label":null},
+            {"kind":"keep","source_provider":"provider_a","source_text":"ship it","output_text":" ship it","conversion_id":null,"label":null}
+        ]);
+    });
+    for (name, breaks) in [
+        ("natural_multiparagraph", serde_json::json!(["\n\n"])),
+        ("natural_adjacent_newlines", serde_json::json!(["\n", "\n"])),
+    ] {
+        rejected_mutation(&corpus, "CC-18", name, |fixture| {
+            fixture["candidate"]["layout"] = serde_json::json!({"decision":"natural","certainty":"clear"});
+            let mut derivation = vec![serde_json::json!({
+                "kind":"keep","source_provider":"provider_a",
+                "source_text":"hey can you send the notes",
+                "output_text":"Hey, can you send the notes",
+                "conversion_id":null,"label":null
+            })];
+            for output in breaks.as_array().expect("breaks") {
+                derivation.push(serde_json::json!({"kind":"layout_break","source_provider":null,"source_text":"","output_text":output,"conversion_id":null,"label":null}));
+            }
+            derivation.push(serde_json::json!({
+                "kind":"keep","source_provider":"provider_a",
+                "source_text":"when you get a chance",
+                "output_text":"when you get a chance?",
+                "conversion_id":null,"label":null
+            }));
+            fixture["candidate"]["derivation"] = Value::Array(derivation);
+        });
+    }
+    rejected_mutation(&corpus, "CC-18", "natural_keep_edge_newlines", |fixture| {
+        fixture["candidate"]["layout"] = serde_json::json!({"decision":"natural","certainty":"clear"});
+        fixture["candidate"]["derivation"] = serde_json::json!([
+            {"kind":"keep","source_provider":"provider_a","source_text":"hey can you send the notes","output_text":"Hey, can you send the notes\n","conversion_id":null,"label":null},
+            {"kind":"keep","source_provider":"provider_a","source_text":"when you get a chance","output_text":"\nwhen you get a chance?","conversion_id":null,"label":null}
+        ]);
+    });
+    rejected_mutation(&corpus, "CC-01", "reconciliation_mismatch", |fixture| {
+        fixture["candidate"]["reconciliation"]["selected_provider"] = "provider_b".into();
+    });
+    rejected_mutation(&corpus, "CC-18", "keep_rephrase_drops_words", |fixture| {
+        fixture["candidate"]["derivation"] = serde_json::json!([{
+            "kind":"keep","source_provider":"provider_a",
+            "source_text":"hey can you send the notes when you get a chance",
+            "output_text":"Send the notes.","conversion_id":null,"label":null
+        }]);
+    });
+    rejected_mutation(&corpus, "CC-18", "omit_undeclared_words", |fixture| {
+        fixture["candidate"]["removals"] = serde_json::json!([]);
+        fixture["candidate"]["derivation"] = serde_json::json!([{
+            "kind":"keep","source_provider":"provider_a","source_text":"send the notes",
+            "output_text":"Send the notes.","conversion_id":null,"label":null
+        }]);
+    });
+    rejected_mutation(&corpus, "CC-18", "reverse_source_order", |fixture| {
+        fixture["candidate"]["removals"] = serde_json::json!([]);
+        fixture["candidate"]["derivation"] = serde_json::json!([
+            {"kind":"keep","source_provider":"provider_a","source_text":"when you get a chance","output_text":"When you get a chance ","conversion_id":null,"label":null},
+            {"kind":"keep","source_provider":"provider_a","source_text":"hey can you send the notes","output_text":"Hey can you send the notes","conversion_id":null,"label":null}
+        ]);
+    });
+}
+
+struct RecordingDelivery {
+    calls: Arc<AtomicUsize>,
+    delivered: Arc<Mutex<Vec<String>>>,
+    clock: Option<(ControlledClock, Arc<AtomicU64>)>,
+}
+
+impl DeliveryAdapter for RecordingDelivery {
+    fn deliver(&mut self, transcript: Transcript) -> BoundaryFuture<'_, DeliveryOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.delivered.lock().expect("delivery lock").push(transcript.0);
+        if let Some((clock, at)) = &self.clock {
+            at.store(clock.millis.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+        Box::pin(async { Ok(DeliveryOutcome::compositor_submitted()) })
+    }
+}
+
+#[derive(Clone)]
+struct ControlledClock {
+    millis: Arc<AtomicU64>,
+}
+
+impl ControlledClock {
+    fn at(millis: u64) -> Self {
+        Self { millis: Arc::new(AtomicU64::new(millis)) }
+    }
+}
+
+impl DprPipelineClock for ControlledClock {
+    fn elapsed(&self) -> Duration {
+        Duration::from_millis(self.millis.load(Ordering::SeqCst))
+    }
+}
+
+struct CannedCloud {
+    calls: Arc<AtomicUsize>,
+    clock: ControlledClock,
+    complete_at: u64,
+    result: Mutex<Option<DprCloudAttempt>>,
+}
+
+impl DprCloudBoundary for CannedCloud {
+    fn attempt<'a>(
+        &'a self,
+        _credential: &'a Credential,
+        _request: DprCloudRequest<'a>,
+        remaining: Duration,
+    ) -> DprCloudFuture<'a> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let deadline = self
+            .clock
+            .millis
+            .load(Ordering::SeqCst)
+            .saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX));
+        self.clock.millis.store(self.complete_at.min(deadline), Ordering::SeqCst);
+        let result = if self.complete_at > deadline {
+            DprCloudAttempt::failure(DprCloudErrorClass::DeadlineExceeded)
+        } else {
+            self.result.lock().expect("cloud result").take().expect("one attempt")
+        };
+        Box::pin(async move { result })
+    }
+}
+
+fn delivery(clock: Option<ControlledClock>) -> (RecordingDelivery, Arc<AtomicUsize>, Arc<AtomicU64>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let at = Arc::new(AtomicU64::new(u64::MAX));
+    (
+        RecordingDelivery {
+            calls: Arc::clone(&calls),
+            delivered: Arc::new(Mutex::new(Vec::new())),
+            clock: clock.map(|clock| (clock, Arc::clone(&at))),
+        },
+        calls,
+        at,
+    )
+}
+
+fn accepted_candidate(source: &str, output: &str) -> StructuredCandidate {
+    parse_structured_candidate_json(
+        serde_json::json!({
+            "schema_version":"1",
+            "base_fingerprint":voisu_core::text_sha256_fingerprint(source),
+            "reconciliation":{"selected_provider":"provider_a","reason":"configured_primary_rank"},
+            "removals":[],"conversions":[],
+            "layout":{"decision":"natural","certainty":"clear"},"labels":[],
+            "derivation":[{"kind":"keep","source_provider":"provider_a","source_text":source,"output_text":output,"conversion_id":null,"label":null}]
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .expect("accepted candidate")
+}
+
+/// Ship gates 2–5: injected time enforces the 1500 ms bound; one candidate
+/// still passes the sole compose gate; one stale candidate and one slow result
+/// fall back after exactly one attempt; Delivery and production diagnostics
+/// never expose a late-upgrade path.
+#[tokio::test]
+async fn orchestration_deadline_compose_call_count_delivery_and_diagnostics() {
+    let source = "hello from voisu";
+    let sources = [
+        ComposeSource { provider: SttProvider::ProviderA, available: true, text: source.to_owned(), primary: true },
+        ComposeSource { provider: SttProvider::ProviderB, available: true, text: "hello from voice you".to_owned(), primary: false },
+    ];
+    let selection = SourceSelection { selected_provider: SttProvider::ProviderA, reason: "configured_primary_rank".to_owned() };
+    let credential = Credential::new("hermetic-secret".to_owned()).expect("credential");
+
+    for (name, complete_at, candidate, expected, decision) in [
+        ("accepted", 200, accepted_candidate(source, "Hello from voisu!"), "Hello from voisu!", CompositionDecision::Accept),
+        ("late", 5_000, accepted_candidate(source, "Hello from voisu!"), "Hello from voisu.", CompositionDecision::FallbackBaseline),
+        ("stale", 200, {
+            let mut stale = accepted_candidate(source, "Hello from voisu!");
+            stale.base_fingerprint = format!("sha256:{}", "0".repeat(64));
+            stale
+        }, "Hello from voisu.", CompositionDecision::FallbackBaseline),
+    ] {
+        let clock = ControlledClock::at(0);
+        let cloud_calls = Arc::new(AtomicUsize::new(0));
+        let cloud = CannedCloud {
+            calls: Arc::clone(&cloud_calls),
+            clock: clock.clone(),
+            complete_at,
+            result: Mutex::new(Some(DprCloudAttempt::success(candidate))),
+        };
+        let (mut delivery, delivery_calls, delivery_at) = delivery(Some(clock.clone()));
+        let completion = dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &selection,
+                provider_state: ProviderState::SemanticDisagreement,
+                policy: RenderingPolicy::Adaptive,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready { boundary: &cloud, credential: &credential },
+                clock: &clock,
+            },
+            &mut delivery,
+        ).await;
+        assert_eq!(cloud_calls.load(Ordering::SeqCst), 1, "{name}: cloud calls");
+        assert_eq!(delivery_calls.load(Ordering::SeqCst), 1, "{name}: Delivery calls");
+        assert!(delivery_at.load(Ordering::SeqCst) <= 1_500, "{name}: late Delivery");
+        assert_eq!(completion.rendered, expected, "{name}: rendered");
+        assert_eq!(completion.compose_decision, decision, "{name}: decision");
+        assert_eq!(completion.delivery_flags, DeliveryFlags::dpr_default(), "{name}: flags");
+        assert_eq!(completion.diagnostic.mode(), DprDiagnosticMode::Production, "{name}: mode");
+        let diagnostic = serde_json::to_string(&completion.diagnostic).expect("diagnostic JSON");
+        assert!(!diagnostic.contains("late_evaluation"), "{name}: eval lane in production");
+        assert!(!diagnostic.contains("candidate_text"), "{name}: retained text in production");
+        assert!(!diagnostic.contains("apply_late"), "{name}: apply-late path in production");
+    }
+}
+
+/// Ship gate 6: all policies round-trip through the real CLI config, and a
+/// Recording-held snapshot remains stable when persisted config changes.
+#[test]
+fn all_three_policies_persist_and_snapshot() {
+    let temp = tempfile::tempdir().expect("config tempdir");
+    let binary = env!("CARGO_BIN_EXE_voisu");
+    let run = |arguments: &[&str]| {
+        Command::new(binary)
+            .args(arguments)
+            .env("XDG_CONFIG_HOME", temp.path())
+            .env_remove("VOISU_ENABLE_DPR")
+            .output()
+            .expect("run voisu CLI")
+    };
+    for policy in ["natural", "adaptive", "structured"] {
+        let set = run(&["rendering", policy]);
+        assert!(set.status.success(), "set {policy}: {}", String::from_utf8_lossy(&set.stderr));
+        let query = run(&["rendering"]);
+        assert!(query.status.success(), "query {policy}");
+        assert_eq!(
+            String::from_utf8_lossy(&query.stdout).trim(),
+            format!("rendering policy: {policy}")
+        );
+    }
+    let snapshot = String::from_utf8_lossy(&run(&["rendering"]).stdout).trim().to_owned();
+    assert!(run(&["rendering", "natural"]).status.success());
+    assert_eq!(
+        snapshot,
+        "rendering policy: structured",
+        "held Recording snapshot changed"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run(&["rendering"]).stdout).trim(),
+        "rendering policy: natural"
+    );
+}
+
+/// Ship gate 8: with DPR rollout absent, the existing Smart Writing gate still
+/// formats and performs one ordinary Delivery. T7 does not flip production.
+#[tokio::test]
+async fn dpr_flag_off_smart_writing_regression() {
+    let (mut delivery, calls, _) = delivery(None);
+    let languages = ResolvedRecordingLanguages::new(vec![(Provider::Groq, "en".to_owned())]);
+    let completion = final_transform_and_deliver(
+        FinalTransformInput {
+            validated_transcript: "hello world",
+            writing_mode: WritingMode::Smart,
+            languages: &languages,
+            grammar: GrammarGateCapability::Unavailable,
+            dictionary_terms: &[],
+            protected_names: &[],
+            credential: CredentialGateEvidence::default(),
+        },
+        &mut delivery,
+    ).await;
+    assert_eq!(completion.rendered, "Hello world.");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!completion.diagnostic.request_began);
+    assert_eq!(completion.diagnostic.outcome, voisu_core::SmartWritingOutcome::FormattingOnly);
+}

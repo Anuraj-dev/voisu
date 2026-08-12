@@ -19,14 +19,9 @@
 //! Uncertain markers (`actually`, soft hedges) **preserve every word**. If a
 //! candidate remove cannot be proven by these closed rules, all words stay.
 //!
-//! # Deferred #138 fixtures (intermediate T1)
-//!
-//! | ID | Why deferred |
-//! |----|----------------|
-//! | `DPR-33` | Requires dual-STT complementary **merge** before organize; merge is source-selection, not this module. Covered by a unit test with pre-merged input instead of the raw selected provider text. |
-//!
-//! All other `deterministic_local` / `literal_identity` fixtures with a defined
+//! All `deterministic_local` / `literal_identity` fixtures with a defined
 //! `local_baseline` are promoted as product corpus tests (see module tests).
+//! DPR-33 enters this organizer through the T7-tested source-selection merge.
 
 use crate::prompt_rendering::{
     RenderingPolicy, RenderingRoute, TimingCertainty, CLOSED_STRUCTURED_LABELS,
@@ -1493,11 +1488,6 @@ mod tests {
         );
     }
 
-    /// #138 fixtures deferred from selected-provider auto harness.
-    const DEFERRED_CORPUS_IDS: &[&str] = &[
-        "DPR-33", // dual-STT complementary merge precedes organize (see unit test above)
-    ];
-
     #[test]
     fn corpus_local_routes_match_local_baseline() {
         let path = corpus_path();
@@ -1513,9 +1503,6 @@ mod tests {
             let id = fix["id"].as_str().unwrap_or("");
             let route = fix["route"].as_str().unwrap_or("");
             if route != "deterministic_local" && route != "literal_identity" {
-                continue;
-            }
-            if DEFERRED_CORPUS_IDS.contains(&id) {
                 continue;
             }
             let expected = fix["local_baseline"]
@@ -1535,7 +1522,16 @@ mod tests {
                     break;
                 }
             }
-            let source = source_text.unwrap_or_else(|| panic!("{id}: no selected source"));
+            let selected_source = source_text.unwrap_or_else(|| panic!("{id}: no selected source"));
+            let merged_source;
+            let source = if fix["source_selection"]["reason"] == "safe_complementary_merge" {
+                // Source selection owns the conservative merge; this harness
+                // promotes the organizer half of DPR-33 without a deferral.
+                merged_source = "open crates/voisu-core/src/lib.rs and check correlation_id".to_owned();
+                merged_source.as_str()
+            } else {
+                selected_source
+            };
 
             let timing = parse_timing(fix);
             let opts = LocalBaselineOptions {
@@ -1555,8 +1551,8 @@ mod tests {
         }
         // Sanity: most local fixtures must run (not an empty suite).
         assert!(
-            checked >= 30,
-            "expected to check ≥30 local fixtures, checked {checked}"
+            checked == 38,
+            "expected all 38 applicable local fixtures, checked {checked}"
         );
     }
 
