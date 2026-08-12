@@ -565,7 +565,7 @@ fn introduces_heading_without_cue(base: &str, rendered: &str, policy: RenderingP
         else {
             return true;
         };
-        if !licensed.iter().any(|label| *label == canonical) {
+        if !licensed.contains(&canonical) {
             return true;
         }
     }
