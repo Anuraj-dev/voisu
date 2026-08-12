@@ -71,6 +71,13 @@ pub use local_baseline::{
     LOCAL_BASELINE_CONTRACT_ID,
 };
 
+mod intent_routing;
+pub use intent_routing::{
+    is_command_shaped, route_intent, IntentObservation, ProcessClass, ProcessHint, ProviderState,
+    RuleId, RoutingDecision, ScoreContribution, SurfaceHint, TimingHint, BROWSER_SHORT_WORDS,
+    COMPLEXITY_CLOUD_THRESHOLD, MESSAGING_SHORT_WORDS, SECTION_CUES_FOR_LENGTH_ASSIST,
+};
+
 // Paged diagnostic responses are negotiated per REQUEST (see `Request::paged`),
 // never by protocol version. The version is interpolated into the socket path,
 // the single-instance lock, and the store directory, so bumping it partitions
