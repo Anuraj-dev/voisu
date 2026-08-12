@@ -1097,15 +1097,19 @@ other_key = 5
         assert_ne!(ENABLE_DPR_ENV, ENABLE_QWEN_FORMAT_ENV);
         assert_eq!(ENABLE_DPR_ENV, "VOISU_ENABLE_DPR");
         assert_eq!(ENABLE_QWEN_FORMAT_ENV, "VOISU_ENABLE_QWEN_FORMAT");
-        // DPR on + Qwen missing/0/false: formatter stays off.
-        assert!(parse_optional_dpr_enablement(Some("1")));
-        assert!(!parse_optional_dpr_enablement(None));
-        assert!(!parse_optional_dpr_enablement(Some("0")));
-        assert!(!parse_optional_dpr_enablement(Some("false")));
-        // Qwen on + DPR missing: Qwen's own parse is independently true.
-        // The daemon still requires both flags before the formatter runs.
-        assert!(parse_optional_dpr_enablement(Some("true")));
-        assert!(!parse_optional_dpr_enablement(Some("")));
+
+        let parse_gates = |dpr: Option<&str>, qwen: Option<&str>| {
+            (
+                parse_optional_dpr_enablement(dpr),
+                parse_optional_dpr_enablement(qwen),
+            )
+        };
+
+        assert_eq!(parse_gates(Some("1"), None), (true, false));
+        assert_eq!(parse_gates(None, Some("true")), (false, true));
+        assert_eq!(parse_gates(Some("1"), Some("0")), (true, false));
+        assert_eq!(parse_gates(None, None), (false, false));
+        assert_eq!(parse_gates(Some("1"), Some("true")), (true, true));
     }
 
     #[test]
