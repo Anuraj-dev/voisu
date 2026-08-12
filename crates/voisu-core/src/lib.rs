@@ -1018,6 +1018,43 @@ pub struct SourceTranscript {
     pub text: String,
 }
 
+/// Strip anchored ASR outro hallucinations from one Source Transcript text.
+///
+/// Pure-outro text becomes empty. Genuine speech with an anchored final outro
+/// keeps the speech and loses only that outro. Mid-sentence mentions of the
+/// same closed phrases are preserved. After a strip, stopword-only or trivial
+/// head remainders (e.g. "Please", "OK", "Yeah") also clear so they never
+/// select or Deliver; multi-word genuine speech is kept.
+#[must_use]
+pub fn sanitize_source_transcript_text(text: &str) -> String {
+    let mut current = text.trim().to_owned();
+    let mut stripped_any = false;
+    while let Some(stripped) = strip_one_anchored_hallucinated_outro(&current) {
+        stripped_any = true;
+        current = stripped;
+    }
+    if stripped_any && !remainder_is_substantial_speech(&current) {
+        return String::new();
+    }
+    current
+}
+
+/// Clear pure-outro sources and strip only anchored final outros from each
+/// Source Transcript. Empty strings after sanitization mean the source carried
+/// no usable speech.
+#[must_use]
+pub fn sanitize_source_transcripts(
+    sources: impl IntoIterator<Item = SourceTranscript>,
+) -> Vec<SourceTranscript> {
+    sources
+        .into_iter()
+        .map(|source| SourceTranscript {
+            provider: source.provider,
+            text: sanitize_source_transcript_text(&source.text),
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 pub struct Transcript(pub String);
 
@@ -1136,6 +1173,23 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         &mut self,
         mut sources: Vec<SourceTranscript>,
     ) -> Result<TranscriptDecision, BoundaryError> {
+        // Classify and strip ASR outro hallucinations before any selection or
+        // model call so silence + "Thank you for watching!" never becomes a
+        // Delivery and never spends a reconciliation attempt.
+        sources = sanitize_source_transcripts(sources);
+        sources.retain(|source| !source.text.is_empty());
+        if sources.is_empty() {
+            let validation_reason = "hallucinated suffix; no Source Transcript remains after stripping ASR outros".to_owned();
+            return Err(
+                BoundaryError::new(BoundaryKind::Validation, validation_reason.clone())
+                    .with_transcript_failure(TranscriptFailureEvidence {
+                        validation_reason,
+                        fallback_reason: Some("hallucinated suffix".to_owned()),
+                        reconciliation_requested: false,
+                        recovery_attempted: false,
+                    }),
+            );
+        }
         sources.sort_by_key(|source| source.provider);
         if let (Some(deepgram), Some(groq)) = (
             sources.iter().find(|source| source.provider == Provider::Deepgram),
@@ -2286,6 +2340,17 @@ fn sentence_boundary_credit(text: &str) -> usize {
     sentence_punctuation_boundaries(text).min(plausible_boundaries)
 }
 
+/// The archetypal ASR outro hallucinations, learned from captioned video.
+/// Matched only when anchored at the final sentence start or the text end —
+/// the same words mid-sentence are ordinary dictation.
+const HALLUCINATED_SUFFIXES: [&str; 5] = [
+    "thank you for watching",
+    "thanks for watching",
+    "like and subscribe",
+    "subtitles by",
+    "transcribed by",
+];
+
 /// The text's final sentence — everything after the last sentence terminator
 /// that ends a word — with leading non-alphanumerics trimmed. A '.' inside a
 /// token ("amara.org", "otter.ai") does not end a sentence, so an outro
@@ -2295,11 +2360,19 @@ fn sentence_boundary_credit(text: &str) -> usize {
 /// with no terminator is itself the final sentence.
 fn final_sentence(text: &str) -> &str {
     let trimmed = text.trim_end_matches(|character: char| !character.is_alphanumeric());
-    let start = trimmed
+    let start = final_sentence_content_start(trimmed);
+    trimmed[start..].trim_start_matches(|character: char| !character.is_alphanumeric())
+}
+
+/// Byte offset in `body` where the final sentence's content begins, after any
+/// leading non-alphanumerics that follow the preceding terminator. `body` must
+/// already have trailing non-alphanumerics trimmed.
+fn final_sentence_content_start(body: &str) -> usize {
+    let after_terminator = body
         .char_indices()
         .filter(|&(index, character)| {
             matches!(character, '.' | '?' | '!')
-                && trimmed[index + character.len_utf8()..]
+                && body[index + character.len_utf8()..]
                     .chars()
                     .next()
                     .is_some_and(char::is_whitespace)
@@ -2307,7 +2380,112 @@ fn final_sentence(text: &str) -> &str {
         .map(|(index, character)| index + character.len_utf8())
         .next_back()
         .unwrap_or(0);
-    trimmed[start..].trim_start_matches(|character: char| !character.is_alphanumeric())
+    body[after_terminator..]
+        .char_indices()
+        .find(|(_, character)| character.is_alphanumeric())
+        .map(|(index, _)| after_terminator + index)
+        .unwrap_or(after_terminator)
+}
+
+/// Offset just after the last sentence terminator that introduces the final
+/// sentence, or `0` when the whole body is one sentence. Used when stripping
+/// a final-sentence outro while keeping the preceding speech and its
+/// terminator.
+fn final_sentence_boundary_start(body: &str) -> usize {
+    body.char_indices()
+        .filter(|&(index, character)| {
+            matches!(character, '.' | '?' | '!')
+                && body[index + character.len_utf8()..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_whitespace)
+        })
+        .map(|(index, character)| index + character.len_utf8())
+        .next_back()
+        .unwrap_or(0)
+}
+
+fn has_anchored_hallucinated_outro(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    let tail = lower.trim_end_matches(|character: char| !character.is_alphanumeric());
+    let outro = final_sentence(&lower);
+    HALLUCINATED_SUFFIXES
+        .iter()
+        .any(|suffix| outro.starts_with(suffix) || tail.ends_with(suffix))
+}
+
+/// Remove one anchored hallucinated outro from the tail of `text`.
+/// Returns `None` when no anchored outro is present.
+fn strip_one_anchored_hallucinated_outro(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let alnum_end = trimmed
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_alphanumeric())
+        .map(|(index, character)| index + character.len_utf8())
+        .unwrap_or(0);
+    let body = &trimmed[..alnum_end];
+    if body.is_empty() {
+        return None;
+    }
+    let content_start = final_sentence_content_start(body);
+    let final_content = &body[content_start..];
+    let final_lower = final_content.to_lowercase();
+    if HALLUCINATED_SUFFIXES
+        .iter()
+        .any(|suffix| final_lower.starts_with(suffix))
+    {
+        let boundary = final_sentence_boundary_start(body);
+        return Some(body[..boundary].trim_end().to_owned());
+    }
+    let body_lower = body.to_lowercase();
+    for suffix in HALLUCINATED_SUFFIXES {
+        if !body_lower.ends_with(suffix) {
+            continue;
+        }
+        // Suffixes are ASCII; strip by char count so non-ASCII heads stay intact.
+        let suffix_chars = suffix.chars().count();
+        let body_chars = body.chars().count();
+        if body_chars < suffix_chars {
+            continue;
+        }
+        let keep: String = body.chars().take(body_chars - suffix_chars).collect();
+        return Some(keep.trim_end().to_owned());
+    }
+    None
+}
+
+/// Politeness / interjection heads that ride in front of ASR outros and are not
+/// standalone speech once the outro is gone. Distinct from `STOPWORDS` so short
+/// real dictation like "Done" is not cleared, while "Please" is.
+const TRIVIAL_OUTRO_PREFIXES: [&str; 9] = [
+    "please", "thanks", "thank", "hi", "hello", "hey", "bye", "alright", "oh",
+];
+
+/// True when post-strip remainder is real speech rather than a stopword-only or
+/// trivial head left glued to a hallucinated outro.
+fn remainder_is_substantial_speech(text: &str) -> bool {
+    let words = normalized_words(text);
+    if words.is_empty() {
+        return false;
+    }
+    let has_real_content = words.iter().any(|word| {
+        !is_stopword(word) && !TRIVIAL_OUTRO_PREFIXES.contains(&word.as_str())
+    });
+    if has_real_content {
+        return true;
+    }
+    // All stopwords / trivial prefixes: keep multi-word utterances such as
+    // "yes i can do that" and clear one- or two-token heads ("ok", "yeah",
+    // "please").
+    words.len() >= 3
 }
 
 fn sentence_start_capitalisation(text: &str) -> (usize, usize) {
@@ -2553,20 +2731,9 @@ fn quality_failure_reason(
     // into repair — the one path allowed to refuse delivery — so a missed
     // outro (visible junk the user can delete) is the cheaper direction.
     // Each anchored placement and the mid-sentence exemption is pinned by a
-    // test.
-    const HALLUCINATED_SUFFIXES: [&str; 5] = [
-        "thank you for watching",
-        "thanks for watching",
-        "like and subscribe",
-        "subtitles by",
-        "transcribed by",
-    ];
-    let tail = lower.trim_end_matches(|character: char| !character.is_alphanumeric());
-    let outro = final_sentence(&lower);
-    if HALLUCINATED_SUFFIXES
-        .iter()
-        .any(|suffix| outro.starts_with(suffix) || tail.ends_with(suffix))
-    {
+    // test. Source selection strips the same anchors via
+    // `sanitize_source_transcript_text` before preferring a provider.
+    if has_anchored_hallucinated_outro(trimmed) {
         return Some(QualityFailure::Other("hallucinated suffix"));
     }
     if script_count(trimmed) >= 3

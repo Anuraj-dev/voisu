@@ -55,7 +55,8 @@ use voisu_core::{
     ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SourceTranscript,
     SourceTranscriptRecord, Transcript, TranscriptDecision, TranscriptDecisionPipeline,
     TranscriptProvider, TranscriptSelection, TranscriptValidator, TriggerKeyBinding, VersionEnvelope,
-    SmartWritingDiagnostic, EnglishEligibilityOutcome, replay_capture, socket_path,
+    SmartWritingDiagnostic, EnglishEligibilityOutcome, replay_capture, sanitize_source_transcripts,
+    socket_path,
 };
 
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
@@ -2161,8 +2162,11 @@ async fn process_recording(
             sources.iter().map(|source| source.provider).collect();
         source_records = sources.iter().map(SourceTranscriptRecord::new).collect();
         evidence.stages.push(LifecycleStage::ProvidersCompleted);
+        // Classify outro hallucinations before DPR selection so pure-outro Groq
+        // never becomes a successful Source Transcript under the DPR branch.
+        let sanitized_sources = sanitize_source_transcripts(dpr_source_snapshot.clone());
         let dpr_context = if dpr_enabled && english_eligible {
-            dpr_source_context(&dpr_source_snapshot, &dictionary_terms)
+            dpr_source_context(&sanitized_sources, &dictionary_terms)
         } else {
             None
         };
@@ -2184,7 +2188,9 @@ async fn process_recording(
                 recovery_attempted: false,
             }
         } else {
-            match validator.validate(sources).await {
+            // Sanitized evidence goes to validation so pure-outro silence fails
+            // closed without a model call (decide strips/refuses the same list).
+            match validator.validate(sanitized_sources).await {
                 Ok(decision) => decision,
                 Err(error) => {
                     if let Some(failure) = error.transcript_failure() {

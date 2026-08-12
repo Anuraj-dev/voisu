@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use voisu_core::{
     compose_structured_candidate, organize_local_baseline, route_intent,
-    text_sha256_fingerprint, CloudOutcome, CloudRequest, ComposeInput, ComposeSource,
-    CompositionDecision, Credential, DeliveryAdapter, DeliveryFlags, DeliveryOutcome,
+    sanitize_source_transcripts, text_sha256_fingerprint, CloudOutcome, CloudRequest, ComposeInput,
+    ComposeSource, CompositionDecision, Credential, DeliveryAdapter, DeliveryFlags, DeliveryOutcome,
     DprDiagnostic, IntentObservation, LocalBaselineOptions, ProcessHint, ProviderState,
     RenderingPolicy, RoutingDecision, SourceSelection, SourceTranscript, SttProvider, SurfaceHint,
     TimingHint, Transcript, TranscriptSelection, Provider,
@@ -124,7 +124,10 @@ pub fn dpr_source_context(
     sources: &[SourceTranscript],
     dictionary_terms: &[String],
 ) -> Option<DprSourceContext> {
-    let available: Vec<&SourceTranscript> = sources
+    // Quality-classify before selection so pure-outro Groq never wins over empty
+    // Deepgram and a trailing anchored outro never enters compose/Delivery.
+    let sanitized = sanitize_source_transcripts(sources.iter().cloned());
+    let available: Vec<&SourceTranscript> = sanitized
         .iter()
         .filter(|source| !source.text.is_empty())
         .collect();
@@ -808,6 +811,111 @@ mod tests {
         assert_eq!(context.source_selection.reason, "configured_primary_rank");
         assert_eq!(context.transcript_selection, TranscriptSelection::SourceGroq);
         assert!(dpr_source_context(&[], &[]).is_none());
+    }
+
+    #[test]
+    fn pure_outro_sources_yield_no_dpr_context() {
+        let sources = vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: String::new(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Thank you for watching!".to_owned(),
+            },
+        ];
+        assert!(
+            dpr_source_context(&sources, &[]).is_none(),
+            "silence + pure outro must not select a Source Transcript"
+        );
+    }
+
+    #[test]
+    fn pure_outro_with_trivial_prefix_yields_no_dpr_context() {
+        for head_outro in [
+            "Please like and subscribe",
+            "OK thanks for watching",
+            "Yeah thank you for watching",
+        ] {
+            let sources = vec![
+                SourceTranscript {
+                    provider: Provider::Deepgram,
+                    text: String::new(),
+                },
+                SourceTranscript {
+                    provider: Provider::Groq,
+                    text: head_outro.to_owned(),
+                },
+            ];
+            assert!(
+                dpr_source_context(&sources, &[]).is_none(),
+                "trivial-prefix outro must not select: {head_outro:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_speech_wins_over_outro_only_sibling() {
+        let sources = vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Schedule the review for Wednesday morning.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Thank you for watching!".to_owned(),
+            },
+        ];
+        let context = dpr_source_context(&sources, &[]).expect("genuine context");
+        assert_eq!(
+            context.selected_source,
+            "Schedule the review for Wednesday morning."
+        );
+        assert_eq!(
+            context.transcript_selection,
+            TranscriptSelection::SourceDeepgram
+        );
+        assert_eq!(context.provider_state, ProviderState::SingleProvider);
+    }
+
+    #[test]
+    fn anchored_final_outro_is_stripped_before_dpr_selection() {
+        let sources = vec![
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Schedule the review for Wednesday morning. Thank you for watching."
+                    .to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Schedule the review for Wednesday morning. Thanks for watching!"
+                    .to_owned(),
+            },
+        ];
+        let context = dpr_source_context(&sources, &[]).expect("stripped context");
+        assert_eq!(
+            context.selected_source,
+            "Schedule the review for Wednesday morning."
+        );
+        assert!(!context.selected_source.to_lowercase().contains("watching"));
+    }
+
+    #[test]
+    fn mid_sentence_outro_phrase_is_preserved_for_dpr_selection() {
+        let spoken = "The demo went well and the recording was transcribed by Whisper.";
+        let sources = vec![
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: spoken.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: spoken.to_owned(),
+            },
+        ];
+        let context = dpr_source_context(&sources, &[]).expect("mid-sentence context");
+        assert_eq!(context.selected_source, spoken);
     }
 
     #[test]
