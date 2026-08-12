@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.19.1
+Version:        0.20.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,15 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Wed Aug 12 2026 Voisu maintainers <voisu@example.invalid> - 0.20.0-1
+- feat(dpr): domain types + rendering_policy CLI/config (#155) (#164)
+- docs(research): Developer Prompt Rendering execution DAG (#145) (#154)
+- docs(research): close #144 dual-ballot approval on DPR specification
+- docs(research): Developer Prompt Rendering specification (#144) (#153)
+- docs(research): #140 three-way model benchmark with Gemini live (#152)
+- docs(research): Developer Prompt Rendering model benchmark (#140) (#151)
+- docs(research): Developer Prompt Rendering diagnostics package (#142) (#150)
+
 * Tue Aug 11 2026 Voisu maintainers <voisu@example.invalid> - 0.19.1-1
 - fix(research): close #139 derivation completeness and source-order gates (#149)
 - docs(research): structured combined-call contract prototype (#139)
