@@ -40,6 +40,10 @@ const WRITING_MODE_KEY: &str = "writing_mode";
 /// The root configuration key selecting Developer Prompt Rendering policy.
 const RENDERING_POLICY_KEY: &str = "rendering_policy";
 
+/// Explicit rollout gate for the DPR pipeline. Only `1` or `true` enables it;
+/// missing, empty, or malformed values keep Smart Writing in production.
+pub const ENABLE_DPR_ENV: &str = "VOISU_ENABLE_DPR";
+
 /// How Voisu delivers a final Transcript after preserving it on the clipboard.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DeliveryMode {
@@ -133,6 +137,9 @@ pub const DEFAULT_WRITING_MODE: WritingMode = WritingMode::Smart;
 /// [`resolve_rendering_policy`].
 pub const DEFAULT_RENDERING_POLICY: RenderingPolicy = voisu_core::DEFAULT_RENDERING_POLICY;
 
+/// Smart Writing remains the production path until an explicit rollout flag.
+pub const DEFAULT_DPR_ENABLED: bool = false;
+
 /// Whether the Deepgram Provider is enabled for Recordings.
 ///
 /// The env override [`DISABLE_DEEPGRAM_ENV`] wins over the persisted file: when
@@ -194,6 +201,19 @@ pub fn set_writing_mode(mode: WritingMode) -> Result<PathBuf, String> {
 /// Recording start so mid-utterance config flips do not affect in-flight work.
 pub fn rendering_policy() -> RenderingPolicy {
     resolve_rendering_policy(read_rendering_policy(&config_path()))
+}
+
+/// Whether the flagged Developer Prompt Rendering pipeline is active for this
+/// daemon process. This is deliberately not inferred from `rendering_policy`:
+/// policy can be configured while the rollout gate remains off.
+pub fn dpr_enabled() -> bool {
+    std::env::var(ENABLE_DPR_ENV)
+        .ok()
+        .is_some_and(|value| parse_dpr_enablement(&value))
+}
+
+fn parse_dpr_enablement(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true")
 }
 
 /// Persists the Rendering Policy, creating the `voisu` config directory if
@@ -1021,6 +1041,17 @@ other_key = 5
             read_rendering_policy(Path::new("/nonexistent/voisu/config.toml")),
             RenderingPolicyLoad::Missing
         );
+    }
+
+    #[test]
+    fn dpr_rollout_gate_defaults_off_and_requires_an_explicit_true_value() {
+        assert!(!DEFAULT_DPR_ENABLED);
+        for value in ["", "0", "false", "yes", "adaptive", "garbage"] {
+            assert!(!parse_dpr_enablement(value), "unexpected enablement: {value}");
+        }
+        for value in ["1", "true", " TRUE "] {
+            assert!(parse_dpr_enablement(value), "expected enablement: {value}");
+        }
     }
 
     #[test]
