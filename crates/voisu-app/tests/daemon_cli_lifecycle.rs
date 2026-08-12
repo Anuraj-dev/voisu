@@ -88,22 +88,15 @@ fn disable_shortcuts_unless_bus_injected(command: &mut Command, environment: &[(
 /// keeps the dual-Provider suite exercising both Providers regardless of the
 /// machine's persisted `voisu deepgram` setting (the shipped default is ON, but
 /// a developer may have persisted OFF locally). A
-/// test that sets its own `XDG_CONFIG_HOME` or `VOISU_DISABLE_DEEPGRAM` opts out
-/// and drives the toggle itself.
+/// test that sets its own `XDG_CONFIG_HOME` opts out and drives the config
+/// itself. An explicit `VOISU_DISABLE_DEEPGRAM` still wins inside the isolated
+/// config, so it must not expose unrelated host settings such as Writing Mode.
 fn isolate_deepgram_config(
     command: &mut Command,
     environment: &[(&str, &str)],
 ) -> Option<TempDir> {
-    // A test that drives the toggle itself keeps its own override untouched.
-    if environment
-        .iter()
-        .any(|(name, _)| *name == "VOISU_DISABLE_DEEPGRAM")
-    {
-        return None;
-    }
-    // Otherwise strip any VOISU_DISABLE_DEEPGRAM inherited from the parent
-    // shell/CI, which would silently disable Deepgram across the dual-Provider
-    // suite.
+    // Strip any inherited override from the parent shell/CI. An explicit test
+    // override is restored from `environment` after this helper returns.
     command.env_remove("VOISU_DISABLE_DEEPGRAM");
     // A test with its own XDG_CONFIG_HOME supplies its own config; leave it be.
     if environment
@@ -169,6 +162,12 @@ impl Daemon {
             command.env_remove("VOISU_TEST_SECRET_STORE");
             command.env_remove("VOISU_TEST_STORED_GROQ_CREDENTIAL");
         }
+        if !environment
+            .iter()
+            .any(|(name, _)| *name == "VOISU_ENABLE_DPR")
+        {
+            command.env_remove("VOISU_ENABLE_DPR");
+        }
         disable_shortcuts_unless_bus_injected(&mut command, environment);
         let config_dir = isolate_deepgram_config(&mut command, environment);
         for (name, value) in environment {
@@ -223,6 +222,12 @@ impl Daemon {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .env_remove("VOISU_DEEPGRAM_API_KEY");
+        if !environment
+            .iter()
+            .any(|(name, _)| *name == "VOISU_ENABLE_DPR")
+        {
+            command.env_remove("VOISU_ENABLE_DPR");
+        }
         disable_shortcuts_unless_bus_injected(&mut command, environment);
         let config_dir = isolate_deepgram_config(&mut command, environment);
         let explicit_deepgram = environment
@@ -1917,6 +1922,100 @@ fn local_minimal_grammar_server(
                 "end_utf8": 8,
                 "before": "is",
                 "after": "are"
+            }]
+        });
+        let response_body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": candidate.to_string()
+                }
+            }]
+        })
+        .to_string();
+        write!(
+            reader.get_mut(),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        )
+        .unwrap();
+    });
+    (
+        format!("http://{address}/openai/v1/chat/completions"),
+        request_rx,
+        server,
+    )
+}
+
+/// Loopback OpenAI-compatible DPR endpoint used through the daemon's flagged
+/// T5 wiring. The candidate is derived from the request's selected source and
+/// fingerprint so the test exercises the production compose gate.
+fn local_dpr_server(
+    expected_credential: &'static str,
+) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_tx, request_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut content_length = 0_usize;
+        let mut authorized = false;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            let lower = line.to_ascii_lowercase();
+            if let Some(value) = lower.strip_prefix("content-length:") {
+                content_length = value.trim().parse().unwrap();
+            }
+            if lower
+                .strip_prefix("authorization:")
+                .is_some_and(|value| value.trim() == format!("bearer {expected_credential}"))
+            {
+                authorized = true;
+            }
+        }
+        assert!(authorized, "DPR credential must be ready before the gate");
+        let mut request_body = vec![0_u8; content_length];
+        reader.read_exact(&mut request_body).unwrap();
+        let request: Value = serde_json::from_slice(&request_body).unwrap();
+        request_tx.send(request.clone()).unwrap();
+        let user: Value = serde_json::from_str(
+            request["messages"][1]["content"]
+                .as_str()
+                .expect("structured DPR user body"),
+        )
+        .unwrap();
+        let source = user["sources"][0]["text"].as_str().unwrap();
+        let selected_provider = user["host_selection"]["selected_provider"]
+            .as_str()
+            .unwrap();
+        let reason = user["host_selection"]["reason"].as_str().unwrap();
+        let candidate = serde_json::json!({
+            "schema_version": "1",
+            "base_fingerprint": user["base_fingerprint"],
+            "reconciliation": {
+                "selected_provider": selected_provider,
+                "reason": reason
+            },
+            "removals": [],
+            "conversions": [],
+            "layout": {"decision": "natural", "certainty": "clear"},
+            "labels": [],
+            "derivation": [{
+                "kind": "keep",
+                "source_provider": selected_provider,
+                "source_text": source,
+                "output_text": "Goal build voisu. Context rust. Requirements fast!",
+                "conversion_id": null,
+                "label": null
             }]
         });
         let response_body = serde_json::json!({
@@ -10218,5 +10317,138 @@ fn smart_writing_real_wiring_reproves_grammar_http_and_credential_cache_miss() {
     assert!(smart["credential_prep_latency_ms"].is_number(), "{history}");
     assert_eq!(smart["edits"][0]["code"], "edit_accepted", "{history}");
     assert_eq!(commands.read("secret-tool.args"), "lookup\nvoisu-provider\ngroq\n");
+    daemon.terminate();
+}
+
+/// T5 production-boundary reproof: explicit rollout enablement selects DPR for
+/// an eligible English Recording, issues one structured request, composes it,
+/// and performs the existing single Delivery. Without this env flag, the SW10
+/// test above proves the unchanged Smart Writing branch.
+#[test]
+fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
+    let runtime = TempDir::new().unwrap();
+    let config = TempDir::new().unwrap();
+    fs::create_dir_all(config.path().join("voisu")).unwrap();
+    fs::write(
+        config.path().join("voisu/config.toml"),
+        "deepgram_enabled = true\nwriting_mode = \"smart\"\nrendering_policy = \"adaptive\"\n",
+    )
+    .unwrap();
+    let commands = FakeCommands::new();
+    let (endpoint, request_rx, server) = local_dpr_server("stored-credential");
+    let path = commands.path();
+    let config_home = config.path().display().to_string();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("XDG_CONFIG_HOME", &config_home),
+            ("VOISU_ENABLE_DPR", "1"),
+            ("VOISU_TEST_CLEAR_GROQ_API_KEY", "1"),
+            ("VOISU_TEST_DPR_ENDPOINT", &endpoint),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "goal break voisu context javascript requirements slow",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "goal build voisu context rust requirements fast",
+            ),
+            (
+                "VOISU_TEST_RECONCILIATION_RESULT",
+                "legacy free form reconciliation must not run",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
+    assert_eq!(
+        stopped["evidence"]["reconciliation_requested"],
+        false,
+        "flagged DPR must not spend a legacy free-form model call: {stopped}"
+    );
+    assert_eq!(
+        stopped["evidence"]["transcript_selection"],
+        "source_groq",
+        "{stopped}"
+    );
+
+    let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    server.join().unwrap();
+    assert_eq!(request["model"], "openai/gpt-oss-20b");
+    assert_eq!(request["reasoning_effort"], "low");
+    assert_eq!(request["response_format"]["type"], "json_schema");
+    let user: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(user["policy"], "adaptive");
+    assert_eq!(user["sources"].as_array().unwrap().len(), 2);
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let record = &history["history"][0];
+    assert_eq!(
+        record["final_transcript"],
+        "Goal build voisu. Context rust. Requirements fast!",
+        "{history}"
+    );
+    assert!(record["smart_writing"].is_null(), "{history}");
+    assert_eq!(commands.read("secret-tool.args"), "lookup\nvoisu-provider\ngroq\n");
+    daemon.terminate();
+}
+
+#[test]
+fn flagged_dpr_snapshots_natural_policy_at_recording_start_and_never_calls_cloud() {
+    let runtime = TempDir::new().unwrap();
+    let config = TempDir::new().unwrap();
+    fs::create_dir_all(config.path().join("voisu")).unwrap();
+    let config_path = config.path().join("voisu/config.toml");
+    fs::write(
+        &config_path,
+        "deepgram_enabled = false\nwriting_mode = \"smart\"\nrendering_policy = \"natural\"\n",
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/openai/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let config_home = config.path().display().to_string();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("XDG_CONFIG_HOME", &config_home),
+            ("VOISU_DISABLE_DEEPGRAM", "1"),
+            ("VOISU_ENABLE_DPR", "true"),
+            ("VOISU_TEST_DPR_ENDPOINT", &endpoint),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "goal build voisu context rust requirements fast",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    fs::write(
+        &config_path,
+        "deepgram_enabled = false\nwriting_mode = \"smart\"\nrendering_policy = \"structured\"\n",
+    )
+    .unwrap();
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
+    listener.set_nonblocking(true).unwrap();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "Natural snapshot must forbid cloud despite the mid-Recording config edit"
+    );
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(
+        history["history"][0]["final_transcript"],
+        "Goal build voisu. Context rust. Requirements fast.",
+        "{history}"
+    );
     daemon.terminate();
 }

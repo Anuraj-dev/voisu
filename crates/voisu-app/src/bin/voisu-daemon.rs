@@ -19,6 +19,11 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use voisu_app::audio_level::{LevelRegistry, LevelRing};
 use voisu_app::grammar_http::GrammarHttpClient;
+use voisu_app::dpr_cloud::DprCloudClient;
+use voisu_app::dpr_pipeline::{
+    dpr_protected_tokens, dpr_source_context, dpr_transform_and_deliver, DprCloudCapability,
+    DprTransformInput, SystemDprPipelineClock,
+};
 use voisu_app::focus::SharedFocusProbe;
 use voisu_app::journal::{escape_journal_control, recording_journal_lines};
 use voisu_app::minimal_grammar::MinimalGrammarAdapter;
@@ -34,7 +39,7 @@ use voisu_app::system::{
     PROVIDER_COMPLETION_DEADLINE,
     RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
-use voisu_app::config::{DeliveryMode, WritingMode};
+use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
     CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonState, DeadlineClock,
@@ -49,7 +54,7 @@ use voisu_core::{
     ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SourceTranscript,
     SourceTranscriptRecord, Transcript, TranscriptDecision, TranscriptDecisionPipeline,
     TranscriptProvider, TranscriptValidator, TriggerKeyBinding, VersionEnvelope,
-    SmartWritingDiagnostic, replay_capture, socket_path,
+    SmartWritingDiagnostic, EnglishEligibilityOutcome, replay_capture, socket_path,
 };
 
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
@@ -468,6 +473,7 @@ struct StartupCompletion {
     result: Result<(Box<dyn ActiveCapture>, ProviderStreams), StartFailure>,
     level_ring: Arc<LevelRing>,
     writing_mode: WritingMode,
+    rendering_policy: RenderingPolicy,
     dictionary_terms: Vec<String>,
     languages: ResolvedRecordingLanguages,
     reply: oneshot::Sender<Response>,
@@ -499,6 +505,7 @@ struct ActiveRecording {
     /// every warning late by exactly that stall. Reporting only.
     deadline_clock: DeadlineClock,
     writing_mode: WritingMode,
+    rendering_policy: RenderingPolicy,
     dictionary_terms: Vec<String>,
     languages: ResolvedRecordingLanguages,
     evidence: LifecycleEvidence,
@@ -584,6 +591,22 @@ async fn actor_loop(
             Ok(adapter) => Some(adapter),
             Err(error) => {
                 eprintln!("Minimal Grammar unavailable: {error}");
+                None
+            }
+        }
+    };
+    let dpr_enabled = voisu_app::config::dpr_enabled();
+    let dpr_client = if !dpr_enabled {
+        None
+    } else if controlled {
+        std::env::var("VOISU_TEST_DPR_ENDPOINT")
+            .ok()
+            .and_then(|endpoint| DprCloudClient::with_endpoint(endpoint).ok())
+    } else {
+        match DprCloudClient::groq() {
+            Ok(client) => Some(client),
+            Err(error) => {
+                eprintln!("Developer Prompt Rendering cloud unavailable: {error}");
                 None
             }
         }
@@ -821,6 +844,7 @@ async fn actor_loop(
                     let session_whisper_prompt =
                         voisu_app::dictionary::whisper_prompt_for_terms(&session_terms);
                     let writing_mode = voisu_app::config::writing_mode();
+                    let rendering_policy = voisu_app::config::rendering_policy();
                     let groq_language = groq_transcription_language();
                     let mut language_declarations =
                         vec![(Provider::Groq, groq_language.clone())];
@@ -885,6 +909,7 @@ async fn actor_loop(
                             result,
                             level_ring,
                             writing_mode,
+                            rendering_policy,
                             dictionary_terms: smart_dictionary_terms,
                             languages,
                             reply,
@@ -917,6 +942,8 @@ async fn actor_loop(
                                 tx.clone(),
                                 reaper.clone(),
                                 grammar_adapter.clone(),
+                                dpr_enabled,
+                                dpr_client.clone(),
                             ) {
                                 let _ = reply.send(*response);
                             }
@@ -956,6 +983,7 @@ async fn actor_loop(
                     result,
                     level_ring,
                     writing_mode,
+                    rendering_policy,
                     dictionary_terms,
                     languages,
                     reply,
@@ -1149,6 +1177,7 @@ async fn actor_loop(
                                 started_at,
                                 deadline_clock,
                                 writing_mode,
+                                rendering_policy,
                                 dictionary_terms,
                                 languages,
                                 evidence,
@@ -1325,6 +1354,8 @@ async fn actor_loop(
                             tx.clone(),
                             reaper.clone(),
                             grammar_adapter.clone(),
+                            dpr_enabled,
+                            dpr_client.clone(),
                         );
                     }
                 }
@@ -1456,6 +1487,8 @@ async fn actor_loop(
                             tx.clone(),
                             reaper.clone(),
                             grammar_adapter.clone(),
+                            dpr_enabled,
+                            dpr_client.clone(),
                         );
                     }
                 }
@@ -1505,6 +1538,8 @@ fn spawn_recording_processing(
     actor: mpsc::Sender<ActorMessage>,
     reaper: ProviderReaper,
     grammar_adapter: Option<MinimalGrammarAdapter>,
+    dpr_enabled: bool,
+    dpr_client: Option<DprCloudClient>,
 ) -> Result<(), (Box<Response>, Option<oneshot::Sender<Response>>)> {
     let (current_validator, current_delivery) = match (validator.take(), delivery.take()) {
         (Some(validator), Some(delivery)) => (validator, delivery),
@@ -1536,6 +1571,8 @@ fn spawn_recording_processing(
         deepgram_enabled,
         reaper.clone(),
         grammar_adapter,
+        dpr_enabled,
+        dpr_client,
     ));
     tokio::spawn(supervise_recording(
         processing,
@@ -1993,7 +2030,10 @@ async fn process_recording(
     deepgram_enabled: bool,
     reaper: ProviderReaper,
     grammar_adapter: Option<MinimalGrammarAdapter>,
+    dpr_enabled: bool,
+    dpr_client: Option<DprCloudClient>,
 ) -> RecordingResult {
+    let utterance_end = Instant::now();
     let ActiveRecording {
         id,
         stop_tx,
@@ -2004,6 +2044,7 @@ async fn process_recording(
         started_at,
         deadline_clock: _,
         writing_mode,
+        rendering_policy,
         dictionary_terms,
         languages,
         mut evidence,
@@ -2094,34 +2135,59 @@ async fn process_recording(
                 }
             }
         }
+        let english_eligible =
+            languages.english_eligibility() == EnglishEligibilityOutcome::Eligible;
         let grammar_enabled = writing_mode == WritingMode::Smart && grammar_adapter.is_some();
+        let dpr_credential_needed = dpr_enabled
+            && english_eligible
+            && rendering_policy != RenderingPolicy::Natural
+            && dpr_client.is_some();
         let (completed, grammar_capability, credential_evidence) =
             complete_with_grammar_capability(
                 providers,
                 audio,
-                grammar_enabled,
+                grammar_enabled || dpr_credential_needed,
                 &reaper,
             )
             .await?;
         provider_failures = completed.provider_failures;
         evidence.provider_timings_ms = completed.timings_ms;
         let sources = completed.sources;
+        let dpr_source_snapshot = sources.clone();
         evidence.source_transcript_providers =
             sources.iter().map(|source| source.provider).collect();
         source_records = sources.iter().map(SourceTranscriptRecord::new).collect();
         evidence.stages.push(LifecycleStage::ProvidersCompleted);
-        let decision = match validator.validate(sources).await {
-            Ok(decision) => decision,
-            Err(error) => {
-                if let Some(failure) = error.transcript_failure() {
-                    evidence.validation_reason = Some(failure.validation_reason.clone());
-                    evidence.fallback_reason = failure.fallback_reason.clone();
-                    evidence.reconciliation_requested = failure.reconciliation_requested;
-                    evidence.recovery_attempted = failure.recovery_attempted;
-                } else {
-                    evidence.validation_reason = Some(error.diagnostic().to_owned());
+        let dpr_context = if dpr_enabled && english_eligible {
+            dpr_source_context(&dpr_source_snapshot)
+        } else {
+            None
+        };
+        let decision = if let Some(context) = dpr_context.as_ref() {
+            TranscriptDecision {
+                transcript: Transcript(context.selected_source.clone()),
+                selection: context.transcript_selection,
+                validation_reason:
+                    "DPR selected one real Source Transcript locally without model reconciliation"
+                        .to_owned(),
+                fallback_reason: None,
+                reconciliation_requested: false,
+                recovery_attempted: false,
+            }
+        } else {
+            match validator.validate(sources).await {
+                Ok(decision) => decision,
+                Err(error) => {
+                    if let Some(failure) = error.transcript_failure() {
+                        evidence.validation_reason = Some(failure.validation_reason.clone());
+                        evidence.fallback_reason = failure.fallback_reason.clone();
+                        evidence.reconciliation_requested = failure.reconciliation_requested;
+                        evidence.recovery_attempted = failure.recovery_attempted;
+                    } else {
+                        evidence.validation_reason = Some(error.diagnostic().to_owned());
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
         };
         evidence.transcript_selection = Some(decision.selection);
@@ -2131,31 +2197,68 @@ async fn process_recording(
         evidence.recovery_attempted = decision.recovery_attempted;
         evidence.stages.push(LifecycleStage::ValidationCompleted);
         let dictionary_refs: Vec<&str> = dictionary_terms.iter().map(String::as_str).collect();
-        let grammar = match (grammar_adapter.as_ref(), grammar_capability.as_ref()) {
-            (Some(adapter), Some(GrammarCapability::Ready(ready))) => {
-                GrammarGateCapability::Ready {
-                    boundary: adapter,
-                    bearer_token: ready.credential().expose_to_boundary(),
+        let delivery_outcome = if let Some(context) = dpr_context {
+            let protected_tokens =
+                dpr_protected_tokens(&context.selected_source, &dictionary_terms);
+            let protected_token_refs: Vec<&str> =
+                protected_tokens.iter().map(String::as_str).collect();
+            let cloud = match (dpr_client.as_ref(), grammar_capability.as_ref()) {
+                (Some(client), Some(GrammarCapability::Ready(ready))) => {
+                    DprCloudCapability::Ready {
+                        boundary: client,
+                        credential: ready.credential(),
+                    }
                 }
-            }
-            _ => GrammarGateCapability::Unavailable,
+                _ => DprCloudCapability::Unavailable,
+            };
+            let clock = SystemDprPipelineClock::from_utterance_end(utterance_end);
+            let transformed = dpr_transform_and_deliver(
+                DprTransformInput {
+                    selected_source: &context.selected_source,
+                    sources: &context.sources,
+                    source_selection: &context.source_selection,
+                    provider_state: context.provider_state,
+                    policy: rendering_policy,
+                    english_eligible,
+                    surface_hint: None,
+                    process_hint: None,
+                    timing: None,
+                    protected_tokens: &protected_token_refs,
+                    cloud,
+                    clock: &clock,
+                },
+                delivery.as_mut(),
+            )
+            .await;
+            final_transcript = Some(transformed.rendered);
+            transformed.delivery?
+        } else {
+            let grammar = match (grammar_adapter.as_ref(), grammar_capability.as_ref()) {
+                (Some(adapter), Some(GrammarCapability::Ready(ready))) => {
+                    GrammarGateCapability::Ready {
+                        boundary: adapter,
+                        bearer_token: ready.credential().expose_to_boundary(),
+                    }
+                }
+                _ => GrammarGateCapability::Unavailable,
+            };
+            let transformed = final_transform_and_deliver(
+                FinalTransformInput {
+                    validated_transcript: &decision.transcript.0,
+                    writing_mode,
+                    languages: &languages,
+                    grammar,
+                    dictionary_terms: &dictionary_refs,
+                    protected_names: &[],
+                    credential: credential_evidence,
+                },
+                delivery.as_mut(),
+            )
+            .await;
+            final_transcript = Some(transformed.rendered);
+            smart_writing = Some(transformed.diagnostic);
+            transformed.delivery?
         };
-        let transformed = final_transform_and_deliver(
-            FinalTransformInput {
-                validated_transcript: &decision.transcript.0,
-                writing_mode,
-                languages: &languages,
-                grammar,
-                dictionary_terms: &dictionary_refs,
-                protected_names: &[],
-                credential: credential_evidence,
-            },
-            delivery.as_mut(),
-        )
-        .await;
-        final_transcript = Some(transformed.rendered);
-        smart_writing = Some(transformed.diagnostic);
-        let delivery_outcome = transformed.delivery?;
         evidence.delivery_count += 1;
         evidence.delivery_method = Some(delivery_outcome.method);
         evidence.delivery_fallback_reason = delivery_outcome.fallback_reason;
