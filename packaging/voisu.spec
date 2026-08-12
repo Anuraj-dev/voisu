@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.28.0
+Version:        0.29.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,10 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Wed Aug 12 2026 Voisu maintainers <voisu@example.invalid> - 0.29.0-1
+- test(dpr): prove 5s accept window and validation clock
+- feat(dpr): enforce a five-second formatting gate
+
 * Wed Aug 12 2026 Voisu maintainers <voisu@example.invalid> - 0.28.0-1
 - feat(dpr): send Qwen formatting requests as json_object
 - fix(dpr): use contains for licensed heading lookup
