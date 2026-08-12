@@ -160,6 +160,27 @@ fn behavior_corpus_all_48_local_baselines_match() {
 }
 
 #[test]
+fn silence_plus_pure_outro_selects_no_source_and_never_enters_transform() {
+    // Deepgram empty + Groq "Thank you for watching!" must not become a
+    // successful DPR Source Transcript (and therefore cannot cloud-call or
+    // Deliver under the DPR branch).
+    let sources = [
+        SourceTranscript {
+            provider: Provider::Deepgram,
+            text: String::new(),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: "Thank you for watching!".to_owned(),
+        },
+    ];
+    assert!(
+        dpr_source_context(&sources, &[]).is_none(),
+        "pure-outro silence must yield no DPR context"
+    );
+}
+
+#[test]
 fn complementary_merge_rejects_semantic_and_negation_gaps() {
     for (left, right, expected_state) in [
         (
