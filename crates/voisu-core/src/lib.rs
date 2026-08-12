@@ -105,8 +105,9 @@ pub use compose_gate::{
 
 mod format_edits;
 pub use format_edits::{
-    apply_format_edit_candidate_json, apply_format_edits, parse_format_edit_candidate_json,
-    FormatEdit, FormatEditCandidate, FormatEditErrorCode, FormatEditKind, FormatEditOutcome,
+    apply_format_edit_candidate_json, apply_format_edit_candidate_json_with, apply_format_edits,
+    apply_format_edits_with, parse_format_edit_candidate_json, FormatEdit, FormatEditCandidate,
+    FormatEditErrorCode, FormatEditKind, FormatEditOutcome, FormatEditSafety,
     CLOSED_FORMAT_EDIT_KINDS, FORMAT_EDIT_CONTRACT_ID, FORMAT_EDIT_CONTRACT_VERSION,
     MAX_FORMAT_EDITS, MAX_FORMAT_EDIT_FIELD_UTF8_BYTES, MAX_FORMAT_EDIT_JSON_DEPTH,
     MAX_FORMAT_EDIT_JSON_NODES, MAX_FORMAT_EDIT_RESPONSE_BYTES,
