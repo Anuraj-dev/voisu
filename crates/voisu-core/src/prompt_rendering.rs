@@ -232,9 +232,12 @@ mod tests {
         assert_eq!(DELIVERY_DEADLINE_MS, 1500);
         assert_eq!(DELIVERY_DEADLINE, Duration::from_millis(1500));
         assert_eq!(DELIVERY_STATE_UNSENT, "unsent");
-        assert!(!DELIVERY_AUTO_SEND);
-        assert!(!DELIVERY_LIVE_TYPE);
-        assert!(!DELIVERY_REPLACE_DELIVERED);
+        // Bool constants are compile-time; const assert satisfies clippy::assertions_on_constants.
+        const {
+            assert!(!DELIVERY_AUTO_SEND);
+            assert!(!DELIVERY_LIVE_TYPE);
+            assert!(!DELIVERY_REPLACE_DELIVERED);
+        }
     }
 
     #[test]
