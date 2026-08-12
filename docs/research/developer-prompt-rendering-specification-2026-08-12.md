@@ -1,7 +1,7 @@
 # Developer Prompt Rendering — specification
 
 **Issue:** [#144](https://github.com/Anuraj-dev/voisu/issues/144) · parent map [#133](https://github.com/Anuraj-dev/voisu/issues/133)  
-**Status:** draft for approval (research → product blueprint). Does **not** change product code by itself.  
+**Status:** **approved planning baseline** (2026-08-12). Blueprint for #145 and product PRs — does **not** change product code by itself.  
 **Language:** English v1 only  
 **Date:** 2026-08-12  
 
@@ -361,19 +361,20 @@ Residuals allowed into #145 as explicit tasks (not silent “approved safe”):
 | Role | Action |
 |---|---|
 | This document | Product blueprint for DPR |
-| Raja | Approve or request changes on the locks in §§1–12 and §15 |
-| Independent review | Residual-land review before merge to `main` as the approved research spec |
-| #145 | Only after this document is accepted as the planning baseline |
+| Dual independent review | Grok residual-land + GPT-5.6 Sol high (Raja-authorized dual ballot) |
+| #145 | May produce the execution DAG against this baseline |
 | Product code | Only under #145’s approved DAG (or explicit follow-on tickets) |
 
-**Ballot:**
+**Ballot (closed 2026-08-12):**
 
-- [x] Independent residual-land review: **APPROVE_WITH_NITS** (P2 polish only; no product-lock changes)  
-- [ ] Raja accepts §§1–12 product locks  
-- [ ] Model policy §9 accepted (Groq in-budget preferred; Gemini retained, latency-gated)  
-- [ ] Ship gates §15 accepted  
+- [x] Independent residual-land review (Grok): **APPROVE_WITH_NITS** (P2 polish only; no product-lock changes)  
+- [x] Independent Sol high (`gpt-5.6-sol`): **APPROVE** — findings none; `BALLOT: APPROVE`  
+- [x] Grok orchestrator concurs with Sol  
+- [x] §§1–12 product locks accepted as planning baseline  
+- [x] Model policy §9 accepted (Groq in-budget preferred; Gemini retained, latency-gated)  
+- [x] Ship gates §15 accepted  
 
-Until Raja closes the ballot, this file is a **draft specification**, not a license to rewrite production behavior.
+**Effect:** this specification is the **approved planning baseline** for map #133. It authorizes **#145** (execution DAG) and later implementation PRs that follow that DAG. It does **not** by itself change shipped product behavior.
 
 ---
 
