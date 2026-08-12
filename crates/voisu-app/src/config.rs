@@ -1078,7 +1078,7 @@ other_key = 5
 
     #[test]
     fn qwen_format_gate_defaults_off_and_shares_the_explicit_true_parser() {
-        assert!(!DEFAULT_QWEN_FORMAT_ENABLED);
+        const { assert!(!DEFAULT_QWEN_FORMAT_ENABLED) };
         assert_eq!(ENABLE_QWEN_FORMAT_ENV, "VOISU_ENABLE_QWEN_FORMAT");
         assert!(!parse_optional_dpr_enablement(None));
         for value in ["", "0", "false", "yes", "qwen", "garbage"] {
