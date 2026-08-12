@@ -84,7 +84,9 @@ pub use compose_gate::{
     ComposeErrorCode, ComposeInput, ComposeOutcome, ComposeSource, CompositionDecision,
     ConversionClaim, DeliveryFlags, DerivationSpan, FallbackTrigger, LabelClaim, LayoutClaim,
     LayoutDecision, Reconciliation, RemovalClaim, RemovalKind, SourceSelection, SpanKind,
-    StructuredCandidate, SttProvider, CLOSED_CONVERSIONS, COMPOSE_GATE_CONTRACT_ID,
+    StructuredCandidate, SttProvider, CLOSED_CONVERSIONS, CLOSED_SOURCE_SELECTION_REASONS,
+    COMPOSE_GATE_CONTRACT_ID, MAX_COMPOSE_CONVERSIONS, MAX_COMPOSE_DERIVATION_SPANS,
+    MAX_COMPOSE_FIELD_UTF8_BYTES, MAX_COMPOSE_LABELS, MAX_COMPOSE_REMOVALS,
 };
 
 // Paged diagnostic responses are negotiated per REQUEST (see `Request::paged`),
