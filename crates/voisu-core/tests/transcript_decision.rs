@@ -2707,6 +2707,14 @@ fn sanitize_clears_pure_outro_and_strips_only_anchored_final_outros() {
         "Schedule the review for \"Wednesday.\""
     );
 
+    // Pure outro with a trivial / stopword head must clear entirely — not leave
+    // "Please" / "OK" / "Yeah" as a selectable Source Transcript.
+    assert_eq!(sanitize_source_transcript_text("Please like and subscribe"), "");
+    assert_eq!(sanitize_source_transcript_text("OK thanks for watching"), "");
+    assert_eq!(sanitize_source_transcript_text("Yeah thank you for watching"), "");
+    assert_eq!(sanitize_source_transcript_text("Ok. Thanks for watching!"), "");
+    assert_eq!(sanitize_source_transcript_text("Yeah. Thank you for watching."), "");
+
     let mid = "The demo went well and the recording was transcribed by Whisper.";
     assert_eq!(sanitize_source_transcript_text(mid), mid);
     let earlier = "Thanks for watching the walkthrough yesterday. Send the release notes.";
@@ -2826,6 +2834,28 @@ fn sanitize_source_transcripts_clears_outro_only_providers() {
         },
     ]);
     assert!(sanitized.iter().all(|source| source.text.is_empty()));
+}
+
+#[test]
+fn sanitize_source_transcripts_clears_trivial_prefix_outros() {
+    let sanitized = sanitize_source_transcripts(vec![
+        SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "Please like and subscribe".to_owned(),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: "OK thanks for watching".to_owned(),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: "Yeah thank you for watching".to_owned(),
+        },
+    ]);
+    assert!(
+        sanitized.iter().all(|source| source.text.is_empty()),
+        "trivial-prefix pure-outros must clear: {sanitized:?}"
+    );
 }
 
 /// The same scrutiny applied to the injection list: "system prompt" is what

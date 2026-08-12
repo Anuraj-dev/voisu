@@ -1022,12 +1022,19 @@ pub struct SourceTranscript {
 ///
 /// Pure-outro text becomes empty. Genuine speech with an anchored final outro
 /// keeps the speech and loses only that outro. Mid-sentence mentions of the
-/// same closed phrases are preserved.
+/// same closed phrases are preserved. After a strip, stopword-only or trivial
+/// head remainders (e.g. "Please", "OK", "Yeah") also clear so they never
+/// select or Deliver; multi-word genuine speech is kept.
 #[must_use]
 pub fn sanitize_source_transcript_text(text: &str) -> String {
     let mut current = text.trim().to_owned();
+    let mut stripped_any = false;
     while let Some(stripped) = strip_one_anchored_hallucinated_outro(&current) {
+        stripped_any = true;
         current = stripped;
+    }
+    if stripped_any && !remainder_is_substantial_speech(&current) {
+        return String::new();
     }
     current
 }
@@ -2453,6 +2460,32 @@ fn strip_one_anchored_hallucinated_outro(text: &str) -> Option<String> {
         return Some(keep.trim_end().to_owned());
     }
     None
+}
+
+/// Politeness / interjection heads that ride in front of ASR outros and are not
+/// standalone speech once the outro is gone. Distinct from `STOPWORDS` so short
+/// real dictation like "Done" is not cleared, while "Please" is.
+const TRIVIAL_OUTRO_PREFIXES: [&str; 9] = [
+    "please", "thanks", "thank", "hi", "hello", "hey", "bye", "alright", "oh",
+];
+
+/// True when post-strip remainder is real speech rather than a stopword-only or
+/// trivial head left glued to a hallucinated outro.
+fn remainder_is_substantial_speech(text: &str) -> bool {
+    let words = normalized_words(text);
+    if words.is_empty() {
+        return false;
+    }
+    let has_real_content = words.iter().any(|word| {
+        !is_stopword(word) && !TRIVIAL_OUTRO_PREFIXES.contains(&word.as_str())
+    });
+    if has_real_content {
+        return true;
+    }
+    // All stopwords / trivial prefixes: keep multi-word utterances such as
+    // "yes i can do that" and clear one- or two-token heads ("ok", "yeah",
+    // "please").
+    words.len() >= 3
 }
 
 fn sentence_start_capitalisation(text: &str) -> (usize, usize) {

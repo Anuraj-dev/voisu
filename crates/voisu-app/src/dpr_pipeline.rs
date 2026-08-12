@@ -832,6 +832,30 @@ mod tests {
     }
 
     #[test]
+    fn pure_outro_with_trivial_prefix_yields_no_dpr_context() {
+        for head_outro in [
+            "Please like and subscribe",
+            "OK thanks for watching",
+            "Yeah thank you for watching",
+        ] {
+            let sources = vec![
+                SourceTranscript {
+                    provider: Provider::Deepgram,
+                    text: String::new(),
+                },
+                SourceTranscript {
+                    provider: Provider::Groq,
+                    text: head_outro.to_owned(),
+                },
+            ];
+            assert!(
+                dpr_source_context(&sources, &[]).is_none(),
+                "trivial-prefix outro must not select: {head_outro:?}"
+            );
+        }
+    }
+
+    #[test]
     fn genuine_speech_wins_over_outro_only_sibling() {
         let sources = vec![
             SourceTranscript {
