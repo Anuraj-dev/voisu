@@ -65,6 +65,15 @@ pub const CLOSED_CONVERSIONS: &[&str] = &[
     "two→2.",
 ];
 
+/// Closed host source-selection reasons shared with structured cloud schemas.
+pub const CLOSED_SOURCE_SELECTION_REASONS: &[&str] = &[
+    "only_available",
+    "exact_agreement",
+    "configured_primary_rank",
+    "punctuation_local_render",
+    "safe_complementary_merge",
+];
+
 // ─── Public enums / outcome ──────────────────────────────────────────────────
 
 /// Hierarchical composition decision (#139).
@@ -1360,14 +1369,7 @@ fn is_fingerprint(value: &str) -> bool {
 }
 
 fn is_select_reason(value: &str) -> bool {
-    matches!(
-        value,
-        "only_available"
-            | "exact_agreement"
-            | "configured_primary_rank"
-            | "punctuation_local_render"
-            | "safe_complementary_merge"
-    )
+    CLOSED_SOURCE_SELECTION_REASONS.contains(&value)
 }
 
 // ─── Helpers (faithful port) ─────────────────────────────────────────────────
