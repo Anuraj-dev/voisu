@@ -134,16 +134,15 @@ fn organize_impl(source: &str, options: &LocalBaselineOptions) -> String {
         return String::new();
     }
 
+    if is_preformatted_list(source) {
+        return convert_preformatted_list(source);
+    }
+
     if options.route == RenderingRoute::LiteralIdentity {
-        if is_preformatted_list(source) || !source_has_spoken_cue(source) {
+        if !source_has_spoken_cue(source) {
             return source.to_owned();
         }
         return apply_bare_spoken_cues(source);
-    }
-
-    // Already multi-line numbered / bullet preformatted → identity.
-    if is_preformatted_list(source) {
-        return source.to_owned();
     }
 
     let mut text = source.to_owned();
@@ -245,6 +244,20 @@ fn is_preformatted_list(text: &str) -> bool {
         }
     }
     any
+}
+
+fn convert_preformatted_list(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() || !source_has_spoken_cue(line) {
+                line.to_owned()
+            } else {
+                apply_bare_spoken_cues(line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn starts_with_numbered_marker(line: &str) -> bool {
@@ -791,7 +804,7 @@ fn apply_bare_spoken_cues_pass(text: &str) -> (String, bool) {
             technical_converted = true;
             continue;
         }
-        if cue_phrase_match(&tokens, i, &["dash"]) {
+        if cue_phrase_match(&tokens, i, &["dash"]) && dash_is_cue(&tokens, i) {
             push_space(&mut out, &mut pending_space);
             out.push('-');
             i += 1;
@@ -863,6 +876,20 @@ fn apply_bare_spoken_cues_pass(text: &str) -> (String, bool) {
     }
 
     (out, technical_converted)
+}
+
+/// Lone `dash` is a cue unless it is the English noun (`a dash of salt`).
+fn dash_is_cue(tokens: &[(usize, usize, &str)], i: usize) -> bool {
+    let prev = i
+        .checked_sub(1)
+        .map(|j| spoken_cue_token(tokens[j].2));
+    let next = tokens
+        .get(i + 1)
+        .map(|token| spoken_cue_token(token.2));
+    !matches!(
+        (prev.as_deref(), next.as_deref()),
+        (Some("a") | Some("the"), Some("of"))
+    )
 }
 
 /// `period` is a cue unless it is ordinary language ("the period of", mid-list, …).
@@ -1502,6 +1529,23 @@ mod tests {
     fn spoken_lone_dash_converts_in_literal_identity() {
         let b = organize_local_baseline("git dash C status", &literal_opts());
         assert_eq!(b.rendered(), "git -C status");
+    }
+
+    #[test]
+    fn ordinary_dash_of_noun_stays_a_word() {
+        let b = organize_local_baseline("add a dash of salt", &adaptive_opts());
+        assert_eq!(b.rendered(), "Add a dash of salt.");
+        assert!(!b.rendered().contains('-'));
+    }
+
+    #[test]
+    fn spoken_dash_dash_converts_inside_preformatted_list() {
+        let src = "1. Run cargo test dash dash workspace\n2. Report results";
+        let b = organize_local_baseline(src, &literal_opts());
+        assert_eq!(
+            b.rendered(),
+            "1. Run cargo test --workspace\n2. Report results"
+        );
     }
 
     #[test]

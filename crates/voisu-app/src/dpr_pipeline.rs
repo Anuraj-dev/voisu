@@ -639,26 +639,36 @@ pub async fn dpr_transform_and_deliver(
                                     },
                                 );
                                 if applied.accepted && !edits.edits.is_empty() {
-                                    let rendered = if edits.base_fingerprint == organized_fingerprint
-                                    {
-                                        applied.rendered
+                                    if edits.base_fingerprint == organized_fingerprint {
+                                        format_rendered = Some(applied.rendered);
+                                        CloudOutcome::Succeeded
                                     } else {
                                         // Cloud edited the spoken source. Re-run
-                                        // spoken-mark conversion so an accepted
-                                        // casing edit cannot leave `dot` as a word.
-                                        organize_local_baseline(
+                                        // spoken-mark conversion so leftover cues
+                                        // still convert, then reject if that would
+                                        // smash a converted command/URL.
+                                        let reapplied = organize_local_baseline(
                                             &applied.rendered,
                                             &LocalBaselineOptions {
                                                 policy: input.policy,
                                                 route: voisu_core::RenderingRoute::LiteralIdentity,
                                                 timing: None,
                                             },
-                                        )
-                                        .rendered()
-                                        .to_owned()
-                                    };
-                                    format_rendered = Some(rendered);
-                                    CloudOutcome::Succeeded
+                                        );
+                                        if organized_protected.iter().any(|token| {
+                                            let core = token.trim_end_matches([
+                                                '.', '!', '?', ',',
+                                            ]);
+                                            !core.is_empty()
+                                                && !reapplied.rendered().contains(core)
+                                        }) {
+                                            cloud_error = Some(DprCloudErrorClass::CandidateSchema);
+                                            CloudOutcome::SchemaFailure
+                                        } else {
+                                            format_rendered = Some(reapplied.rendered().to_owned());
+                                            CloudOutcome::Succeeded
+                                        }
+                                    }
                                 } else if applied.accepted {
                                     CloudOutcome::Skipped
                                 } else {
@@ -2886,5 +2896,69 @@ mod tests {
             completion.rendered
         );
         assert_eq!(completion.compose_decision, CompositionDecision::Accept);
+    }
+
+    #[tokio::test]
+    async fn spoken_source_edit_cannot_rewrite_words_that_become_protected() {
+        let source = "cargo test dash dash workspace";
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".to_owned(),
+        };
+        let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
+        let workspace_start = source.find("workspace").unwrap();
+        let cloud = FormatEditCloud {
+            calls: Arc::new(AtomicUsize::new(0)),
+            saw_small_edit_contract: Arc::new(Mutex::new(None)),
+            remaining_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            candidate: format_edit_candidate(
+                source,
+                workspace_start,
+                workspace_start + "workspace".len(),
+                "workspace",
+                "evil",
+                "bounded_wording",
+            ),
+        };
+        let mut delivery = RecordingDelivery {
+            calls: Arc::new(AtomicUsize::new(0)),
+            rendered: Arc::new(Mutex::new(Vec::new())),
+            initiated_ms: None,
+        };
+        let clock = FixedClock(Duration::ZERO);
+
+        let completion = dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &selection,
+                provider_state: ProviderState::SemanticDisagreement,
+                policy: RenderingPolicy::Adaptive,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready {
+                    boundary: &cloud,
+                    credential: &credential,
+                },
+                clock: &clock,
+                small_edit_contract: true,
+            },
+            &mut delivery,
+        )
+        .await;
+
+        assert_eq!(completion.rendered, "cargo test --workspace");
+        assert!(!completion.rendered.contains("evil"));
+        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::CandidateSchema));
     }
 }
