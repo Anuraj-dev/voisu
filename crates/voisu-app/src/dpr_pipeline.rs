@@ -2226,9 +2226,9 @@ mod tests {
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             delivered.lock().expect("delivery").as_slice(),
-            ["Goal:\nShip the rust parser."]
+            ["Goal ship the rust parser."]
         );
-        assert_eq!(completion.rendered, "Goal:\nShip the rust parser.");
+        assert_eq!(completion.rendered, "Goal ship the rust parser.");
         assert_eq!(
             completion.cloud_error,
             Some(DprCloudErrorClass::DeadlineExceeded)
@@ -2262,9 +2262,9 @@ mod tests {
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             delivered.lock().expect("delivery").as_slice(),
-            ["Goal:\nShip the rust parser."]
+            ["Goal ship the rust parser."]
         );
-        assert_eq!(completion.rendered, "Goal:\nShip the rust parser.");
+        assert_eq!(completion.rendered, "Goal ship the rust parser.");
         assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
         assert_eq!(
             completion.cloud_error,
@@ -2370,7 +2370,7 @@ mod tests {
         let completion = run_timed_format_attempt(&cloud, &clock, &mut delivery).await;
 
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(completion.rendered, "Goal:\nShip the rust parser.");
+        assert_eq!(completion.rendered, "Goal ship the rust parser.");
         assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::RateLimited));
     }
 

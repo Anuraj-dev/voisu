@@ -2302,7 +2302,7 @@
       "fallback": null,
       "protected_tokens": [],
       "forbidden_outcomes": [
-        "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
+        "Goal fix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
         "Goal: Fix the flaky auth test."
       ],
       "label_evidence": [],
@@ -2433,7 +2433,7 @@
       "fallback": null,
       "protected_tokens": [],
       "forbidden_outcomes": [
-        "Goal fix the flaky auth test."
+        "Goal:\nFix the flaky auth test."
       ],
       "label_evidence": [
         {
@@ -3057,7 +3057,7 @@
       },
       "protected_tokens": [],
       "forbidden_outcomes": [
-        "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.\n\nRequirements:\nHandle retries, timeouts, and partial failures.\n\nNotes:\nConsider structured logging."
+        "Goal fix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.\n\nRequirements:\nHandle retries, timeouts, and partial failures.\n\nNotes:\nConsider structured logging."
       ],
       "label_evidence": [],
       "allowed_operations": {
@@ -3211,7 +3211,7 @@
       "timing": null,
       "fallback": {
         "trigger": "invalid_fixed_label",
-        "result": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small."
+        "result": "Goal fix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small."
       },
       "protected_tokens": [],
   "forbidden_outcomes": [
@@ -3343,8 +3343,8 @@
           "Mission"
         ]
       },
-      "local_baseline": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
-      "expected_final": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
+      "local_baseline": "Goal fix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
+      "expected_final": "Goal fix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
       "rationale": "A non-closed cloud label is rejected; Structured fallback keeps all source-supported closed labels."
     },
     {
@@ -3692,8 +3692,8 @@
         "justification": "structured_complex_source_supported_sections",
         "deadline_evidence": null
       },
-      "local_baseline": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
-      "expected_final": "Goal:\nFix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
+      "local_baseline": "Goal fix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
+      "expected_final": "Goal fix the flaky auth test.\n\nContext:\nIt fails on CI only.\n\nRequirements:\nKeep public API stable.\n\nConstraints:\nNo new dependencies.\n\nSteps:\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\n\nAcceptance Criteria:\nCI is green on main.\n\nFiles:\ncrates/voisu-core/src/auth.rs\n\nNotes:\nKeep the change small.",
       "rationale": "One structured cloud decision renders all and only the eight source-supported closed labels."
     },
     {
