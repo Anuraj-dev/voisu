@@ -22,19 +22,19 @@ Description: Cloud-first Linux dictation for Wayland
 
 Package: voisu
 Architecture: amd64
-Version: 0.6.0-1
+Version: 0.35.1-1
 Priority: optional
 Section: utils
 Maintainer: Anuraj Jit Saikia <rajasaikia1644@gmail.com>
-Installed-Size: 14621
+Installed-Size: 19653
 Depends: curl, libc6 (>= 2.39), libc6 (>= 2.43), libcairo2 (>= 1.10.0), libglib2.0-0t64 (>= 2.54.0), libgtk-4-1 (>= 4.0.0), libgtk4-layer-shell0 (>= 1.0.2), libsecret-tools, libxkbcommon0 (>= 0.5.0), pipewire-bin, wireplumber, wl-clipboard | xclip, xdg-desktop-portal
 Recommends: libei1
-Filename: pool/main/v/voisu/voisu_0.6.0-1_amd64.deb
-Size: 3010156
-MD5sum: 65b8d06043de9bb43c114318455c642c
-SHA1: edce91f20785f2709bef8b8f40cfcd5ac0123670
-SHA256: 5409c4431f6e4eace0b2d005dbfb92fbd0a9b9a4122bb133e63fa6518d655e8b
-SHA512: 0c7f875564b6590d4b6f6a47206e54f812a9ca2d67facfaa200302889c82a31dce091ec5b944f810f4472b02c24464b232a7bd61ee9c5c1f28a3c0e784a5cf55
+Filename: pool/main/v/voisu/voisu_0.35.1-1_amd64.deb
+Size: 4845072
+MD5sum: c9d13a03083a0f478b0080c8e19e5dd2
+SHA1: 55cae3a6f81bacd46a761393af48885f66a5bdfa
+SHA256: 7a1c69f4eb764c184721797cd5f121d39813ed7a385cb81a7210c6bed6bd3e3d
+SHA512: a259b20e1a5809f299c1aaf6edb4f25c223ae2b1182b9a4a55dd8fb4af7d8b2a920e0a27c32facb4d6ca6965c03595861e823ee96534cf480677f11ad7cb7e32
 Description: Cloud-first Linux dictation for Wayland
  Voisu turns a bounded Recording into a validated Transcript and performs
  Delivery into the focused application, with clipboard preservation as the
