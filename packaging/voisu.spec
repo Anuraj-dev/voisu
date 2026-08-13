@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.31.0
+Version:        0.32.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,10 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Thu Aug 13 2026 Voisu maintainers <voisu@example.invalid> - 0.32.0-1
+- docs(review): record grok 4.6 vs sol medium first-pass on #191
+- feat(format): convert first/second/third into numbered lines
+
 * Thu Aug 13 2026 Voisu maintainers <voisu@example.invalid> - 0.31.0-1
 - fix(format): keep ordinary dash nouns and converted spans
 - fix(format): keep spoken marks through sections and later edits
