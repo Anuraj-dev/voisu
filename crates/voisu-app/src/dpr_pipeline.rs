@@ -2704,6 +2704,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spoken_first_second_third_delivers_numbered_lines_without_cloud() {
+        let completion = deliver_local_spoken_marks(
+            "first do the deployment second figure out the env variable third report to me",
+        )
+        .await;
+        assert_eq!(
+            completion.rendered,
+            "1. Do the deployment\n2. Figure out the env variable\n3. Report to me"
+        );
+        assert!(!completion.cloud_attempted);
+        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+    }
+
+    #[tokio::test]
     async fn format_edit_cannot_smash_converted_url() {
         let source = "https colon slash slash example dot test slash a";
         let sources = [ComposeSource {

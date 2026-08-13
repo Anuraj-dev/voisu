@@ -156,6 +156,11 @@ fn organize_impl(source: &str, options: &LocalBaselineOptions) -> String {
     let (cued, technical_converted) = apply_bare_spoken_cues_pass(&text);
     text = cued;
 
+    // Spoken first/second/third step sequence → numbered lines (no Steps cue).
+    if let Some(steps) = try_spoken_ordinal_steps(&text) {
+        return steps;
+    }
+
     // Structural: multi-section / steps / Structured single-section labels.
     if let Some(structured) = try_section_organize(&text, options.policy) {
         return structured;
@@ -442,6 +447,9 @@ const SECTION_CUES: &[(&[&str], &str)] = &[
 
 const ORDINALS: &[(&str, u8)] = &[("one", 1), ("two", 2), ("three", 3), ("four", 4)];
 
+/// Spoken step ordinals. v1 fires only on a full first/second/third sequence.
+const SPOKEN_STEP_ORDINALS: &[(&str, u8)] = &[("first", 1), ("second", 2), ("third", 3)];
+
 #[derive(Clone, Debug)]
 struct SectionSpan {
     label: &'static str,
@@ -714,6 +722,65 @@ fn try_numbered_steps_body(body: &[(usize, usize, &str)]) -> Option<Vec<String>>
             .into_iter()
             .map(|(n, t)| format!("{n}. {t}"))
             .collect(),
+    )
+}
+
+/// Convert a spoken `first` … `second` … `third` sequence into numbered lines.
+/// Requires all three ordinals, in order, starting at the first token.
+/// `The first time` and grocery comma lists do not match.
+fn try_spoken_ordinal_steps(text: &str) -> Option<String> {
+    let tokens = word_tokens(text);
+    if tokens.is_empty() {
+        return None;
+    }
+    if spoken_cue_token(tokens[0].2) != "first" {
+        return None;
+    }
+
+    let mut items: Vec<(u8, String)> = Vec::new();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let cue = spoken_cue_token(tokens[i].2);
+        let Some(&(_, num)) = SPOKEN_STEP_ORDINALS.iter().find(|(w, _)| *w == cue) else {
+            if items.is_empty() {
+                return None;
+            }
+            if let Some(last) = items.last_mut() {
+                last.1.push(' ');
+                last.1.push_str(tokens[i].2);
+            }
+            i += 1;
+            continue;
+        };
+        i += 1;
+        let mut words = Vec::new();
+        while i < tokens.len() {
+            let next = spoken_cue_token(tokens[i].2);
+            if SPOKEN_STEP_ORDINALS.iter().any(|(w, _)| *w == next) {
+                break;
+            }
+            words.push(tokens[i].2);
+            i += 1;
+        }
+        if words.is_empty() {
+            return None;
+        }
+        items.push((num, capitalize_sentence_start(&words.join(" "))));
+    }
+    if items.len() != 3 {
+        return None;
+    }
+    for (idx, (num, _)) in items.iter().enumerate() {
+        if *num as usize != idx + 1 {
+            return None;
+        }
+    }
+    Some(
+        items
+            .into_iter()
+            .map(|(n, t)| format!("{n}. {t}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
     )
 }
 
@@ -1553,6 +1620,44 @@ mod tests {
         let b = organize_local_baseline("Cup, milk, eggs, bread", &literal_opts());
         assert_eq!(b.rendered(), "Cup, milk, eggs, bread");
         assert!(!b.rendered().contains('"'));
+    }
+
+    #[test]
+    fn spoken_first_second_third_becomes_numbered_lines() {
+        let src = "first do the deployment second figure out the env variable third report to me";
+        let expect = "1. Do the deployment\n2. Figure out the env variable\n3. Report to me";
+        for opts in [adaptive_opts(), natural_opts(), structured_opts()] {
+            let b = organize_local_baseline(src, &opts);
+            assert_eq!(
+                b.rendered(),
+                expect,
+                "policy={:?} route={:?}",
+                opts.policy,
+                opts.route
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_time_stays_a_sentence() {
+        let b = organize_local_baseline("The first time I tried this", &adaptive_opts());
+        assert_eq!(b.rendered(), "The first time I tried this.");
+        assert!(
+            !b.rendered().contains("1."),
+            "ordinary first-time speech must not become a list, got {:?}",
+            b.rendered()
+        );
+    }
+
+    #[test]
+    fn grocery_comma_list_stays_a_sentence() {
+        let b = organize_local_baseline("Cup, milk, eggs, bread", &adaptive_opts());
+        assert_eq!(b.rendered(), "Cup, milk, eggs, bread.");
+        assert!(
+            !b.rendered().contains("1."),
+            "grocery comma list must not become numbered lines, got {:?}",
+            b.rendered()
+        );
     }
 
     #[test]
