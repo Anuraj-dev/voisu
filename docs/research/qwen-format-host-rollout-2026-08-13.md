@@ -14,8 +14,10 @@ this formatter remains off. Those fixes do not depend on this flag.
 
 ## Default: formatter off
 
-A packaged install, a stock `voisu.service` user unit, and a stock
-`~/.config/voisu/config.toml` all leave Qwen formatting **off**.
+A packaged install ships `VOISU_ENABLE_DPR=1` on the user unit so local
+organize (spoken marks, quotes, first/second lists) runs. It does **not**
+set `VOISU_ENABLE_QWEN_FORMAT`. A stock `~/.config/voisu/config.toml` also
+leaves Qwen formatting **off**.
 
 | Condition | Formatter |
 |---|---|
