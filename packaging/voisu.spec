@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.34.0
+Version:        0.35.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,10 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Thu Aug 13 2026 Voisu maintainers <voisu@example.invalid> - 0.35.0-1
+- feat(packaging): default-on local DPR organize, keep Qwen off (#195)
+- test(dpr): add opt-in live Goal format path (#194)
+
 * Thu Aug 13 2026 Voisu maintainers <voisu@example.invalid> - 0.34.0-1
 - feat(dpr): admit formatting cloud only for leftover Goal (#193)
 
