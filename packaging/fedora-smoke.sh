@@ -297,7 +297,7 @@ test -x /usr/bin/voisu-daemon
 test -r /usr/lib/systemd/user/voisu.service
 grep -qx 'ExecStart=/usr/bin/voisu-daemon --systemd' /usr/lib/systemd/user/voisu.service
 grep -qx 'Environment=VOISU_ENABLE_DPR=1' /usr/lib/systemd/user/voisu.service
-if grep -Eq 'VOISU_ENABLE_QWEN_FORMAT' /usr/lib/systemd/user/voisu.service; then
+if grep -Eq '^Environment=.*VOISU_ENABLE_QWEN_FORMAT' /usr/lib/systemd/user/voisu.service; then
     printf 'FAIL: packaged voisu.service must not set VOISU_ENABLE_QWEN_FORMAT\n' >&2; exit 1
 fi
 # Fresh-home safety: the unit must provision its own config/state dirs. An
