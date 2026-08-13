@@ -29,6 +29,12 @@ Shipped and working in the current release:
 - **Overlay** — optional, separate on-screen status surface (GTK4) reflecting
   daemon state. Runs as its own user service; on Fedora it is a separate
   `voisu-overlay` package.
+- **Spoken formatting** — `dash dash`, `slash`, `dot`, `colon slash slash`,
+  `quote` / `unquote`, `new line` / `new paragraph`, and spoken
+  `first` / `second` / `third` steps become real marks and numbered lines.
+  Grocery comma lists and “the first time…” stay ordinary sentences. Voisu
+  does not invent a `Goal:` heading from the word “goal”. Extra cloud
+  polish stays off in the package.
 - **Packaging** — four channels, all live:
   - Fedora / COPR (`anuraj-dev/voisu`)
   - Arch / AUR (`voisu` from source, `voisu-bin` prebuilt)

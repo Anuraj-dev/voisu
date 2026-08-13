@@ -76,6 +76,10 @@ grep -qx 'StateDirectory=voisu' "$unit"
 if grep -Eq '^ReadWritePaths=.*%h' "$unit"; then
     echo "FAIL: voisu.service ReadWritePaths still references a %h home path"; exit 1
 fi
+grep -qx 'Environment=VOISU_ENABLE_DPR=1' "$unit"
+if grep -Eq 'VOISU_ENABLE_QWEN_FORMAT' "$unit"; then
+    echo "FAIL: packaged voisu.service must not set VOISU_ENABLE_QWEN_FORMAT"; exit 1
+fi
 echo "[evidence] voisu.service declares Configuration/StateDirectory and no %h ReadWritePaths"
 
 # Packaged-metadata assertions (crib of packaging/fedora-smoke.sh's checks that

@@ -9,6 +9,9 @@ StartLimitBurst=3
 [Service]
 Type=simple
 ExecStart=/usr/bin/voisu-daemon --systemd
+# Local spoken-mark / list organize. Do not set VOISU_ENABLE_QWEN_FORMAT here —
+# the cloud formatter stays off until a later host-only rollout.
+Environment=VOISU_ENABLE_DPR=1
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=60s
