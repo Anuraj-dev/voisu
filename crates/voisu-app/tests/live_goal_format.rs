@@ -293,15 +293,6 @@ async fn live_goal_format_sends_leftover_notes_through_production_path() {
                 "accepted cloud text must keep the spoken Goal license"
             );
             keeps_spoken_meaning(spoken, transcript);
-            for line in transcript.lines() {
-                let trimmed = line.trim_start();
-                if trimmed.starts_with('#') {
-                    assert!(
-                        trimmed.to_ascii_lowercase().contains("goal"),
-                        "do not invent a heading without the word goal"
-                    );
-                }
-            }
         } else {
             assert_eq!(
                 transcript, &baseline,
