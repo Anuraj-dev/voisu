@@ -23,6 +23,7 @@
 //! `local_baseline` are promoted as product corpus tests (see module tests).
 //! DPR-33 enters this organizer through the T7-tested source-selection merge.
 
+use crate::is_command_shaped;
 use crate::prompt_rendering::{
     RenderingPolicy, RenderingRoute, TimingCertainty, CLOSED_STRUCTURED_LABELS,
 };
@@ -113,7 +114,8 @@ impl LocalBaseline {
 
 /// Organize selected source text into a deterministic local baseline.
 ///
-/// - `literal_identity` → identity (no organize).
+/// - `literal_identity` → spoken marks / quote cues only (no filler strip,
+///   section organize, sentence casing, or terminal punctuation).
 /// - otherwise → Natural-shaped organize; Structured policy may emit closed
 ///   section headers when speech supplies a supported cue.
 ///
@@ -132,13 +134,15 @@ fn organize_impl(source: &str, options: &LocalBaselineOptions) -> String {
         return String::new();
     }
 
-    if options.route == RenderingRoute::LiteralIdentity {
-        return source.to_owned();
+    if is_preformatted_list(source) {
+        return convert_preformatted_list(source);
     }
 
-    // Already multi-line numbered / bullet preformatted → identity.
-    if is_preformatted_list(source) {
-        return source.to_owned();
+    if options.route == RenderingRoute::LiteralIdentity {
+        if !source_has_spoken_cue(source) {
+            return source.to_owned();
+        }
+        return apply_bare_spoken_cues(source);
     }
 
     let mut text = source.to_owned();
@@ -147,13 +151,15 @@ fn organize_impl(source: &str, options: &LocalBaselineOptions) -> String {
     text = strip_leading_clear_fillers(&text);
     text = apply_clear_backtrack(&text);
 
+    // Spoken marks / quotes before section organize so Structured Goal
+    // bodies still convert `dash dash` and `quote,`.
+    let (cued, technical_converted) = apply_bare_spoken_cues_pass(&text);
+    text = cued;
+
     // Structural: multi-section / steps / Structured single-section labels.
     if let Some(structured) = try_section_organize(&text, options.policy) {
         return structured;
     }
-
-    // Bare spoken cues (period, new line, quote…unquote, …).
-    text = apply_bare_spoken_cues(&text);
 
     // Clear pause → paragraph break; uncertain → single stream.
     if let Some(timing) = options.timing.as_ref() {
@@ -162,16 +168,46 @@ fn organize_impl(source: &str, options: &LocalBaselineOptions) -> String {
         }
     }
 
-    // Light punctuation / casing polish.
-    text = apply_discourse_ok(&text);
-    text = apply_vocative_hey(&text);
-    // Unpaired bare `quote` (no `unquote`) leaves the following stream as words:
-    // sentence-case the start, but do not weekday-capitalize inside that span (DPR-11).
-    let weekday = !has_unpaired_quote_cue(source);
-    text = apply_sentence_and_weekday_casing(&text, weekday);
-    text = add_terminal_punctuation_dpr(&text);
+    // Polish surrounding prose. Skip casing/period only when the whole
+    // utterance is a command, URL/path, or a single quoted span.
+    if !skip_sentence_polish(&text, technical_converted) {
+        text = apply_discourse_ok(&text);
+        text = apply_vocative_hey(&text);
+        // Unpaired bare `quote` (no `unquote`) leaves the following stream as words:
+        // sentence-case the start, but do not weekday-capitalize inside that span (DPR-11).
+        let weekday = !has_unpaired_quote_cue(source);
+        text = apply_sentence_and_weekday_casing(&text, weekday);
+        if !is_only_quoted_span(&text) {
+            text = add_terminal_punctuation_dpr(&text);
+        }
+    }
 
     text
+}
+
+/// Skip sentence polish when a technical conversion produced a command, a
+/// leading URL/path, or a quote-only span. Mixed prose still polishes.
+fn skip_sentence_polish(text: &str, technical_converted: bool) -> bool {
+    if is_only_quoted_span(text) {
+        return true;
+    }
+    if !technical_converted {
+        return false;
+    }
+    if is_command_shaped(text) {
+        return true;
+    }
+    let first = text.split_whitespace().next().unwrap_or("");
+    first.contains("://") || first.contains('/') || first.starts_with('-') || first.starts_with('.')
+}
+
+/// True when the whole utterance is one quoted span (`"leave this"`).
+fn is_only_quoted_span(text: &str) -> bool {
+    let t = text.trim();
+    t.len() >= 2
+        && t.starts_with('"')
+        && t.ends_with('"')
+        && t.bytes().filter(|&b| b == b'"').count() == 2
 }
 
 /// True when a bare `quote` token appears without a later `unquote`.
@@ -179,7 +215,7 @@ fn has_unpaired_quote_cue(text: &str) -> bool {
     let tokens = word_tokens(text);
     let mut open = false;
     for &(_, _, tok) in &tokens {
-        let l = ascii_lower(tok);
+        let l = spoken_cue_token(tok);
         if l == "quote" {
             open = true;
         } else if l == "unquote" {
@@ -208,6 +244,20 @@ fn is_preformatted_list(text: &str) -> bool {
         }
     }
     any
+}
+
+fn convert_preformatted_list(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() || !source_has_spoken_cue(line) {
+                line.to_owned()
+            } else {
+                apply_bare_spoken_cues(line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn starts_with_numbered_marker(line: &str) -> bool {
@@ -563,6 +613,55 @@ fn phrase_match(tokens: &[(usize, usize, &str)], i: usize, phrase: &[&str]) -> b
         .all(|(k, w)| ascii_lower(tokens[i + k].2) == *w)
 }
 
+/// Match a spoken cue phrase after stripping one trailing comma or period
+/// from each token (`quote,` → `quote`). Case-insensitive.
+fn cue_phrase_match(tokens: &[(usize, usize, &str)], i: usize, phrase: &[&str]) -> bool {
+    if i + phrase.len() > tokens.len() {
+        return false;
+    }
+    phrase
+        .iter()
+        .enumerate()
+        .all(|(k, w)| spoken_cue_token(tokens[i + k].2) == *w)
+}
+
+fn spoken_cue_token(tok: &str) -> String {
+    let lower = ascii_lower(tok);
+    if lower.ends_with(',') || lower.ends_with('.') {
+        lower[..lower.len() - 1].to_owned()
+    } else {
+        lower
+    }
+}
+
+/// True when the source contains a spoken mark, quote pair, or layout cue
+/// that LiteralIdentity must still convert.
+fn source_has_spoken_cue(text: &str) -> bool {
+    let tokens = word_tokens(text);
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if spoken_cue_token(tokens[i].2) == "quote"
+            && (i + 1..tokens.len()).any(|j| spoken_cue_token(tokens[j].2) == "unquote")
+        {
+            return true;
+        }
+        if cue_phrase_match(&tokens, i, &["colon", "slash", "slash"])
+            || cue_phrase_match(&tokens, i, &["dash", "dash"])
+            || cue_phrase_match(&tokens, i, &["dash"])
+            || cue_phrase_match(&tokens, i, &["slash"])
+            || cue_phrase_match(&tokens, i, &["dot"])
+            || cue_phrase_match(&tokens, i, &["new", "paragraph"])
+            || cue_phrase_match(&tokens, i, &["new", "line"])
+            || cue_phrase_match(&tokens, i, &["exclamation", "point"])
+            || (cue_phrase_match(&tokens, i, &["period"]) && period_is_cue(&tokens, i))
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 fn try_numbered_steps_body(body: &[(usize, usize, &str)]) -> Option<Vec<String>> {
     if body.is_empty() {
         return None;
@@ -621,9 +720,13 @@ fn try_numbered_steps_body(body: &[(usize, usize, &str)]) -> Option<Vec<String>>
 // ─── Bare spoken cues ────────────────────────────────────────────────────────
 
 fn apply_bare_spoken_cues(text: &str) -> String {
+    apply_bare_spoken_cues_pass(text).0
+}
+
+fn apply_bare_spoken_cues_pass(text: &str) -> (String, bool) {
     let tokens = word_tokens(text);
     if tokens.is_empty() {
-        return text.to_owned();
+        return (text.to_owned(), false);
     }
 
     // Pass 1: paired quote … unquote (protect interior from further cue conversion).
@@ -632,8 +735,9 @@ fn apply_bare_spoken_cues(text: &str) -> String {
     {
         let mut i = 0usize;
         while i < tokens.len() {
-            if ascii_lower(tokens[i].2) == "quote" {
-                if let Some(j) = (i + 1..tokens.len()).find(|&j| ascii_lower(tokens[j].2) == "unquote")
+            if spoken_cue_token(tokens[i].2) == "quote" {
+                if let Some(j) = (i + 1..tokens.len())
+                    .find(|&j| spoken_cue_token(tokens[j].2) == "unquote")
                 {
                     quote_pairs.push((i, j));
                     skip[i..=j].fill(true);
@@ -651,6 +755,7 @@ fn apply_bare_spoken_cues(text: &str) -> String {
     let mut out = String::new();
     let mut i = 0usize;
     let mut pending_space = false;
+    let mut technical_converted = false;
 
     let push_space = |out: &mut String, pending: &mut bool| {
         if *pending && !out.is_empty() {
@@ -668,8 +773,7 @@ fn apply_bare_spoken_cues(text: &str) -> String {
         if let Some(&(q, u)) = quote_pairs.iter().find(|(q, _)| *q == i) {
             push_space(&mut out, &mut pending_space);
             out.push('"');
-            let interior = join_tokens(&tokens[q + 1..u]);
-            out.push_str(&interior);
+            out.push_str(&join_quote_interior(&tokens[q + 1..u]));
             out.push('"');
             i = u + 1;
             pending_space = true;
@@ -682,9 +786,52 @@ fn apply_bare_spoken_cues(text: &str) -> String {
             continue;
         }
 
+        // Spoken technical marks convert anywhere (including metalinguistic
+        // "words X and Y" spans). Longest phrase first.
+        if cue_phrase_match(&tokens, i, &["colon", "slash", "slash"]) {
+            trim_trailing_space(&mut out);
+            out.push_str("://");
+            i += 3;
+            pending_space = false;
+            technical_converted = true;
+            continue;
+        }
+        if cue_phrase_match(&tokens, i, &["dash", "dash"]) {
+            push_space(&mut out, &mut pending_space);
+            out.push_str("--");
+            i += 2;
+            pending_space = false;
+            technical_converted = true;
+            continue;
+        }
+        if cue_phrase_match(&tokens, i, &["dash"]) && dash_is_cue(&tokens, i) {
+            push_space(&mut out, &mut pending_space);
+            out.push('-');
+            i += 1;
+            pending_space = false;
+            technical_converted = true;
+            continue;
+        }
+        if cue_phrase_match(&tokens, i, &["slash"]) {
+            trim_trailing_space(&mut out);
+            out.push('/');
+            i += 1;
+            pending_space = false;
+            technical_converted = true;
+            continue;
+        }
+        if cue_phrase_match(&tokens, i, &["dot"]) {
+            trim_trailing_space(&mut out);
+            out.push('.');
+            i += 1;
+            pending_space = false;
+            technical_converted = true;
+            continue;
+        }
+
         // Multi-word cues (longest first), unless metalinguistic.
         if !meta[i] {
-            if phrase_match(&tokens, i, &["exclamation", "point"]) {
+            if cue_phrase_match(&tokens, i, &["exclamation", "point"]) {
                 push_space(&mut out, &mut pending_space);
                 // Glue bang to previous word.
                 trim_trailing_space(&mut out);
@@ -693,7 +840,7 @@ fn apply_bare_spoken_cues(text: &str) -> String {
                 pending_space = true;
                 continue;
             }
-            if phrase_match(&tokens, i, &["new", "paragraph"]) {
+            if cue_phrase_match(&tokens, i, &["new", "paragraph"]) {
                 push_space(&mut out, &mut pending_space);
                 trim_trailing_space(&mut out);
                 // Ensure previous clause has period before break when it lacks punct.
@@ -703,7 +850,7 @@ fn apply_bare_spoken_cues(text: &str) -> String {
                 pending_space = false;
                 continue;
             }
-            if phrase_match(&tokens, i, &["new", "line"]) {
+            if cue_phrase_match(&tokens, i, &["new", "line"]) {
                 push_space(&mut out, &mut pending_space);
                 trim_trailing_space(&mut out);
                 ensure_clause_period(&mut out);
@@ -712,7 +859,7 @@ fn apply_bare_spoken_cues(text: &str) -> String {
                 pending_space = false;
                 continue;
             }
-            if phrase_match(&tokens, i, &["period"]) && period_is_cue(&tokens, i) {
+            if cue_phrase_match(&tokens, i, &["period"]) && period_is_cue(&tokens, i) {
                 push_space(&mut out, &mut pending_space);
                 trim_trailing_space(&mut out);
                 out.push('.');
@@ -728,7 +875,21 @@ fn apply_bare_spoken_cues(text: &str) -> String {
         pending_space = true;
     }
 
-    out
+    (out, technical_converted)
+}
+
+/// Lone `dash` is a cue unless it is the English noun (`a dash of salt`).
+fn dash_is_cue(tokens: &[(usize, usize, &str)], i: usize) -> bool {
+    let prev = i
+        .checked_sub(1)
+        .map(|j| spoken_cue_token(tokens[j].2));
+    let next = tokens
+        .get(i + 1)
+        .map(|token| spoken_cue_token(token.2));
+    !matches!(
+        (prev.as_deref(), next.as_deref()),
+        (Some("a") | Some("the"), Some("of"))
+    )
 }
 
 /// `period` is a cue unless it is ordinary language ("the period of", mid-list, …).
@@ -1186,6 +1347,21 @@ fn join_tokens(tokens: &[(usize, usize, &str)]) -> String {
         .join(" ")
 }
 
+/// Join quote interior tokens. A trailing comma on the last interior word is
+/// cue-adjacent STT glue (`quote, leave this, unquote`), not list punctuation.
+fn join_quote_interior(tokens: &[(usize, usize, &str)]) -> String {
+    if tokens.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<&str> = tokens.iter().map(|(_, _, t)| *t).collect();
+    if let Some(last) = parts.last_mut() {
+        if let Some(stripped) = last.strip_suffix(',') {
+            *last = stripped;
+        }
+    }
+    parts.join(" ")
+}
+
 fn ascii_lower(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -1261,6 +1437,173 @@ mod tests {
         let src = "run cargo test --workspace -- --test-threads=4";
         let b = organize_local_baseline(src, &literal_opts());
         assert_eq!(b.rendered(), src);
+    }
+
+    #[test]
+    fn spoken_dash_dash_converts_in_literal_identity() {
+        let b = organize_local_baseline("cargo test dash dash workspace", &literal_opts());
+        assert_eq!(b.rendered(), "cargo test --workspace");
+    }
+
+    #[test]
+    fn spoken_slash_and_dot_convert_in_literal_identity() {
+        let b = organize_local_baseline(
+            "create slash voisu core slash s r c slash lib dot rs",
+            &literal_opts(),
+        );
+        assert_eq!(b.rendered(), "create/voisu core/s r c/lib.rs");
+    }
+
+    #[test]
+    fn spoken_colon_slash_slash_converts_in_literal_identity() {
+        let b = organize_local_baseline(
+            "https colon slash slash example dot test slash a",
+            &literal_opts(),
+        );
+        assert_eq!(b.rendered(), "https://example.test/a");
+    }
+
+    #[test]
+    fn spoken_quote_unquote_strips_cue_comma_in_literal_identity() {
+        let b = organize_local_baseline("quote, leave this, unquote", &literal_opts());
+        assert_eq!(b.rendered(), "\"leave this\"");
+    }
+
+    #[test]
+    fn unpaired_quote_stays_words_in_literal_identity() {
+        let b = organize_local_baseline("quote leave this", &literal_opts());
+        assert!(
+            b.rendered().contains("quote"),
+            "unpaired quote must stay a word, got {:?}",
+            b.rendered()
+        );
+        assert!(
+            !b.rendered().contains('"'),
+            "unpaired quote must not invent a quote mark, got {:?}",
+            b.rendered()
+        );
+    }
+
+    #[test]
+    fn unspoken_url_scheme_is_not_invented() {
+        let b = organize_local_baseline("look at example test", &literal_opts());
+        assert_eq!(b.rendered(), "look at example test");
+        assert!(
+            !b.rendered().contains("://"),
+            "must not invent :// when those words were not said, got {:?}",
+            b.rendered()
+        );
+    }
+
+    #[test]
+    fn spoken_dash_dash_converts_under_adaptive() {
+        let b = organize_local_baseline("cargo test dash dash workspace", &adaptive_opts());
+        assert_eq!(b.rendered(), "cargo test --workspace");
+    }
+
+    #[test]
+    fn spoken_dash_dash_converts_inside_structured_goal() {
+        let b = organize_local_baseline(
+            "goal run cargo test dash dash workspace",
+            &structured_opts(),
+        );
+        assert!(
+            b.rendered().contains("--workspace"),
+            "Structured Goal must still convert dash dash, got {:?}",
+            b.rendered()
+        );
+        assert!(
+            !b.rendered().to_ascii_lowercase().contains("dash"),
+            "spoken dash must not remain after Structured organize, got {:?}",
+            b.rendered()
+        );
+    }
+
+    #[test]
+    fn mixed_prose_with_dot_still_sentence_polishes() {
+        let b = organize_local_baseline("please send this to example dot com", &adaptive_opts());
+        assert_eq!(b.rendered(), "Please send this to example.com.");
+    }
+
+    #[test]
+    fn spoken_lone_dash_converts_in_literal_identity() {
+        let b = organize_local_baseline("git dash C status", &literal_opts());
+        assert_eq!(b.rendered(), "git -C status");
+    }
+
+    #[test]
+    fn ordinary_dash_of_noun_stays_a_word() {
+        let b = organize_local_baseline("add a dash of salt", &adaptive_opts());
+        assert_eq!(b.rendered(), "Add a dash of salt.");
+        assert!(!b.rendered().contains('-'));
+    }
+
+    #[test]
+    fn spoken_dash_dash_converts_inside_preformatted_list() {
+        let src = "1. Run cargo test dash dash workspace\n2. Report results";
+        let b = organize_local_baseline(src, &literal_opts());
+        assert_eq!(
+            b.rendered(),
+            "1. Run cargo test --workspace\n2. Report results"
+        );
+    }
+
+    #[test]
+    fn grocery_comma_list_is_not_a_quote_conversion() {
+        let b = organize_local_baseline("Cup, milk, eggs, bread", &literal_opts());
+        assert_eq!(b.rendered(), "Cup, milk, eggs, bread");
+        assert!(!b.rendered().contains('"'));
+    }
+
+    #[test]
+    fn new_line_and_new_paragraph_still_convert_in_literal_identity() {
+        let line = organize_local_baseline("first thought new line second thought", &literal_opts());
+        assert_eq!(line.rendered(), "first thought.\nsecond thought");
+        let para = organize_local_baseline("intro new paragraph body text", &literal_opts());
+        assert_eq!(para.rendered(), "intro.\n\nbody text");
+    }
+
+    #[test]
+    fn spoken_dash_dash_converts_in_metalinguistic_span() {
+        let b = organize_local_baseline("say the words dash dash out loud", &literal_opts());
+        assert!(
+            b.rendered().contains("--"),
+            "dash dash must convert even in a words-span, got {:?}",
+            b.rendered()
+        );
+        assert!(
+            !b.rendered().to_ascii_lowercase().contains("dash"),
+            "spoken dash must not remain a word, got {:?}",
+            b.rendered()
+        );
+    }
+
+    #[test]
+    fn spoken_marks_oracles_hold_under_every_policy() {
+        let cases = [
+            ("cargo test dash dash workspace", "cargo test --workspace"),
+            (
+                "create slash voisu core slash s r c slash lib dot rs",
+                "create/voisu core/s r c/lib.rs",
+            ),
+            (
+                "https colon slash slash example dot test slash a",
+                "https://example.test/a",
+            ),
+            ("quote, leave this, unquote", "\"leave this\""),
+        ];
+        for (src, expect) in cases {
+            for opts in [literal_opts(), adaptive_opts(), natural_opts(), structured_opts()] {
+                let got = organize_local_baseline(src, &opts);
+                assert_eq!(
+                    got.rendered(),
+                    expect,
+                    "src={src:?} policy={:?} route={:?}",
+                    opts.policy,
+                    opts.route
+                );
+            }
+        }
     }
 
     #[test]
