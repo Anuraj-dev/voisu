@@ -441,7 +441,8 @@ pub fn dpr_protected_tokens(selected_source: &str, dictionary_terms: &[String]) 
             || token.starts_with('-')
             || token.contains('_')
             || token.contains("::")
-            || token.contains(['(', ')', '[', ']', '{', '}', '=', '@']);
+            || token.contains(['(', ')', '[', ']', '{', '}', '=', '@'])
+            || is_dot_technical_token(token);
         if negation || technical {
             push_protected(&mut protected, selected_source, token);
         }
@@ -463,6 +464,21 @@ pub fn dpr_protected_tokens(selected_source: &str, dictionary_terms: &[String]) 
         search_from = interior_end + " unquote".len();
     }
 
+    // Organized `"…"` spans (including interiors from `quote,` … `unquote`).
+    let mut quoted_from = 0;
+    while let Some(open_relative) = selected_source[quoted_from..].find('"') {
+        let interior_start = quoted_from + open_relative + 1;
+        let Some(close_relative) = selected_source[interior_start..].find('"') else {
+            break;
+        };
+        push_protected(
+            &mut protected,
+            selected_source,
+            &selected_source[interior_start..interior_start + close_relative],
+        );
+        quoted_from = interior_start + close_relative + 1;
+    }
+
     // Dictionary entries are important spelling/name evidence, but cannot
     // crowd closed technical or semantic atoms out of the bounded request.
     for term in dictionary_terms {
@@ -470,6 +486,21 @@ pub fn dpr_protected_tokens(selected_source: &str, dictionary_terms: &[String]) 
     }
 
     protected
+}
+
+/// `cargo.toml` / `.env` are technical. A sentence-final `hello.` is not.
+fn is_dot_technical_token(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    if bytes.first() == Some(&b'.')
+        && bytes
+            .get(1)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+    {
+        return true;
+    }
+    bytes.windows(3).any(|window| {
+        window[1] == b'.' && window[0].is_ascii_alphanumeric() && window[2].is_ascii_alphanumeric()
+    })
 }
 
 fn push_protected(protected: &mut Vec<String>, source: &str, token: &str) {
@@ -515,6 +546,9 @@ pub async fn dpr_transform_and_deliver(
     let organized_protected = dpr_protected_tokens(baseline.rendered(), &[]);
     let mut protected_tokens: Vec<&str> = input.protected_tokens.to_vec();
     for token in &organized_protected {
+        if protected_tokens.len() >= MAX_DPR_PROTECTED_TOKENS {
+            break;
+        }
         if !protected_tokens.contains(&token.as_str()) {
             protected_tokens.push(token.as_str());
         }
@@ -605,7 +639,25 @@ pub async fn dpr_transform_and_deliver(
                                     },
                                 );
                                 if applied.accepted && !edits.edits.is_empty() {
-                                    format_rendered = Some(applied.rendered);
+                                    let rendered = if edits.base_fingerprint == organized_fingerprint
+                                    {
+                                        applied.rendered
+                                    } else {
+                                        // Cloud edited the spoken source. Re-run
+                                        // spoken-mark conversion so an accepted
+                                        // casing edit cannot leave `dot` as a word.
+                                        organize_local_baseline(
+                                            &applied.rendered,
+                                            &LocalBaselineOptions {
+                                                policy: input.policy,
+                                                route: voisu_core::RenderingRoute::LiteralIdentity,
+                                                timing: None,
+                                            },
+                                        )
+                                        .rendered()
+                                        .to_owned()
+                                    };
+                                    format_rendered = Some(rendered);
                                     CloudOutcome::Succeeded
                                 } else if applied.accepted {
                                     CloudOutcome::Skipped
@@ -1143,6 +1195,26 @@ mod tests {
         }
         assert!(!protected.iter().any(|token| token == "cargo"));
         assert!(protected.len() <= MAX_DPR_PROTECTED_TOKENS);
+    }
+
+    #[test]
+    fn protected_tokens_include_organized_quote_interior_and_dot_files() {
+        let quoted = dpr_protected_tokens("\"connection refused\"", &[]);
+        assert!(
+            quoted.iter().any(|token| token == "connection refused"),
+            "quoted interior missing: {quoted:?}"
+        );
+
+        let dots = dpr_protected_tokens("open cargo.toml and .env today", &[]);
+        assert!(
+            dots.iter().any(|token| token == "cargo.toml"),
+            "cargo.toml missing: {dots:?}"
+        );
+        assert!(
+            dots.iter().any(|token| token == ".env"),
+            ".env missing: {dots:?}"
+        );
+        assert!(!dots.iter().any(|token| token == "today"));
     }
 
     #[tokio::test]
@@ -2751,5 +2823,68 @@ mod tests {
         assert!(!completion.rendered.contains("evil"));
         assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
         assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::CandidateSchema));
+    }
+
+    #[tokio::test]
+    async fn accepted_spoken_source_edit_still_converts_remaining_marks() {
+        let source = "look at example dot com";
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".to_owned(),
+        };
+        let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
+        let cloud = FormatEditCloud {
+            calls: Arc::new(AtomicUsize::new(0)),
+            saw_small_edit_contract: Arc::new(Mutex::new(None)),
+            remaining_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            candidate: format_edit_candidate(source, 0, 4, "look", "Look", "casing"),
+        };
+        let mut delivery = RecordingDelivery {
+            calls: Arc::new(AtomicUsize::new(0)),
+            rendered: Arc::new(Mutex::new(Vec::new())),
+            initiated_ms: None,
+        };
+        let clock = FixedClock(Duration::ZERO);
+
+        let completion = dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &selection,
+                provider_state: ProviderState::SemanticDisagreement,
+                policy: RenderingPolicy::Adaptive,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready {
+                    boundary: &cloud,
+                    credential: &credential,
+                },
+                clock: &clock,
+                small_edit_contract: true,
+            },
+            &mut delivery,
+        )
+        .await;
+
+        assert!(
+            completion.rendered.contains("example.com"),
+            "accepted spoken-source edit must not leave spoken dot, got {:?}",
+            completion.rendered
+        );
+        assert!(
+            !completion.rendered.to_ascii_lowercase().contains("dot"),
+            "spoken dot must convert after the accepted edit, got {:?}",
+            completion.rendered
+        );
+        assert_eq!(completion.compose_decision, CompositionDecision::Accept);
     }
 }

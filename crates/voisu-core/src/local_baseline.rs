@@ -23,6 +23,7 @@
 //! `local_baseline` are promoted as product corpus tests (see module tests).
 //! DPR-33 enters this organizer through the T7-tested source-selection merge.
 
+use crate::is_command_shaped;
 use crate::prompt_rendering::{
     RenderingPolicy, RenderingRoute, TimingCertainty, CLOSED_STRUCTURED_LABELS,
 };
@@ -151,14 +152,15 @@ fn organize_impl(source: &str, options: &LocalBaselineOptions) -> String {
     text = strip_leading_clear_fillers(&text);
     text = apply_clear_backtrack(&text);
 
+    // Spoken marks / quotes before section organize so Structured Goal
+    // bodies still convert `dash dash` and `quote,`.
+    let (cued, technical_converted) = apply_bare_spoken_cues_pass(&text);
+    text = cued;
+
     // Structural: multi-section / steps / Structured single-section labels.
     if let Some(structured) = try_section_organize(&text, options.policy) {
         return structured;
     }
-
-    // Bare spoken cues (period, new line, quote…unquote, spoken marks).
-    let (cued, technical_converted) = apply_bare_spoken_cues_pass(&text);
-    text = cued;
 
     // Clear pause → paragraph break; uncertain → single stream.
     if let Some(timing) = options.timing.as_ref() {
@@ -167,11 +169,11 @@ fn organize_impl(source: &str, options: &LocalBaselineOptions) -> String {
         }
     }
 
-    // Light punctuation / casing polish. After a technical mark conversion,
-    // do not sentence-case or add a terminal period (command/URL oracles).
-    text = apply_discourse_ok(&text);
-    text = apply_vocative_hey(&text);
-    if !technical_converted {
+    // Polish surrounding prose. Skip casing/period only when the whole
+    // utterance is a command, URL/path, or a single quoted span.
+    if !skip_sentence_polish(&text, technical_converted) {
+        text = apply_discourse_ok(&text);
+        text = apply_vocative_hey(&text);
         // Unpaired bare `quote` (no `unquote`) leaves the following stream as words:
         // sentence-case the start, but do not weekday-capitalize inside that span (DPR-11).
         let weekday = !has_unpaired_quote_cue(source);
@@ -182,6 +184,22 @@ fn organize_impl(source: &str, options: &LocalBaselineOptions) -> String {
     }
 
     text
+}
+
+/// Skip sentence polish when a technical conversion produced a command, a
+/// leading URL/path, or a quote-only span. Mixed prose still polishes.
+fn skip_sentence_polish(text: &str, technical_converted: bool) -> bool {
+    if is_only_quoted_span(text) {
+        return true;
+    }
+    if !technical_converted {
+        return false;
+    }
+    if is_command_shaped(text) {
+        return true;
+    }
+    let first = text.split_whitespace().next().unwrap_or("");
+    first.contains("://") || first.contains('/') || first.starts_with('-') || first.starts_with('.')
 }
 
 /// True when the whole utterance is one quoted span (`"leave this"`).
@@ -1454,6 +1472,30 @@ mod tests {
     fn spoken_dash_dash_converts_under_adaptive() {
         let b = organize_local_baseline("cargo test dash dash workspace", &adaptive_opts());
         assert_eq!(b.rendered(), "cargo test --workspace");
+    }
+
+    #[test]
+    fn spoken_dash_dash_converts_inside_structured_goal() {
+        let b = organize_local_baseline(
+            "goal run cargo test dash dash workspace",
+            &structured_opts(),
+        );
+        assert!(
+            b.rendered().contains("--workspace"),
+            "Structured Goal must still convert dash dash, got {:?}",
+            b.rendered()
+        );
+        assert!(
+            !b.rendered().to_ascii_lowercase().contains("dash"),
+            "spoken dash must not remain after Structured organize, got {:?}",
+            b.rendered()
+        );
+    }
+
+    #[test]
+    fn mixed_prose_with_dot_still_sentence_polishes() {
+        let b = organize_local_baseline("please send this to example dot com", &adaptive_opts());
+        assert_eq!(b.rendered(), "Please send this to example.com.");
     }
 
     #[test]
