@@ -905,7 +905,7 @@ fn format_edit_candidate(
 #[tokio::test]
 async fn formatting_apply_relaxes_lexical_source_words_without_dropping_safety() {
     let credential = Credential::new("hermetic-secret".to_owned()).expect("credential");
-    let wording_source = "pls ship the rust parser";
+    let wording_source = "goal pls ship the rust parser";
     let wording_sources = [ComposeSource {
         provider: SttProvider::ProviderA,
         available: true,
@@ -924,8 +924,8 @@ async fn formatting_apply_relaxes_lexical_source_words_without_dropping_safety()
         complete_at: 200,
         result: Mutex::new(Some(DprCloudAttempt::format_edits(format_edit_candidate(
             wording_source,
-            0,
-            3,
+            5,
+            8,
             "pls",
             "Please",
             "bounded_wording",
@@ -956,10 +956,10 @@ async fn formatting_apply_relaxes_lexical_source_words_without_dropping_safety()
     .await;
     assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
     assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(accepted.rendered, "Please ship the rust parser");
+    assert_eq!(accepted.rendered, "goal Please ship the rust parser");
     assert_eq!(accepted.compose_decision, CompositionDecision::Accept);
 
-    let unsafe_source = "do not deploy https://example.test/a";
+    let unsafe_source = "goal do not deploy https://example.test/a";
     let unsafe_sources = [ComposeSource {
         provider: SttProvider::ProviderA,
         available: true,

@@ -81,8 +81,8 @@ pub use prompt_rendering::{
 
 mod local_baseline;
 pub use local_baseline::{
-    organize_local_baseline, LocalBaseline, LocalBaselineOptions, LocalTiming, PauseBoundary,
-    LOCAL_BASELINE_CONTRACT_ID,
+    leftover_admits_format_cloud, organize_local_baseline, LocalBaseline, LocalBaselineOptions,
+    LocalTiming, PauseBoundary, LOCAL_BASELINE_CONTRACT_ID,
 };
 
 mod intent_routing;

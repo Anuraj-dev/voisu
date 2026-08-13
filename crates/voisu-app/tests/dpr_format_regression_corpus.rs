@@ -209,7 +209,7 @@ const CORPUS: &[Fixture] = &[
             src(Provider::Deepgram, ""),
             src(
                 Provider::Groq,
-                "pls schedule the review for Wednesday morning. Thank you for watching.",
+                "goal pls schedule the review for Wednesday morning. Thank you for watching.",
             ),
         ],
         policy: RenderingPolicy::Adaptive,
@@ -219,7 +219,7 @@ const CORPUS: &[Fixture] = &[
         complete_at_ms: SUCCESS_COMPLETE_AT_MS,
         honor_budget: true,
         cloud: CloudScript::Edits(&[replace("pls", "Please", "bounded_wording")]),
-        expect: Expect::Accept("Please schedule the review for Wednesday morning."),
+        expect: Expect::Accept("goal Please schedule the review for Wednesday morning."),
         format_required: true,
     },
     Fixture {
@@ -227,7 +227,7 @@ const CORPUS: &[Fixture] = &[
         category: "silence_outro",
         sources: &[src(
             Provider::Groq,
-            "we should thank you for watching the demo",
+            "goal we should thank you for watching the demo",
         )],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
@@ -236,7 +236,7 @@ const CORPUS: &[Fixture] = &[
         complete_at_ms: SUCCESS_COMPLETE_AT_MS,
         honor_budget: true,
         cloud: CloudScript::Edits(&[replace("we", "We", "casing")]),
-        expect: Expect::Accept("We should thank you for watching the demo"),
+        expect: Expect::Accept("goal We should thank you for watching the demo"),
         format_required: true,
     },
     // --- structured prompts -----------------------------------------------
@@ -258,7 +258,7 @@ const CORPUS: &[Fixture] = &[
     Fixture {
         id: "paragraphs_break",
         category: "paragraphs_lists",
-        sources: &[src(Provider::Groq, "first thought then second thought")],
+        sources: &[src(Provider::Groq, "goal first thought then second thought")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -270,13 +270,13 @@ const CORPUS: &[Fixture] = &[
             "thought\n\nthen",
             "whitespace_layout",
         )]),
-        expect: Expect::Accept("first thought\n\nthen second thought"),
+        expect: Expect::Accept("goal first thought\n\nthen second thought"),
         format_required: true,
     },
     Fixture {
         id: "lists_numbering",
         category: "paragraphs_lists",
-        sources: &[src(Provider::Groq, "first item and second item")],
+        sources: &[src(Provider::Groq, "goal first item and second item")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -288,14 +288,14 @@ const CORPUS: &[Fixture] = &[
             "1. first item\n2. second item",
             "structure",
         )]),
-        expect: Expect::Accept("1. first item\n2. second item"),
+        expect: Expect::Accept("goal 1. first item\n2. second item"),
         format_required: true,
     },
     // --- fillers / corrections --------------------------------------------
     Fixture {
         id: "fillers_um_pls",
         category: "fillers_corrections",
-        sources: &[src(Provider::Groq, "um pls ship the rust parser")],
+        sources: &[src(Provider::Groq, "goal um pls ship the rust parser")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -306,7 +306,7 @@ const CORPUS: &[Fixture] = &[
             replace("um ", "", "filler_removal"),
             replace("pls", "Please", "bounded_wording"),
         ]),
-        expect: Expect::Accept("Please ship the rust parser"),
+        expect: Expect::Accept("goal Please ship the rust parser"),
         format_required: true,
     },
     Fixture {
@@ -314,7 +314,7 @@ const CORPUS: &[Fixture] = &[
         category: "fillers_corrections",
         sources: &[src(
             Provider::Groq,
-            "pls send the draft I mean the final note",
+            "goal pls send the draft I mean the final note",
         )],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
@@ -326,7 +326,7 @@ const CORPUS: &[Fixture] = &[
             replace("the draft I mean ", "", "clear_backtrack_removal"),
             replace("pls", "Please", "bounded_wording"),
         ]),
-        expect: Expect::Accept("Please send the final note"),
+        expect: Expect::Accept("goal Please send the final note"),
         format_required: true,
     },
     // --- ordinary messages ------------------------------------------------
@@ -336,13 +336,13 @@ const CORPUS: &[Fixture] = &[
         sources: &[src(Provider::Groq, "pls send the notes when you can")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
-        open_cloud: true,
+        open_cloud: false,
         extra_protected: &[],
         complete_at_ms: SUCCESS_COMPLETE_AT_MS,
         honor_budget: true,
         cloud: CloudScript::Edits(&[replace("pls", "Please", "bounded_wording")]),
-        expect: Expect::Accept("Please send the notes when you can"),
-        format_required: true,
+        expect: Expect::FallbackBaseline,
+        format_required: false,
     },
     // --- quotes -----------------------------------------------------------
     Fixture {
@@ -351,7 +351,7 @@ const CORPUS: &[Fixture] = &[
         sources: &[src(Provider::Groq, "say quote leave this unquote now")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
-        open_cloud: true,
+        open_cloud: false,
         extra_protected: &[],
         complete_at_ms: SUCCESS_COMPLETE_AT_MS,
         honor_budget: true,
@@ -360,14 +360,14 @@ const CORPUS: &[Fixture] = &[
             "\"leave this\"",
             "quote_conversion",
         )]),
-        expect: Expect::Accept("say \"leave this\" now"),
-        format_required: true,
+        expect: Expect::FallbackBaseline,
+        format_required: false,
     },
     // --- protected facts (mutations must fall back) -----------------------
     Fixture {
         id: "protected_name",
         category: "protected_facts",
-        sources: &[src(Provider::Groq, "ask Alice to review it")],
+        sources: &[src(Provider::Groq, "goal ask Alice to review it")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -381,7 +381,7 @@ const CORPUS: &[Fixture] = &[
     Fixture {
         id: "protected_command",
         category: "protected_facts",
-        sources: &[src(Provider::Groq, "run cargo test --workspace")],
+        sources: &[src(Provider::Groq, "goal run cargo test --workspace")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -397,7 +397,7 @@ const CORPUS: &[Fixture] = &[
         category: "protected_facts",
         sources: &[src(
             Provider::Groq,
-            "edit crates/voisu-core/src/lib.rs today",
+            "goal edit crates/voisu-core/src/lib.rs today",
         )],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
@@ -416,7 +416,7 @@ const CORPUS: &[Fixture] = &[
     Fixture {
         id: "protected_url",
         category: "protected_facts",
-        sources: &[src(Provider::Groq, "open https://example.test/a now")],
+        sources: &[src(Provider::Groq, "goal open https://example.test/a now")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -434,7 +434,7 @@ const CORPUS: &[Fixture] = &[
     Fixture {
         id: "protected_date",
         category: "protected_facts",
-        sources: &[src(Provider::Groq, "ship on 2026-08-16 please")],
+        sources: &[src(Provider::Groq, "goal ship on 2026-08-16 please")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -448,7 +448,7 @@ const CORPUS: &[Fixture] = &[
     Fixture {
         id: "protected_time",
         category: "protected_facts",
-        sources: &[src(Provider::Groq, "meet at 3pm tomorrow")],
+        sources: &[src(Provider::Groq, "goal meet at 3pm tomorrow")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -462,7 +462,7 @@ const CORPUS: &[Fixture] = &[
     Fixture {
         id: "protected_negation",
         category: "protected_facts",
-        sources: &[src(Provider::Groq, "do not deploy tonight")],
+        sources: &[src(Provider::Groq, "goal do not deploy tonight")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -476,7 +476,7 @@ const CORPUS: &[Fixture] = &[
     Fixture {
         id: "protected_quoted_interior",
         category: "protected_facts",
-        sources: &[src(Provider::Groq, "say quote leave this unquote now")],
+        sources: &[src(Provider::Groq, "goal say quote leave this unquote now")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -506,7 +506,7 @@ const CORPUS: &[Fixture] = &[
     Fixture {
         id: "wording_pls_please",
         category: "allowed_wording",
-        sources: &[src(Provider::Groq, "pls ship the rust parser")],
+        sources: &[src(Provider::Groq, "goal pls ship the rust parser")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -514,14 +514,14 @@ const CORPUS: &[Fixture] = &[
         complete_at_ms: SUCCESS_COMPLETE_AT_MS,
         honor_budget: true,
         cloud: CloudScript::Edits(&[replace("pls", "Please", "bounded_wording")]),
-        expect: Expect::Accept("Please ship the rust parser"),
+        expect: Expect::Accept("goal Please ship the rust parser"),
         format_required: true,
     },
     // --- malformed JSON / 429 / timeout / late / artifacts ----------------
     Fixture {
         id: "malformed_json",
         category: "malformed_json",
-        sources: &[src(Provider::Groq, "pls ship the rust parser")],
+        sources: &[src(Provider::Groq, "goal pls ship the rust parser")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -535,7 +535,7 @@ const CORPUS: &[Fixture] = &[
     Fixture {
         id: "rate_limited_429",
         category: "rate_limited",
-        sources: &[src(Provider::Groq, "pls ship the rust parser")],
+        sources: &[src(Provider::Groq, "goal pls ship the rust parser")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -549,7 +549,7 @@ const CORPUS: &[Fixture] = &[
     Fixture {
         id: "timeout_provider_budget",
         category: "timeout",
-        sources: &[src(Provider::Groq, "pls ship the rust parser")],
+        sources: &[src(Provider::Groq, "goal pls ship the rust parser")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -563,7 +563,7 @@ const CORPUS: &[Fixture] = &[
     Fixture {
         id: "late_after_gate_discarded",
         category: "timeout",
-        sources: &[src(Provider::Groq, "pls ship the rust parser")],
+        sources: &[src(Provider::Groq, "goal pls ship the rust parser")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -580,7 +580,7 @@ const CORPUS: &[Fixture] = &[
         sources: &[src(Provider::Groq, "ship the rust parser today")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
-        open_cloud: true,
+        open_cloud: false,
         extra_protected: &[],
         complete_at_ms: SUCCESS_COMPLETE_AT_MS,
         honor_budget: true,
@@ -591,7 +591,7 @@ const CORPUS: &[Fixture] = &[
     Fixture {
         id: "artifact_user_heading",
         category: "prompt_artifact",
-        sources: &[src(Provider::Groq, "ship the rust parser")],
+        sources: &[src(Provider::Groq, "goal ship the rust parser")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -605,7 +605,7 @@ const CORPUS: &[Fixture] = &[
     Fixture {
         id: "artifact_developer_heading",
         category: "prompt_artifact",
-        sources: &[src(Provider::Groq, "ship the rust parser")],
+        sources: &[src(Provider::Groq, "goal ship the rust parser")],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -855,10 +855,10 @@ async fn run_trial(fixture: &Fixture) -> Trial {
         );
     }
 
-    let provider_state = if fixture.open_cloud {
-        ProviderState::SemanticDisagreement
-    } else {
+    let provider_state = if matches!(fixture.cloud, CloudScript::None) {
         context.provider_state
+    } else {
+        ProviderState::SemanticDisagreement
     };
     let routing = route_intent(&IntentObservation {
         policy: fixture.policy,
@@ -943,6 +943,13 @@ async fn run_trial(fixture: &Fixture) -> Trial {
                 *saw_small_edit.lock().expect("flag"),
                 Some(true),
                 "{}: formatting path must request the small-edit contract",
+                fixture.id
+            );
+        } else {
+            assert_eq!(
+                cloud_calls.load(Ordering::SeqCst),
+                0,
+                "{}: leftover must not start a formatting cloud call",
                 fixture.id
             );
         }

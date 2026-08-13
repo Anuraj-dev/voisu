@@ -129,6 +129,16 @@ pub fn organize_local_baseline(source: &str, options: &LocalBaselineOptions) -> 
     }
 }
 
+/// True when leftover organized text still looks like a Goal or mixed
+/// structured notes that may admit a formatting cloud call.
+///
+/// Uses intent-routing section-header cues (`goal is` / leading `goal` /
+/// `goal:`), not mid-sentence token windows. Ordinary chat stays closed.
+#[must_use]
+pub fn leftover_admits_format_cloud(organized: &str) -> bool {
+    crate::intent_routing::leftover_has_goal_or_mixed_section_headers(organized)
+}
+
 fn organize_impl(source: &str, options: &LocalBaselineOptions) -> String {
     if source.is_empty() {
         return String::new();
@@ -1769,6 +1779,62 @@ mod tests {
             );
             assert!(!b.rendered().contains("Goal:"));
         }
+    }
+
+    #[test]
+    fn leftover_admits_goal_and_mixed_structured_notes() {
+        let goal_is = organize_local_baseline(
+            "Goal is to deploy the application right now",
+            &adaptive_opts(),
+        );
+        assert_eq!(
+            goal_is.rendered(),
+            "Goal is to deploy the application right now."
+        );
+        assert!(leftover_admits_format_cloud(goal_is.rendered()));
+
+        let leading_goal = organize_local_baseline("goal ship the rust parser", &adaptive_opts());
+        assert_eq!(leading_goal.rendered(), "Goal ship the rust parser.");
+        assert!(leftover_admits_format_cloud(leading_goal.rendered()));
+
+        let mixed = organize_local_baseline(
+            "goal is to deploy the application right now context is the production cluster notes check the rollback",
+            &adaptive_opts(),
+        );
+        assert_eq!(
+            mixed.rendered(),
+            "Goal is to deploy the application right now. Context is the production cluster. Notes check the rollback."
+        );
+        assert!(leftover_admits_format_cloud(mixed.rendered()));
+    }
+
+    #[test]
+    fn leftover_rejects_local_jobs_and_ordinary_chat() {
+        let dash_dash = organize_local_baseline("cargo test dash dash workspace", &adaptive_opts());
+        assert_eq!(dash_dash.rendered(), "cargo test --workspace");
+        assert!(!leftover_admits_format_cloud(dash_dash.rendered()));
+
+        let numbered = organize_local_baseline(
+            "first do the deployment second figure out the env variable third report to me",
+            &adaptive_opts(),
+        );
+        assert_eq!(
+            numbered.rendered(),
+            "1. Do the deployment\n2. Figure out the env variable\n3. Report to me"
+        );
+        assert!(!leftover_admits_format_cloud(numbered.rendered()));
+
+        let grocery = organize_local_baseline("Cup, milk, eggs, bread", &adaptive_opts());
+        assert_eq!(grocery.rendered(), "Cup, milk, eggs, bread.");
+        assert!(!leftover_admits_format_cloud(grocery.rendered()));
+
+        let first_time = organize_local_baseline("The first time I tried this", &adaptive_opts());
+        assert_eq!(first_time.rendered(), "The first time I tried this.");
+        assert!(!leftover_admits_format_cloud(first_time.rendered()));
+
+        let ordinary = organize_local_baseline("pls send the notes when you can", &adaptive_opts());
+        assert_eq!(ordinary.rendered(), "Pls send the notes when you can.");
+        assert!(!leftover_admits_format_cloud(ordinary.rendered()));
     }
 
     #[test]

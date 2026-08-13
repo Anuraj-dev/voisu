@@ -331,6 +331,16 @@ fn section_header_re(phrase: &str) -> Regex {
     Regex::new(&pattern).unwrap_or_else(|e| panic!("section header re for {phrase}: {e}"))
 }
 
+/// Header-shape section cues only (`goal is` / leading `goal` / `goal:`).
+/// Stream token-windows are intentionally unused so mid-sentence `notes`
+/// does not look like a Notes heading.
+pub(crate) fn leftover_has_goal_or_mixed_section_headers(organized: &str) -> bool {
+    SECTION_CUES
+        .iter()
+        .find(|cue| cue.phrase == "goal")
+        .is_some_and(|cue| cue.pattern.is_match(organized))
+}
+
 struct SectionCue {
     signal_id: &'static str,
     phrase: &'static str,
