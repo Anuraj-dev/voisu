@@ -9,13 +9,13 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use voisu_core::{
-    apply_format_edits_with, compose_structured_candidate, organize_local_baseline, route_intent,
-    sanitize_source_transcripts, text_sha256_fingerprint, CloudOutcome, CloudRequest, ComposeInput,
-    ComposeSource, CompositionDecision, Credential, DeliveryAdapter, DeliveryFlags, DeliveryOutcome,
-    DprDiagnostic, FormatEditSafety, IntentObservation, LocalBaselineOptions, ProcessHint,
-    ProviderState, RenderingPolicy, RoutingDecision, SourceSelection, SourceTranscript,
-    SttProvider, SurfaceHint, TimingHint, Transcript, TranscriptSelection, Provider,
-    MAX_COMPOSE_FIELD_UTF8_BYTES,
+    apply_format_edits_with, compose_structured_candidate, leftover_admits_format_cloud,
+    organize_local_baseline, route_intent, sanitize_source_transcripts, text_sha256_fingerprint,
+    CloudOutcome, CloudRequest, ComposeInput, ComposeSource, CompositionDecision, Credential,
+    DeliveryAdapter, DeliveryFlags, DeliveryOutcome, DprDiagnostic, FormatEditSafety,
+    IntentObservation, LocalBaselineOptions, ProcessHint, ProviderState, RenderingPolicy,
+    RoutingDecision, SourceSelection, SourceTranscript, SttProvider, SurfaceHint, TimingHint,
+    Transcript, TranscriptSelection, Provider, MAX_COMPOSE_FIELD_UTF8_BYTES,
 };
 
 use crate::dpr_cloud::{
@@ -559,8 +559,11 @@ pub async fn dpr_transform_and_deliver(
     let mut cloud_error = None;
     let mut candidate = None;
     let mut format_rendered = None;
+    let skip_format_cloud = input.small_edit_contract
+        && !leftover_admits_format_cloud(baseline.rendered());
     let cloud_outcome = if !input.english_eligible
         || routing.cloud_request == CloudRequest::NotAllowed
+        || skip_format_cloud
     {
         diagnostic.cloud_skipped(route_selected_at);
         CloudOutcome::Skipped
@@ -2274,7 +2277,7 @@ mod tests {
 
     #[tokio::test]
     async fn formatting_success_after_legacy_deadline_before_five_second_gate_is_accepted() {
-        let source = "pls ship the rust parser";
+        let source = "goal pls ship the rust parser";
         let clock = ControlledClock::new(0);
         let cloud_calls = Arc::new(AtomicUsize::new(0));
         let cloud = CountingFormatCloud {
@@ -2284,7 +2287,7 @@ mod tests {
             completes_at_ms: 2_000,
             honor_budget: true,
             outcome: CannedFormatCloudOutcome::Success(format_edit_candidate(
-                source, 0, 3, "pls", "Please", "bounded_wording",
+                source, 5, 8, "pls", "Please", "bounded_wording",
             )),
         };
         let delivery_calls = Arc::new(AtomicUsize::new(0));
@@ -2339,10 +2342,10 @@ mod tests {
 
         assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(completion.rendered, "Please ship the rust parser");
+        assert_eq!(completion.rendered, "goal Please ship the rust parser");
         assert_eq!(
             delivered.lock().expect("delivery").as_slice(),
-            ["Please ship the rust parser"]
+            ["goal Please ship the rust parser"]
         );
         assert_ne!(completion.rendered, baseline.rendered());
         assert_eq!(completion.compose_decision, CompositionDecision::Accept);
@@ -2505,7 +2508,7 @@ mod tests {
 
     #[tokio::test]
     async fn formatting_accepts_bounded_wording_absent_from_the_source() {
-        let source = "pls ship the rust parser";
+        let source = "goal pls ship the rust parser";
         let sources = [ComposeSource {
             provider: SttProvider::ProviderA,
             available: true,
@@ -2521,7 +2524,7 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
             saw_small_edit_contract: Arc::new(Mutex::new(None)),
             remaining_ms: Arc::new(AtomicU64::new(0)),
-            candidate: format_edit_candidate(source, 0, 3, "pls", "Please", "bounded_wording"),
+            candidate: format_edit_candidate(source, 5, 8, "pls", "Please", "bounded_wording"),
         };
         let mut delivery = RecordingDelivery {
             calls: Arc::new(AtomicUsize::new(0)),
@@ -2553,14 +2556,14 @@ mod tests {
         )
         .await;
 
-        assert_eq!(completion.rendered, "Please ship the rust parser");
+        assert_eq!(completion.rendered, "goal Please ship the rust parser");
         assert_eq!(completion.compose_decision, CompositionDecision::Accept);
         assert!(completion.cloud_error.is_none());
     }
 
     #[tokio::test]
     async fn formatting_safety_rejects_protected_heading_and_artifact_to_baseline() {
-        let source = "do not deploy https://example.test/a";
+        let source = "goal do not deploy https://example.test/a";
         let sources = [ComposeSource {
             provider: SttProvider::ProviderA,
             available: true,
@@ -2730,9 +2733,20 @@ mod tests {
         assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
     }
 
-    #[tokio::test]
-    async fn format_edit_cannot_smash_converted_url() {
-        let source = "https colon slash slash example dot test slash a";
+    struct ReadyFormatPath {
+        completion: DprTransformCompletion,
+        cloud_calls: usize,
+        saw_small_edit: Option<bool>,
+        delivery_calls: usize,
+        delivered: Vec<String>,
+    }
+
+    async fn deliver_ready_format_path(
+        source: &str,
+        provider_state: ProviderState,
+        policy: RenderingPolicy,
+        small_edit_contract: bool,
+    ) -> ReadyFormatPath {
         let sources = [ComposeSource {
             provider: SttProvider::ProviderA,
             available: true,
@@ -2744,7 +2758,164 @@ mod tests {
             reason: "only_available".to_owned(),
         };
         let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
-        let converted = "https://example.test/a";
+        let cloud_calls = Arc::new(AtomicUsize::new(0));
+        let saw_small_edit = Arc::new(Mutex::new(None));
+        let cloud = FormatEditCloud {
+            calls: Arc::clone(&cloud_calls),
+            saw_small_edit_contract: Arc::clone(&saw_small_edit),
+            remaining_ms: Arc::new(AtomicU64::new(0)),
+            candidate: format_edit_candidate(
+                source,
+                0,
+                source.len().min(4),
+                &source[..source.len().min(4)],
+                "X",
+                "casing",
+            ),
+        };
+        let delivery_calls = Arc::new(AtomicUsize::new(0));
+        let rendered = Arc::new(Mutex::new(Vec::new()));
+        let mut delivery = RecordingDelivery {
+            calls: Arc::clone(&delivery_calls),
+            rendered: Arc::clone(&rendered),
+            initiated_ms: None,
+        };
+        let clock = FixedClock(Duration::ZERO);
+        let completion = dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &selection,
+                provider_state,
+                policy,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready {
+                    boundary: &cloud,
+                    credential: &credential,
+                },
+                clock: &clock,
+                small_edit_contract,
+            },
+            &mut delivery,
+        )
+        .await;
+        ReadyFormatPath {
+            completion,
+            cloud_calls: cloud_calls.load(Ordering::SeqCst),
+            saw_small_edit: *saw_small_edit.lock().expect("flag"),
+            delivery_calls: delivery_calls.load(Ordering::SeqCst),
+            delivered: rendered.lock().expect("delivery").clone(),
+        }
+    }
+
+    fn assert_formatting_cloud_skipped(run: &ReadyFormatPath, expected: &str) {
+        assert_eq!(run.completion.rendered, expected);
+        assert_eq!(run.delivered.as_slice(), [expected]);
+        assert_eq!(run.cloud_calls, 0);
+        assert!(!run.completion.cloud_attempted);
+        assert!(run.completion.cloud_error.is_none());
+        assert_eq!(run.delivery_calls, 1);
+        assert_eq!(
+            run.completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
+        assert!(diagnostic_event_names(&run.completion)
+            .contains(&DprDiagnosticEventName::CloudSkipped));
+        assert!(
+            !diagnostic_event_names(&run.completion)
+                .contains(&DprDiagnosticEventName::CloudRequestStarted)
+        );
+    }
+
+    #[tokio::test]
+    async fn dash_dash_dispute_does_not_start_formatting_cloud() {
+        let run = deliver_ready_format_path(
+            "cargo test dash dash workspace",
+            ProviderState::SemanticDisagreement,
+            RenderingPolicy::Adaptive,
+            true,
+        )
+        .await;
+        assert_formatting_cloud_skipped(&run, "cargo test --workspace");
+    }
+
+    #[tokio::test]
+    async fn first_second_third_dispute_does_not_start_formatting_cloud() {
+        let run = deliver_ready_format_path(
+            "first do the deployment second figure out the env variable third report to me",
+            ProviderState::SemanticDisagreement,
+            RenderingPolicy::Adaptive,
+            true,
+        )
+        .await;
+        assert_formatting_cloud_skipped(
+            &run,
+            "1. Do the deployment\n2. Figure out the env variable\n3. Report to me",
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_disputed_chat_does_not_start_formatting_cloud() {
+        let run = deliver_ready_format_path(
+            "hey how are you doing today",
+            ProviderState::SemanticDisagreement,
+            RenderingPolicy::Adaptive,
+            true,
+        )
+        .await;
+        assert_formatting_cloud_skipped(&run, "Hey, how are you doing today.");
+    }
+
+    #[tokio::test]
+    async fn leftover_goal_flag_on_may_start_formatting_cloud() {
+        let run = deliver_ready_format_path(
+            "Goal is to deploy the application right now",
+            ProviderState::SemanticDisagreement,
+            RenderingPolicy::Adaptive,
+            true,
+        )
+        .await;
+        assert_eq!(run.cloud_calls, 1);
+        assert!(run.completion.cloud_attempted);
+        assert_eq!(run.saw_small_edit, Some(true));
+        assert_eq!(run.delivery_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn leftover_goal_flag_off_does_not_take_formatting_contract() {
+        let run = deliver_ready_format_path(
+            "goal ship the rust parser",
+            ProviderState::SemanticDisagreement,
+            RenderingPolicy::Adaptive,
+            false,
+        )
+        .await;
+        assert_eq!(run.cloud_calls, 1);
+        assert!(run.completion.cloud_attempted);
+        assert_eq!(run.saw_small_edit, Some(false));
+        assert_eq!(run.delivery_calls, 1);
+        assert_eq!(run.completion.rendered, "Goal ship the rust parser.");
+    }
+
+    #[tokio::test]
+    async fn format_edit_cannot_smash_converted_url() {
+        let source = "goal https colon slash slash example dot test slash a";
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".to_owned(),
+        };
+        let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
+        let converted = "Goal https://example.test/a.";
         let url_start = converted.find("https://example.test/a").unwrap();
         let cloud = FormatEditCloud {
             calls: Arc::new(AtomicUsize::new(0)),
@@ -2790,7 +2961,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(completion.rendered, "https://example.test/a");
+        assert_eq!(completion.rendered, "Goal https://example.test/a.");
         assert!(!completion.rendered.contains("evil"));
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
         assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
@@ -2799,7 +2970,7 @@ mod tests {
 
     #[tokio::test]
     async fn format_edit_cannot_smash_converted_dash_dash() {
-        let source = "cargo test dash dash workspace";
+        let source = "goal cargo test dash dash workspace";
         let sources = [ComposeSource {
             provider: SttProvider::ProviderA,
             available: true,
@@ -2811,7 +2982,7 @@ mod tests {
             reason: "only_available".to_owned(),
         };
         let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
-        let converted = "cargo test --workspace";
+        let converted = "goal cargo test --workspace";
         let flag_start = converted.find("--workspace").unwrap();
         let cloud = FormatEditCloud {
             calls: Arc::new(AtomicUsize::new(0)),
@@ -2856,7 +3027,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(completion.rendered, "cargo test --workspace");
+        assert_eq!(completion.rendered, "goal cargo test --workspace");
         assert!(!completion.rendered.contains("evil"));
         assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
         assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::CandidateSchema));
@@ -2864,7 +3035,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_spoken_source_edit_still_converts_remaining_marks() {
-        let source = "look at example dot com";
+        let source = "goal look at example dot com";
         let sources = [ComposeSource {
             provider: SttProvider::ProviderA,
             available: true,
@@ -2876,11 +3047,12 @@ mod tests {
             reason: "only_available".to_owned(),
         };
         let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
+        let look_start = source.find("look").unwrap();
         let cloud = FormatEditCloud {
             calls: Arc::new(AtomicUsize::new(0)),
             saw_small_edit_contract: Arc::new(Mutex::new(None)),
             remaining_ms: Arc::new(AtomicU64::new(u64::MAX)),
-            candidate: format_edit_candidate(source, 0, 4, "look", "Look", "casing"),
+            candidate: format_edit_candidate(source, look_start, look_start + 4, "look", "Look", "casing"),
         };
         let mut delivery = RecordingDelivery {
             calls: Arc::new(AtomicUsize::new(0)),
@@ -2927,7 +3099,7 @@ mod tests {
 
     #[tokio::test]
     async fn spoken_source_edit_cannot_rewrite_words_that_become_protected() {
-        let source = "cargo test dash dash workspace";
+        let source = "goal cargo test dash dash workspace";
         let sources = [ComposeSource {
             provider: SttProvider::ProviderA,
             available: true,
@@ -2983,7 +3155,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(completion.rendered, "cargo test --workspace");
+        assert_eq!(completion.rendered, "goal cargo test --workspace");
         assert!(!completion.rendered.contains("evil"));
         assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
         assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::CandidateSchema));
