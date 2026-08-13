@@ -471,11 +471,13 @@ fn try_section_organize(text: &str, policy: RenderingPolicy) -> Option<String> {
 
     let multi = sections.len() >= 2;
     let only_steps = sections.len() == 1 && sections[0].label == "Steps";
+    let only_goal = sections.len() == 1 && sections[0].label == "Goal";
     let structured_single =
-        policy == RenderingPolicy::Structured && sections.len() == 1 && !only_steps;
+        policy == RenderingPolicy::Structured && sections.len() == 1 && !only_steps && !only_goal;
 
     // Adaptive/Natural with a single non-steps section: Natural-shaped (no headers).
-    if !multi && !only_steps && !structured_single {
+    // A lone spoken Goal stays ordinary words — no local `Goal:` heading.
+    if only_goal || (!multi && !only_steps && !structured_single) {
         return None;
     }
 
@@ -502,6 +504,17 @@ fn try_section_organize(text: &str, policy: RenderingPolicy) -> Option<String> {
                 }
                 continue;
             }
+        }
+
+        if sec.label == "Goal" {
+            let body_text = join_tokens(body);
+            let combined = if body_text.is_empty() {
+                "Goal".to_owned()
+            } else {
+                format!("Goal {body_text}")
+            };
+            parts.push(ensure_terminal_period(&capitalize_sentence_start(&combined)));
+            continue;
         }
 
         let body_text = join_tokens(body);
@@ -1735,10 +1748,27 @@ mod tests {
     }
 
     #[test]
-    fn structured_emits_closed_goal_label() {
+    fn structured_does_not_emit_goal_heading() {
         let src = "goal fix the flaky auth test";
         let b = organize_local_baseline(src, &structured_opts());
-        assert_eq!(b.rendered(), "Goal:\nFix the flaky auth test.");
+        assert!(!b.rendered().contains("Goal:"));
+        assert_eq!(b.rendered(), "Goal fix the flaky auth test.");
+    }
+
+    #[test]
+    fn spoken_goal_is_not_a_local_heading() {
+        let src = "Goal is to deploy the application right now";
+        for opts in [adaptive_opts(), natural_opts(), structured_opts()] {
+            let b = organize_local_baseline(src, &opts);
+            assert_eq!(
+                b.rendered(),
+                "Goal is to deploy the application right now.",
+                "policy={:?} route={:?}",
+                opts.policy,
+                opts.route
+            );
+            assert!(!b.rendered().contains("Goal:"));
+        }
     }
 
     #[test]

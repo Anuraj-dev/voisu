@@ -2226,9 +2226,9 @@ mod tests {
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             delivered.lock().expect("delivery").as_slice(),
-            ["Goal:\nShip the rust parser."]
+            ["Goal ship the rust parser."]
         );
-        assert_eq!(completion.rendered, "Goal:\nShip the rust parser.");
+        assert_eq!(completion.rendered, "Goal ship the rust parser.");
         assert_eq!(
             completion.cloud_error,
             Some(DprCloudErrorClass::DeadlineExceeded)
@@ -2262,9 +2262,9 @@ mod tests {
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             delivered.lock().expect("delivery").as_slice(),
-            ["Goal:\nShip the rust parser."]
+            ["Goal ship the rust parser."]
         );
-        assert_eq!(completion.rendered, "Goal:\nShip the rust parser.");
+        assert_eq!(completion.rendered, "Goal ship the rust parser.");
         assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
         assert_eq!(
             completion.cloud_error,
@@ -2370,7 +2370,7 @@ mod tests {
         let completion = run_timed_format_attempt(&cloud, &clock, &mut delivery).await;
 
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(completion.rendered, "Goal:\nShip the rust parser.");
+        assert_eq!(completion.rendered, "Goal ship the rust parser.");
         assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::RateLimited));
     }
 
@@ -2701,6 +2701,19 @@ mod tests {
                 "source={source:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn spoken_goal_delivers_ordinary_words_without_heading() {
+        let completion =
+            deliver_local_spoken_marks("Goal is to deploy the application right now").await;
+        assert_eq!(
+            completion.rendered,
+            "Goal is to deploy the application right now."
+        );
+        assert!(!completion.rendered.contains("Goal:"));
+        assert!(!completion.cloud_attempted);
+        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
     }
 
     #[tokio::test]
