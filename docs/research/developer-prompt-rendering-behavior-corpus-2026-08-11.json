@@ -2496,9 +2496,9 @@
         "justification": "structured_simple_source_supported_developer_section",
         "deadline_evidence": null
       },
-      "local_baseline": "Goal:\nFix the flaky auth test.",
-      "expected_final": "Goal:\nFix the flaky auth test.",
-      "rationale": "Structured consistently renders the simple source-supported Goal section with the canonical closed label."
+      "local_baseline": "Goal fix the flaky auth test.",
+      "expected_final": "Goal fix the flaky auth test.",
+      "rationale": "Local organize no longer emits a Goal heading; spoken Goal stays ordinary words until cloud Goal is proven."
     },
     {
       "surface_hint": "messaging",

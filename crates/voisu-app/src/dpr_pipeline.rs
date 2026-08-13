@@ -2704,6 +2704,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spoken_goal_delivers_ordinary_words_without_heading() {
+        let completion =
+            deliver_local_spoken_marks("Goal is to deploy the application right now").await;
+        assert_eq!(
+            completion.rendered,
+            "Goal is to deploy the application right now."
+        );
+        assert!(!completion.rendered.contains("Goal:"));
+        assert!(!completion.cloud_attempted);
+        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+    }
+
+    #[tokio::test]
     async fn spoken_first_second_third_delivers_numbered_lines_without_cloud() {
         let completion = deliver_local_spoken_marks(
             "first do the deployment second figure out the env variable third report to me",
