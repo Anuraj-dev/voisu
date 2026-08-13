@@ -512,7 +512,15 @@ pub async fn dpr_transform_and_deliver(
             timing: None,
         },
     );
+    let organized_protected = dpr_protected_tokens(baseline.rendered(), &[]);
+    let mut protected_tokens: Vec<&str> = input.protected_tokens.to_vec();
+    for token in &organized_protected {
+        if !protected_tokens.contains(&token.as_str()) {
+            protected_tokens.push(token.as_str());
+        }
+    }
     let base_fingerprint = text_sha256_fingerprint(input.selected_source);
+    let organized_fingerprint = text_sha256_fingerprint(baseline.rendered());
     let mut cloud_attempted = false;
     let mut cloud_error = None;
     let mut candidate = None;
@@ -562,7 +570,7 @@ pub async fn dpr_transform_and_deliver(
                                 selected_source: input.selected_source,
                                 base_fingerprint: &base_fingerprint,
                                 policy: input.policy,
-                                protected_tokens: input.protected_tokens,
+                                protected_tokens: &protected_tokens,
                                 small_edit_contract: input.small_edit_contract,
                             },
                             provider_budget,
@@ -583,11 +591,16 @@ pub async fn dpr_transform_and_deliver(
                     } else if input.small_edit_contract {
                         match attempt_format_edits {
                             Some(edits) => {
+                                let edit_base = if edits.base_fingerprint == organized_fingerprint {
+                                    baseline.rendered()
+                                } else {
+                                    input.selected_source
+                                };
                                 let applied = apply_format_edits_with(
-                                    input.selected_source,
+                                    edit_base,
                                     &edits,
                                     &FormatEditSafety {
-                                        protected_tokens: input.protected_tokens,
+                                        protected_tokens: &protected_tokens,
                                         policy: input.policy,
                                     },
                                 );
@@ -630,7 +643,7 @@ pub async fn dpr_transform_and_deliver(
                     base_fingerprint: &base_fingerprint,
                     sources: input.sources,
                     source_selection: input.source_selection,
-                    protected_tokens: input.protected_tokens,
+                    protected_tokens: &protected_tokens,
                     policy: input.policy,
                     cloud_outcome: CloudOutcome::DeadlineExceeded,
                     candidate: None,
@@ -657,7 +670,7 @@ pub async fn dpr_transform_and_deliver(
                 base_fingerprint: &base_fingerprint,
                 sources: input.sources,
                 source_selection: input.source_selection,
-                protected_tokens: input.protected_tokens,
+                protected_tokens: &protected_tokens,
                 policy: input.policy,
                 cloud_outcome,
                 candidate: candidate.as_ref(),
@@ -671,7 +684,7 @@ pub async fn dpr_transform_and_deliver(
                     base_fingerprint: &base_fingerprint,
                     sources: input.sources,
                     source_selection: input.source_selection,
-                    protected_tokens: input.protected_tokens,
+                    protected_tokens: &protected_tokens,
                     policy: input.policy,
                     cloud_outcome: CloudOutcome::DeadlineExceeded,
                     candidate: None,
@@ -2532,6 +2545,210 @@ mod tests {
 
         assert_eq!(completion.rendered, baseline.rendered());
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::CandidateSchema));
+    }
+
+    async fn deliver_local_spoken_marks(source: &str) -> DprTransformCompletion {
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".to_owned(),
+        };
+        let mut delivery = RecordingDelivery {
+            calls: Arc::new(AtomicUsize::new(0)),
+            rendered: Arc::new(Mutex::new(Vec::new())),
+            initiated_ms: None,
+        };
+        let clock = FixedClock(Duration::ZERO);
+        dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &selection,
+                provider_state: ProviderState::SingleProvider,
+                policy: RenderingPolicy::Adaptive,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Unavailable,
+                clock: &clock,
+                small_edit_contract: false,
+            },
+            &mut delivery,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn spoken_dash_dash_delivers_without_cloud() {
+        let completion = deliver_local_spoken_marks("cargo test dash dash workspace").await;
+        assert_eq!(completion.rendered, "cargo test --workspace");
+        assert!(!completion.cloud_attempted);
+        assert_eq!(completion.routing.cloud_request, CloudRequest::NotAllowed);
+        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+    }
+
+    #[tokio::test]
+    async fn spoken_mark_oracles_deliver_without_cloud() {
+        for (source, expect) in [
+            ("cargo test dash dash workspace", "cargo test --workspace"),
+            (
+                "create slash voisu core slash s r c slash lib dot rs",
+                "create/voisu core/s r c/lib.rs",
+            ),
+            (
+                "https colon slash slash example dot test slash a",
+                "https://example.test/a",
+            ),
+            ("quote, leave this, unquote", "\"leave this\""),
+        ] {
+            let completion = deliver_local_spoken_marks(source).await;
+            assert_eq!(completion.rendered, expect, "source={source:?}");
+            assert!(!completion.cloud_attempted, "source={source:?}");
+            assert_eq!(
+                completion.compose_decision,
+                CompositionDecision::FallbackBaseline,
+                "source={source:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn format_edit_cannot_smash_converted_url() {
+        let source = "https colon slash slash example dot test slash a";
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".to_owned(),
+        };
+        let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
+        let converted = "https://example.test/a";
+        let url_start = converted.find("https://example.test/a").unwrap();
+        let cloud = FormatEditCloud {
+            calls: Arc::new(AtomicUsize::new(0)),
+            saw_small_edit_contract: Arc::new(Mutex::new(None)),
+            remaining_ms: Arc::new(AtomicU64::new(0)),
+            candidate: format_edit_candidate(
+                converted,
+                url_start,
+                url_start + "https://example.test/a".len(),
+                "https://example.test/a",
+                "https://evil.test/a",
+                "bounded_wording",
+            ),
+        };
+        let delivery_calls = Arc::new(AtomicUsize::new(0));
+        let mut delivery = RecordingDelivery {
+            calls: Arc::clone(&delivery_calls),
+            rendered: Arc::new(Mutex::new(Vec::new())),
+            initiated_ms: None,
+        };
+        let clock = FixedClock(Duration::ZERO);
+
+        let completion = dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &selection,
+                provider_state: ProviderState::SemanticDisagreement,
+                policy: RenderingPolicy::Adaptive,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready {
+                    boundary: &cloud,
+                    credential: &credential,
+                },
+                clock: &clock,
+                small_edit_contract: true,
+            },
+            &mut delivery,
+        )
+        .await;
+
+        assert_eq!(completion.rendered, "https://example.test/a");
+        assert!(!completion.rendered.contains("evil"));
+        assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::CandidateSchema));
+    }
+
+    #[tokio::test]
+    async fn format_edit_cannot_smash_converted_dash_dash() {
+        let source = "cargo test dash dash workspace";
+        let sources = [ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        }];
+        let selection = SourceSelection {
+            selected_provider: SttProvider::ProviderA,
+            reason: "only_available".to_owned(),
+        };
+        let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
+        let converted = "cargo test --workspace";
+        let flag_start = converted.find("--workspace").unwrap();
+        let cloud = FormatEditCloud {
+            calls: Arc::new(AtomicUsize::new(0)),
+            saw_small_edit_contract: Arc::new(Mutex::new(None)),
+            remaining_ms: Arc::new(AtomicU64::new(0)),
+            candidate: format_edit_candidate(
+                converted,
+                flag_start,
+                flag_start + "--workspace".len(),
+                "--workspace",
+                "--evil",
+                "bounded_wording",
+            ),
+        };
+        let mut delivery = RecordingDelivery {
+            calls: Arc::new(AtomicUsize::new(0)),
+            rendered: Arc::new(Mutex::new(Vec::new())),
+            initiated_ms: None,
+        };
+        let clock = FixedClock(Duration::ZERO);
+
+        let completion = dpr_transform_and_deliver(
+            DprTransformInput {
+                selected_source: source,
+                sources: &sources,
+                source_selection: &selection,
+                provider_state: ProviderState::SemanticDisagreement,
+                policy: RenderingPolicy::Adaptive,
+                english_eligible: true,
+                surface_hint: None,
+                process_hint: None,
+                timing: None,
+                protected_tokens: &[],
+                cloud: DprCloudCapability::Ready {
+                    boundary: &cloud,
+                    credential: &credential,
+                },
+                clock: &clock,
+                small_edit_contract: true,
+            },
+            &mut delivery,
+        )
+        .await;
+
+        assert_eq!(completion.rendered, "cargo test --workspace");
+        assert!(!completion.rendered.contains("evil"));
         assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
         assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::CandidateSchema));
     }
