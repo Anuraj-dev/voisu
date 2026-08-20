@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.35.2
+Version:        0.36.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,9 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Thu Aug 20 2026 Voisu maintainers <voisu@example.invalid> - 0.36.0-1
+- feat(tools): add private full-pipeline transcript evaluator (#211)
+
 * Thu Aug 20 2026 Voisu maintainers <voisu@example.invalid> - 0.35.2-1
 - fix(core): keep section organization lossless (#210)
 - docs(conventions): update stack run and test commands (#197)
