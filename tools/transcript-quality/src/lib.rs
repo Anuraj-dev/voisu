@@ -6,6 +6,7 @@
 mod completeness;
 mod evaluate;
 mod manifest;
+mod mark;
 mod metrics;
 mod report;
 
@@ -15,6 +16,11 @@ pub use manifest::{load_manifest, load_recordings, LoadedRecording, Manifest, Ma
 pub use metrics::{
     align_words, detect_critical_errors, detect_section_loss, tokenize, CriticalError,
     SectionLoss, WordError,
+};
+pub use mark::{
+    attach_reference, default_corpus_dir, default_diagnostics_dir, mark_last, newest_completed,
+    probe_daemon_activity, render_promotion, run_mark_last, Label, LabelRecord, MarkConfig,
+    Promotion, RecordingActivity, ReferenceMeta,
 };
 pub use report::{
     ArmName, ArmResult, EvaluationReport, RecordingReport, StableReport, VolatileReport,

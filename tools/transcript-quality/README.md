@@ -95,6 +95,37 @@ The JSON has a `stable` object (sorted keys, no wall-clock) and a `volatile`
 object for evaluator scoring time (not pipeline execution latency). Identical
 inputs hash to the same `stable_fingerprint`.
 
+## Mark and promote
+
+Private host tool equivalent to `mark-last good|bad`. It is not in
+`voisu --help`, packages, or service units.
+
+```sh
+cargo run --manifest-path tools/transcript-quality/Cargo.toml --bin mark-last -- \
+  good --note 'optional note'
+```
+
+It resolves the newest completed correlation ID from
+`$XDG_STATE_HOME/voisu/diagnostics/history.jsonl` (default
+`~/.local/state/voisu/diagnostics/`), refuses to mark while a Recording is
+active or when debug audio is already missing, copies the PCM with mode 0600
+into `~/.local/state/voisu/dev-audio/promoted/`, and snapshots both Source
+Transcripts, the current final, any reconstruction candidate, decision
+evidence, model ID, and timing. Secrets are scrubbed. Rolling debug capture
+under `diagnostics/audio` is left in place (seven-day expiry); only the
+promoted copy is permanent.
+
+A later adjudicated reference can be attached without replacing raw evidence:
+
+```sh
+cargo run --manifest-path tools/transcript-quality/Cargo.toml --bin mark-last -- \
+  attach-reference rec-… --file /path/to/reference.txt
+```
+
+Repeated marks of the same Recording do not create a second corpus entry.
+The tool refuses to write under a git work tree. Do not copy private audio
+into this repository.
+
 ## Tests
 
 ```sh
@@ -102,4 +133,4 @@ cargo test --manifest-path tools/transcript-quality/Cargo.toml -- --test-threads
 ```
 
 Synthetic fixtures live in `fixtures/`. They are short fake sentences, not
-Raja audio.
+Raja audio. Mark/promote tests use tempdirs and synthetic PCM only.
