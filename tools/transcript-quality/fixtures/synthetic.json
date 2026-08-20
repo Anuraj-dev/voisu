@@ -1,0 +1,57 @@
+{
+  "recordings": [
+    {
+      "correlation_id": "rec-complete",
+      "speaker": "synthetic",
+      "tags": ["completeness"],
+      "source_transcripts": {
+        "groq": "open the pravah board and move the eval ticket to review",
+        "deepgram": "open the pravah board"
+      },
+      "reference_path": "references/rec-complete.txt",
+      "reference_kind": "adjudicated"
+    },
+    {
+      "correlation_id": "rec-section-loss",
+      "speaker": "synthetic",
+      "tags": ["section-loss"],
+      "source_transcripts": {
+        "groq": "please remember this context ship the rust parser files src/main.rs",
+        "deepgram": "please remember this"
+      },
+      "reference_path": "references/rec-section-loss.txt",
+      "reference_kind": "adjudicated"
+    },
+    {
+      "correlation_id": "rec-missing-reference",
+      "speaker": "synthetic",
+      "tags": ["missing-reference"],
+      "source_transcripts": {
+        "groq": "ship the rust parser",
+        "deepgram": "ship the rust parser"
+      }
+    },
+    {
+      "correlation_id": "rec-missing-source",
+      "speaker": "synthetic",
+      "tags": ["missing-source"],
+      "source_transcripts": {
+        "groq_path": "does-not-exist-groq.txt",
+        "deepgram_path": "does-not-exist-deepgram.txt"
+      },
+      "reference_text": "ship the rust parser",
+      "reference_kind": "adjudicated"
+    },
+    {
+      "correlation_id": "rec-script-reference",
+      "speaker": "synthetic",
+      "tags": ["reading-script"],
+      "source_transcripts": {
+        "groq": "ship the rust parser",
+        "deepgram": "ship the rust parser"
+      },
+      "reference_path": "reading-script.txt",
+      "reference_kind": "script"
+    }
+  ]
+}
