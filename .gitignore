@@ -25,4 +25,5 @@ _copr_srpm/
 
 # Private evaluator reports (developer-only; the crate itself stays tracked)
 /tools/transcript-quality/out/
+/tools/transcript-quality/target/
 **/transcript-quality-report.json
