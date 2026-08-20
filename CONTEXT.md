@@ -14,6 +14,10 @@ _Avoid_: Session, clip, voice packet
 The final validated text produced from a Recording.
 _Avoid_: Output, message, transcription result
 
+**Transcript Fidelity**:
+The degree to which a Transcript preserves the meaning and complete content of the Recording. It outranks presentation polish and latency; uncertain text may remain unformatted but must not be silently deleted, invented, or reinterpreted.
+_Avoid_: Output quality, prettiness, model quality
+
 **Source Transcript**:
 Text returned independently by Groq or Deepgram before reconciliation and
 quality validation.
@@ -22,6 +26,14 @@ _Avoid_: Raw transcript, provider output
 **Merge Result**:
 The candidate text produced by reconciling two Source Transcripts.
 _Avoid_: Blend, fusion
+
+**Intent Reconstruction**:
+An experimental candidate that resolves conflicting Source Transcripts by inferring the wording and meaning the user most likely intended, including wording not present in either source.
+_Avoid_: Unrestricted merge, smart correction, AI cleanup
+
+**Structure Cue**:
+An explicit spoken marker that authorizes Voisu to organize following words as a named section. A Recording must begin with one, and later cues must occur at clear speech boundaries; ordinary cue words inside prose are not Structure Cues.
+_Avoid_: Heading keyword, magic word, section-like word
 
 **Trigger Key**:
 The user-approved global shortcut whose first activation starts a Recording and
@@ -49,4 +61,3 @@ _Avoid_: Provider error, bad transcription
 The bounded post-Recording wait during which Voisu accepts Source Transcripts
 from both cloud providers before using the valid result already available.
 _Avoid_: API timeout, race timeout
-

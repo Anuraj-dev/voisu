@@ -494,7 +494,9 @@ fn try_section_organize(text: &str, policy: RenderingPolicy) -> Option<String> {
     // Steps-only (DPR-05): numbered lines, no "Steps" header under any policy.
     if only_steps {
         let body_tokens = &tokens[sections[0].body_start..];
-        return try_numbered_steps_body(body_tokens).map(|lines| lines.join("\n"));
+        return try_numbered_steps_body(body_tokens)
+            .map(|lines| lines.join("\n"))
+            .and_then(|rendered| commit_section_organize(text, rendered));
     }
 
     let mut parts: Vec<String> = Vec::new();
@@ -556,8 +558,8 @@ fn try_section_organize(text: &str, policy: RenderingPolicy) -> Option<String> {
         return None;
     }
 
-    if policy == RenderingPolicy::Structured {
-        Some(parts.join("\n\n"))
+    let rendered = if policy == RenderingPolicy::Structured {
+        parts.join("\n\n")
     } else {
         // Natural multi-section (DPR-26):
         //   prose sections space-joined;
@@ -588,8 +590,50 @@ fn try_section_organize(text: &str, policy: RenderingPolicy) -> Option<String> {
             }
         }
         // Capitalize weekday tokens inside the assembled Natural multi-section text.
-        Some(apply_sentence_and_weekday_casing(&out, true))
+        apply_sentence_and_weekday_casing(&out, true)
+    };
+    commit_section_organize(text, rendered)
+}
+
+/// Keep organization only when every non-cue source token survives once, in order.
+fn commit_section_organize(source: &str, rendered: String) -> Option<String> {
+    if preserves_non_cue_tokens(source, &rendered) {
+        Some(rendered)
+    } else {
+        None
     }
+}
+
+fn preserves_non_cue_tokens(source: &str, rendered: &str) -> bool {
+    non_cue_content_keys(source) == non_cue_content_keys(rendered)
+}
+
+fn non_cue_content_keys(text: &str) -> Vec<String> {
+    word_tokens(text)
+        .into_iter()
+        .filter_map(|(_, _, tok)| {
+            let core = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            if core.is_empty() {
+                return None;
+            }
+            let key = ascii_lower(core);
+            if is_section_cue_key(&key) || is_step_marker_key(&key) {
+                None
+            } else {
+                Some(key)
+            }
+        })
+        .collect()
+}
+
+fn is_section_cue_key(key: &str) -> bool {
+    SECTION_CUES
+        .iter()
+        .any(|(phrase, _)| phrase.iter().any(|word| *word == key))
+}
+
+fn is_step_marker_key(key: &str) -> bool {
+    ORDINALS.iter().any(|(word, _)| *word == key) || matches!(key, "1" | "2" | "3" | "4")
 }
 
 fn natural_cue_display(label: &str) -> &str {
@@ -608,21 +652,75 @@ fn natural_cue_display(label: &str) -> &str {
 }
 
 fn find_section_spans(tokens: &[(usize, usize, &str)]) -> Vec<SectionSpan> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    // A Recording must begin with a Structure Cue (token 0 of the post-filler stream).
+    let Some((label, cue_len)) = match_section_cue(tokens, 0) else {
+        return Vec::new();
+    };
+    let mut out = vec![SectionSpan {
+        label,
+        cue_start: 0,
+        body_start: cue_len,
+    }];
+    let mut i = cue_len;
     while i < tokens.len() {
         if let Some((label, cue_len)) = match_section_cue(tokens, i) {
-            out.push(SectionSpan {
-                label,
-                cue_start: i,
-                body_start: i + cue_len,
-            });
-            i += cue_len;
-        } else {
-            i += 1;
+            if later_structure_cue(tokens, i) {
+                out.push(SectionSpan {
+                    label,
+                    cue_start: i,
+                    body_start: i + cue_len,
+                });
+                i += cue_len;
+                continue;
+            }
         }
+        i += 1;
     }
     out
+}
+
+/// Later Structure Cues occur at a sentence/pause boundary or as consecutive-cue dictation.
+/// A determiner plus a cue-shaped noun stays prose.
+fn later_structure_cue(tokens: &[(usize, usize, &str)], i: usize) -> bool {
+    if i == 0 {
+        return true;
+    }
+    let prev = tokens[i - 1].2;
+    if token_ends_speech_boundary(prev) {
+        return true;
+    }
+    !preceded_by_determiner(tokens, i)
+}
+
+fn token_ends_speech_boundary(tok: &str) -> bool {
+    tok.trim_end().ends_with(['.', '!', '?'])
+}
+
+fn preceded_by_determiner(tokens: &[(usize, usize, &str)], i: usize) -> bool {
+    let prev = tokens[i - 1].2;
+    let core = prev.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    matches!(
+        ascii_lower(core).as_str(),
+        "the"
+            | "a"
+            | "an"
+            | "my"
+            | "your"
+            | "our"
+            | "their"
+            | "his"
+            | "her"
+            | "its"
+            | "this"
+            | "that"
+            | "these"
+            | "those"
+            | "some"
+            | "any"
+    )
 }
 
 fn match_section_cue(tokens: &[(usize, usize, &str)], i: usize) -> Option<(&'static str, usize)> {
@@ -1806,6 +1904,210 @@ mod tests {
             "Goal is to deploy the application right now. Context is the production cluster. Notes check the rollback."
         );
         assert!(leftover_admits_format_cloud(mixed.rendered()));
+    }
+
+    fn rec_372011_groq_source() -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rec-372011-9-1787154075295-groq.txt");
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    fn lexical_key(tok: &str) -> Option<String> {
+        let core = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if core.is_empty() {
+            None
+        } else {
+            Some(ascii_lower(core))
+        }
+    }
+
+    fn non_cue_keys(text: &str) -> Vec<String> {
+        const CUES: &[&str] = &[
+            "goal",
+            "context",
+            "notes",
+            "steps",
+            "files",
+            "requirements",
+            "constraints",
+            "acceptance",
+            "criteria",
+        ];
+        const ORDINALS: &[&str] = &["one", "two", "three", "four", "1", "2", "3", "4"];
+        word_tokens(text)
+            .into_iter()
+            .filter_map(|(_, _, t)| lexical_key(t))
+            .filter(|k| !CUES.contains(&k.as_str()) && !ORDINALS.contains(&k.as_str()))
+            .collect()
+    }
+
+    fn assert_opening_survives(src: &str, rendered: &str, opening: &str) {
+        let lower = ascii_lower(rendered);
+        assert!(
+            lower.contains(&ascii_lower(opening)),
+            "opening {opening:?} lost from source {src:?} → {rendered:?}"
+        );
+        assert!(
+            !lower.trim_start().starts_with("goal "),
+            "false Goal section ate the prefix: {rendered:?}"
+        );
+        let src_n = word_tokens(src).len();
+        let out_n = word_tokens(rendered).len();
+        assert!(
+            out_n + 2 >= src_n,
+            "word count collapsed by deleting the prefix: {src_n} → {out_n} ({rendered:?})"
+        );
+    }
+
+    #[test]
+    fn controlled_rec_372011_groq_source_keeps_opening_prefix() {
+        // rec-372011-9-1787154075295 Groq Source Transcript.
+        let src = rec_372011_groq_source();
+        assert!(
+            src.starts_with("This paragraph deliberately"),
+            "fixture must keep the Groq opening, got {:?}",
+            &src[..src.len().min(80)]
+        );
+        for opts in [adaptive_opts(), natural_opts(), structured_opts()] {
+            let b = organize_local_baseline(&src, &opts);
+            assert_opening_survives(&src, b.rendered(), "This paragraph deliberately");
+            assert_eq!(
+                non_cue_keys(&src),
+                non_cue_keys(b.rendered()),
+                "policy={:?}: non-cue tokens missing, duplicated, or reordered → {:?}",
+                opts.policy,
+                b.rendered()
+            );
+        }
+    }
+
+    #[test]
+    fn historical_rec_115529_class_keeps_prose_prefix() {
+        // rec-115529-8-1786612351451 deletion class (minimized public wording).
+        let src = "ok so I have finished the writeup and I will remind you we are updating the docs first then we can talk about the goal during the review and the context for the notes that stay in this paragraph";
+        for opts in [adaptive_opts(), natural_opts(), structured_opts()] {
+            let b = organize_local_baseline(src, &opts);
+            assert_opening_survives(src, b.rendered(), "ok so I have finished");
+            assert!(
+                ascii_lower(b.rendered()).contains("updating the docs first"),
+                "policy={:?}: prefix prose dropped → {:?}",
+                opts.policy,
+                b.rendered()
+            );
+        }
+    }
+
+    #[test]
+    fn mid_sentence_cue_nouns_stay_prose_and_keep_prefix() {
+        let src = "The gardener explained that his goal was restoration and the context included flooding while his notes mentioned birds and the practical steps involved planting because project files included a map and funding requirements prohibited herbicides and physical constraints included a narrow road so acceptance criteria stayed a phrase in this sentence";
+        for opts in [adaptive_opts(), natural_opts(), structured_opts()] {
+            let b = organize_local_baseline(src, &opts);
+            assert_opening_survives(src, b.rendered(), "The gardener explained");
+            let lower = ascii_lower(b.rendered());
+            for noun in [
+                "goal",
+                "context",
+                "notes",
+                "steps",
+                "files",
+                "requirements",
+                "constraints",
+                "acceptance",
+                "criteria",
+            ] {
+                assert!(
+                    lower.contains(noun),
+                    "policy={:?}: cue-shaped noun {noun:?} lost → {:?}",
+                    opts.policy,
+                    b.rendered()
+                );
+            }
+            assert!(
+                !b.rendered().contains("Goal:"),
+                "mid-sentence nouns must stay prose, got {:?}",
+                b.rendered()
+            );
+        }
+    }
+
+    #[test]
+    fn first_structure_cue_must_begin_the_utterance() {
+        let dictated = "um uh goal fix the flaky auth test context it fails on CI only";
+        let organized = organize_local_baseline(dictated, &adaptive_opts());
+        assert_eq!(
+            organized.rendered(),
+            "Goal fix the flaky auth test. Context it fails on CI only."
+        );
+
+        let prose = "We talked about the goal during lunch and the context changed";
+        let kept = organize_local_baseline(prose, &adaptive_opts());
+        assert_eq!(
+            kept.rendered(),
+            "We talked about the goal during lunch and the context changed."
+        );
+        assert!(
+            !ascii_lower(kept.rendered())
+                .trim_start()
+                .starts_with("goal "),
+            "bare cue-shaped nouns inside prose must stay literal, got {:?}",
+            kept.rendered()
+        );
+    }
+
+    #[test]
+    fn organized_non_cue_tokens_survive_exactly_once() {
+        let src = "goal fix the flaky auth test context it fails on CI only requirements keep public API stable constraints no new dependencies steps one reproduce two isolate three fix four verify acceptance criteria CI is green on main files crates/voisu-core/src/auth.rs notes keep the change small";
+        for opts in [adaptive_opts(), natural_opts(), structured_opts()] {
+            let b = organize_local_baseline(src, &opts);
+            assert_eq!(
+                non_cue_keys(src),
+                non_cue_keys(b.rendered()),
+                "policy={:?}: non-cue tokens missing, duplicated, or reordered → {:?}",
+                opts.policy,
+                b.rendered()
+            );
+        }
+
+        let prefix = "Please keep this prefix before the goal during lunch and the notes after";
+        let rolled = organize_local_baseline(prefix, &adaptive_opts());
+        assert_eq!(
+            rolled.rendered(),
+            "Please keep this prefix before the goal during lunch and the notes after."
+        );
+        assert_eq!(non_cue_keys(prefix), non_cue_keys(rolled.rendered()));
+    }
+
+    #[test]
+    fn genuine_multi_section_dictation_still_organizes() {
+        let src = "goal fix the flaky auth test context it fails on CI only requirements keep public API stable constraints no new dependencies steps one reproduce two isolate three fix four verify acceptance criteria CI is green on main files crates/voisu-core/src/auth.rs notes keep the change small";
+        let expect = "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.";
+        for opts in [adaptive_opts(), natural_opts()] {
+            let b = organize_local_baseline(src, &opts);
+            assert_eq!(
+                b.rendered(),
+                expect,
+                "policy={:?}",
+                opts.policy
+            );
+        }
+        let structured = organize_local_baseline(src, &structured_opts());
+        let structured_lower = ascii_lower(structured.rendered());
+        assert!(
+            structured_lower.contains("flaky auth test"),
+            "Structured dictation dropped the Goal body: {:?}",
+            structured.rendered()
+        );
+        assert!(
+            structured_lower.contains("keep the change small"),
+            "Structured dictation dropped the Notes body: {:?}",
+            structured.rendered()
+        );
+        assert!(
+            structured.rendered().contains("1. Reproduce"),
+            "Structured dictation lost numbered steps: {:?}",
+            structured.rendered()
+        );
     }
 
     #[test]
