@@ -467,12 +467,9 @@ fn code_tokens(text: &str) -> Vec<String> {
             if cleaned.is_empty() {
                 return None;
             }
-            let camel = cleaned.chars().any(|c| c.is_ascii_uppercase())
-                && cleaned.chars().any(|c| c.is_ascii_lowercase())
-                && cleaned.chars().any(|c| c.is_ascii_alphabetic());
             if cleaned.contains('_')
                 || cleaned.contains("::")
-                || camel
+                || has_internal_lower_to_upper(cleaned)
                 || cleaned.starts_with("--")
             {
                 Some(cleaned.to_ascii_lowercase())
@@ -481,6 +478,17 @@ fn code_tokens(text: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+fn has_internal_lower_to_upper(token: &str) -> bool {
+    let mut prev_lower = false;
+    for c in token.chars() {
+        if prev_lower && c.is_ascii_uppercase() {
+            return true;
+        }
+        prev_lower = c.is_ascii_lowercase();
+    }
+    false
 }
 
 fn missing_clauses(reference: &str, hypothesis: &str) -> Vec<String> {
@@ -544,6 +552,25 @@ mod tests {
                 .iter()
                 .any(|err| err.category == "code" && err.reference_token == "runtool"),
             "runTool should be a code-token error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn sentence_initial_please_is_not_a_code_token() {
+        let errors = detect_critical_errors(
+            "Please call formatValidated",
+            "call format validated",
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|err| err.category == "code" && err.reference_token == "please"),
+            "sentence-initial Please must not be a code error, got {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|err| err.category == "code"
+                && err.reference_token == "formatvalidated"),
+            "formatValidated should still be a code-token error, got {errors:?}"
         );
     }
 

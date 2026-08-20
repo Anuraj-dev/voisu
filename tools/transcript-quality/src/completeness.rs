@@ -32,9 +32,9 @@ pub enum CompletenessChoice {
 
 /// Prefer the materially fuller safe Source Transcript.
 ///
-/// Discounts repeated filler, duplicated loops, and known outro garbage.
-/// A short coherent fragment must not beat a longer non-repetitive sibling.
-/// This is not product source selection (ticket 02).
+/// Discounts repeated filler, consecutive duplicate tokens, duplicated loops,
+/// and known outro garbage. A short coherent fragment must not beat a longer
+/// non-repetitive sibling. This is not product source selection (ticket 02).
 pub fn select_completeness_aware(
     groq: Option<&str>,
     deepgram: Option<&str>,
@@ -136,7 +136,7 @@ fn score(text: &str) -> ContentScore {
         .into_iter()
         .filter(|tok| !is_filler(tok))
         .collect();
-    let collapsed = collapse_loops(&tokens);
+    let collapsed = collapse_loops(&collapse_consecutive_duplicates(&tokens));
     let mut unique = collapsed.clone();
     unique.sort();
     unique.dedup();
@@ -151,6 +151,16 @@ fn is_filler(tok: &str) -> bool {
         tok,
         "um" | "uh" | "er" | "ah" | "hmm" | "huh" | "mhm" | "uh-huh" | "uhhuh"
     )
+}
+
+fn collapse_consecutive_duplicates(tokens: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(tokens.len());
+    for tok in tokens {
+        if out.last() != Some(tok) {
+            out.push(tok.clone());
+        }
+    }
+    out
 }
 
 fn collapse_loops(tokens: &[String]) -> Vec<String> {
@@ -254,6 +264,26 @@ mod tests {
             }
             CompletenessChoice::Missing { reason } => {
                 panic!("expected longer collapsed Deepgram, got missing: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_duplicate_tokens_do_not_count_as_fuller() {
+        let once = "deploy now";
+        let twice = "deploy now now";
+        let choice = select_completeness_aware(Some(once), Some(twice));
+        match choice {
+            CompletenessChoice::Selected { provider, text } => {
+                assert_eq!(
+                    provider,
+                    SourceProvider::Groq,
+                    "deploy now now must not beat deploy now: selected {provider:?} {text:?}"
+                );
+                assert_eq!(text, once);
+            }
+            CompletenessChoice::Missing { reason } => {
+                panic!("expected Groq deploy now, got missing: {reason}")
             }
         }
     }

@@ -20,7 +20,9 @@ cargo run --manifest-path tools/transcript-quality/Cargo.toml -- \
 (gitignored) when the manifest lives in this git work tree. A private manifest
 outside the repository still writes `transcript-quality-report.json` beside it.
 The tool refuses to write a git-tracked path unless `--out` is gitignored or
-outside the repo. Tests must pass `--out` under a tempfile.
+outside the repo. If `git check-ignore` fails (any status other than 0 or 1),
+the path is refused. An ignored or out-of-tree symlink whose target is a
+tracked file is refused. Tests must pass `--out` under a tempfile.
 
 `--deliver-scratch <path>` is recognized and refused. Default evaluation writes
 report files only. Delivery into a scratch editor is not implemented here
@@ -63,8 +65,9 @@ references, not a runtime gate.
 
 1. **completeness_aware_source** — evaluator heuristic (ticket 02 is not in
    product). Discount repeated filler, duplicated loops, and known outro
-   garbage; prefer the materially fuller safe Source Transcript. A contiguous
-   short fragment does not beat a longer sibling.
+   garbage; prefer the materially fuller safe Source Transcript. Consecutive
+   duplicate tokens are collapsed (`deploy now now` does not beat `deploy now`).
+   A contiguous short fragment does not beat a longer sibling.
 2. **guarded_pipeline** — the saved current pipeline Transcript
    (`final_transcript`). If that field is missing, the arm is `missing`. This
    tool does not re-run the organizer on the completeness-selected source and
@@ -83,13 +86,14 @@ per-Recording rows.
 Each scored arm reports strict word error (insertions, deletions,
 substitutions), critical semantic errors (negation, numbers, units, names,
 commands, paths, URLs, code tokens, missing clauses), and section loss
-(prefix or body deleted relative to the reference or to the source that fed
-the organizer). Aggregates use corpus-weighted WER (sum of edits over sum of
-reference tokens) and keep every per-Recording row.
+(prefix or body deleted relative to the reference). The saved pipeline is not
+compared against the completeness-selected source. Aggregates use
+corpus-weighted WER (sum of edits over sum of reference tokens) and keep every
+per-Recording row.
 
 The JSON has a `stable` object (sorted keys, no wall-clock) and a `volatile`
-object for timestamps and local-call latency. Identical inputs hash to the
-same `stable_fingerprint`.
+object for evaluator scoring time (not pipeline execution latency). Identical
+inputs hash to the same `stable_fingerprint`.
 
 ## Tests
 

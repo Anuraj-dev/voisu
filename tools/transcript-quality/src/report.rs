@@ -117,17 +117,107 @@ pub fn default_report_path(manifest_path: &Path) -> PathBuf {
 
 pub fn ensure_report_path_writable(path: &Path) -> Result<(), String> {
     let abs = normalize_path(path);
-    let Some(root) = git_root_of(&abs) else {
+    let resolved = resolve_for_write(&abs);
+    check_git_path_writable(&abs)?;
+    if resolved != abs {
+        check_git_path_writable(&resolved).map_err(|err| {
+            format!("{err} (resolved from {})", abs.display())
+        })?;
+    }
+    Ok(())
+}
+
+fn check_git_path_writable(path: &Path) -> Result<(), String> {
+    let Some(root) = git_root_of(path) else {
         return Ok(());
     };
-    if path_is_gitignored(&root, &abs) {
-        return Ok(());
+    match git_check_ignore(&root, path) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
+            "refusing to write report {} under git work tree {}; use --out under an ignored path (tools/transcript-quality/out/) or outside the repository",
+            path.display(),
+            root.display()
+        )),
+        Err(err) => Err(err),
     }
-    Err(format!(
-        "refusing to write report {} under git work tree {}; use --out under an ignored path (tools/transcript-quality/out/) or outside the repository",
-        abs.display(),
-        root.display()
-    ))
+}
+
+fn git_check_ignore(root: &Path, path: &Path) -> Result<bool, String> {
+    match Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["check-ignore", "-q", "--"])
+        .arg(path)
+        .status()
+    {
+        Ok(status) => ignore_status_result(status, path),
+        Err(err) => Err(format!(
+            "git check-ignore failed ({err}); refusing report path {}",
+            path.display()
+        )),
+    }
+}
+
+fn ignore_status_result(status: std::process::ExitStatus, path: &Path) -> Result<bool, String> {
+    if status.success() {
+        Ok(true)
+    } else if status.code() == Some(1) {
+        Ok(false)
+    } else {
+        Err(format!(
+            "git check-ignore failed (exit {:?}); refusing report path {}",
+            status.code(),
+            path.display()
+        ))
+    }
+}
+
+fn resolve_for_write(path: &Path) -> PathBuf {
+    resolve_for_write_depth(path, 0)
+}
+
+fn resolve_for_write_depth(path: &Path, depth: usize) -> PathBuf {
+    if depth > 8 {
+        return normalize_path(path);
+    }
+    if let Ok(canon) = fs::canonicalize(path) {
+        return canon;
+    }
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            if let Ok(target) = fs::read_link(path) {
+                let joined = if target.is_absolute() {
+                    normalize_path(&target)
+                } else if let Some(parent) = path.parent() {
+                    normalize_path(&parent.join(target))
+                } else {
+                    normalize_path(&target)
+                };
+                if joined != path {
+                    return resolve_for_write_depth(&joined, depth + 1);
+                }
+            }
+        }
+    }
+    let mut current = path.to_path_buf();
+    let mut missing = Vec::new();
+    while !current.as_os_str().is_empty() {
+        if current.exists() {
+            break;
+        }
+        match current.file_name() {
+            Some(name) => missing.push(name.to_os_string()),
+            None => break,
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    let mut resolved = fs::canonicalize(&current).unwrap_or_else(|_| normalize_path(&current));
+    for name in missing.into_iter().rev() {
+        resolved.push(name);
+    }
+    resolved
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -164,28 +254,6 @@ fn git_root_of(path: &Path) -> Option<PathBuf> {
             return None;
         }
     }
-}
-
-fn path_is_gitignored(root: &Path, path: &Path) -> bool {
-    match Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["check-ignore", "-q", "--"])
-        .arg(path)
-        .status()
-    {
-        Ok(status) if status.success() => true,
-        Ok(status) if status.code() == Some(1) => false,
-        _ => ignored_by_known_patterns(root, path),
-    }
-}
-
-fn ignored_by_known_patterns(root: &Path, path: &Path) -> bool {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if name == "transcript-quality-report.json" {
-        return true;
-    }
-    path.starts_with(root.join("tools/transcript-quality/out"))
 }
 
 pub fn write_report(report: &EvaluationReport, path: &Path) -> Result<(), String> {
@@ -442,5 +510,84 @@ mod tests {
             err.contains("refusing to write report"),
             "unexpected refuse message: {err}"
         );
+    }
+
+    #[test]
+    fn check_ignore_unknown_status_is_fail_closed() {
+        let path = Path::new("transcript-quality-report.json");
+        let status = fake_exit(128);
+        let err = ignore_status_result(status, path)
+            .expect_err("unknown git check-ignore status must refuse");
+        assert!(
+            err.contains("refusing report path"),
+            "unexpected fail-closed message: {err}"
+        );
+        assert!(
+            ignore_status_result(fake_exit(0), path).expect("exit 0 is ignored"),
+            "exit 0 must mean ignored"
+        );
+        assert!(
+            !ignore_status_result(fake_exit(1), path).expect("exit 1 is not ignored"),
+            "exit 1 must mean not ignored"
+        );
+    }
+
+    fn fake_exit(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn ignored_symlink_onto_tracked_file_is_refused() {
+        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let tracked = crate_dir.join("Cargo.toml");
+        let before = fs::read(&tracked).expect("read tracked file");
+        let out_dir = crate_dir.join("out");
+        fs::create_dir_all(&out_dir).expect("ignored out dir");
+        let link = out_dir.join(format!(
+            "symlink-attack-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&tracked, &link).expect("plant ignored symlink");
+        let err = ensure_report_path_writable(&link)
+            .expect_err("ignored symlink onto a tracked file must be refused");
+        assert!(
+            err.contains("refusing to write report"),
+            "unexpected refuse message: {err}"
+        );
+        let after = fs::read(&tracked).expect("tracked file still readable");
+        assert_eq!(before, after, "tracked git path must not be overwritten");
+        let _ = fs::remove_file(&link);
+    }
+
+    #[test]
+    fn outside_symlink_onto_tracked_file_is_refused() {
+        let tracked = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let before = fs::read(&tracked).expect("read tracked file");
+        let dir = std::env::temp_dir().join(format!(
+            "voisu-tq-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("out.json");
+        std::os::unix::fs::symlink(&tracked, &link).expect("plant outside symlink");
+        let err = ensure_report_path_writable(&link)
+            .expect_err("symlink outside git onto a tracked file must be refused");
+        assert!(
+            err.contains("refusing to write report"),
+            "unexpected refuse message: {err}"
+        );
+        let after = fs::read(&tracked).expect("tracked file still readable");
+        assert_eq!(before, after, "tracked git path must not be overwritten");
+        let _ = fs::remove_dir_all(dir);
     }
 }

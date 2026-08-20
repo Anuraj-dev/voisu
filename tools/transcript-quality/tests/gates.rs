@@ -229,11 +229,16 @@ fn section_loss_when_organized_text_drops_source_prefix() {
         } => {
             assert!(
                 section_loss.prefix,
-                "saved pipeline Transcript dropped the source prefix but section_loss.prefix is false; hypothesis={hypothesis:?} loss={section_loss:?}"
+                "saved pipeline Transcript dropped the reference prefix but section_loss.prefix is false; hypothesis={hypothesis:?} loss={section_loss:?}"
             );
             assert!(
-                section_loss.relative_to.iter().any(|item| item == "source"),
-                "section loss must cite the selected source: {:?}",
+                section_loss.relative_to.iter().any(|item| item == "reference"),
+                "section loss must cite the adjudicated reference: {:?}",
+                section_loss.relative_to
+            );
+            assert!(
+                !section_loss.relative_to.iter().any(|item| item == "source"),
+                "guarded arm must not compare against the completeness-selected source: {:?}",
                 section_loss.relative_to
             );
             assert!(
@@ -251,8 +256,21 @@ fn section_loss_when_organized_text_drops_source_prefix() {
 fn guarded_pipeline_scores_saved_final_not_organizer_on_selected_source() {
     let report = evaluate_synthetic();
     match arm(&report, "rec-saved-pipeline", "guarded_pipeline") {
-        ArmResult::Scored { hypothesis, .. } => {
+        ArmResult::Scored {
+            hypothesis,
+            section_loss,
+            ..
+        } => {
             assert_eq!(hypothesis, "ship the rust parser");
+            assert!(
+                !section_loss.any(),
+                "saved pipeline matches the reference; must not fabricate deletion vs a different source: {section_loss:?}"
+            );
+            assert!(
+                !section_loss.relative_to.iter().any(|item| item == "source"),
+                "guarded arm must not cite completeness-selected source: {:?}",
+                section_loss.relative_to
+            );
         }
         ArmResult::Missing { reason } => panic!("saved pipeline should score: {reason}"),
     }

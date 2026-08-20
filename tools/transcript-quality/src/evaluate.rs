@@ -163,6 +163,7 @@ fn evaluate_recording(
         .filter(|text| !text.is_empty());
     let (pipeline_arm, pipeline_ms) = match saved_pipeline {
         Some(final_text) => {
+            // Scoring time only. This is not current-pipeline execution latency.
             let started = Instant::now();
             let arm = score_or_missing(
                 recording.reference.as_deref(),
@@ -170,7 +171,10 @@ fn evaluate_recording(
                 None,
                 Some(final_text),
                 None,
-                selected_text.as_deref().unwrap_or(""),
+                // Source-relative section loss must use the saved Transcript,
+                // not the completeness-selected source (which may not have
+                // produced this final).
+                final_text,
             );
             (arm, Some(elapsed_ms(started)))
         }
