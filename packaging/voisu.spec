@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.36.0
+Version:        0.37.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,10 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Thu Aug 20 2026 Voisu maintainers <voisu@example.invalid> - 0.37.0-1
+- feat(format): convert embedded first/second/third lists at boundaries (#213)
+- feat(tools): mark and promote developer evidence (#212)
+
 * Thu Aug 20 2026 Voisu maintainers <voisu@example.invalid> - 0.36.0-1
 - feat(tools): add private full-pipeline transcript evaluator (#211)
 
