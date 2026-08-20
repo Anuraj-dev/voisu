@@ -15,8 +15,9 @@ const AUDIO_BYTES: &[u8] = b"pcm-fixture-01";
 const AUDIO_SHA256: &str =
     "sha256:3989e80db5a6dbcfb1f756275cf3da9215a1c53be31c18ac4a9fd7ac40986e88";
 
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn scratch_dir(label: &str) -> PathBuf {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
         "voisu-mark-{}-{}-{label}",
@@ -123,6 +124,12 @@ fn seed_newest(harness: &Harness) -> DiagnosticRecord {
 
 fn mode(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+fn chmod(path: &Path, mode: u32) {
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(mode);
+    fs::set_permissions(path, permissions).unwrap();
 }
 
 #[test]
@@ -294,6 +301,88 @@ fn refuses_git_work_tree_corpus_paths() {
     .unwrap_err();
     assert!(err.contains("git"), "{err}");
     assert!(!git_corpus.exists());
+}
+
+#[test]
+fn refuses_corpus_path_symlinked_into_git_tree() {
+    let harness = Harness::new("git-link");
+    seed_newest(&harness);
+    let tools_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("tools/transcript-quality parent")
+        .to_path_buf();
+    let link = harness.root.join("link");
+    std::os::unix::fs::symlink(&tools_dir, &link).expect("plant /tmp/link -> repo/tools");
+    let leaf = format!(
+        "should-not-write-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let corpus = link.join(&leaf);
+    let planted = tools_dir.join(&leaf);
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(planted.clone());
+    let err = mark_last(
+        &MarkConfig {
+            diagnostics_dir: &harness.diagnostics,
+            corpus_dir: &corpus,
+            activity: RecordingActivity::Idle,
+            now_ms: 1,
+        },
+        Label::Good,
+        None,
+    )
+    .unwrap_err();
+    assert!(err.contains("git"), "{err}");
+    assert!(
+        !planted.exists(),
+        "symlink into the git work tree must not create {}",
+        planted.display()
+    );
+}
+
+#[test]
+fn remake_chmods_matching_preexisting_world_readable_files() {
+    let harness = Harness::new("chmod");
+    seed_newest(&harness);
+    mark_last(
+        &harness.config(RecordingActivity::Idle),
+        Label::Good,
+        None,
+    )
+    .unwrap();
+    let entry = harness.corpus.join("rec-new");
+    let audio = entry.join("audio.pcm");
+    let snapshot = entry.join("snapshot.json");
+    let checksum = entry.join("checksum.sha256");
+    chmod(&audio, 0o644);
+    chmod(&snapshot, 0o644);
+    chmod(&checksum, 0o644);
+    chmod(&entry, 0o755);
+    chmod(&harness.corpus, 0o755);
+    assert_eq!(mode(&audio), 0o644);
+    assert_eq!(mode(&snapshot), 0o644);
+    assert_eq!(mode(&checksum), 0o644);
+    assert_eq!(mode(&entry), 0o755);
+    assert_eq!(mode(&harness.corpus), 0o755);
+
+    let second = mark_last(
+        &harness.config(RecordingActivity::Idle),
+        Label::Good,
+        None,
+    )
+    .unwrap();
+    assert!(second.already_present);
+    assert_eq!(mode(&audio), 0o600);
+    assert_eq!(mode(&snapshot), 0o600);
+    assert_eq!(mode(&checksum), 0o600);
+    assert_eq!(mode(&entry), 0o700);
+    assert_eq!(mode(&harness.corpus), 0o700);
 }
 
 #[test]

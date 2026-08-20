@@ -289,12 +289,15 @@ pub fn mark_last(
                 record.correlation_id
             ));
         }
+        ensure_private_file(&dest_audio)?;
     } else {
         write_private_new(&dest_audio, &bytes)?;
     }
 
     let snapshot_path = entry_dir.join(SNAPSHOT_FILE);
-    if !snapshot_path.is_file() {
+    if snapshot_path.is_file() {
+        ensure_private_file(&snapshot_path)?;
+    } else {
         let snapshot = build_snapshot(record, debug_audio, &checksum, bytes.len() as u64)?;
         let json = serde_json::to_vec_pretty(&snapshot)
             .map_err(|err| format!("cannot serialize snapshot: {err}"))?;
@@ -302,7 +305,9 @@ pub fn mark_last(
     }
 
     let checksum_path = entry_dir.join(CHECKSUM_FILE);
-    if !checksum_path.is_file() {
+    if checksum_path.is_file() {
+        ensure_private_file(&checksum_path)?;
+    } else {
         let line = format!("{checksum}  {AUDIO_FILE}\n");
         write_private_new(&checksum_path, line.as_bytes())?;
     }
@@ -744,10 +749,15 @@ fn refuse_git_tree(path: &Path) -> Result<(), String> {
 }
 
 fn git_root_of(path: &Path) -> Option<PathBuf> {
-    let mut dir = if path.is_dir() {
-        path.to_path_buf()
+    // Resolve symlinks first so `/tmp/link -> repo/tools` still refuses.
+    let resolved = resolve_path(path);
+    let mut dir = if resolved.is_dir() {
+        resolved
     } else {
-        path.parent().unwrap_or(path).to_path_buf()
+        match resolved.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => resolved,
+        }
     };
     loop {
         if dir.join(".git").exists() {
@@ -757,6 +767,61 @@ fn git_root_of(path: &Path) -> Option<PathBuf> {
             return None;
         }
     }
+}
+
+fn resolve_path(path: &Path) -> PathBuf {
+    resolve_path_depth(path, 0)
+}
+
+fn resolve_path_depth(path: &Path, depth: usize) -> PathBuf {
+    if depth > 8 {
+        return normalize_path(path);
+    }
+    let abs = normalize_path(path);
+    if let Ok(canon) = fs::canonicalize(&abs) {
+        return canon;
+    }
+    if let Ok(meta) = fs::symlink_metadata(&abs) {
+        if meta.file_type().is_symlink() {
+            if let Ok(target) = fs::read_link(&abs) {
+                let joined = if target.is_absolute() {
+                    normalize_path(&target)
+                } else if let Some(parent) = abs.parent() {
+                    normalize_path(&parent.join(target))
+                } else {
+                    normalize_path(&target)
+                };
+                if joined != abs {
+                    return resolve_path_depth(&joined, depth + 1);
+                }
+            }
+        }
+        // Exists, but canonicalize failed (permissions, etc.). Do not recurse.
+        return abs;
+    }
+    let mut current = abs;
+    let mut missing = Vec::new();
+    while !current.as_os_str().is_empty() {
+        if fs::symlink_metadata(&current).is_ok() {
+            break;
+        }
+        match current.file_name() {
+            Some(name) => missing.push(name.to_os_string()),
+            None => break,
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    let mut resolved = if current.as_os_str().is_empty() {
+        normalize_path(path)
+    } else {
+        resolve_path_depth(&current, depth + 1)
+    };
+    for name in missing.into_iter().rev() {
+        resolved.push(name);
+    }
+    resolved
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -818,6 +883,17 @@ fn read_regular_file(path: &Path) -> Result<Vec<u8>, String> {
         return Err(format!("not a regular file: {}", path.display()));
     }
     fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))
+}
+
+fn ensure_private_file(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| {
+        format!("cannot set permissions on {}: {err}", path.display())
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!("not a regular file: {}", path.display()));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|err| format!("cannot set permissions on {}: {err}", path.display()))
 }
 
 fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
