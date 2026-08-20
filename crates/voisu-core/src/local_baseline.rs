@@ -640,8 +640,12 @@ fn surviving_source_keys(
 ) -> Vec<String> {
     let mut skip = vec![false; tokens.len()];
     for (idx, sec) in sections.iter().enumerate() {
-        for i in sec.cue_start..sec.body_start {
-            skip[i] = true;
+        for flag in skip
+            .get_mut(sec.cue_start..sec.body_start)
+            .into_iter()
+            .flatten()
+        {
+            *flag = true;
         }
         if sec.label != "Steps" {
             continue;
@@ -654,12 +658,12 @@ fn surviving_source_keys(
         if try_numbered_steps_body(body).is_none() {
             continue;
         }
-        for i in sec.body_start..body_end {
-            if ORDINALS
-                .iter()
-                .any(|(w, _)| ascii_lower(tokens[i].2) == *w)
-            {
-                skip[i] = true;
+        for (flag, (_, _, tok)) in skip[sec.body_start..body_end]
+            .iter_mut()
+            .zip(tokens[sec.body_start..body_end].iter())
+        {
+            if ORDINALS.iter().any(|(w, _)| ascii_lower(tok) == *w) {
+                *flag = true;
             }
         }
     }
