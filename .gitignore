@@ -22,3 +22,7 @@ _copr_srpm/
 .env
 .env.*
 !.env.example
+
+# Private evaluator reports (developer-only; the crate itself stays tracked)
+/tools/transcript-quality/out/
+**/transcript-quality-report.json

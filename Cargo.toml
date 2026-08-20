@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/voisu-app", "crates/voisu-core"]
+exclude = ["tools/transcript-quality"]
 resolver = "2"
 
 [workspace.package]
