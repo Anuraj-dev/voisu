@@ -56,7 +56,19 @@ pub fn select_completeness_aware(
         (Some(groq_text), Some(deepgram_text)) => {
             let groq_score = score(&groq_text);
             let deepgram_score = score(&deepgram_text);
-            if groq_score.beats(&deepgram_score) {
+            // A contiguous fragment of a longer sibling is never the fuller source,
+            // even when unique-content counts tie.
+            if is_contiguous_fragment(&groq_score.tokens, &deepgram_score.tokens) {
+                CompletenessChoice::Selected {
+                    provider: SourceProvider::Deepgram,
+                    text: deepgram_text,
+                }
+            } else if is_contiguous_fragment(&deepgram_score.tokens, &groq_score.tokens) {
+                CompletenessChoice::Selected {
+                    provider: SourceProvider::Groq,
+                    text: groq_text,
+                }
+            } else if groq_score.beats(&deepgram_score) {
                 CompletenessChoice::Selected {
                     provider: SourceProvider::Groq,
                     text: groq_text,
@@ -66,15 +78,20 @@ pub fn select_completeness_aware(
                     provider: SourceProvider::Deepgram,
                     text: deepgram_text,
                 }
-            } else if groq_score.unique_content_words >= deepgram_score.unique_content_words {
+            } else if groq_score.tokens.len() > deepgram_score.tokens.len() {
                 CompletenessChoice::Selected {
                     provider: SourceProvider::Groq,
                     text: groq_text,
                 }
-            } else {
+            } else if deepgram_score.tokens.len() > groq_score.tokens.len() {
                 CompletenessChoice::Selected {
                     provider: SourceProvider::Deepgram,
                     text: deepgram_text,
+                }
+            } else {
+                CompletenessChoice::Selected {
+                    provider: SourceProvider::Groq,
+                    text: groq_text,
                 }
             }
         }
@@ -98,11 +115,6 @@ struct ContentScore {
 
 impl ContentScore {
     fn beats(&self, other: &ContentScore) -> bool {
-        if is_contiguous_fragment(&other.tokens, &self.tokens)
-            && self.unique_content_words > other.unique_content_words
-        {
-            return true;
-        }
         let extra = self
             .unique_content_words
             .saturating_sub(other.unique_content_words);
@@ -211,6 +223,38 @@ mod tests {
                 assert_eq!(provider, SourceProvider::Deepgram);
             }
             CompletenessChoice::Missing { reason } => panic!("unexpected missing: {reason}"),
+        }
+    }
+
+    #[test]
+    fn groq_short_prefix_loses_to_deepgram_same_unique_longer_sibling() {
+        let groq = "open the pravah board";
+        let deepgram = "open the pravah board open";
+        let choice = select_completeness_aware(Some(groq), Some(deepgram));
+        match choice {
+            CompletenessChoice::Selected { provider, text } => {
+                assert_eq!(provider, SourceProvider::Deepgram);
+                assert_eq!(text, deepgram);
+            }
+            CompletenessChoice::Missing { reason } => {
+                panic!("expected Deepgram longer sibling, got missing: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn collapsed_length_beats_groq_default_when_unique_ties() {
+        let groq = "alpha beta gamma";
+        let deepgram = "alpha gamma beta alpha";
+        let choice = select_completeness_aware(Some(groq), Some(deepgram));
+        match choice {
+            CompletenessChoice::Selected { provider, text } => {
+                assert_eq!(provider, SourceProvider::Deepgram);
+                assert_eq!(text, deepgram);
+            }
+            CompletenessChoice::Missing { reason } => {
+                panic!("expected longer collapsed Deepgram, got missing: {reason}")
+            }
         }
     }
 }

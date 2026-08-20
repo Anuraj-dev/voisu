@@ -16,9 +16,11 @@ cargo run --manifest-path tools/transcript-quality/Cargo.toml -- \
   --out /path/to/report.json
 ```
 
-`--out` is optional. The default is `transcript-quality-report.json` next to
-the manifest, so a private manifest does not write into the git tree. Tests
-must pass `--out` under a tempfile.
+`--out` is optional. The default is `tools/transcript-quality/out/transcript-quality-report.json`
+(gitignored) when the manifest lives in this git work tree. A private manifest
+outside the repository still writes `transcript-quality-report.json` beside it.
+The tool refuses to write a git-tracked path unless `--out` is gitignored or
+outside the repo. Tests must pass `--out` under a tempfile.
 
 `--deliver-scratch <path>` is recognized and refused. Default evaluation writes
 report files only. Delivery into a scratch editor is not implemented here
@@ -42,25 +44,31 @@ Each Recording may include:
 | `source_transcripts.groq_path` / `.deepgram_path` | Files with the same text |
 | `final_transcript` / `final_transcript_path` | Current guarded pipeline Transcript, if saved |
 | `reference_path` / `reference_text` | Audio-adjudicated reference |
-| `reference_kind` | `adjudicated` (default when a reference is present) or `script` |
+| `reference_kind` | `adjudicated` or `script`. Absent is not spoken truth |
+| `adjudicated` | `true` marks a reference as spoken truth without `reference_kind` |
 | `speaker` | Speaker label |
 | `tags` | Free-form test tags |
 | `rendering_policy` | `natural` / `adaptive` / `structured` for the organizer call |
 
 Relative paths resolve against the manifest directory.
 
-The original reading script is not spoken truth. `reference_kind` of `script`,
-`reading_script`, or `prompt`, or a `reading-script` / `script` tag, treats the
-reference as missing evidence.
+The original reading script is not spoken truth. A reference is used only when
+`reference_kind` is `adjudicated` (or equivalent) or `adjudicated: true`.
+`reference_kind` of `script`, `reading_script`, or `prompt`, a
+`reading-script` / `script` tag, or an unmarked reference is missing evidence.
+Audio may be absent for synthetic text-vs-text rows; it is how humans create
+references, not a runtime gate.
 
 ## Arms
 
 1. **completeness_aware_source** — evaluator heuristic (ticket 02 is not in
    product). Discount repeated filler, duplicated loops, and known outro
-   garbage; prefer the materially fuller safe Source Transcript.
-2. **guarded_pipeline** — `voisu_core::organize_local_baseline` plus
-   `format_validated` on the selected source. This tool does not reimplement
-   the organizer.
+   garbage; prefer the materially fuller safe Source Transcript. A contiguous
+   short fragment does not beat a longer sibling.
+2. **guarded_pipeline** — the saved current pipeline Transcript
+   (`final_transcript`). If that field is missing, the arm is `missing`. This
+   tool does not re-run the organizer on the completeness-selected source and
+   call that the current pipeline.
 3. **intent_reconstruction** — skipped with reason `missing` until ticket 05.
    A missing reconstruction is never scored as zero error.
 
@@ -76,7 +84,8 @@ Each scored arm reports strict word error (insertions, deletions,
 substitutions), critical semantic errors (negation, numbers, units, names,
 commands, paths, URLs, code tokens, missing clauses), and section loss
 (prefix or body deleted relative to the reference or to the source that fed
-the organizer).
+the organizer). Aggregates use corpus-weighted WER (sum of edits over sum of
+reference tokens) and keep every per-Recording row.
 
 The JSON has a `stable` object (sorted keys, no wall-clock) and a `volatile`
 object for timestamps and local-call latency. Identical inputs hash to the

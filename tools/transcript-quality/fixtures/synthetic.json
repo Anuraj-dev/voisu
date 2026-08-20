@@ -9,7 +9,8 @@
         "deepgram": "open the pravah board"
       },
       "reference_path": "references/rec-complete.txt",
-      "reference_kind": "adjudicated"
+      "reference_kind": "adjudicated",
+      "adjudicated": true
     },
     {
       "correlation_id": "rec-section-loss",
@@ -19,8 +20,23 @@
         "groq": "please remember this context ship the rust parser files src/main.rs",
         "deepgram": "please remember this"
       },
+      "final_transcript": "Context ship the rust parser. Files src/main.rs.",
       "reference_path": "references/rec-section-loss.txt",
-      "reference_kind": "adjudicated"
+      "reference_kind": "adjudicated",
+      "adjudicated": true
+    },
+    {
+      "correlation_id": "rec-saved-pipeline",
+      "speaker": "synthetic",
+      "tags": ["saved-pipeline"],
+      "source_transcripts": {
+        "groq": "please remember this context ship the rust parser",
+        "deepgram": "please remember this"
+      },
+      "final_transcript": "ship the rust parser",
+      "reference_text": "ship the rust parser",
+      "reference_kind": "adjudicated",
+      "adjudicated": true
     },
     {
       "correlation_id": "rec-missing-reference",
@@ -29,7 +45,19 @@
       "source_transcripts": {
         "groq": "ship the rust parser",
         "deepgram": "ship the rust parser"
-      }
+      },
+      "final_transcript": "ship the rust parser"
+    },
+    {
+      "correlation_id": "rec-unmarked-reference",
+      "speaker": "synthetic",
+      "tags": ["unmarked-reference"],
+      "source_transcripts": {
+        "groq": "ship the rust parser",
+        "deepgram": "ship the rust parser"
+      },
+      "final_transcript": "ship the rust parser",
+      "reference_text": "ship the rust parser"
     },
     {
       "correlation_id": "rec-missing-source",
@@ -40,7 +68,8 @@
         "deepgram_path": "does-not-exist-deepgram.txt"
       },
       "reference_text": "ship the rust parser",
-      "reference_kind": "adjudicated"
+      "reference_kind": "adjudicated",
+      "adjudicated": true
     },
     {
       "correlation_id": "rec-script-reference",
@@ -50,6 +79,7 @@
         "groq": "ship the rust parser",
         "deepgram": "ship the rust parser"
       },
+      "final_transcript": "ship the rust parser",
       "reference_path": "reading-script.txt",
       "reference_kind": "script"
     }

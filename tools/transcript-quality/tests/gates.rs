@@ -109,7 +109,7 @@ fn missing_reconstruction_is_missing_not_zero_error() {
         .get("intent_reconstruction")
         .expect("reconstruction aggregate");
     assert_eq!(agg.scored, 0);
-    assert!(agg.mean_word_error.is_none());
+    assert!(agg.corpus_word_error.is_none());
 }
 
 #[test]
@@ -131,6 +131,17 @@ fn missing_reference_and_missing_source_are_missing() {
                 )
             }
         }
+        match arm(&report, "rec-unmarked-reference", name) {
+            ArmResult::Missing { reason } => {
+                assert!(
+                    reason.contains("adjudicated") || reason.contains("marked"),
+                    "unmarked reference must not be spoken truth: {reason}"
+                );
+            }
+            ArmResult::Scored { .. } => {
+                panic!("{name} scored an unmarked reading as spoken truth")
+            }
+        }
         match arm(&report, "rec-script-reference", name) {
             ArmResult::Missing { reason } => {
                 assert!(
@@ -140,19 +151,28 @@ fn missing_reference_and_missing_source_are_missing() {
             }
             ArmResult::Scored { .. } => panic!("{name} scored a reading script as spoken truth"),
         }
-        match arm(&report, "rec-missing-source", name) {
-            ArmResult::Missing { reason } => {
-                assert!(
-                    reason.contains("Source Transcript") || reason.contains("missing"),
-                    "{name}: {reason}"
-                );
-            }
-            ArmResult::Scored { word_error, .. } => {
-                panic!(
-                    "{name} scored missing source as wer={}",
-                    word_error.error_rate
-                )
-            }
+    }
+
+    match arm(&report, "rec-missing-source", "completeness_aware_source") {
+        ArmResult::Missing { reason } => {
+            assert!(
+                reason.contains("Source Transcript") || reason.contains("missing"),
+                "completeness_aware_source: {reason}"
+            );
+        }
+        ArmResult::Scored { word_error, .. } => {
+            panic!("completeness scored missing source as wer={}", word_error.error_rate)
+        }
+    }
+    match arm(&report, "rec-missing-source", "guarded_pipeline") {
+        ArmResult::Missing { reason } => {
+            assert!(
+                reason.contains("final_transcript") || reason.contains("guarded pipeline"),
+                "guarded_pipeline: {reason}"
+            );
+        }
+        ArmResult::Scored { word_error, .. } => {
+            panic!("guarded pipeline scored missing final as wer={}", word_error.error_rate)
         }
     }
 }
@@ -181,6 +201,21 @@ fn completeness_prefers_materially_longer_non_repetitive_sibling() {
         }
         ArmResult::Missing { reason } => panic!("completeness arm missing: {reason}"),
     }
+    assert_eq!(
+        row.evidence.get("audio").map(String::as_str),
+        Some("not_provided")
+    );
+    match arm(&report, "rec-complete", "guarded_pipeline") {
+        ArmResult::Missing { reason } => {
+            assert!(
+                reason.contains("final_transcript"),
+                "unsaved current pipeline must be missing: {reason}"
+            );
+        }
+        ArmResult::Scored { hypothesis, .. } => {
+            panic!("guarded pipeline must not score organizer-on-selected-source: {hypothesis}")
+        }
+    }
 }
 
 #[test]
@@ -194,20 +229,59 @@ fn section_loss_when_organized_text_drops_source_prefix() {
         } => {
             assert!(
                 section_loss.prefix,
-                "organizer dropped the source prefix but section_loss.prefix is false; hypothesis={hypothesis:?} loss={section_loss:?}"
+                "saved pipeline Transcript dropped the source prefix but section_loss.prefix is false; hypothesis={hypothesis:?} loss={section_loss:?}"
             );
             assert!(
                 section_loss.relative_to.iter().any(|item| item == "source"),
-                "section loss must cite the source that fed the organizer: {:?}",
+                "section loss must cite the selected source: {:?}",
                 section_loss.relative_to
             );
             assert!(
                 !hypothesis
                     .to_ascii_lowercase()
                     .contains("please remember this"),
-                "fixture expected the organizer to drop the prefix; hypothesis={hypothesis}"
+                "saved pipeline Transcript dropped the prefix; hypothesis={hypothesis}"
             );
         }
         ArmResult::Missing { reason } => panic!("pipeline arm missing: {reason}"),
     }
+}
+
+#[test]
+fn guarded_pipeline_scores_saved_final_not_organizer_on_selected_source() {
+    let report = evaluate_synthetic();
+    match arm(&report, "rec-saved-pipeline", "guarded_pipeline") {
+        ArmResult::Scored { hypothesis, .. } => {
+            assert_eq!(hypothesis, "ship the rust parser");
+        }
+        ArmResult::Missing { reason } => panic!("saved pipeline should score: {reason}"),
+    }
+    match arm(&report, "rec-saved-pipeline", "completeness_aware_source") {
+        ArmResult::Scored { hypothesis, .. } => {
+            assert!(
+                hypothesis.contains("please remember this"),
+                "completeness should keep the selected source, got {hypothesis}"
+            );
+        }
+        ArmResult::Missing { reason } => panic!("completeness arm missing: {reason}"),
+    }
+}
+
+#[test]
+fn refuse_to_write_report_onto_a_tracked_git_path() {
+    let tracked = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let before = fs::read(&tracked).expect("read tracked file");
+    let err = transcript_quality::run([
+        "--manifest",
+        fixtures_manifest().to_str().unwrap(),
+        "--out",
+        tracked.to_str().unwrap(),
+    ])
+    .expect_err("must refuse tracked --out");
+    assert!(
+        err.contains("refusing to write report"),
+        "unexpected error: {err}"
+    );
+    let after = fs::read(&tracked).expect("tracked file still readable");
+    assert_eq!(before, after, "tracked git path must not be overwritten");
 }

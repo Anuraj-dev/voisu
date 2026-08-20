@@ -177,12 +177,8 @@ fn dropped_prefix_len(original: &[String], hypothesis: &[String]) -> usize {
     if original.is_empty() || hypothesis.is_empty() {
         return 0;
     }
-    if original.starts_with(hypothesis)
-        && original.len() > hypothesis.len()
-        && original.len() - hypothesis.len() >= 3
-    {
-        return original.len() - hypothesis.len();
-    }
+    // original.starts_with(hypothesis) with leftover original tokens is a
+    // dropped suffix/body, not a dropped prefix.
     let first = &hypothesis[0];
     let Some(start) = original.iter().position(|tok| tok == first) else {
         return 0;
@@ -277,12 +273,7 @@ pub fn detect_critical_errors(reference: &str, hypothesis: &str) -> Vec<Critical
     );
     push_missing_category(&mut out, "path", path_tokens(&ref_tokens), &hyp_set);
     push_missing_category(&mut out, "url", url_tokens(&ref_tokens), &hyp_set);
-    push_missing_category(
-        &mut out,
-        "code",
-        code_tokens(&ref_tokens),
-        &hyp_set,
-    );
+    push_missing_category(&mut out, "code", code_tokens(reference), &hyp_set);
 
     for clause in missing_clauses(reference, hypothesis) {
         out.push(CriticalError {
@@ -467,18 +458,28 @@ fn url_tokens(tokens: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn code_tokens(tokens: &[String]) -> Vec<String> {
-    tokens
-        .iter()
-        .filter(|tok| {
-            tok.contains('_')
-                || tok.contains("::")
-                || (tok.chars().any(|c| c.is_ascii_uppercase())
-                    && tok.chars().any(|c| c.is_ascii_lowercase())
-                    && tok.contains(|c: char| c.is_ascii_alphabetic()))
-                || tok.starts_with("--")
+fn code_tokens(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|raw| {
+            let cleaned = raw.trim_matches(|c: char| {
+                !c.is_ascii_alphanumeric() && c != '_' && c != ':' && c != '-'
+            });
+            if cleaned.is_empty() {
+                return None;
+            }
+            let camel = cleaned.chars().any(|c| c.is_ascii_uppercase())
+                && cleaned.chars().any(|c| c.is_ascii_lowercase())
+                && cleaned.chars().any(|c| c.is_ascii_alphabetic());
+            if cleaned.contains('_')
+                || cleaned.contains("::")
+                || camel
+                || cleaned.starts_with("--")
+            {
+                Some(cleaned.to_ascii_lowercase())
+            } else {
+                None
+            }
         })
-        .cloned()
         .collect()
 }
 
@@ -513,6 +514,37 @@ mod tests {
         let loss = detect_section_loss(source, source, organized);
         assert!(loss.prefix, "expected prefix section loss, got {loss:?}");
         assert!(loss.relative_to.iter().any(|r| r == "source"));
+    }
+
+    #[test]
+    fn hypothesis_that_is_a_prefix_of_source_is_body_loss_not_prefix() {
+        let source = "please remember this context ship the rust parser files src/main.rs";
+        let hypothesis = "please remember this context";
+        let loss = detect_section_loss(source, source, hypothesis);
+        assert!(
+            !loss.prefix,
+            "dropped suffix/body must not count as prefix: {loss:?}"
+        );
+        assert!(loss.body, "expected body/suffix section loss, got {loss:?}");
+    }
+
+    #[test]
+    fn camel_case_identifiers_count_as_code_token_errors() {
+        let errors = detect_critical_errors(
+            "call formatValidated then runTool",
+            "call format validated then run tool",
+        );
+        assert!(
+            errors.iter().any(|err| err.category == "code"
+                && err.reference_token == "formatvalidated"),
+            "formatValidated should be a code-token error, got {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|err| err.category == "code" && err.reference_token == "runtool"),
+            "runTool should be a code-token error, got {errors:?}"
+        );
     }
 
     #[test]

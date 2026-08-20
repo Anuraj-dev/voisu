@@ -30,9 +30,11 @@ USAGE:
       --manifest /path/to/manifest.json --out /path/to/report.json
 
 --manifest            JSON or JSONL of saved Recordings (required)
---out                 Report JSON. Default: transcript-quality-report.json
-                      next to the manifest (not under this git tree unless
-                      the manifest itself lives there)
+--out                 Report JSON. Default: tools/transcript-quality/out/
+                      transcript-quality-report.json when the manifest lives
+                      in this git tree; otherwise next to the manifest.
+                      Refuses a git-tracked path unless it is gitignored or
+                      outside the repository.
 --deliver-scratch     Request Delivery into that blank editor path.
                       Unimplemented: evaluation still runs; nothing is typed.
 --help                Print this help
@@ -55,12 +57,10 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<(), String
         );
     }
 
-    let out = parsed.out.unwrap_or_else(|| {
-        manifest_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("transcript-quality-report.json")
-    });
+    let out = parsed
+        .out
+        .unwrap_or_else(|| report::default_report_path(&manifest_path));
+    report::ensure_report_path_writable(&out)?;
 
     let config = EvalConfig {
         deliver_scratch: parsed.deliver_scratch,

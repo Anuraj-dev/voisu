@@ -30,6 +30,8 @@ pub struct ManifestRecording {
     #[serde(default)]
     pub reference_kind: Option<String>,
     #[serde(default)]
+    pub adjudicated: Option<bool>,
+    #[serde(default)]
     pub speaker: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
@@ -192,6 +194,19 @@ fn resolve_reference(
             ),
         ));
     }
+    if !reference_is_adjudicated(row) {
+        let provided = row.reference_text.as_ref().is_some_and(|t| !t.trim().is_empty())
+            || row
+                .reference_path
+                .as_ref()
+                .is_some_and(|p| !p.trim().is_empty());
+        let reason = if provided {
+            "reference is not marked adjudicated (set reference_kind to adjudicated or adjudicated=true)"
+        } else {
+            "no audio-adjudicated reference was provided"
+        };
+        return Ok((None, Some(reason.to_owned())));
+    }
     let text = load_optional_text(
         base,
         row.reference_text.as_deref(),
@@ -214,16 +229,18 @@ fn resolve_reference(
     }
 }
 
-fn reference_is_script(row: &ManifestRecording) -> bool {
-    let kind = row
-        .reference_kind
+fn reference_kind(row: &ManifestRecording) -> String {
+    row.reference_kind
         .as_deref()
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase()
-        .replace('-', "_");
+        .replace('-', "_")
+}
+
+fn reference_is_script(row: &ManifestRecording) -> bool {
     if matches!(
-        kind.as_str(),
+        reference_kind(row).as_str(),
         "script" | "reading_script" | "prompt" | "reading_prompt"
     ) {
         return true;
@@ -232,6 +249,19 @@ fn reference_is_script(row: &ManifestRecording) -> bool {
         let t = tag.trim().to_ascii_lowercase();
         t == "script" || t == "reading-script" || t == "reading_script"
     })
+}
+
+fn reference_is_adjudicated(row: &ManifestRecording) -> bool {
+    if row.adjudicated == Some(false) {
+        return false;
+    }
+    if row.adjudicated == Some(true) {
+        return true;
+    }
+    matches!(
+        reference_kind(row).as_str(),
+        "adjudicated" | "audio_adjudicated" | "spoken"
+    )
 }
 
 fn load_optional_text(

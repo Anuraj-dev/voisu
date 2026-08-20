@@ -2,11 +2,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
-use voisu_core::{
-    format_validated, organize_local_baseline, LocalBaselineOptions, RenderingPolicy,
-    RenderingRoute, WritingMode,
-};
-
 use crate::completeness::{select_completeness_aware, CompletenessChoice};
 use crate::manifest::{self, EvidencePresence, LoadedRecording};
 use crate::metrics::{align_words, detect_critical_errors, detect_section_loss};
@@ -110,6 +105,10 @@ fn evaluate_recording(
             "missing".to_owned()
         },
     );
+    evidence.insert(
+        "rendering_policy".to_owned(),
+        recording.rendering_policy.as_str().to_owned(),
+    );
 
     let mut timing: BTreeMap<String, Option<u64>> = BTreeMap::new();
     let source_started = Instant::now();
@@ -155,37 +154,29 @@ fn evaluate_recording(
         ),
     );
 
-    let (pipeline_arm, pipeline_ms) = match selected_text.as_deref() {
-        Some(source) => {
+    // Ticket 03 arm 2 is the saved current guarded pipeline, not organizer-on-
+    // completeness-selected-source.
+    let saved_pipeline = recording
+        .final_transcript
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let (pipeline_arm, pipeline_ms) = match saved_pipeline {
+        Some(final_text) => {
             let started = Instant::now();
-            let organized = run_guarded_pipeline(source, recording.rendering_policy);
-            let ms = elapsed_ms(started);
-            if organized.trim().is_empty() {
-                (
-                    ArmResult::Missing {
-                        reason: "empty Transcript after local organize (Quality Failure)".to_owned(),
-                    },
-                    Some(ms),
-                )
-            } else {
-                (
-                    score_or_missing(
-                        recording.reference.as_deref(),
-                        recording.reference_missing_reason.as_deref(),
-                        None,
-                        Some(organized.as_str()),
-                        selected_provider.as_deref(),
-                        source,
-                    ),
-                    Some(ms),
-                )
-            }
+            let arm = score_or_missing(
+                recording.reference.as_deref(),
+                recording.reference_missing_reason.as_deref(),
+                None,
+                Some(final_text),
+                None,
+                selected_text.as_deref().unwrap_or(""),
+            );
+            (arm, Some(elapsed_ms(started)))
         }
         None => (
             ArmResult::Missing {
-                reason: source_missing
-                    .clone()
-                    .unwrap_or_else(|| "no Source Transcript to feed the organizer".to_owned()),
+                reason: "no saved final_transcript for the current guarded pipeline".to_owned(),
             },
             None,
         ),
@@ -246,18 +237,6 @@ fn score_or_missing(
         selected_source: selected_source.map(str::to_owned),
         word_error,
     }
-}
-
-fn run_guarded_pipeline(source: &str, policy: RenderingPolicy) -> String {
-    let options = LocalBaselineOptions {
-        policy,
-        route: RenderingRoute::DeterministicLocal,
-        timing: None,
-    };
-    let organized = organize_local_baseline(source, &options);
-    format_validated(organized.rendered(), WritingMode::Smart)
-        .rendered()
-        .to_owned()
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
