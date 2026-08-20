@@ -166,8 +166,8 @@ fn organize_impl(source: &str, options: &LocalBaselineOptions) -> String {
     let (cued, technical_converted) = apply_bare_spoken_cues_pass(&text);
     text = cued;
 
-    // Spoken first/second/third step sequence → numbered lines (no Steps cue).
-    if let Some(steps) = try_spoken_ordinal_steps(&text) {
+    // Spoken first/second/third at start or after a speech/pause boundary → numbered lines.
+    if let Some(steps) = try_spoken_ordinal_steps(&text, options.timing.as_ref()) {
         return steps;
     }
 
@@ -457,7 +457,8 @@ const SECTION_CUES: &[(&[&str], &str)] = &[
 
 const ORDINALS: &[(&str, u8)] = &[("one", 1), ("two", 2), ("three", 3), ("four", 4)];
 
-/// Spoken step ordinals. v1 fires only on a full first/second/third sequence.
+/// Spoken step ordinals. v1 fires only on a full first/second/third sequence
+/// at utterance start or after a credible speech boundary.
 const SPOKEN_STEP_ORDINALS: &[(&str, u8)] = &[("first", 1), ("second", 2), ("third", 3)];
 
 #[derive(Clone, Debug)]
@@ -915,22 +916,26 @@ fn try_numbered_steps_body(body: &[(usize, usize, &str)]) -> Option<Vec<String>>
 }
 
 /// Convert a spoken `first` … `second` … `third` sequence into numbered lines.
-/// Requires all three ordinals, in order, starting at the first token.
-/// `The first time` and grocery comma lists do not match.
-fn try_spoken_ordinal_steps(text: &str) -> Option<String> {
+///
+/// The sequence may start the utterance or follow a credible speech boundary
+/// (previous token ends with `.!?`, an explicit spoken break / newline, or a
+/// Clear pause). Mid-clause `first` does not open a list. Later `second` /
+/// `third` must themselves sit at a speech boundary, or belong to an
+/// unpunctuated consecutive run with no `.!?` inside an item. An item body
+/// that contains `.!?` not immediately before the next ordinal fails closed.
+/// `The first time`, rankings, and dates stay prose.
+fn try_spoken_ordinal_steps(text: &str, timing: Option<&LocalTiming>) -> Option<String> {
     let tokens = word_tokens(text);
     if tokens.is_empty() {
         return None;
     }
-    if spoken_cue_token(tokens[0].2) != "first" {
-        return None;
-    }
+    let start = spoken_ordinal_list_start(text, &tokens, timing)?;
 
     let mut items: Vec<(u8, String)> = Vec::new();
-    let mut i = 0usize;
+    let mut markers: Vec<usize> = Vec::new();
+    let mut i = start;
     while i < tokens.len() {
-        let cue = spoken_cue_token(tokens[i].2);
-        let Some(&(_, num)) = SPOKEN_STEP_ORDINALS.iter().find(|(w, _)| *w == cue) else {
+        let Some(num) = spoken_list_step_number(&tokens, i) else {
             if items.is_empty() {
                 return None;
             }
@@ -941,12 +946,27 @@ fn try_spoken_ordinal_steps(text: &str) -> Option<String> {
             i += 1;
             continue;
         };
+        markers.push(i);
         i += 1;
         let mut words = Vec::new();
         while i < tokens.len() {
-            let next = spoken_cue_token(tokens[i].2);
-            if SPOKEN_STEP_ORDINALS.iter().any(|(w, _)| *w == next) {
+            if spoken_list_step_number(&tokens, i).is_some() {
                 break;
+            }
+            if token_ends_speech_boundary(tokens[i].2) {
+                let following_ordinal =
+                    i + 1 < tokens.len() && spoken_list_step_number(&tokens, i + 1).is_some();
+                if !following_ordinal && i + 1 < tokens.len() {
+                    // Intervening sentence after a boundary `first` — do not
+                    // harvest a later `second`/`third` from the rest of the Recording.
+                    return None;
+                }
+                words.push(tokens[i].2);
+                i += 1;
+                if following_ordinal {
+                    break;
+                }
+                continue;
             }
             words.push(tokens[i].2);
             i += 1;
@@ -964,13 +984,165 @@ fn try_spoken_ordinal_steps(text: &str) -> Option<String> {
             return None;
         }
     }
-    Some(
-        items
-            .into_iter()
-            .map(|(n, t)| format!("{n}. {t}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+    let list = items
+        .into_iter()
+        .map(|(n, t)| format!("{n}. {t}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rendered = join_intro_and_spoken_list(text, &tokens, start, &list);
+    commit_spoken_ordinal_steps(&tokens, &markers, rendered)
+}
+
+/// First boundary-qualified list `first`. Date/ranking `first` is skipped.
+fn spoken_ordinal_list_start(
+    text: &str,
+    tokens: &[(usize, usize, &str)],
+    timing: Option<&LocalTiming>,
+) -> Option<usize> {
+    tokens.iter().enumerate().find_map(|(i, _)| {
+        (spoken_list_step_number(tokens, i) == Some(1)
+            && spoken_list_open_boundary(text, tokens, i, timing))
+        .then_some(i)
+    })
+}
+
+/// List open is utterance-initial, after `.!?`, after an explicit spoken break,
+/// or after a Clear pause immediately before this token.
+/// Unlike [`later_structure_cue`], a mid-clause `first` never opens a list.
+fn spoken_list_open_boundary(
+    text: &str,
+    tokens: &[(usize, usize, &str)],
+    i: usize,
+    timing: Option<&LocalTiming>,
+) -> bool {
+    if i == 0 {
+        return true;
+    }
+    if token_ends_speech_boundary(tokens[i - 1].2) {
+        return true;
+    }
+    if text[tokens[i - 1].1..tokens[i].0].contains('\n') {
+        return true;
+    }
+    clear_pause_before_token(tokens, i, timing)
+}
+
+/// `first`/`second`/`third` used as a list marker, not a date or ranking.
+fn spoken_list_step_number(tokens: &[(usize, usize, &str)], i: usize) -> Option<u8> {
+    let cue = spoken_cue_token(tokens[i].2);
+    let &(_, num) = SPOKEN_STEP_ORDINALS.iter().find(|(w, _)| *w == cue)?;
+    if i > 0
+        && !token_ends_speech_boundary(tokens[i - 1].2)
+        && preceded_by_determiner(tokens, i)
+    {
+        return None;
+    }
+    if ordinal_followed_by_ranking_copula(tokens, i) {
+        return None;
+    }
+    Some(num)
+}
+
+fn ordinal_followed_by_ranking_copula(tokens: &[(usize, usize, &str)], i: usize) -> bool {
+    tokens.get(i + 1).is_some_and(|(_, _, tok)| {
+        matches!(
+            spoken_cue_token(tok).as_str(),
+            "was" | "is" | "are" | "were"
+        )
+    })
+}
+
+fn clear_pause_before_token(
+    tokens: &[(usize, usize, &str)],
+    i: usize,
+    timing: Option<&LocalTiming>,
+) -> bool {
+    let Some(timing) = timing else {
+        return false;
+    };
+    if timing.certainty != TimingCertainty::Clear || i == 0 {
+        return false;
+    }
+    timing.boundaries.iter().any(|boundary| {
+        let left: Vec<String> = boundary
+            .left_phrase
+            .split_whitespace()
+            .map(ascii_lower)
+            .collect();
+        let right: Vec<String> = boundary
+            .right_phrase
+            .split_whitespace()
+            .map(ascii_lower)
+            .collect();
+        if left.is_empty() || right.is_empty() || i < left.len() {
+            return false;
+        }
+        phrase_tokens_at(tokens, i - left.len(), &left) && phrase_tokens_at(tokens, i, &right)
+    })
+}
+
+fn phrase_tokens_at(tokens: &[(usize, usize, &str)], start: usize, phrase: &[String]) -> bool {
+    if start + phrase.len() > tokens.len() {
+        return false;
+    }
+    phrase
+        .iter()
+        .enumerate()
+        .all(|(k, w)| ascii_lower(tokens[start + k].2) == *w)
+}
+
+/// Keep a spoken `new paragraph` (`\n\n`) instead of collapsing it to one newline.
+fn join_intro_and_spoken_list(
+    text: &str,
+    tokens: &[(usize, usize, &str)],
+    start: usize,
+    list: &str,
+) -> String {
+    if start == 0 {
+        return list.to_owned();
+    }
+    let prefix = text[..tokens[start].0].trim_end();
+    if prefix.is_empty() {
+        return list.to_owned();
+    }
+    let gap = &text[tokens[start - 1].1..tokens[start].0];
+    let sep = if gap.contains("\n\n") { "\n\n" } else { "\n" };
+    let prefix = ensure_terminal_period(&capitalize_sentence_start(prefix));
+    format!("{prefix}{sep}{list}")
+}
+
+/// Keep the conversion only when every non-ordinal-marker source token survives
+/// once, in order, including introductory prose before an embedded list.
+fn commit_spoken_ordinal_steps(
+    tokens: &[(usize, usize, &str)],
+    markers: &[usize],
+    rendered: String,
+) -> Option<String> {
+    let mut skip = vec![false; tokens.len()];
+    for &i in markers {
+        skip[i] = true;
+    }
+    let source_keys: Vec<String> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !skip[*i])
+        .filter_map(|(_, (_, _, tok))| token_content_key(tok))
+        .collect();
+    let rendered_keys: Vec<String> = word_tokens(&rendered)
+        .into_iter()
+        .filter_map(|(_, _, tok)| {
+            if is_rendered_step_marker(tok) {
+                None
+            } else {
+                token_content_key(tok)
+            }
+        })
+        .collect();
+    if is_key_subsequence(&source_keys, &rendered_keys) {
+        Some(rendered)
+    } else {
+        None
+    }
 }
 
 // ─── Bare spoken cues ────────────────────────────────────────────────────────
@@ -1836,6 +2008,216 @@ mod tests {
             "ordinary first-time speech must not become a list, got {:?}",
             b.rendered()
         );
+    }
+
+    fn assert_not_numbered_list(src: &str, rendered: &str) {
+        assert!(
+            !rendered.contains("1.") && !rendered.contains("2.") && !rendered.contains("3."),
+            "ordinary ordinal prose must stay a sentence, {src:?} → {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn embedded_first_second_third_after_intro_becomes_numbered_lines() {
+        // Minimized public stand-in for controlled human test 5 (no private WAV).
+        let src = "I need you to take this in order. First do the deployment second figure out the env variable third report to me";
+        let expect = "I need you to take this in order.\n1. Do the deployment\n2. Figure out the env variable\n3. Report to me";
+        for opts in [adaptive_opts(), natural_opts(), structured_opts()] {
+            let b = organize_local_baseline(src, &opts);
+            assert_eq!(
+                b.rendered(),
+                expect,
+                "policy={:?} route={:?}",
+                opts.policy,
+                opts.route
+            );
+            assert_opening_survives(src, b.rendered(), "I need you to take this in order");
+            assert_eq!(
+                non_cue_keys(src)
+                    .into_iter()
+                    .filter(|k| !matches!(k.as_str(), "first" | "second" | "third"))
+                    .collect::<Vec<_>>(),
+                non_cue_keys(b.rendered())
+                    .into_iter()
+                    .filter(|k| !matches!(k.as_str(), "1" | "2" | "3"))
+                    .collect::<Vec<_>>(),
+                "policy={:?}: intro or list body lost → {:?}",
+                opts.policy,
+                b.rendered()
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_list_after_spoken_period_or_break_keeps_intro() {
+        let numbered = "1. Do the deployment\n2. Figure out the env variable\n3. Report to me";
+        let cases = [
+            (
+                "here is the plan period first do the deployment second figure out the env variable third report to me",
+                format!("Here is the plan.\n{numbered}"),
+            ),
+            (
+                "here is the plan new line first do the deployment second figure out the env variable third report to me",
+                format!("Here is the plan.\n{numbered}"),
+            ),
+            (
+                "here is the plan new paragraph first do the deployment second figure out the env variable third report to me",
+                format!("Here is the plan.\n\n{numbered}"),
+            ),
+        ];
+        for (src, expect) in cases {
+            for opts in [adaptive_opts(), natural_opts(), structured_opts()] {
+                let b = organize_local_baseline(src, &opts);
+                assert_eq!(
+                    b.rendered(),
+                    expect,
+                    "src={src:?} policy={:?}",
+                    opts.policy
+                );
+                assert_opening_survives(src, b.rendered(), "here is the plan");
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_ordinal_prose_stays_sentences() {
+        let cases = [
+            "The first time I tried this",
+            "she finished first second and third in the race",
+            "we met on the first of march then the second of april and the third of may",
+            "I will remind you we are updating the docs first then we can talk",
+            "I remember. The first time I tried this it failed",
+            "I remember. First I tried this it failed. Later she finished second and the third of may we shipped",
+            "The trip is booked. First of march then the second of april and the third of may",
+            "Results. First was Alice second was Bob third was Carol",
+        ];
+        for src in cases {
+            let b = organize_local_baseline(src, &adaptive_opts());
+            assert_not_numbered_list(src, b.rendered());
+            assert_eq!(
+                non_cue_keys(src),
+                non_cue_keys(b.rendered()),
+                "ordinal prose lost tokens: {src:?} → {:?}",
+                b.rendered()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_second_or_third_boundary_stays_prose() {
+        let cases = [
+            (
+                "I need you to take this in order. First do the deployment second figure out the env variable",
+                "take this in order",
+            ),
+            (
+                "I need you to take this in order. First do the deployment third report to me",
+                "take this in order",
+            ),
+            ("here is the plan. first do the deployment", "here is the plan"),
+        ];
+        for (src, opening) in cases {
+            let b = organize_local_baseline(src, &adaptive_opts());
+            assert_not_numbered_list(src, b.rendered());
+            assert_opening_survives(src, b.rendered(), opening);
+        }
+    }
+
+    #[test]
+    fn ordinal_words_without_boundary_do_not_authorize_a_list() {
+        let src = "okay first do the deployment second figure out the env variable third report to me";
+        let b = organize_local_baseline(src, &adaptive_opts());
+        assert_eq!(
+            b.rendered(),
+            "Okay first do the deployment second figure out the env variable third report to me."
+        );
+        assert_not_numbered_list(src, b.rendered());
+
+        let dictate = "now I will dictate a list first do the deployment second figure out the env variable third report to me";
+        let kept = organize_local_baseline(dictate, &adaptive_opts());
+        assert_eq!(
+            kept.rendered(),
+            "Now I will dictate a list first do the deployment second figure out the env variable third report to me."
+        );
+        assert_not_numbered_list(dictate, kept.rendered());
+    }
+
+    #[test]
+    fn the_first_time_then_bounded_list_keeps_intro() {
+        let src = "The first time I tried this it failed. First do the deployment second figure out the env variable third report to me";
+        let expect = "The first time I tried this it failed.\n1. Do the deployment\n2. Figure out the env variable\n3. Report to me";
+        let b = organize_local_baseline(src, &adaptive_opts());
+        assert_eq!(b.rendered(), expect);
+        assert_opening_survives(src, b.rendered(), "The first time I tried this");
+    }
+
+    #[test]
+    fn embedded_list_stays_literal_unless_spoken_marks() {
+        let src = "I need you to take this in order. First do the deployment second figure out the env variable third report to me";
+        let literal = organize_local_baseline(src, &literal_opts());
+        assert_eq!(literal.rendered(), src);
+        assert_not_numbered_list(src, literal.rendered());
+
+        let with_break = "here is the plan new line first do the deployment second figure out the env variable third report to me";
+        let broken = organize_local_baseline(with_break, &literal_opts());
+        assert_eq!(
+            broken.rendered(),
+            "here is the plan.\nfirst do the deployment second figure out the env variable third report to me"
+        );
+        assert_not_numbered_list(with_break, broken.rendered());
+    }
+
+    #[test]
+    fn punctuated_spoken_items_become_numbered_lines() {
+        let src = "Take this. First do X. Second do Y. Third do Z.";
+        let b = organize_local_baseline(src, &adaptive_opts());
+        assert_eq!(
+            b.rendered(),
+            "Take this.\n1. Do X.\n2. Do Y.\n3. Do Z."
+        );
+        assert_opening_survives(src, b.rendered(), "Take this");
+    }
+
+    fn adaptive_opts_with_timing(
+        certainty: TimingCertainty,
+        left: &str,
+        right: &str,
+    ) -> LocalBaselineOptions {
+        LocalBaselineOptions {
+            policy: RenderingPolicy::Adaptive,
+            route: RenderingRoute::DeterministicLocal,
+            timing: Some(LocalTiming {
+                certainty,
+                boundaries: vec![PauseBoundary {
+                    left_phrase: left.to_owned(),
+                    right_phrase: right.to_owned(),
+                    pause_ms: 720,
+                }],
+            }),
+        }
+    }
+
+    #[test]
+    fn clear_pause_before_first_authorizes_a_list() {
+        let src = "I need you to take this in order first do the deployment second figure out the env variable third report to me";
+        let without = organize_local_baseline(src, &adaptive_opts());
+        assert_not_numbered_list(src, without.rendered());
+
+        let with_pause = organize_local_baseline(
+            src,
+            &adaptive_opts_with_timing(TimingCertainty::Clear, "in order", "first do"),
+        );
+        assert_eq!(
+            with_pause.rendered(),
+            "I need you to take this in order.\n1. Do the deployment\n2. Figure out the env variable\n3. Report to me"
+        );
+        assert_opening_survives(src, with_pause.rendered(), "I need you to take this in order");
+
+        let uncertain = organize_local_baseline(
+            src,
+            &adaptive_opts_with_timing(TimingCertainty::Uncertain, "in order", "first do"),
+        );
+        assert_not_numbered_list(src, uncertain.rendered());
     }
 
     #[test]
