@@ -1,22 +1,22 @@
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Mon, 17 Aug 2026 05:00:31 +0000
+Date: Sun, 23 Aug 2026 13:38:16 +0000
 Acquire-By-Hash: yes
-Valid-Until: Wed, 16 Sep 2026 05:00:31 +0000
+Valid-Until: Tue, 22 Sep 2026 13:38:16 +0000
 Description: Voisu apt repository
 Label: Voisu
 Origin: Voisu
 Suite: stable
 MD5Sum:
- 0d7421d195819a822408f49bef09cce3             3652 main/binary-amd64/Packages
- 1c4c7c752214ccbc2ce57a9329b19948             1216 main/binary-amd64/Packages.gz
+ 489efe195efb2529caf20932472f56ea             3654 main/binary-amd64/Packages
+ 80cd5d4f427a8cfce2dd26a7914c5f59             1214 main/binary-amd64/Packages.gz
 SHA1:
- 28eef48c1d7c24f20878638568ef1c26e37cc6fc             3652 main/binary-amd64/Packages
- f85384f46b1d05a8424147698d5f3e313d5e2bae             1216 main/binary-amd64/Packages.gz
+ 3ce2312d627c2b62b3fc8d7581e6c564fcc6b18e             3654 main/binary-amd64/Packages
+ 414f55601e6be62116d5b00b2879b1cb66a8f036             1214 main/binary-amd64/Packages.gz
 SHA256:
- 44b017ff3b50f9314064eb5286bce14901d77b1b3fa5905f69a7b6dc06b547a4             3652 main/binary-amd64/Packages
- 610149e0c727071221788766830c9c9be44b1098eb9efa6e407f9aecd24df0da             1216 main/binary-amd64/Packages.gz
+ ec00f9e7a9fac196e1040b9a83036af51dd66d9553bc8fe6c025f4d6d04d8ff7             3654 main/binary-amd64/Packages
+ 9d701a1e857f47d560fd6de5aadea3ccd07122cd71d358375249b10d54070f28             1214 main/binary-amd64/Packages.gz
 SHA512:
- 7616b412729385c1b1e46548bd2e0789c596bd1f69da56e22b9de2478dbea67a39557be3cc71cb217cd1b0d68a9e23a98c368739a7a6b6e16627bc088e445768             3652 main/binary-amd64/Packages
- 83ab7f6b81be275ddc1dddaaef331698572e9d2d1a772cc02b02c9e0c4c9aec8afea7d46463f8415f71b547d2706edcd1d82901fc39830e1e775a92918884ceb             1216 main/binary-amd64/Packages.gz
+ 878b83fa9ee2cc245aed6d9b02bd3c33fcbcf24874460a914663668562010d0700961b6c6b999657e168dd8920d49e0728fe83a6647cbfc24e01607a12e8a6e6             3654 main/binary-amd64/Packages
+ 0b3a0effe41c608f217fd8ae3ae7af829d0c3da22a788fd3bcc04e8214b71211055f2a0483d4441d84b4369f6c19ab1019ed17525ceb37cd3a4b51b67468d5f2             1214 main/binary-amd64/Packages.gz
