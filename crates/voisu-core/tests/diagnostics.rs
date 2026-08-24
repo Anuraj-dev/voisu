@@ -695,6 +695,11 @@ impl TranscriptValidator for EchoValidator {
                 fallback_reason: None,
                 reconciliation_requested: false,
                 recovery_attempted: false,
+                source_selection_diagnostic: voisu_core::SourceSelectionDiagnostic {
+                    sources: Vec::new(),
+                    selected_provider: None,
+                    confidence: None,
+                },
             })
         })
     }

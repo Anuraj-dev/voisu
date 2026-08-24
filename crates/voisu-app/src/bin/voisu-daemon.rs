@@ -1721,6 +1721,7 @@ fn base_evidence(
         fallback_reason: None,
         reconciliation_requested: false,
         recovery_attempted: false,
+        source_selection_diagnostic: None,
     }
 }
 
@@ -2175,6 +2176,8 @@ async fn process_recording(
                     evidence.fallback_reason = failure.fallback_reason.clone();
                     evidence.reconciliation_requested = failure.reconciliation_requested;
                     evidence.recovery_attempted = failure.recovery_attempted;
+                    evidence.source_selection_diagnostic =
+                        Some(failure.source_selection_diagnostic.clone());
                 } else {
                     evidence.validation_reason = Some(error.diagnostic().to_owned());
                 }
@@ -2182,6 +2185,7 @@ async fn process_recording(
             }
         };
         evidence.transcript_selection = Some(decision.selection);
+        evidence.source_selection_diagnostic = Some(decision.source_selection_diagnostic.clone());
         evidence.validation_reason = Some(decision.validation_reason);
         evidence.fallback_reason = decision.fallback_reason;
         evidence.reconciliation_requested = decision.reconciliation_requested;
@@ -2626,6 +2630,11 @@ fn diagnostic_record(
     record.stages = evidence.stages.clone();
     record.streamed_chunk_count = evidence.streamed_chunk_count;
     record.source_transcripts = source_transcripts;
+    if let Some(selection) = evidence.source_selection_diagnostic.as_ref() {
+        record.source_coverage = selection.sources.clone();
+        record.selected_provider = selection.selected_provider;
+        record.selection_confidence = selection.confidence;
+    }
     record.provider_failures = provider_failures;
     if let Some(text) = final_transcript {
         record.set_final_transcript(text);

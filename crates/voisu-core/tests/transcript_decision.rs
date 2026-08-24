@@ -1243,7 +1243,7 @@ async fn contraction_fallback_refuses_when_both_sources_fail_quality_guards() {
 /// silence) passes every text-shaped guard, so before the exclusion it counted
 /// as the one quality-safe source here and `contraction_source_fallback`
 /// delivered the dots — a lost dictation dressed as a delivery, and worse from
-/// this arm than from the clean one, because the arm exists precisely to stop
+/// this arm than from the safe one, because the arm exists precisely to stop
 /// the user receiving LESS than a provider heard.
 ///
 /// The pair reaches reconciliation at all because the only worded source is
@@ -1538,10 +1538,10 @@ async fn a_fragment_source_is_gated_by_length_ratio_not_merged() {
 }
 
 #[tokio::test]
-async fn clean_source_fallback_selects_by_quality_not_a_fixed_provider() {
+async fn safe_source_fallback_selects_by_quality_not_a_fixed_provider() {
     // Two overlapping sources disagree (one is riddled with stutter, so they
     // reconcile rather than gate), reconciliation then FAILS, and the
-    // clean-source fallback must select the cleaner Deepgram source — NOT Groq
+    // safe-source fallback must select the higher-quality Deepgram source — NOT Groq
     // by a fixed max-provider preference.
     let mut pipeline =
         TranscriptDecisionPipeline::new(FailingReconcileModel, Duration::from_millis(50));
@@ -1567,6 +1567,169 @@ async fn clean_source_fallback_selects_by_quality_not_a_fixed_provider() {
     );
     assert!(decision.reconciliation_requested);
     assert!(decision.fallback_reason.unwrap().contains("cloud reconciliation failed"));
+}
+
+#[tokio::test]
+async fn reconciliation_failure_prefers_a_materially_fuller_safe_source_before_cohesion() {
+    let mut pipeline =
+        TranscriptDecisionPipeline::new(FailingReconcileModel, Duration::from_millis(50));
+
+    let complete = "Review the deployment plan with the platform team tomorrow morning then send the approved rollback checklist to operations before the release window opens.";
+    let fragment = "Review the deployment plan with the platform team tomorrow morning.";
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: complete.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: fragment.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(decision.transcript.0, complete);
+    assert!(decision.reconciliation_requested);
+    assert!(decision.validation_reason.contains("materially fuller safe Source Transcript"));
+    assert!(decision.validation_reason.contains("raw words"));
+    assert!(decision.validation_reason.contains("adjusted coverage"));
+    assert!(decision.validation_reason.contains("repetition discount"));
+    assert!(decision.validation_reason.contains("confidence high"));
+    assert!(decision.validation_reason.contains("safety passed"));
+    assert_eq!(
+        decision.source_selection_diagnostic.selected_provider,
+        Some(Provider::Deepgram)
+    );
+    assert_eq!(
+        decision.source_selection_diagnostic.confidence,
+        Some(voisu_core::SourceSelectionConfidence::High)
+    );
+}
+
+#[tokio::test]
+async fn repeated_filler_does_not_make_a_source_materially_fuller() {
+    let mut pipeline =
+        TranscriptDecisionPipeline::new(FailingReconcileModel, Duration::from_millis(50));
+
+    let complete = "Review the deployment plan with the platform team tomorrow and send the rollback checklist to operations.";
+    let padded = "Review the deployment plan with the platform team tomorrow um um um um um um um um um um um um.";
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: complete.to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: padded.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(decision.transcript.0, complete);
+    let groq = decision
+        .source_selection_diagnostic
+        .sources
+        .iter()
+        .find(|source| source.provider == Provider::Groq)
+        .unwrap();
+    assert_eq!(groq.repetition_discount, 10);
+    assert_eq!(groq.adjusted_coverage, groq.raw_words - 10);
+}
+
+#[tokio::test]
+async fn selection_diagnostics_measure_unclamped_sanitized_source_transcripts() {
+    let complete = std::iter::repeat_n("deploy", 2_000).collect::<Vec<_>>().join(" ");
+    let fragment = std::iter::repeat_n("deploy", 1_000).collect::<Vec<_>>().join(" ");
+    let mut pipeline =
+        TranscriptDecisionPipeline::new(FailingReconcileModel, Duration::from_millis(50));
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: complete.clone(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: fragment,
+            },
+        ])
+        .await
+        .unwrap();
+
+    let deepgram = decision
+        .source_selection_diagnostic
+        .sources
+        .iter()
+        .find(|source| source.provider == Provider::Deepgram)
+        .unwrap();
+    assert_eq!(deepgram.raw_words, 2_000);
+    assert!(voisu_core::SourceTranscriptRecord::new(&SourceTranscript {
+        provider: Provider::Deepgram,
+        text: complete,
+    })
+    .text
+    .split_whitespace()
+    .count()
+        < deepgram.raw_words);
+}
+
+#[tokio::test]
+async fn repeated_negation_and_function_words_are_not_discounted_as_filler() {
+    let mut pipeline =
+        TranscriptDecisionPipeline::new(FailingReconcileModel, Duration::from_millis(50));
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Do not deploy, do not restart, do not delete, and do not approve the release."
+                    .to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Do not deploy, restart, delete, or approve the release today.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    let deepgram = decision
+        .source_selection_diagnostic
+        .sources
+        .iter()
+        .find(|source| source.provider == Provider::Deepgram)
+        .unwrap();
+    assert_eq!(deepgram.raw_words, 15);
+    assert_eq!(deepgram.adjusted_coverage, 15);
+    assert_eq!(deepgram.repetition_discount, 0);
+}
+
+#[tokio::test]
+async fn near_equal_safe_sources_keep_existing_evidence_tiers() {
+    let mut pipeline =
+        TranscriptDecisionPipeline::new(FailingReconcileModel, Duration::from_millis(50));
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Deploy the Kubernetes cluster with twelve worker nodes and sixty four gigabytes of memory per node for production.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Deploy the the Kubernetes cluster with twelve worker nodes and sixty four gigabytes memory per node for the production workload.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert!(!decision.validation_reason.contains("materially fuller"));
 }
 
 /// A provider transcribing silence or noise can return punctuation only
@@ -1619,12 +1782,12 @@ async fn a_wordless_source_transcript_is_never_delivered_over_heard_words() {
 }
 
 /// The companion pin the wordless fix must not break: filtering the wordless
-/// side must leave the sibling DELIVERED, not refused, and a clean sibling
+/// side must leave the sibling DELIVERED, not refused, and a safe sibling
 /// needs no reconciliation model at all — a merge with a stub has nothing to
 /// merge. Both provider positions are pinned so the selection follows the
 /// words, not the slot.
 #[tokio::test]
-async fn a_clean_source_beside_a_wordless_sibling_is_delivered_without_reconciliation() {
+async fn a_safe_source_beside_a_wordless_sibling_is_delivered_without_reconciliation() {
     let spoken = "Send the deployment summary to the platform team before the Friday standup.";
     let cases = [
         (spoken, "...", TranscriptSelection::SourceDeepgram),
@@ -1743,6 +1906,10 @@ async fn unique_word_salad_with_no_cross_agreement_is_gated_and_dictation_wins()
         reason.contains("low-confidence"),
         "a selection decided without cross-source evidence must be marked low-confidence: {reason}"
     );
+    assert_eq!(
+        decision.source_selection_diagnostic.confidence,
+        Some(voisu_core::SourceSelectionConfidence::Low)
+    );
 }
 
 #[tokio::test]
@@ -1787,7 +1954,7 @@ async fn gated_selection_is_stable_under_provider_position_swap() {
 async fn reconciliation_failure_fallback_is_not_gamed_by_a_partially_overlapping_salad() {
     // §3.4 fallback path: the salad shares just enough content words ("cache",
     // "value") with the dictation to slip past the divergence gate, the pair
-    // reconciles, and reconciliation FAILS. The clean-source fallback must not
+    // reconciles, and reconciliation FAILS. The safe-source fallback must not
     // rank by an intrinsic score a unique-word salad inflates — it must select
     // the source whose content the OTHER source confirms: the dictation's words
     // are heavily confirmed by the salad's stolen terms, while the salad's
@@ -2444,7 +2611,7 @@ async fn source_derived_initial_reconciliation_still_delivers_as_reconciled() {
 
 /// #98 co-land guard: Qwen-style meta and GPT-OSS-style refusals pass
 /// `quality_failure_reason` but invent vocabulary no Source Transcript heard.
-/// They must fall straight to clean_source_fallback — no Repair, no delivery.
+/// They must fall straight to safe_source_fallback — no Repair, no delivery.
 #[tokio::test]
 async fn non_source_derived_initial_reconciliation_falls_back_without_repair() {
     let fixtures = [
@@ -2478,7 +2645,7 @@ async fn non_source_derived_initial_reconciliation_falls_back_without_repair() {
             .await
             .unwrap_or_else(|error| {
                 panic!(
-                    "non-source-derived reconcile must fall back to a clean source, not refuse: {candidate:?}: {}",
+                    "non-source-derived reconcile must fall back to a safe source, not refuse: {candidate:?}: {}",
                     error.diagnostic()
                 )
             });
@@ -2493,7 +2660,7 @@ async fn non_source_derived_initial_reconciliation_falls_back_without_repair() {
                 decision.selection,
                 TranscriptSelection::SourceDeepgram | TranscriptSelection::SourceGroq
             ),
-            "expected a clean Source Transcript, got {:?} for {candidate:?}",
+            "expected a safe Source Transcript, got {:?} for {candidate:?}",
             decision.selection
         );
         assert!(
@@ -2752,6 +2919,24 @@ async fn pure_outro_sources_refuse_without_model_and_without_delivery() {
         "{}",
         error.diagnostic()
     );
+    let diagnostic = &error
+        .transcript_failure()
+        .expect("refusal should preserve Source Transcript evidence")
+        .source_selection_diagnostic;
+    assert_eq!(diagnostic.sources.len(), 2);
+    assert_eq!(diagnostic.selected_provider, None);
+    assert_eq!(diagnostic.confidence, None);
+    for provider in [Provider::Deepgram, Provider::Groq] {
+        let source = diagnostic
+            .sources
+            .iter()
+            .find(|source| source.provider == provider)
+            .expect("both provider records should survive sanitization");
+        assert_eq!(source.raw_words, 0);
+        assert_eq!(source.adjusted_coverage, 0);
+        assert_eq!(source.repetition_discount, 0);
+        assert!(!source.safety_passed);
+    }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
@@ -2922,11 +3107,11 @@ async fn a_leaked_meta_reasoning_preamble_is_still_repaired() {
 }
 
 /// The floor decides PREFERENCE, not delivery. Both Source Transcripts here are
-/// clean and complete; a repair that hands back six words of them is a summary,
+/// safe and complete; a repair that hands back six words of them is a summary,
 /// and a user who spoke fifteen words must get a full Source Transcript rather
 /// than the model's precis.
 #[tokio::test]
-async fn a_contracted_repair_loses_to_a_clean_source_transcript() {
+async fn a_contracted_repair_loses_to_a_safe_source_transcript() {
     let deepgram = "Book the conference room for Tuesday afternoon and invite the entire design review team today.";
     let groq = "Schedule the platform review for Wednesday morning and invite the release engineering group tomorrow.";
     let mut pipeline = TranscriptDecisionPipeline::new(
@@ -3151,7 +3336,7 @@ async fn remaining_quality_guardrails_repair_unsafe_merge_results() {
 }
 
 #[tokio::test]
-async fn failed_recovery_falls_back_to_a_clean_groq_source_transcript() {
+async fn failed_recovery_falls_back_to_a_safe_groq_source_transcript() {
     let mut pipeline =
         TranscriptDecisionPipeline::new(AlwaysUnsafeModel, Duration::from_millis(50));
 
