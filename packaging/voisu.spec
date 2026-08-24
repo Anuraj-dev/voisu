@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.37.0
+Version:        0.37.1
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,12 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Mon Aug 24 2026 Voisu maintainers <voisu@example.invalid> - 0.37.1-1
+- fix(core): prefer complete safe source transcripts (#215)
+- docs(research): add formatting model notes
+- docs(status): record v0.35.2 host validation
+- docs(research): record 2026-08-20 Grok 4.6 vs Sol review bakeoff (#214)
+
 * Thu Aug 20 2026 Voisu maintainers <voisu@example.invalid> - 0.37.0-1
 - feat(format): convert embedded first/second/third lists at boundaries (#213)
 - feat(tools): mark and promote developer evidence (#212)
