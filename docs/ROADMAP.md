@@ -40,18 +40,30 @@ Shipped and working in the current release:
   - Arch / AUR (`voisu` from source, `voisu-bin` prebuilt)
   - Debian / Ubuntu apt repo (GPG-signed, self-hosted on GitHub Pages;
     targets Ubuntu 26.04 LTS amd64)
-  - GitHub Releases (`.deb`, tarball, `SHA256SUMS`)
+- GitHub Releases (`.deb`, tarball, `SHA256SUMS`)
+
+## Current host status
+
+As of 2026-08-24, the installed `voisu-bin` `0.35.2-1` works on Raja's
+Omarchy/Hyprland host. Both user services are enabled and active. `voisu doctor`
+passes every check. Left Alt starts and stops Recordings, and clipboard Delivery
+works. No active runtime issue is known on this configured host.
+
+The remaining work is release follow-through and transcript-quality experiments.
+It is not a current installation failure.
 
 ## Next
 
-- **Systematic live desktop validation** across KDE, GNOME, and Hyprland
-  (install + run + overlay + Trigger Key + Delivery), beyond ad-hoc testing.
-- **Hyprland Type Delivery** — decide between clipboard-only support and a
-  wlroots virtual-keyboard delivery backend (see Known limitations). A
-  `voisu doctor` RemoteDesktop probe is a planned follow-up either way.
-- **First-run robustness** — continued hardening of fresh-home provisioning and
-  `voisu doctor` guidance for portal/shortcut setup failures.
-- **Scripted apt smoke test** to complement the release install-smoke gate.
+- Finish the `v0.35.2` host replay for the section-loss fix: one controlled
+  prefix-loss case and one natural multi-cue Recording.
+- Implement complete-source selection so a shorter but coherent provider result
+  cannot beat a materially fuller safe result.
+- Add the host-only Intent Reconstruction path, then run the six-Recording pilot.
+  Run the 30–50 Recording trial only if that pilot passes.
+- Tune Raja's private vocabulary and use the measured results to decide whether
+  Intent Reconstruction should stay experimental or become ordinary behavior.
+- Move the working Hyprland service setup into the package/setup flow and run the
+  cold-login gate.
 
 ## Known limitations
 

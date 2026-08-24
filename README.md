@@ -68,20 +68,21 @@ systemctl --user enable --now voisu-overlay.service
 How you pick the Trigger Key depends on your desktop's portal:
 
 - **KDE Plasma / GNOME:** a system dialog appears the first time the daemon
-  starts — choose the key once and it persists.
+  starts — choose Left Alt to match Voisu's default, and it persists.
 - **Hyprland:** there is no dialog by design. Install
   `xdg-desktop-portal-hyprland`, start the daemon, then read the registered
-  shortcut and declare the bind in `hyprland.conf`:
+  shortcut and declare the bind in `hyprland.conf`. Voisu's documented default
+  compositor binding is Left Alt (`code:64`):
 
   ```sh
   hyprctl globalshortcuts        # shows the exact appid:voisu-toggle string
   ```
 
   ```conf
-  bind = SUPER, D, global, voisu:voisu-toggle   # use the exact string hyprctl printed
+  bind = , code:64, global, voisu:voisu-toggle   # use the exact string hyprctl printed
   ```
 
-  `SUPER, D` is only an example key; the part after `global,` must match
+  If you choose another key, replace `code:64`; the part after `global,` must match
   `hyprctl globalshortcuts` verbatim (the app-id half can be empty, e.g.
   `:voisu-toggle`). Plain wlroots portals do not implement GlobalShortcuts, so
   the Trigger Key cannot bind without `xdg-desktop-portal-hyprland`.
