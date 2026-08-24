@@ -199,6 +199,31 @@ impl SourceTranscriptRecord {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SourceCoverageRecord {
+    pub provider: Provider,
+    pub raw_words: usize,
+    pub adjusted_coverage: usize,
+    pub repetition_discount: usize,
+    pub safety_passed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceSelectionConfidence {
+    High,
+    Low,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SourceSelectionDiagnostic {
+    pub sources: Vec<SourceCoverageRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_provider: Option<Provider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<SourceSelectionConfidence>,
+}
+
 /// The recorded location and expiry of an explicitly captured debug audio file.
 /// Its presence is the only way raw audio is retained; without debug capture it
 /// is `None`. Only a validated basename is stored — never an arbitrary path — so
@@ -589,10 +614,16 @@ pub struct DiagnosticRecord {
     pub streamed_chunk_count: u32,
     #[serde(default)]
     pub source_transcripts: Vec<SourceTranscriptRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_coverage: Vec<SourceCoverageRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_transcript: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<TranscriptSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_provider: Option<Provider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_confidence: Option<SourceSelectionConfidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -649,8 +680,11 @@ impl DiagnosticRecord {
             stages: Vec::new(),
             streamed_chunk_count: 0,
             source_transcripts: Vec::new(),
+            source_coverage: Vec::new(),
             final_transcript: None,
             selection: None,
+            selected_provider: None,
+            selection_confidence: None,
             validation_reason: None,
             fallback_reason: None,
             reconciliation_requested: false,

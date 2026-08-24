@@ -170,6 +170,7 @@ mod tests {
             fallback_reason: None,
             reconciliation_requested: false,
             recovery_attempted: false,
+            source_selection_diagnostic: None,
         }
     }
 

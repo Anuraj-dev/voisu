@@ -29,7 +29,8 @@ pub use diagnostics::{
     DebugAudioRecord, DiagnosticExport, DiagnosticRecord, DiagnosticStore,
     EnglishEligibilityOutcome, PruneOutcome, ReplayOutcome, RetentionPolicy,
     SmartWritingDiagnostic, SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome,
-    SmartWritingReasonCode, SourceTranscriptRecord, DEFAULT_DEBUG_AUDIO_TTL, DEFAULT_MAX_AGE,
+    SmartWritingReasonCode, SourceCoverageRecord, SourceSelectionConfidence,
+    SourceSelectionDiagnostic, SourceTranscriptRecord, DEFAULT_DEBUG_AUDIO_TTL, DEFAULT_MAX_AGE,
     DEFAULT_MAX_RECORDS, EXPORT_ENV_ALLOWLIST, MAX_MODEL_ID_UTF8_BYTES,
     MAX_SMART_WRITING_DIAGNOSTIC_EDITS, MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES,
     MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES, MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES,
@@ -350,6 +351,8 @@ pub struct LifecycleEvidence {
     pub reconciliation_requested: bool,
     #[serde(default)]
     pub recovery_attempted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_selection_diagnostic: Option<SourceSelectionDiagnostic>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -568,6 +571,7 @@ pub struct TranscriptFailureEvidence {
     pub fallback_reason: Option<String>,
     pub reconciliation_requested: bool,
     pub recovery_attempted: bool,
+    pub source_selection_diagnostic: SourceSelectionDiagnostic,
 }
 
 impl BoundaryError {
@@ -1146,6 +1150,7 @@ pub struct TranscriptDecision {
     pub fallback_reason: Option<String>,
     pub reconciliation_requested: bool,
     pub recovery_attempted: bool,
+    pub source_selection_diagnostic: SourceSelectionDiagnostic,
 }
 
 pub struct TranscriptDecisionPipeline<M> {
@@ -1187,6 +1192,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         // model call so silence + "Thank you for watching!" never becomes a
         // Delivery and never spends a reconciliation attempt.
         sources = sanitize_source_transcripts(sources);
+        let sanitized_sources = sources.clone();
         sources.retain(|source| !source.text.is_empty());
         if sources.is_empty() {
             let validation_reason = "hallucinated suffix; no Source Transcript remains after stripping ASR outros".to_owned();
@@ -1197,6 +1203,11 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                         fallback_reason: Some("hallucinated suffix".to_owned()),
                         reconciliation_requested: false,
                         recovery_attempted: false,
+                        source_selection_diagnostic: source_selection_diagnostic(
+                            &sanitized_sources,
+                            None,
+                            None,
+                        ),
                     }),
             );
         }
@@ -1252,6 +1263,15 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                     fallback_reason: None,
                     reconciliation_requested: false,
                     recovery_attempted: false,
+                    source_selection_diagnostic: source_selection_diagnostic(
+                        &sources,
+                        Some(selected.provider),
+                        Some(if lexically_identical {
+                            SourceSelectionConfidence::High
+                        } else {
+                            SourceSelectionConfidence::Low
+                        }),
+                    ),
                 });
             }
 
@@ -1286,6 +1306,11 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                         fallback_reason: Some(gate.reason),
                         reconciliation_requested: false,
                         recovery_attempted: false,
+                        source_selection_diagnostic: source_selection_diagnostic(
+                            &sources,
+                            Some(winner.provider),
+                            Some(gate.confidence),
+                        ),
                     });
                 }
                 // The better source itself failed a quality guardrail: fall
@@ -1304,7 +1329,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 match tokio::time::timeout(self.deadline, request.as_mut()).await {
                     Ok(Ok(merge_result)) => merge_result,
                     Ok(Err(error)) => {
-                        return clean_source_fallback(
+                        return safe_source_fallback(
                             &sources,
                             format!("cloud reconciliation failed: {}", error.diagnostic()),
                             true,
@@ -1322,7 +1347,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                         let _ =
                             tokio::time::timeout(RECONCILIATION_CLEANUP_GRACE, request.as_mut())
                                 .await;
-                        return clean_source_fallback(
+                        return safe_source_fallback(
                             &sources,
                             "cloud reconciliation deadline elapsed".to_owned(),
                             true,
@@ -1340,14 +1365,14 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                     .repair_candidate(&sources, merge_result, reason, true)
                     .await;
             }
-            // Reconcile success requires both a clean quality check and
-            // source-derived vocabulary. A model may return short, clean
+            // Reconcile success requires both a passed safety check and
+            // source-derived vocabulary. A model may return short, guardrail-passing
             // meta/refusal text that trips no quality marker yet invents words
             // no provider heard — deliver that as Reconciled and the user is
             // typed a non-transcript. Fall back without Repair: Repair exists
             // for quality failures, not for non-source-derived invent.
             if !is_source_derived(&merge_result.0, &sources) {
-                return clean_source_fallback(
+                return safe_source_fallback(
                     &sources,
                     "reconciliation produced words absent from every Source Transcript"
                         .to_owned(),
@@ -1362,6 +1387,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 fallback_reason: None,
                 reconciliation_requested: true,
                 recovery_attempted: false,
+                source_selection_diagnostic: source_selection_diagnostic(&sources, None, None),
             });
         }
 
@@ -1388,6 +1414,11 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             fallback_reason: None,
             reconciliation_requested: false,
             recovery_attempted: false,
+            source_selection_diagnostic: source_selection_diagnostic(
+                &sources,
+                Some(source.provider),
+                Some(SourceSelectionConfidence::High),
+            ),
         })
     }
 
@@ -1410,7 +1441,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             match tokio::time::timeout(self.deadline, request.as_mut()).await {
                 Ok(Ok(repaired)) => repaired,
                 Ok(Err(error)) => {
-                    return clean_source_fallback(
+                    return safe_source_fallback(
                         sources,
                         format!("recovery failed: {}", error.diagnostic()),
                         reconciliation_requested,
@@ -1425,7 +1456,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                     cancel.cancel();
                     let _ = tokio::time::timeout(RECONCILIATION_CLEANUP_GRACE, request.as_mut())
                         .await;
-                    return clean_source_fallback(
+                    return safe_source_fallback(
                         sources,
                         "recovery deadline elapsed".to_owned(),
                         reconciliation_requested,
@@ -1437,7 +1468,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         let failure = quality_failure_reason(&repaired.0, sources);
         if let Some(failure) = &failure {
             if !failure.is_contraction() {
-                return clean_source_fallback(
+                return safe_source_fallback(
                     sources,
                     format!("recovery produced {}", failure.reason()),
                     reconciliation_requested,
@@ -1446,7 +1477,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             }
         }
         if !is_source_derived(&repaired.0, sources) {
-            return clean_source_fallback(
+            return safe_source_fallback(
                 sources,
                 "recovery produced words no Source Transcript contains".to_owned(),
                 reconciliation_requested,
@@ -1455,7 +1486,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         }
         if let Some(failure) = failure {
             // The repair contracted past the merge floor. It is built out of
-            // words the providers heard and is otherwise clean, so it is still
+            // words the providers heard and otherwise passes guardrails, so it is still
             // the user's speech — but a complete Source Transcript carries more
             // of it, and preferring one is exactly what the floor is for. The
             // fallback follows the spec's contraction rule: the LONGER Source
@@ -1465,7 +1496,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             // The floor decides PREFERENCE, not delivery. When the offending
             // text was in both Source Transcripts, neither is safe and this
             // repair is all that is left of the Recording; refusing it there
-            // was the round-1 P0. So a failure to find a clean source hands the
+            // was the round-1 P0. So a failure to find a safe source hands the
             // repair over rather than losing the dictation — with the measured
             // contraction on the diagnostic record, because a silently
             // delivered précis is the case an operator tuning the floor most
@@ -1482,11 +1513,12 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 transcript: Transcript(repaired.0.trim().to_owned()),
                 selection: TranscriptSelection::Repaired,
                 validation_reason: format!(
-                    "repaired {reason}; delivered a contracted repair because neither Source Transcript is clean"
+                    "repaired {reason}; delivered a contracted repair because neither Source Transcript is safe"
                 ),
                 fallback_reason: Some(failure.reason()),
                 reconciliation_requested,
                 recovery_attempted: true,
+                source_selection_diagnostic: source_selection_diagnostic(sources, None, None),
             });
         }
         Ok(TranscriptDecision {
@@ -1496,6 +1528,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             fallback_reason: None,
             reconciliation_requested,
             recovery_attempted: true,
+            source_selection_diagnostic: source_selection_diagnostic(sources, None, None),
         })
     }
 }
@@ -1520,31 +1553,24 @@ fn contraction_source_fallback(
     recovery_attempted: bool,
 ) -> Result<TranscriptDecision, BoundaryError> {
     let safe = quality_safe_sources(sources);
-    let source = match safe.as_slice() {
+    let selected = match safe.as_slice() {
         [] => None,
-        [only] => Some(*only),
+        [only] => Some((
+            *only,
+            source_selection_diagnostic(
+                sources,
+                Some(only.provider),
+                Some(SourceSelectionConfidence::High),
+            ),
+        )),
         [left, right, ..] => {
-            let left_words = normalized_words(&left.text);
-            let right_words = normalized_words(&right.text);
-            let left_padded = surplus_is_self_repetition(&left_words, &right_words);
-            let right_padded = surplus_is_self_repetition(&right_words, &left_words);
-            Some(match (left_padded, right_padded) {
-                (true, false) => *right,
-                (false, true) => *left,
-                // Neither side is padding (or both are): deliver the longer
-                // text. An exact tie keeps Groq, the standing default.
-                _ => {
-                    if left_words.len() > right_words.len() {
-                        *left
-                    } else {
-                        *right
-                    }
-                }
-            })
+            let preference = complete_source_preference(left, right);
+            Some((preference.source, preference.selection_diagnostic))
         }
     };
-    let source = source.ok_or_else(|| {
+    let (source, selection_diagnostic) = selected.ok_or_else(|| {
         source_fallback_refusal(
+            sources,
             &reason,
             reconciliation_requested,
             recovery_attempted,
@@ -1556,15 +1582,16 @@ fn contraction_source_fallback(
             Provider::Deepgram => TranscriptSelection::SourceDeepgram,
             Provider::Groq => TranscriptSelection::SourceGroq,
         },
-        validation_reason:
-            "longer Source Transcript delivered after a rejected contraction".to_owned(),
+        validation_reason: "fuller safe Source Transcript delivered after a rejected contraction"
+            .to_owned(),
         fallback_reason: Some(reason),
         reconciliation_requested,
         recovery_attempted,
+        source_selection_diagnostic: selection_diagnostic,
     })
 }
 
-fn clean_source_fallback(
+fn safe_source_fallback(
     sources: &[SourceTranscript],
     reason: String,
     reconciliation_requested: bool,
@@ -1578,20 +1605,43 @@ fn clean_source_fallback(
     let source = match safe.as_slice() {
         [] => None,
         [only] => Some(*only),
-        [left, right, ..] => Some(
-            match select_better_source(
+        [left, right, ..] => {
+            let preference = complete_source_preference(left, right);
+            if preference.material {
+                return Ok(source_fallback_decision(
+                    preference.source,
+                    reason,
+                    reconciliation_requested,
+                    recovery_attempted,
+                    preference.diagnostic,
+                    preference.selection_diagnostic,
+                ));
+            }
+            let (winner, evidence) = select_better_source(
                 &normalized_words(&left.text),
                 &normalized_words(&right.text),
-            )
-            .0
-            {
+            );
+            let selected = match winner {
                 GateWinner::Left => *left,
                 GateWinner::Right => *right,
-            },
-        ),
+            };
+            return Ok(source_fallback_decision(
+                selected,
+                reason,
+                reconciliation_requested,
+                recovery_attempted,
+                "safe Source Transcript selected by existing evidence tiers".to_owned(),
+                source_selection_diagnostic(
+                    sources,
+                    Some(selected.provider),
+                    Some(evidence.confidence()),
+                ),
+            ));
+        }
     };
     let source = source.ok_or_else(|| {
         source_fallback_refusal(
+            sources,
             &reason,
             reconciliation_requested,
             recovery_attempted,
@@ -1603,14 +1653,169 @@ fn clean_source_fallback(
             Provider::Deepgram => TranscriptSelection::SourceDeepgram,
             Provider::Groq => TranscriptSelection::SourceGroq,
         },
-        validation_reason: "clean Source Transcript passed validation".to_owned(),
+        validation_reason: "safe Source Transcript selected by existing evidence tiers".to_owned(),
         fallback_reason: Some(reason),
         reconciliation_requested,
         recovery_attempted,
+        source_selection_diagnostic: source_selection_diagnostic(
+            sources,
+            Some(source.provider),
+            Some(SourceSelectionConfidence::High),
+        ),
     })
 }
 
-/// The Source Transcripts a fallback may deliver: individually clean under
+fn source_fallback_decision(
+    source: &SourceTranscript,
+    reason: String,
+    reconciliation_requested: bool,
+    recovery_attempted: bool,
+    validation_reason: String,
+    source_selection_diagnostic: SourceSelectionDiagnostic,
+) -> TranscriptDecision {
+    TranscriptDecision {
+        transcript: Transcript(source.text.trim().to_owned()),
+        selection: match source.provider {
+            Provider::Deepgram => TranscriptSelection::SourceDeepgram,
+            Provider::Groq => TranscriptSelection::SourceGroq,
+        },
+        validation_reason,
+        fallback_reason: Some(reason),
+        reconciliation_requested,
+        recovery_attempted,
+        source_selection_diagnostic,
+    }
+}
+
+/// Provisional boundary pinned by the checked-in fuller/near-equal/repetition
+/// regressions. The private controlled corpus needed for calibration is not in
+/// this checkout; that calibration remains a release gate rather than a claim
+/// encoded here. This is stricter than the catastrophic-fragment floor because
+/// completeness is a preference, not a claim that the shorter source is garbage.
+const MATERIAL_COMPLETENESS_RATIO: f64 = 0.80;
+
+struct CompleteSourcePreference<'a> {
+    source: &'a SourceTranscript,
+    material: bool,
+    diagnostic: String,
+    selection_diagnostic: SourceSelectionDiagnostic,
+}
+
+fn complete_source_preference<'a>(
+    left: &'a SourceTranscript,
+    right: &'a SourceTranscript,
+) -> CompleteSourcePreference<'a> {
+    let left_words = normalized_words(&left.text);
+    let right_words = normalized_words(&right.text);
+    let analysis_sources = [(*left).clone(), (*right).clone()];
+    let coverage = source_coverage(&analysis_sources);
+    let left_discount = coverage[0].repetition_discount;
+    let right_discount = coverage[1].repetition_discount;
+    let left_coverage = coverage[0].adjusted_coverage;
+    let right_coverage = coverage[1].adjusted_coverage;
+    let (source, fuller, shorter) = if left_coverage > right_coverage {
+        (left, left_coverage, right_coverage)
+    } else {
+        (right, right_coverage, left_coverage)
+    };
+    let material = fuller > 0
+        && (shorter as f64 / fuller as f64) < MATERIAL_COMPLETENESS_RATIO;
+    let diagnostic = format!(
+        "materially fuller safe Source Transcript selected; raw words Deepgram={} Groq={}; adjusted coverage Deepgram={} Groq={}; repetition discount Deepgram={} Groq={}; selected provider={}; confidence high; safety passed",
+        if left.provider == Provider::Deepgram { left_words.len() } else { right_words.len() },
+        if left.provider == Provider::Groq { left_words.len() } else { right_words.len() },
+        if left.provider == Provider::Deepgram { left_coverage } else { right_coverage },
+        if left.provider == Provider::Groq { left_coverage } else { right_coverage },
+        if left.provider == Provider::Deepgram { left_discount } else { right_discount },
+        if left.provider == Provider::Groq { left_discount } else { right_discount },
+        source.provider.cli_label(),
+    );
+    CompleteSourcePreference {
+        source,
+        material,
+        diagnostic,
+        selection_diagnostic: SourceSelectionDiagnostic {
+            sources: coverage,
+            selected_provider: Some(source.provider),
+            confidence: Some(SourceSelectionConfidence::High),
+        },
+    }
+}
+
+fn repetition_discount(candidate: &[String], other: &[String]) -> usize {
+    let mut filler_counts: HashMap<&str, usize> = HashMap::new();
+    for word in candidate.iter().filter(|word| is_known_filler(word)) {
+        *filler_counts.entry(word.as_str()).or_default() += 1;
+    }
+    let filler_discount: usize = filler_counts.values().map(|count| count.saturating_sub(2)).sum();
+
+    if surplus_is_self_repetition(candidate, other) {
+        let mut budget: HashMap<&str, usize> = HashMap::new();
+        for word in other {
+            *budget.entry(word.as_str()).or_default() += 1;
+        }
+        let surplus = candidate
+            .iter()
+            .filter(|word| match budget.get_mut(word.as_str()) {
+                Some(remaining) if *remaining > 0 => {
+                    *remaining -= 1;
+                    false
+                }
+                _ => true,
+            })
+            .count();
+        filler_discount.max(surplus)
+    } else {
+        filler_discount
+    }
+}
+
+fn is_known_filler(word: &str) -> bool {
+    matches!(word, "um" | "uh" | "uhh" | "erm" | "hmm")
+}
+
+fn source_coverage(sources: &[SourceTranscript]) -> Vec<SourceCoverageRecord> {
+    (0..sources.len()).map(|index| {
+        let words = normalized_words(&sources[index].text);
+        let other_words = sources
+            .iter()
+            .enumerate()
+            .find(|(other_index, _)| *other_index != index)
+            .map(|(_, source)| normalized_words(&source.text))
+            .unwrap_or_default();
+        let discount = repetition_discount(&words, &other_words);
+        let safety_passed = !words.is_empty()
+            && non_contraction_quality_failure_reason(
+                &sources[index].text,
+                &[SourceTranscript {
+                    provider: sources[index].provider,
+                    text: sources[index].text.clone(),
+                }],
+            )
+            .is_none();
+        SourceCoverageRecord {
+            provider: sources[index].provider,
+            raw_words: words.len(),
+            adjusted_coverage: words.len().saturating_sub(discount),
+            repetition_discount: discount,
+            safety_passed,
+        }
+    }).collect()
+}
+
+fn source_selection_diagnostic(
+    sources: &[SourceTranscript],
+    selected_provider: Option<Provider>,
+    confidence: Option<SourceSelectionConfidence>,
+) -> SourceSelectionDiagnostic {
+    SourceSelectionDiagnostic {
+        sources: source_coverage(sources),
+        selected_provider,
+        confidence,
+    }
+}
+
+/// The Source Transcripts a fallback may deliver: individually safe under
 /// the non-contraction guards AND carrying at least one normalised word.
 ///
 /// The wordless exclusion is what keeps every fallback arm inside the
@@ -1639,6 +1844,7 @@ fn quality_safe_sources<'a>(
 }
 
 fn source_fallback_refusal(
+    sources: &[SourceTranscript],
     reason: &str,
     reconciliation_requested: bool,
     recovery_attempted: bool,
@@ -1650,6 +1856,7 @@ fn source_fallback_refusal(
             fallback_reason: Some(reason.to_owned()),
             reconciliation_requested,
             recovery_attempted,
+            source_selection_diagnostic: source_selection_diagnostic(sources, None, None),
         })
 }
 
@@ -1668,6 +1875,7 @@ enum GateWinner {
 struct QualityGate {
     winner: GateWinner,
     reason: String,
+    confidence: SourceSelectionConfidence,
 }
 
 /// English function words plus common spoken fillers, excluded from content
@@ -1697,7 +1905,7 @@ fn distinct_content_words(words: &[String]) -> HashSet<&str> {
 }
 
 /// A content-density quality score in [0, 1], used ONLY to break a
-/// clean-source fallback tie (never to decide gating). It deliberately does NOT
+/// safe-source fallback tie (never to decide gating). It deliberately does NOT
 /// reward lexical uniqueness — an earlier type-token-ratio term let a salad of
 /// all-unique words outscore accurate dictation that repeats real content words
 /// (e.g. "cache … cache invalidation … cache"). It rewards content-word density
@@ -1896,6 +2104,16 @@ enum SelectionEvidence {
     /// No evidence at all: the deterministic default (the later source, Groq)
     /// was applied.
     Default,
+}
+
+impl SelectionEvidence {
+    fn confidence(self) -> SourceSelectionConfidence {
+        if self.is_low_confidence() {
+            SourceSelectionConfidence::Low
+        } else {
+            SourceSelectionConfidence::High
+        }
+    }
 }
 
 impl SelectionEvidence {
@@ -2131,6 +2349,7 @@ fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
         };
         return Some(QualityGate {
             winner,
+            confidence: SourceSelectionConfidence::High,
             reason:
                 "catastrophically divergent (one Source Transcript is wordless); selected the only Source Transcript with words"
                     .to_owned(),
@@ -2153,6 +2372,7 @@ fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
         };
         return Some(QualityGate {
             winner,
+            confidence: SourceSelectionConfidence::High,
             reason:
                 "catastrophically divergent (one Source Transcript is a degenerate filler/repetition loop without independent cross-source support); selected the coherent Source Transcript"
                     .to_owned(),
@@ -2170,6 +2390,7 @@ fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
         };
         return Some(QualityGate {
             winner,
+            confidence: SourceSelectionConfidence::High,
             reason: format!(
                 "catastrophically divergent (length ratio {length_ratio:.2} below {DIVERGENCE_LENGTH_RATIO_FLOOR:.2}); selected the fuller Source Transcript, the other is a fragment"
             ),
@@ -2196,6 +2417,7 @@ fn source_quality_gate(left: &str, right: &str) -> Option<QualityGate> {
                 };
                 return Some(QualityGate {
                     winner,
+                    confidence: evidence.confidence(),
                     reason: format!(
                         "catastrophically divergent (cross-source content agreement {agreement:.2} below {CONTENT_OVERLAP_FLOOR:.2}); selected the Source Transcript better supported by cross-source evidence{low_confidence}"
                     ),
