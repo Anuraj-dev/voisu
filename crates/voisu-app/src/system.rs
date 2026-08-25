@@ -2070,23 +2070,29 @@ fn service_reports_failed() -> bool {
     crate::service::service_is_failed()
 }
 
-fn daemon_status_handshake() -> Result<(), ()> {
-    let path = socket_path().map_err(|_| ())?;
-    let mut stream = UnixStream::connect(path).map_err(|_| ())?;
+/// Query the daemon's status response with the same bounded framing used by
+/// the basic daemon readiness check. The CLI uses the additive readiness
+/// payload to compare the daemon's inherited session with its own.
+pub fn daemon_status_response() -> Option<Response> {
+    let path = socket_path().ok()?;
+    let mut stream = UnixStream::connect(path).ok()?;
     // A single Instant budget bounds the whole handshake. A per-read timeout is
     // reset by every byte, so a peer trickling one byte per interval would hold
     // doctor forever; the accumulated response is also capped during reading so
     // an oversized frame can never be fully buffered before the cap is checked.
     let started = Instant::now();
-    stream.set_write_timeout(Some(PROCESS_DEADLINE)).map_err(|_| ())?;
-    serde_json::to_writer(&mut stream, &Request::new(DaemonCommand::Status)).map_err(|_| ())?;
-    stream.write_all(b"\n").map_err(|_| ())?;
-    let response = read_bounded_frame(&mut stream, started)?;
-    let envelope: VersionEnvelope = serde_json::from_str(&response).map_err(|_| ())?;
-    let response: Response = serde_json::from_str(&response).map_err(|_| ())?;
+    stream.set_write_timeout(Some(PROCESS_DEADLINE)).ok()?;
+    serde_json::to_writer(&mut stream, &Request::new(DaemonCommand::Status)).ok()?;
+    stream.write_all(b"\n").ok()?;
+    let response = read_bounded_frame(&mut stream, started).ok()?;
+    let envelope: VersionEnvelope = serde_json::from_str(&response).ok()?;
+    let response: Response = serde_json::from_str(&response).ok()?;
     (envelope.version == PROTOCOL_VERSION && response.ok && response.state.is_some())
-        .then_some(())
-        .ok_or(())
+        .then_some(response)
+}
+
+fn daemon_status_handshake() -> Result<(), ()> {
+    daemon_status_response().map(|_| ()).ok_or(())
 }
 
 fn read_bounded_frame(stream: &mut UnixStream, started: Instant) -> Result<String, ()> {

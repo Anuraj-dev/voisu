@@ -4,15 +4,16 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use voisu_core::{
-    BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, ExportCorrelationId,
-    KeyDiagnosis, KeyLocation, PROTOCOL_VERSION, Provider, ProviderAuthenticator, ProviderKeyStatus,
-    ReadinessInspector, ReadinessStatus, ReplayFixturePath, Request, Response, SecretStore,
-    VersionEnvelope, provider_free_tier_hint, socket_path,
+    BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, DaemonReadiness,
+    ExportCorrelationId, KeyDiagnosis, KeyLocation, PasteActionState, PROTOCOL_VERSION, Provider,
+    ProviderAuthenticator, ProviderKeyStatus, ReadinessInspector, ReadinessStatus,
+    ReplayFixturePath, Request, Response, SecretStore, SessionKind, VersionEnvelope,
+    provider_free_tier_hint, resolve_session, socket_path,
 };
 use voisu_app::service::{UserServiceAction, manage_user_service};
 use voisu_app::system::{
     DIAGNOSTIC_RESPONSE_DEADLINE, FedoraReadiness, PROCESSING_RESPONSE_DEADLINE,
-    ProviderHttpClient, SecretToolStore,
+    ProviderHttpClient, SecretToolStore, daemon_status_response,
 };
 use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
 
@@ -311,6 +312,16 @@ fn doctor(verbose: bool) -> ExitCode {
         .unwrap_or(voisu_app::focus::FocusBackendKind::None);
     rows.push(focus_guard_row(focus_backend));
 
+    // The CLI's own probes remain useful, but they cannot prove that the
+    // already-running service inherited the same display endpoint. Newer
+    // daemons add an additive readiness payload; old daemons simply retain the
+    // historic doctor table.
+    if let Some(response) = daemon_status_response() {
+        if let Some(readiness) = response.readiness.as_ref() {
+            rows.extend(daemon_readiness_rows(readiness));
+        }
+    }
+
     // The live key checks reach the network; a test that pins other doctor
     // output opts out with VOISU_TEST_SKIP_DOCTOR_KEYS and covers the key
     // classification through dedicated seams instead.
@@ -376,6 +387,211 @@ fn focus_guard_row(backend: voisu_app::focus::FocusBackendKind) -> DoctorRow {
             "focus backend available for guarded Delivery",
         )
         .value(backend.as_str())
+    }
+}
+
+fn daemon_readiness_rows(readiness: &DaemonReadiness) -> Vec<DoctorRow> {
+    let mut rows = Vec::with_capacity(5);
+    rows.push(daemon_session_row(readiness));
+
+    let cli_delivery = voisu_app::config::delivery_mode().as_str();
+    let delivery_matches = readiness.delivery_mode == cli_delivery;
+    rows.push(
+        DoctorRow::new(
+            "Daemon delivery",
+            if delivery_matches {
+                ReadinessStatus::Pass
+            } else {
+                ReadinessStatus::Fail
+            },
+            if delivery_matches {
+                "daemon Delivery mode matches the current configuration"
+            } else {
+                "daemon selected Delivery before the current configuration; restart the service"
+            },
+        )
+        .value(readiness.delivery_mode.clone())
+        .action("voisu service restart"),
+    );
+
+    rows.push(match readiness.paste_action {
+        PasteActionState::Verified => DoctorRow::new(
+            "Paste action",
+            ReadinessStatus::Pass,
+            "Hyprland Paste Action was verified by the daemon",
+        )
+        .value("verified"),
+        PasteActionState::ClipboardOnly => DoctorRow::new(
+            "Paste action",
+            ReadinessStatus::Warn,
+            "no verified Hyprland Paste Action; Delivery remains clipboard-only",
+        )
+        .value("clipboard-only"),
+        PasteActionState::NotRequired => DoctorRow::new(
+            "Paste action",
+            ReadinessStatus::Skip,
+            "the selected Delivery mode does not use a Hyprland Paste Action",
+        )
+        .value("not selected"),
+    });
+
+    let clipboard_value = readiness
+        .clipboard_backend
+        .as_deref()
+        .unwrap_or("not installed");
+    rows.push(if readiness.clipboard_usable {
+        DoctorRow::new(
+            "Daemon clipboard",
+            ReadinessStatus::Pass,
+            "the daemon has a clipboard tool and a usable display endpoint",
+        )
+        .value(clipboard_value)
+    } else if readiness.clipboard_backend.is_some() {
+        DoctorRow::new(
+            "Daemon clipboard",
+            ReadinessStatus::Fail,
+            "a clipboard tool is installed, but the daemon cannot reach its display endpoint",
+        )
+        .value(clipboard_value)
+        .action("voisu service restart")
+    } else {
+        DoctorRow::new(
+            "Daemon clipboard",
+            ReadinessStatus::Fail,
+            "no clipboard backend is installed in the daemon environment",
+        )
+        .value(clipboard_value)
+        .action("install wl-clipboard on Wayland or xclip on X11")
+    });
+
+    if is_hyprland_session() {
+        rows.push(overlay_readiness_row());
+    }
+    rows
+}
+
+fn daemon_session_row(readiness: &DaemonReadiness) -> DoctorRow {
+    let cli_wayland = std::env::var("WAYLAND_DISPLAY").ok();
+    let cli_x11 = std::env::var("DISPLAY").ok();
+    let cli_type = std::env::var("XDG_SESSION_TYPE").ok();
+    let cli_resolution = resolve_session(cli_wayland.as_deref(), cli_x11.as_deref(), cli_type.as_deref());
+    let daemon_resolution = resolve_session(
+        readiness.wayland_display.as_deref(),
+        readiness.x11_display.as_deref(),
+        readiness.session_type.as_deref(),
+    );
+    let daemon_session = match readiness.session_type.as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("wayland") => SessionKind::Wayland,
+        Some(value) if value.eq_ignore_ascii_case("x11") => SessionKind::X11,
+        _ => daemon_resolution.session,
+    };
+    let same_endpoint = match cli_resolution.session {
+        SessionKind::Wayland => {
+            daemon_session == SessionKind::Wayland
+                && cli_wayland.as_deref() == readiness.wayland_display.as_deref()
+        }
+        SessionKind::X11 => {
+            daemon_session == SessionKind::X11
+                && cli_x11.as_deref() == readiness.x11_display.as_deref()
+        }
+        SessionKind::Unknown => false,
+    };
+    let value = daemon_session_value(readiness, daemon_session);
+    if same_endpoint {
+        DoctorRow::new(
+            "Daemon session",
+            ReadinessStatus::Pass,
+            "daemon session type and display endpoint match the current CLI session",
+        )
+        .value(value)
+    } else {
+        DoctorRow::new(
+            "Daemon session",
+            ReadinessStatus::Fail,
+            "daemon session state is missing or stale compared with this CLI; restart the service",
+        )
+        .value(value)
+        .action("voisu service restart")
+    }
+}
+
+fn daemon_session_value(readiness: &DaemonReadiness, session: SessionKind) -> String {
+    let label = match session {
+        SessionKind::Wayland => "Wayland",
+        SessionKind::X11 => "X11",
+        SessionKind::Unknown => "unknown",
+    };
+    let display = match session {
+        SessionKind::Wayland => readiness.wayland_display.as_deref(),
+        SessionKind::X11 => readiness.x11_display.as_deref(),
+        SessionKind::Unknown => None,
+    }
+    .filter(|value| !value.trim().is_empty())
+    .unwrap_or("missing");
+    format!("{label} / {display}")
+}
+
+fn is_hyprland_session() -> bool {
+    std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|value| !value.is_empty())
+        && resolve_session(
+            std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+            std::env::var("DISPLAY").ok().as_deref(),
+            std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+        )
+        .session
+            == SessionKind::Wayland
+}
+
+fn overlay_readiness_row() -> DoctorRow {
+    if let Ok(value) = std::env::var("VOISU_TEST_OVERLAY_READINESS") {
+        return match value.as_str() {
+            "ready" => DoctorRow::new(
+                "Overlay",
+                ReadinessStatus::Pass,
+                "Hyprland Overlay is enabled and active",
+            )
+            .value("active"),
+            "enabled" => DoctorRow::new(
+                "Overlay",
+                ReadinessStatus::Fail,
+                "Hyprland Overlay is enabled but not active",
+            )
+            .value("stopped")
+            .action("voisu service start"),
+            _ => DoctorRow::new(
+                "Overlay",
+                ReadinessStatus::Fail,
+                "Hyprland Overlay is not enabled",
+            )
+            .value("disabled")
+            .action("voisu service install"),
+        };
+    }
+
+    match voisu_app::service::hyprland_overlay_readiness() {
+        Ok(readiness) if readiness.enabled && readiness.active => DoctorRow::new(
+            "Overlay",
+            ReadinessStatus::Pass,
+            "Hyprland Overlay is enabled and active",
+        )
+        .value("active"),
+        Ok(readiness) if readiness.enabled => DoctorRow::new(
+            "Overlay",
+            ReadinessStatus::Fail,
+            "Hyprland Overlay is enabled but not active",
+        )
+        .value("stopped")
+        .action("voisu service start"),
+        Ok(_) => DoctorRow::new(
+            "Overlay",
+            ReadinessStatus::Fail,
+            "Hyprland Overlay is not enabled",
+        )
+        .value("disabled")
+        .action("voisu service install"),
+        Err(detail) => DoctorRow::new("Overlay", ReadinessStatus::Fail, detail)
+            .value("unknown")
+            .action("voisu service install"),
     }
 }
 
