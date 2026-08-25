@@ -48,7 +48,10 @@ As of 2026-08-25, the installed source package `voisu` `0.38.0-1` works on
 Raja's Omarchy/Hyprland host. Both user services are enabled and active.
 `voisu doctor` passes every check. Left Alt starts and stops Recordings, and
 clipboard Delivery works. The host-only Intent Reconstruction gate is enabled
-for #205. No active runtime issue is known on this configured host.
+for #205. The #205 response-boundary repair is merged in
+[PR #217](https://github.com/Anuraj-dev/voisu/pull/217), but the experiment
+still needs audio-backed evaluation before any safety or quality claim. No
+active runtime issue is known on this configured host.
 
 The remaining work is release follow-through and transcript-quality experiments.
 It is not a current installation failure.
