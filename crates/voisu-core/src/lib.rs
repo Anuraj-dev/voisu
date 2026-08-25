@@ -340,6 +340,8 @@ pub struct LifecycleEvidence {
     pub truncated_by: Option<CaptureLimit>,
     #[serde(default)]
     pub provider_timings_ms: Vec<ProviderTiming>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_failures: Vec<ProviderFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_to_text_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1151,6 +1153,7 @@ pub struct IntentReconstructionRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IntentReconstructionResponse {
+    #[serde(alias = "inferred_text")]
     wording: String,
 }
 

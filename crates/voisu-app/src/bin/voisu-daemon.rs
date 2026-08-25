@@ -1733,6 +1733,7 @@ fn base_evidence(
         capture_finalized_ms: None,
         truncated_by: None,
         provider_timings_ms: Vec::new(),
+        provider_failures: Vec::new(),
         release_to_text_ms: None,
         transcript_selection: None,
         validation_reason: None,
@@ -2932,7 +2933,17 @@ async fn replay_recording(
                 .map(|source| source.provider)
                 .collect();
             evidence.provider_timings_ms = outcome.timings_ms;
+            evidence.provider_failures = outcome.provider_failures;
             evidence.transcript_selection = Some(outcome.decision.selection);
+            if let Some(attempt) = &outcome.decision.intent_reconstruction {
+                evidence.intent_reconstruction = Some(IntentReconstructionDiagnostic {
+                    model: voisu_app::system::DEFAULT_GROQ_RECONCILIATION_MODEL.to_owned(),
+                    eligibility: attempt.eligibility,
+                    outcome: attempt.outcome,
+                    elapsed_ms: outcome.reconstruction_elapsed_ms,
+                    candidate: attempt.candidate.clone(),
+                });
+            }
             evidence.validation_reason = Some(outcome.decision.validation_reason.clone());
             evidence.fallback_reason = outcome.decision.fallback_reason.clone();
             evidence.reconciliation_requested = outcome.decision.reconciliation_requested;

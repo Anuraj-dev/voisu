@@ -8699,6 +8699,31 @@ fn fixed_fixture_replays_through_provider_and_validation_boundaries() {
 }
 
 #[test]
+fn replay_exposes_intent_reconstruction_evidence() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_ENABLE_INTENT_RECONSTRUCTION", "1"),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Book the room Tuesday afternoon."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Schedule the review Wednesday morning."),
+            ("VOISU_TEST_RECONCILIATION_RESULT", "Book the review on Wednesday morning."),
+        ],
+    );
+    fs::write(fixture_dir(runtime.path()).join("intent.pcm"), vec![1_u8; 3_200]).unwrap();
+
+    let replayed = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"replay":"intent.pcm"}}"#,
+    );
+    assert_eq!(replayed["ok"], true, "{replayed}");
+    assert_eq!(replayed["evidence"]["transcript_selection"], "intent_reconstructed");
+    assert_eq!(replayed["evidence"]["reconciliation_requested"], true);
+    assert_eq!(replayed["evidence"]["intent_reconstruction"]["outcome"], "accepted");
+    assert_eq!(replayed["evidence"]["intent_reconstruction"]["model"], "qwen/qwen3.6-27b");
+}
+
+#[test]
 fn replay_of_a_missing_fixture_is_rejected_and_leaves_the_daemon_reusable() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start(runtime.path());

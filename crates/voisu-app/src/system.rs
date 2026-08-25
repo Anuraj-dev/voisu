@@ -6199,7 +6199,7 @@ fn groq_intent_reconstruction_request_body(
         "reasoning_effort": "none",
         "temperature": 0,
         "messages": [
-            {"role": "system", "content": "Infer the user's most likely intended wording from both Source Transcripts. Neither source is truth. Novel wording is allowed. Return JSON only. Deterministic host code owns structural layout."},
+            {"role": "system", "content": "Infer the user's most likely intended wording from both Source Transcripts. Neither source is truth. Novel wording is allowed. Return exactly one JSON object with exactly this shape: {\"wording\":\"...\"}. The wording value must contain the final transcript. Do not add any other keys, markdown fences, or explanation. Deterministic host code owns structural layout."},
             {"role": "user", "content": serde_json::json!({
                 "sources": sources,
                 "dictionary": request.dictionary_terms,
@@ -10059,6 +10059,10 @@ mod tests {
             body["response_format"],
             serde_json::json!({"type": "json_object"})
         );
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("exactly this shape: {\"wording\":\"...\"}"));
         let user: serde_json::Value = serde_json::from_str(
             body["messages"][1]["content"].as_str().unwrap(),
         ).unwrap();
