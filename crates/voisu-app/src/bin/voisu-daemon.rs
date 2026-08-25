@@ -813,6 +813,7 @@ async fn actor_loop(
                         current_groq,
                         current_validator,
                         provider_deadline,
+                        deepgram_enabled,
                     ));
                     tokio::spawn(supervise_replay(
                         replay,
@@ -1733,6 +1734,7 @@ fn base_evidence(
         capture_finalized_ms: None,
         truncated_by: None,
         provider_timings_ms: Vec::new(),
+        provider_failures: Vec::new(),
         release_to_text_ms: None,
         transcript_selection: None,
         validation_reason: None,
@@ -2905,6 +2907,7 @@ async fn replay_recording(
     mut groq: Box<dyn TranscriptProvider>,
     mut validator: Box<dyn TranscriptValidator>,
     provider_deadline: Duration,
+    deepgram_enabled: bool,
 ) -> ReplayResult {
     let response = match run_replay(
         &fixture_name,
@@ -2914,6 +2917,7 @@ async fn replay_recording(
         &mut groq,
         validator.as_mut(),
         provider_deadline,
+        deepgram_enabled,
     )
     .await
     {
@@ -2932,7 +2936,17 @@ async fn replay_recording(
                 .map(|source| source.provider)
                 .collect();
             evidence.provider_timings_ms = outcome.timings_ms;
+            evidence.provider_failures = outcome.provider_failures;
             evidence.transcript_selection = Some(outcome.decision.selection);
+            if let Some(attempt) = &outcome.decision.intent_reconstruction {
+                evidence.intent_reconstruction = Some(IntentReconstructionDiagnostic {
+                    model: voisu_app::system::DEFAULT_GROQ_RECONCILIATION_MODEL.to_owned(),
+                    eligibility: attempt.eligibility,
+                    outcome: attempt.outcome,
+                    elapsed_ms: outcome.reconstruction_elapsed_ms,
+                    candidate: attempt.candidate.clone(),
+                });
+            }
             evidence.validation_reason = Some(outcome.decision.validation_reason.clone());
             evidence.fallback_reason = outcome.decision.fallback_reason.clone();
             evidence.reconciliation_requested = outcome.decision.reconciliation_requested;
@@ -3031,6 +3045,7 @@ async fn run_replay(
     groq: &mut Box<dyn TranscriptProvider>,
     validator: &mut dyn TranscriptValidator,
     provider_deadline: Duration,
+    deepgram_enabled: bool,
 ) -> Result<ReplayOutcome, BoundaryError> {
     let bytes = read_fixture(fixture_dir, fixture_name)?;
     let deepgram_stream = deepgram.start(id)?;
@@ -3060,7 +3075,11 @@ async fn run_replay(
             groq: groq_stream,
         },
     );
-    replay_capture(CapturedAudio::new(bytes), coordinator, validator).await
+    let mut outcome = replay_capture(CapturedAudio::new(bytes), coordinator, validator).await?;
+    if !deepgram_enabled {
+        normalize_disabled_deepgram(&mut outcome.provider_failures);
+    }
+    Ok(outcome)
 }
 
 /// Upper bound the listener waits for the actor's reply to one Toggle before

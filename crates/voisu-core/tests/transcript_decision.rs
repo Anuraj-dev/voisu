@@ -141,14 +141,27 @@ async fn typed_low_confidence_selection_reconstructs_but_same_words_skip() {
 }
 
 #[test]
-fn intent_reconstruction_response_requires_exact_wording_shape() {
+fn intent_reconstruction_response_accepts_observed_alias_but_rejects_unknown_shape() {
     assert_eq!(
         voisu_core::parse_intent_reconstruction_response(r#"{"wording":"hello"}"#)
             .unwrap()
             .0,
         "hello"
     );
-    for invalid in [r#"{"wording":"hello","notes":"extra"}"#, r#"{"text":"hello"}"#, "hello"] {
+    // Qwen's live Groq response used this semantically equivalent key even
+    // though the host contract expects `wording`.
+    assert_eq!(
+        voisu_core::parse_intent_reconstruction_response(r#"{"inferred_text":"hello"}"#)
+            .unwrap()
+            .0,
+        "hello"
+    );
+    for invalid in [
+        r#"{"wording":"hello","inferred_text":"hello"}"#,
+        r#"{"wording":"hello","notes":"extra"}"#,
+        r#"{"text":"hello"}"#,
+        "hello",
+    ] {
         assert!(voisu_core::parse_intent_reconstruction_response(invalid).is_err());
     }
 }
