@@ -490,6 +490,13 @@ fn provider_key_rows(runtime: &tokio::runtime::Runtime) -> Vec<DoctorRow> {
 /// core; here we supply the real terminal, keyring, and live validator.
 fn setup() -> ExitCode {
     use voisu_app::setup::{LiveKeyValidator, ProviderOutcome, StdioWizard, run_setup};
+    use voisu_app::setup_profile::{discover_setup_profile, live_setup_facts};
+
+    let discovery = match discover_setup_profile(&live_setup_facts()) {
+        Ok(discovery) => discovery,
+        Err(error) => return fail(4, &error.message()),
+    };
+    println!("Detected {} Setup Profile.", discovery.profile.as_str());
     let outcome = run_setup(&mut StdioWizard, &mut SecretToolStore, &mut LiveKeyValidator);
     // A run that stored/kept no usable key (every provider skipped or its store
     // failed) did not accomplish setup's job, so it must not report success.

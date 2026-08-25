@@ -3961,6 +3961,10 @@ fn setup_wizard_validates_each_key_then_persists_both() {
     command
         .arg("setup")
         .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_SESSION_TYPE", "wayland")
+        .env("WAYLAND_DISPLAY", "wayland-test")
+        .env("XDG_CURRENT_DESKTOP", "Hyprland")
+        .env("HYPRLAND_INSTANCE_SIGNATURE", "setup-test-instance")
         .env("VOISU_TEST_SECRET_STORE", "unavailable")
         .env("VOISU_TEST_AUTH_DEEPGRAM", "authorized")
         .env("VOISU_TEST_AUTH_GROQ", "authorized")
@@ -3973,6 +3977,12 @@ fn setup_wizard_validates_each_key_then_persists_both() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    fs::create_dir_all(config_home.path().join("hypr")).unwrap();
+    fs::write(
+        config_home.path().join("hypr/hyprland.lua"),
+        "-- setup test current Lua configuration\n",
+    )
+    .unwrap();
     let mut child = command.spawn().expect("setup should run");
     child
         .stdin
@@ -3995,6 +4005,45 @@ fn setup_wizard_validates_each_key_then_persists_both() {
     let body = fs::read_to_string(&file).unwrap();
     assert!(body.contains("deepgram=deepgram-secret"), "{body}");
     assert!(body.contains("groq=groq-secret"), "{body}");
+}
+
+#[test]
+fn setup_rejects_legacy_hyprland_without_writing_files() {
+    let runtime = TempDir::new().unwrap();
+    let config_home = TempDir::new().unwrap();
+    let hyprland_dir = config_home.path().join("hypr");
+    fs::create_dir_all(&hyprland_dir).unwrap();
+    fs::write(
+        hyprland_dir.join("hyprland.conf"),
+        "# legacy Hyprland configuration\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_voisu"))
+        .arg("setup")
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("XDG_SESSION_TYPE", "wayland")
+        .env("WAYLAND_DISPLAY", "wayland-test")
+        .env("XDG_CURRENT_DESKTOP", "Omarchy")
+        .env("HYPRLAND_INSTANCE_SIGNATURE", "legacy-test-instance")
+        .env_remove("VOISU_DEEPGRAM_API_KEY")
+        .env_remove("VOISU_GROQ_API_KEY")
+        .output()
+        .expect("setup should run");
+
+    assert_eq!(output.status.code(), Some(4), "setup must stop before the wizard");
+    let error = stderr(&output);
+    assert!(
+        error.contains("legacy configuration")
+            && error.contains("current Lua configuration")
+            && error.contains("re-run `voisu setup`"),
+        "{error}"
+    );
+    assert!(
+        !config_home.path().join("voisu/credentials").exists(),
+        "legacy discovery failure must not write credentials"
+    );
 }
 
 #[test]
