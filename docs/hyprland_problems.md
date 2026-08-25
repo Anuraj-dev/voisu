@@ -35,7 +35,7 @@ Systemd breaks the cycle by deleting a start job. On the observed cold login, it
 #### Intended fix
 
 - The desktop session owns the portal. Voisu must not add `After=` or `Wants=` dependencies on `xdg-desktop-portal.service`.
-- On Omarchy/UWSM, start Voisu after `graphical-session.target` and use `ConditionEnvironment=WAYLAND_DISPLAY`.
+- On Omarchy/UWSM, start Voisu after `wayland-session-waitenv.service` and use `ConditionEnvironment=WAYLAND_DISPLAY`. The service remains enabled by `graphical-session.target` but must not also order itself after that target, which would create a cycle.
 - Keep `PartOf=graphical-session.target` so Voisu stops with the compositor.
 - Keep login enablement through `WantedBy=graphical-session.target`.
 - Replace the complete packaged dependency set. Systemd cannot remove `After=` or `Wants=` dependencies from a drop-in by assigning an empty value.
@@ -45,7 +45,7 @@ The target shape is:
 
 ```ini
 [Unit]
-After=graphical-session.target dbus.socket pipewire.service
+After=wayland-session-waitenv.service dbus.socket pipewire.service
 Wants=dbus.socket pipewire.service
 PartOf=graphical-session.target
 ConditionEnvironment=WAYLAND_DISPLAY

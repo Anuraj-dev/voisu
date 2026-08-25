@@ -87,6 +87,7 @@ enum OptionalOverlayAction {
 pub fn manage_user_service(action: UserServiceAction) -> Result<UserServiceReport, String> {
     match action {
         UserServiceAction::Install => {
+            import_session_environment();
             let report = install()?;
             Ok(append_optional_overlay_report(
                 report,
@@ -898,9 +899,11 @@ fn service_unit(executable: &Path) -> Result<String, String> {
     Ok(format!(concat!(
         "[Unit]\n",
         "Description=Voisu dictation daemon\n",
-        "After=dbus.socket pipewire.service xdg-desktop-portal.service\n",
-        "Wants=dbus.socket pipewire.service xdg-desktop-portal.service\n",
+        "After=wayland-session-waitenv.service dbus.socket pipewire.service\n",
+        "Wants=dbus.socket pipewire.service\n",
         "PartOf=graphical-session.target\n",
+        "ConditionEnvironment=|WAYLAND_DISPLAY\n",
+        "ConditionEnvironment=|DISPLAY\n",
         "StartLimitIntervalSec=30s\n",
         "StartLimitBurst=3\n\n",
         "[Service]\n",
