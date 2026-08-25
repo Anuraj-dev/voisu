@@ -37,7 +37,7 @@ use voisu_app::system::{
     PipeWireCapture, PortalClipboardDelivery, ProviderReaper, CAPTURE_FINALIZE_DEADLINE,
     DEFAULT_TRANSCRIPTION_LANGUAGE, DIAGNOSTIC_RESPONSE_DEADLINE, PROCESSING_RESPONSE_DEADLINE,
     PROVIDER_COMPLETION_DEADLINE,
-    RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
+    INTENT_RECONSTRUCTION_DEADLINE, RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
 use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
 use voisu_core::{
@@ -45,14 +45,14 @@ use voisu_core::{
     CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonState, DeadlineClock,
     DeliveryAdapter,
     DeliveryMethod, DeliveryOutcome, DiagnosticPage, DiagnosticRecord, DiagnosticStore,
-    DprDiagnostic,
+    DprDiagnostic, IntentReconstructionDiagnostic,
     LifecycleEvidence, LifecycleStage,
     OverlayEvent, OverlayOutcome,
     MergeResult, PROTOCOL_VERSION, Provider,
     ProviderCompletion, ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream,
     ProviderStreams,
     ReconciliationKind, ReconciliationModel,
-    ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SourceTranscript,
+    PreparedTranscriptDecision, ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SourceTranscript,
     SourceTranscriptRecord, Transcript, TranscriptDecision, TranscriptDecisionPipeline,
     TranscriptProvider, TranscriptValidator, TriggerKeyBinding, VersionEnvelope,
     SmartWritingDiagnostic, EnglishEligibilityOutcome, replay_capture, sanitize_source_transcripts,
@@ -440,6 +440,11 @@ enum ActorMessage {
     Command(Command, oneshot::Sender<Response>),
     Started(Box<StartupCompletion>),
     PumpTerminated(u64),
+    AuthorizeDelivery {
+        id: u64,
+        correlation_id: String,
+        reply: oneshot::Sender<bool>,
+    },
     Completed(Box<Completion>),
     Recovered(u64),
     ReplayCompleted(Box<ReplayCompletion>),
@@ -598,7 +603,8 @@ async fn actor_loop(
         }
     };
     let dpr_enabled = voisu_app::config::dpr_enabled();
-    let dpr_client = if !dpr_enabled {
+    let qwen_format_enabled = voisu_app::config::qwen_format_enabled();
+    let dpr_client = if !dpr_enabled || !qwen_format_enabled {
         None
     } else if controlled {
         std::env::var("VOISU_TEST_DPR_ENDPOINT")
@@ -644,8 +650,11 @@ async fn actor_loop(
     // panic, so retain the providers configured for this Recording beside the
     // actor-owned adapters and pass that list into every supervised stop path.
     let configured_providers = vec![Provider::Deepgram, Provider::Groq];
+    let intent_reconstruction = voisu_app::config::intent_reconstruction_enabled();
     let mut validator: Option<Box<dyn TranscriptValidator>> = if controlled {
-        Some(Box::new(ControlledValidator::from_env()))
+        Some(Box::new(ControlledValidator::from_env(intent_reconstruction)))
+    } else if intent_reconstruction {
+        Some(Box::new(MergeResultValidator::intent_reconstruction(reaper.clone())))
     } else {
         Some(Box::new(MergeResultValidator::new()))
     };
@@ -1362,6 +1371,14 @@ async fn actor_loop(
                     }
                 }
             }
+            ActorMessage::AuthorizeDelivery { id, correlation_id, reply } => {
+                let authorized = matches!(
+                    &state,
+                    ActorState::Processing(evidence)
+                        if evidence.recording_id == id && evidence.correlation_id == correlation_id
+                );
+                let _ = reply.send(authorized);
+            }
             ActorMessage::Completed(completed) => {
                 let truncated = completed.evidence.truncated_by.is_some();
                 let delivery_method = completed.evidence.delivery_method;
@@ -1575,6 +1592,7 @@ fn spawn_recording_processing(
         grammar_adapter,
         dpr_enabled,
         dpr_client,
+        actor.clone(),
     ));
     tokio::spawn(supervise_recording(
         processing,
@@ -1722,6 +1740,7 @@ fn base_evidence(
         reconciliation_requested: false,
         recovery_attempted: false,
         source_selection_diagnostic: None,
+        intent_reconstruction: None,
     }
 }
 
@@ -2035,6 +2054,7 @@ async fn process_recording(
     grammar_adapter: Option<MinimalGrammarAdapter>,
     dpr_enabled: bool,
     dpr_client: Option<DprCloudClient>,
+    actor: mpsc::Sender<ActorMessage>,
 ) -> RecordingResult {
     let utterance_end = Instant::now();
     let ActiveRecording {
@@ -2143,15 +2163,18 @@ async fn process_recording(
         let english_eligible =
             languages.english_eligibility() == EnglishEligibilityOutcome::Eligible;
         let grammar_enabled = writing_mode == WritingMode::Smart && grammar_adapter.is_some();
-        let dpr_credential_needed = dpr_enabled
-            && english_eligible
+        let dpr_owns_formatting = dpr_enabled && english_eligible;
+        let grammar_credential_needed =
+            grammar_enabled && (!dpr_owns_formatting || voisu_app::config::qwen_format_enabled());
+        let dpr_credential_needed = dpr_owns_formatting
+            && voisu_app::config::qwen_format_enabled()
             && rendering_policy != RenderingPolicy::Natural
             && dpr_client.is_some();
         let (completed, grammar_capability, credential_evidence) =
             complete_with_grammar_capability(
                 providers,
                 audio,
-                grammar_enabled || dpr_credential_needed,
+                grammar_credential_needed || dpr_credential_needed,
                 &reaper,
             )
             .await?;
@@ -2168,8 +2191,8 @@ async fn process_recording(
         // DPR branch synthesized a successful TranscriptDecision from local
         // source selection and skipped the validator entirely.
         let sanitized_sources = sanitize_source_transcripts(dpr_source_snapshot.clone());
-        let decision = match validator.validate(sanitized_sources.clone()).await {
-            Ok(decision) => decision,
+        let prepared = match validator.prepare(sanitized_sources.clone()).await {
+            Ok(prepared) => prepared,
             Err(error) => {
                 if let Some(failure) = error.transcript_failure() {
                     evidence.validation_reason = Some(failure.validation_reason.clone());
@@ -2184,14 +2207,48 @@ async fn process_recording(
                 return Err(error);
             }
         };
+        // Eligibility and deterministic fallback selection are complete before
+        // this stage and clock. Only the bounded model request follows it.
+        evidence.stages.push(LifecycleStage::ValidationCompleted);
+        let validation_completed = Instant::now();
+        let reconstruction_started = Instant::now();
+        let decision = match prepared {
+            PreparedTranscriptDecision::Ready(decision) => decision,
+            PreparedTranscriptDecision::Reconstruct(attempt) => {
+                match validator.reconstruct(attempt).await {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        if let Some(failure) = error.transcript_failure() {
+                            evidence.validation_reason = Some(failure.validation_reason.clone());
+                            evidence.fallback_reason = failure.fallback_reason.clone();
+                            evidence.reconciliation_requested = failure.reconciliation_requested;
+                            evidence.recovery_attempted = failure.recovery_attempted;
+                            evidence.source_selection_diagnostic =
+                                Some(failure.source_selection_diagnostic.clone());
+                        } else {
+                            evidence.validation_reason = Some(error.diagnostic().to_owned());
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        if let Some(attempt) = &decision.intent_reconstruction {
+            evidence.intent_reconstruction = Some(IntentReconstructionDiagnostic {
+                model: voisu_app::system::DEFAULT_GROQ_RECONCILIATION_MODEL.to_owned(),
+                eligibility: attempt.eligibility,
+                outcome: attempt.outcome,
+                elapsed_ms: u64::try_from(reconstruction_started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+                candidate: attempt.candidate.clone(),
+            });
+        }
         evidence.transcript_selection = Some(decision.selection);
         evidence.source_selection_diagnostic = Some(decision.source_selection_diagnostic.clone());
         evidence.validation_reason = Some(decision.validation_reason);
         evidence.fallback_reason = decision.fallback_reason;
         evidence.reconciliation_requested = decision.reconciliation_requested;
         evidence.recovery_attempted = decision.recovery_attempted;
-        evidence.stages.push(LifecycleStage::ValidationCompleted);
-        let validation_completed = Instant::now();
         let dictionary_refs: Vec<&str> = dictionary_terms.iter().map(String::as_str).collect();
         // Formatting uses the validated Transcript text, not a re-selected raw
         // source. Compose evidence still comes from sanitized provider sources.
@@ -2199,6 +2256,12 @@ async fn process_recording(
             dpr_source_context(&sanitized_sources, &dictionary_terms)
         } else {
             None
+        };
+        let mut authorized_delivery = CorrelationAuthorizedDelivery {
+            inner: delivery.as_mut(),
+            actor: actor.clone(),
+            recording_id: id,
+            correlation_id: correlation_id.clone(),
         };
         let delivery_outcome = if let Some(context) = dpr_context {
             let selected_source = decision.transcript.0.as_str();
@@ -2240,7 +2303,7 @@ async fn process_recording(
                     clock: &clock,
                     small_edit_contract,
                 },
-                delivery.as_mut(),
+                &mut authorized_delivery,
             )
             .await;
             dpr = Some(transformed.diagnostic);
@@ -2266,7 +2329,7 @@ async fn process_recording(
                     protected_names: &[],
                     credential: credential_evidence,
                 },
-                delivery.as_mut(),
+                &mut authorized_delivery,
             )
             .await;
             final_transcript = Some(transformed.rendered);
@@ -2329,6 +2392,53 @@ async fn process_recording(
         evidence,
         validator,
         delivery,
+    }
+}
+
+async fn authorize_delivery(
+    actor: &mpsc::Sender<ActorMessage>,
+    id: u64,
+    correlation_id: String,
+) -> Result<(), BoundaryError> {
+    let (reply, authorized) = oneshot::channel();
+    actor
+        .send(ActorMessage::AuthorizeDelivery { id, correlation_id, reply })
+        .await
+        .map_err(|_| BoundaryError::new(
+            BoundaryKind::Delivery,
+            "active Recording correlation unavailable",
+        ))?;
+    match authorized.await {
+        Ok(true) => Ok(()),
+        _ => Err(BoundaryError::new(
+            BoundaryKind::Delivery,
+            "active Recording correlation changed before Delivery",
+        )),
+    }
+}
+
+/// Keeps the active-Recording check adjacent to the one irreversible Delivery
+/// call, after every optional formatting path has completed.
+struct CorrelationAuthorizedDelivery<'a> {
+    inner: &'a mut dyn DeliveryAdapter,
+    actor: mpsc::Sender<ActorMessage>,
+    recording_id: u64,
+    correlation_id: String,
+}
+
+impl DeliveryAdapter for CorrelationAuthorizedDelivery<'_> {
+    fn deliver(&mut self, transcript: Transcript) -> BoundaryFuture<'_, DeliveryOutcome> {
+        Box::pin(async move {
+            let correlation_id = if std::env::var_os("VOISU_TEST_STALE_DELIVERY_CORRELATION")
+                .is_some()
+            {
+                format!("{}-stale", self.correlation_id)
+            } else {
+                self.correlation_id.clone()
+            };
+            authorize_delivery(&self.actor, self.recording_id, correlation_id).await?;
+            self.inner.deliver(transcript).await
+        })
     }
 }
 
@@ -2481,8 +2591,12 @@ async fn supervise_recording(
                     ));
                 }
             }
-            let (validator, delivery) =
-                rebuild_recording_adapters(controlled, delivery_mode, focus_probe.clone());
+            let (validator, delivery) = rebuild_recording_adapters(
+                controlled,
+                delivery_mode,
+                focus_probe.clone(),
+                &reaper,
+            );
             RecordingResult {
                 result: Err(error),
                 evidence: panic_evidence,
@@ -2522,15 +2636,21 @@ fn rebuild_recording_adapters(
     controlled: bool,
     delivery_mode: DeliveryMode,
     focus_probe: Option<SharedFocusProbe>,
+    reaper: &ProviderReaper,
 ) -> (Box<dyn TranscriptValidator>, Box<dyn DeliveryAdapter>) {
+    let intent_reconstruction = voisu_app::config::intent_reconstruction_enabled();
     if controlled {
         (
-            Box::new(ControlledValidator::from_env()),
+            Box::new(ControlledValidator::from_env(intent_reconstruction)),
             Box::new(ControlledDelivery),
         )
     } else {
         (
-            Box::new(MergeResultValidator::new()),
+            if intent_reconstruction {
+                Box::new(MergeResultValidator::intent_reconstruction(reaper.clone()))
+            } else {
+                Box::new(MergeResultValidator::new())
+            },
             build_delivery_adapter(false, delivery_mode, focus_probe),
         )
     }
@@ -2656,6 +2776,7 @@ fn diagnostic_record(
     record.debug_audio = debug_audio;
     record.smart_writing = smart_writing;
     record.dpr = dpr;
+    record.intent_reconstruction = evidence.intent_reconstruction.clone();
     record
 }
 
@@ -2749,7 +2870,9 @@ fn rebuild_replay_adapters(
         (
             deepgram,
             Box::new(ControlledProvider::from_env(Provider::Groq)),
-            Box::new(ControlledValidator::from_env()),
+            Box::new(ControlledValidator::from_env(
+                voisu_app::config::intent_reconstruction_enabled(),
+            )),
         )
     } else {
         (
@@ -2760,7 +2883,11 @@ fn rebuild_replay_adapters(
                 groq_transcription_language(),
                 reaper,
             ),
-            Box::new(MergeResultValidator::new()),
+            if voisu_app::config::intent_reconstruction_enabled() {
+                Box::new(MergeResultValidator::intent_reconstruction(reaper.clone()))
+            } else {
+                Box::new(MergeResultValidator::new())
+            },
         )
     }
 }
@@ -3784,18 +3911,21 @@ struct ControlledValidator {
 }
 
 impl ControlledValidator {
-    fn from_env() -> Self {
+    fn from_env(intent_reconstruction: bool) -> Self {
         let deadline = if std::env::var_os("VOISU_TEST_RECONCILIATION_DEADLINE_MS").is_some() {
             env_millis("VOISU_TEST_RECONCILIATION_DEADLINE_MS").max(Duration::from_millis(1))
+        } else if intent_reconstruction {
+            INTENT_RECONSTRUCTION_DEADLINE
         } else {
             RECONCILIATION_DEADLINE
         };
-        Self {
-            pipeline: TranscriptDecisionPipeline::new(
-                ControlledReconciliationModel::from_env(),
-                deadline,
-            ),
-        }
+        let model = ControlledReconciliationModel::from_env();
+        let pipeline = if intent_reconstruction {
+            TranscriptDecisionPipeline::with_intent_reconstruction(model, deadline, Vec::new())
+        } else {
+            TranscriptDecisionPipeline::new(model, deadline)
+        };
+        Self { pipeline }
     }
 }
 
@@ -3809,6 +3939,20 @@ impl TranscriptValidator for ControlledValidator {
         sources: Vec<SourceTranscript>,
     ) -> BoundaryFuture<'_, TranscriptDecision> {
         self.pipeline.validate(sources)
+    }
+
+    fn prepare(
+        &mut self,
+        sources: Vec<SourceTranscript>,
+    ) -> BoundaryFuture<'_, PreparedTranscriptDecision> {
+        Box::pin(self.pipeline.prepare(sources))
+    }
+
+    fn reconstruct(
+        &mut self,
+        attempt: voisu_core::IntentReconstructionAttempt,
+    ) -> BoundaryFuture<'_, TranscriptDecision> {
+        Box::pin(self.pipeline.reconstruct(attempt))
     }
 }
 
@@ -3876,6 +4020,14 @@ impl ReconciliationModel for ControlledReconciliationModel {
                 )
             })
         })
+    }
+
+    fn reconstruct_intent(
+        &mut self,
+        request: voisu_core::IntentReconstructionRequest,
+        cancel: Arc<CancelRegistry>,
+    ) -> BoundaryFuture<'_, MergeResult> {
+        self.request(ReconciliationKind::Reconcile, request.sources, None, cancel)
     }
 }
 

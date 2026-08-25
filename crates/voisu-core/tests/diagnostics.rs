@@ -4,7 +4,9 @@ use tempfile::TempDir;
 use voisu_core::{
     clamp_utf8_bytes, correlation_id, export_record, is_text_sha256_fingerprint, replay_capture,
     text_sha256_fingerprint, unix_millis_now, AudioChunk, BoundaryFuture, CapturedAudio,
-    DebugAudioRecord, DiagnosticRecord, DiagnosticStore, EnglishEligibilityOutcome, LifecycleStage,
+    DebugAudioRecord, DiagnosticRecord, DiagnosticStore, EnglishEligibilityOutcome,
+    IntentReconstructionDiagnostic, IntentReconstructionEligibility, IntentReconstructionOutcome,
+    LifecycleStage,
     Provider, ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream,
     ProviderStreams, RetentionPolicy, SmartWritingDiagnostic, SmartWritingEditEvidence,
     SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode, SourceTranscript, Transcript,
@@ -382,6 +384,28 @@ fn export_scrubs_secret_values_from_transcripts_and_reasons() {
 }
 
 #[test]
+fn export_scrubs_and_bounds_intent_reconstruction_evidence() {
+    let secret = "intent-secret";
+    let mut record = DiagnosticRecord::new("intent-export".to_owned(), 9);
+    record.intent_reconstruction = Some(IntentReconstructionDiagnostic {
+        model: "m".repeat(MAX_MODEL_ID_UTF8_BYTES + 20),
+        eligibility: IntentReconstructionEligibility::MaterialDisagreement,
+        outcome: IntentReconstructionOutcome::Rejected,
+        elapsed_ms: 42,
+        candidate: Some(format!("before {secret} after")),
+    });
+
+    let export = export_record(
+        record,
+        [("VOISU_GROQ_API_KEY".to_owned(), secret.to_owned())],
+    );
+    let intent = export.record.intent_reconstruction.unwrap();
+    assert_eq!(intent.model.len(), MAX_MODEL_ID_UTF8_BYTES);
+    assert!(!intent.candidate.as_deref().unwrap().contains(secret));
+    assert!(intent.candidate.as_deref().unwrap().contains(REDACTED));
+}
+
+#[test]
 fn provider_failures_are_retained_and_surfaced_in_history() {
     // A provider that failed mid-stream and one that was absent/disabled must
     // both leave a visible entry in the retained history record — never a silent
@@ -700,6 +724,7 @@ impl TranscriptValidator for EchoValidator {
                     selected_provider: None,
                     confidence: None,
                 },
+                intent_reconstruction: None,
             })
         })
     }

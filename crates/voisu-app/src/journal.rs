@@ -171,6 +171,7 @@ mod tests {
             reconciliation_requested: false,
             recovery_attempted: false,
             source_selection_diagnostic: None,
+            intent_reconstruction: None,
         }
     }
 

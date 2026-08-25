@@ -48,6 +48,7 @@ pub const ENABLE_DPR_ENV: &str = "VOISU_ENABLE_DPR";
 /// Tickets 1–2 can ship without enabling Qwen formatting. Only `1` or `true`
 /// switch the formatting cloud contract off #139 derivation.
 pub const ENABLE_QWEN_FORMAT_ENV: &str = "VOISU_ENABLE_QWEN_FORMAT";
+pub const ENABLE_INTENT_RECONSTRUCTION_ENV: &str = "VOISU_ENABLE_INTENT_RECONSTRUCTION";
 
 /// How Voisu delivers a final Transcript after preserving it on the clipboard.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -227,6 +228,12 @@ pub fn dpr_enabled() -> bool {
 /// `1`/`true` is the instant rollback switch ([`ENABLE_QWEN_FORMAT_ENV`]).
 pub fn qwen_format_enabled() -> bool {
     parse_optional_dpr_enablement(std::env::var(ENABLE_QWEN_FORMAT_ENV).ok().as_deref())
+}
+
+pub fn intent_reconstruction_enabled() -> bool {
+    parse_optional_dpr_enablement(
+        std::env::var(ENABLE_INTENT_RECONSTRUCTION_ENV).ok().as_deref(),
+    )
 }
 
 fn parse_dpr_enablement(value: &str) -> bool {
@@ -1110,6 +1117,20 @@ other_key = 5
         assert_eq!(parse_gates(Some("1"), Some("0")), (true, false));
         assert_eq!(parse_gates(None, None), (false, false));
         assert_eq!(parse_gates(Some("1"), Some("true")), (true, true));
+    }
+
+    #[test]
+    fn intent_reconstruction_gate_defaults_off_and_is_independent() {
+        assert_eq!(
+            ENABLE_INTENT_RECONSTRUCTION_ENV,
+            "VOISU_ENABLE_INTENT_RECONSTRUCTION"
+        );
+        assert_ne!(ENABLE_INTENT_RECONSTRUCTION_ENV, ENABLE_DPR_ENV);
+        assert_ne!(ENABLE_INTENT_RECONSTRUCTION_ENV, ENABLE_QWEN_FORMAT_ENV);
+        assert!(!parse_optional_dpr_enablement(None));
+        assert!(!parse_optional_dpr_enablement(Some("0")));
+        assert!(parse_optional_dpr_enablement(Some("1")));
+        assert!(parse_optional_dpr_enablement(Some("true")));
     }
 
     #[test]

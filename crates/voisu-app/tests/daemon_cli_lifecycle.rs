@@ -21,7 +21,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 use voisu_app::system::{
     CAPTURE_FINALIZE_DEADLINE, CLIPBOARD_DELIVERY_DEADLINE,
-    LIBEI_DELIVERY_DEADLINE, PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE,
+    INTENT_RECONSTRUCTION_DEADLINE, LIBEI_DELIVERY_DEADLINE, PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE,
     RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
 
@@ -58,6 +58,7 @@ fn stop_response_budget_strictly_exceeds_all_daemon_processing_deadlines() {
                 + RECOVERY_ABORT_DEADLINE
                 + RECONCILIATION_DEADLINE * 2
     );
+    assert!(PROCESSING_RESPONSE_DEADLINE > INTENT_RECONSTRUCTION_DEADLINE);
 }
 
 struct Daemon {
@@ -173,6 +174,12 @@ impl Daemon {
             .any(|(name, _)| *name == "VOISU_ENABLE_QWEN_FORMAT")
         {
             command.env_remove("VOISU_ENABLE_QWEN_FORMAT");
+        }
+        if !environment
+            .iter()
+            .any(|(name, _)| *name == "VOISU_ENABLE_INTENT_RECONSTRUCTION")
+        {
+            command.env_remove("VOISU_ENABLE_INTENT_RECONSTRUCTION");
         }
         disable_shortcuts_unless_bus_injected(&mut command, environment);
         let config_dir = isolate_deepgram_config(&mut command, environment);
@@ -2005,31 +2012,47 @@ fn local_dpr_server(
                 .expect("structured DPR user body"),
         )
         .unwrap();
-        let source = user["sources"][0]["text"].as_str().unwrap();
-        let selected_provider = user["host_selection"]["selected_provider"]
-            .as_str()
-            .unwrap();
-        let reason = user["host_selection"]["reason"].as_str().unwrap();
-        let candidate = serde_json::json!({
-            "schema_version": "1",
-            "base_fingerprint": user["base_fingerprint"],
-            "reconciliation": {
-                "selected_provider": selected_provider,
-                "reason": reason
-            },
-            "removals": [],
-            "conversions": [],
-            "layout": {"decision": "natural", "certainty": "clear"},
-            "labels": [],
-            "derivation": [{
-                "kind": "keep",
-                "source_provider": selected_provider,
-                "source_text": source,
-                "output_text": "Goal build voisu. Context rust. Requirements fast!",
-                "conversion_id": null,
-                "label": null
-            }]
-        });
+        let candidate = if let Some(source) = user["base_text"].as_str() {
+            let start = source.rfind(' ').map_or(0, |index| index + 1);
+            let before = &source[start..];
+            serde_json::json!({
+                "version": "1",
+                "base_fingerprint": user["base_fingerprint"],
+                "edits": [{
+                    "start_utf8": start,
+                    "end_utf8": source.len(),
+                    "before": before,
+                    "after": format!("{before}!"),
+                    "kind": "punctuation"
+                }]
+            })
+        } else {
+            let source = user["sources"][0]["text"].as_str().unwrap();
+            let selected_provider = user["host_selection"]["selected_provider"]
+                .as_str()
+                .unwrap();
+            let reason = user["host_selection"]["reason"].as_str().unwrap();
+            serde_json::json!({
+                "schema_version": "1",
+                "base_fingerprint": user["base_fingerprint"],
+                "reconciliation": {
+                    "selected_provider": selected_provider,
+                    "reason": reason
+                },
+                "removals": [],
+                "conversions": [],
+                "layout": {"decision": "natural", "certainty": "clear"},
+                "labels": [],
+                "derivation": [{
+                    "kind": "keep",
+                    "source_provider": selected_provider,
+                    "source_text": source,
+                    "output_text": "Goal build voisu. Context rust. Requirements fast!",
+                    "conversion_id": null,
+                    "label": null
+                }]
+            })
+        };
         let response_body = serde_json::json!({
             "choices": [{
                 "message": {
@@ -4928,6 +4951,115 @@ fn material_disagreement_reconciles_with_recorded_selection_and_validation() {
     assert_eq!(
         stopped["evidence"]["validation_reason"],
         "Merge Result passed validation"
+    );
+}
+
+#[test]
+fn enabled_intent_reconstruction_records_lifecycle_and_delivers_once() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_ENABLE_INTENT_RECONSTRUCTION", "1"),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Book the room Tuesday afternoon."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Schedule the review Wednesday morning."),
+            ("VOISU_TEST_RECONCILIATION_RESULT", "Book the review on Wednesday morning."),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
+    assert_eq!(stopped["evidence"]["transcript_selection"], "intent_reconstructed");
+    assert_eq!(
+        stopped["evidence"]["stages"],
+        serde_json::json!([
+            "capture_started", "providers_started", "capture_finalized",
+            "providers_completed", "validation_completed", "delivery_completed"
+        ])
+    );
+    let intent = &stopped["evidence"]["intent_reconstruction"];
+    assert_eq!(intent["eligibility"], "material_disagreement", "{stopped}");
+    assert_eq!(intent["outcome"], "accepted", "{stopped}");
+    assert_eq!(intent["model"], "qwen/qwen3.6-27b", "{stopped}");
+
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(history["history"][0]["intent_reconstruction"], *intent, "{history}");
+    assert_eq!(
+        history["history"][0]["source_coverage"].as_array().unwrap().len(),
+        2,
+        "{history}"
+    );
+    assert_eq!(
+        history["history"][0]["final_transcript"],
+        "Book the review on Wednesday morning.",
+        "{history}"
+    );
+}
+
+#[test]
+fn intent_reconstruction_deadline_falls_back_without_late_replacement() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_ENABLE_INTENT_RECONSTRUCTION", "1"),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Book the room Tuesday afternoon."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Schedule the review Wednesday morning."),
+            ("VOISU_TEST_RECONCILIATION_RESULT", "This late wording must never appear."),
+            ("VOISU_TEST_RECONCILIATION_DELAY_MS", "200"),
+            ("VOISU_TEST_RECONCILIATION_DEADLINE_MS", "20"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
+    assert_eq!(
+        stopped["evidence"]["intent_reconstruction"]["outcome"],
+        "deadline",
+        "{stopped}"
+    );
+    assert_ne!(stopped["evidence"]["transcript_selection"], "intent_reconstructed");
+    thread::sleep(Duration::from_millis(250));
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(history["history"].as_array().unwrap().len(), 1, "{history}");
+    assert_eq!(history["history"][0]["delivery_count"], 1, "{history}");
+    assert_ne!(history["history"][0]["final_transcript"], "This late wording must never appear.");
+}
+
+#[test]
+fn stale_correlation_after_formatting_is_refused_at_delivery() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_ENABLE_INTENT_RECONSTRUCTION", "1"),
+            ("VOISU_ENABLE_DPR", "1"),
+            ("VOISU_TEST_STALE_DELIVERY_CORRELATION", "1"),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Book the room Tuesday afternoon."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Schedule the review Wednesday morning."),
+            ("VOISU_TEST_RECONCILIATION_RESULT", "Book the review on Wednesday morning."),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], false, "{stopped}");
+    assert_eq!(stopped["evidence"]["delivery_count"], 0, "{stopped}");
+    assert_eq!(stopped["evidence"]["intent_reconstruction"]["outcome"], "accepted");
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(
+        history["history"][0]["dpr"]["events"][0]["name"],
+        "route_selected",
+        "formatting must start before correlation becomes stale: {history}"
+    );
+    assert!(
+        stopped["message"].as_str().unwrap().contains("Delivery failed"),
+        "{stopped}"
     );
 }
 
@@ -10412,14 +10544,80 @@ fn smart_writing_real_wiring_reproves_grammar_http_and_credential_cache_miss() {
     daemon.terminate();
 }
 
-/// T5 production-boundary reproof: explicit rollout enablement selects DPR for
-/// an eligible English Recording, issues one structured request, composes it,
-/// and performs the existing single Delivery. Without this env flag, the SW10
-/// test above proves the unchanged Smart Writing branch.
-///
-/// Validation always runs first (Ticket 2). Near-identical provider texts keep
-/// the path free of reconciliation so the one structured DPR cloud call remains
-/// the only model attempt after ValidationCompleted.
+/// The shipped DPR flag enables deterministic organization, but cloud wording
+/// authority remains behind the separate host-only Qwen-format flag.
+#[test]
+fn dpr_flag_alone_formats_locally_without_cloud_or_credential_lookup() {
+    let runtime = TempDir::new().unwrap();
+    let config = TempDir::new().unwrap();
+    fs::create_dir_all(config.path().join("voisu")).unwrap();
+    fs::write(
+        config.path().join("voisu/config.toml"),
+        "deepgram_enabled = true\nwriting_mode = \"smart\"\nrendering_policy = \"adaptive\"\n",
+    )
+    .unwrap();
+    let commands = FakeCommands::new();
+    let path = commands.path();
+    let config_home = config.path().display().to_string();
+    let daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("XDG_CONFIG_HOME", &config_home),
+            ("VOISU_ENABLE_DPR", "1"),
+            ("VOISU_TEST_CLEAR_GROQ_API_KEY", "1"),
+            // Keep the normal controlled grammar adapter present so this
+            // regression observes the old production-like credential lookup.
+            // Local DPR must not prepare that unused Smart Writing capability.
+            (
+                "VOISU_TEST_MINIMAL_GRAMMAR_ENDPOINT",
+                "http://127.0.0.1:9/openai/v1/chat/completions",
+            ),
+            (
+                "VOISU_TEST_DPR_ENDPOINT",
+                "http://127.0.0.1:9/openai/v1/chat/completions",
+            ),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "goal build voisu context rust requirements fast",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "goal build voisu context rust requirements fast",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
+    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(
+        history["history"][0]["dpr"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "route_selected",
+            "cloud_skipped",
+            "fallback_baseline_selected",
+            "delivery_emitted",
+        ],
+        "DPR alone must remain deterministic and local: {history}"
+    );
+    assert!(
+        !commands.bin.path().join("secret-tool.args").exists(),
+        "local DPR must not prepare a cloud credential"
+    );
+    daemon.terminate();
+}
+
+/// With both host flags enabled, the production seam issues one structured DPR
+/// request and still performs the existing single Delivery. Near-identical
+/// sources avoid an Intent Reconstruction request before this formatting call.
 #[test]
 fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
     let runtime = TempDir::new().unwrap();
@@ -10440,6 +10638,7 @@ fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
             ("PATH", &path),
             ("XDG_CONFIG_HOME", &config_home),
             ("VOISU_ENABLE_DPR", "1"),
+            ("VOISU_ENABLE_QWEN_FORMAT", "1"),
             ("VOISU_TEST_CLEAR_GROQ_API_KEY", "1"),
             ("VOISU_TEST_DPR_ENDPOINT", &endpoint),
             (
@@ -10480,19 +10679,22 @@ fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
 
     let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
-    assert_eq!(request["model"], "openai/gpt-oss-20b");
-    assert_eq!(request["reasoning_effort"], "low");
-    assert_eq!(request["response_format"]["type"], "json_schema");
+    assert_eq!(request["model"], "qwen/qwen3.6-27b");
+    assert_eq!(request["reasoning_effort"], "none");
+    assert_eq!(request["response_format"]["type"], "json_object");
     let user: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap())
         .unwrap();
     assert_eq!(user["policy"], "adaptive");
-    assert_eq!(user["sources"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        user["base_text"],
+        "goal build voisu context rust requirements fast"
+    );
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
     assert_eq!(
         record["final_transcript"],
-        "Goal build voisu. Context rust. Requirements fast!",
+        "goal build voisu context rust requirements fast!",
         "{history}"
     );
     assert!(record["smart_writing"].is_null(), "{history}");
@@ -10618,6 +10820,7 @@ fn flagged_dpr_snapshots_policy_per_recording_and_observes_later_config_changes(
             ("XDG_CONFIG_HOME", &config_home),
             ("VOISU_DISABLE_DEEPGRAM", "1"),
             ("VOISU_ENABLE_DPR", "true"),
+            ("VOISU_ENABLE_QWEN_FORMAT", "1"),
             ("VOISU_TEST_CLEAR_GROQ_API_KEY", "1"),
             ("VOISU_TEST_DPR_ENDPOINT", &endpoint),
             (
@@ -10684,7 +10887,7 @@ fn flagged_dpr_snapshots_policy_per_recording_and_observes_later_config_changes(
             .unwrap()
             .iter()
             .any(|record| record["final_transcript"]
-                == "Goal build voisu. Context rust. Requirements fast!"),
+                == "goal build voisu context rust requirements fast!"),
         "Structured policy was not observed by the subsequent Recording: {history}"
     );
     daemon.terminate();
