@@ -6,6 +6,35 @@
 use std::process::{Command, Output};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const EXPECTED_HELP: &str = "\
+usage: voisu <command> [args]
+
+commands:
+  setup
+  start
+  stop
+  toggle
+  status
+  shortcut
+  history [--json]
+  export <correlation-id>
+  replay <fixture-name>
+  doctor [--verbose|-v]
+  auth set <groq|deepgram>
+  auth verify <groq|deepgram>
+  deepgram <on|off>
+  delivery [type|clipboard|guarded]
+  writing [smart|literal]
+  rendering [natural|adaptive|structured]
+  dictionary add <term>
+  dictionary remove <term>
+  dictionary list [--json]
+  service <install|start|stop|restart|status|uninstall>
+
+options:
+  -h, --help, help
+  -V, --version
+";
 
 fn run(bin: &str, arguments: &[&str]) -> Output {
     Command::new(bin)
@@ -32,7 +61,8 @@ fn voisu_help_flag_prints_usage_and_exits_zero() {
     for flag in ["--help", "-h", "help"] {
         let output = run(env!("CARGO_BIN_EXE_voisu"), &[flag]);
         assert!(output.status.success(), "{flag}: {output:?}");
-        assert!(stdout(&output).contains("usage: voisu"), "{flag}");
+        assert!(output.stderr.is_empty(), "{flag}: {output:?}");
+        assert_eq!(stdout(&output), EXPECTED_HELP, "{flag}");
     }
 }
 

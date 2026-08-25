@@ -1173,8 +1173,37 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
     }
 }
 
+const USAGE: &str = "\
+usage: voisu <command> [args]
+
+commands:
+  setup
+  start
+  stop
+  toggle
+  status
+  shortcut
+  history [--json]
+  export <correlation-id>
+  replay <fixture-name>
+  doctor [--verbose|-v]
+  auth set <groq|deepgram>
+  auth verify <groq|deepgram>
+  deepgram <on|off>
+  delivery [type|clipboard|guarded]
+  writing [smart|literal]
+  rendering [natural|adaptive|structured]
+  dictionary add <term>
+  dictionary remove <term>
+  dictionary list [--json]
+  service <install|start|stop|restart|status|uninstall>
+
+options:
+  -h, --help, help
+  -V, --version";
+
 fn usage() -> &'static str {
-    "usage: voisu <setup|start|stop|toggle|status|shortcut|history|export|replay|doctor|auth|deepgram|delivery|writing|rendering|dictionary|service>\n\n  voisu setup  # guided, re-runnable wizard: validate and store your Deepgram and Groq keys\n  voisu shortcut  # show the desktop-approved Trigger Key binding\n  voisu history  # newest-first Recordings with per-Provider outcome and tail latency\n  voisu history --json  # the full raw diagnostic records as JSON\n  voisu export <correlation-id>\n  voisu replay <fixture-name>  # a file inside the private fixtures directory\n  voisu doctor [--verbose]  # capability, focus-guard, and live per-key round-trip checks; --verbose adds the reasoning behind each line\n  voisu auth set <groq|deepgram>  # credential is read from stdin\n  voisu auth verify <groq|deepgram>\n  voisu deepgram <on|off>  # enable/disable the Deepgram Provider (default on)\n  voisu delivery [type|clipboard|guarded]  # choose Transcript Delivery (default type); no argument shows the persisted mode\n  voisu writing [smart|literal]  # choose Writing Mode (default smart); no argument shows the persisted mode\n  voisu rendering [natural|adaptive|structured]  # choose Rendering Policy (default adaptive); no argument shows the persisted policy\n  voisu dictionary add <term>\n  voisu dictionary remove <term>\n  voisu dictionary list [--json]\n  voisu service <install|start|stop|restart|status|uninstall>"
+    USAGE
 }
 
 fn fail(code: u8, message: &str) -> ExitCode {
