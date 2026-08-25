@@ -374,7 +374,9 @@ pub fn discover_paste_action(sources: &[&str], live_bindings: &Value) -> Option<
         .iter()
         .flat_map(|source| {
             parse_lua_bindings(source)
+                .ok()
                 .into_iter()
+                .flatten()
                 .map(|binding| (binding, (*source).to_owned()))
                 .collect::<Vec<_>>()
         })
@@ -454,7 +456,7 @@ pub fn discover_paste_action_from_sources(
     // this keeps unrelated or inactive Lua files out of the decision.
     let root_mentions_omarchy = source_storage[0].contains("omarchy")
         || std::env::var("XDG_CURRENT_DESKTOP")
-            .is_ok_and(|desktop| desktop.eq_ignore_ascii_case("omarchy"));
+            .is_ok_and(|desktop| desktop_has_label(&desktop, "omarchy"));
     if root_mentions_omarchy {
         for path in omarchy_clipboard_source_candidates(root) {
             if let Some(source) = files.read_to_string(&path)? {
@@ -492,7 +494,7 @@ pub fn discover_live_paste_action() -> Option<VerifiedPasteAction> {
     }
     if sources[0].contains("omarchy")
         || std::env::var("XDG_CURRENT_DESKTOP")
-            .is_ok_and(|desktop| desktop.eq_ignore_ascii_case("omarchy"))
+            .is_ok_and(|desktop| desktop_has_label(&desktop, "omarchy"))
     {
         for path in omarchy_clipboard_source_candidates(&root) {
             if let Ok(Some(source)) = files.read_to_string(&path) {
@@ -565,6 +567,13 @@ fn normalize_key(key: &str) -> String {
     key.trim().to_ascii_uppercase()
 }
 
+fn desktop_has_label(desktop: &str, wanted: &str) -> bool {
+    desktop
+        .split([':', ';'])
+        .map(str::trim)
+        .any(|label| label.eq_ignore_ascii_case(wanted))
+}
+
 fn is_paste_description(description: &str) -> bool {
     let description = description.to_ascii_lowercase();
     description.contains("paste")
@@ -578,18 +587,71 @@ fn is_omarchy_universal_paste(binding: &LuaBinding, source: &str) -> bool {
     {
         return false;
     }
-    let compact = source.chars().filter(|character| !character.is_whitespace()).collect::<String>();
+    let compact = compact_lua_code(source);
     [
         "universal_clipboard_shortcut(default_mods,default_key,terminal_mods,terminal_key)",
         "ifactive_window_is_terminal()then",
         "send_shortcut_once(terminal_mods,terminal_key)()",
         "send_shortcut_once(default_mods,default_key)()",
-        "o.bind(\"SUPER+V\",\"Universalpaste\",universal_clipboard_shortcut(\"CTRL\",\"V\",\"SHIFT\",\"Insert\"))",
     ]
     .iter()
     .all(|marker| compact.contains(marker))
         && (compact.contains("functionuniversal_clipboard_shortcut(")
             || compact.contains("localfunctionuniversal_clipboard_shortcut("))
+}
+
+fn compact_lua_code(source: &str) -> String {
+    let mut code = String::new();
+    let mut characters = source.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '-' && characters.peek() == Some(&'-') {
+            characters.next();
+            if characters.peek() == Some(&'[') {
+                characters.next();
+                if characters.peek() == Some(&'[') {
+                    characters.next();
+                    let mut previous = None;
+                    for character in characters.by_ref() {
+                        if previous == Some(']') && character == ']' {
+                            break;
+                        }
+                        previous = Some(character);
+                    }
+                    continue;
+                }
+            }
+            for character in characters.by_ref() {
+                if character == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if character == '[' && characters.peek() == Some(&'[') {
+            characters.next();
+            let mut previous = None;
+            for character in characters.by_ref() {
+                if previous == Some(']') && character == ']' {
+                    break;
+                }
+                previous = Some(character);
+            }
+            continue;
+        }
+        if character == '"' || character == '\'' {
+            let quote = character;
+            while let Some(character) = characters.next() {
+                if character == '\\' {
+                    let _ = characters.next();
+                } else if character == quote {
+                    break;
+                }
+            }
+            continue;
+        }
+        code.push(character);
+    }
+    code.chars().filter(|character| !character.is_whitespace()).collect()
 }
 
 pub fn plan_trigger_binding(source: &str) -> TriggerBindingPlan {
@@ -1322,6 +1384,31 @@ o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V",
                 terminal: PasteShortcut { binding: "SHIFT + Insert".to_owned() },
             }
         );
+    }
+
+    #[test]
+    fn omarchy_helper_markers_in_strings_or_comments_are_not_verified() {
+        let source = r#"
+local fake = "function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key) if active_window_is_terminal() then send_shortcut_once(terminal_mods, terminal_key)() send_shortcut_once(default_mods, default_key)() end"
+-- function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key)
+o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V", "SHIFT", "Insert"))
+"#;
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+
+        assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn omarchy_desktop_label_accepts_multi_label_values() {
+        assert!(desktop_has_label("Hyprland:Omarchy", "omarchy"));
+        assert!(desktop_has_label("Hyprland;Omarchy", "omarchy"));
+        assert!(!desktop_has_label("Hyprland", "omarchy"));
     }
 
     #[test]
