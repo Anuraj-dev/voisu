@@ -813,6 +813,7 @@ async fn actor_loop(
                         current_groq,
                         current_validator,
                         provider_deadline,
+                        deepgram_enabled,
                     ));
                     tokio::spawn(supervise_replay(
                         replay,
@@ -2906,6 +2907,7 @@ async fn replay_recording(
     mut groq: Box<dyn TranscriptProvider>,
     mut validator: Box<dyn TranscriptValidator>,
     provider_deadline: Duration,
+    deepgram_enabled: bool,
 ) -> ReplayResult {
     let response = match run_replay(
         &fixture_name,
@@ -2915,6 +2917,7 @@ async fn replay_recording(
         &mut groq,
         validator.as_mut(),
         provider_deadline,
+        deepgram_enabled,
     )
     .await
     {
@@ -3042,6 +3045,7 @@ async fn run_replay(
     groq: &mut Box<dyn TranscriptProvider>,
     validator: &mut dyn TranscriptValidator,
     provider_deadline: Duration,
+    deepgram_enabled: bool,
 ) -> Result<ReplayOutcome, BoundaryError> {
     let bytes = read_fixture(fixture_dir, fixture_name)?;
     let deepgram_stream = deepgram.start(id)?;
@@ -3071,7 +3075,11 @@ async fn run_replay(
             groq: groq_stream,
         },
     );
-    replay_capture(CapturedAudio::new(bytes), coordinator, validator).await
+    let mut outcome = replay_capture(CapturedAudio::new(bytes), coordinator, validator).await?;
+    if !deepgram_enabled {
+        normalize_disabled_deepgram(&mut outcome.provider_failures);
+    }
+    Ok(outcome)
 }
 
 /// Upper bound the listener waits for the actor's reply to one Toggle before

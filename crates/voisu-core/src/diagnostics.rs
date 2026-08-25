@@ -1685,8 +1685,12 @@ pub async fn replay_capture(
     let completion = coordinator.complete_with_timings(audio).await?;
     let source_transcripts = completion.sources.clone();
     let provider_failures = completion.provider_failures;
+    let prepared = validator.prepare(completion.sources).await?;
+    // Keep this origin aligned with the live Recording path: preparation owns
+    // source classification and fallback selection, while this clock measures
+    // only the bounded reconstruction seam that follows it.
     let reconstruction_started = Instant::now();
-    let decision = match validator.prepare(completion.sources).await? {
+    let decision = match prepared {
         PreparedTranscriptDecision::Ready(decision) => decision,
         PreparedTranscriptDecision::Reconstruct(attempt) => validator.reconstruct(attempt).await?,
     };
