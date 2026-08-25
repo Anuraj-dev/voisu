@@ -88,6 +88,7 @@ pub enum TriggerBindingPlan {
     Install { key: TriggerKey },
     AlreadyInstalled { key: TriggerKey },
     Conflicts { conflicts: Vec<BindingConflict> },
+    Unparseable { detail: String },
 }
 
 #[derive(Debug)]
@@ -99,6 +100,9 @@ pub enum TriggerBindingError {
     },
     Conflicts {
         conflicts: Vec<BindingConflict>,
+    },
+    Unparseable {
+        detail: String,
     },
     ReloadFailed {
         detail: String,
@@ -152,6 +156,10 @@ impl fmt::Display for TriggerBindingError {
                     "Recovery: remove or change one exact binding, then rerun `{RECOVERY_COMMAND}`."
                 )
             }
+            Self::Unparseable { detail } => write!(
+                formatter,
+                "cannot safely inspect the Hyprland Lua bindings: {detail}. Recovery: fix the binding expression and rerun `{RECOVERY_COMMAND}`."
+            ),
             Self::ReloadFailed {
                 detail,
                 backup_path,
@@ -332,7 +340,7 @@ fn binding_argument(binding: &Value) -> Option<&str> {
     })
 }
 
-pub fn parse_lua_bindings(source: &str) -> Vec<LuaBinding> {
+pub fn parse_lua_bindings(source: &str) -> Result<Vec<LuaBinding>, String> {
     let mut bindings = Vec::new();
     let mut chunk = String::new();
     let mut managed = false;
@@ -340,20 +348,20 @@ pub fn parse_lua_bindings(source: &str) -> Vec<LuaBinding> {
     for line in source.split_inclusive('\n') {
         match line.trim() {
             BEGIN_MARKER => {
-                bindings.extend(parse_lua_chunk(&chunk, managed));
+                bindings.extend(parse_lua_chunk(&chunk, managed)?);
                 chunk.clear();
                 managed = true;
             }
             END_MARKER => {
-                bindings.extend(parse_lua_chunk(&chunk, managed));
+                bindings.extend(parse_lua_chunk(&chunk, managed)?);
                 chunk.clear();
                 managed = false;
             }
             _ => chunk.push_str(line),
         }
     }
-    bindings.extend(parse_lua_chunk(&chunk, managed));
-    bindings
+    bindings.extend(parse_lua_chunk(&chunk, managed)?);
+    Ok(bindings)
 }
 
 /// Finds the first paste binding that is proven by both the active Lua source
@@ -585,15 +593,10 @@ fn is_omarchy_universal_paste(binding: &LuaBinding, source: &str) -> bool {
 }
 
 pub fn plan_trigger_binding(source: &str) -> TriggerBindingPlan {
-    let bindings = parse_lua_bindings(source);
-    for candidate in [LEFT_ALT, RIGHT_ALT] {
-        if bindings
-            .iter()
-            .any(|binding| binding.managed && binding.is_standalone_for(candidate))
-        {
-            return TriggerBindingPlan::AlreadyInstalled { key: candidate };
-        }
-    }
+    let bindings = match parse_lua_bindings(source) {
+        Ok(bindings) => bindings,
+        Err(detail) => return TriggerBindingPlan::Unparseable { detail },
+    };
 
     let mut conflicts = Vec::new();
     for candidate in [LEFT_ALT, RIGHT_ALT] {
@@ -606,11 +609,33 @@ pub fn plan_trigger_binding(source: &str) -> TriggerBindingPlan {
                 description: binding.description.clone(),
                 command: binding.command.clone(),
             });
-        } else {
+        }
+    }
+    if conflicts.is_empty() {
+        for candidate in [LEFT_ALT, RIGHT_ALT] {
+            if bindings
+                .iter()
+                .any(|binding| binding.managed && binding.is_standalone_for(candidate))
+            {
+                return TriggerBindingPlan::AlreadyInstalled { key: candidate };
+            }
+        }
+    }
+
+    for candidate in [LEFT_ALT, RIGHT_ALT] {
+        if !bindings
+            .iter()
+            .any(|binding| binding.is_standalone_for(candidate))
+        {
             return TriggerBindingPlan::Install { key: candidate };
         }
     }
-    TriggerBindingPlan::Conflicts { conflicts }
+
+    if !conflicts.is_empty() {
+        return TriggerBindingPlan::Conflicts { conflicts };
+    }
+
+    unreachable!("a conflict-free binding plan always finds an available candidate")
 }
 
 pub fn backup_path(path: &Path) -> PathBuf {
@@ -674,6 +699,9 @@ pub fn install_trigger_binding(
         TriggerBindingPlan::Conflicts { conflicts } => {
             return Err(TriggerBindingError::from_conflicts(conflicts));
         }
+        TriggerBindingPlan::Unparseable { detail } => {
+            return Err(TriggerBindingError::Unparseable { detail });
+        }
         TriggerBindingPlan::Install { key } => key,
     };
 
@@ -698,7 +726,7 @@ pub fn install_trigger_binding(
     }
 
     if let Err(detail) = hyprland.reload() {
-        let restore_error = restore_original(files, path, original.as_deref()).err();
+        let restore_error = restore_original_and_reload(files, path, original.as_deref(), hyprland);
         return Err(TriggerBindingError::ReloadFailed {
             detail,
             backup_path: backup,
@@ -713,7 +741,8 @@ pub fn install_trigger_binding(
             backup_path: backup,
         }),
         Ok(false) => {
-            let restore_error = restore_original(files, path, original.as_deref()).err();
+            let restore_error =
+                restore_original_and_reload(files, path, original.as_deref(), hyprland);
             Err(TriggerBindingError::VerificationFailed {
                 detail: format!(
                     "Hyprland did not report {} ({}) running `{VOISU_TOGGLE_COMMAND}`",
@@ -724,7 +753,8 @@ pub fn install_trigger_binding(
             })
         }
         Err(detail) => {
-            let restore_error = restore_original(files, path, original.as_deref()).err();
+            let restore_error =
+                restore_original_and_reload(files, path, original.as_deref(), hyprland);
             Err(TriggerBindingError::VerificationFailed {
                 detail,
                 backup_path: backup,
@@ -743,6 +773,21 @@ fn restore_original(
         Some(contents) => files.write_atomic(path, contents),
         None => files.remove_file(path),
     }
+}
+
+fn restore_original_and_reload(
+    files: &dyn BindingFileSystem,
+    path: &Path,
+    original: Option<&str>,
+    hyprland: &mut dyn HyprlandController,
+) -> Option<String> {
+    if let Err(detail) = restore_original(files, path, original) {
+        return Some(detail);
+    }
+    hyprland
+        .reload()
+        .err()
+        .map(|detail| format!("reloading the restored configuration failed: {detail}"))
 }
 
 fn append_managed_binding(source: &str, key: TriggerKey) -> String {
@@ -785,11 +830,11 @@ enum LuaToken {
     Symbol(char),
 }
 
-fn parse_lua_chunk(source: &str, managed: bool) -> Vec<LuaBinding> {
+fn parse_lua_chunk(source: &str, managed: bool) -> Result<Vec<LuaBinding>, String> {
     let tokens = lex_lua(source);
     let mut bindings = Vec::new();
     let mut index = 0;
-    while index + 9 < tokens.len() {
+    while index + 3 < tokens.len() {
         let is_bind_call = matches!(
             (&tokens[index], &tokens[index + 1], &tokens[index + 2], &tokens[index + 3]),
             (
@@ -803,10 +848,7 @@ fn parse_lua_chunk(source: &str, managed: bool) -> Vec<LuaBinding> {
             index += 1;
             continue;
         }
-        let Some((key, description, command)) = parse_bind_arguments(&tokens[index + 4..]) else {
-            index += 1;
-            continue;
-        };
+        let (key, description, command) = parse_bind_arguments(&tokens[index + 4..])?;
         bindings.push(LuaBinding {
             key,
             description,
@@ -815,35 +857,37 @@ fn parse_lua_chunk(source: &str, managed: bool) -> Vec<LuaBinding> {
         });
         index += 4;
     }
-    bindings
+    Ok(bindings)
 }
 
-fn parse_bind_arguments(tokens: &[LuaToken]) -> Option<(String, String, String)> {
+fn parse_bind_arguments(tokens: &[LuaToken]) -> Result<(String, String, String), String> {
     let mut index = 0;
-    let read_string = |index: &mut usize| -> Option<String> {
-        let value = match tokens.get(*index)? {
-            LuaToken::String(value) => value.clone(),
-            _ => return None,
+    let read_string = |index: &mut usize, label: &str| -> Result<String, String> {
+        let value = match tokens.get(*index) {
+            Some(LuaToken::String(value)) => value.clone(),
+            Some(_) => return Err(format!("the {label} must be a string literal")),
+            None => return Err(format!("the {label} is missing")),
         };
         *index += 1;
-        Some(value)
+        Ok(value)
     };
-    let key = read_string(&mut index)?;
+    let key = read_string(&mut index, "binding key")?;
     if !matches!(tokens.get(index), Some(LuaToken::Symbol(','))) {
-        return None;
+        return Err("the binding key must be followed by a comma".to_owned());
     }
     index += 1;
-    let description = read_string(&mut index)?;
+    let description = read_string(&mut index, "binding description")?;
     if !matches!(tokens.get(index), Some(LuaToken::Symbol(','))) {
-        return None;
+        return Err("the binding description must be followed by a comma".to_owned());
     }
     index += 1;
-    let command = match tokens.get(index)? {
-        LuaToken::String(value) => value.clone(),
-        LuaToken::Symbol(')') => return None,
-        _ => "<Lua dispatcher>".to_owned(),
+    let command = match tokens.get(index) {
+        Some(LuaToken::String(value)) => value.clone(),
+        Some(LuaToken::Symbol(')')) => return Err("the binding command is missing".to_owned()),
+        Some(_) => "<Lua dispatcher>".to_owned(),
+        None => return Err("the binding command is missing".to_owned()),
     };
-    Some((key, description, command))
+    Ok((key, description, command))
 }
 
 fn lex_lua(source: &str) -> Vec<LuaToken> {
@@ -920,13 +964,30 @@ mod tests {
     use tempfile::TempDir;
 
     struct FakeHyprland {
-        reload_succeeds: bool,
+        reload_results: Vec<bool>,
+        reload_calls: usize,
         verification_succeeds: bool,
+    }
+
+    impl FakeHyprland {
+        fn new(reload_results: &[bool], verification_succeeds: bool) -> Self {
+            Self {
+                reload_results: reload_results.to_vec(),
+                reload_calls: 0,
+                verification_succeeds,
+            }
+        }
     }
 
     impl HyprlandController for FakeHyprland {
         fn reload(&mut self) -> Result<(), String> {
-            self.reload_succeeds
+            let succeeds = self
+                .reload_results
+                .get(self.reload_calls)
+                .copied()
+                .unwrap_or(false);
+            self.reload_calls += 1;
+            succeeds
                 .then_some(())
                 .ok_or_else(|| "reload failed".to_owned())
         }
@@ -954,7 +1015,7 @@ o.bind(
 )
 "#;
 
-        let bindings = parse_lua_bindings(source);
+        let bindings = parse_lua_bindings(source).unwrap();
 
         assert_eq!(bindings.len(), 2);
         assert!(!bindings[0].is_standalone());
@@ -992,6 +1053,32 @@ o.bind("code:108", "Launcher", hl.dsp.exec_cmd("launcher"))
         assert_eq!(conflicts[0].command, "<Lua dispatcher>");
         assert_eq!(conflicts[1].description, "Launcher");
         assert_eq!(conflicts[1].command, "<Lua dispatcher>");
+    }
+
+    #[test]
+    fn managed_binding_does_not_hide_a_new_user_conflict() {
+        let source = format!(
+            "{BEGIN_MARKER}\no.bind(\"code:64\", \"Voisu dictation\", \"voisu toggle\")\n{END_MARKER}\no.bind(\"code:108\", \"Launcher\", \"launcher\")\n"
+        );
+
+        let TriggerBindingPlan::Conflicts { conflicts } = plan_trigger_binding(&source) else {
+            panic!("a user-owned exact binding must remain a conflict on rerun");
+        };
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].candidate, RIGHT_ALT);
+    }
+
+    #[test]
+    fn unparseable_candidate_binding_fails_closed() {
+        let source = r#"
+local left_alt = "code:64"
+o.bind(left_alt, "Terminal", "kitty")
+"#;
+
+        let TriggerBindingPlan::Unparseable { detail } = plan_trigger_binding(source) else {
+            panic!("a dynamic candidate key must not be treated as free");
+        };
+        assert!(detail.contains("binding key"));
     }
 
     #[test]
@@ -1083,10 +1170,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let original =
             "-- user bindings\no.bind(\"ALT, code:64\", \"Alt Tab\", \"workspace next\")\n";
         fs::write(&path, original).unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: true,
-            verification_succeeds: true,
-        };
+        let mut hyprland = FakeHyprland::new(&[true], true);
 
         let report =
             install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland).unwrap();
@@ -1115,10 +1199,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let (_directory, path) = config_dir();
         let original = "o.bind(\"code:64\", \"Terminal\", \"kitty\")\n";
         fs::write(&path, original).unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: true,
-            verification_succeeds: true,
-        };
+        let mut hyprland = FakeHyprland::new(&[true], true);
 
         let report =
             install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland).unwrap();
@@ -1137,10 +1218,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             "o.bind(\"code:108\", \"Launcher\", \"launcher\")\n"
         );
         fs::write(&path, original).unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: false,
-            verification_succeeds: false,
-        };
+        let mut hyprland = FakeHyprland::new(&[], false);
 
         let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland)
             .expect_err("both conflicts must stop before any external action");
@@ -1154,16 +1232,10 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
     fn rerunning_does_not_duplicate_the_managed_binding() {
         let (_directory, path) = config_dir();
         fs::write(&path, "-- user bindings\n").unwrap();
-        let mut first = FakeHyprland {
-            reload_succeeds: true,
-            verification_succeeds: true,
-        };
+        let mut first = FakeHyprland::new(&[true], true);
         install_trigger_binding(&path, &LocalBindingFileSystem, &mut first).unwrap();
         let before = fs::read_to_string(&path).unwrap();
-        let mut second = FakeHyprland {
-            reload_succeeds: false,
-            verification_succeeds: true,
-        };
+        let mut second = FakeHyprland::new(&[], true);
 
         let report = install_trigger_binding(&path, &LocalBindingFileSystem, &mut second).unwrap();
 
@@ -1177,10 +1249,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let (_directory, path) = config_dir();
         let original = "-- original\n";
         fs::write(&path, original).unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: false,
-            verification_succeeds: true,
-        };
+        let mut hyprland = FakeHyprland::new(&[false, true], true);
 
         let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland)
             .expect_err("reload failure must fail setup");
@@ -1191,6 +1260,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             fs::read_to_string(backup_path(Path::new(&path))).unwrap(),
             original
         );
+        assert_eq!(hyprland.reload_calls, 2);
     }
 
     #[test]
@@ -1198,16 +1268,14 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let (_directory, path) = config_dir();
         let original = "-- original\n";
         fs::write(&path, original).unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: true,
-            verification_succeeds: false,
-        };
+        let mut hyprland = FakeHyprland::new(&[true, true], false);
 
         let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland)
             .expect_err("verification failure must fail setup");
 
         assert!(error.to_string().contains("verification"));
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(hyprland.reload_calls, 2);
     }
 
     const OMARCHY_PASTE_SOURCE: &str = r#"
