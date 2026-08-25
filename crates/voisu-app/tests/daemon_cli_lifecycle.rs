@@ -3211,6 +3211,197 @@ fn doctor_reports_each_fedora_capability_through_the_public_cli() {
     assert_eq!(stdout(&doctor), expected);
 }
 
+#[test]
+fn doctor_rejects_a_daemon_started_without_wayland_display() {
+    let empty_path = TempDir::new().unwrap();
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", ""),
+            ("DISPLAY", ""),
+            ("PATH", empty_path.path().to_str().unwrap()),
+            ("VOISU_TEST_REPORT_DAEMON_READINESS", "1"),
+        ],
+    );
+    let status = ipc_request(
+        runtime.path(),
+        &format!(
+            r#"{{"version":{PROTOCOL_VERSION},"command":"status"}}"#
+        ),
+    );
+    assert_eq!(status["readiness"]["session_type"], "wayland");
+    assert_eq!(status["readiness"]["wayland_display"], "");
+    assert_eq!(status["readiness"]["clipboard_usable"], false);
+
+    let config_home = TempDir::new().unwrap();
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-0"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", ""),
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
+    );
+    let output = stdout(&doctor);
+    assert_eq!(doctor.status.code(), Some(4), "{output}");
+    assert!(output.contains(&doctor_line("Daemon session", "Wayland / missing", "FAIL")), "{output}");
+    assert!(output.contains(&doctor_line("Daemon clipboard", "not installed", "FAIL")), "{output}");
+}
+
+#[test]
+fn doctor_rejects_a_daemon_with_a_stale_wayland_display() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-1"),
+            ("DISPLAY", ""),
+            ("VOISU_TEST_REPORT_DAEMON_READINESS", "1"),
+        ],
+    );
+    let config_home = TempDir::new().unwrap();
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-2"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", ""),
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
+    );
+    let output = stdout(&doctor);
+    assert_eq!(doctor.status.code(), Some(4), "{output}");
+    assert!(output.contains(&doctor_line("Daemon session", "Wayland / wayland-1", "FAIL")), "{output}");
+    assert!(output.contains("voisu service restart"), "{output}");
+}
+
+#[test]
+fn doctor_reports_clipboard_only_when_hyprland_paste_is_unverified() {
+    let config_home = TempDir::new().unwrap();
+    let voisu_config = config_home.path().join("voisu");
+    fs::create_dir_all(&voisu_config).unwrap();
+    fs::write(voisu_config.join("config.toml"), "delivery_mode = \"clipboard\"\n").unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat >/dev/null\n");
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let runtime = TempDir::new().unwrap();
+    let config_home_value = config_home.path().to_str().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("XDG_CONFIG_HOME", config_home_value),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-4"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", ""),
+            ("PATH", &path),
+            ("VOISU_TEST_REPORT_DAEMON_READINESS", "1"),
+        ],
+    );
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-4"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", ""),
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
+    );
+    let output = stdout(&doctor);
+    assert!(doctor.status.success(), "{output}");
+    assert!(
+        output.contains(&doctor_line("Paste action", "clipboard-only", "WARN")),
+        "{output}"
+    );
+}
+
+#[test]
+fn doctor_reports_hyprland_overlay_readiness() {
+    let commands = TempDir::new().unwrap();
+    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat >/dev/null\n");
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-5"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test"),
+            ("PATH", &path),
+            ("VOISU_TEST_REPORT_DAEMON_READINESS", "1"),
+        ],
+    );
+    let config_home = TempDir::new().unwrap();
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-5"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test"),
+            ("VOISU_TEST_OVERLAY_READINESS", "ready"),
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
+    );
+    let output = stdout(&doctor);
+    assert!(doctor.status.success(), "{output}");
+    assert!(output.contains(&doctor_line("Overlay", "active", "PASS")), "{output}");
+}
+
+#[test]
+fn doctor_accepts_a_recovered_daemon_session_and_reports_backend_state() {
+    let commands = TempDir::new().unwrap();
+    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat >/dev/null\n");
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-3"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", ""),
+            ("PATH", &path),
+            ("VOISU_TEST_REPORT_DAEMON_READINESS", "1"),
+        ],
+    );
+    let config_home = TempDir::new().unwrap();
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-3"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", ""),
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
+    );
+    let output = stdout(&doctor);
+    assert!(doctor.status.success(), "{output}");
+    assert!(output.contains(&doctor_line("Daemon session", "Wayland / wayland-3", "PASS")), "{output}");
+    assert!(output.contains(&doctor_line("Daemon clipboard", "wl-copy", "PASS")), "{output}");
+}
+
 /// One terse doctor line as the production formatter renders it: label padded to
 /// 15, value padded to 20, two-space gutters, then STATUS.
 fn doctor_line(label: &str, value: &str, status: &str) -> String {

@@ -49,6 +49,14 @@ pub struct UserServiceReport {
     pub exit_code: u8,
 }
 
+/// The two systemd-user states that determine whether the Hyprland Overlay can
+/// provide setup/recording feedback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OverlayReadiness {
+    pub enabled: bool,
+    pub active: bool,
+}
+
 impl UserServiceReport {
     fn success(message: impl Into<String>) -> Self {
         Self {
@@ -152,6 +160,15 @@ pub fn start_hyprland_services() -> Result<UserServiceReport, String> {
     Ok(report)
 }
 
+/// Reports Overlay state without changing it. Doctor uses this after the
+/// daemon's own readiness response so a healthy daemon cannot mask a missing
+/// or stopped Hyprland feedback service.
+pub fn hyprland_overlay_readiness() -> Result<OverlayReadiness, String> {
+    let enabled = overlay_state("is-enabled")? == "enabled";
+    let active = overlay_state("is-active")? == "active";
+    Ok(OverlayReadiness { enabled, active })
+}
+
 fn hyprland_overlay_install_command() -> String {
     let manager = PACKAGE_MANAGERS
         .into_iter()
@@ -177,15 +194,29 @@ fn first_on_path(program: &str) -> Option<PathBuf> {
 }
 
 fn require_overlay_state(expected: &str, operation: &str) -> Result<(), String> {
-    let output = systemctl(&[operation, OVERLAY_UNIT_NAME])?;
-    if output.success && output.stdout.trim() == expected {
-        Ok(())
+    require_overlay_state_value(expected, operation).map(|_| ())
+}
+
+fn require_overlay_state_value(expected: &str, operation: &str) -> Result<bool, String> {
+    let state = overlay_state(operation)?;
+    if state == expected {
+        Ok(true)
     } else {
         Err(format!(
             "Overlay service is not {expected}; systemctl --user {operation} {OVERLAY_UNIT_NAME} reported {}",
-            output.stdout.trim()
+            state
         ))
     }
+}
+
+fn overlay_state(operation: &str) -> Result<String, String> {
+    let output = systemctl(&[operation, OVERLAY_UNIT_NAME])?;
+    if output.stdout.trim().is_empty() {
+        return Err(format!(
+            "systemctl --user {operation} {OVERLAY_UNIT_NAME} returned no state"
+        ));
+    }
+    Ok(output.stdout.trim().to_owned())
 }
 
 fn manage_optional_overlay(action: OptionalOverlayAction) -> Option<String> {
