@@ -69,6 +69,10 @@ pub enum SetupDiscoveryError {
         desktop: Option<String>,
     },
     LegacyHyprlandConfig(PathBuf),
+    AmbiguousHyprlandConfig {
+        current_lua: PathBuf,
+        legacy: PathBuf,
+    },
     MissingHyprlandLua,
 }
 
@@ -94,6 +98,11 @@ impl SetupDiscoveryError {
                 "Hyprland is using legacy configuration at {}; update Hyprland to the current Lua configuration, then re-run `voisu setup`; no files were changed",
                 path.display()
             ),
+            Self::AmbiguousHyprlandConfig { current_lua, legacy } => format!(
+                "Hyprland configuration is ambiguous: both {} and {} exist; keep only the active current Lua configuration, then re-run `voisu setup`; no files were changed",
+                current_lua.display(),
+                legacy.display()
+            ),
             Self::MissingHyprlandLua => {
                 "Hyprland's current Lua configuration was not found; create or enable `~/.config/hypr/hyprland.lua`, then re-run `voisu setup`; no files were changed".to_owned()
             }
@@ -110,10 +119,8 @@ pub fn discover_setup_profile(
         facts.x11_display.as_deref(),
         facts.session_type.as_deref(),
     );
-    let desktop = facts
-        .current_desktop
-        .as_deref()
-        .or(facts.session_desktop.as_deref());
+    let desktop = non_empty(facts.current_desktop.as_deref())
+        .or_else(|| non_empty(facts.session_desktop.as_deref()));
     let hyprland = session.session == SessionKind::Wayland
         && is_present(facts.hyprland_instance_signature.as_deref());
 
@@ -122,7 +129,13 @@ pub fn discover_setup_profile(
             facts.current_lua_config.as_ref(),
             facts.legacy_config.as_ref(),
         ) {
-            (Some(path), _) => HyprlandConfig::CurrentLua(path.clone()),
+            (Some(current_lua), Some(legacy)) => {
+                return Err(SetupDiscoveryError::AmbiguousHyprlandConfig {
+                    current_lua: current_lua.clone(),
+                    legacy: legacy.clone(),
+                });
+            }
+            (Some(path), None) => HyprlandConfig::CurrentLua(path.clone()),
             (None, Some(path)) => {
                 return Err(SetupDiscoveryError::LegacyHyprlandConfig(path.clone()));
             }
@@ -194,6 +207,10 @@ fn read_os_release_id() -> Option<String> {
 
 fn is_present(value: Option<&str>) -> bool {
     value.is_some_and(|value| !value.trim().is_empty())
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 fn is_fedora(value: Option<&str>) -> bool {
@@ -284,6 +301,20 @@ mod tests {
     }
 
     #[test]
+    fn both_hyprland_config_formats_fail_closed_as_ambiguous() {
+        let mut facts = hyprland_facts();
+        facts.legacy_config = Some(PathBuf::from("/tmp/hyprland.conf"));
+
+        let error = discover_setup_profile(&facts).expect_err("ambiguous config must stop setup");
+        assert!(matches!(
+            error,
+            SetupDiscoveryError::AmbiguousHyprlandConfig { .. }
+        ));
+        assert!(error.message().contains("configuration is ambiguous"));
+        assert!(error.message().contains("no files were changed"));
+    }
+
+    #[test]
     fn fedora_kde_and_gnome_wayland_resolve_to_the_fedora_profile() {
         for desktop in ["KDE", "GNOME"] {
             let facts = SetupDiscoveryFacts {
@@ -298,6 +329,23 @@ mod tests {
                 SetupProfile::FedoraWayland
             );
         }
+    }
+
+    #[test]
+    fn empty_current_desktop_uses_the_session_desktop_fallback() {
+        let facts = SetupDiscoveryFacts {
+            wayland_display: Some("wayland-0".to_owned()),
+            session_type: Some("wayland".to_owned()),
+            current_desktop: Some("  ".to_owned()),
+            session_desktop: Some("KDE".to_owned()),
+            distro_id: Some("fedora".to_owned()),
+            ..SetupDiscoveryFacts::default()
+        };
+
+        assert_eq!(
+            discover_setup_profile(&facts).unwrap().profile,
+            SetupProfile::FedoraWayland
+        );
     }
 
     #[test]
