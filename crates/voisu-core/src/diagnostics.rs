@@ -224,6 +224,46 @@ pub struct SourceSelectionDiagnostic {
     pub confidence: Option<SourceSelectionConfidence>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentReconstructionEligibility {
+    MaterialDisagreement,
+    LowConfidenceSelection,
+    NearIdenticalHighConfidence,
+    SingleSource,
+    RepairPath,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentReconstructionOutcome {
+    Accepted,
+    Rejected,
+    Failed,
+    Deadline,
+    Skipped,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct IntentReconstructionDiagnostic {
+    pub model: String,
+    pub eligibility: IntentReconstructionEligibility,
+    pub outcome: IntentReconstructionOutcome,
+    pub elapsed_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<String>,
+}
+
+impl IntentReconstructionDiagnostic {
+    fn normalize(&mut self) {
+        self.model = clamp_utf8_bytes(&self.model, MAX_MODEL_ID_UTF8_BYTES);
+        self.candidate = self
+            .candidate
+            .take()
+            .map(|candidate| clamp_utf8_bytes(&candidate, MAX_STORED_TEXT));
+    }
+}
+
 /// The recorded location and expiry of an explicitly captured debug audio file.
 /// Its presence is the only way raw audio is retained; without debug capture it
 /// is `None`. Only a validated basename is stored — never an arbitrary path — so
@@ -667,6 +707,8 @@ pub struct DiagnosticRecord {
     /// not exist unless the crate is compiled with its explicit eval feature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dpr: Option<DprDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_reconstruction: Option<IntentReconstructionDiagnostic>,
 }
 
 impl DiagnosticRecord {
@@ -702,6 +744,7 @@ impl DiagnosticRecord {
             debug_audio: None,
             smart_writing: None,
             dpr: None,
+            intent_reconstruction: None,
         }
     }
 
@@ -1073,6 +1116,12 @@ pub fn export_record(
         }
         dpr.normalize();
     }
+    if let Some(intent) = record.intent_reconstruction.as_mut() {
+        intent.candidate = intent.candidate.take().map(|candidate| {
+            scrub_free_text(&candidate, &secrets)
+        });
+        intent.normalize();
+    }
     DiagnosticExport {
         record,
         environment: redacted_environment(vars),
@@ -1406,6 +1455,9 @@ impl DiagnosticStore {
         }
         if let Some(dpr) = record.dpr.as_mut() {
             dpr.normalize();
+        }
+        if let Some(intent) = record.intent_reconstruction.as_mut() {
+            intent.normalize();
         }
         let _guard = self.lock_store();
         let mut records = self.load_raw()?;

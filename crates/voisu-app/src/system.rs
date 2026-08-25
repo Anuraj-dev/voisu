@@ -17,8 +17,8 @@ use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture,
     BoundaryKind, CancelRegistry, CaptureLimit, CapturedAudio, ClipboardTool,
     Command as DaemonCommand, Credential, DeadlineClock, DeliveryAdapter, DeliveryOutcome,
-    KeyDiagnosis,
-    KeyLocation, PackageManager, Provider,
+    IntentReconstructionAttempt, IntentReconstructionRequest, KeyDiagnosis,
+    KeyLocation, PackageManager, PreparedTranscriptDecision, Provider,
     ProviderAuthenticator, ProviderKeyStatus, ProviderStream, ReadinessCapability, ReadinessFinding,
     MergeResult, ReadinessInspector, ReadinessStatus, ReconciliationKind, ReconciliationModel,
     Request, Response, SecretStore, SessionKind, SessionResolution, ShortcutPortal, ShortcutSession,
@@ -43,6 +43,7 @@ pub const LIBEI_DELIVERY_DEADLINE: Duration = Duration::from_secs(5);
 /// Recording fails or a partial start is rolled back.
 pub const RECOVERY_ABORT_DEADLINE: Duration = PROCESS_DEADLINE;
 pub const RECONCILIATION_DEADLINE: Duration = Duration::from_secs(3);
+pub const INTENT_RECONSTRUCTION_DEADLINE: Duration = Duration::from_secs(5);
 pub const PROCESSING_RESPONSE_DEADLINE: Duration = Duration::from_secs(
     CAPTURE_FINALIZE_DEADLINE.as_secs()
         + PROVIDER_COMPLETION_DEADLINE.as_secs()
@@ -74,7 +75,7 @@ const RECONCILIATION_PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 /// Default Groq chat-completions model for Transcript reconciliation.
 /// Exact id only — no family-wide Qwen rule. Co-lands with the #98
 /// `reasoning_effort: "none"` body field for this same exact id.
-const DEFAULT_GROQ_RECONCILIATION_MODEL: &str = "qwen/qwen3.6-27b";
+pub const DEFAULT_GROQ_RECONCILIATION_MODEL: &str = "qwen/qwen3.6-27b";
 const MIN_RECORDING_BYTES: usize = PCM_CHUNK_BYTES;
 /// The one configured maximum for a Recording. Both capture's retained PCM
 /// buffer and its default Deadline derive from this value — and so do the
@@ -5993,8 +5994,18 @@ impl MergeResultValidator {
     pub fn new() -> Self {
         Self {
             pipeline: TranscriptDecisionPipeline::new(
-                GroqReconciliationModel,
+                GroqReconciliationModel::legacy(),
                 RECONCILIATION_DEADLINE,
+            ),
+        }
+    }
+
+    pub fn intent_reconstruction(reaper: ProviderReaper) -> Self {
+        Self {
+            pipeline: TranscriptDecisionPipeline::with_intent_reconstruction(
+                GroqReconciliationModel { reaper: Some(reaper) },
+                INTENT_RECONSTRUCTION_DEADLINE,
+                Vec::new(),
             ),
         }
     }
@@ -6017,9 +6028,31 @@ impl TranscriptValidator for MergeResultValidator {
     ) -> BoundaryFuture<'_, TranscriptDecision> {
         self.pipeline.validate(sources)
     }
+
+    fn prepare(
+        &mut self,
+        sources: Vec<SourceTranscript>,
+    ) -> BoundaryFuture<'_, PreparedTranscriptDecision> {
+        Box::pin(self.pipeline.prepare(sources))
+    }
+
+    fn reconstruct(
+        &mut self,
+        attempt: IntentReconstructionAttempt,
+    ) -> BoundaryFuture<'_, TranscriptDecision> {
+        Box::pin(self.pipeline.reconstruct(attempt))
+    }
 }
 
-struct GroqReconciliationModel;
+struct GroqReconciliationModel {
+    reaper: Option<ProviderReaper>,
+}
+
+impl GroqReconciliationModel {
+    fn legacy() -> Self {
+        Self { reaper: None }
+    }
+}
 
 impl ReconciliationModel for GroqReconciliationModel {
     fn request(
@@ -6055,6 +6088,125 @@ impl ReconciliationModel for GroqReconciliationModel {
             })?
         })
     }
+
+    fn reconstruct_intent(
+        &mut self,
+        request: IntentReconstructionRequest,
+        cancel: Arc<CancelRegistry>,
+    ) -> BoundaryFuture<'_, MergeResult> {
+        let reaper = self.reaper.clone().expect("intent validator has a reaper");
+        Box::pin(async move {
+            let lane = reaper.credential_lane().clone();
+            let entry = lane.register();
+            let mut owner = CredentialPreparationOwner::new(entry, lane, Provider::Groq);
+            let capability = tokio::select! {
+                capability = owner.poll_outcome() => capability,
+                _ = wait_for_reconstruction_cancel(Arc::clone(&cancel)) => {
+                    owner.cancel_and_drive_terminal().await;
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Validation,
+                        "Intent Reconstruction request cancelled",
+                    ));
+                }
+            };
+            let GrammarCapability::Ready(ready) = capability else {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Validation,
+                    "Groq credential unavailable for Intent Reconstruction",
+                ));
+            };
+            let credential = ready.credential().clone();
+            tokio::task::spawn_blocking(move || {
+                request_groq_intent_reconstruction(credential, request, &cancel)
+            })
+            .await
+            .map_err(|_| BoundaryError::new(
+                BoundaryKind::Validation,
+                "Intent Reconstruction request task failed",
+            ))?
+        })
+    }
+}
+
+async fn wait_for_reconstruction_cancel(cancel: Arc<CancelRegistry>) {
+    while !cancel.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn request_groq_intent_reconstruction(
+    credential: Credential,
+    request: IntentReconstructionRequest,
+    cancel: &CancelRegistry,
+) -> Result<MergeResult, BoundaryError> {
+    let endpoint = std::env::var("VOISU_GROQ_RECONCILIATION_URL")
+        .unwrap_or_else(|_| "https://api.groq.com/openai/v1/chat/completions".to_owned());
+    if !provider_endpoint_is_secure(&endpoint) {
+        return Err(BoundaryError::new(
+            BoundaryKind::Validation,
+            "Groq Intent Reconstruction endpoint must use HTTPS except on loopback",
+        ));
+    }
+    let body = groq_intent_reconstruction_request_body(&request).to_string();
+    let config = format!(
+        "url = \"{}\"\nheader = \"Authorization: Bearer {}\"\nheader = \"Content-Type: application/json\"\ndata = \"{}\"\n",
+        curl_config_escape(&endpoint),
+        curl_config_escape(credential.expose_to_boundary()),
+        curl_config_escape(&body),
+    );
+    let outcome = run_restricted_with_deadline(
+        "curl",
+        &["-q", "--config", "-", "--fail", "--silent", "--show-error", "--max-time", "5"],
+        Some(config.as_bytes()),
+        true,
+        INTENT_RECONSTRUCTION_DEADLINE,
+        Some(cancel),
+    )
+    .map_err(|_| BoundaryError::new(
+        BoundaryKind::Validation,
+        "Groq Intent Reconstruction request unavailable or failed",
+    ))?;
+    if !outcome.success {
+        return Err(BoundaryError::new(
+            BoundaryKind::Validation,
+            "Groq rejected the Intent Reconstruction request",
+        ));
+    }
+    let response: serde_json::Value = serde_json::from_slice(&outcome.stdout).map_err(|_| {
+        BoundaryError::new(
+            BoundaryKind::Validation,
+            "Groq Intent Reconstruction returned malformed JSON",
+        )
+    })?;
+    let content = response.pointer("/choices/0/message/content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| BoundaryError::new(
+            BoundaryKind::Validation,
+            "Groq Intent Reconstruction omitted content",
+        ))?;
+    voisu_core::parse_intent_reconstruction_response(content)
+}
+
+fn groq_intent_reconstruction_request_body(
+    request: &IntentReconstructionRequest,
+) -> serde_json::Value {
+    let sources: Vec<_> = request.sources.iter().map(|source| serde_json::json!({
+        "provider": source.provider.cli_label(),
+        "text": source.text,
+    })).collect();
+    serde_json::json!({
+        "model": DEFAULT_GROQ_RECONCILIATION_MODEL,
+        "reasoning_effort": "none",
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": "Infer the user's most likely intended wording from both Source Transcripts. Neither source is truth. Novel wording is allowed. Return JSON only. Deterministic host code owns structural layout."},
+            {"role": "user", "content": serde_json::json!({
+                "sources": sources,
+                "dictionary": request.dictionary_terms,
+            }).to_string()}
+        ],
+        "response_format": {"type": "json_object"}
+    })
 }
 
 fn request_groq_reconciliation(
@@ -9892,6 +10044,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn intent_reconstruction_body_uses_json_object_mode_with_both_sources_and_dictionary() {
+        let body = groq_intent_reconstruction_request_body(&IntentReconstructionRequest {
+            sources: vec![
+                SourceTranscript { provider: Provider::Deepgram, text: "sanitized one".to_owned() },
+                SourceTranscript { provider: Provider::Groq, text: "sanitized two".to_owned() },
+            ],
+            dictionary_terms: vec!["Voisu".to_owned()],
+        });
+        assert_eq!(body["model"], "qwen/qwen3.6-27b");
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(
+            body["response_format"],
+            serde_json::json!({"type": "json_object"})
+        );
+        let user: serde_json::Value = serde_json::from_str(
+            body["messages"][1]["content"].as_str().unwrap(),
+        ).unwrap();
+        assert_eq!(user["sources"].as_array().unwrap().len(), 2);
+        assert_eq!(user["dictionary"], serde_json::json!(["Voisu"]));
+    }
+
     /// #98: every other override omits `reasoning_effort` (no family-wide Qwen
     /// rule; GPT-OSS rejects `none` with HTTP 400).
     #[test]
@@ -10033,6 +10207,40 @@ mod tests {
     fn credential_prep_constants_match_spec() {
         assert_eq!(CREDENTIAL_PREP_WORK_DEADLINE, Duration::from_secs(13));
         assert_eq!(CREDENTIAL_REAP_WATCHDOG, Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn intent_deadline_cancels_and_reaps_credential_lookup_before_fallback() {
+        let _lock = credential_owner_test_lock().await;
+        let _env = CredentialEnvGuard::capture(&[
+            "VOISU_GROQ_API_KEY",
+            "VOISU_TEST_SECRET_STORE",
+            "VOISU_TEST_STORED_GROQ_CREDENTIAL",
+            "PATH",
+        ]);
+        clear_groq_credential_surface();
+        let tools = tempfile::TempDir::new().unwrap();
+        install_fake_secret_tool(tools.path(), "#!/bin/sh\nsleep 30\n");
+        let reaper = ProviderReaper::new();
+        let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
+            GroqReconciliationModel { reaper: Some(reaper.clone()) },
+            Duration::from_millis(30),
+            Vec::new(),
+        );
+        let prepared = pipeline.prepare(vec![
+            SourceTranscript { provider: Provider::Deepgram, text: "Book the room Tuesday afternoon.".to_owned() },
+            SourceTranscript { provider: Provider::Groq, text: "Schedule the review Wednesday morning.".to_owned() },
+        ]).await.unwrap();
+        let PreparedTranscriptDecision::Reconstruct(attempt) = prepared else {
+            panic!("material disagreement must reconstruct");
+        };
+        let decision = pipeline.reconstruct(attempt).await.unwrap();
+
+        assert_eq!(
+            decision.intent_reconstruction.unwrap().outcome,
+            voisu_core::IntentReconstructionOutcome::Deadline
+        );
+        assert_eq!(reaper.credential_lane().pending_count(), 0);
     }
 
     #[tokio::test]

@@ -5,8 +5,194 @@ use std::time::Duration;
 use voisu_core::{
     sanitize_source_transcript_text, sanitize_source_transcripts, BoundaryError, BoundaryFuture,
     BoundaryKind, CancelRegistry, MergeResult, Provider, ReconciliationKind, ReconciliationModel,
-    SourceTranscript, TranscriptDecisionPipeline, TranscriptSelection,
+    IntentReconstructionEligibility, IntentReconstructionOutcome, IntentReconstructionRequest,
+    PreparedTranscriptDecision, SourceTranscript, TranscriptDecisionPipeline, TranscriptSelection,
+    MAX_STORED_TEXT,
 };
+
+struct IntentModel {
+    requests: Arc<Mutex<Vec<IntentReconstructionRequest>>>,
+    result: String,
+    fail: bool,
+}
+
+impl ReconciliationModel for IntentModel {
+    fn request(
+        &mut self,
+        _kind: ReconciliationKind,
+        _sources: Vec<SourceTranscript>,
+        _candidate: Option<MergeResult>,
+        _cancel: Arc<CancelRegistry>,
+    ) -> BoundaryFuture<'_, MergeResult> {
+        Box::pin(async { panic!("intent mode must use the reconstruction seam") })
+    }
+
+    fn reconstruct_intent(
+        &mut self,
+        request: IntentReconstructionRequest,
+        _cancel: Arc<CancelRegistry>,
+    ) -> BoundaryFuture<'_, MergeResult> {
+        self.requests.lock().unwrap().push(request);
+        let result = self.result.clone();
+        let fail = self.fail;
+        Box::pin(async move {
+            if fail {
+                Err(BoundaryError::new(
+                    BoundaryKind::Validation,
+                    "controlled Intent Reconstruction failure",
+                ))
+            } else {
+                Ok(MergeResult(result))
+            }
+        })
+    }
+}
+
+fn divergent_sources() -> Vec<SourceTranscript> {
+    vec![
+        SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "Schedule the cache migration before Friday.".to_owned(),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: "Cancel the cash meeting after Thursday.".to_owned(),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn material_disagreement_is_prepared_before_intent_reconstruction_runs() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
+        IntentModel {
+            requests: Arc::clone(&requests),
+            result: "Schedule the cache migration after Thursday.".to_owned(),
+            fail: false,
+        },
+        Duration::from_secs(5),
+        vec!["cache migration".to_owned()],
+    );
+
+    let attempt = match pipeline.prepare(divergent_sources()).await.unwrap() {
+        PreparedTranscriptDecision::Reconstruct(attempt) => attempt,
+        PreparedTranscriptDecision::Ready(_) => panic!("material disagreement must reconstruct"),
+    };
+    assert_eq!(attempt.eligibility, IntentReconstructionEligibility::MaterialDisagreement);
+    assert!(requests.lock().unwrap().is_empty());
+
+    let decision = pipeline.reconstruct(attempt).await.unwrap();
+    assert_eq!(decision.selection, TranscriptSelection::IntentReconstructed);
+    assert_eq!(decision.transcript.0, "Schedule the cache migration after Thursday.");
+    let evidence = decision.intent_reconstruction.unwrap();
+    assert_eq!(evidence.outcome, IntentReconstructionOutcome::Accepted);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0].dictionary_terms, ["cache migration"]);
+    assert_eq!(requests[0].sources.len(), 2);
+}
+
+#[tokio::test]
+async fn typed_low_confidence_selection_reconstructs_but_same_words_skip() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
+        IntentModel {
+            requests: Arc::clone(&calls),
+            result: "Deploy on Tuesday morning.".to_owned(),
+            fail: false,
+        },
+        Duration::from_secs(5),
+        Vec::new(),
+    );
+    let low_confidence = vec![
+        SourceTranscript { provider: Provider::Deepgram, text: "Please deploy the cache service on Tuesday morning after review.".to_owned() },
+        SourceTranscript { provider: Provider::Groq, text: "Please deploy the cache service on Thursday morning after review.".to_owned() },
+    ];
+    let attempt = match pipeline.prepare(low_confidence).await.unwrap() {
+        PreparedTranscriptDecision::Reconstruct(attempt) => attempt,
+        PreparedTranscriptDecision::Ready(_) => panic!("different words must reconstruct"),
+    };
+    assert_eq!(attempt.eligibility, IntentReconstructionEligibility::LowConfidenceSelection);
+
+    let reconstructed = pipeline.reconstruct(attempt).await.unwrap();
+    let low_evidence = reconstructed.intent_reconstruction.unwrap();
+    assert_eq!(low_evidence.eligibility, IntentReconstructionEligibility::LowConfidenceSelection);
+    assert_eq!(
+        reconstructed.source_selection_diagnostic.confidence,
+        Some(voisu_core::SourceSelectionConfidence::Low),
+        "the typed ticket-#201 classification must drive both surfaces"
+    );
+
+    let same_words = vec![
+        SourceTranscript { provider: Provider::Deepgram, text: "Deploy on Tuesday morning".to_owned() },
+        SourceTranscript { provider: Provider::Groq, text: "Deploy on Tuesday morning.".to_owned() },
+    ];
+    let decision = match pipeline.prepare(same_words).await.unwrap() {
+        PreparedTranscriptDecision::Ready(decision) => decision,
+        PreparedTranscriptDecision::Reconstruct(_) => panic!("same words must skip"),
+    };
+    let evidence = decision.intent_reconstruction.unwrap();
+    assert_eq!(evidence.eligibility, IntentReconstructionEligibility::NearIdenticalHighConfidence);
+    assert_eq!(evidence.outcome, IntentReconstructionOutcome::Skipped);
+    assert_eq!(
+        decision.source_selection_diagnostic.confidence,
+        Some(voisu_core::SourceSelectionConfidence::High)
+    );
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn intent_reconstruction_response_requires_exact_wording_shape() {
+    assert_eq!(
+        voisu_core::parse_intent_reconstruction_response(r#"{"wording":"hello"}"#)
+            .unwrap()
+            .0,
+        "hello"
+    );
+    for invalid in [r#"{"wording":"hello","notes":"extra"}"#, r#"{"text":"hello"}"#, "hello"] {
+        assert!(voisu_core::parse_intent_reconstruction_response(invalid).is_err());
+    }
+}
+
+#[tokio::test]
+async fn intent_reconstruction_failures_keep_typed_evidence_and_safe_fallback() {
+    let cases = [
+        (true, "unused".to_owned(), IntentReconstructionOutcome::Failed),
+        (false, String::new(), IntentReconstructionOutcome::Rejected),
+        (
+            false,
+            "Thank you for watching!".to_owned(),
+            IntentReconstructionOutcome::Rejected,
+        ),
+        (
+            false,
+            "x".repeat(100_001),
+            IntentReconstructionOutcome::Rejected,
+        ),
+    ];
+    for (fail, result, expected) in cases {
+        let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
+            IntentModel {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                result,
+                fail,
+            },
+            Duration::from_secs(5),
+            Vec::new(),
+        );
+        let PreparedTranscriptDecision::Reconstruct(attempt) =
+            pipeline.prepare(divergent_sources()).await.unwrap()
+        else {
+            panic!("material disagreement must reconstruct");
+        };
+        let decision = pipeline.reconstruct(attempt).await.unwrap();
+        assert_ne!(decision.selection, TranscriptSelection::IntentReconstructed);
+        let evidence = decision.intent_reconstruction.unwrap();
+        assert_eq!(evidence.outcome, expected);
+        if expected == IntentReconstructionOutcome::Rejected {
+            assert!(evidence.candidate.unwrap().len() <= MAX_STORED_TEXT);
+        }
+    }
+}
 
 struct CountingModel {
     calls: Arc<AtomicUsize>,

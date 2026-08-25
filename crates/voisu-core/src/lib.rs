@@ -27,7 +27,8 @@ pub use diagnostics::{
     is_text_sha256_fingerprint, redacted_environment, replay_capture, sanitize_url,
     scrub_embedded_urls, scrub_secret_values, text_sha256_fingerprint, unix_millis_now,
     DebugAudioRecord, DiagnosticExport, DiagnosticRecord, DiagnosticStore,
-    EnglishEligibilityOutcome, PruneOutcome, ReplayOutcome, RetentionPolicy,
+    EnglishEligibilityOutcome, IntentReconstructionDiagnostic,
+    IntentReconstructionEligibility, IntentReconstructionOutcome, PruneOutcome, ReplayOutcome, RetentionPolicy,
     SmartWritingDiagnostic, SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome,
     SmartWritingReasonCode, SourceCoverageRecord, SourceSelectionConfidence,
     SourceSelectionDiagnostic, SourceTranscriptRecord, DEFAULT_DEBUG_AUDIO_TTL, DEFAULT_MAX_AGE,
@@ -353,6 +354,8 @@ pub struct LifecycleEvidence {
     pub recovery_attempted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_selection_diagnostic: Option<SourceSelectionDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_reconstruction: Option<IntentReconstructionDiagnostic>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1114,7 +1117,7 @@ impl CancelRegistry {
 /// subprocess before the fallback Transcript becomes observable. A
 /// cancel-honoring model completes within one subprocess poll tick plus a
 /// brief reap, well inside this bound.
-const RECONCILIATION_CLEANUP_GRACE: Duration = Duration::from_secs(1);
+const RECONCILIATION_CLEANUP_GRACE: Duration = Duration::from_secs(3);
 
 pub trait ReconciliationModel: Send {
     /// Requests a Merge Result. The request MUST observe `cancel`: once the
@@ -1129,6 +1132,35 @@ pub trait ReconciliationModel: Send {
         candidate: Option<MergeResult>,
         cancel: Arc<CancelRegistry>,
     ) -> BoundaryFuture<'_, MergeResult>;
+
+    fn reconstruct_intent(
+        &mut self,
+        request: IntentReconstructionRequest,
+        cancel: Arc<CancelRegistry>,
+    ) -> BoundaryFuture<'_, MergeResult> {
+        self.request(ReconciliationKind::Reconcile, request.sources, None, cancel)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct IntentReconstructionRequest {
+    pub sources: Vec<SourceTranscript>,
+    pub dictionary_terms: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntentReconstructionResponse {
+    wording: String,
+}
+
+pub fn parse_intent_reconstruction_response(content: &str) -> Result<MergeResult, BoundaryError> {
+    serde_json::from_str::<IntentReconstructionResponse>(content)
+        .map(|response| MergeResult(response.wording))
+        .map_err(|_| BoundaryError::new(
+            BoundaryKind::Validation,
+            "Intent Reconstruction returned invalid shape",
+        ))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1138,8 +1170,26 @@ pub enum TranscriptSelection {
     NearIdenticalGroq,
     Reconciled,
     Repaired,
+    IntentReconstructed,
     SourceDeepgram,
     SourceGroq,
+}
+
+#[derive(Clone, Debug)]
+pub struct IntentReconstructionEvidence {
+    pub eligibility: IntentReconstructionEligibility,
+    pub outcome: IntentReconstructionOutcome,
+    pub candidate: Option<String>,
+}
+
+impl IntentReconstructionEvidence {
+    fn skipped(eligibility: IntentReconstructionEligibility) -> Self {
+        Self {
+            eligibility,
+            outcome: IntentReconstructionOutcome::Skipped,
+            candidate: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1151,12 +1201,28 @@ pub struct TranscriptDecision {
     pub reconciliation_requested: bool,
     pub recovery_attempted: bool,
     pub source_selection_diagnostic: SourceSelectionDiagnostic,
+    pub intent_reconstruction: Option<IntentReconstructionEvidence>,
+}
+
+#[derive(Debug)]
+pub struct IntentReconstructionAttempt {
+    pub request: IntentReconstructionRequest,
+    pub eligibility: IntentReconstructionEligibility,
+    classification: SourcePairClassification,
+    fallback: Result<TranscriptDecision, BoundaryError>,
+}
+
+#[derive(Debug)]
+pub enum PreparedTranscriptDecision {
+    Ready(TranscriptDecision),
+    Reconstruct(IntentReconstructionAttempt),
 }
 
 pub struct TranscriptDecisionPipeline<M> {
     model: M,
     deadline: Duration,
     dictionary_terms: Vec<String>,
+    intent_reconstruction: bool,
 }
 
 impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
@@ -1165,6 +1231,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             model,
             deadline,
             dictionary_terms: Vec::new(),
+            intent_reconstruction: false,
         }
     }
 
@@ -1177,11 +1244,141 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             model,
             deadline,
             dictionary_terms,
+            intent_reconstruction: false,
+        }
+    }
+
+    pub fn with_intent_reconstruction(
+        model: M,
+        deadline: Duration,
+        dictionary_terms: Vec<String>,
+    ) -> Self {
+        Self {
+            model,
+            deadline,
+            dictionary_terms,
+            intent_reconstruction: true,
         }
     }
 
     pub fn set_dictionary_terms(&mut self, dictionary_terms: Vec<String>) {
         self.dictionary_terms = dictionary_terms;
+    }
+
+    pub async fn prepare(
+        &mut self,
+        mut sources: Vec<SourceTranscript>,
+    ) -> Result<PreparedTranscriptDecision, BoundaryError> {
+        if !self.intent_reconstruction {
+            return self.decide(sources).await.map(PreparedTranscriptDecision::Ready);
+        }
+
+        sources = sanitize_source_transcripts(sources);
+        sources.retain(|source| !source.text.is_empty());
+        sources.sort_by_key(|source| source.provider);
+        if let (Some(deepgram), Some(groq)) = (
+            sources.iter().find(|source| source.provider == Provider::Deepgram),
+            sources.iter().find(|source| source.provider == Provider::Groq),
+        ) {
+            let classification = source_pair_classification(&deepgram.text, &groq.text);
+            if let Some(eligibility) = classification.intent_eligibility() {
+                let mut fallback = safe_source_fallback(
+                    &sources,
+                    "Intent Reconstruction fallback prepared".to_owned(),
+                    true,
+                    false,
+                );
+                if let Some(confidence) = classification.diagnostic_confidence() {
+                    if let Ok(decision) = &mut fallback {
+                        decision.source_selection_diagnostic.confidence = Some(confidence);
+                    }
+                }
+                return Ok(PreparedTranscriptDecision::Reconstruct(IntentReconstructionAttempt {
+                    request: IntentReconstructionRequest {
+                        sources,
+                        dictionary_terms: self.dictionary_terms.clone(),
+                    },
+                    eligibility,
+                    classification,
+                    fallback,
+                }));
+            }
+        }
+
+        let mut decision = self.decide(sources).await?;
+        let eligibility = if decision.selection == TranscriptSelection::Repaired {
+            IntentReconstructionEligibility::RepairPath
+        } else if decision.source_selection_diagnostic.sources.len() == 1 {
+            IntentReconstructionEligibility::SingleSource
+        } else {
+            IntentReconstructionEligibility::NearIdenticalHighConfidence
+        };
+        decision.intent_reconstruction = Some(IntentReconstructionEvidence::skipped(eligibility));
+        Ok(PreparedTranscriptDecision::Ready(decision))
+    }
+
+    pub async fn reconstruct(
+        &mut self,
+        attempt: IntentReconstructionAttempt,
+    ) -> Result<TranscriptDecision, BoundaryError> {
+        let IntentReconstructionAttempt {
+            request,
+            eligibility,
+            classification,
+            fallback,
+        } = attempt;
+        let sources = request.sources.clone();
+        let cancel = CancelRegistry::new();
+        let model_request = self.model.reconstruct_intent(request, Arc::clone(&cancel));
+        let candidate = match bounded_model_call(model_request, cancel, self.deadline).await {
+            Ok(candidate) => candidate,
+            Err(ModelCallFailure::Failed(error)) => return intent_fallback(
+                fallback,
+                eligibility,
+                IntentReconstructionOutcome::Failed,
+                format!("Intent Reconstruction failed: {}", error.diagnostic()),
+                None,
+            ),
+            Err(ModelCallFailure::DeadlineElapsed) => return intent_fallback(
+                fallback,
+                eligibility,
+                IntentReconstructionOutcome::Deadline,
+                "Intent Reconstruction deadline elapsed".to_owned(),
+                None,
+            ),
+        };
+        let wording = candidate.0.trim();
+        let bounded_candidate = Some(clamp_utf8_bytes(wording, MAX_STORED_TEXT));
+        if wording.is_empty()
+            || wording.len() > MAX_INTENT_RECONSTRUCTION_UTF8_BYTES
+            || sanitize_source_transcript_text(wording) != wording
+        {
+            return intent_fallback(
+                fallback,
+                eligibility,
+                IntentReconstructionOutcome::Rejected,
+                "Intent Reconstruction returned empty, oversized, or outro text".to_owned(),
+                bounded_candidate,
+            );
+        }
+        Ok(TranscriptDecision {
+            transcript: Transcript(wording.to_owned()),
+            selection: TranscriptSelection::IntentReconstructed,
+            validation_reason: "Intent Reconstruction passed validation".to_owned(),
+            fallback_reason: None,
+            reconciliation_requested: true,
+            recovery_attempted: false,
+            source_selection_diagnostic: source_selection_diagnostic(
+                &sources,
+                None,
+                classification.diagnostic_confidence(),
+            ),
+            intent_reconstruction: Some(IntentReconstructionEvidence {
+                eligibility,
+                outcome: IntentReconstructionOutcome::Accepted,
+                candidate: bounded_candidate,
+            }),
+        })
     }
 
     pub async fn decide(
@@ -1216,9 +1413,9 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             sources.iter().find(|source| source.provider == Provider::Deepgram),
             sources.iter().find(|source| source.provider == Provider::Groq),
         ) {
-            if source_similarity(&deepgram.text, &groq.text) >= 0.85 {
-                let lexically_identical =
-                    normalized_words(&deepgram.text) == normalized_words(&groq.text);
+            let classification = source_pair_classification(&deepgram.text, &groq.text);
+            if classification.is_near_identical() {
+                let lexically_identical = classification.is_lexically_identical();
                 // Word-for-word equal texts differ only in rendering, so the
                 // three formatting signals decide them. Texts whose words
                 // differ keep the Groq default, always: the difference may be a
@@ -1266,12 +1463,9 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                     source_selection_diagnostic: source_selection_diagnostic(
                         &sources,
                         Some(selected.provider),
-                        Some(if lexically_identical {
-                            SourceSelectionConfidence::High
-                        } else {
-                            SourceSelectionConfidence::Low
-                        }),
+                        Some(classification.confidence()),
                     ),
+                    intent_reconstruction: None,
                 });
             }
 
@@ -1311,6 +1505,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                             Some(winner.provider),
                             Some(gate.confidence),
                         ),
+                        intent_reconstruction: None,
                     });
                 }
                 // The better source itself failed a quality guardrail: fall
@@ -1388,6 +1583,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 reconciliation_requested: true,
                 recovery_attempted: false,
                 source_selection_diagnostic: source_selection_diagnostic(&sources, None, None),
+                intent_reconstruction: None,
             });
         }
 
@@ -1419,6 +1615,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 Some(source.provider),
                 Some(SourceSelectionConfidence::High),
             ),
+            intent_reconstruction: None,
         })
     }
 
@@ -1519,6 +1716,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 reconciliation_requested,
                 recovery_attempted: true,
                 source_selection_diagnostic: source_selection_diagnostic(sources, None, None),
+                intent_reconstruction: None,
             });
         }
         Ok(TranscriptDecision {
@@ -1529,6 +1727,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             reconciliation_requested,
             recovery_attempted: true,
             source_selection_diagnostic: source_selection_diagnostic(sources, None, None),
+            intent_reconstruction: None,
         })
     }
 }
@@ -1588,6 +1787,7 @@ fn contraction_source_fallback(
         reconciliation_requested,
         recovery_attempted,
         source_selection_diagnostic: selection_diagnostic,
+        intent_reconstruction: None,
     })
 }
 
@@ -1662,7 +1862,51 @@ fn safe_source_fallback(
             Some(source.provider),
             Some(SourceSelectionConfidence::High),
         ),
+        intent_reconstruction: None,
     })
+}
+
+const MAX_INTENT_RECONSTRUCTION_UTF8_BYTES: usize = 100_000;
+
+fn intent_fallback(
+    fallback: Result<TranscriptDecision, BoundaryError>,
+    eligibility: IntentReconstructionEligibility,
+    outcome: IntentReconstructionOutcome,
+    reason: String,
+    candidate: Option<String>,
+) -> Result<TranscriptDecision, BoundaryError> {
+    let mut decision = fallback?;
+    decision.validation_reason = reason.clone();
+    decision.fallback_reason = Some(reason);
+    decision.reconciliation_requested = true;
+    decision.intent_reconstruction = Some(IntentReconstructionEvidence {
+        eligibility,
+        outcome,
+        candidate,
+    });
+    Ok(decision)
+}
+
+enum ModelCallFailure {
+    Failed(BoundaryError),
+    DeadlineElapsed,
+}
+
+async fn bounded_model_call(
+    request: BoundaryFuture<'_, MergeResult>,
+    cancel: Arc<CancelRegistry>,
+    deadline: Duration,
+) -> Result<MergeResult, ModelCallFailure> {
+    tokio::pin!(request);
+    match tokio::time::timeout(deadline, request.as_mut()).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => Err(ModelCallFailure::Failed(error)),
+        Err(_) => {
+            cancel.cancel();
+            let _ = tokio::time::timeout(RECONCILIATION_CLEANUP_GRACE, request.as_mut()).await;
+            Err(ModelCallFailure::DeadlineElapsed)
+        }
+    }
 }
 
 fn source_fallback_decision(
@@ -1684,6 +1928,7 @@ fn source_fallback_decision(
         reconciliation_requested,
         recovery_attempted,
         source_selection_diagnostic,
+        intent_reconstruction: None,
     }
 }
 
@@ -2085,6 +2330,72 @@ const MIN_COMPARABLE_CONTENT: usize = 5;
 
 /// Cross-confirmation differences below this margin are noise, not a decision.
 const CONFIRMATION_MARGIN: f64 = 0.15;
+
+/// The ticket-#201 classification shared by source selection and Intent
+/// Reconstruction eligibility. Keeping the near-identical boundary and lexical
+/// comparison in one typed result prevents those surfaces from drifting apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourcePairClassification {
+    NearIdentical { lexically_identical: bool },
+    MaterialDisagreement,
+}
+
+impl SourcePairClassification {
+    fn is_near_identical(self) -> bool {
+        matches!(self, Self::NearIdentical { .. })
+    }
+
+    fn is_lexically_identical(self) -> bool {
+        matches!(
+            self,
+            Self::NearIdentical {
+                lexically_identical: true
+            }
+        )
+    }
+
+    fn confidence(self) -> SourceSelectionConfidence {
+        match self {
+            Self::NearIdentical {
+                lexically_identical: true,
+            } => SourceSelectionConfidence::High,
+            Self::NearIdentical {
+                lexically_identical: false,
+            } => SourceSelectionConfidence::Low,
+            Self::MaterialDisagreement => {
+                unreachable!("material disagreement has no near-identical confidence")
+            }
+        }
+    }
+
+    fn diagnostic_confidence(self) -> Option<SourceSelectionConfidence> {
+        self.is_near_identical().then(|| self.confidence())
+    }
+
+    fn intent_eligibility(self) -> Option<IntentReconstructionEligibility> {
+        match self {
+            Self::NearIdentical {
+                lexically_identical: true,
+            } => None,
+            Self::NearIdentical {
+                lexically_identical: false,
+            } => Some(IntentReconstructionEligibility::LowConfidenceSelection),
+            Self::MaterialDisagreement => {
+                Some(IntentReconstructionEligibility::MaterialDisagreement)
+            }
+        }
+    }
+}
+
+fn source_pair_classification(left: &str, right: &str) -> SourcePairClassification {
+    if source_similarity(left, right) >= 0.85 {
+        SourcePairClassification::NearIdentical {
+            lexically_identical: normalized_words(left) == normalized_words(right),
+        }
+    } else {
+        SourcePairClassification::MaterialDisagreement
+    }
+}
 
 /// Which evidence tier decided a selection between two disagreeing sources.
 /// The first two tiers rest on cross-source evidence a salad cannot fake; the
@@ -3469,6 +3780,20 @@ pub trait TranscriptValidator: Send {
         &mut self,
         sources: Vec<SourceTranscript>,
     ) -> BoundaryFuture<'_, TranscriptDecision>;
+
+    fn prepare(
+        &mut self,
+        sources: Vec<SourceTranscript>,
+    ) -> BoundaryFuture<'_, PreparedTranscriptDecision> {
+        Box::pin(async move { self.validate(sources).await.map(PreparedTranscriptDecision::Ready) })
+    }
+
+    fn reconstruct(
+        &mut self,
+        attempt: IntentReconstructionAttempt,
+    ) -> BoundaryFuture<'_, TranscriptDecision> {
+        Box::pin(async move { attempt.fallback })
+    }
 }
 
 impl<M: ReconciliationModel> TranscriptValidator for TranscriptDecisionPipeline<M> {
@@ -3481,6 +3806,20 @@ impl<M: ReconciliationModel> TranscriptValidator for TranscriptDecisionPipeline<
         sources: Vec<SourceTranscript>,
     ) -> BoundaryFuture<'_, TranscriptDecision> {
         Box::pin(async move { self.decide(sources).await })
+    }
+
+    fn prepare(
+        &mut self,
+        sources: Vec<SourceTranscript>,
+    ) -> BoundaryFuture<'_, PreparedTranscriptDecision> {
+        Box::pin(async move { TranscriptDecisionPipeline::prepare(self, sources).await })
+    }
+
+    fn reconstruct(
+        &mut self,
+        attempt: IntentReconstructionAttempt,
+    ) -> BoundaryFuture<'_, TranscriptDecision> {
+        Box::pin(async move { TranscriptDecisionPipeline::reconstruct(self, attempt).await })
     }
 }
 
