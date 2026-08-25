@@ -1,7 +1,8 @@
 [Unit]
 Description=Voisu overlay observer
 PartOf=graphical-session.target
-After=voisu.service
+After=graphical-session.target wayland-session-waitenv.service voisu.service
+ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
 Type=simple

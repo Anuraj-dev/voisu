@@ -1,8 +1,9 @@
 [Unit]
 Description=Voisu dictation daemon
-After=dbus.socket pipewire.service xdg-desktop-portal.service
-Wants=dbus.socket pipewire.service xdg-desktop-portal.service
+After=graphical-session.target wayland-session-waitenv.service dbus.socket pipewire.service
+Wants=dbus.socket pipewire.service
 PartOf=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
 StartLimitIntervalSec=30s
 StartLimitBurst=3
 

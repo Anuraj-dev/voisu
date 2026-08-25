@@ -77,6 +77,22 @@ if grep -Eq '^ReadWritePaths=.*%h' "$unit"; then
     echo "FAIL: voisu.service ReadWritePaths still references a %h home path"; exit 1
 fi
 grep -qx 'Environment=VOISU_ENABLE_DPR=1' "$unit"
+grep -qx 'After=graphical-session.target wayland-session-waitenv.service dbus.socket pipewire.service' "$unit"
+grep -qx 'Wants=dbus.socket pipewire.service' "$unit"
+grep -qx 'PartOf=graphical-session.target' "$unit"
+grep -qx 'ConditionEnvironment=WAYLAND_DISPLAY' "$unit"
+grep -qx 'WantedBy=graphical-session.target' "$unit"
+if grep -Eq '^(After|Wants)=.*xdg-desktop-portal\.service' "$unit"; then
+    echo "FAIL: packaged voisu.service must not own xdg-desktop-portal.service"; exit 1
+fi
+overlay_unit=/usr/lib/systemd/user/voisu-overlay.service
+grep -qx 'After=graphical-session.target wayland-session-waitenv.service voisu.service' "$overlay_unit"
+grep -qx 'PartOf=graphical-session.target' "$overlay_unit"
+grep -qx 'ConditionEnvironment=WAYLAND_DISPLAY' "$overlay_unit"
+grep -qx 'WantedBy=graphical-session.target' "$overlay_unit"
+if grep -Eq '^(After|Wants)=.*xdg-desktop-portal\.service' "$overlay_unit"; then
+    echo "FAIL: packaged voisu-overlay.service must not own xdg-desktop-portal.service"; exit 1
+fi
 if grep -Eq '^Environment=.*VOISU_ENABLE_QWEN_FORMAT' "$unit"; then
     echo "FAIL: packaged voisu.service must not set VOISU_ENABLE_QWEN_FORMAT"; exit 1
 fi
