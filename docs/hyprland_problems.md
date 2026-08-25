@@ -169,6 +169,12 @@ Running `voisu service install` may replace or migrate the host-only daemon unit
 
 ## Release gates
 
+The executable collector and operator-owned evidence procedure live in
+[`docs/hyprland-release-gate.md`](hyprland-release-gate.md) and
+`packaging/hyprland-release-gate.sh`. The collector is fail-closed: it never
+turns an unrun cold-login, recovery, stale-daemon, or upgrade check into a
+passing release claim.
+
 Do not claim Hyprland support until a packaged installation passes all of these on a clean user account:
 
 1. Install Voisu and run only the documented setup flow.
