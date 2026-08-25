@@ -13,6 +13,35 @@ pub const VOISU_TOGGLE_COMMAND: &str = "voisu toggle";
 pub const VOISU_TRIGGER_DESCRIPTION: &str = "Voisu dictation";
 pub const RECOVERY_COMMAND: &str = "voisu setup";
 
+/// A key chord that is safe for the daemon to emit after it has verified the
+/// corresponding Hyprland binding. This is data only: no Lua or shell text is
+/// ever executed by the paste path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PasteShortcut {
+    pub binding: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PasteBehavior {
+    /// The known Omarchy helper chooses a different application shortcut for a
+    /// terminal. The daemon emits the verified binding key and lets Hyprland
+    /// perform that focus-sensitive choice.
+    OmarchyUniversal {
+        normal: PasteShortcut,
+        terminal: PasteShortcut,
+    },
+    /// A literal `o.bind` dispatcher selected by the user. The command remains
+    /// owned by Hyprland; Voisu only emits the verified binding key.
+    Simple,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedPasteAction {
+    pub shortcut: PasteShortcut,
+    pub description: String,
+    pub behavior: PasteBehavior,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TriggerKey {
     pub label: &'static str,
@@ -231,6 +260,13 @@ impl BindingFileSystem for LocalBindingFileSystem {
 pub trait HyprlandController {
     fn reload(&mut self) -> Result<(), String>;
     fn binding_is_installed(&mut self, key: &str, command: &str) -> Result<bool, String>;
+
+    /// Returns the compositor's current binding table. A default keeps the
+    /// trigger-binding seam source-compatible for callers that only need
+    /// installation verification.
+    fn live_bindings(&mut self) -> Result<Value, String> {
+        Err("live Hyprland bindings are unavailable".to_owned())
+    }
 }
 
 pub struct LiveHyprlandController;
@@ -247,6 +283,13 @@ impl HyprlandController for LiveHyprlandController {
             .ok_or_else(|| "`hyprctl binds -j` returned a failure".to_owned())?;
         serde_json::from_slice::<Value>(&payload)
             .map(|value| hyprland_binding_is_installed(&value, key, command))
+            .map_err(|error| format!("invalid `hyprctl binds -j` response: {error}"))
+    }
+
+    fn live_bindings(&mut self) -> Result<Value, String> {
+        let payload = crate::system::run_restricted_stdout("hyprctl", &["binds", "-j"])
+            .ok_or_else(|| "`hyprctl binds -j` returned a failure".to_owned())?;
+        serde_json::from_slice(&payload)
             .map_err(|error| format!("invalid `hyprctl binds -j` response: {error}"))
     }
 }
@@ -311,6 +354,234 @@ pub fn parse_lua_bindings(source: &str) -> Vec<LuaBinding> {
     }
     bindings.extend(parse_lua_chunk(&chunk, managed));
     bindings
+}
+
+/// Finds the first paste binding that is proven by both the active Lua source
+/// and the compositor's live binding table. The source is deliberately
+/// conservative: literal dispatchers are accepted only when their description
+/// identifies a paste action, and dynamic Lua functions are accepted only for
+/// the exact Omarchy universal-paste helper shape.
+pub fn discover_paste_action(sources: &[&str], live_bindings: &Value) -> Option<VerifiedPasteAction> {
+    let bindings = sources
+        .iter()
+        .flat_map(|source| {
+            parse_lua_bindings(source)
+                .into_iter()
+                .map(|binding| (binding, (*source).to_owned()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let live = live_bindings.as_array()?;
+
+    for binding in live {
+        let Some(dispatcher) = binding.get("dispatcher").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(live_description) = binding.get("description").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(source) = bindings.iter().find_map(|(candidate, source)| {
+            (candidate.description == live_description
+                && live_binding_matches_source(binding, candidate))
+                .then_some((candidate, source))
+        }) else {
+            continue;
+        };
+        let (candidate, source_text) = source;
+
+        if dispatcher == "__lua" && is_omarchy_universal_paste(candidate, source_text) {
+            return Some(VerifiedPasteAction {
+                shortcut: PasteShortcut {
+                    binding: candidate.key.trim().to_owned(),
+                },
+                description: candidate.description.clone(),
+                behavior: PasteBehavior::OmarchyUniversal {
+                    normal: PasteShortcut {
+                        binding: "CTRL + V".to_owned(),
+                    },
+                    terminal: PasteShortcut {
+                        binding: "SHIFT + Insert".to_owned(),
+                    },
+                },
+            });
+        }
+
+        // A literal dispatcher is safe to trigger through the compositor. The
+        // command itself is not executed by Voisu; it is only selected after
+        // the source and live dispatcher agree. Dynamic functions and unknown
+        // dispatchers never reach this branch.
+        if dispatcher == "exec"
+            && candidate.command != "<Lua dispatcher>"
+            && is_paste_description(&candidate.description)
+        {
+            return Some(VerifiedPasteAction {
+                shortcut: PasteShortcut {
+                    binding: candidate.key.trim().to_owned(),
+                },
+                description: candidate.description.clone(),
+                behavior: PasteBehavior::Simple,
+            });
+        }
+    }
+    None
+}
+
+/// Reads the active current-Lua root and the small set of source files that
+/// can define the standard Omarchy clipboard helper. Setup can use this with
+/// its injected [`BindingFileSystem`] seam; production discovery never scans
+/// arbitrary files or evaluates Lua.
+pub fn discover_paste_action_from_sources(
+    root: &Path,
+    files: &dyn BindingFileSystem,
+    hyprland: &mut dyn HyprlandController,
+) -> Result<Option<VerifiedPasteAction>, String> {
+    let root_source = files
+        .read_to_string(root)?
+        .ok_or_else(|| format!("active Hyprland Lua source is missing: {}", root.display()))?;
+    let mut source_storage = vec![root_source];
+
+    // Current Omarchy imports the clipboard bindings through its default
+    // module tree rather than copying the helper into the user's file. Only
+    // add the known file when the active source actually refers to Omarchy;
+    // this keeps unrelated or inactive Lua files out of the decision.
+    let root_mentions_omarchy = source_storage[0].contains("omarchy")
+        || std::env::var("XDG_CURRENT_DESKTOP")
+            .is_ok_and(|desktop| desktop.eq_ignore_ascii_case("omarchy"));
+    if root_mentions_omarchy {
+        for path in omarchy_clipboard_source_candidates(root) {
+            if let Some(source) = files.read_to_string(&path)? {
+                source_storage.push(source);
+                break;
+            }
+        }
+    }
+
+    let live = hyprland.live_bindings()?;
+    let sources = source_storage.iter().map(String::as_str).collect::<Vec<_>>();
+    Ok(discover_paste_action(&sources, &live))
+}
+
+/// Production discovery for the daemon. A missing or unreadable source is a
+/// safe clipboard-only result; setup/diagnostic callers that need the exact
+/// failure should use [`discover_paste_action_from_sources`] directly.
+pub fn discover_live_paste_action() -> Option<VerifiedPasteAction> {
+    std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
+    let config_root = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".config"))
+        })?;
+    let root = config_root.join("hypr/hyprland.lua");
+    let files = LocalBindingFileSystem;
+    let mut hyprland = LiveHyprlandController;
+    let root_source = files.read_to_string(&root).ok().flatten()?;
+    let mut sources = vec![root_source];
+    let bindings = root.with_file_name("bindings.lua");
+    if let Ok(Some(source)) = files.read_to_string(&bindings) {
+        sources.push(source);
+    }
+    if sources[0].contains("omarchy")
+        || std::env::var("XDG_CURRENT_DESKTOP")
+            .is_ok_and(|desktop| desktop.eq_ignore_ascii_case("omarchy"))
+    {
+        for path in omarchy_clipboard_source_candidates(&root) {
+            if let Ok(Some(source)) = files.read_to_string(&path) {
+                sources.push(source);
+                break;
+            }
+        }
+    }
+    let live = hyprland.live_bindings().ok()?;
+    let source_refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+    discover_paste_action(&source_refs, &live)
+}
+
+fn omarchy_clipboard_source_candidates(root: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("OMARCHY_PATH") {
+        candidates.push(PathBuf::from(path).join("default/hypr/bindings/clipboard.lua"));
+    }
+    if let Some(home) = root
+        .ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == "hypr"))
+        .and_then(Path::parent)
+    {
+        candidates.push(home.join("default/hypr/bindings/clipboard.lua"));
+    }
+    candidates.push(PathBuf::from("/usr/share/omarchy/default/hypr/bindings/clipboard.lua"));
+    candidates
+}
+
+fn live_binding_matches_source(live: &Value, source: &LuaBinding) -> bool {
+    let Some((source_modmask, source_key)) = shortcut_parts(&source.key) else {
+        return false;
+    };
+    let live_key = live.get("key").and_then(Value::as_str).unwrap_or_default();
+    let live_modmask = live.get("modmask").and_then(Value::as_u64).unwrap_or(u64::MAX);
+    if source_modmask != live_modmask || normalize_key(live_key) != normalize_key(&source_key) {
+        return false;
+    }
+    match live.get("dispatcher").and_then(Value::as_str) {
+        Some("exec") => binding_argument(live)
+            .map(str::trim)
+            .is_some_and(|argument| argument == source.command.trim()),
+        Some("__lua") => source.command == "<Lua dispatcher>",
+        _ => false,
+    }
+}
+
+fn shortcut_parts(binding: &str) -> Option<(u64, String)> {
+    let pieces = binding
+        .split('+')
+        .map(str::trim)
+        .filter(|piece| !piece.is_empty())
+        .collect::<Vec<_>>();
+    let key = pieces.last()?.to_owned();
+    let mut modmask = 0;
+    for modifier in &pieces[..pieces.len().saturating_sub(1)] {
+        modmask |= match modifier.to_ascii_uppercase().as_str() {
+            "SHIFT" => 1,
+            "CAPS" | "CAPSLOCK" => 2,
+            "CTRL" | "CONTROL" => 4,
+            "ALT" => 8,
+            "SUPER" | "META" | "WIN" | "MOD4" => 64,
+            _ => return None,
+        };
+    }
+    Some((modmask, key.to_owned()))
+}
+
+fn normalize_key(key: &str) -> String {
+    key.trim().to_ascii_uppercase()
+}
+
+fn is_paste_description(description: &str) -> bool {
+    let description = description.to_ascii_lowercase();
+    description.contains("paste")
+        || (description.contains("clipboard") && description.contains("insert"))
+}
+
+fn is_omarchy_universal_paste(binding: &LuaBinding, source: &str) -> bool {
+    if binding.command != "<Lua dispatcher>"
+        || binding.description != "Universal paste"
+        || !binding.key.contains('+')
+    {
+        return false;
+    }
+    let compact = source.chars().filter(|character| !character.is_whitespace()).collect::<String>();
+    [
+        "universal_clipboard_shortcut(default_mods,default_key,terminal_mods,terminal_key)",
+        "ifactive_window_is_terminal()then",
+        "send_shortcut_once(terminal_mods,terminal_key)()",
+        "send_shortcut_once(default_mods,default_key)()",
+        "o.bind(\"SUPER+V\",\"Universalpaste\",universal_clipboard_shortcut(\"CTRL\",\"V\",\"SHIFT\",\"Insert\"))",
+    ]
+    .iter()
+    .all(|marker| compact.contains(marker))
+        && (compact.contains("functionuniversal_clipboard_shortcut(")
+            || compact.contains("localfunctionuniversal_clipboard_shortcut("))
 }
 
 pub fn plan_trigger_binding(source: &str) -> TriggerBindingPlan {
@@ -937,5 +1208,100 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
 
         assert!(error.to_string().contains("verification"));
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    const OMARCHY_PASTE_SOURCE: &str = r#"
+local function send_shortcut_once(mods, key)
+  return function()
+    hl.dispatch(hl.dsp.send_key_state({ mods = mods, key = key, state = "down" }))
+    hl.timer(function()
+      hl.dispatch(hl.dsp.send_key_state({ mods = mods, key = key, state = "up" }))
+    end, { timeout = 50, type = "oneshot" })
+  end
+end
+local function active_window_is_terminal()
+  return true
+end
+local function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key)
+  return function()
+    if active_window_is_terminal() then
+      send_shortcut_once(terminal_mods, terminal_key)()
+    else
+      send_shortcut_once(default_mods, default_key)()
+    end
+  end
+end
+o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V", "SHIFT", "Insert"))
+"#;
+
+    #[test]
+    fn omarchy_universal_paste_requires_live_dynamic_binding_and_keeps_both_paths() {
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+
+        let action = discover_paste_action(&[OMARCHY_PASTE_SOURCE], &live)
+            .expect("known Omarchy helper should be verified");
+        assert_eq!(action.shortcut.binding, "SUPER + V");
+        assert_eq!(
+            action.behavior,
+            PasteBehavior::OmarchyUniversal {
+                normal: PasteShortcut { binding: "CTRL + V".to_owned() },
+                terminal: PasteShortcut { binding: "SHIFT + Insert".to_owned() },
+            }
+        );
+    }
+
+    #[test]
+    fn a_different_literal_paste_binding_is_verified_from_live_hyprland() {
+        let source = r#"o.bind("CTRL + SHIFT + P", "Paste transcript", "hyprctl dispatch sendshortcut CTRL V")"#;
+        let live = serde_json::json!([{
+            "key": "P",
+            "modmask": 5,
+            "description": "Paste transcript",
+            "dispatcher": "exec",
+            "arg": "hyprctl dispatch sendshortcut CTRL V"
+        }]);
+
+        let action = discover_paste_action(&[source], &live).expect("literal binding is verified");
+        assert_eq!(action.shortcut.binding, "CTRL + SHIFT + P");
+        assert_eq!(action.behavior, PasteBehavior::Simple);
+    }
+
+    #[test]
+    fn a_literal_paste_binding_with_a_different_live_command_fails_closed() {
+        let source = r#"o.bind("CTRL + SHIFT + P", "Paste transcript", "safe-paste")"#;
+        let live = serde_json::json!([{
+            "key": "P",
+            "modmask": 5,
+            "description": "Paste transcript",
+            "dispatcher": "exec",
+            "arg": "different-command"
+        }]);
+
+        assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn unknown_dynamic_paste_function_fails_closed() {
+        let source = r#"
+local function my_paste()
+  os.execute("dangerous-command")
+end
+o.bind("SUPER + P", "Paste transcript", my_paste)
+"#;
+        let live = serde_json::json!([{
+            "key": "P",
+            "modmask": 64,
+            "description": "Paste transcript",
+            "dispatcher": "__lua",
+            "arg": "92"
+        }]);
+
+        assert!(discover_paste_action(&[source], &live).is_none());
     }
 }

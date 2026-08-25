@@ -2671,7 +2671,20 @@ fn build_delivery_adapter(
     } else {
         match delivery_mode {
             DeliveryMode::Type => Box::new(PortalClipboardDelivery::default()),
-            DeliveryMode::Clipboard => Box::new(PortalClipboardDelivery::clipboard_only()),
+            DeliveryMode::Clipboard => {
+                match voisu_app::hyprland_bindings::discover_live_paste_action() {
+                    Some(action) => {
+                        eprintln!("verified Hyprland Paste Action: {}", action.description);
+                        Box::new(PortalClipboardDelivery::with_hyprland_paste(action))
+                    }
+                    None => {
+                        eprintln!(
+                            "no verified Hyprland Paste Action; Delivery will remain clipboard-only"
+                        );
+                        Box::new(PortalClipboardDelivery::clipboard_only())
+                    }
+                }
+            }
             DeliveryMode::Guarded => {
                 let focus = focus_probe.unwrap_or_else(|| {
                     Arc::new(tokio::sync::Mutex::new(Box::new(

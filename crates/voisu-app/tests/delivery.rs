@@ -12,9 +12,10 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use voisu_app::focus::SharedFocusProbe;
+use voisu_app::hyprland_bindings::{PasteBehavior, PasteShortcut, VerifiedPasteAction};
 use voisu_app::system::{
     ClipboardBoundary, DirectDeliverySession, FedoraRemoteDesktopPortal, GuardedDelivery,
-    NotificationBoundary, PortalClipboardDelivery, RemoteDesktopPortal,
+    NotificationBoundary, PasteBoundary, PortalClipboardDelivery, RemoteDesktopPortal,
 };
 use voisu_core::{
     BoundaryError, BoundaryFuture, BoundaryKind, DeliveryAdapter, DeliveryMethod, DeliveryOutcome,
@@ -113,6 +114,36 @@ struct RecordingDelivery {
     label: &'static str,
     events: Arc<Mutex<Vec<String>>>,
     outcome: DeliveryOutcome,
+}
+
+struct RecordingPaste {
+    events: Arc<Mutex<Vec<String>>>,
+    failure: Option<&'static str>,
+}
+
+impl PasteBoundary for RecordingPaste {
+    fn invoke(&mut self, action: &VerifiedPasteAction) -> BoundaryFuture<'_, ()> {
+        let event = format!("paste:{}", action.shortcut.binding);
+        let events = Arc::clone(&self.events);
+        let failure = self.failure;
+        Box::pin(async move {
+            events.lock().unwrap().push(event);
+            match failure {
+                Some(reason) => Err(BoundaryError::new(BoundaryKind::Delivery, reason)),
+                None => Ok(()),
+            }
+        })
+    }
+}
+
+fn verified_paste_action() -> VerifiedPasteAction {
+    VerifiedPasteAction {
+        shortcut: PasteShortcut {
+            binding: "CTRL + SHIFT + P".to_owned(),
+        },
+        description: "Paste transcript".to_owned(),
+        behavior: PasteBehavior::Simple,
+    }
 }
 
 impl DeliveryAdapter for RecordingDelivery {
@@ -276,6 +307,71 @@ async fn clipboard_is_preserved_before_unicode_multiline_compositor_submission()
             format!("direct:{expected}"),
         ]
     );
+}
+
+#[tokio::test]
+async fn verified_paste_preserves_clipboard_then_attempts_one_paste_action() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let action = verified_paste_action();
+    let mut delivery = PortalClipboardDelivery::with_paste_boundaries(
+        Box::new(RecordingClipboard(Arc::clone(&events))),
+        action,
+        Box::new(RecordingPaste {
+            events: Arc::clone(&events),
+            failure: None,
+        }),
+    );
+
+    let outcome = delivery.deliver(Transcript("final transcript".to_owned())).await.unwrap();
+
+    assert_eq!(outcome.method, DeliveryMethod::CompositorSubmitted);
+    assert_eq!(events.lock().unwrap().as_slice(), [
+        "clipboard:final transcript",
+        "paste:CTRL + SHIFT + P",
+    ]);
+}
+
+#[tokio::test]
+async fn paste_failure_keeps_the_final_transcript_on_clipboard_and_does_not_retry() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let action = verified_paste_action();
+    let mut delivery = PortalClipboardDelivery::with_paste_boundaries(
+        Box::new(RecordingClipboard(Arc::clone(&events))),
+        action,
+        Box::new(RecordingPaste {
+            events: Arc::clone(&events),
+            failure: Some("compositor rejected Paste Action"),
+        }),
+    );
+
+    let outcome = delivery.deliver(Transcript("recoverable transcript".to_owned())).await.unwrap();
+
+    assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
+    assert!(outcome
+        .fallback_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("Transcript remains on the clipboard")));
+    assert_eq!(events.lock().unwrap().as_slice(), [
+        "clipboard:recoverable transcript",
+        "paste:CTRL + SHIFT + P",
+    ]);
+}
+
+#[tokio::test]
+async fn no_verified_paste_action_is_explicitly_clipboard_only() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut delivery = PortalClipboardDelivery::clipboard_only_with_boundary(Box::new(
+        RecordingClipboard(Arc::clone(&events)),
+    ));
+
+    let outcome = delivery.deliver(Transcript("clipboard only".to_owned())).await.unwrap();
+
+    assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
+    assert_eq!(
+        outcome.fallback_reason.as_deref(),
+        Some("no verified Hyprland Paste Action; Transcript remains on the clipboard")
+    );
+    assert_eq!(events.lock().unwrap().as_slice(), ["clipboard:clipboard only"]);
 }
 
 #[tokio::test]
