@@ -898,9 +898,10 @@ fn service_unit(executable: &Path) -> Result<String, String> {
     Ok(format!(concat!(
         "[Unit]\n",
         "Description=Voisu dictation daemon\n",
-        "After=dbus.socket pipewire.service xdg-desktop-portal.service\n",
-        "Wants=dbus.socket pipewire.service xdg-desktop-portal.service\n",
+        "After=graphical-session.target wayland-session-waitenv.service dbus.socket pipewire.service\n",
+        "Wants=dbus.socket pipewire.service\n",
         "PartOf=graphical-session.target\n",
+        "ConditionEnvironment=WAYLAND_DISPLAY\n",
         "StartLimitIntervalSec=30s\n",
         "StartLimitBurst=3\n\n",
         "[Service]\n",
