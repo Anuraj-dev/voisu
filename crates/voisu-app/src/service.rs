@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use voisu_core::{
-    Command, PROTOCOL_VERSION, Request, Response, VersionEnvelope, socket_path,
+    Command, PACKAGE_MANAGERS, PROTOCOL_VERSION, Request, Response, VersionEnvelope,
+    install_instruction, socket_path,
 };
 
 use crate::process::guard_external_child;
@@ -113,6 +114,77 @@ pub fn manage_user_service(action: UserServiceAction) -> Result<UserServiceRepor
             let report = uninstall()?;
             Ok(append_optional_overlay_report(report, overlay_message))
         }
+    }
+}
+
+/// Checks the package-level Overlay prerequisite for the Hyprland setup flow.
+/// Setup must not silently complete without the required feedback service.
+pub fn hyprland_overlay_preflight() -> Result<(), String> {
+    if packaged_overlay_unit_exists() {
+        return Ok(());
+    }
+    Err(format!(
+        "required Overlay package is missing; install it with `{}` and re-run `voisu setup`",
+        hyprland_overlay_install_command()
+    ))
+}
+
+/// Installs/enables the corrected daemon and Overlay units without starting
+/// the daemon before the Trigger Key configuration has been reloaded.
+pub fn install_hyprland_services() -> Result<UserServiceReport, String> {
+    hyprland_overlay_preflight()?;
+    let report = manage_user_service(UserServiceAction::Install)?;
+    if report
+        .message
+        .contains("warning: optional Overlay service was not managed")
+    {
+        return Err(report.message);
+    }
+    Ok(report)
+}
+
+/// Starts the daemon after Hyprland setup has reloaded the user's Lua config,
+/// then verifies that the required Overlay is enabled and active too.
+pub fn start_hyprland_services() -> Result<UserServiceReport, String> {
+    let report = manage_user_service(UserServiceAction::Start)?;
+    require_overlay_state("enabled", "is-enabled")?;
+    require_overlay_state("active", "is-active")?;
+    Ok(report)
+}
+
+fn hyprland_overlay_install_command() -> String {
+    let manager = PACKAGE_MANAGERS
+        .into_iter()
+        .find(|manager| first_on_path(manager.probe_binary()).is_some());
+    let package = match manager {
+        Some(voisu_core::PackageManager::Dnf) => "voisu-overlay",
+        Some(_) => "voisu",
+        None => return "install the Voisu Overlay package with your package manager".to_owned(),
+    };
+    install_instruction(manager, package)
+}
+
+fn first_on_path(program: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|directory| directory.join(program))
+        .find(|candidate| {
+            fs::metadata(candidate)
+                .map(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+}
+
+fn require_overlay_state(expected: &str, operation: &str) -> Result<(), String> {
+    let output = systemctl(&[operation, OVERLAY_UNIT_NAME])?;
+    if output.success && output.stdout.trim() == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "Overlay service is not {expected}; systemctl --user {operation} {OVERLAY_UNIT_NAME} reported {}",
+            output.stdout.trim()
+        ))
     }
 }
 

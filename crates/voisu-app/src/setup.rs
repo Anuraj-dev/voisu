@@ -7,10 +7,19 @@
 //! terminal, network, or keyring. The thin production glue ([`StdioWizard`],
 //! [`LiveKeyValidator`]) lives at the bottom of this file.
 
+use std::path::Path;
+
 use voisu_core::{
     Credential, KeyDiagnosis, KeyLocation, Provider, ProviderKeyStatus, SecretStore,
     provider_free_tier_hint,
 };
+
+use crate::config::{self, DeliveryMode};
+use crate::hyprland_bindings::{
+    LiveHyprlandController, LocalBindingFileSystem, TriggerKey, VerifiedPasteAction,
+    discover_live_paste_action, install_trigger_binding,
+};
+use crate::service;
 
 /// Injected terminal IO. Prompts and messages both flow through here so a test
 /// can script every keystroke and capture every line.
@@ -49,6 +58,70 @@ pub enum ProviderOutcome {
 pub struct SetupOutcome {
     pub deepgram: ProviderOutcome,
     pub groq: ProviderOutcome,
+}
+
+/// The observable result of a completed Hyprland setup flow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HyprlandSetupOutcome {
+    pub trigger_key: TriggerKey,
+    pub paste_verified: bool,
+}
+
+/// Desktop seams for the Hyprland setup orchestrator. The provider wizard
+/// remains separate so credentials and user data are preserved across reruns.
+pub trait HyprlandSetupActions {
+    fn select_clipboard_delivery(&mut self) -> Result<(), String>;
+    fn install_services(&mut self) -> Result<(), String>;
+    fn install_trigger_binding(&mut self, config: &Path) -> Result<TriggerKey, String>;
+    fn discover_paste_action(&mut self) -> Option<VerifiedPasteAction>;
+    fn start_services_and_query_daemon(&mut self) -> Result<(), String>;
+}
+
+/// Runs the Hyprland setup steps in their dependency order. Every mutating
+/// step is behind an injected seam so the ordering and failure boundaries are
+/// testable without a compositor, systemd user manager, or daemon process.
+pub fn run_hyprland_setup(
+    config: &Path,
+    actions: &mut dyn HyprlandSetupActions,
+) -> Result<HyprlandSetupOutcome, String> {
+    actions.install_services()?;
+    actions.select_clipboard_delivery()?;
+    let trigger_key = actions.install_trigger_binding(config)?;
+    let paste_verified = actions.discover_paste_action().is_some();
+    actions.start_services_and_query_daemon()?;
+    Ok(HyprlandSetupOutcome {
+        trigger_key,
+        paste_verified,
+    })
+}
+
+/// Production adapters for the Hyprland setup flow.
+pub struct LiveHyprlandSetupActions;
+
+impl HyprlandSetupActions for LiveHyprlandSetupActions {
+    fn select_clipboard_delivery(&mut self) -> Result<(), String> {
+        config::set_delivery_mode(DeliveryMode::Clipboard).map(|_| ())
+    }
+
+    fn install_services(&mut self) -> Result<(), String> {
+        service::install_hyprland_services().map(|_| ())
+    }
+
+    fn install_trigger_binding(&mut self, config: &Path) -> Result<TriggerKey, String> {
+        let files = LocalBindingFileSystem;
+        let mut hyprland = LiveHyprlandController;
+        install_trigger_binding(config, &files, &mut hyprland)
+            .map(|report| report.key)
+            .map_err(|error| error.to_string())
+    }
+
+    fn discover_paste_action(&mut self) -> Option<VerifiedPasteAction> {
+        discover_live_paste_action()
+    }
+
+    fn start_services_and_query_daemon(&mut self) -> Result<(), String> {
+        service::start_hyprland_services().map(|_| ())
+    }
 }
 
 /// Runs the interactive wizard to completion and reports what became of each
@@ -754,6 +827,102 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use voisu_core::{BoundaryError, BoundaryKind};
+
+    struct FakeHyprlandSetup {
+        events: Vec<&'static str>,
+        paste: bool,
+        fail_at: Option<&'static str>,
+    }
+
+    impl FakeHyprlandSetup {
+        fn step(&mut self, name: &'static str) -> Result<(), String> {
+            self.events.push(name);
+            if self.fail_at == Some(name) {
+                Err(format!("{name} failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl HyprlandSetupActions for FakeHyprlandSetup {
+        fn select_clipboard_delivery(&mut self) -> Result<(), String> {
+            self.step("clipboard")
+        }
+
+        fn install_services(&mut self) -> Result<(), String> {
+            self.step("services")
+        }
+
+        fn install_trigger_binding(&mut self, _config: &Path) -> Result<TriggerKey, String> {
+            self.step("trigger")?;
+            Ok(crate::hyprland_bindings::LEFT_ALT)
+        }
+
+        fn discover_paste_action(&mut self) -> Option<VerifiedPasteAction> {
+            self.events.push("paste");
+            self.paste.then_some(VerifiedPasteAction {
+                shortcut: crate::hyprland_bindings::PasteShortcut {
+                    binding: "SUPER + V".to_owned(),
+                },
+                description: "Universal paste".to_owned(),
+                behavior: crate::hyprland_bindings::PasteBehavior::Simple,
+            })
+        }
+
+        fn start_services_and_query_daemon(&mut self) -> Result<(), String> {
+            self.step("start-and-query")
+        }
+    }
+
+    #[test]
+    fn hyprland_setup_runs_desktop_steps_in_dependency_order() {
+        let mut actions = FakeHyprlandSetup {
+            events: Vec::new(),
+            paste: true,
+            fail_at: None,
+        };
+
+        let result = run_hyprland_setup(Path::new("/tmp/hyprland.lua"), &mut actions)
+            .expect("setup should complete");
+
+        assert_eq!(result.trigger_key, crate::hyprland_bindings::LEFT_ALT);
+        assert!(result.paste_verified);
+        assert_eq!(
+            actions.events,
+            vec!["services", "clipboard", "trigger", "paste", "start-and-query"]
+        );
+    }
+
+    #[test]
+    fn hyprland_setup_reports_clipboard_only_when_paste_is_not_verified() {
+        let mut actions = FakeHyprlandSetup {
+            events: Vec::new(),
+            paste: false,
+            fail_at: None,
+        };
+
+        let result = run_hyprland_setup(Path::new("/tmp/hyprland.lua"), &mut actions)
+            .expect("clipboard-only setup should complete");
+
+        assert!(!result.paste_verified);
+        assert_eq!(actions.events.last(), Some(&"start-and-query"));
+    }
+
+    #[test]
+    fn hyprland_setup_stops_before_starting_when_a_required_step_fails() {
+        let mut actions = FakeHyprlandSetup {
+            events: Vec::new(),
+            paste: true,
+            fail_at: Some("trigger"),
+        };
+
+        let error = run_hyprland_setup(Path::new("/tmp/hyprland.lua"), &mut actions)
+            .expect_err("failed trigger setup must remain incomplete");
+
+        assert_eq!(error, "trigger failed");
+        assert_eq!(actions.events, vec!["services", "clipboard", "trigger"]);
+    }
 
     /// A scripted terminal: pops queued key/line answers and records output.
     struct FakeIo {
