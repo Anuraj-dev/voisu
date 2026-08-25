@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.37.1
+Version:        0.38.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,9 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Tue Aug 25 2026 Voisu maintainers <voisu@example.invalid> - 0.38.0-1
+- feat(core): add host-only intent reconstruction (#216)
+
 * Mon Aug 24 2026 Voisu maintainers <voisu@example.invalid> - 0.37.1-1
 - fix(core): prefer complete safe source transcripts (#215)
 - docs(research): add formatting model notes
