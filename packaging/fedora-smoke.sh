@@ -300,17 +300,20 @@ grep -qx 'Environment=VOISU_ENABLE_DPR=1' /usr/lib/systemd/user/voisu.service
 grep -qx 'After=graphical-session.target wayland-session-waitenv.service dbus.socket pipewire.service' /usr/lib/systemd/user/voisu.service
 grep -qx 'Wants=dbus.socket pipewire.service' /usr/lib/systemd/user/voisu.service
 grep -qx 'PartOf=graphical-session.target' /usr/lib/systemd/user/voisu.service
-grep -qx 'ConditionEnvironment=WAYLAND_DISPLAY' /usr/lib/systemd/user/voisu.service
+grep -qx 'ConditionEnvironment=|WAYLAND_DISPLAY' /usr/lib/systemd/user/voisu.service
+grep -qx 'ConditionEnvironment=|DISPLAY' /usr/lib/systemd/user/voisu.service
 grep -qx 'WantedBy=graphical-session.target' /usr/lib/systemd/user/voisu.service
 if grep -Eq '^(After|Wants)=.*xdg-desktop-portal\.service' /usr/lib/systemd/user/voisu.service; then
     printf 'FAIL: packaged voisu.service must not own xdg-desktop-portal.service\n' >&2; exit 1
 fi
-grep -qx 'After=graphical-session.target wayland-session-waitenv.service voisu.service' /usr/lib/systemd/user/voisu-overlay.service
-grep -qx 'PartOf=graphical-session.target' /usr/lib/systemd/user/voisu-overlay.service
-grep -qx 'ConditionEnvironment=WAYLAND_DISPLAY' /usr/lib/systemd/user/voisu-overlay.service
-grep -qx 'WantedBy=graphical-session.target' /usr/lib/systemd/user/voisu-overlay.service
-if grep -Eq '^(After|Wants)=.*xdg-desktop-portal\.service' /usr/lib/systemd/user/voisu-overlay.service; then
-    printf 'FAIL: packaged voisu-overlay.service must not own xdg-desktop-portal.service\n' >&2; exit 1
+if test "$overlay_installed_before" -eq 1; then
+    grep -qx 'After=graphical-session.target wayland-session-waitenv.service voisu.service' /usr/lib/systemd/user/voisu-overlay.service
+    grep -qx 'PartOf=graphical-session.target' /usr/lib/systemd/user/voisu-overlay.service
+    grep -qx 'ConditionEnvironment=WAYLAND_DISPLAY' /usr/lib/systemd/user/voisu-overlay.service
+    grep -qx 'WantedBy=graphical-session.target' /usr/lib/systemd/user/voisu-overlay.service
+    if grep -Eq '^(After|Wants)=.*xdg-desktop-portal\.service' /usr/lib/systemd/user/voisu-overlay.service; then
+        printf 'FAIL: packaged voisu-overlay.service must not own xdg-desktop-portal.service\n' >&2; exit 1
+    fi
 fi
 if grep -Eq '^Environment=.*VOISU_ENABLE_QWEN_FORMAT' /usr/lib/systemd/user/voisu.service; then
     printf 'FAIL: packaged voisu.service must not set VOISU_ENABLE_QWEN_FORMAT\n' >&2; exit 1

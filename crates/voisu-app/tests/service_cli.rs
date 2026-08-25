@@ -384,6 +384,7 @@ fn assert_graphical_session_unit_shape(
     unit: &str,
     expected_after: &str,
     expected_wants: Option<&str>,
+    expected_conditions: &[&str],
 ) {
     assert_unit_assignment(unit_name, unit, "After=", expected_after);
     match expected_wants {
@@ -391,7 +392,14 @@ fn assert_graphical_session_unit_shape(
         None => assert_unit_assignment_absent(unit_name, unit, "Wants="),
     }
     assert_unit_assignment(unit_name, unit, "PartOf=", "graphical-session.target");
-    assert_unit_assignment(unit_name, unit, "ConditionEnvironment=", "WAYLAND_DISPLAY");
+    let conditions: Vec<_> = unit
+        .lines()
+        .filter_map(|line| line.strip_prefix("ConditionEnvironment="))
+        .collect();
+    assert_eq!(
+        conditions, expected_conditions,
+        "{unit_name} display conditions changed"
+    );
     assert_unit_assignment(unit_name, unit, "WantedBy=", "graphical-session.target");
     assert!(
         !unit.lines().any(|line| {
@@ -469,12 +477,14 @@ fn packaged_units_have_graphical_session_readiness_without_portal_ownership() {
         PACKAGED_DAEMON_UNIT,
         "graphical-session.target wayland-session-waitenv.service dbus.socket pipewire.service",
         Some("dbus.socket pipewire.service"),
+        &["|WAYLAND_DISPLAY", "|DISPLAY"],
     );
     assert_graphical_session_unit_shape(
         "voisu-overlay.service",
         PACKAGED_OVERLAY_UNIT,
         "graphical-session.target wayland-session-waitenv.service voisu.service",
         None,
+        &["WAYLAND_DISPLAY"],
     );
     assert_packaged_daemon_runtime_contract(PACKAGED_DAEMON_UNIT);
     assert_packaged_overlay_runtime_contract(PACKAGED_OVERLAY_UNIT);
@@ -580,6 +590,7 @@ fn install_is_idempotent_atomic_and_free_of_stale_session_or_checkout_values() {
         &unit,
         "graphical-session.target wayland-session-waitenv.service dbus.socket pipewire.service",
         Some("dbus.socket pipewire.service"),
+        &["|WAYLAND_DISPLAY", "|DISPLAY"],
     );
     assert!(unit.contains(&format!(
         "ExecStart=\"{}\" --systemd",
