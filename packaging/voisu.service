@@ -1,6 +1,6 @@
 [Unit]
 Description=Voisu dictation daemon
-After=graphical-session.target wayland-session-waitenv.service dbus.socket pipewire.service
+After=wayland-session-waitenv.service dbus.socket pipewire.service
 Wants=dbus.socket pipewire.service
 PartOf=graphical-session.target
 ConditionEnvironment=|WAYLAND_DISPLAY
