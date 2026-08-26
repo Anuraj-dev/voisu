@@ -44,7 +44,15 @@ impl LuaBinding {
     }
 
     fn is_standalone_for(&self, candidate: TriggerKey) -> bool {
-        self.key.trim() == candidate.code
+        let key = self.key.trim();
+        if key.eq_ignore_ascii_case(candidate.code) {
+            return true;
+        }
+        match candidate.code {
+            "code:64" => key.eq_ignore_ascii_case("Alt_L"),
+            "code:108" => key.eq_ignore_ascii_case("Alt_R"),
+            _ => false,
+        }
     }
 }
 
@@ -732,6 +740,13 @@ pub fn install_trigger_binding(
 
     let key = match plan {
         TriggerBindingPlan::AlreadyInstalled { key } => {
+            if let Err(detail) = hyprland.reload() {
+                return Err(TriggerBindingError::ReloadFailed {
+                    detail,
+                    backup_path: backup,
+                    restore_error: None,
+                });
+            }
             let verified = hyprland
                 .binding_is_installed(key.code, VOISU_TOGGLE_COMMAND)
                 .map_err(|detail| TriggerBindingError::VerificationFailed {
@@ -1197,6 +1212,30 @@ o.bind(
     }
 
     #[test]
+    fn keysym_aliases_occupy_the_same_physical_alt_keys() {
+        let source = r#"
+o.bind("Alt_L", "Launch terminal", "kitty")
+o.bind("ALT, Alt_R", "Modified right alt", "workspace next")
+"#;
+
+        assert_eq!(
+            plan_trigger_binding(source),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+
+        let both = r#"
+o.bind("alt_l", "Launch terminal", "kitty")
+o.bind("Alt_R", "Launcher", "launcher")
+"#;
+        let TriggerBindingPlan::Conflicts { conflicts } = plan_trigger_binding(both) else {
+            panic!("Alt_L and Alt_R must occupy the preferred physical keys");
+        };
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].candidate, LEFT_ALT);
+        assert_eq!(conflicts[1].candidate, RIGHT_ALT);
+    }
+
+    #[test]
     fn left_alt_conflict_falls_back_to_right_alt() {
         let source = r#"
 o.bind("code:64", "Launch terminal", "kitty")
@@ -1605,13 +1644,31 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let mut first = FakeHyprland::new(&[true], true);
         install_trigger_binding(&path, &LocalBindingFileSystem, &mut first).unwrap();
         let before = fs::read_to_string(&path).unwrap();
-        let mut second = FakeHyprland::new(&[], true);
+        let mut second = FakeHyprland::new(&[true], true);
 
         let report = install_trigger_binding(&path, &LocalBindingFileSystem, &mut second).unwrap();
 
         assert!(!report.changed);
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
         assert_eq!(before.matches(BEGIN_MARKER).count(), 1);
+        assert_eq!(second.reload_calls, 1);
+    }
+
+    #[test]
+    fn already_installed_reload_failure_leaves_the_file_untouched() {
+        let (_directory, path) = config_dir();
+        fs::write(&path, "-- user bindings\n").unwrap();
+        let mut first = FakeHyprland::new(&[true], true);
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut first).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let mut second = FakeHyprland::new(&[false], true);
+
+        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut second)
+            .expect_err("a stale compositor must not skip reload on rerun");
+
+        assert!(error.to_string().contains("reload"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(second.reload_calls, 1);
     }
 
     #[test]
