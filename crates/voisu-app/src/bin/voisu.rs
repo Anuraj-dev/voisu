@@ -13,7 +13,7 @@ use voisu_core::{
 use voisu_app::service::{UserServiceAction, manage_user_service};
 use voisu_app::system::{
     DIAGNOSTIC_RESPONSE_DEADLINE, FedoraReadiness, PROCESSING_RESPONSE_DEADLINE,
-    ProviderHttpClient, SecretToolStore, daemon_status_response,
+    ProviderHttpClient, SecretToolStore,
 };
 use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
 
@@ -288,7 +288,8 @@ impl DoctorRow {
 }
 
 fn doctor(verbose: bool) -> ExitCode {
-    let mut rows: Vec<DoctorRow> = FedoraReadiness
+    let mut inspector = FedoraReadiness::default();
+    let mut rows: Vec<DoctorRow> = inspector
         .inspect()
         .into_iter()
         .map(|finding| DoctorRow {
@@ -314,12 +315,13 @@ fn doctor(verbose: bool) -> ExitCode {
 
     // The CLI's own probes remain useful, but they cannot prove that the
     // already-running service inherited the same display endpoint. Newer
-    // daemons add an additive readiness payload; old daemons simply retain the
-    // historic doctor table.
-    if let Some(response) = daemon_status_response() {
-        if let Some(readiness) = response.readiness.as_ref() {
-            rows.extend(daemon_readiness_rows(readiness));
-        }
+    // daemons add an additive readiness payload on the handshake already used
+    // for the Daemon row; old daemons simply retain the historic doctor table.
+    if let Some(readiness) = inspector
+        .daemon_status()
+        .and_then(|response| response.readiness.as_ref())
+    {
+        rows.extend(daemon_readiness_rows(readiness));
     }
 
     // The live key checks reach the network; a test that pins other doctor

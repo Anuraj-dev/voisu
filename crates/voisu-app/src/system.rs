@@ -124,12 +124,24 @@ const DEEPGRAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// the accumulated prefix would deliver a plausible but truncated Transcript.
 const DEEPGRAM_CLOSE_GRACE: Duration = Duration::from_secs(10);
 
-pub struct FedoraReadiness;
+#[derive(Default)]
+pub struct FedoraReadiness {
+    /// Last Status handshake from `inspect`. Doctor reuses it so a hung
+    /// socket is not held for a second PROCESS_DEADLINE.
+    daemon_status: Option<Response>,
+}
+
+impl FedoraReadiness {
+    pub fn daemon_status(&self) -> Option<&Response> {
+        self.daemon_status.as_ref()
+    }
+}
 
 impl ReadinessInspector for FedoraReadiness {
     fn inspect(&mut self) -> Vec<ReadinessFinding> {
+        self.daemon_status = daemon_status_response();
         if let Some(value) = std::env::var_os("VOISU_TEST_READINESS") {
-            return controlled_readiness(&value.to_string_lossy());
+            return controlled_readiness(&value.to_string_lossy(), self.daemon_status.as_ref());
         }
         let mut findings = vec![
             session_finding(),
@@ -138,7 +150,7 @@ impl ReadinessInspector for FedoraReadiness {
             portals_finding(),
             clipboard_finding(),
             secret_service_finding(),
-            daemon_finding(),
+            daemon_finding(self.daemon_status.as_ref()),
         ];
         // Appended only when it can demonstrate a problem, so the common case
         // stays quiet and the golden table is unaffected.
@@ -1605,7 +1617,7 @@ fn pipewire_finding() -> ReadinessFinding {
     }
 }
 
-fn controlled_readiness(value: &str) -> Vec<ReadinessFinding> {
+fn controlled_readiness(value: &str, daemon_status: Option<&Response>) -> Vec<ReadinessFinding> {
     // Host-independent findings so the doctor-output golden test is stable
     // everywhere: no real probes, no package-manager detection.
     let mut findings = vec![
@@ -1617,7 +1629,7 @@ fn controlled_readiness(value: &str) -> Vec<ReadinessFinding> {
         readiness(ReadinessCapability::Portals, ReadinessStatus::Pass, "desktop portal responds"),
         readiness(ReadinessCapability::Clipboard, ReadinessStatus::Pass, "clipboard roundtrip succeeds"),
         readiness(ReadinessCapability::SecretStorage, ReadinessStatus::Pass, "Secret Service responds"),
-        daemon_finding(),
+        daemon_finding(daemon_status),
     ];
     if value == "pass" {
         return findings;
@@ -2030,8 +2042,8 @@ fn global_shortcuts_available() -> bool {
     .is_ok_and(|outcome| outcome.success)
 }
 
-fn daemon_finding() -> ReadinessFinding {
-    if daemon_status_handshake().is_ok() {
+fn daemon_finding(response: Option<&Response>) -> ReadinessFinding {
+    if response.is_some() {
         return readiness(
             ReadinessCapability::Daemon,
             ReadinessStatus::Pass,
@@ -2089,10 +2101,6 @@ pub fn daemon_status_response() -> Option<Response> {
     let response: Response = serde_json::from_str(&response).ok()?;
     (envelope.version == PROTOCOL_VERSION && response.ok && response.state.is_some())
         .then_some(response)
-}
-
-fn daemon_status_handshake() -> Result<(), ()> {
-    daemon_status_response().map(|_| ()).ok_or(())
 }
 
 fn read_bounded_frame(stream: &mut UnixStream, started: Instant) -> Result<String, ()> {
