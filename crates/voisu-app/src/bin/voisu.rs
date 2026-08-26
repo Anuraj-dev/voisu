@@ -509,7 +509,8 @@ fn setup() -> ExitCode {
             return fail(4, &error);
         }
     }
-    let outcome = run_setup(&mut StdioWizard, &mut SecretToolStore, &mut LiveKeyValidator);
+    let mut wizard = StdioWizard;
+    let outcome = run_setup(&mut wizard, &mut SecretToolStore, &mut LiveKeyValidator);
     // A run that stored/kept no usable key (every provider skipped or its store
     // failed) did not accomplish setup's job, so it must not report success.
     let usable = |outcome: ProviderOutcome| {
@@ -521,7 +522,7 @@ fn setup() -> ExitCode {
     if usable(outcome.deepgram) || usable(outcome.groq) {
         if !wizard_only {
             if let Some(HyprlandConfig::CurrentLua(config)) = hyprland_config {
-                let mut actions = LiveHyprlandSetupActions;
+                let mut actions = LiveHyprlandSetupActions { io: &mut wizard };
                 match run_hyprland_setup(&config, &mut actions) {
                     Ok(result) => {
                         let paste = if result.paste_verified {

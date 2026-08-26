@@ -74,12 +74,11 @@ It is not a current installation failure.
   fresh home.
 - **Portal behavior differs by desktop:**
   - **KDE Plasma / GNOME** — Trigger Key dialog appears on first daemon start
-    and persists. Text-insertion Delivery works via RemoteDesktop.
-  - **Hyprland** — no shortcut dialog by design. Install
-    `xdg-desktop-portal-hyprland`, start the daemon, read the registered
-    shortcut with `hyprctl globalshortcuts`, and declare the bind in
-    `hyprland.conf`. **Type Delivery does not work on Hyprland**: its portal
-    implements no RemoteDesktop interface, so use `voisu delivery clipboard`.
+    and persists with a user-chosen key. Text-insertion Delivery works via RemoteDesktop.
+  - **Hyprland** — no shortcut dialog. `voisu setup` installs Caps Lock
+    (`code:66`) after a default-yes prompt, or Right Alt (`code:108`) on
+    decline or conflict. **Type Delivery does not work on Hyprland**: its portal
+    implements no RemoteDesktop interface, so setup selects `clipboard`.
   - **Plain wlroots** portals do not implement GlobalShortcuts, so the Trigger
     Key cannot bind without `xdg-desktop-portal-hyprland`.
   - Run `voisu doctor` if the Trigger Key does not respond — it reports a portal

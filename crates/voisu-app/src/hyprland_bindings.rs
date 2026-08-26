@@ -9,9 +9,13 @@ use serde_json::Value;
 
 pub const BEGIN_MARKER: &str = "-- BEGIN VOISU MANAGED TRIGGER";
 pub const END_MARKER: &str = "-- END VOISU MANAGED TRIGGER";
+pub const BEGIN_INPUT_MARKER: &str = "-- BEGIN VOISU MANAGED INPUT";
+pub const END_INPUT_MARKER: &str = "-- END VOISU MANAGED INPUT";
 pub const VOISU_TOGGLE_COMMAND: &str = "voisu toggle";
 pub const VOISU_TRIGGER_DESCRIPTION: &str = "Voisu dictation";
 pub const RECOVERY_COMMAND: &str = "voisu setup";
+const CAPS_NONE: &str = "caps:none";
+const BOTH_CAPSLOCK_CANCEL: &str = "shift:both_capslock_cancel";
 
 /// A key chord that is safe for the daemon to emit after it has verified the
 /// corresponding Hyprland binding. This is data only: no Lua or shell text is
@@ -48,14 +52,21 @@ pub struct TriggerKey {
     pub code: &'static str,
 }
 
-pub const LEFT_ALT: TriggerKey = TriggerKey {
-    label: "Left Alt",
-    code: "code:64",
+pub const CAPS_LOCK: TriggerKey = TriggerKey {
+    label: "Caps Lock",
+    code: "code:66",
 };
 
 pub const RIGHT_ALT: TriggerKey = TriggerKey {
     label: "Right Alt",
     code: "code:108",
+};
+
+/// Left Alt remains a documented combination example; Hyprland setup never
+/// auto-installs it as the Trigger Key.
+pub const LEFT_ALT: TriggerKey = TriggerKey {
+    label: "Left Alt",
+    code: "code:64",
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,7 +79,7 @@ pub struct LuaBinding {
 
 impl LuaBinding {
     pub fn is_standalone(&self) -> bool {
-        self.is_standalone_for(LEFT_ALT) || self.is_standalone_for(RIGHT_ALT)
+        self.is_standalone_for(CAPS_LOCK) || self.is_standalone_for(RIGHT_ALT)
     }
 
     fn is_standalone_for(&self, candidate: TriggerKey) -> bool {
@@ -135,7 +146,7 @@ impl fmt::Display for TriggerBindingError {
             Self::Conflicts { conflicts } => {
                 writeln!(
                     formatter,
-                    "both preferred Trigger Key candidates are already bound:"
+                    "preferred Trigger Key candidates are already bound:"
                 )?;
                 for conflict in conflicts {
                     writeln!(
@@ -361,7 +372,10 @@ pub fn parse_lua_bindings(source: &str) -> Vec<LuaBinding> {
 /// conservative: literal dispatchers are accepted only when their description
 /// identifies a paste action, and dynamic Lua functions are accepted only for
 /// the exact Omarchy universal-paste helper shape.
-pub fn discover_paste_action(sources: &[&str], live_bindings: &Value) -> Option<VerifiedPasteAction> {
+pub fn discover_paste_action(
+    sources: &[&str],
+    live_bindings: &Value,
+) -> Option<VerifiedPasteAction> {
     let bindings = sources
         .iter()
         .flat_map(|source| {
@@ -383,7 +397,7 @@ pub fn discover_paste_action(sources: &[&str], live_bindings: &Value) -> Option<
         let Some(source) = bindings.iter().find_map(|(candidate, source)| {
             (candidate.description == live_description
                 && live_binding_matches_source(binding, candidate))
-                .then_some((candidate, source))
+            .then_some((candidate, source))
         }) else {
             continue;
         };
@@ -457,7 +471,10 @@ pub fn discover_paste_action_from_sources(
     }
 
     let live = hyprland.live_bindings()?;
-    let sources = source_storage.iter().map(String::as_str).collect::<Vec<_>>();
+    let sources = source_storage
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     Ok(discover_paste_action(&sources, &live))
 }
 
@@ -510,7 +527,9 @@ fn omarchy_clipboard_source_candidates(root: &Path) -> Vec<PathBuf> {
     {
         candidates.push(home.join("default/hypr/bindings/clipboard.lua"));
     }
-    candidates.push(PathBuf::from("/usr/share/omarchy/default/hypr/bindings/clipboard.lua"));
+    candidates.push(PathBuf::from(
+        "/usr/share/omarchy/default/hypr/bindings/clipboard.lua",
+    ));
     candidates
 }
 
@@ -519,7 +538,10 @@ fn live_binding_matches_source(live: &Value, source: &LuaBinding) -> bool {
         return false;
     };
     let live_key = live.get("key").and_then(Value::as_str).unwrap_or_default();
-    let live_modmask = live.get("modmask").and_then(Value::as_u64).unwrap_or(u64::MAX);
+    let live_modmask = live
+        .get("modmask")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
     if source_modmask != live_modmask || normalize_key(live_key) != normalize_key(&source_key) {
         return false;
     }
@@ -570,7 +592,10 @@ fn is_omarchy_universal_paste(binding: &LuaBinding, source: &str) -> bool {
     {
         return false;
     }
-    let compact = source.chars().filter(|character| !character.is_whitespace()).collect::<String>();
+    let compact = source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
     [
         "universal_clipboard_shortcut(default_mods,default_key,terminal_mods,terminal_key)",
         "ifactive_window_is_terminal()then",
@@ -584,9 +609,9 @@ fn is_omarchy_universal_paste(binding: &LuaBinding, source: &str) -> bool {
             || compact.contains("localfunctionuniversal_clipboard_shortcut("))
 }
 
-pub fn plan_trigger_binding(source: &str) -> TriggerBindingPlan {
+pub fn plan_trigger_binding(source: &str, prefer_caps_lock: bool) -> TriggerBindingPlan {
     let bindings = parse_lua_bindings(source);
-    for candidate in [LEFT_ALT, RIGHT_ALT] {
+    for candidate in [CAPS_LOCK, RIGHT_ALT] {
         if bindings
             .iter()
             .any(|binding| binding.managed && binding.is_standalone_for(candidate))
@@ -595,19 +620,27 @@ pub fn plan_trigger_binding(source: &str) -> TriggerBindingPlan {
         }
     }
 
-    let mut conflicts = Vec::new();
-    for candidate in [LEFT_ALT, RIGHT_ALT] {
-        if let Some(binding) = bindings
+    let unmanaged = |candidate: TriggerKey| {
+        bindings
             .iter()
             .find(|binding| !binding.managed && binding.is_standalone_for(candidate))
-        {
+    };
+
+    if prefer_caps_lock && unmanaged(CAPS_LOCK).is_none() {
+        return TriggerBindingPlan::Install { key: CAPS_LOCK };
+    }
+    if unmanaged(RIGHT_ALT).is_none() {
+        return TriggerBindingPlan::Install { key: RIGHT_ALT };
+    }
+
+    let mut conflicts = Vec::new();
+    for candidate in [CAPS_LOCK, RIGHT_ALT] {
+        if let Some(binding) = unmanaged(candidate) {
             conflicts.push(BindingConflict {
                 candidate,
                 description: binding.description.clone(),
                 command: binding.command.clone(),
             });
-        } else {
-            return TriggerBindingPlan::Install { key: candidate };
         }
     }
     TriggerBindingPlan::Conflicts { conflicts }
@@ -634,6 +667,7 @@ pub fn install_trigger_binding(
     path: &Path,
     files: &dyn BindingFileSystem,
     hyprland: &mut dyn HyprlandController,
+    prefer_caps_lock: bool,
 ) -> Result<TriggerBindingInstallReport, TriggerBindingError> {
     let original = files
         .read_to_string(path)
@@ -644,30 +678,39 @@ pub fn install_trigger_binding(
         })?;
     let source = original.as_deref().unwrap_or_default();
     let backup = backup_path(path);
-    let plan = plan_trigger_binding(source);
+    let plan = plan_trigger_binding(source, prefer_caps_lock);
+    let input_path = path.with_file_name("input.lua");
+    let original_input =
+        files
+            .read_to_string(&input_path)
+            .map_err(|detail| TriggerBindingError::File {
+                action: "read",
+                path: input_path.clone(),
+                detail,
+            })?;
 
     let key = match plan {
         TriggerBindingPlan::AlreadyInstalled { key } => {
-            let verified = hyprland
-                .binding_is_installed(key.code, VOISU_TOGGLE_COMMAND)
-                .map_err(|detail| TriggerBindingError::VerificationFailed {
-                    detail,
-                    backup_path: backup.clone(),
-                    restore_error: None,
-                })?;
-            if !verified {
-                return Err(TriggerBindingError::VerificationFailed {
-                    detail: format!(
-                        "{} ({}) is managed by Voisu but is not reported by Hyprland",
-                        key.label, key.code
-                    ),
-                    backup_path: backup.clone(),
-                    restore_error: None,
-                });
+            let input_changed = apply_caps_lock_input_if_needed(
+                key,
+                source,
+                &input_path,
+                original_input.as_deref(),
+                files,
+            )?;
+            if input_changed {
+                if let Err(error) =
+                    reload_and_verify(hyprland, key, path, files, original.as_deref(), &backup)
+                {
+                    let _ = restore_original(files, &input_path, original_input.as_deref());
+                    return Err(error);
+                }
+            } else {
+                verify_installed_binding(hyprland, key, &backup)?;
             }
             return Ok(TriggerBindingInstallReport {
                 key,
-                changed: false,
+                changed: input_changed,
                 backup_path: backup,
             });
         }
@@ -685,8 +728,11 @@ pub fn install_trigger_binding(
             detail,
         })?;
 
+    apply_caps_lock_input_if_needed(key, source, &input_path, original_input.as_deref(), files)?;
+
     let updated = append_managed_binding(source, key);
     if let Err(detail) = files.write_atomic(path, &updated) {
+        let _ = restore_original(files, &input_path, original_input.as_deref());
         let restore_error = restore_original(files, path, original.as_deref()).err();
         return Err(TriggerBindingError::File {
             action: "install the Hyprland binding",
@@ -697,40 +743,121 @@ pub fn install_trigger_binding(
         });
     }
 
+    if let Err(error) = reload_and_verify(hyprland, key, path, files, original.as_deref(), &backup)
+    {
+        let _ = restore_original(files, &input_path, original_input.as_deref());
+        return Err(error);
+    }
+
+    Ok(TriggerBindingInstallReport {
+        key,
+        changed: true,
+        backup_path: backup,
+    })
+}
+
+fn apply_caps_lock_input_if_needed(
+    key: TriggerKey,
+    hyprland_source: &str,
+    input_path: &Path,
+    original_input: Option<&str>,
+    files: &dyn BindingFileSystem,
+) -> Result<bool, TriggerBindingError> {
+    if key != CAPS_LOCK {
+        return Ok(false);
+    }
+    let input_source = original_input.unwrap_or("");
+    if caps_lock_input_already_applied(&[input_source, hyprland_source]) {
+        return Ok(false);
+    }
+
+    let backup = backup_path(input_path);
+    files
+        .write_atomic(&backup, input_source)
+        .map_err(|detail| TriggerBindingError::File {
+            action: "save a recoverable backup",
+            path: backup,
+            detail,
+        })?;
+
+    let merged = merge_caps_lock_kb_options(last_kb_options(&[input_source, hyprland_source]));
+    let updated = append_managed_input(input_source, &merged);
+    if let Err(detail) = files.write_atomic(input_path, &updated) {
+        let restore_error = restore_original(files, input_path, original_input).err();
+        return Err(TriggerBindingError::File {
+            action: "install the Hyprland input setting",
+            path: input_path.to_owned(),
+            detail: restore_error
+                .map(|restore| format!("{detail}; automatic restore failed: {restore}"))
+                .unwrap_or(detail),
+        });
+    }
+    Ok(true)
+}
+
+fn reload_and_verify(
+    hyprland: &mut dyn HyprlandController,
+    key: TriggerKey,
+    path: &Path,
+    files: &dyn BindingFileSystem,
+    original: Option<&str>,
+    backup: &Path,
+) -> Result<(), TriggerBindingError> {
     if let Err(detail) = hyprland.reload() {
-        let restore_error = restore_original(files, path, original.as_deref()).err();
+        let restore_error = restore_original(files, path, original).err();
         return Err(TriggerBindingError::ReloadFailed {
             detail,
-            backup_path: backup,
+            backup_path: backup.to_owned(),
             restore_error,
         });
     }
-
     match hyprland.binding_is_installed(key.code, VOISU_TOGGLE_COMMAND) {
-        Ok(true) => Ok(TriggerBindingInstallReport {
-            key,
-            changed: true,
-            backup_path: backup,
-        }),
+        Ok(true) => Ok(()),
         Ok(false) => {
-            let restore_error = restore_original(files, path, original.as_deref()).err();
+            let restore_error = restore_original(files, path, original).err();
             Err(TriggerBindingError::VerificationFailed {
                 detail: format!(
                     "Hyprland did not report {} ({}) running `{VOISU_TOGGLE_COMMAND}`",
                     key.label, key.code
                 ),
-                backup_path: backup,
+                backup_path: backup.to_owned(),
                 restore_error,
             })
         }
         Err(detail) => {
-            let restore_error = restore_original(files, path, original.as_deref()).err();
+            let restore_error = restore_original(files, path, original).err();
             Err(TriggerBindingError::VerificationFailed {
                 detail,
-                backup_path: backup,
+                backup_path: backup.to_owned(),
                 restore_error,
             })
         }
+    }
+}
+
+fn verify_installed_binding(
+    hyprland: &mut dyn HyprlandController,
+    key: TriggerKey,
+    backup: &Path,
+) -> Result<(), TriggerBindingError> {
+    let verified = hyprland
+        .binding_is_installed(key.code, VOISU_TOGGLE_COMMAND)
+        .map_err(|detail| TriggerBindingError::VerificationFailed {
+            detail,
+            backup_path: backup.to_owned(),
+            restore_error: None,
+        })?;
+    if verified {
+        Ok(())
+    } else {
+        Err(TriggerBindingError::VerificationFailed {
+            detail: format!(
+                "{} ({}) is managed by Voisu but is not reported by Hyprland",
+                key.label, key.code
+            ),
+            backup_path: backup.to_owned(),
+            restore_error: None,
+        })
     }
 }
 
@@ -755,6 +882,11 @@ fn append_managed_binding(source: &str, key: TriggerKey) -> String {
     }
     content.push_str(BEGIN_MARKER);
     content.push('\n');
+    if key == CAPS_LOCK {
+        // Load the sibling input.lua written for Caps Lock even when the
+        // user's hyprland.lua does not already require it.
+        content.push_str("require(\"hypr.input\")\n");
+    }
     content.push_str(&format!(
         "o.bind(\"{}\", \"{VOISU_TRIGGER_DESCRIPTION}\", \"{VOISU_TOGGLE_COMMAND}\")\n",
         key.code
@@ -764,13 +896,99 @@ fn append_managed_binding(source: &str, key: TriggerKey) -> String {
     content
 }
 
+fn append_managed_input(source: &str, kb_options: &str) -> String {
+    let mut content = remove_marked_block(source, BEGIN_INPUT_MARKER, END_INPUT_MARKER);
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if !content.is_empty() && !content.ends_with("\n\n") {
+        content.push('\n');
+    }
+    content.push_str(BEGIN_INPUT_MARKER);
+    content.push('\n');
+    content.push_str("-- Caps Lock is the Trigger Key; disable lock on that key.\n");
+    content.push_str("hl.config({\n");
+    content.push_str("  input = {\n");
+    content.push_str(&format!("    kb_options = \"{kb_options}\",\n"));
+    content.push_str("  },\n");
+    content.push_str("})\n");
+    content.push_str(END_INPUT_MARKER);
+    content.push('\n');
+    content
+}
+
+fn caps_lock_input_already_applied(sources: &[&str]) -> bool {
+    last_kb_options(sources).is_some_and(|options| {
+        let parts: Vec<&str> = options.split(',').map(str::trim).collect();
+        parts.contains(&CAPS_NONE)
+            && (parts.contains(&BOTH_CAPSLOCK_CANCEL) || parts.contains(&"shift:both_capslock"))
+    })
+}
+
+fn last_kb_options(sources: &[&str]) -> Option<String> {
+    sources
+        .iter()
+        .rev()
+        .find_map(|source| kb_options_values(source).into_iter().next_back())
+}
+
+fn kb_options_values(source: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut rest = source;
+    while let Some(index) = rest.find("kb_options") {
+        rest = &rest[index + "kb_options".len()..];
+        let trimmed = rest.trim_start();
+        let Some(trimmed) = trimmed.strip_prefix('=') else {
+            continue;
+        };
+        let trimmed = trimmed.trim_start();
+        let quote = match trimmed.chars().next() {
+            Some('"') => '"',
+            Some('\'') => '\'',
+            _ => continue,
+        };
+        let inner = &trimmed[1..];
+        if let Some(end) = inner.find(quote) {
+            values.push(inner[..end].to_owned());
+        }
+    }
+    values
+}
+
+fn merge_caps_lock_kb_options(existing: Option<String>) -> String {
+    let mut kept = Vec::new();
+    if let Some(existing) = existing {
+        for option in existing.split(',') {
+            let option = option.trim();
+            if option.is_empty()
+                || option == "compose:caps"
+                || option.starts_with("caps:")
+                || option == BOTH_CAPSLOCK_CANCEL
+                || option == "shift:both_capslock"
+            {
+                continue;
+            }
+            if !kept.iter().any(|kept: &String| kept == option) {
+                kept.push(option.to_owned());
+            }
+        }
+    }
+    let mut result = vec![CAPS_NONE.to_owned(), BOTH_CAPSLOCK_CANCEL.to_owned()];
+    result.extend(kept);
+    result.join(",")
+}
+
 fn remove_managed_blocks(source: &str) -> String {
+    remove_marked_block(source, BEGIN_MARKER, END_MARKER)
+}
+
+fn remove_marked_block(source: &str, begin: &str, end: &str) -> String {
     let mut result = String::new();
     let mut managed = false;
     for line in source.split_inclusive('\n') {
         match line.trim() {
-            BEGIN_MARKER => managed = true,
-            END_MARKER if managed => managed = false,
+            marker if marker == begin => managed = true,
+            marker if marker == end && managed => managed = false,
             _ if !managed => result.push_str(line),
             _ => {}
         }
@@ -965,14 +1183,22 @@ o.bind(
     }
 
     #[test]
-    fn left_alt_conflict_falls_back_to_right_alt() {
+    fn caps_lock_conflict_falls_back_to_right_alt() {
         let source = r#"
-o.bind("code:64", "Launch terminal", "kitty")
+o.bind("code:66", "Launch terminal", "kitty")
 o.bind("ALT, code:108", "Modified right alt", "workspace next")
 "#;
 
         assert_eq!(
-            plan_trigger_binding(source),
+            plan_trigger_binding(source, true),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+    }
+
+    #[test]
+    fn declining_caps_lock_installs_right_alt() {
+        assert_eq!(
+            plan_trigger_binding("", false),
             TriggerBindingPlan::Install { key: RIGHT_ALT }
         );
     }
@@ -980,11 +1206,11 @@ o.bind("ALT, code:108", "Modified right alt", "workspace next")
     #[test]
     fn exact_bindings_with_lua_dispatchers_are_still_conflicts() {
         let source = r#"
-o.bind("code:64", "Terminal", { omarchy = "terminal" })
+o.bind("code:66", "Terminal", { omarchy = "terminal" })
 o.bind("code:108", "Launcher", hl.dsp.exec_cmd("launcher"))
 "#;
 
-        let TriggerBindingPlan::Conflicts { conflicts } = plan_trigger_binding(source) else {
+        let TriggerBindingPlan::Conflicts { conflicts } = plan_trigger_binding(source, true) else {
             panic!("non-string dispatchers must not leave exact keys available");
         };
         assert_eq!(conflicts.len(), 2);
@@ -1058,11 +1284,11 @@ o.bind("code:108", "Launcher", hl.dsp.exec_cmd("launcher"))
     #[test]
     fn both_exact_conflicts_describe_bindings_and_recovery() {
         let source = r#"
-o.bind("code:64", "Launch terminal", "kitty")
+o.bind("code:66", "Launch terminal", "kitty")
 o.bind("code:108", "Lock screen", "loginctl lock-session")
 "#;
 
-        let plan = plan_trigger_binding(source);
+        let plan = plan_trigger_binding(source, true);
         let TriggerBindingPlan::Conflicts { conflicts } = plan else {
             panic!("both exact bindings must conflict");
         };
@@ -1089,18 +1315,17 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         };
 
         let report =
-            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland).unwrap();
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
 
-        assert_eq!(report.key, LEFT_ALT);
+        assert_eq!(report.key, CAPS_LOCK);
         assert!(report.changed);
-        assert_eq!(
-            fs::read_to_string(&path)
-                .unwrap()
-                .matches(BEGIN_MARKER)
-                .count(),
-            1
-        );
+        let updated = fs::read_to_string(&path).unwrap();
+        assert_eq!(updated.matches(BEGIN_MARKER).count(), 1);
+        assert!(updated.contains("code:66"));
         assert_eq!(fs::read_to_string(&report.backup_path).unwrap(), original);
+        let input = fs::read_to_string(path.with_file_name("input.lua")).unwrap();
+        assert!(input.contains(CAPS_NONE));
+        assert!(input.contains(BOTH_CAPSLOCK_CANCEL));
         assert!(fs::read_dir(path.parent().unwrap())
             .unwrap()
             .all(|entry| !entry
@@ -1111,9 +1336,9 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
     }
 
     #[test]
-    fn fallback_preserves_the_exact_left_alt_binding() {
+    fn fallback_preserves_the_exact_caps_lock_binding() {
         let (_directory, path) = config_dir();
-        let original = "o.bind(\"code:64\", \"Terminal\", \"kitty\")\n";
+        let original = "o.bind(\"code:66\", \"Terminal\", \"kitty\")\n";
         fs::write(&path, original).unwrap();
         let mut hyprland = FakeHyprland {
             reload_succeeds: true,
@@ -1121,19 +1346,39 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         };
 
         let report =
-            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland).unwrap();
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
         let updated = fs::read_to_string(&path).unwrap();
 
         assert_eq!(report.key, RIGHT_ALT);
         assert!(updated.contains(original));
         assert!(updated.contains("o.bind(\"code:108\", \"Voisu dictation\", \"voisu toggle\")"));
+        assert!(!path.with_file_name("input.lua").exists());
+    }
+
+    #[test]
+    fn rejected_caps_lock_installs_right_alt_without_input_rewrite() {
+        let (_directory, path) = config_dir();
+        fs::write(&path, "-- user bindings\n").unwrap();
+        let mut hyprland = FakeHyprland {
+            reload_succeeds: true,
+            verification_succeeds: true,
+        };
+
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, false).unwrap();
+
+        assert_eq!(report.key, RIGHT_ALT);
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("o.bind(\"code:108\", \"Voisu dictation\", \"voisu toggle\")"));
+        assert!(!path.with_file_name("input.lua").exists());
     }
 
     #[test]
     fn both_conflicts_leave_the_file_and_compositor_untouched() {
         let (_directory, path) = config_dir();
         let original = concat!(
-            "o.bind(\"code:64\", \"Terminal\", \"kitty\")\n",
+            "o.bind(\"code:66\", \"Terminal\", \"kitty\")\n",
             "o.bind(\"code:108\", \"Launcher\", \"launcher\")\n"
         );
         fs::write(&path, original).unwrap();
@@ -1142,7 +1387,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             verification_succeeds: false,
         };
 
-        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland)
+        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true)
             .expect_err("both conflicts must stop before any external action");
 
         assert_eq!(error.exit_code(), 4);
@@ -1158,15 +1403,17 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             reload_succeeds: true,
             verification_succeeds: true,
         };
-        install_trigger_binding(&path, &LocalBindingFileSystem, &mut first).unwrap();
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut first, true).unwrap();
         let before = fs::read_to_string(&path).unwrap();
         let mut second = FakeHyprland {
             reload_succeeds: false,
             verification_succeeds: true,
         };
 
-        let report = install_trigger_binding(&path, &LocalBindingFileSystem, &mut second).unwrap();
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut second, false).unwrap();
 
+        assert_eq!(report.key, CAPS_LOCK);
         assert!(!report.changed);
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
         assert_eq!(before.matches(BEGIN_MARKER).count(), 1);
@@ -1182,7 +1429,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             verification_succeeds: true,
         };
 
-        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland)
+        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true)
             .expect_err("reload failure must fail setup");
 
         assert!(error.to_string().contains("reload"));
@@ -1191,6 +1438,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             fs::read_to_string(backup_path(Path::new(&path))).unwrap(),
             original
         );
+        assert!(!path.with_file_name("input.lua").exists());
     }
 
     #[test]
@@ -1203,11 +1451,85 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             verification_succeeds: false,
         };
 
-        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland)
+        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true)
             .expect_err("verification failure must fail setup");
 
         assert!(error.to_string().contains("verification"));
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!path.with_file_name("input.lua").exists());
+    }
+
+    #[test]
+    fn already_installed_right_alt_is_kept_without_asking_caps_lock() {
+        let (_directory, path) = config_dir();
+        fs::write(
+            &path,
+            concat!(
+                "-- BEGIN VOISU MANAGED TRIGGER\n",
+                "o.bind(\"code:108\", \"Voisu dictation\", \"voisu toggle\")\n",
+                "-- END VOISU MANAGED TRIGGER\n"
+            ),
+        )
+        .unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let mut hyprland = FakeHyprland {
+            reload_succeeds: false,
+            verification_succeeds: true,
+        };
+
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+
+        assert_eq!(report.key, RIGHT_ALT);
+        assert!(!report.changed);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert!(!path.with_file_name("input.lua").exists());
+    }
+
+    #[test]
+    fn caps_lock_input_merges_existing_kb_options() {
+        let (_directory, path) = config_dir();
+        fs::write(&path, "-- user bindings\n").unwrap();
+        fs::write(
+            path.with_file_name("input.lua"),
+            "hl.config({\n  input = {\n    kb_options = \"compose:caps,grp:alts_toggle\",\n  },\n})\n",
+        )
+        .unwrap();
+        let mut hyprland = FakeHyprland {
+            reload_succeeds: true,
+            verification_succeeds: true,
+        };
+
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let input = fs::read_to_string(path.with_file_name("input.lua")).unwrap();
+        let last = last_kb_options(&[&input]).expect("managed kb_options");
+
+        assert_eq!(
+            last,
+            format!("{CAPS_NONE},{BOTH_CAPSLOCK_CANCEL},grp:alts_toggle")
+        );
+        assert!(
+            input.contains("compose:caps"),
+            "the original assignment stays; last-wins managed kb_options overrides it"
+        );
+    }
+
+    #[test]
+    fn existing_caps_lock_input_is_not_rewritten() {
+        let (_directory, path) = config_dir();
+        fs::write(&path, "-- user bindings\n").unwrap();
+        let input_path = path.with_file_name("input.lua");
+        let original_input =
+            "hl.config({\n  input = {\n    kb_options = \"caps:none,shift:both_capslock_cancel\",\n  },\n})\n";
+        fs::write(&input_path, original_input).unwrap();
+        let mut hyprland = FakeHyprland {
+            reload_succeeds: true,
+            verification_succeeds: true,
+        };
+
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+
+        assert_eq!(fs::read_to_string(&input_path).unwrap(), original_input);
     }
 
     const OMARCHY_PASTE_SOURCE: &str = r#"
@@ -1250,8 +1572,12 @@ o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V",
         assert_eq!(
             action.behavior,
             PasteBehavior::OmarchyUniversal {
-                normal: PasteShortcut { binding: "CTRL + V".to_owned() },
-                terminal: PasteShortcut { binding: "SHIFT + Insert".to_owned() },
+                normal: PasteShortcut {
+                    binding: "CTRL + V".to_owned()
+                },
+                terminal: PasteShortcut {
+                    binding: "SHIFT + Insert".to_owned()
+                },
             }
         );
     }

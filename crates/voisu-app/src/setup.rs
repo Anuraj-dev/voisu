@@ -10,14 +10,15 @@
 use std::path::Path;
 
 use voisu_core::{
-    Credential, KeyDiagnosis, KeyLocation, Provider, ProviderKeyStatus, SecretStore,
-    provider_free_tier_hint,
+    provider_free_tier_hint, Credential, KeyDiagnosis, KeyLocation, Provider, ProviderKeyStatus,
+    SecretStore,
 };
 
 use crate::config::{self, DeliveryMode};
 use crate::hyprland_bindings::{
-    LiveHyprlandController, LocalBindingFileSystem, TriggerKey, VerifiedPasteAction,
-    discover_live_paste_action, install_trigger_binding,
+    discover_live_paste_action, install_trigger_binding, plan_trigger_binding, BindingFileSystem,
+    LiveHyprlandController, LocalBindingFileSystem, TriggerBindingPlan, TriggerKey,
+    VerifiedPasteAction, CAPS_LOCK,
 };
 use crate::service;
 
@@ -96,9 +97,11 @@ pub fn run_hyprland_setup(
 }
 
 /// Production adapters for the Hyprland setup flow.
-pub struct LiveHyprlandSetupActions;
+pub struct LiveHyprlandSetupActions<'a> {
+    pub io: &'a mut dyn WizardIo,
+}
 
-impl HyprlandSetupActions for LiveHyprlandSetupActions {
+impl HyprlandSetupActions for LiveHyprlandSetupActions<'_> {
     fn select_clipboard_delivery(&mut self) -> Result<(), String> {
         config::set_delivery_mode(DeliveryMode::Clipboard).map(|_| ())
     }
@@ -109,8 +112,13 @@ impl HyprlandSetupActions for LiveHyprlandSetupActions {
 
     fn install_trigger_binding(&mut self, config: &Path) -> Result<TriggerKey, String> {
         let files = LocalBindingFileSystem;
+        let source = files
+            .read_to_string(config)
+            .map_err(|error| format!("cannot read {}: {error}", config.display()))?
+            .unwrap_or_default();
+        let prefer_caps_lock = caps_lock_trigger_preferred(&source, self.io);
         let mut hyprland = LiveHyprlandController;
-        install_trigger_binding(config, &files, &mut hyprland)
+        install_trigger_binding(config, &files, &mut hyprland, prefer_caps_lock)
             .map(|report| report.key)
             .map_err(|error| error.to_string())
     }
@@ -161,7 +169,10 @@ fn configure_provider(
     // env-override key is a deliberate choice, and migrate a plaintext key back
     // into the keyring on keep when the keyring is available again.
     match store.diagnose(provider) {
-        KeyDiagnosis::Found { location: KeyLocation::EnvOverride, .. } => {
+        KeyDiagnosis::Found {
+            location: KeyLocation::EnvOverride,
+            ..
+        } => {
             io.writeln(&format!(
                 "Note: {name} is set via the {} environment variable, which wins at runtime — \
                  unset it to use a stored key.",
@@ -171,7 +182,10 @@ fn configure_provider(
                 return ProviderOutcome::Kept;
             }
         }
-        KeyDiagnosis::Found { location: KeyLocation::Keyring, .. } => {
+        KeyDiagnosis::Found {
+            location: KeyLocation::Keyring,
+            ..
+        } => {
             if ask_yes_no(
                 io,
                 &format!("A {name} key is already stored in your keyring. Keep it?"),
@@ -181,20 +195,26 @@ fn configure_provider(
                 return ProviderOutcome::Kept;
             }
         }
-        KeyDiagnosis::Found { location: KeyLocation::PlaintextFile, credential } => {
+        KeyDiagnosis::Found {
+            location: KeyLocation::PlaintextFile,
+            credential,
+        } => {
             io.writeln(&format!(
                 "A {name} key is stored in the plaintext fallback file (saved while the keyring \
                  was unavailable)."
             ));
-            if ask_yes_no(io, "Keep it, migrating into your keyring if available?", true) {
+            if ask_yes_no(
+                io,
+                "Keep it, migrating into your keyring if available?",
+                true,
+            ) {
                 match store.replace(provider, credential) {
                     Ok(()) => io.writeln(&format!(
                         "Kept the {name} key (migrated into the keyring if it was available)."
                     )),
-                    Err(error) => io.writeln(&format!(
-                        "Kept the {name} key: {}",
-                        error.public_message()
-                    )),
+                    Err(error) => {
+                        io.writeln(&format!("Kept the {name} key: {}", error.public_message()))
+                    }
                 }
                 return ProviderOutcome::Kept;
             }
@@ -217,7 +237,9 @@ fn configure_provider(
     }
 
     loop {
-        let entered = io.prompt_secret(&format!("Enter your {name} API key (leave blank to skip): "));
+        let entered = io.prompt_secret(&format!(
+            "Enter your {name} API key (leave blank to skip): "
+        ));
         let key = match entered {
             Some(key) => key.trim().to_owned(),
             None => {
@@ -232,7 +254,9 @@ fn configure_provider(
         let credential = match Credential::new(key) {
             Ok(credential) => credential,
             Err(_) => {
-                io.writeln("That key contains a line break; paste the key on one line and try again.");
+                io.writeln(
+                    "That key contains a line break; paste the key on one line and try again.",
+                );
                 continue;
             }
         };
@@ -255,7 +279,10 @@ fn configure_provider(
                 };
             }
             ProviderKeyStatus::InvalidKey => {
-                io.writeln(&format!("{name} rejected that key ({}).", ProviderKeyStatus::InvalidKey.headline()));
+                io.writeln(&format!(
+                    "{name} rejected that key ({}).",
+                    ProviderKeyStatus::InvalidKey.headline()
+                ));
                 io.writeln(provider_free_tier_hint(provider));
                 if ask_yes_no(io, "Try a different key?", true) {
                     continue;
@@ -288,6 +315,20 @@ fn configure_provider(
                 return ProviderOutcome::Skipped;
             }
         }
+    }
+}
+
+/// Hyprland-only: ask to use Caps Lock unless a managed Trigger Key is already
+/// installed or Caps Lock has an exact unmanaged binding.
+fn caps_lock_trigger_preferred(source: &str, io: &mut dyn WizardIo) -> bool {
+    match plan_trigger_binding(source, true) {
+        TriggerBindingPlan::AlreadyInstalled { .. } => false,
+        TriggerBindingPlan::Install { key } if key == CAPS_LOCK => ask_yes_no(
+            io,
+            "Use Caps Lock as the Trigger Key? Caps Lock will not toggle lock state.",
+            true,
+        ),
+        _ => false,
     }
 }
 
@@ -856,7 +897,7 @@ mod tests {
 
         fn install_trigger_binding(&mut self, _config: &Path) -> Result<TriggerKey, String> {
             self.step("trigger")?;
-            Ok(crate::hyprland_bindings::LEFT_ALT)
+            Ok(crate::hyprland_bindings::CAPS_LOCK)
         }
 
         fn discover_paste_action(&mut self) -> Option<VerifiedPasteAction> {
@@ -886,11 +927,17 @@ mod tests {
         let result = run_hyprland_setup(Path::new("/tmp/hyprland.lua"), &mut actions)
             .expect("setup should complete");
 
-        assert_eq!(result.trigger_key, crate::hyprland_bindings::LEFT_ALT);
+        assert_eq!(result.trigger_key, crate::hyprland_bindings::CAPS_LOCK);
         assert!(result.paste_verified);
         assert_eq!(
             actions.events,
-            vec!["services", "clipboard", "trigger", "paste", "start-and-query"]
+            vec![
+                "services",
+                "clipboard",
+                "trigger",
+                "paste",
+                "start-and-query"
+            ]
         );
     }
 
@@ -922,6 +969,79 @@ mod tests {
 
         assert_eq!(error, "trigger failed");
         assert_eq!(actions.events, vec!["services", "clipboard", "trigger"]);
+    }
+
+    #[test]
+    fn caps_lock_prompt_defaults_to_yes_when_the_key_is_free() {
+        let mut io = FakeIo::new(vec![], vec![Some("")]);
+        assert!(caps_lock_trigger_preferred("", &mut io));
+        assert!(
+            io.transcript()
+                .contains("Use Caps Lock as the Trigger Key?"),
+            "{}",
+            io.transcript()
+        );
+    }
+
+    #[test]
+    fn rejecting_caps_lock_falls_back_without_installing_left_alt() {
+        let mut io = FakeIo::new(vec![], vec![Some("n")]);
+        assert!(!caps_lock_trigger_preferred("", &mut io));
+        assert_eq!(
+            plan_trigger_binding("", false),
+            TriggerBindingPlan::Install {
+                key: crate::hyprland_bindings::RIGHT_ALT
+            }
+        );
+    }
+
+    #[test]
+    fn occupied_caps_lock_does_not_prompt() {
+        let mut io = FakeIo::new(vec![], vec![Some("y")]);
+        let source = r#"o.bind("code:66", "Terminal", "kitty")"#;
+        assert!(!caps_lock_trigger_preferred(source, &mut io));
+        assert!(
+            !io.transcript().contains("Caps Lock"),
+            "{}",
+            io.transcript()
+        );
+    }
+
+    #[test]
+    fn already_installed_caps_lock_does_not_prompt() {
+        let mut io = FakeIo::new(vec![], vec![Some("n")]);
+        let source = concat!(
+            "-- BEGIN VOISU MANAGED TRIGGER\n",
+            "o.bind(\"code:66\", \"Voisu dictation\", \"voisu toggle\")\n",
+            "-- END VOISU MANAGED TRIGGER\n"
+        );
+        assert!(!caps_lock_trigger_preferred(source, &mut io));
+        assert!(
+            !io.transcript().contains("Caps Lock"),
+            "{}",
+            io.transcript()
+        );
+        assert_eq!(
+            plan_trigger_binding(source, false),
+            TriggerBindingPlan::AlreadyInstalled {
+                key: crate::hyprland_bindings::CAPS_LOCK
+            }
+        );
+    }
+
+    #[test]
+    fn provider_wizard_does_not_prompt_for_hyprland_caps_lock() {
+        let mut io = FakeIo::new(vec![Some("deepgram-key"), Some("groq-key")], vec![]);
+        let mut store = FakeStore::default();
+        let mut validator = FakeValidator {
+            statuses: vec![ProviderKeyStatus::Valid, ProviderKeyStatus::Valid],
+        };
+        run_setup(&mut io, &mut store, &mut validator);
+        assert!(
+            !io.transcript().contains("Caps Lock"),
+            "Fedora KDE/GNOME keep the portal Trigger Key path:\n{}",
+            io.transcript()
+        );
     }
 
     /// A scripted terminal: pops queued key/line answers and records output.
@@ -981,14 +1101,24 @@ mod tests {
     }
 
     impl SecretStore for FakeStore {
-        fn replace(&mut self, provider: Provider, credential: Credential) -> Result<(), BoundaryError> {
+        fn replace(
+            &mut self,
+            provider: Provider,
+            credential: Credential,
+        ) -> Result<(), BoundaryError> {
             if self.fail_replace {
-                return Err(BoundaryError::new(BoundaryKind::SecretStorage, "store failed"));
+                return Err(BoundaryError::new(
+                    BoundaryKind::SecretStorage,
+                    "store failed",
+                ));
             }
-            self.keys
-                .insert(provider.secret_service_value(), credential.expose_to_boundary().to_owned());
+            self.keys.insert(
+                provider.secret_service_value(),
+                credential.expose_to_boundary().to_owned(),
+            );
             // A successful store migrates a key into the keyring.
-            self.locations.insert(provider.secret_service_value(), KeyLocation::Keyring);
+            self.locations
+                .insert(provider.secret_service_value(), KeyLocation::Keyring);
             Ok(())
         }
         fn load(&mut self, provider: Provider) -> Result<Credential, BoundaryError> {
@@ -1032,10 +1162,7 @@ mod tests {
 
     #[test]
     fn both_valid_keys_are_validated_then_stored() {
-        let mut io = FakeIo::new(
-            vec![Some("deepgram-key"), Some("groq-key")],
-            vec![],
-        );
+        let mut io = FakeIo::new(vec![Some("deepgram-key"), Some("groq-key")], vec![]);
         let mut store = FakeStore::default();
         let mut validator = FakeValidator {
             statuses: vec![ProviderKeyStatus::Valid, ProviderKeyStatus::Valid],
@@ -1043,8 +1170,16 @@ mod tests {
         let outcome = run_setup(&mut io, &mut store, &mut validator);
         assert_eq!(outcome.deepgram, ProviderOutcome::Stored);
         assert_eq!(outcome.groq, ProviderOutcome::Stored);
-        assert_eq!(store.keys.get("deepgram").map(String::as_str), Some("deepgram-key"));
+        assert_eq!(
+            store.keys.get("deepgram").map(String::as_str),
+            Some("deepgram-key")
+        );
         assert_eq!(store.keys.get("groq").map(String::as_str), Some("groq-key"));
+        assert!(
+            !io.transcript().contains("Caps Lock"),
+            "the provider wizard must not ask Hyprland Trigger Key questions:\n{}",
+            io.transcript()
+        );
     }
 
     #[test]
@@ -1065,8 +1200,15 @@ mod tests {
         };
         let outcome = run_setup(&mut io, &mut store, &mut validator);
         assert_eq!(outcome.deepgram, ProviderOutcome::Stored);
-        assert_eq!(store.keys.get("deepgram").map(String::as_str), Some("good-key"));
-        assert!(io.transcript().contains("run `voisu setup`"), "{}", io.transcript());
+        assert_eq!(
+            store.keys.get("deepgram").map(String::as_str),
+            Some("good-key")
+        );
+        assert!(
+            io.transcript().contains("run `voisu setup`"),
+            "{}",
+            io.transcript()
+        );
     }
 
     #[test]
@@ -1090,7 +1232,9 @@ mod tests {
     #[test]
     fn an_already_stored_key_can_be_kept_without_re_entering() {
         let mut store = FakeStore::default();
-        store.keys.insert("deepgram", "existing-deepgram".to_owned());
+        store
+            .keys
+            .insert("deepgram", "existing-deepgram".to_owned());
         // Keep Deepgram (yes), then enter a Groq key.
         let mut io = FakeIo::new(vec![Some("groq-key")], vec![Some("y")]);
         let mut validator = FakeValidator {
@@ -1099,7 +1243,10 @@ mod tests {
         let outcome = run_setup(&mut io, &mut store, &mut validator);
         assert_eq!(outcome.deepgram, ProviderOutcome::Kept);
         // The stored key is untouched.
-        assert_eq!(store.keys.get("deepgram").map(String::as_str), Some("existing-deepgram"));
+        assert_eq!(
+            store.keys.get("deepgram").map(String::as_str),
+            Some("existing-deepgram")
+        );
         assert_eq!(outcome.groq, ProviderOutcome::Stored);
     }
 
@@ -1117,7 +1264,8 @@ mod tests {
         let outcome = run_setup(&mut io, &mut store, &mut validator);
         assert_eq!(outcome.deepgram, ProviderOutcome::Kept);
         assert!(
-            io.transcript().contains("environment variable, which wins at runtime"),
+            io.transcript()
+                .contains("environment variable, which wins at runtime"),
             "{}",
             io.transcript()
         );
@@ -1148,7 +1296,10 @@ mod tests {
         );
         // The wizard still prompts so a key can be stored for after the fix.
         assert_eq!(outcome.deepgram, ProviderOutcome::Stored);
-        assert_eq!(store.keys.get("deepgram").map(String::as_str), Some("deepgram-key"));
+        assert_eq!(
+            store.keys.get("deepgram").map(String::as_str),
+            Some("deepgram-key")
+        );
     }
 
     #[test]
@@ -1157,13 +1308,19 @@ mod tests {
         // on keep, re-stored (migrated) through replace.
         let mut store = FakeStore::default();
         store.keys.insert("deepgram", "file-deepgram".to_owned());
-        store.locations.insert("deepgram", KeyLocation::PlaintextFile);
+        store
+            .locations
+            .insert("deepgram", KeyLocation::PlaintextFile);
         // Keep+migrate Deepgram (yes), then skip Groq.
         let mut io = FakeIo::new(vec![Some("")], vec![Some("y")]);
         let mut validator = FakeValidator { statuses: vec![] };
         let outcome = run_setup(&mut io, &mut store, &mut validator);
         assert_eq!(outcome.deepgram, ProviderOutcome::Kept);
-        assert!(io.transcript().contains("plaintext fallback file"), "{}", io.transcript());
+        assert!(
+            io.transcript().contains("plaintext fallback file"),
+            "{}",
+            io.transcript()
+        );
         // The migration re-stored it, flipping its location to the keyring.
         assert_eq!(store.locations.get("deepgram"), Some(&KeyLocation::Keyring));
     }
@@ -1181,7 +1338,10 @@ mod tests {
         };
         let outcome = run_setup(&mut io, &mut store, &mut validator);
         assert_eq!(outcome.deepgram, ProviderOutcome::StoredUnverified);
-        assert_eq!(store.keys.get("deepgram").map(String::as_str), Some("deepgram-key"));
+        assert_eq!(
+            store.keys.get("deepgram").map(String::as_str),
+            Some("deepgram-key")
+        );
         assert_eq!(outcome.groq, ProviderOutcome::Skipped);
     }
 
@@ -1394,7 +1554,9 @@ mod tests {
     #[test]
     fn finish_at_eof_returns_a_pending_non_empty_line() {
         let (editor, _, _) = feed(b"partial");
-        assert!(matches!(editor.finish_at_eof(), MaskedOutcome::Entered(line) if line == "partial"));
+        assert!(
+            matches!(editor.finish_at_eof(), MaskedOutcome::Entered(line) if line == "partial")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1403,7 +1565,10 @@ mod tests {
 
     #[test]
     fn reveal_shows_first_four_and_last_four_with_the_count() {
-        assert_eq!(mask_key_reveal("gsk_1234567890abcd"), "gsk_••••abcd   (18 chars)");
+        assert_eq!(
+            mask_key_reveal("gsk_1234567890abcd"),
+            "gsk_••••abcd   (18 chars)"
+        );
         // Exactly at the twelve-character threshold.
         assert_eq!(mask_key_reveal("abcdefghijkl"), "abcd••••ijkl   (12 chars)");
     }
@@ -1437,7 +1602,11 @@ mod tests {
         let masked = masked_lflag(original);
         assert_eq!(masked & libc::ECHO, 0, "ECHO must be cleared");
         assert_eq!(masked & libc::ICANON, 0, "ICANON must be cleared");
-        assert_eq!(masked & libc::ISIG, libc::ISIG, "ISIG must survive so Ctrl-C still signals");
+        assert_eq!(
+            masked & libc::ISIG,
+            libc::ISIG,
+            "ISIG must survive so Ctrl-C still signals"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1527,7 +1696,10 @@ mod tests {
         original.c_lflag |= libc::ECHO | libc::ICANON | libc::ISIG;
         original.c_cc[libc::VMIN] = 7;
         original.c_cc[libc::VTIME] = 13;
-        assert_eq!(unsafe { libc::tcsetattr(slave, libc::TCSANOW, &original) }, 0);
+        assert_eq!(
+            unsafe { libc::tcsetattr(slave, libc::TCSANOW, &original) },
+            0
+        );
 
         // A parent-held slave fd to read the termios back after the child exits.
         let probe = unsafe { libc::dup(slave) };
@@ -1535,13 +1707,22 @@ mod tests {
 
         // Readiness pipe: the child writes one byte once masked mode is live.
         let mut pipe_fds = [0 as libc::c_int; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0, "pipe failed");
+        assert_eq!(
+            unsafe { libc::pipe(pipe_fds.as_mut_ptr()) },
+            0,
+            "pipe failed"
+        );
         let (ready_read, ready_write) = (pipe_fds[0], pipe_fds[1]);
 
         let exe = std::env::current_exe().expect("current_exe");
         let slave_stdin = unsafe { OwnedFd::from_raw_fd(slave) };
         let mut cmd = Command::new(exe);
-        cmd.args(["setup::tests::pty_child_entry", "--exact", "--test-threads=1", "-q"]);
+        cmd.args([
+            "setup::tests::pty_child_entry",
+            "--exact",
+            "--test-threads=1",
+            "-q",
+        ]);
         cmd.env("VOISU_MASKED_PTY_CHILD", mode);
         cmd.stdin(Stdio::from(slave_stdin));
         cmd.stdout(Stdio::null());
@@ -1550,7 +1731,10 @@ mod tests {
         unsafe {
             cmd.pre_exec(move || {
                 // No core dumps from the SIGQUIT path.
-                let limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                let limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
                 libc::setrlimit(libc::RLIMIT_CORE, &limit);
                 // Wire the readiness pipe write-end to fd 3 for the child.
                 if libc::dup2(ready_write, 3) < 0 {
@@ -1564,12 +1748,21 @@ mod tests {
         // Parent drops the write-end so a child that dies early yields EOF on
         // the read-end rather than blocking the parent forever.
         unsafe { libc::close(ready_write) };
-        PtyChild { child, master, probe, ready: ready_read }
+        PtyChild {
+            child,
+            master,
+            probe,
+            ready: ready_read,
+        }
     }
 
     fn termios_of(fd: libc::c_int) -> libc::termios {
         let mut termios: libc::termios = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::tcgetattr(fd, &mut termios) }, 0, "tcgetattr failed");
+        assert_eq!(
+            unsafe { libc::tcgetattr(fd, &mut termios) },
+            0,
+            "tcgetattr failed"
+        );
         termios
     }
 
@@ -1598,7 +1791,11 @@ mod tests {
 
     fn assert_terminal_restored(termios: &libc::termios, context: &str) {
         assert_ne!(termios.c_lflag & libc::ECHO, 0, "ECHO restored ({context})");
-        assert_ne!(termios.c_lflag & libc::ICANON, 0, "ICANON restored ({context})");
+        assert_ne!(
+            termios.c_lflag & libc::ICANON,
+            0,
+            "ICANON restored ({context})"
+        );
         assert_eq!(termios.c_cc[libc::VMIN], 7, "VMIN restored ({context})");
         assert_eq!(termios.c_cc[libc::VTIME], 13, "VTIME restored ({context})");
     }
@@ -1626,12 +1823,19 @@ mod tests {
     fn run_signal_restoration(signal: libc::c_int, name: &str) {
         use std::os::unix::process::ExitStatusExt;
         let mut pty = spawn_pty_child("signal");
-        assert!(wait_ready(pty.ready), "child never reached masked mode ({name})");
+        assert!(
+            wait_ready(pty.ready),
+            "child never reached masked mode ({name})"
+        );
         // Interrupt while the child is parked in the masked read.
         let killed = unsafe { libc::kill(pty.child.id() as libc::pid_t, signal) };
         assert_eq!(killed, 0, "kill {name} failed");
         let status = pty.child.wait().expect("wait child");
-        assert_eq!(status.signal(), Some(signal), "child should die from {name}: {status:?}");
+        assert_eq!(
+            status.signal(),
+            Some(signal),
+            "child should die from {name}: {status:?}"
+        );
         // The async-signal-safe handler must have restored the tty before death.
         assert_terminal_restored(&termios_of(pty.probe), name);
         close_pty(&pty);
