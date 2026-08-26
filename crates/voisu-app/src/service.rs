@@ -143,10 +143,15 @@ pub fn install_hyprland_services() -> Result<UserServiceReport, String> {
     Ok(report)
 }
 
-/// Starts the daemon after Hyprland setup has reloaded the user's Lua config,
-/// then verifies that the required Overlay is enabled and active too.
+/// Restarts the daemon after Hyprland setup has written Delivery and Trigger
+/// Key settings, then verifies that the required Overlay is enabled and active.
+/// `systemctl start` is a no-op when the unit is already running, so a rerun
+/// would otherwise leave the daemon on the previous Delivery mode.
 pub fn start_hyprland_services() -> Result<UserServiceReport, String> {
-    let report = manage_user_service(UserServiceAction::Start)?;
+    let report = manage_user_service(UserServiceAction::Restart)?;
+    if report.exit_code != 0 {
+        return Err(report.message);
+    }
     require_overlay_state("enabled", "is-enabled")?;
     require_overlay_state("active", "is-active")?;
     Ok(report)
@@ -402,15 +407,23 @@ fn start() -> Result<UserServiceReport, String> {
 /// — which the graphical session populated — and sets them on the manager; they
 /// are not persisted across logins. Best-effort: a failure never blocks the
 /// start, since the daemon still runs and Delivery falls back to the clipboard.
+///
+/// `HYPRLAND_INSTANCE_SIGNATURE` is imported only when this process has it.
+/// systemd fails the whole import if a named variable is unset, which would
+/// drop DISPLAY/WAYLAND_DISPLAY on KDE/GNOME.
 fn import_session_environment() {
-    let _ = systemctl(&[
+    let mut arguments = vec![
         "import-environment",
         "DISPLAY",
         "WAYLAND_DISPLAY",
         "XAUTHORITY",
         "XDG_SESSION_TYPE",
         "XDG_CURRENT_DESKTOP",
-    ]);
+    ];
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|value| !value.is_empty()) {
+        arguments.push("HYPRLAND_INSTANCE_SIGNATURE");
+    }
+    let _ = systemctl(&arguments);
 }
 
 fn stop() -> Result<UserServiceReport, String> {

@@ -78,7 +78,8 @@ impl ServiceFixture {
             .env("VOISU_PACKAGED_DAEMON_PATH", &self.packaged_daemon)
             .env("VOISU_DISABLE_SHORTCUTS", "1")
             .env("VOISU_DISABLE_DIRECT_DELIVERY", "1")
-            .env("VOISU_TEST_MODE", "controlled");
+            .env("VOISU_TEST_MODE", "controlled")
+            .env_remove("HYPRLAND_INSTANCE_SIGNATURE");
         command
     }
 
@@ -1133,6 +1134,30 @@ fn service_start_and_restart_import_the_session_display_environment() {
         calls.matches(expected).count(),
         2,
         "start and restart must each issue the complete import-environment list:\n{calls}"
+    );
+    assert!(
+        !calls.contains("HYPRLAND_INSTANCE_SIGNATURE"),
+        "an unset Hyprland signature must not be named, or systemd fails the whole import:\n{calls}"
+    );
+}
+
+#[test]
+fn service_start_imports_hyprland_signature_when_the_cli_has_it() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    assert!(fixture.run(&["service", "install"]).status.success());
+    fixture.use_real_managed_daemon();
+    let _ = fixture
+        .command(&["service", "start"])
+        .env("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test-instance")
+        .output()
+        .unwrap();
+
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    assert!(
+        calls.contains(
+            "--user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE"
+        ),
+        "the daemon's Paste Action discovery needs the compositor signature:\n{calls}"
     );
 }
 
