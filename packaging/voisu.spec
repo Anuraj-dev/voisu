@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.40.0
+Version:        0.41.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,13 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Wed Aug 26 2026 Voisu maintainers <voisu@example.invalid> - 0.41.0-1
+- fix(paste): verify Hyprland Lua string paste binds as Simple
+- fix(paste): verify opaque Hyprland Lua binds on the first invoke
+- fix(paste): close remaining PR review gaps
+- fix(delivery): harden verified Hyprland paste path
+- feat(delivery): use verified Hyprland paste action
+
 * Wed Aug 26 2026 Voisu maintainers <voisu@example.invalid> - 0.40.0-1
 - fix(hyprland): treat Alt keysyms as occupied and reload on rerun
 - fix(hyprland): scan paren-free imports and keep managed reruns
