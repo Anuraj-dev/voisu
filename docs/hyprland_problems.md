@@ -104,9 +104,9 @@ Voisu currently defaults to `type`. Type Delivery requires a RemoteDesktop porta
 #### Intended fix
 
 - During Hyprland setup, select `clipboard` Delivery by default.
-- Explain that clipboard mode writes the final Transcript to the clipboard and does not insert it into the focused application.
+- Explain that clipboard mode preserves the final Transcript on the clipboard first. If a verified Hyprland Paste Action exists, Voisu then emits that shortcut once. Unverified or failed paste stays clipboard-only.
 - Keep the setting persistent across service restarts and package upgrades.
-- Do not silently fall back to simulated typing or direct paste.
+- Do not silently fall back to simulated typing or an unverified paste.
 
 Equivalent command:
 
@@ -143,7 +143,7 @@ For a Hyprland session, `voisu setup` should:
 1. Detect Hyprland and the session manager, including Omarchy/UWSM when present.
 2. Install or select a service definition without a portal ownership dependency.
 3. Enable the daemon and optional Overlay for the graphical session.
-4. Select clipboard Delivery and explain that Voisu will not paste directly.
+4. Select clipboard Delivery and explain that the Transcript is preserved on the clipboard before any verified Paste Action.
 5. Inspect the requested Trigger Key, ask before changing it, and install the compositor binding.
 6. Reload Hyprland and systemd, then start both services.
 7. Query the running daemon and report its real capture, provider, display, and Delivery readiness.
@@ -176,7 +176,7 @@ Do not claim Hyprland support until a packaged installation passes all of these 
 4. Confirm both services start without an ordering cycle or manual restart.
 5. Confirm the daemon process has the active `WAYLAND_DISPLAY` before the first Recording.
 6. Press Left Alt to start and stop a controlled Recording.
-7. Confirm exactly one final Transcript reaches the clipboard and is not inserted into the focused application.
+7. Confirm exactly one final Transcript reaches the clipboard, then at most one verified Paste Action; paste failure must leave the Transcript on the clipboard.
 8. Confirm the Overlay shows Recording, Processing, and terminal feedback.
 9. Restart Hyprland or its portal and confirm both Voisu processes recover.
 10. Deliberately create a stale-daemon condition and confirm `voisu doctor` detects it.

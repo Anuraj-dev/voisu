@@ -6519,7 +6519,6 @@ pub struct PortalPasteAction {
     portal: Option<Box<dyn RemoteDesktopPortal>>,
     session: Option<Box<dyn DirectDeliverySession>>,
     setup: Option<tokio::task::JoinHandle<PasteSetupResult>>,
-    live_verification: Option<tokio::task::JoinHandle<Option<VerifiedPasteAction>>>,
     terminal_failure: Option<String>,
     live_action_verifier: Option<LivePasteActionVerifier>,
 }
@@ -6536,13 +6535,17 @@ impl PortalPasteAction {
         action: VerifiedPasteAction,
         portal: Box<dyn RemoteDesktopPortal>,
     ) -> Self {
-        Self::with_options(
+        let mut paste = Self::with_options(
             action,
             portal,
             Some(Arc::new(
                 crate::hyprland_bindings::discover_live_paste_action,
             )),
-        )
+        );
+        // Overlap the portal grant with daemon lifetime, matching Type
+        // Delivery, so the first Transcript is not the permission prompt.
+        paste.begin_paste_setup();
+        paste
     }
 
     fn with_options(
@@ -6555,10 +6558,22 @@ impl PortalPasteAction {
             portal: Some(portal),
             session: None,
             setup: None,
-            live_verification: None,
             terminal_failure: None,
             live_action_verifier,
         }
+    }
+
+    fn begin_paste_setup(&mut self) {
+        if self.session.is_some() || self.setup.is_some() {
+            return;
+        }
+        let Some(mut portal) = self.portal.take() else {
+            return;
+        };
+        self.setup = Some(tokio::spawn(async move {
+            let result = portal.connect_paste().await;
+            (portal, result)
+        }));
     }
 
     #[cfg(test)]
@@ -6592,21 +6607,12 @@ impl PasteBoundary for PortalPasteAction {
                 return Err(BoundaryError::new(BoundaryKind::Delivery, reason));
             }
             if let Some(verifier) = self.live_action_verifier.clone() {
-                if self.live_verification.is_none() {
-                    self.live_verification = Some(tokio::task::spawn_blocking(move || verifier()));
-                }
-                let verification = self
-                    .live_verification
-                    .take()
-                    .expect("live Paste Action verification was started");
-                if !verification.is_finished() {
-                    self.live_verification = Some(verification);
-                    return Err(BoundaryError::new(
-                        BoundaryKind::Delivery,
-                        "Paste Action verification pending",
-                    ));
-                }
-                let live_action = verification.await.ok().flatten();
+                // hyprctl is short; await it on the invoke that needs the
+                // result so this Recording is not dropped as clipboard-only.
+                let live_action = tokio::task::spawn_blocking(move || verifier())
+                    .await
+                    .ok()
+                    .flatten();
                 if live_action.as_ref() != Some(&requested) {
                     return Err(BoundaryError::new(
                         BoundaryKind::Delivery,
@@ -6615,19 +6621,10 @@ impl PasteBoundary for PortalPasteAction {
                 }
             }
             if self.session.is_none() {
-                if self.setup.is_none() {
-                    let mut portal = self.portal.take().ok_or_else(|| {
-                        BoundaryError::new(BoundaryKind::Delivery, "Paste portal unavailable")
-                    })?;
-                    self.setup = Some(tokio::spawn(async move {
-                        let result = portal.connect_paste().await;
-                        (portal, result)
-                    }));
-                }
-                let setup = self
-                    .setup
-                    .take()
-                    .expect("Paste portal setup was started");
+                self.begin_paste_setup();
+                let setup = self.setup.take().ok_or_else(|| {
+                    BoundaryError::new(BoundaryKind::Delivery, "Paste portal unavailable")
+                })?;
                 if !setup.is_finished() {
                     self.setup = Some(setup);
                     return Err(BoundaryError::new(
@@ -10346,18 +10343,49 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn paste_action_rejects_a_cached_binding_after_live_revalidation_changes() {
+    struct RecordingShortcutSession(Arc<Mutex<Vec<String>>>);
+
+    impl DirectDeliverySession for RecordingShortcutSession {
+        fn deliver_text(&mut self, _text: &str) -> BoundaryFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn deliver_shortcut(&mut self, shortcut: &str) -> BoundaryFuture<'_, ()> {
+            let events = Arc::clone(&self.0);
+            let shortcut = shortcut.to_owned();
+            Box::pin(async move {
+                events.lock().unwrap().push(format!("shortcut:{shortcut}"));
+                Ok(())
+            })
+        }
+    }
+
+    fn test_paste_action() -> VerifiedPasteAction {
         use crate::hyprland_bindings::{PasteBehavior, PasteShortcut};
 
-        let cached = VerifiedPasteAction {
+        VerifiedPasteAction {
             shortcut: PasteShortcut {
                 binding: "SUPER + V".to_owned(),
             },
             description: "Universal paste".to_owned(),
             live_binding_identity: "91".to_owned(),
             behavior: PasteBehavior::Simple,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn production_paste_starts_portal_setup_before_the_first_invoke() {
+        let paste = PortalPasteAction::with_live_revalidation(
+            test_paste_action(),
+            Box::new(DisabledRemoteDesktopPortal),
+        );
+        assert!(paste.setup.is_some());
+        assert!(paste.session.is_none());
+    }
+
+    #[tokio::test]
+    async fn paste_action_rejects_a_cached_binding_after_live_revalidation_changes() {
+        let cached = test_paste_action();
         let live = VerifiedPasteAction {
             live_binding_identity: "92".to_owned(),
             ..cached.clone()
@@ -10368,52 +10396,29 @@ mod tests {
             live,
         );
 
-        let error = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let error = paste
-                    .invoke(&cached)
-                    .await
-                    .expect_err("a stale cached action must fail closed");
-                if error.diagnostic() == "Paste Action verification pending" {
-                    tokio::task::yield_now().await;
-                } else {
-                    break error;
-                }
-            }
-        })
-        .await
-        .expect("live verification should complete");
+        let error = tokio::time::timeout(Duration::from_secs(1), paste.invoke(&cached))
+            .await
+            .expect("live verification should complete")
+            .expect_err("a stale cached action must fail closed");
         assert_eq!(error.diagnostic(), "verified Paste Action is no longer active");
     }
 
     #[tokio::test]
-    async fn live_paste_revalidation_does_not_block_invoke() {
+    async fn live_paste_revalidation_awaits_and_pastes_on_the_first_invoke() {
         use std::sync::mpsc;
 
-        use crate::hyprland_bindings::{PasteBehavior, PasteShortcut};
-
-        let action = VerifiedPasteAction {
-            shortcut: PasteShortcut {
-                binding: "SUPER + V".to_owned(),
-            },
-            description: "Universal paste".to_owned(),
-            live_binding_identity: "91".to_owned(),
-            behavior: PasteBehavior::Simple,
-        };
+        let action = test_paste_action();
+        let events = Arc::new(Mutex::new(Vec::new()));
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
         let release_rx = Arc::new(Mutex::new(release_rx));
-        let releaser = std::thread::spawn(move || {
-            started_rx.recv().expect("live verifier should start");
-            release_tx.send(()).expect("live verifier should be released");
-        });
         let verifier_action = action.clone();
         let verifier_release = Arc::clone(&release_rx);
         let verifier = Arc::new(move || {
-            started_tx.send(()).expect("live verifier start should be observed");
+            started_tx
+                .send(())
+                .expect("live verifier start should be observed");
             let _ = verifier_release.lock().unwrap().recv();
-            done_tx.send(()).expect("live verifier completion should be observed");
             Some(verifier_action.clone())
         });
         let mut paste = PortalPasteAction::with_options(
@@ -10421,16 +10426,24 @@ mod tests {
             Box::new(DisabledRemoteDesktopPortal),
             Some(verifier),
         );
+        // Portal permission stays non-blocking and is not under test here.
+        paste.session = Some(Box::new(RecordingShortcutSession(Arc::clone(&events))));
 
-        let error = tokio::time::timeout(Duration::from_secs(1), paste.invoke(&action))
+        let requested = action.clone();
+        let invoke = tokio::spawn(async move { paste.invoke(&requested).await });
+        let releaser = std::thread::spawn(move || {
+            started_rx.recv().expect("live verifier should start");
+            release_tx
+                .send(())
+                .expect("live verifier should be released");
+        });
+        tokio::time::timeout(Duration::from_secs(1), invoke)
             .await
-            .expect("live verification must not block the delivery future")
-            .expect_err("the first invocation must fail closed while verification is pending");
-        assert_eq!(error.diagnostic(), "Paste Action verification pending");
-        done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("live verifier should finish in the background");
+            .expect("live verification must complete on the first invoke")
+            .expect("invoke task should finish")
+            .expect("the first invocation must paste once live verification matches");
         releaser.join().expect("verifier release thread should finish");
+        assert_eq!(events.lock().unwrap().as_slice(), ["shortcut:SUPER + V"]);
     }
 
     #[test]
