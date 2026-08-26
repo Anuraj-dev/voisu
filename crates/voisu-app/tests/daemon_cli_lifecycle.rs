@@ -10354,7 +10354,7 @@ cat > "$dir/clipboard"
     assert_eq!(record["delivery_method"], "clipboard_fallback", "{history}");
     assert_eq!(
         record["delivery_fallback_reason"],
-        "direct Delivery disabled for this run",
+        "no verified Hyprland Paste Action; Transcript remains on the clipboard",
         "clipboard mode must skip the emulated-input adapter: {history}"
     );
 

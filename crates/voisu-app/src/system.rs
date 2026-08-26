@@ -31,6 +31,7 @@ use crate::audio_level::{
     bands, BandState, LevelRegistry, PcmChunkAssembler, SampleDecoder, PCM_CHUNK_BYTES,
 };
 use crate::focus::SharedFocusProbe;
+use crate::hyprland_bindings::VerifiedPasteAction;
 use crate::process::guard_external_child;
 use crate::secret_file::{FileSecretStore, RemoveError};
 
@@ -6336,12 +6337,32 @@ pub trait ClipboardBoundary: Send {
     fn preserve(&mut self, transcript: &Transcript) -> BoundaryFuture<'_, ()>;
 }
 
+/// The only operation the post-copy path can perform. Implementations receive
+/// a closed, source-verified action and never receive arbitrary Lua or shell
+/// source to evaluate.
+pub trait PasteBoundary: Send {
+    fn invoke(&mut self, action: &VerifiedPasteAction) -> BoundaryFuture<'_, ()>;
+}
+
 pub trait DirectDeliverySession: Send {
     fn deliver_text(&mut self, text: &str) -> BoundaryFuture<'_, ()>;
+
+    fn deliver_shortcut(&mut self, _shortcut: &str) -> BoundaryFuture<'_, ()> {
+        Box::pin(async {
+            Err(BoundaryError::new(
+                BoundaryKind::Delivery,
+                "keyboard shortcut submission unavailable",
+            ))
+        })
+    }
 }
 
 pub trait RemoteDesktopPortal: Send {
     fn connect(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>>;
+
+    fn connect_paste(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>> {
+        self.connect()
+    }
 }
 
 pub trait NotificationBoundary: Send {
@@ -6470,6 +6491,10 @@ impl DeliveryAdapter for GuardedDelivery {
 pub struct PortalClipboardDelivery {
     clipboard: Box<dyn ClipboardBoundary>,
     portal: Box<dyn RemoteDesktopPortal>,
+    paste: Option<Box<dyn PasteBoundary>>,
+    paste_action: Option<VerifiedPasteAction>,
+    direct_enabled: bool,
+    clipboard_fallback_reason: String,
     session: Option<Box<dyn DirectDeliverySession>>,
     setup: Option<tokio::task::JoinHandle<Result<Box<dyn DirectDeliverySession>, BoundaryError>>>,
     setup_failure: Option<String>,
@@ -6480,6 +6505,177 @@ pub struct PortalClipboardDelivery {
 
 const REMOTE_DESKTOP_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
+/// A paste session is separate from the normal text Delivery session. The
+/// portal may expose a text-capable device for Type Delivery, while a verified
+/// Hyprland binding always needs a keyboard-capable device.
+type PasteSetupResult = (
+    Box<dyn RemoteDesktopPortal>,
+    Result<Box<dyn DirectDeliverySession>, BoundaryError>,
+);
+type LivePasteActionVerifier = Arc<dyn Fn() -> Option<VerifiedPasteAction> + Send + Sync>;
+
+pub struct PortalPasteAction {
+    action: VerifiedPasteAction,
+    portal: Option<Box<dyn RemoteDesktopPortal>>,
+    session: Option<Box<dyn DirectDeliverySession>>,
+    setup: Option<tokio::task::JoinHandle<PasteSetupResult>>,
+    terminal_failure: Option<String>,
+    live_action_verifier: Option<LivePasteActionVerifier>,
+}
+
+impl PortalPasteAction {
+    pub fn with_boundaries(
+        action: VerifiedPasteAction,
+        portal: Box<dyn RemoteDesktopPortal>,
+    ) -> Self {
+        Self::with_options(action, portal, None)
+    }
+
+    fn with_live_revalidation(
+        action: VerifiedPasteAction,
+        portal: Box<dyn RemoteDesktopPortal>,
+    ) -> Self {
+        let mut paste = Self::with_options(
+            action,
+            portal,
+            Some(Arc::new(
+                crate::hyprland_bindings::discover_live_paste_action,
+            )),
+        );
+        // Overlap the portal grant with daemon lifetime, matching Type
+        // Delivery, so the first Transcript is not the permission prompt.
+        paste.begin_paste_setup();
+        paste
+    }
+
+    fn with_options(
+        action: VerifiedPasteAction,
+        portal: Box<dyn RemoteDesktopPortal>,
+        live_action_verifier: Option<LivePasteActionVerifier>,
+    ) -> Self {
+        Self {
+            action,
+            portal: Some(portal),
+            session: None,
+            setup: None,
+            terminal_failure: None,
+            live_action_verifier,
+        }
+    }
+
+    fn begin_paste_setup(&mut self) {
+        if self.session.is_some() || self.setup.is_some() {
+            return;
+        }
+        let Some(mut portal) = self.portal.take() else {
+            return;
+        };
+        self.setup = Some(tokio::spawn(async move {
+            let result = portal.connect_paste().await;
+            (portal, result)
+        }));
+    }
+
+    #[cfg(test)]
+    fn with_test_revalidation(
+        action: VerifiedPasteAction,
+        portal: Box<dyn RemoteDesktopPortal>,
+        live_action: VerifiedPasteAction,
+    ) -> Self {
+        Self::with_options(
+            action,
+            portal,
+            Some(Arc::new(move || Some(live_action.clone()))),
+        )
+    }
+}
+
+impl PasteBoundary for PortalPasteAction {
+    fn invoke(&mut self, action: &VerifiedPasteAction) -> BoundaryFuture<'_, ()> {
+        // The action is captured at construction and checked again here so a
+        // caller cannot swap a discovered action for another one mid-round.
+        let expected = self.action.clone();
+        let requested = action.clone();
+        Box::pin(async move {
+            if expected != requested {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Delivery,
+                    "verified Paste Action changed during Delivery",
+                ));
+            }
+            if let Some(reason) = self.terminal_failure.clone() {
+                return Err(BoundaryError::new(BoundaryKind::Delivery, reason));
+            }
+            if let Some(verifier) = self.live_action_verifier.clone() {
+                // hyprctl is short; await it on the invoke that needs the
+                // result so this Recording is not dropped as clipboard-only.
+                let live_action = tokio::task::spawn_blocking(move || verifier())
+                    .await
+                    .ok()
+                    .flatten();
+                if live_action.as_ref() != Some(&requested) {
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Delivery,
+                        "verified Paste Action is no longer active",
+                    ));
+                }
+            }
+            if self.session.is_none() {
+                self.begin_paste_setup();
+                let setup = self.setup.take().ok_or_else(|| {
+                    BoundaryError::new(BoundaryKind::Delivery, "Paste portal unavailable")
+                })?;
+                if !setup.is_finished() {
+                    self.setup = Some(setup);
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Delivery,
+                        "Paste portal permission request pending",
+                    ));
+                }
+                match setup.await {
+                    Ok((portal, Ok(session))) => {
+                        self.portal = Some(portal);
+                        self.session = Some(session);
+                    }
+                    Ok((portal, Err(error))) => {
+                        self.portal = Some(portal);
+                        self.remember_failure(&error);
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        let reason = "Paste portal setup unavailable".to_owned();
+                        self.terminal_failure = Some(reason.clone());
+                        return Err(BoundaryError::new(BoundaryKind::Delivery, reason));
+                    }
+                }
+            }
+            let result = self
+                .session
+                .as_mut()
+                .expect("Paste Action session was established")
+                .deliver_shortcut(&requested.shortcut.binding)
+                .await;
+            if result.is_err() {
+                self.session = None;
+                if let Err(error) = &result {
+                    self.remember_failure(error);
+                }
+            }
+            result
+        })
+    }
+}
+
+impl PortalPasteAction {
+    fn remember_failure(&mut self, error: &BoundaryError) {
+        let reason = error.diagnostic().to_owned();
+        if error.is_permanent() || terminal_remote_desktop_failure(&reason) {
+            clear_restore_token();
+            self.terminal_failure = Some(reason);
+        }
+    }
+}
+
 impl PortalClipboardDelivery {
     pub fn with_boundaries(
         clipboard: Box<dyn ClipboardBoundary>,
@@ -6488,6 +6684,12 @@ impl PortalClipboardDelivery {
         Self {
             clipboard,
             portal,
+            paste: None,
+            paste_action: None,
+            direct_enabled: true,
+            clipboard_fallback_reason:
+                "no verified Hyprland Paste Action; Transcript remains on the clipboard"
+                    .to_owned(),
             session: None,
             setup: None,
             setup_failure: None,
@@ -6497,8 +6699,48 @@ impl PortalClipboardDelivery {
         }
     }
 
+    pub fn with_paste_boundaries(
+        clipboard: Box<dyn ClipboardBoundary>,
+        action: VerifiedPasteAction,
+        paste: Box<dyn PasteBoundary>,
+    ) -> Self {
+        let mut delivery = Self::with_boundaries(
+            clipboard,
+            Box::new(DisabledRemoteDesktopPortal),
+        );
+        delivery.paste = Some(paste);
+        delivery.paste_action = Some(action);
+        delivery.direct_enabled = false;
+        delivery
+    }
+
     pub fn clipboard_only() -> Self {
-        Self::with_boundaries(Box::new(WlClipboard), Box::new(DisabledRemoteDesktopPortal))
+        Self::clipboard_only_with_boundary(Box::new(WlClipboard))
+    }
+
+    pub fn clipboard_only_with_boundary(clipboard: Box<dyn ClipboardBoundary>) -> Self {
+        Self::clipboard_only_with_reason(
+            clipboard,
+            "no verified Hyprland Paste Action; Transcript remains on the clipboard",
+        )
+    }
+
+    pub fn clipboard_only_with_reason(
+        clipboard: Box<dyn ClipboardBoundary>,
+        reason: impl Into<String>,
+    ) -> Self {
+        let mut delivery = Self::with_boundaries(clipboard, Box::new(DisabledRemoteDesktopPortal));
+        delivery.direct_enabled = false;
+        delivery.clipboard_fallback_reason = reason.into();
+        delivery
+    }
+
+    pub fn with_hyprland_paste(action: VerifiedPasteAction) -> Self {
+        let paste = PortalPasteAction::with_live_revalidation(
+            action.clone(),
+            Box::new(FedoraRemoteDesktopPortal),
+        );
+        Self::with_paste_boundaries(Box::new(WlClipboard), action, Box::new(paste))
     }
 }
 
@@ -6508,6 +6750,24 @@ impl DeliveryAdapter for PortalClipboardDelivery {
             // Clipboard preservation is the recoverability guarantee.
             // Compositor submission is never reported unless this succeeds.
             self.clipboard.preserve(&transcript).await?;
+
+            if let (Some(paste), Some(action)) = (self.paste.as_mut(), self.paste_action.clone()) {
+                match paste.invoke(&action).await {
+                    Ok(()) => return Ok(DeliveryOutcome::compositor_submitted()),
+                    Err(error) => {
+                        return Ok(DeliveryOutcome::clipboard_fallback(format!(
+                            "Paste Action failed; Transcript remains on the clipboard: {}",
+                            error.diagnostic()
+                        )));
+                    }
+                }
+            }
+
+            if !self.direct_enabled {
+                return Ok(DeliveryOutcome::clipboard_fallback(
+                    self.clipboard_fallback_reason.clone(),
+                ));
+            }
 
             if self.session.is_none() {
                 if let Some(reason) = self.setup_failure.clone() {
@@ -6789,9 +7049,10 @@ impl RemoteDesktopPortal for DisabledRemoteDesktopPortal {
     }
 }
 
-impl RemoteDesktopPortal for FedoraRemoteDesktopPortal {
-    fn connect(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>> {
-        Box::pin(async move {
+impl FedoraRemoteDesktopPortal {
+    async fn connect_inner(
+        force_keyboard: bool,
+    ) -> Result<Box<dyn DirectDeliverySession>, BoundaryError> {
             use std::sync::atomic::Ordering;
             use zbus::zvariant::Value;
 
@@ -6929,7 +7190,7 @@ impl RemoteDesktopPortal for FedoraRemoteDesktopPortal {
             })?;
             let fd: std::os::fd::OwnedFd = fd.into();
             let sender_result = tokio::task::spawn_blocking(move || {
-                NativeEiSender::connect(fd.into_raw_fd())
+                NativeEiSender::connect_with_keyboard(fd.into_raw_fd(), force_keyboard)
             })
             .await
             .map_err(|_| {
@@ -6949,17 +7210,32 @@ impl RemoteDesktopPortal for FedoraRemoteDesktopPortal {
                 closures,
                 sender: Some(sender),
             }) as Box<dyn DirectDeliverySession>)
-        })
+    }
+}
+
+impl RemoteDesktopPortal for FedoraRemoteDesktopPortal {
+    fn connect(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>> {
+        Box::pin(Self::connect_inner(false))
+    }
+
+    fn connect_paste(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>> {
+        Box::pin(Self::connect_inner(true))
     }
 }
 
 fn classify_remote_desktop_failure(error: BoundaryError) -> BoundaryError {
-    let reason = if error.diagnostic().contains("denied or cancelled") {
+    let permanent = error.is_permanent();
+    let reason = if error.is_permanent() || error.diagnostic().contains("denied or cancelled") {
         "permission denied"
     } else {
         "RemoteDesktop portal unavailable"
     };
-    BoundaryError::new(BoundaryKind::Delivery, reason)
+    let classified = BoundaryError::new(BoundaryKind::Delivery, reason);
+    if permanent {
+        classified.permanent()
+    } else {
+        classified
+    }
 }
 
 async fn fail_and_close(
@@ -6969,7 +7245,7 @@ async fn fail_and_close(
 ) -> BoundaryError {
     close_portal_session(connection, session_path).await;
     let error = classify_remote_desktop_failure(error);
-    if terminal_remote_desktop_failure(error.diagnostic()) {
+    if error.is_permanent() || terminal_remote_desktop_failure(error.diagnostic()) {
         clear_restore_token();
     }
     error
@@ -6999,6 +7275,31 @@ impl DirectDeliverySession for FedoraDirectDeliverySession {
             })?;
             let (returned, result) = tokio::task::spawn_blocking(move || {
                 let result = sender.deliver(&text);
+                (sender, result)
+            })
+            .await
+            .map_err(|_| BoundaryError::new(BoundaryKind::Delivery, "libei disconnected"))?;
+            self.sender = Some(returned);
+            result
+        })
+    }
+
+    fn deliver_shortcut(&mut self, shortcut: &str) -> BoundaryFuture<'_, ()> {
+        let shortcut = shortcut.to_owned();
+        Box::pin(async move {
+            use zbus::export::ordered_stream::OrderedStreamExt;
+            if matches!(
+                tokio::time::timeout(Duration::from_millis(1), self.closures.next()).await,
+                Ok(Some(_))
+            ) {
+                clear_restore_token();
+                return Err(BoundaryError::new(BoundaryKind::Delivery, "permission revoked"));
+            }
+            let mut sender = self.sender.take().ok_or_else(|| {
+                BoundaryError::new(BoundaryKind::Delivery, "libei disconnected")
+            })?;
+            let (returned, result) = tokio::task::spawn_blocking(move || {
+                let result = sender.deliver_shortcut(&shortcut);
                 (sender, result)
             })
             .await
@@ -7220,6 +7521,74 @@ fn resolve_keyboard_paste_keys(
         BoundaryError::new(BoundaryKind::Delivery, "active keyboard layout unavailable")
     })?;
     Ok(KeyboardPasteKeys { control, paste })
+}
+
+fn resolve_shortcut_keycodes(
+    keymap_text: String,
+    group: u32,
+    shortcut: &str,
+) -> Result<Vec<u32>, BoundaryError> {
+    use xkbcommon::xkb;
+
+    let context = xkb::Context::new(xkb::CONTEXT_NO_ENVIRONMENT_NAMES);
+    let keymap = xkb::Keymap::new_from_string(
+        &context,
+        keymap_text,
+        xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+    .ok_or_else(|| BoundaryError::new(BoundaryKind::Delivery, "active keyboard layout unavailable"))?;
+    let find = |keysym: xkb::Keysym| -> Option<u32> {
+        (keymap.min_keycode().raw()..=keymap.max_keycode().raw()).find_map(|raw| {
+            let key = xkb::Keycode::new(raw);
+            (keymap.key_get_syms_by_level(key, group, 0) == [keysym])
+                .then(|| raw.checked_sub(8))
+                .flatten()
+        })
+    };
+    let tokens = shortcut
+        .split('+')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let key = tokens.last().ok_or_else(|| {
+        BoundaryError::new(BoundaryKind::Delivery, "verified Paste Action shortcut is empty")
+    })?;
+    let mut codes = Vec::with_capacity(tokens.len());
+    for modifier in &tokens[..tokens.len().saturating_sub(1)] {
+        let keysym = match modifier.to_ascii_uppercase().as_str() {
+            "CTRL" | "CONTROL" => xkb::Keysym::from(xkb::keysyms::KEY_Control_L),
+            "SHIFT" => xkb::Keysym::from(xkb::keysyms::KEY_Shift_L),
+            "ALT" => xkb::Keysym::from(xkb::keysyms::KEY_Alt_L),
+            "SUPER" | "META" | "WIN" | "MOD4" => {
+                xkb::Keysym::from(xkb::keysyms::KEY_Super_L)
+            }
+            _ => {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Delivery,
+                    "verified Paste Action contains an unknown modifier",
+                ))
+            }
+        };
+        codes.push(find(keysym).ok_or_else(|| {
+            BoundaryError::new(BoundaryKind::Delivery, "active keyboard layout unavailable")
+        })?);
+    }
+    let keycode = if let Some(raw) = key.strip_prefix("code:") {
+        raw.parse::<u32>().ok().and_then(|raw| raw.checked_sub(8))
+    } else {
+        let name = if key.len() == 1 && key.as_bytes()[0].is_ascii_alphabetic() {
+            key.to_ascii_lowercase()
+        } else {
+            (*key).to_owned()
+        };
+        let keysym = xkb::keysym_from_name(&name, xkb::KEYSYM_CASE_INSENSITIVE);
+        (keysym != xkb::Keysym::from(xkb::keysyms::KEY_NoSymbol)).then(|| find(keysym)).flatten()
+    };
+    codes.push(keycode.ok_or_else(|| {
+        BoundaryError::new(BoundaryKind::Delivery, "active keyboard layout unavailable")
+    })?);
+    Ok(codes)
 }
 
 fn libei_text_buffer(text: &str) -> Result<CString, BoundaryError> {
@@ -7535,7 +7904,10 @@ impl Drop for EiConnectGuard<'_> {
 }
 
 impl NativeEiSender {
-    fn connect(fd: libc::c_int) -> Result<Self, BoundaryError> {
+    fn connect_with_keyboard(
+        fd: libc::c_int,
+        force_keyboard: bool,
+    ) -> Result<Self, BoundaryError> {
         let api = match EiApi::load() {
             Ok(api) => api,
             Err(error) => {
@@ -7585,7 +7957,8 @@ impl NativeEiSender {
                 let link_event = match event_type {
                     EI_EVENT_SEAT_ADDED => {
                         event_seat = unsafe { (guard.api.event_seat)(event) };
-                        if guard.api.text_utf8.is_some()
+                        if !force_keyboard
+                            && guard.api.text_utf8.is_some()
                             && !event_seat.is_null()
                             && unsafe { (guard.api.seat_has_capability)(event_seat, EI_CAP_TEXT) }
                         {
@@ -7607,7 +7980,8 @@ impl NativeEiSender {
                     },
                     EI_EVENT_DEVICE_ADDED => {
                         event_device = unsafe { (guard.api.event_device)(event) };
-                        if guard.api.text_utf8.is_some()
+                        if !force_keyboard
+                            && guard.api.text_utf8.is_some()
                             && !event_device.is_null()
                             && unsafe {
                                 (guard.api.device_has_capability)(event_device, EI_CAP_TEXT)
@@ -7762,6 +8136,70 @@ impl NativeEiSender {
         }
     }
 
+    fn deliver_shortcut(&mut self, shortcut: &str) -> Result<(), BoundaryError> {
+        self.absorb_pending_state()?;
+        if !self.link.ready() || self.mode != EiDeliveryMode::KeyboardPaste {
+            return Err(BoundaryError::new(
+                BoundaryKind::Delivery,
+                "keyboard shortcut submission unavailable",
+            ));
+        }
+        let keycodes = resolve_shortcut_keycodes(
+            keyboard_keymap_text(&self.api, self.device)?,
+            self.link.keyboard_group,
+            shortcut,
+        )?;
+        self.sequence = self.sequence.wrapping_add(1).max(1);
+        unsafe {
+            (self.api.start_emulating)(self.device, self.sequence);
+            for key in &keycodes {
+                (self.api.keyboard_key)(self.device, *key, true);
+                (self.api.frame)(self.device, (self.api.now)(self.context));
+            }
+            for key in keycodes.iter().rev() {
+                (self.api.keyboard_key)(self.device, *key, false);
+                (self.api.frame)(self.device, (self.api.now)(self.context));
+            }
+            (self.api.stop_emulating)(self.device);
+        }
+        let ping = unsafe { (self.api.new_ping)(self.context) };
+        if ping.is_null() {
+            return Err(BoundaryError::new(
+                BoundaryKind::Delivery,
+                "compositor rejected Paste Action",
+            ));
+        }
+        let expected_ping = unsafe { (self.api.ping_get_id)(ping) };
+        unsafe {
+            (self.api.ping)(ping);
+            (self.api.ping_unref)(ping);
+        }
+        let mut confirmation = EiDeliveryConfirmation::default();
+        let deadline = Instant::now() + LIBEI_DELIVERY_DEADLINE;
+        while Instant::now() < deadline {
+            poll_libei(&self.api, self.context, deadline)?;
+            loop {
+                let event = unsafe { (self.api.get_event)(self.context) };
+                if event.is_null() {
+                    break;
+                }
+                let event_type = unsafe { (self.api.event_type)(event) };
+                let link_event = self.classify_delivery_event(event, event_type, expected_ping);
+                let _ = self.link.observe(link_event);
+                confirmation.observe(link_event);
+                unsafe { (self.api.event_unref)(event) };
+            }
+            if let Some(verdict) = confirmation.verdict() {
+                return verdict
+                    .map_err(|reason| BoundaryError::new(BoundaryKind::Delivery, reason));
+            }
+        }
+        Err(BoundaryError::new(
+            BoundaryKind::Delivery,
+            "compositor rejected Paste Action",
+        ))
+    }
+
     fn deliver(&mut self, text: &str) -> Result<(), BoundaryError> {
         self.absorb_pending_state()?;
         if !self.link.ready() {
@@ -7888,6 +8326,12 @@ impl Default for PortalClipboardDelivery {
         Self {
             clipboard: Box::new(WlClipboard),
             portal: Box::new(FedoraRemoteDesktopPortal),
+            paste: None,
+            paste_action: None,
+            direct_enabled: true,
+            clipboard_fallback_reason:
+                "no verified Hyprland Paste Action; Transcript remains on the clipboard"
+                    .to_owned(),
             session: None,
             setup: Some(spawn_remote_desktop_setup()),
             setup_failure: None,
@@ -9864,6 +10308,156 @@ mod tests {
 
         assert_eq!(us.control, dvorak.control);
         assert_ne!(us.paste, dvorak.paste);
+    }
+
+    #[test]
+    fn verified_shortcuts_use_unshifted_letters_and_ei_codes() {
+        use xkbcommon::xkb;
+
+        let context = xkb::Context::new(xkb::CONTEXT_NO_ENVIRONMENT_NAMES);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "us",
+            "",
+            Some(String::new()),
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .unwrap();
+        let text = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+        let uppercase = resolve_shortcut_keycodes(text.clone(), 0, "SUPER + V").unwrap();
+        let lowercase = resolve_shortcut_keycodes(text.clone(), 0, "SUPER + v").unwrap();
+        assert_eq!(uppercase, lowercase);
+        assert_eq!(
+            resolve_shortcut_keycodes(text.clone(), 0, "SUPER + INSERT").unwrap(),
+            resolve_shortcut_keycodes(text.clone(), 0, "SUPER + insert").unwrap()
+        );
+        assert_eq!(
+            resolve_shortcut_keycodes(text.clone(), 0, "code:64").unwrap(),
+            vec![56]
+        );
+        assert_eq!(
+            resolve_shortcut_keycodes(text, 0, "code:108").unwrap(),
+            vec![100]
+        );
+    }
+
+    struct RecordingShortcutSession(Arc<Mutex<Vec<String>>>);
+
+    impl DirectDeliverySession for RecordingShortcutSession {
+        fn deliver_text(&mut self, _text: &str) -> BoundaryFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn deliver_shortcut(&mut self, shortcut: &str) -> BoundaryFuture<'_, ()> {
+            let events = Arc::clone(&self.0);
+            let shortcut = shortcut.to_owned();
+            Box::pin(async move {
+                events.lock().unwrap().push(format!("shortcut:{shortcut}"));
+                Ok(())
+            })
+        }
+    }
+
+    fn test_paste_action() -> VerifiedPasteAction {
+        use crate::hyprland_bindings::{PasteBehavior, PasteShortcut};
+
+        VerifiedPasteAction {
+            shortcut: PasteShortcut {
+                binding: "SUPER + V".to_owned(),
+            },
+            description: "Universal paste".to_owned(),
+            live_binding_identity: "91".to_owned(),
+            behavior: PasteBehavior::Simple,
+        }
+    }
+
+    #[tokio::test]
+    async fn production_paste_starts_portal_setup_before_the_first_invoke() {
+        let paste = PortalPasteAction::with_live_revalidation(
+            test_paste_action(),
+            Box::new(DisabledRemoteDesktopPortal),
+        );
+        assert!(paste.setup.is_some());
+        assert!(paste.session.is_none());
+    }
+
+    #[tokio::test]
+    async fn paste_action_rejects_a_cached_binding_after_live_revalidation_changes() {
+        let cached = test_paste_action();
+        let live = VerifiedPasteAction {
+            live_binding_identity: "92".to_owned(),
+            ..cached.clone()
+        };
+        let mut paste = PortalPasteAction::with_test_revalidation(
+            cached.clone(),
+            Box::new(DisabledRemoteDesktopPortal),
+            live,
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(1), paste.invoke(&cached))
+            .await
+            .expect("live verification should complete")
+            .expect_err("a stale cached action must fail closed");
+        assert_eq!(error.diagnostic(), "verified Paste Action is no longer active");
+    }
+
+    #[tokio::test]
+    async fn live_paste_revalidation_awaits_and_pastes_on_the_first_invoke() {
+        use std::sync::mpsc;
+
+        let action = test_paste_action();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let verifier_action = action.clone();
+        let verifier_release = Arc::clone(&release_rx);
+        let verifier = Arc::new(move || {
+            started_tx
+                .send(())
+                .expect("live verifier start should be observed");
+            let _ = verifier_release.lock().unwrap().recv();
+            Some(verifier_action.clone())
+        });
+        let mut paste = PortalPasteAction::with_options(
+            action.clone(),
+            Box::new(DisabledRemoteDesktopPortal),
+            Some(verifier),
+        );
+        // Portal permission stays non-blocking and is not under test here.
+        paste.session = Some(Box::new(RecordingShortcutSession(Arc::clone(&events))));
+
+        let requested = action.clone();
+        let invoke = tokio::spawn(async move { paste.invoke(&requested).await });
+        let releaser = std::thread::spawn(move || {
+            started_rx.recv().expect("live verifier should start");
+            release_tx
+                .send(())
+                .expect("live verifier should be released");
+        });
+        tokio::time::timeout(Duration::from_secs(1), invoke)
+            .await
+            .expect("live verification must complete on the first invoke")
+            .expect("invoke task should finish")
+            .expect("the first invocation must paste once live verification matches");
+        releaser.join().expect("verifier release thread should finish");
+        assert_eq!(events.lock().unwrap().as_slice(), ["shortcut:SUPER + V"]);
+    }
+
+    #[test]
+    fn remote_desktop_classification_preserves_permanent_denials() {
+        let error = classify_remote_desktop_failure(
+            BoundaryError::new(
+                BoundaryKind::Delivery,
+                "the desktop did not approve the SelectDevices request (response 1)",
+            )
+            .permanent(),
+        );
+
+        assert_eq!(error.diagnostic(), "permission denied");
+        assert!(error.is_permanent());
     }
 
     /// A compositor that populates the keymap memfd with `write()` leaves the

@@ -10,11 +10,14 @@ use std::thread;
 use std::time::Duration;
 
 use tempfile::TempDir;
+use tokio::sync::Notify;
 
 use voisu_app::focus::SharedFocusProbe;
+use voisu_app::hyprland_bindings::{PasteBehavior, PasteShortcut, VerifiedPasteAction};
 use voisu_app::system::{
     ClipboardBoundary, DirectDeliverySession, FedoraRemoteDesktopPortal, GuardedDelivery,
-    NotificationBoundary, PortalClipboardDelivery, RemoteDesktopPortal,
+    NotificationBoundary, PasteBoundary, PortalClipboardDelivery, PortalPasteAction,
+    RemoteDesktopPortal,
 };
 use voisu_core::{
     BoundaryError, BoundaryFuture, BoundaryKind, DeliveryAdapter, DeliveryMethod, DeliveryOutcome,
@@ -100,6 +103,88 @@ impl DirectDeliverySession for FailingSession {
     }
 }
 
+struct PasteSession(Arc<Mutex<Vec<String>>>);
+
+impl DirectDeliverySession for PasteSession {
+    fn deliver_text(&mut self, _text: &str) -> BoundaryFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn deliver_shortcut(&mut self, shortcut: &str) -> BoundaryFuture<'_, ()> {
+        let events = Arc::clone(&self.0);
+        let shortcut = shortcut.to_owned();
+        Box::pin(async move {
+            events.lock().unwrap().push(format!("shortcut:{shortcut}"));
+            Ok(())
+        })
+    }
+}
+
+struct PastePortal {
+    attempts: Arc<AtomicUsize>,
+    events: Arc<Mutex<Vec<String>>>,
+    control: Option<Arc<PastePortalControl>>,
+    failure: Option<&'static str>,
+}
+
+struct PastePortalControl {
+    started: Notify,
+    completed: Notify,
+    release: Notify,
+    wait_for_release: bool,
+}
+
+impl PastePortalControl {
+    fn gated() -> Arc<Self> {
+        Arc::new(Self {
+            started: Notify::new(),
+            completed: Notify::new(),
+            release: Notify::new(),
+            wait_for_release: true,
+        })
+    }
+
+    fn immediate() -> Arc<Self> {
+        Arc::new(Self {
+            started: Notify::new(),
+            completed: Notify::new(),
+            release: Notify::new(),
+            wait_for_release: false,
+        })
+    }
+}
+
+impl RemoteDesktopPortal for PastePortal {
+    fn connect(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>> {
+        Box::pin(async {
+            Err(BoundaryError::new(
+                BoundaryKind::Delivery,
+                "text portal path is not used by Paste Action",
+            ))
+        })
+    }
+
+    fn connect_paste(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        let control = self.control.clone();
+        let failure = self.failure;
+        let events = Arc::clone(&self.events);
+        Box::pin(async move {
+            if let Some(control) = control {
+                control.started.notify_one();
+                if control.wait_for_release {
+                    control.release.notified().await;
+                }
+                control.completed.notify_one();
+            }
+            match failure {
+                Some(reason) => Err(BoundaryError::new(BoundaryKind::Delivery, reason)),
+                None => Ok(Box::new(PasteSession(events)) as Box<dyn DirectDeliverySession>),
+            }
+        })
+    }
+}
+
 struct SequenceFocusProbe(std::collections::VecDeque<Option<WindowIdentity>>);
 
 impl FocusProbe for SequenceFocusProbe {
@@ -113,6 +198,37 @@ struct RecordingDelivery {
     label: &'static str,
     events: Arc<Mutex<Vec<String>>>,
     outcome: DeliveryOutcome,
+}
+
+struct RecordingPaste {
+    events: Arc<Mutex<Vec<String>>>,
+    failure: Option<&'static str>,
+}
+
+impl PasteBoundary for RecordingPaste {
+    fn invoke(&mut self, action: &VerifiedPasteAction) -> BoundaryFuture<'_, ()> {
+        let event = format!("paste:{}", action.shortcut.binding);
+        let events = Arc::clone(&self.events);
+        let failure = self.failure;
+        Box::pin(async move {
+            events.lock().unwrap().push(event);
+            match failure {
+                Some(reason) => Err(BoundaryError::new(BoundaryKind::Delivery, reason)),
+                None => Ok(()),
+            }
+        })
+    }
+}
+
+fn verified_paste_action() -> VerifiedPasteAction {
+    VerifiedPasteAction {
+        shortcut: PasteShortcut {
+            binding: "CTRL + SHIFT + P".to_owned(),
+        },
+        description: "Paste transcript".to_owned(),
+        live_binding_identity: "test-live-binding".to_owned(),
+        behavior: PasteBehavior::Simple,
+    }
 }
 
 impl DeliveryAdapter for RecordingDelivery {
@@ -276,6 +392,204 @@ async fn clipboard_is_preserved_before_unicode_multiline_compositor_submission()
             format!("direct:{expected}"),
         ]
     );
+}
+
+#[tokio::test]
+async fn verified_paste_preserves_clipboard_then_attempts_one_paste_action() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let action = verified_paste_action();
+    let mut delivery = PortalClipboardDelivery::with_paste_boundaries(
+        Box::new(RecordingClipboard(Arc::clone(&events))),
+        action,
+        Box::new(RecordingPaste {
+            events: Arc::clone(&events),
+            failure: None,
+        }),
+    );
+
+    let outcome = delivery.deliver(Transcript("final transcript".to_owned())).await.unwrap();
+
+    assert_eq!(outcome.method, DeliveryMethod::CompositorSubmitted);
+    assert_eq!(events.lock().unwrap().as_slice(), [
+        "clipboard:final transcript",
+        "paste:CTRL + SHIFT + P",
+    ]);
+}
+
+#[tokio::test]
+async fn paste_failure_keeps_the_final_transcript_on_clipboard_and_does_not_retry() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let action = verified_paste_action();
+    let mut delivery = PortalClipboardDelivery::with_paste_boundaries(
+        Box::new(RecordingClipboard(Arc::clone(&events))),
+        action,
+        Box::new(RecordingPaste {
+            events: Arc::clone(&events),
+            failure: Some("compositor rejected Paste Action"),
+        }),
+    );
+
+    let outcome = delivery.deliver(Transcript("recoverable transcript".to_owned())).await.unwrap();
+
+    assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
+    assert!(outcome
+        .fallback_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("Transcript remains on the clipboard")));
+    assert_eq!(events.lock().unwrap().as_slice(), [
+        "clipboard:recoverable transcript",
+        "paste:CTRL + SHIFT + P",
+    ]);
+}
+
+#[tokio::test]
+async fn paste_portal_setup_is_backgrounded_and_later_delivers_the_shortcut() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let control = PastePortalControl::gated();
+    let action = verified_paste_action();
+    let mut paste = PortalPasteAction::with_boundaries(
+        action.clone(),
+        Box::new(PastePortal {
+            attempts: Arc::clone(&attempts),
+            events: Arc::clone(&events),
+            control: Some(Arc::clone(&control)),
+            failure: None,
+        }),
+    );
+
+    let first = paste.invoke(&action).await.expect_err("setup should be pending");
+    assert_eq!(first.diagnostic(), "Paste portal permission request pending");
+    tokio::time::timeout(Duration::from_secs(1), control.started.notified())
+        .await
+        .expect("paste portal setup should start");
+    control.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), control.completed.notified())
+        .await
+        .expect("paste portal setup should complete");
+    paste.invoke(&action).await.unwrap();
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(events.lock().unwrap().as_slice(), ["shortcut:CTRL + SHIFT + P"]);
+}
+
+#[tokio::test]
+async fn paste_delivery_returns_before_permission_finishes_and_preserves_each_transcript() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let control = PastePortalControl::gated();
+    let action = verified_paste_action();
+    let paste = PortalPasteAction::with_boundaries(
+        action.clone(),
+        Box::new(PastePortal {
+            attempts: Arc::clone(&attempts),
+            events: Arc::clone(&events),
+            control: Some(Arc::clone(&control)),
+            failure: None,
+        }),
+    );
+    let mut delivery = PortalClipboardDelivery::with_paste_boundaries(
+        Box::new(RecordingClipboard(Arc::clone(&events))),
+        action,
+        Box::new(paste),
+    );
+
+    let first = tokio::time::timeout(
+        Duration::from_secs(1),
+        delivery.deliver(Transcript("first transcript".to_owned())),
+    )
+    .await
+    .expect("permission approval must not block Transcript completion")
+    .unwrap();
+    assert_eq!(first.method, DeliveryMethod::ClipboardFallback);
+    assert!(first
+        .fallback_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("permission request pending")));
+
+    tokio::time::timeout(Duration::from_secs(1), control.started.notified())
+        .await
+        .expect("paste portal setup should start");
+    control.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), control.completed.notified())
+        .await
+        .expect("paste portal setup should complete");
+    let second = delivery
+        .deliver(Transcript("second transcript".to_owned()))
+        .await
+        .unwrap();
+    assert_eq!(second.method, DeliveryMethod::CompositorSubmitted);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [
+            "clipboard:first transcript",
+            "clipboard:second transcript",
+            "shortcut:CTRL + SHIFT + P"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn paste_portal_terminal_denial_is_not_retried() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let control = PastePortalControl::immediate();
+    let action = verified_paste_action();
+    let mut paste = PortalPasteAction::with_boundaries(
+        action.clone(),
+        Box::new(PastePortal {
+            attempts: Arc::clone(&attempts),
+            events,
+            control: Some(Arc::clone(&control)),
+            failure: Some("permission denied"),
+        }),
+    );
+
+    let _ = paste.invoke(&action).await;
+    tokio::time::timeout(Duration::from_secs(1), control.completed.notified())
+        .await
+        .expect("paste portal denial should complete");
+    let first = paste.invoke(&action).await.expect_err("denial must fail");
+    let second = paste.invoke(&action).await.expect_err("denial must stay terminal");
+
+    assert_eq!(first.diagnostic(), "permission denied");
+    assert_eq!(second.diagnostic(), "permission denied");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn direct_delivery_opt_out_reports_its_actual_reason() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut delivery = PortalClipboardDelivery::clipboard_only_with_reason(
+        Box::new(RecordingClipboard(Arc::clone(&events))),
+        "direct Delivery disabled by test; Transcript remains on the clipboard",
+    );
+
+    let outcome = delivery.deliver(Transcript("opt out".to_owned())).await.unwrap();
+
+    assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
+    assert_eq!(
+        outcome.fallback_reason.as_deref(),
+        Some("direct Delivery disabled by test; Transcript remains on the clipboard")
+    );
+}
+
+#[tokio::test]
+async fn no_verified_paste_action_is_explicitly_clipboard_only() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut delivery = PortalClipboardDelivery::clipboard_only_with_boundary(Box::new(
+        RecordingClipboard(Arc::clone(&events)),
+    ));
+
+    let outcome = delivery.deliver(Transcript("clipboard only".to_owned())).await.unwrap();
+
+    assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
+    assert_eq!(
+        outcome.fallback_reason.as_deref(),
+        Some("no verified Hyprland Paste Action; Transcript remains on the clipboard")
+    );
+    assert_eq!(events.lock().unwrap().as_slice(), ["clipboard:clipboard only"]);
 }
 
 #[tokio::test]

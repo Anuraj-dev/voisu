@@ -34,7 +34,7 @@ use voisu_app::smart_writing::{
 use voisu_app::system::{
     groq_transcription_language, CredentialPreparationOwner, DeepgramProvider, DesktopNotifier,
     FedoraShortcutPortal, GrammarCapability, GroqProvider, GuardedDelivery, MergeResultValidator,
-    PipeWireCapture, PortalClipboardDelivery, ProviderReaper, CAPTURE_FINALIZE_DEADLINE,
+    PipeWireCapture, PortalClipboardDelivery, ProviderReaper, WlClipboard, CAPTURE_FINALIZE_DEADLINE,
     DEFAULT_TRANSCRIPTION_LANGUAGE, DIAGNOSTIC_RESPONSE_DEADLINE, PROCESSING_RESPONSE_DEADLINE,
     PROVIDER_COMPLETION_DEADLINE,
     INTENT_RECONSTRUCTION_DEADLINE, RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
@@ -2669,11 +2669,27 @@ fn build_delivery_adapter(
     if controlled {
         Box::new(ControlledDelivery)
     } else if std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_some() {
-        Box::new(PortalClipboardDelivery::clipboard_only())
+        Box::new(PortalClipboardDelivery::clipboard_only_with_reason(
+            Box::new(WlClipboard),
+            "direct Delivery disabled by VOISU_DISABLE_DIRECT_DELIVERY; Transcript remains on the clipboard",
+        ))
     } else {
         match delivery_mode {
             DeliveryMode::Type => Box::new(PortalClipboardDelivery::default()),
-            DeliveryMode::Clipboard => Box::new(PortalClipboardDelivery::clipboard_only()),
+            DeliveryMode::Clipboard => {
+                match voisu_app::hyprland_bindings::discover_live_paste_action() {
+                    Some(action) => {
+                        eprintln!("verified Hyprland Paste Action: {}", action.description);
+                        Box::new(PortalClipboardDelivery::with_hyprland_paste(action))
+                    }
+                    None => {
+                        eprintln!(
+                            "no verified Hyprland Paste Action; Delivery will remain clipboard-only"
+                        );
+                        Box::new(PortalClipboardDelivery::clipboard_only())
+                    }
+                }
+            }
             DeliveryMode::Guarded => {
                 let focus = focus_probe.unwrap_or_else(|| {
                     Arc::new(tokio::sync::Mutex::new(Box::new(
