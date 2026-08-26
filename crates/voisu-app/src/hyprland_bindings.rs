@@ -9,8 +9,6 @@ use serde_json::Value;
 
 pub const BEGIN_MARKER: &str = "-- BEGIN VOISU MANAGED TRIGGER";
 pub const END_MARKER: &str = "-- END VOISU MANAGED TRIGGER";
-pub const BEGIN_INPUT_MARKER: &str = "-- BEGIN VOISU MANAGED INPUT";
-pub const END_INPUT_MARKER: &str = "-- END VOISU MANAGED INPUT";
 pub const VOISU_TOGGLE_COMMAND: &str = "voisu toggle";
 pub const VOISU_TRIGGER_DESCRIPTION: &str = "Voisu dictation";
 pub const RECOVERY_COMMAND: &str = "voisu setup";
@@ -705,40 +703,27 @@ pub fn install_trigger_binding(
             .read_to_string(&input_path)
             .map_err(|detail| TriggerBindingError::File {
                 action: "read",
-                path: input_path.clone(),
+                path: input_path,
                 detail,
             })?;
 
     let key = match plan {
-        TriggerBindingPlan::AlreadyInstalled { key } => {
-            let input_changed = apply_caps_lock_input_if_needed(
-                key,
-                source,
-                &input_path,
-                original_input.as_deref(),
-                files,
-            )?;
-            if input_changed {
-                if let Err(error) =
-                    reload_and_verify(hyprland, key, path, files, original.as_deref(), &backup)
-                {
-                    let _ = restore_original(files, &input_path, original_input.as_deref());
-                    return Err(error);
-                }
-            } else {
-                verify_installed_binding(hyprland, key, &backup)?;
-            }
-            return Ok(TriggerBindingInstallReport {
-                key,
-                changed: input_changed,
-                backup_path: backup,
-            });
-        }
+        TriggerBindingPlan::AlreadyInstalled { key } => key,
         TriggerBindingPlan::Conflicts { conflicts } => {
             return Err(TriggerBindingError::from_conflicts(conflicts));
         }
         TriggerBindingPlan::Install { key } => key,
     };
+
+    let updated = desired_hyprland_source(source, key, original_input.as_deref().unwrap_or(""));
+    if updated == source {
+        verify_installed_binding(hyprland, key, &backup)?;
+        return Ok(TriggerBindingInstallReport {
+            key,
+            changed: false,
+            backup_path: backup,
+        });
+    }
 
     files
         .write_atomic(&backup, source)
@@ -748,11 +733,7 @@ pub fn install_trigger_binding(
             detail,
         })?;
 
-    apply_caps_lock_input_if_needed(key, source, &input_path, original_input.as_deref(), files)?;
-
-    let updated = append_managed_binding(source, key);
     if let Err(detail) = files.write_atomic(path, &updated) {
-        let _ = restore_original(files, &input_path, original_input.as_deref());
         let restore_error = restore_original(files, path, original.as_deref()).err();
         return Err(TriggerBindingError::File {
             action: "install the Hyprland binding",
@@ -763,9 +744,7 @@ pub fn install_trigger_binding(
         });
     }
 
-    if let Err(error) = reload_and_verify(hyprland, key, path, files, original.as_deref(), &backup)
-    {
-        let _ = restore_original(files, &input_path, original_input.as_deref());
+    if let Err(error) = reload_and_verify(hyprland, key, path, files, original.as_deref(), &backup) {
         return Err(error);
     }
 
@@ -774,45 +753,6 @@ pub fn install_trigger_binding(
         changed: true,
         backup_path: backup,
     })
-}
-
-fn apply_caps_lock_input_if_needed(
-    key: TriggerKey,
-    hyprland_source: &str,
-    input_path: &Path,
-    original_input: Option<&str>,
-    files: &dyn BindingFileSystem,
-) -> Result<bool, TriggerBindingError> {
-    if key != CAPS_LOCK {
-        return Ok(false);
-    }
-    let input_source = original_input.unwrap_or("");
-    if caps_lock_input_already_applied(&[input_source, hyprland_source]) {
-        return Ok(false);
-    }
-
-    let backup = backup_path(input_path);
-    files
-        .write_atomic(&backup, input_source)
-        .map_err(|detail| TriggerBindingError::File {
-            action: "save a recoverable backup",
-            path: backup,
-            detail,
-        })?;
-
-    let merged = merge_caps_lock_kb_options(last_kb_options(&[input_source, hyprland_source]));
-    let updated = append_managed_input(input_source, &merged);
-    if let Err(detail) = files.write_atomic(input_path, &updated) {
-        let restore_error = restore_original(files, input_path, original_input).err();
-        return Err(TriggerBindingError::File {
-            action: "install the Hyprland input setting",
-            path: input_path.to_owned(),
-            detail: restore_error
-                .map(|restore| format!("{detail}; automatic restore failed: {restore}"))
-                .unwrap_or(detail),
-        });
-    }
-    Ok(true)
 }
 
 fn reload_and_verify(
@@ -899,7 +839,13 @@ fn restore_original(
     }
 }
 
-fn append_managed_binding(source: &str, key: TriggerKey) -> String {
+fn desired_hyprland_source(source: &str, key: TriggerKey, input_source: &str) -> String {
+    let kb_options = (key == CAPS_LOCK)
+        .then(|| merge_caps_lock_kb_options(last_kb_options(&[input_source, source])));
+    append_managed_binding(source, key, kb_options.as_deref())
+}
+
+fn append_managed_binding(source: &str, key: TriggerKey, kb_options: Option<&str>) -> String {
     let mut content = remove_managed_blocks(source);
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
@@ -909,10 +855,16 @@ fn append_managed_binding(source: &str, key: TriggerKey) -> String {
     }
     content.push_str(BEGIN_MARKER);
     content.push('\n');
-    if key == CAPS_LOCK {
-        // Load the sibling input.lua written for Caps Lock even when the
-        // user's hyprland.lua does not already require it.
-        content.push_str("require(\"hypr.input\")\n");
+    if let Some(kb_options) = kb_options {
+        // Stock Hyprland Lua has no Omarchy package.path, so a sibling
+        // require("hypr.input") is a hard error. Last-wins hl.config here
+        // applies Caps Lock kb_options without loading another file.
+        content.push_str("-- Caps Lock is the Trigger Key; disable lock on that key.\n");
+        content.push_str("hl.config({\n");
+        content.push_str("  input = {\n");
+        content.push_str(&format!("    kb_options = \"{kb_options}\",\n"));
+        content.push_str("  },\n");
+        content.push_str("})\n");
     }
     content.push_str(&format!(
         "o.bind(\"{}\", \"{VOISU_TRIGGER_DESCRIPTION}\", \"{VOISU_TOGGLE_COMMAND}\")\n",
@@ -921,35 +873,6 @@ fn append_managed_binding(source: &str, key: TriggerKey) -> String {
     content.push_str(END_MARKER);
     content.push('\n');
     content
-}
-
-fn append_managed_input(source: &str, kb_options: &str) -> String {
-    let mut content = remove_marked_block(source, BEGIN_INPUT_MARKER, END_INPUT_MARKER);
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
-    }
-    if !content.is_empty() && !content.ends_with("\n\n") {
-        content.push('\n');
-    }
-    content.push_str(BEGIN_INPUT_MARKER);
-    content.push('\n');
-    content.push_str("-- Caps Lock is the Trigger Key; disable lock on that key.\n");
-    content.push_str("hl.config({\n");
-    content.push_str("  input = {\n");
-    content.push_str(&format!("    kb_options = \"{kb_options}\",\n"));
-    content.push_str("  },\n");
-    content.push_str("})\n");
-    content.push_str(END_INPUT_MARKER);
-    content.push('\n');
-    content
-}
-
-fn caps_lock_input_already_applied(sources: &[&str]) -> bool {
-    last_kb_options(sources).is_some_and(|options| {
-        let parts: Vec<&str> = options.split(',').map(str::trim).collect();
-        parts.contains(&CAPS_NONE)
-            && (parts.contains(&BOTH_CAPSLOCK_CANCEL) || parts.contains(&"shift:both_capslock"))
-    })
 }
 
 fn last_kb_options(sources: &[&str]) -> Option<String> {
@@ -1187,6 +1110,53 @@ mod tests {
         (directory, path)
     }
 
+    fn managed_block(source: &str) -> &str {
+        let start = source.find(BEGIN_MARKER).expect("managed begin marker");
+        let end = source.find(END_MARKER).expect("managed end marker") + END_MARKER.len();
+        &source[start..end]
+    }
+
+    fn assert_caps_lock_managed_block(source: &str) {
+        let block = managed_block(source);
+        assert!(
+            !block.contains("require("),
+            "managed trigger block must not require a sibling file: {block}"
+        );
+        assert!(
+            !block.contains("require(\"hypr.input\")") && !block.contains("require(\"input\")"),
+            "managed trigger block must not load input.lua: {block}"
+        );
+        assert!(
+            block.contains("o.bind(\"code:66\", \"Voisu dictation\", \"voisu toggle\")"),
+            "{block}"
+        );
+        let last = last_kb_options(&[block]).expect("managed kb_options");
+        assert!(
+            last.split(',').map(str::trim).any(|part| part == CAPS_NONE),
+            "last-wins kb_options must include {CAPS_NONE}: {last}"
+        );
+        assert!(
+            last.split(',').map(str::trim).any(|part| part == BOTH_CAPSLOCK_CANCEL),
+            "last-wins kb_options must keep {BOTH_CAPSLOCK_CANCEL}: {last}"
+        );
+    }
+
+    fn assert_right_alt_managed_block(source: &str) {
+        let block = managed_block(source);
+        assert!(
+            block.contains("o.bind(\"code:108\", \"Voisu dictation\", \"voisu toggle\")"),
+            "{block}"
+        );
+        assert!(
+            !block.contains("kb_options"),
+            "Right Alt must not inject kb_options: {block}"
+        );
+        assert!(
+            !block.contains("require("),
+            "Right Alt must not inject a require: {block}"
+        );
+    }
+
     #[test]
     fn lua_parser_keeps_combinations_out_of_standalone_conflicts() {
         let source = r#"
@@ -1248,9 +1218,7 @@ o.bind("ALT, code:108", "Modified right alt", "workspace next")
 
         assert_eq!(report.key, RIGHT_ALT);
         assert!(!hyprland_lua.contains("code:66"));
-        assert!(
-            hyprland_lua.contains("o.bind(\"code:108\", \"Voisu dictation\", \"voisu toggle\")")
-        );
+        assert_right_alt_managed_block(&hyprland_lua);
         assert_eq!(fs::read_to_string(&bindings).unwrap(), original_bindings);
         assert!(!path.with_file_name("input.lua").exists());
     }
@@ -1373,11 +1341,10 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         assert!(report.changed);
         let updated = fs::read_to_string(&path).unwrap();
         assert_eq!(updated.matches(BEGIN_MARKER).count(), 1);
-        assert!(updated.contains("code:66"));
+        assert_caps_lock_managed_block(&updated);
+        assert!(updated.contains("-- user bindings"));
         assert_eq!(fs::read_to_string(&report.backup_path).unwrap(), original);
-        let input = fs::read_to_string(path.with_file_name("input.lua")).unwrap();
-        assert!(input.contains(CAPS_NONE));
-        assert!(input.contains(BOTH_CAPSLOCK_CANCEL));
+        assert!(!path.with_file_name("input.lua").exists());
         assert!(fs::read_dir(path.parent().unwrap())
             .unwrap()
             .all(|entry| !entry
@@ -1385,6 +1352,33 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
                 .file_name()
                 .to_string_lossy()
                 .contains(".voisu-hyprland.")));
+    }
+
+    #[test]
+    fn stock_hyprland_without_input_require_gets_bind_and_kb_options() {
+        let (_directory, path) = config_dir();
+        fs::write(
+            &path,
+            concat!(
+                "-- stock Hyprland Lua has no Omarchy bootstrap\n",
+                "o.bind(\"SUPER, Q\", \"Quit\", \"hyprctl dispatch exit\")\n"
+            ),
+        )
+        .unwrap();
+        let mut hyprland = FakeHyprland {
+            reload_succeeds: true,
+            verification_succeeds: true,
+        };
+
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(report.key, CAPS_LOCK);
+        assert!(updated.contains("o.bind(\"SUPER, Q\", \"Quit\", \"hyprctl dispatch exit\")"));
+        assert!(!updated.contains("require("));
+        assert_caps_lock_managed_block(&updated);
+        assert!(!path.with_file_name("input.lua").exists());
     }
 
     #[test]
@@ -1403,7 +1397,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
 
         assert_eq!(report.key, RIGHT_ALT);
         assert!(updated.contains(original));
-        assert!(updated.contains("o.bind(\"code:108\", \"Voisu dictation\", \"voisu toggle\")"));
+        assert_right_alt_managed_block(&updated);
         assert!(!path.with_file_name("input.lua").exists());
     }
 
@@ -1420,9 +1414,9 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, false).unwrap();
 
         assert_eq!(report.key, RIGHT_ALT);
-        assert!(fs::read_to_string(&path)
-            .unwrap()
-            .contains("o.bind(\"code:108\", \"Voisu dictation\", \"voisu toggle\")"));
+        let updated = fs::read_to_string(&path).unwrap();
+        assert_right_alt_managed_block(&updated);
+        assert!(!updated.contains("hl.config"));
         assert!(!path.with_file_name("input.lua").exists());
     }
 
@@ -1469,6 +1463,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         assert!(!report.changed);
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
         assert_eq!(before.matches(BEGIN_MARKER).count(), 1);
+        assert_caps_lock_managed_block(&before);
     }
 
     #[test]
@@ -1476,6 +1471,9 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let (_directory, path) = config_dir();
         let original = "-- original\n";
         fs::write(&path, original).unwrap();
+        let input_path = path.with_file_name("input.lua");
+        let original_input = "require = nil -- user input.lua must stay untouched\n";
+        fs::write(&input_path, original_input).unwrap();
         let mut hyprland = FakeHyprland {
             reload_succeeds: false,
             verification_succeeds: true,
@@ -1490,7 +1488,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             fs::read_to_string(backup_path(Path::new(&path))).unwrap(),
             original
         );
-        assert!(!path.with_file_name("input.lua").exists());
+        assert_eq!(fs::read_to_string(&input_path).unwrap(), original_input);
     }
 
     #[test]
@@ -1535,6 +1533,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         assert_eq!(report.key, RIGHT_ALT);
         assert!(!report.changed);
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert_right_alt_managed_block(&before);
         assert!(!path.with_file_name("input.lua").exists());
     }
 
@@ -1552,10 +1551,14 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             verification_succeeds: true,
         };
 
+        let original_input = fs::read_to_string(path.with_file_name("input.lua")).unwrap();
         install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let hyprland_lua = fs::read_to_string(&path).unwrap();
         let input = fs::read_to_string(path.with_file_name("input.lua")).unwrap();
-        let last = last_kb_options(&[&input]).expect("managed kb_options");
+        let last = last_kb_options(&[&input, &hyprland_lua]).expect("managed kb_options");
 
+        assert_eq!(input, original_input);
+        assert_caps_lock_managed_block(&hyprland_lua);
         assert_eq!(
             last,
             format!("{CAPS_NONE},{BOTH_CAPSLOCK_CANCEL},grp:alts_toggle")
@@ -1580,8 +1583,64 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         };
 
         install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let hyprland_lua = fs::read_to_string(&path).unwrap();
 
         assert_eq!(fs::read_to_string(&input_path).unwrap(), original_input);
+        assert_caps_lock_managed_block(&hyprland_lua);
+    }
+
+    #[test]
+    fn existing_user_input_require_is_left_outside_the_managed_block() {
+        let (_directory, path) = config_dir();
+        fs::write(
+            &path,
+            concat!(
+                "require(\"hypr.input\")\n",
+                "o.bind(\"SUPER, Return\", \"Terminal\", \"kitty\")\n"
+            ),
+        )
+        .unwrap();
+        let mut hyprland = FakeHyprland {
+            reload_succeeds: true,
+            verification_succeeds: true,
+        };
+
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+
+        assert!(updated.contains("require(\"hypr.input\")"));
+        assert!(!managed_block(&updated).contains("require("));
+        assert_caps_lock_managed_block(&updated);
+        assert!(!path.with_file_name("input.lua").exists());
+    }
+
+    #[test]
+    fn already_installed_caps_lock_drops_managed_input_require() {
+        let (_directory, path) = config_dir();
+        fs::write(
+            &path,
+            concat!(
+                "-- BEGIN VOISU MANAGED TRIGGER\n",
+                "require(\"hypr.input\")\n",
+                "o.bind(\"code:66\", \"Voisu dictation\", \"voisu toggle\")\n",
+                "-- END VOISU MANAGED TRIGGER\n"
+            ),
+        )
+        .unwrap();
+        let mut hyprland = FakeHyprland {
+            reload_succeeds: true,
+            verification_succeeds: true,
+        };
+
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(report.key, CAPS_LOCK);
+        assert!(report.changed);
+        assert_caps_lock_managed_block(&updated);
+        assert!(!updated.contains("require("));
+        assert!(!path.with_file_name("input.lua").exists());
     }
 
     const OMARCHY_PASTE_SOURCE: &str = r#"
