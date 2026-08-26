@@ -744,9 +744,7 @@ pub fn install_trigger_binding(
         });
     }
 
-    if let Err(error) = reload_and_verify(hyprland, key, path, files, original.as_deref(), &backup) {
-        return Err(error);
-    }
+    reload_and_verify(hyprland, key, path, files, original.as_deref(), &backup)?;
 
     Ok(TriggerBindingInstallReport {
         key,
