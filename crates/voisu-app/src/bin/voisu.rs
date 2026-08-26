@@ -490,8 +490,8 @@ fn provider_key_rows(runtime: &tokio::runtime::Runtime) -> Vec<DoctorRow> {
 /// core; here we supply the real terminal, keyring, and live validator.
 fn setup() -> ExitCode {
     use voisu_app::setup::{
-        LiveHyprlandSetupActions, LiveKeyValidator, ProviderOutcome, StdioWizard,
-        run_hyprland_setup, run_setup,
+        LiveHyprlandSetupActions, LiveKeyValidator, ProviderOutcome, SETUP_COMPLETE_MESSAGE,
+        StdioWizard, run_hyprland_setup, run_setup,
     };
     use voisu_app::setup_profile::{HyprlandConfig, discover_setup_profile, live_setup_facts};
 
@@ -530,6 +530,7 @@ fn setup() -> ExitCode {
                         } else {
                             "clipboard-only paste fallback"
                         };
+                        println!("{SETUP_COMPLETE_MESSAGE}");
                         println!(
                             "Voisu is configured. Press {} to test; {paste}.",
                             result.trigger_key.label
@@ -544,9 +545,11 @@ fn setup() -> ExitCode {
                     ),
                 }
             } else {
+                println!("{SETUP_COMPLETE_MESSAGE}");
                 ExitCode::SUCCESS
             }
         } else {
+            println!("{SETUP_COMPLETE_MESSAGE}");
             ExitCode::SUCCESS
         }
     } else {

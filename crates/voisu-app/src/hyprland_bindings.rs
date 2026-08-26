@@ -610,7 +610,17 @@ fn is_omarchy_universal_paste(binding: &LuaBinding, source: &str) -> bool {
 }
 
 pub fn plan_trigger_binding(source: &str, prefer_caps_lock: bool) -> TriggerBindingPlan {
-    let bindings = parse_lua_bindings(source);
+    plan_trigger_bindings(&[source], prefer_caps_lock)
+}
+
+/// Plans the Trigger Key from every occupancy source. Sibling files such as
+/// `bindings.lua` must be included so an exact unmanaged Caps Lock bind there
+/// is not installed again in `hyprland.lua`.
+pub fn plan_trigger_bindings(sources: &[&str], prefer_caps_lock: bool) -> TriggerBindingPlan {
+    let bindings = sources
+        .iter()
+        .flat_map(|source| parse_lua_bindings(source))
+        .collect::<Vec<_>>();
     for candidate in [CAPS_LOCK, RIGHT_ALT] {
         if bindings
             .iter()
@@ -677,8 +687,18 @@ pub fn install_trigger_binding(
             detail,
         })?;
     let source = original.as_deref().unwrap_or_default();
+    let sibling_path = path.with_file_name("bindings.lua");
+    let sibling =
+        files
+            .read_to_string(&sibling_path)
+            .map_err(|detail| TriggerBindingError::File {
+                action: "read",
+                path: sibling_path,
+                detail,
+            })?;
+    let occupancy = occupancy_sources(source, sibling.as_deref());
     let backup = backup_path(path);
-    let plan = plan_trigger_binding(source, prefer_caps_lock);
+    let plan = plan_trigger_bindings(&occupancy, prefer_caps_lock);
     let input_path = path.with_file_name("input.lua");
     let original_input =
         files
@@ -858,6 +878,13 @@ fn verify_installed_binding(
             backup_path: backup.to_owned(),
             restore_error: None,
         })
+    }
+}
+
+fn occupancy_sources<'a>(hyprland: &'a str, sibling: Option<&'a str>) -> Vec<&'a str> {
+    match sibling {
+        Some(extra) => vec![hyprland, extra],
+        None => vec![hyprland],
     }
 }
 
@@ -1201,6 +1228,31 @@ o.bind("ALT, code:108", "Modified right alt", "workspace next")
             plan_trigger_binding("", false),
             TriggerBindingPlan::Install { key: RIGHT_ALT }
         );
+    }
+
+    #[test]
+    fn unmanaged_caps_lock_in_sibling_bindings_falls_back_to_right_alt() {
+        let (_directory, path) = config_dir();
+        fs::write(&path, "").unwrap();
+        let bindings = path.with_file_name("bindings.lua");
+        let original_bindings = "o.bind(\"code:66\", \"Launch terminal\", \"kitty\")\n";
+        fs::write(&bindings, original_bindings).unwrap();
+        let mut hyprland = FakeHyprland {
+            reload_succeeds: true,
+            verification_succeeds: true,
+        };
+
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let hyprland_lua = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(report.key, RIGHT_ALT);
+        assert!(!hyprland_lua.contains("code:66"));
+        assert!(
+            hyprland_lua.contains("o.bind(\"code:108\", \"Voisu dictation\", \"voisu toggle\")")
+        );
+        assert_eq!(fs::read_to_string(&bindings).unwrap(), original_bindings);
+        assert!(!path.with_file_name("input.lua").exists());
     }
 
     #[test]

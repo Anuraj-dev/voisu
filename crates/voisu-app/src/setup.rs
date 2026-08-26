@@ -16,7 +16,7 @@ use voisu_core::{
 
 use crate::config::{self, DeliveryMode};
 use crate::hyprland_bindings::{
-    discover_live_paste_action, install_trigger_binding, plan_trigger_binding, BindingFileSystem,
+    discover_live_paste_action, install_trigger_binding, plan_trigger_bindings, BindingFileSystem,
     LiveHyprlandController, LocalBindingFileSystem, TriggerBindingPlan, TriggerKey,
     VerifiedPasteAction, CAPS_LOCK,
 };
@@ -116,7 +116,12 @@ impl HyprlandSetupActions for LiveHyprlandSetupActions<'_> {
             .read_to_string(config)
             .map_err(|error| format!("cannot read {}: {error}", config.display()))?
             .unwrap_or_default();
-        let prefer_caps_lock = caps_lock_trigger_preferred(&source, self.io);
+        let sibling_path = config.with_file_name("bindings.lua");
+        let sibling = files
+            .read_to_string(&sibling_path)
+            .map_err(|error| format!("cannot read {}: {error}", sibling_path.display()))?
+            .unwrap_or_default();
+        let prefer_caps_lock = caps_lock_trigger_preferred(&[&source, &sibling], self.io);
         let mut hyprland = LiveHyprlandController;
         install_trigger_binding(config, &files, &mut hyprland, prefer_caps_lock)
             .map(|report| report.key)
@@ -146,7 +151,6 @@ pub fn run_setup(
     io.writeln("");
     let groq = configure_provider(io, store, validator, Provider::Groq);
     io.writeln("");
-    io.writeln("Setup complete. Run `voisu doctor` to re-check your keys and desktop.");
     if deepgram == ProviderOutcome::Skipped {
         io.writeln(
             "No Deepgram key configured — run `voisu deepgram off` for the faster Groq-only path.",
@@ -318,10 +322,15 @@ fn configure_provider(
     }
 }
 
+/// Wrap-up printed only after the full setup path succeeds. Hyprland still has
+/// daemon/Overlay work after the credential wizard, so this must not run first.
+pub const SETUP_COMPLETE_MESSAGE: &str =
+    "Setup complete. Run `voisu doctor` to re-check your keys and desktop.";
+
 /// Hyprland-only: ask to use Caps Lock unless a managed Trigger Key is already
 /// installed or Caps Lock has an exact unmanaged binding.
-fn caps_lock_trigger_preferred(source: &str, io: &mut dyn WizardIo) -> bool {
-    match plan_trigger_binding(source, true) {
+fn caps_lock_trigger_preferred(sources: &[&str], io: &mut dyn WizardIo) -> bool {
+    match plan_trigger_bindings(sources, true) {
         TriggerBindingPlan::AlreadyInstalled { .. } => false,
         TriggerBindingPlan::Install { key } if key == CAPS_LOCK => ask_yes_no(
             io,
@@ -866,6 +875,7 @@ impl KeyValidator for LiveKeyValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hyprland_bindings::plan_trigger_binding;
     use std::collections::HashMap;
     use voisu_core::{BoundaryError, BoundaryKind};
 
@@ -974,7 +984,7 @@ mod tests {
     #[test]
     fn caps_lock_prompt_defaults_to_yes_when_the_key_is_free() {
         let mut io = FakeIo::new(vec![], vec![Some("")]);
-        assert!(caps_lock_trigger_preferred("", &mut io));
+        assert!(caps_lock_trigger_preferred(&[""], &mut io));
         assert!(
             io.transcript()
                 .contains("Use Caps Lock as the Trigger Key?"),
@@ -986,7 +996,7 @@ mod tests {
     #[test]
     fn rejecting_caps_lock_falls_back_without_installing_left_alt() {
         let mut io = FakeIo::new(vec![], vec![Some("n")]);
-        assert!(!caps_lock_trigger_preferred("", &mut io));
+        assert!(!caps_lock_trigger_preferred(&[""], &mut io));
         assert_eq!(
             plan_trigger_binding("", false),
             TriggerBindingPlan::Install {
@@ -999,7 +1009,7 @@ mod tests {
     fn occupied_caps_lock_does_not_prompt() {
         let mut io = FakeIo::new(vec![], vec![Some("y")]);
         let source = r#"o.bind("code:66", "Terminal", "kitty")"#;
-        assert!(!caps_lock_trigger_preferred(source, &mut io));
+        assert!(!caps_lock_trigger_preferred(&[source], &mut io));
         assert!(
             !io.transcript().contains("Caps Lock"),
             "{}",
@@ -1015,7 +1025,7 @@ mod tests {
             "o.bind(\"code:66\", \"Voisu dictation\", \"voisu toggle\")\n",
             "-- END VOISU MANAGED TRIGGER\n"
         );
-        assert!(!caps_lock_trigger_preferred(source, &mut io));
+        assert!(!caps_lock_trigger_preferred(&[source], &mut io));
         assert!(
             !io.transcript().contains("Caps Lock"),
             "{}",
@@ -1040,6 +1050,23 @@ mod tests {
         assert!(
             !io.transcript().contains("Caps Lock"),
             "Fedora KDE/GNOME keep the portal Trigger Key path:\n{}",
+            io.transcript()
+        );
+        assert!(
+            !io.transcript().contains("Setup complete"),
+            "Hyprland still has work after credentials:\n{}",
+            io.transcript()
+        );
+    }
+
+    #[test]
+    fn occupied_caps_lock_in_sibling_bindings_does_not_prompt() {
+        let mut io = FakeIo::new(vec![], vec![Some("y")]);
+        let sibling = r#"o.bind("code:66", "Terminal", "kitty")"#;
+        assert!(!caps_lock_trigger_preferred(&["", sibling], &mut io));
+        assert!(
+            !io.transcript().contains("Caps Lock"),
+            "{}",
             io.transcript()
         );
     }
@@ -1178,6 +1205,11 @@ mod tests {
         assert!(
             !io.transcript().contains("Caps Lock"),
             "the provider wizard must not ask Hyprland Trigger Key questions:\n{}",
+            io.transcript()
+        );
+        assert!(
+            !io.transcript().contains("Setup complete"),
+            "{}",
             io.transcript()
         );
     }
