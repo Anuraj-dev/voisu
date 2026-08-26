@@ -16,15 +16,15 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
     BoundaryError, CaptureLimit, CapturedAudio, DeliveryMethod, DprDiagnostic, LifecycleStage,
-    Provider, ProviderCoordinator, ProviderFailure, ProviderTiming, SourceTranscript,
-    TranscriptDecision, TranscriptSelection, TranscriptValidator,
+    PreparedTranscriptDecision, Provider, ProviderCoordinator, ProviderFailure, ProviderTiming,
+    SourceTranscript, TranscriptDecision, TranscriptSelection, TranscriptValidator,
 };
 
 /// A stored transcript text is clamped so a bounded history never grows without
@@ -1663,6 +1663,9 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
 pub struct ReplayOutcome {
     pub source_transcripts: Vec<SourceTranscript>,
     pub timings_ms: Vec<ProviderTiming>,
+    /// Time spent in the validation/reconstruction seam, excluding provider
+    /// completion. This mirrors the live Recording's validation-origin clock.
+    pub reconstruction_elapsed_ms: u64,
     /// Providers that failed or were absent while replaying the fixture, carried
     /// through so a replay surfaces the same failure visibility as a live
     /// Recording.
@@ -1682,10 +1685,20 @@ pub async fn replay_capture(
     let completion = coordinator.complete_with_timings(audio).await?;
     let source_transcripts = completion.sources.clone();
     let provider_failures = completion.provider_failures;
-    let decision = validator.validate(completion.sources).await?;
+    let prepared = validator.prepare(completion.sources).await?;
+    // Keep this origin aligned with the live Recording path: preparation owns
+    // source classification and fallback selection, while this clock measures
+    // only the bounded reconstruction seam that follows it.
+    let reconstruction_started = Instant::now();
+    let decision = match prepared {
+        PreparedTranscriptDecision::Ready(decision) => decision,
+        PreparedTranscriptDecision::Reconstruct(attempt) => validator.reconstruct(attempt).await?,
+    };
     Ok(ReplayOutcome {
         source_transcripts,
         timings_ms: completion.timings_ms,
+        reconstruction_elapsed_ms: u64::try_from(reconstruction_started.elapsed().as_millis())
+            .unwrap_or(u64::MAX),
         provider_failures,
         decision,
     })

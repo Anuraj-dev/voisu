@@ -35,7 +35,7 @@ Systemd breaks the cycle by deleting a start job. On the observed cold login, it
 #### Intended fix
 
 - The desktop session owns the portal. Voisu must not add `After=` or `Wants=` dependencies on `xdg-desktop-portal.service`.
-- On Omarchy/UWSM, start Voisu after `graphical-session.target` and use `ConditionEnvironment=WAYLAND_DISPLAY`.
+- On Omarchy/UWSM, start Voisu after `wayland-session-waitenv.service` and use `ConditionEnvironment=WAYLAND_DISPLAY`. The service remains enabled by `graphical-session.target` but must not also order itself after that target, which would create a cycle.
 - Keep `PartOf=graphical-session.target` so Voisu stops with the compositor.
 - Keep login enablement through `WantedBy=graphical-session.target`.
 - Replace the complete packaged dependency set. Systemd cannot remove `After=` or `Wants=` dependencies from a drop-in by assigning an empty value.
@@ -45,7 +45,7 @@ The target shape is:
 
 ```ini
 [Unit]
-After=graphical-session.target dbus.socket pipewire.service
+After=wayland-session-waitenv.service dbus.socket pipewire.service
 Wants=dbus.socket pipewire.service
 PartOf=graphical-session.target
 ConditionEnvironment=WAYLAND_DISPLAY
@@ -105,9 +105,9 @@ Voisu currently defaults to `type`. Type Delivery requires a RemoteDesktop porta
 #### Intended fix
 
 - During Hyprland setup, select `clipboard` Delivery by default.
-- Explain that clipboard mode writes the final Transcript to the clipboard and does not insert it into the focused application.
+- Explain that clipboard mode preserves the final Transcript on the clipboard first. If a verified Hyprland Paste Action exists, Voisu then emits that shortcut once. Unverified or failed paste stays clipboard-only.
 - Keep the setting persistent across service restarts and package upgrades.
-- Do not silently fall back to simulated typing or direct paste.
+- Do not silently fall back to simulated typing or an unverified paste.
 
 Equivalent command:
 
@@ -144,8 +144,8 @@ For a Hyprland session, `voisu setup` should:
 1. Detect Hyprland and the session manager, including Omarchy/UWSM when present.
 2. Install or select a service definition without a portal ownership dependency.
 3. Enable the daemon and optional Overlay for the graphical session.
-4. Select clipboard Delivery and explain that Voisu will not paste directly.
-5. Ask to use Caps Lock as the Trigger Key (default yes), then install Caps Lock or Right Alt.
+4. Select clipboard Delivery and explain that the Transcript is preserved on the clipboard before any verified Paste Action.
+5. Ask to use Caps Lock as the Trigger Key (default yes), then install Caps Lock or Right Alt. Never overwrite an exact unmanaged bind.
 6. Reload Hyprland and systemd, then start both services.
 7. Query the running daemon and report its real capture, provider, display, and Delivery readiness.
 8. Print one clear recovery command only when a step fails.
@@ -176,8 +176,8 @@ Do not claim Hyprland support until a packaged installation passes all of these 
 3. Reboot and log into Hyprland.
 4. Confirm both services start without an ordering cycle or manual restart.
 5. Confirm the daemon process has the active `WAYLAND_DISPLAY` before the first Recording.
-6. Press Caps Lock to start and stop a controlled Recording.
-7. Confirm exactly one final Transcript reaches the clipboard and is not inserted into the focused application.
+6. Press Caps Lock (or the selected Trigger Key) to start and stop a controlled Recording.
+7. Confirm exactly one final Transcript reaches the clipboard, then at most one verified Paste Action; paste failure must leave the Transcript on the clipboard.
 8. Confirm the Overlay shows Recording, Processing, and terminal feedback.
 9. Restart Hyprland or its portal and confirm both Voisu processes recover.
 10. Deliberately create a stale-daemon condition and confirm `voisu doctor` detects it.

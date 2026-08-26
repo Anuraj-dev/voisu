@@ -8749,6 +8749,68 @@ fn fixed_fixture_replays_through_provider_and_validation_boundaries() {
 }
 
 #[test]
+fn replay_exposes_intent_reconstruction_evidence() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_ENABLE_INTENT_RECONSTRUCTION", "1"),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Book the room Tuesday afternoon."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Schedule the review Wednesday morning."),
+            ("VOISU_TEST_RECONCILIATION_RESULT", "Book the review on Wednesday morning."),
+        ],
+    );
+    fs::write(fixture_dir(runtime.path()).join("intent.pcm"), vec![1_u8; 3_200]).unwrap();
+
+    let replayed = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"replay":"intent.pcm"}}"#,
+    );
+    assert_eq!(replayed["ok"], true, "{replayed}");
+    assert_eq!(replayed["evidence"]["transcript_selection"], "intent_reconstructed");
+    assert_eq!(replayed["evidence"]["reconciliation_requested"], true);
+    assert_eq!(replayed["evidence"]["intent_reconstruction"]["outcome"], "accepted");
+    assert_eq!(replayed["evidence"]["intent_reconstruction"]["model"], "qwen/qwen3.6-27b");
+}
+
+#[test]
+fn replay_normalizes_disabled_deepgram_failure_evidence() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_DISABLE_DEEPGRAM", "1"),
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Deepgram must not run."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Replay with Groq only."),
+        ],
+    );
+    fs::write(fixture_dir(runtime.path()).join("groq-only.pcm"), vec![1_u8; 3_200]).unwrap();
+
+    let replayed = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"replay":"groq-only.pcm"}}"#,
+    );
+    assert_eq!(replayed["ok"], true, "{replayed}");
+    assert_eq!(
+        replayed["evidence"]["source_transcript_providers"],
+        serde_json::json!(["groq"])
+    );
+    let failures = replayed["evidence"]["provider_failures"]
+        .as_array()
+        .expect("replay evidence retains provider failures");
+    let deepgram = failures
+        .iter()
+        .find(|failure| failure["provider"] == "deepgram")
+        .expect("disabled Deepgram is represented in replay evidence");
+    assert_eq!(deepgram["stage"], "not_started", "{replayed}");
+    assert_eq!(
+        deepgram["diagnostic"],
+        "Deepgram disabled for this Recording",
+        "{replayed}"
+    );
+}
+
+#[test]
 fn replay_of_a_missing_fixture_is_rejected_and_leaves_the_daemon_reusable() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start(runtime.path());

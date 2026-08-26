@@ -917,6 +917,7 @@ mod tests {
                     binding: "SUPER + V".to_owned(),
                 },
                 description: "Universal paste".to_owned(),
+                live_binding_identity: "test-live-binding".to_owned(),
                 behavior: crate::hyprland_bindings::PasteBehavior::Simple,
             })
         }

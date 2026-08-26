@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
@@ -41,6 +42,7 @@ pub enum PasteBehavior {
 pub struct VerifiedPasteAction {
     pub shortcut: PasteShortcut,
     pub description: String,
+    pub live_binding_identity: String,
     pub behavior: PasteBehavior,
 }
 
@@ -67,21 +69,38 @@ pub const LEFT_ALT: TriggerKey = TriggerKey {
     code: "code:64",
 };
 
+const PREFERRED_TRIGGER_KEYS: [TriggerKey; 2] = [CAPS_LOCK, RIGHT_ALT];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LuaBinding {
     pub key: String,
     pub description: String,
     pub command: String,
+    dispatcher: Option<String>,
+    dispatcher_arguments: Option<Vec<String>>,
     managed: bool,
 }
 
 impl LuaBinding {
     pub fn is_standalone(&self) -> bool {
-        self.is_standalone_for(CAPS_LOCK) || self.is_standalone_for(RIGHT_ALT)
+        PREFERRED_TRIGGER_KEYS
+            .iter()
+            .any(|candidate| self.is_standalone_for(*candidate))
     }
 
     fn is_standalone_for(&self, candidate: TriggerKey) -> bool {
-        self.key.trim() == candidate.code
+        let key = self.key.trim();
+        if key.eq_ignore_ascii_case(candidate.code) {
+            return true;
+        }
+        match candidate.code {
+            "code:66" => {
+                key.eq_ignore_ascii_case("Caps_Lock") || key.eq_ignore_ascii_case("CapsLock")
+            }
+            "code:108" => key.eq_ignore_ascii_case("Alt_R"),
+            "code:64" => key.eq_ignore_ascii_case("Alt_L"),
+            _ => false,
+        }
     }
 }
 
@@ -97,6 +116,7 @@ pub enum TriggerBindingPlan {
     Install { key: TriggerKey },
     AlreadyInstalled { key: TriggerKey },
     Conflicts { conflicts: Vec<BindingConflict> },
+    Unparseable { detail: String },
 }
 
 #[derive(Debug)]
@@ -108,6 +128,9 @@ pub enum TriggerBindingError {
     },
     Conflicts {
         conflicts: Vec<BindingConflict>,
+    },
+    Unparseable {
+        detail: String,
     },
     ReloadFailed {
         detail: String,
@@ -161,6 +184,10 @@ impl fmt::Display for TriggerBindingError {
                     "Recovery: remove or change one exact binding, then rerun `{RECOVERY_COMMAND}`."
                 )
             }
+            Self::Unparseable { detail } => write!(
+                formatter,
+                "cannot safely inspect the Hyprland Lua bindings: {detail}. Recovery: fix the binding expression and rerun `{RECOVERY_COMMAND}`."
+            ),
             Self::ReloadFailed {
                 detail,
                 backup_path,
@@ -219,7 +246,14 @@ impl BindingFileSystem for LocalBindingFileSystem {
     fn read_to_string(&self, path: &Path) -> Result<Option<String>, String> {
         match fs::read_to_string(path) {
             Ok(contents) => Ok(Some(contents)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
+                ) =>
+            {
+                Ok(None)
+            }
             Err(error) => Err(error.to_string()),
         }
     }
@@ -341,35 +375,167 @@ fn binding_argument(binding: &Value) -> Option<&str> {
     })
 }
 
-pub fn parse_lua_bindings(source: &str) -> Vec<LuaBinding> {
+fn live_binding_identity(binding: &Value, dispatcher: &str) -> Option<String> {
+    let argument = binding_argument(binding)?.trim();
+    match dispatcher {
+        "__lua" => argument.parse::<u64>().ok().map(|_| argument.to_owned()),
+        "exec" => Some(argument.to_owned()),
+        _ => None,
+    }
+}
+
+pub fn parse_lua_bindings(source: &str) -> Result<Vec<LuaBinding>, String> {
     let mut bindings = Vec::new();
+    for (chunk, managed) in split_lua_chunks(source)? {
+        bindings.extend(parse_lua_chunk(&chunk, managed)?);
+    }
+    Ok(bindings)
+}
+
+fn split_lua_chunks(source: &str) -> Result<Vec<(String, bool)>, String> {
+    let mut chunks = Vec::new();
     let mut chunk = String::new();
     let mut managed = false;
+    let mut state = LuaSourceState::default();
 
     for line in source.split_inclusive('\n') {
-        match line.trim() {
-            BEGIN_MARKER => {
-                bindings.extend(parse_lua_chunk(&chunk, managed));
-                chunk.clear();
+        match state.marker_for_line(line) {
+            Some(LuaMarker::Begin) if managed => {
+                return Err("nested Voisu managed trigger begin marker".to_owned());
+            }
+            Some(LuaMarker::Begin) => {
+                chunks.push((std::mem::take(&mut chunk), false));
                 managed = true;
             }
-            END_MARKER => {
-                bindings.extend(parse_lua_chunk(&chunk, managed));
-                chunk.clear();
+            Some(LuaMarker::End) if !managed => {
+                return Err(
+                    "Voisu managed trigger end marker has no matching begin marker".to_owned(),
+                );
+            }
+            Some(LuaMarker::End) => {
+                chunks.push((std::mem::take(&mut chunk), true));
                 managed = false;
             }
-            _ => chunk.push_str(line),
+            None => chunk.push_str(line),
+        }
+        state.consume(line);
+    }
+
+    if managed {
+        return Err("Voisu managed trigger begin marker has no matching end marker".to_owned());
+    }
+    chunks.push((chunk, false));
+    Ok(chunks)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LuaMarker {
+    Begin,
+    End,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum LuaSourceMode {
+    #[default]
+    Code,
+    LineComment,
+    Quoted(char),
+    LongBracket(String),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LuaSourceState {
+    mode: LuaSourceMode,
+}
+
+impl LuaSourceState {
+    fn marker_for_line(&self, line: &str) -> Option<LuaMarker> {
+        if self.mode != LuaSourceMode::Code {
+            return None;
+        }
+        match line.trim() {
+            BEGIN_MARKER => Some(LuaMarker::Begin),
+            END_MARKER => Some(LuaMarker::End),
+            _ => None,
         }
     }
-    bindings.extend(parse_lua_chunk(&chunk, managed));
-    bindings
+
+    fn consume(&mut self, line: &str) {
+        let chars: Vec<char> = line.chars().collect();
+        let mut index = 0;
+        while index < chars.len() {
+            match &self.mode {
+                LuaSourceMode::Code => {
+                    if chars[index] == '-' && chars.get(index + 1) == Some(&'-') {
+                        index += 2;
+                        if let Some((closing, consumed)) = long_bracket_open(&chars, index) {
+                            self.mode = LuaSourceMode::LongBracket(closing);
+                            index = consumed;
+                        } else {
+                            self.mode = LuaSourceMode::LineComment;
+                        }
+                    } else if matches!(chars[index], '\'' | '"') {
+                        self.mode = LuaSourceMode::Quoted(chars[index]);
+                        index += 1;
+                    } else if let Some((closing, consumed)) = long_bracket_open(&chars, index) {
+                        self.mode = LuaSourceMode::LongBracket(closing);
+                        index = consumed;
+                    } else {
+                        index += 1;
+                    }
+                }
+                LuaSourceMode::LineComment => {
+                    if chars[index] == '\n' {
+                        self.mode = LuaSourceMode::Code;
+                    }
+                    index += 1;
+                }
+                LuaSourceMode::Quoted(quote) => {
+                    if chars[index] == '\\' {
+                        index = (index + 2).min(chars.len());
+                    } else {
+                        if chars[index] == *quote {
+                            self.mode = LuaSourceMode::Code;
+                        }
+                        index += 1;
+                    }
+                }
+                LuaSourceMode::LongBracket(closing) => {
+                    if chars[index..].starts_with(&closing.chars().collect::<Vec<_>>()) {
+                        index += closing.chars().count();
+                        self.mode = LuaSourceMode::Code;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+        }
+        if self.mode == LuaSourceMode::LineComment {
+            self.mode = LuaSourceMode::Code;
+        }
+    }
+}
+
+fn long_bracket_open(chars: &[char], start: usize) -> Option<(String, usize)> {
+    if chars.get(start) != Some(&'[') {
+        return None;
+    }
+    let mut index = start + 1;
+    while chars.get(index) == Some(&'=') {
+        index += 1;
+    }
+    if chars.get(index) != Some(&'[') {
+        return None;
+    }
+    let equals = index - start - 1;
+    Some((format!("]{}]", "=".repeat(equals)), index + 1))
 }
 
 /// Finds the first paste binding that is proven by both the active Lua source
 /// and the compositor's live binding table. The source is deliberately
-/// conservative: literal dispatchers are accepted only when their description
-/// identifies a paste action, and dynamic Lua functions are accepted only for
-/// the exact Omarchy universal-paste helper shape.
+/// conservative: string-literal third arguments are accepted only when their
+/// description identifies a paste action, and dynamic Lua functions are
+/// accepted only for the exact Omarchy universal-paste helper shape.
 pub fn discover_paste_action(
     sources: &[&str],
     live_bindings: &Value,
@@ -378,7 +544,9 @@ pub fn discover_paste_action(
         .iter()
         .flat_map(|source| {
             parse_lua_bindings(source)
+                .ok()
                 .into_iter()
+                .flatten()
                 .map(|binding| (binding, (*source).to_owned()))
                 .collect::<Vec<_>>()
         })
@@ -389,59 +557,68 @@ pub fn discover_paste_action(
         let Some(dispatcher) = binding.get("dispatcher").and_then(Value::as_str) else {
             continue;
         };
+        let Some(live_binding_identity) = live_binding_identity(binding, dispatcher) else {
+            continue;
+        };
         let Some(live_description) = binding.get("description").and_then(Value::as_str) else {
             continue;
         };
-        let Some(source) = bindings.iter().find_map(|(candidate, source)| {
-            (candidate.description == live_description
-                && live_binding_matches_source(binding, candidate))
-            .then_some((candidate, source))
-        }) else {
-            continue;
-        };
-        let (candidate, source_text) = source;
+        // One live row can share a description with several source binds. Try
+        // each match so an earlier unverified candidate cannot hide a later
+        // helper or string command.
+        for (candidate, source_text) in &bindings {
+            if candidate.description != live_description
+                || !live_binding_matches_source(binding, candidate)
+            {
+                continue;
+            }
 
-        if dispatcher == "__lua" && is_omarchy_universal_paste(candidate, source_text) {
-            return Some(VerifiedPasteAction {
-                shortcut: PasteShortcut {
-                    binding: candidate.key.trim().to_owned(),
-                },
-                description: candidate.description.clone(),
-                behavior: PasteBehavior::OmarchyUniversal {
-                    normal: PasteShortcut {
-                        binding: "CTRL + V".to_owned(),
+            if dispatcher == "__lua" && is_omarchy_universal_paste(candidate, source_text) {
+                return Some(VerifiedPasteAction {
+                    shortcut: PasteShortcut {
+                        binding: candidate.key.trim().to_owned(),
                     },
-                    terminal: PasteShortcut {
-                        binding: "SHIFT + Insert".to_owned(),
+                    description: candidate.description.clone(),
+                    live_binding_identity,
+                    behavior: PasteBehavior::OmarchyUniversal {
+                        normal: PasteShortcut {
+                            binding: "CTRL + V".to_owned(),
+                        },
+                        terminal: PasteShortcut {
+                            binding: "SHIFT + Insert".to_owned(),
+                        },
                     },
-                },
-            });
-        }
+                });
+            }
 
-        // A literal dispatcher is safe to trigger through the compositor. The
-        // command itself is not executed by Voisu; it is only selected after
-        // the source and live dispatcher agree. Dynamic functions and unknown
-        // dispatchers never reach this branch.
-        if dispatcher == "exec"
-            && candidate.command != "<Lua dispatcher>"
-            && is_paste_description(&candidate.description)
-        {
-            return Some(VerifiedPasteAction {
-                shortcut: PasteShortcut {
-                    binding: candidate.key.trim().to_owned(),
-                },
-                description: candidate.description.clone(),
-                behavior: PasteBehavior::Simple,
-            });
+            // String o.bind commands are live __lua on current Hyprland, not
+            // exec. The command stays with Hyprland; Voisu only emits the chord.
+            // Identifier and function third arguments stay unverified except
+            // the Omarchy helper above.
+            if matches!(dispatcher, "exec" | "__lua")
+                && is_string_literal_command(candidate)
+                && is_paste_description(&candidate.description)
+            {
+                return Some(VerifiedPasteAction {
+                    shortcut: PasteShortcut {
+                        binding: candidate.key.trim().to_owned(),
+                    },
+                    description: candidate.description.clone(),
+                    live_binding_identity,
+                    behavior: PasteBehavior::Simple,
+                });
+            }
         }
     }
     None
 }
 
-/// Reads the active current-Lua root and the small set of source files that
-/// can define the standard Omarchy clipboard helper. Setup can use this with
-/// its injected [`BindingFileSystem`] seam; production discovery never scans
-/// arbitrary files or evaluates Lua.
+/// Reads the active current-Lua root and every Lua file reachable from it
+/// through the same import walker used for trigger-binding inspection. The
+/// known Omarchy clipboard helper is added only when the active root refers
+/// to Omarchy; sibling files that are not imported are ignored. Setup can
+/// use this with its injected [`BindingFileSystem`] seam; production
+/// discovery never scans arbitrary files or evaluates Lua.
 pub fn discover_paste_action_from_sources(
     root: &Path,
     files: &dyn BindingFileSystem,
@@ -450,17 +627,22 @@ pub fn discover_paste_action_from_sources(
     let root_source = files
         .read_to_string(root)?
         .ok_or_else(|| format!("active Hyprland Lua source is missing: {}", root.display()))?;
-    let mut source_storage = vec![root_source];
+    let (mut source_storage, mut visited) =
+        collect_reachable_lua_sources(root, &root_source, files)?;
 
     // Current Omarchy imports the clipboard bindings through its default
     // module tree rather than copying the helper into the user's file. Only
     // add the known file when the active source actually refers to Omarchy;
     // this keeps unrelated or inactive Lua files out of the decision.
-    let root_mentions_omarchy = source_storage[0].contains("omarchy")
+    let root_mentions_omarchy = root_source.contains("omarchy")
         || std::env::var("XDG_CURRENT_DESKTOP")
-            .is_ok_and(|desktop| desktop.eq_ignore_ascii_case("omarchy"));
+            .is_ok_and(|desktop| desktop_has_label(&desktop, "omarchy"));
     if root_mentions_omarchy {
         for path in omarchy_clipboard_source_candidates(root) {
+            let path = normalize_path(&path);
+            if !visited.insert(path.clone()) {
+                continue;
+            }
             if let Some(source) = files.read_to_string(&path)? {
                 source_storage.push(source);
                 break;
@@ -491,26 +673,9 @@ pub fn discover_live_paste_action() -> Option<VerifiedPasteAction> {
     let root = config_root.join("hypr/hyprland.lua");
     let files = LocalBindingFileSystem;
     let mut hyprland = LiveHyprlandController;
-    let root_source = files.read_to_string(&root).ok().flatten()?;
-    let mut sources = vec![root_source];
-    let bindings = root.with_file_name("bindings.lua");
-    if let Ok(Some(source)) = files.read_to_string(&bindings) {
-        sources.push(source);
-    }
-    if sources[0].contains("omarchy")
-        || std::env::var("XDG_CURRENT_DESKTOP")
-            .is_ok_and(|desktop| desktop.eq_ignore_ascii_case("omarchy"))
-    {
-        for path in omarchy_clipboard_source_candidates(&root) {
-            if let Ok(Some(source)) = files.read_to_string(&path) {
-                sources.push(source);
-                break;
-            }
-        }
-    }
-    let live = hyprland.live_bindings().ok()?;
-    let source_refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
-    discover_paste_action(&source_refs, &live)
+    discover_paste_action_from_sources(&root, &files, &mut hyprland)
+        .ok()
+        .flatten()
 }
 
 fn omarchy_clipboard_source_candidates(root: &Path) -> Vec<PathBuf> {
@@ -535,19 +700,34 @@ fn live_binding_matches_source(live: &Value, source: &LuaBinding) -> bool {
     let Some((source_modmask, source_key)) = shortcut_parts(&source.key) else {
         return false;
     };
+    let dispatcher = live.get("dispatcher").and_then(Value::as_str);
     let live_key = live.get("key").and_then(Value::as_str).unwrap_or_default();
-    let live_modmask = live
-        .get("modmask")
-        .and_then(Value::as_u64)
-        .unwrap_or(u64::MAX);
-    if source_modmask != live_modmask || normalize_key(live_key) != normalize_key(&source_key) {
-        return false;
+    // Current Hyprland reports Lua binds with an empty key and often
+    // modmask 0. The physical chord is recovered from the matching source
+    // after description, dispatcher, and helper-body checks succeed.
+    let opaque_lua_key = dispatcher == Some("__lua") && live_key.trim().is_empty();
+    if !opaque_lua_key {
+        let live_modmask = live
+            .get("modmask")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX);
+        if source_modmask != live_modmask || normalize_key(live_key) != normalize_key(&source_key) {
+            return false;
+        }
     }
-    match live.get("dispatcher").and_then(Value::as_str) {
-        Some("exec") => binding_argument(live)
-            .map(str::trim)
-            .is_some_and(|argument| argument == source.command.trim()),
-        Some("__lua") => source.command == "<Lua dispatcher>",
+    match dispatcher {
+        Some("exec") => {
+            is_string_literal_command(source)
+                && binding_argument(live)
+                    .map(str::trim)
+                    .is_some_and(|argument| argument == source.command.trim())
+        }
+        Some("__lua") => {
+            live_binding_identity(live, "__lua").is_some()
+                && (is_string_literal_command(source)
+                    || (source.command == "<Lua dispatcher>"
+                        && source.dispatcher.as_deref().is_some()))
+        }
         _ => false,
     }
 }
@@ -563,7 +743,10 @@ fn shortcut_parts(binding: &str) -> Option<(u64, String)> {
     for modifier in &pieces[..pieces.len().saturating_sub(1)] {
         modmask |= match modifier.to_ascii_uppercase().as_str() {
             "SHIFT" => 1,
-            "CAPS" | "CAPSLOCK" => 2,
+            // Caps is a Hyprland modmask bit, but paste emission has no Caps
+            // keycode. Treat it as unverified rather than discovering a chord
+            // that later fails with "unknown modifier".
+            "CAPS" | "CAPSLOCK" => return None,
             "CTRL" | "CONTROL" => 4,
             "ALT" => 8,
             "SUPER" | "META" | "WIN" | "MOD4" => 64,
@@ -577,34 +760,204 @@ fn normalize_key(key: &str) -> String {
     key.trim().to_ascii_uppercase()
 }
 
+fn desktop_has_label(desktop: &str, wanted: &str) -> bool {
+    desktop
+        .split([':', ';'])
+        .map(str::trim)
+        .any(|label| label.eq_ignore_ascii_case(wanted))
+}
+
 fn is_paste_description(description: &str) -> bool {
     let description = description.to_ascii_lowercase();
     description.contains("paste")
         || (description.contains("clipboard") && description.contains("insert"))
 }
 
+fn is_string_literal_command(binding: &LuaBinding) -> bool {
+    binding.command != "<Lua dispatcher>" && binding.dispatcher.is_none()
+}
+
 fn is_omarchy_universal_paste(binding: &LuaBinding, source: &str) -> bool {
     if binding.command != "<Lua dispatcher>"
+        || binding.dispatcher.as_deref() != Some("universal_clipboard_shortcut")
         || binding.description != "Universal paste"
         || !binding.key.contains('+')
+        || !binding
+            .dispatcher_arguments
+            .as_ref()
+            .is_some_and(|arguments| {
+                arguments
+                    .iter()
+                    .map(String::as_str)
+                    .eq(["CTRL", "V", "SHIFT", "Insert"])
+            })
     {
         return false;
     }
-    let compact = source
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    [
-        "universal_clipboard_shortcut(default_mods,default_key,terminal_mods,terminal_key)",
-        "ifactive_window_is_terminal()then",
-        "send_shortcut_once(terminal_mods,terminal_key)()",
-        "send_shortcut_once(default_mods,default_key)()",
-        "o.bind(\"SUPER+V\",\"Universalpaste\",universal_clipboard_shortcut(\"CTRL\",\"V\",\"SHIFT\",\"Insert\"))",
-    ]
-    .iter()
-    .all(|marker| compact.contains(marker))
-        && (compact.contains("functionuniversal_clipboard_shortcut(")
-            || compact.contains("localfunctionuniversal_clipboard_shortcut("))
+    let Ok(tokens) = lex_lua(source) else {
+        return false;
+    };
+    function_body_matches(
+        &tokens,
+        "universal_clipboard_shortcut",
+        &[
+            "default_mods",
+            "default_key",
+            "terminal_mods",
+            "terminal_key",
+        ],
+        r#"
+return function()
+  if active_window_is_terminal() then
+    send_shortcut_once(terminal_mods, terminal_key)()
+  else
+    send_shortcut_once(default_mods, default_key)()
+  end
+end
+"#,
+    ) && function_body_matches(
+        &tokens,
+        "send_shortcut_once",
+        &["mods", "key"],
+        r#"
+return function()
+  hl.dispatch(hl.dsp.send_key_state({ mods = mods, key = key, state = "down" }))
+  hl.timer(function()
+    hl.dispatch(hl.dsp.send_key_state({ mods = mods, key = key, state = "up" }))
+  end, { timeout = 50, type = "oneshot" })
+end
+"#,
+    ) && function_body_matches(
+        &tokens,
+        "active_window_is_terminal",
+        &[],
+        r#"
+local window = hl.get_active_window()
+if not window then
+  return false
+end
+for _, tag in ipairs(window.tags or {}) do
+  if tag:gsub("%*$", "") == "terminal" then
+    return true
+  end
+end
+return false
+"#,
+    )
+}
+
+fn function_body_matches(
+    tokens: &[LuaToken],
+    name: &str,
+    expected_parameters: &[&str],
+    expected_body: &str,
+) -> bool {
+    let Some(body) = named_function_body(tokens, name, expected_parameters) else {
+        return false;
+    };
+    lex_lua(expected_body).is_ok_and(|expected| expected.as_slice() == body)
+}
+
+fn named_function_body<'a>(
+    tokens: &'a [LuaToken],
+    name: &str,
+    expected_parameters: &[&str],
+) -> Option<&'a [LuaToken]> {
+    for function_index in 0..tokens.len().saturating_sub(3) {
+        if !matches!(
+            (&tokens[function_index], &tokens[function_index + 1]),
+            (LuaToken::Identifier(keyword), LuaToken::Identifier(function_name))
+                if keyword == "function" && function_name == name
+        ) {
+            continue;
+        }
+        if !matches!(tokens.get(function_index + 2), Some(LuaToken::Symbol('('))) {
+            continue;
+        }
+        let (body_start, parameters) = parse_function_parameters(tokens, function_index + 2)?;
+        if parameters != expected_parameters {
+            continue;
+        }
+        let body_end = matching_function_end(tokens, body_start)?;
+        return Some(&tokens[body_start..body_end]);
+    }
+    None
+}
+
+fn parse_function_parameters(tokens: &[LuaToken], open_index: usize) -> Option<(usize, Vec<&str>)> {
+    let mut index = open_index + 1;
+    let mut parameters = Vec::new();
+    loop {
+        match tokens.get(index)? {
+            LuaToken::Identifier(parameter) => {
+                parameters.push(parameter.as_str());
+                index += 1;
+                if !matches!(tokens.get(index), Some(LuaToken::Symbol(','))) {
+                    if !matches!(tokens.get(index), Some(LuaToken::Symbol(')'))) {
+                        return None;
+                    }
+                    return Some((index + 1, parameters));
+                }
+                index += 1;
+            }
+            LuaToken::Symbol(')') => return Some((index + 1, parameters)),
+            _ => return None,
+        }
+    }
+}
+
+fn matching_function_end(tokens: &[LuaToken], body_start: usize) -> Option<usize> {
+    let mut blocks = vec![LuaBlock::Function];
+    let mut awaiting_loop_do = false;
+    for (index, token) in tokens.iter().enumerate().skip(body_start) {
+        let LuaToken::Identifier(keyword) = token else {
+            continue;
+        };
+        match keyword.as_str() {
+            "function" => {
+                blocks.push(LuaBlock::Function);
+                awaiting_loop_do = false;
+            }
+            "if" => {
+                blocks.push(LuaBlock::Conditional);
+                awaiting_loop_do = false;
+            }
+            "for" | "while" => {
+                blocks.push(LuaBlock::Loop);
+                awaiting_loop_do = true;
+            }
+            "do" if awaiting_loop_do => awaiting_loop_do = false,
+            "do" => {
+                blocks.push(LuaBlock::Do);
+                awaiting_loop_do = false;
+            }
+            "repeat" => {
+                blocks.push(LuaBlock::Repeat);
+                awaiting_loop_do = false;
+            }
+            "until" if matches!(blocks.last(), Some(LuaBlock::Repeat)) => {
+                blocks.pop();
+            }
+            "until" => return None,
+            "end" => {
+                blocks.pop()?;
+                if blocks.is_empty() {
+                    return Some(index);
+                }
+                awaiting_loop_do = false;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+enum LuaBlock {
+    Function,
+    Conditional,
+    Loop,
+    Do,
+    Repeat,
 }
 
 pub fn plan_trigger_binding(source: &str, prefer_caps_lock: bool) -> TriggerBindingPlan {
@@ -615,17 +968,50 @@ pub fn plan_trigger_binding(source: &str, prefer_caps_lock: bool) -> TriggerBind
 /// `bindings.lua` must be included so an exact unmanaged Caps Lock bind there
 /// is not installed again in `hyprland.lua`.
 pub fn plan_trigger_bindings(sources: &[&str], prefer_caps_lock: bool) -> TriggerBindingPlan {
-    let bindings = sources
-        .iter()
-        .flat_map(|source| parse_lua_bindings(source))
-        .collect::<Vec<_>>();
-    for candidate in [CAPS_LOCK, RIGHT_ALT] {
-        if bindings
-            .iter()
-            .any(|binding| binding.managed && binding.is_standalone_for(candidate))
-        {
-            return TriggerBindingPlan::AlreadyInstalled { key: candidate };
+    let mut bindings = Vec::new();
+    for source in sources {
+        match parse_lua_bindings(source) {
+            Ok(parsed) => bindings.extend(parsed),
+            Err(detail) => return TriggerBindingPlan::Unparseable { detail },
         }
+    }
+    plan_trigger_binding_from_bindings(&bindings, prefer_caps_lock)
+}
+
+fn plan_trigger_binding_with_imports(
+    path: &Path,
+    source: &str,
+    files: &dyn BindingFileSystem,
+    prefer_caps_lock: bool,
+) -> TriggerBindingPlan {
+    let bindings = match load_lua_bindings_with_occupancy(path, source, files) {
+        Ok(bindings) => bindings,
+        Err(detail) => return TriggerBindingPlan::Unparseable { detail },
+    };
+
+    plan_trigger_binding_from_bindings(&bindings, prefer_caps_lock)
+}
+
+fn plan_trigger_binding_from_bindings(
+    bindings: &[LuaBinding],
+    prefer_caps_lock: bool,
+) -> TriggerBindingPlan {
+    if let Some(binding) = bindings.iter().find(|binding| {
+        binding.managed
+            && binding.is_standalone()
+            && (binding.description != VOISU_TRIGGER_DESCRIPTION
+                || binding.command != VOISU_TOGGLE_COMMAND)
+    }) {
+        let candidate = PREFERRED_TRIGGER_KEYS
+            .into_iter()
+            .find(|candidate| binding.is_standalone_for(*candidate))
+            .expect("standalone managed binding has a preferred candidate");
+        return TriggerBindingPlan::Unparseable {
+            detail: format!(
+                "the managed {} binding does not match Voisu's expected description or command",
+                candidate.label
+            ),
+        };
     }
 
     let unmanaged = |candidate: TriggerKey| {
@@ -633,6 +1019,15 @@ pub fn plan_trigger_bindings(sources: &[&str], prefer_caps_lock: bool) -> Trigge
             .iter()
             .find(|binding| !binding.managed && binding.is_standalone_for(candidate))
     };
+
+    for candidate in PREFERRED_TRIGGER_KEYS {
+        let managed = bindings
+            .iter()
+            .any(|binding| binding.managed && binding.is_standalone_for(candidate));
+        if managed && unmanaged(candidate).is_none() {
+            return TriggerBindingPlan::AlreadyInstalled { key: candidate };
+        }
+    }
 
     if prefer_caps_lock && unmanaged(CAPS_LOCK).is_none() {
         return TriggerBindingPlan::Install { key: CAPS_LOCK };
@@ -642,7 +1037,7 @@ pub fn plan_trigger_bindings(sources: &[&str], prefer_caps_lock: bool) -> Trigge
     }
 
     let mut conflicts = Vec::new();
-    for candidate in [CAPS_LOCK, RIGHT_ALT] {
+    for candidate in PREFERRED_TRIGGER_KEYS {
         if let Some(binding) = unmanaged(candidate) {
             conflicts.push(BindingConflict {
                 candidate,
@@ -651,7 +1046,209 @@ pub fn plan_trigger_bindings(sources: &[&str], prefer_caps_lock: bool) -> Trigge
             });
         }
     }
-    TriggerBindingPlan::Conflicts { conflicts }
+    if !conflicts.is_empty() {
+        return TriggerBindingPlan::Conflicts { conflicts };
+    }
+
+    unreachable!("a conflict-free binding plan always finds an available candidate")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LuaImport {
+    loader: &'static str,
+    path: String,
+}
+
+fn load_lua_bindings_with_occupancy(
+    root_path: &Path,
+    root_source: &str,
+    files: &dyn BindingFileSystem,
+) -> Result<Vec<LuaBinding>, String> {
+    let mut visited = HashSet::new();
+    let mut bindings = Vec::new();
+    for_each_lua_source(
+        root_path,
+        root_source,
+        files,
+        &mut visited,
+        &mut |_path, source| {
+            bindings.extend(parse_lua_bindings(source)?);
+            Ok(())
+        },
+    )?;
+    let sibling_path = normalize_path(&root_path.with_file_name("bindings.lua"));
+    if !visited.contains(&sibling_path) {
+        if let Some(sibling) = files.read_to_string(&sibling_path)? {
+            bindings.extend(parse_lua_bindings(&sibling)?);
+        }
+    }
+    Ok(bindings)
+}
+
+fn collect_reachable_lua_sources(
+    root_path: &Path,
+    root_source: &str,
+    files: &dyn BindingFileSystem,
+) -> Result<(Vec<String>, HashSet<PathBuf>), String> {
+    let mut visited = HashSet::new();
+    let mut sources = Vec::new();
+    for_each_lua_source(
+        root_path,
+        root_source,
+        files,
+        &mut visited,
+        &mut |_path, source| {
+            sources.push(source.to_owned());
+            Ok(())
+        },
+    )?;
+    Ok((sources, visited))
+}
+
+fn for_each_lua_source(
+    path: &Path,
+    source: &str,
+    files: &dyn BindingFileSystem,
+    visited: &mut HashSet<PathBuf>,
+    visit: &mut dyn FnMut(&Path, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let path = normalize_path(path);
+    if !visited.insert(path.clone()) {
+        return Ok(());
+    }
+
+    visit(&path, source)?;
+    for import in parse_lua_imports(source)? {
+        let Some(imported_path) = resolve_lua_import(&path, &import, files)? else {
+            continue;
+        };
+        let imported_source = files
+            .read_to_string(&imported_path)
+            .map_err(|detail| {
+                format!(
+                    "cannot read imported Lua file {}: {detail}",
+                    imported_path.display()
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "imported Lua file {} does not exist",
+                    imported_path.display()
+                )
+            })?;
+        for_each_lua_source(&imported_path, &imported_source, files, visited, visit)?;
+    }
+    Ok(())
+}
+
+fn parse_lua_imports(source: &str) -> Result<Vec<LuaImport>, String> {
+    let tokens = lex_lua(source)?;
+    let mut imports = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let LuaToken::Identifier(loader) = &tokens[index] else {
+            index += 1;
+            continue;
+        };
+        if !matches!(
+            loader.as_str(),
+            "dofile" | "loadfile" | "require" | "source"
+        ) {
+            index += 1;
+            continue;
+        }
+        let (path, consumed) = match tokens.get(index + 1) {
+            Some(LuaToken::Symbol('(')) => match tokens.get(index + 2) {
+                Some(LuaToken::String(path)) => (path, 3),
+                _ => {
+                    return Err(format!(
+                        "the Lua import {loader} must use a string literal path"
+                    ));
+                }
+            },
+            Some(LuaToken::String(path)) => (path, 2),
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        if path.is_empty() {
+            return Err(format!("the Lua import {loader} has an empty path"));
+        }
+        imports.push(LuaImport {
+            loader: match loader.as_str() {
+                "dofile" => "dofile",
+                "loadfile" => "loadfile",
+                "require" => "require",
+                "source" => "source",
+                _ => unreachable!(),
+            },
+            path: path.clone(),
+        });
+        index += consumed;
+    }
+    Ok(imports)
+}
+
+fn resolve_lua_import(
+    importing_path: &Path,
+    import: &LuaImport,
+    files: &dyn BindingFileSystem,
+) -> Result<Option<PathBuf>, String> {
+    let import_path = Path::new(&import.path);
+    let parent = importing_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut candidates = vec![if import_path.is_absolute() {
+        import_path.to_owned()
+    } else {
+        parent.join(import_path)
+    }];
+
+    if import.loader == "require" && import_path.extension().is_none() {
+        let module_path = import.path.replace('.', "/");
+        candidates.push(parent.join(format!("{module_path}.lua")));
+        candidates.push(parent.join(&module_path).join("init.lua"));
+    }
+
+    for candidate in &candidates {
+        if files
+            .read_to_string(candidate)
+            .map_err(|detail| {
+                format!(
+                    "cannot inspect imported Lua file {}: {detail}",
+                    candidate.display()
+                )
+            })?
+            .is_some()
+        {
+            return Ok(Some(normalize_path(candidate)));
+        }
+    }
+
+    if import.loader == "require" {
+        Ok(None)
+    } else {
+        Err(format!(
+            "Lua import {} refers to missing file {}",
+            import.loader,
+            candidates
+                .first()
+                .map_or_else(|| import.path.clone(), |path| path.display().to_string())
+        ))
+    }
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 pub fn backup_path(path: &Path) -> PathBuf {
@@ -685,18 +1282,8 @@ pub fn install_trigger_binding(
             detail,
         })?;
     let source = original.as_deref().unwrap_or_default();
-    let sibling_path = path.with_file_name("bindings.lua");
-    let sibling =
-        files
-            .read_to_string(&sibling_path)
-            .map_err(|detail| TriggerBindingError::File {
-                action: "read",
-                path: sibling_path,
-                detail,
-            })?;
-    let occupancy = occupancy_sources(source, sibling.as_deref());
     let backup = backup_path(path);
-    let plan = plan_trigger_bindings(&occupancy, prefer_caps_lock);
+    let plan = plan_trigger_binding_with_imports(path, source, files, prefer_caps_lock);
     let input_path = path.with_file_name("input.lua");
     let original_input =
         files
@@ -708,16 +1295,22 @@ pub fn install_trigger_binding(
             })?;
 
     let key = match plan {
-        TriggerBindingPlan::AlreadyInstalled { key } => key,
         TriggerBindingPlan::Conflicts { conflicts } => {
             return Err(TriggerBindingError::from_conflicts(conflicts));
         }
-        TriggerBindingPlan::Install { key } => key,
+        TriggerBindingPlan::Unparseable { detail } => {
+            return Err(TriggerBindingError::Unparseable { detail });
+        }
+        TriggerBindingPlan::AlreadyInstalled { key } | TriggerBindingPlan::Install { key } => key,
     };
 
-    let updated = desired_hyprland_source(source, key, original_input.as_deref().unwrap_or(""));
+    let updated =
+        match desired_hyprland_source(source, key, original_input.as_deref().unwrap_or("")) {
+            Ok(updated) => updated,
+            Err(detail) => return Err(TriggerBindingError::Unparseable { detail }),
+        };
     if updated == source {
-        verify_installed_binding(hyprland, key, &backup)?;
+        verify_already_installed(hyprland, key, &backup)?;
         return Ok(TriggerBindingInstallReport {
             key,
             changed: false,
@@ -744,60 +1337,57 @@ pub fn install_trigger_binding(
         });
     }
 
-    reload_and_verify(hyprland, key, path, files, original.as_deref(), &backup)?;
-
-    Ok(TriggerBindingInstallReport {
-        key,
-        changed: true,
-        backup_path: backup,
-    })
-}
-
-fn reload_and_verify(
-    hyprland: &mut dyn HyprlandController,
-    key: TriggerKey,
-    path: &Path,
-    files: &dyn BindingFileSystem,
-    original: Option<&str>,
-    backup: &Path,
-) -> Result<(), TriggerBindingError> {
     if let Err(detail) = hyprland.reload() {
-        let restore_error = restore_original(files, path, original).err();
+        let restore_error = restore_original_and_reload(files, path, original.as_deref(), hyprland);
         return Err(TriggerBindingError::ReloadFailed {
             detail,
-            backup_path: backup.to_owned(),
+            backup_path: backup,
             restore_error,
         });
     }
+
     match hyprland.binding_is_installed(key.code, VOISU_TOGGLE_COMMAND) {
-        Ok(true) => Ok(()),
+        Ok(true) => Ok(TriggerBindingInstallReport {
+            key,
+            changed: true,
+            backup_path: backup,
+        }),
         Ok(false) => {
-            let restore_error = restore_original(files, path, original).err();
+            let restore_error =
+                restore_original_and_reload(files, path, original.as_deref(), hyprland);
             Err(TriggerBindingError::VerificationFailed {
                 detail: format!(
                     "Hyprland did not report {} ({}) running `{VOISU_TOGGLE_COMMAND}`",
                     key.label, key.code
                 ),
-                backup_path: backup.to_owned(),
+                backup_path: backup,
                 restore_error,
             })
         }
         Err(detail) => {
-            let restore_error = restore_original(files, path, original).err();
+            let restore_error =
+                restore_original_and_reload(files, path, original.as_deref(), hyprland);
             Err(TriggerBindingError::VerificationFailed {
                 detail,
-                backup_path: backup.to_owned(),
+                backup_path: backup,
                 restore_error,
             })
         }
     }
 }
 
-fn verify_installed_binding(
+fn verify_already_installed(
     hyprland: &mut dyn HyprlandController,
     key: TriggerKey,
     backup: &Path,
 ) -> Result<(), TriggerBindingError> {
+    if let Err(detail) = hyprland.reload() {
+        return Err(TriggerBindingError::ReloadFailed {
+            detail,
+            backup_path: backup.to_owned(),
+            restore_error: None,
+        });
+    }
     let verified = hyprland
         .binding_is_installed(key.code, VOISU_TOGGLE_COMMAND)
         .map_err(|detail| TriggerBindingError::VerificationFailed {
@@ -819,13 +1409,6 @@ fn verify_installed_binding(
     }
 }
 
-fn occupancy_sources<'a>(hyprland: &'a str, sibling: Option<&'a str>) -> Vec<&'a str> {
-    match sibling {
-        Some(extra) => vec![hyprland, extra],
-        None => vec![hyprland],
-    }
-}
-
 fn restore_original(
     files: &dyn BindingFileSystem,
     path: &Path,
@@ -837,14 +1420,37 @@ fn restore_original(
     }
 }
 
-fn desired_hyprland_source(source: &str, key: TriggerKey, input_source: &str) -> String {
+fn restore_original_and_reload(
+    files: &dyn BindingFileSystem,
+    path: &Path,
+    original: Option<&str>,
+    hyprland: &mut dyn HyprlandController,
+) -> Option<String> {
+    if let Err(detail) = restore_original(files, path, original) {
+        return Some(detail);
+    }
+    hyprland
+        .reload()
+        .err()
+        .map(|detail| format!("reloading the restored configuration failed: {detail}"))
+}
+
+fn desired_hyprland_source(
+    source: &str,
+    key: TriggerKey,
+    input_source: &str,
+) -> Result<String, String> {
     let kb_options = (key == CAPS_LOCK)
         .then(|| merge_caps_lock_kb_options(last_kb_options(&[input_source, source])));
     append_managed_binding(source, key, kb_options.as_deref())
 }
 
-fn append_managed_binding(source: &str, key: TriggerKey, kb_options: Option<&str>) -> String {
-    let mut content = remove_managed_blocks(source);
+fn append_managed_binding(
+    source: &str,
+    key: TriggerKey,
+    kb_options: Option<&str>,
+) -> Result<String, String> {
+    let mut content = remove_managed_blocks(source)?;
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
@@ -870,7 +1476,7 @@ fn append_managed_binding(source: &str, key: TriggerKey, kb_options: Option<&str
     ));
     content.push_str(END_MARKER);
     content.push('\n');
-    content
+    Ok(content)
 }
 
 fn last_kb_options(sources: &[&str]) -> Option<String> {
@@ -926,36 +1532,29 @@ fn merge_caps_lock_kb_options(existing: Option<String>) -> String {
     result.join(",")
 }
 
-fn remove_managed_blocks(source: &str) -> String {
-    remove_marked_block(source, BEGIN_MARKER, END_MARKER)
-}
-
-fn remove_marked_block(source: &str, begin: &str, end: &str) -> String {
-    let mut result = String::new();
-    let mut managed = false;
-    for line in source.split_inclusive('\n') {
-        match line.trim() {
-            marker if marker == begin => managed = true,
-            marker if marker == end && managed => managed = false,
-            _ if !managed => result.push_str(line),
-            _ => {}
-        }
-    }
-    result
+fn remove_managed_blocks(source: &str) -> Result<String, String> {
+    Ok(split_lua_chunks(source)?
+        .into_iter()
+        .filter(|(_, managed)| !managed)
+        .map(|(chunk, _)| chunk)
+        .collect())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum LuaToken {
     Identifier(String),
     String(String),
+    Number(String),
     Symbol(char),
 }
 
-fn parse_lua_chunk(source: &str, managed: bool) -> Vec<LuaBinding> {
-    let tokens = lex_lua(source);
+type ParsedBindArguments = (String, String, String, Option<String>, Option<Vec<String>>);
+
+fn parse_lua_chunk(source: &str, managed: bool) -> Result<Vec<LuaBinding>, String> {
+    let tokens = lex_lua(source)?;
     let mut bindings = Vec::new();
     let mut index = 0;
-    while index + 9 < tokens.len() {
+    while index + 3 < tokens.len() {
         let is_bind_call = matches!(
             (&tokens[index], &tokens[index + 1], &tokens[index + 2], &tokens[index + 3]),
             (
@@ -969,68 +1568,139 @@ fn parse_lua_chunk(source: &str, managed: bool) -> Vec<LuaBinding> {
             index += 1;
             continue;
         }
-        let Some((key, description, command)) = parse_bind_arguments(&tokens[index + 4..]) else {
-            index += 1;
-            continue;
-        };
+        let (key, description, command, dispatcher, dispatcher_arguments) =
+            parse_bind_arguments(&tokens[index + 4..])?;
         bindings.push(LuaBinding {
             key,
             description,
             command,
+            dispatcher,
+            dispatcher_arguments,
             managed,
         });
         index += 4;
     }
-    bindings
+    Ok(bindings)
 }
 
-fn parse_bind_arguments(tokens: &[LuaToken]) -> Option<(String, String, String)> {
+fn parse_bind_arguments(tokens: &[LuaToken]) -> Result<ParsedBindArguments, String> {
     let mut index = 0;
-    let read_string = |index: &mut usize| -> Option<String> {
-        let value = match tokens.get(*index)? {
-            LuaToken::String(value) => value.clone(),
-            _ => return None,
+    let read_string = |index: &mut usize, label: &str| -> Result<String, String> {
+        let value = match tokens.get(*index) {
+            Some(LuaToken::String(value)) => value.clone(),
+            Some(_) => return Err(format!("the {label} must be a string literal")),
+            None => return Err(format!("the {label} is missing")),
         };
         *index += 1;
-        Some(value)
+        Ok(value)
     };
-    let key = read_string(&mut index)?;
+    let key = read_string(&mut index, "binding key")?;
     if !matches!(tokens.get(index), Some(LuaToken::Symbol(','))) {
-        return None;
+        return Err("the binding key must be followed by a comma".to_owned());
     }
     index += 1;
-    let description = read_string(&mut index)?;
+    let description = read_string(&mut index, "binding description")?;
     if !matches!(tokens.get(index), Some(LuaToken::Symbol(','))) {
-        return None;
+        return Err("the binding description must be followed by a comma".to_owned());
     }
     index += 1;
-    let command = match tokens.get(index)? {
-        LuaToken::String(value) => value.clone(),
-        LuaToken::Symbol(')') => return None,
-        _ => "<Lua dispatcher>".to_owned(),
+    let (command, dispatcher, dispatcher_arguments) = match tokens.get(index) {
+        Some(LuaToken::String(value)) => {
+            index += 1;
+            (value.clone(), None, None)
+        }
+        Some(LuaToken::Symbol(')')) => return Err("the binding command is missing".to_owned()),
+        Some(LuaToken::Identifier(name)) => {
+            let name = name.clone();
+            index += 1;
+            let arguments = if matches!(tokens.get(index), Some(LuaToken::Symbol('('))) {
+                let (next, arguments) = parse_dispatcher_arguments(tokens, index)?;
+                index = next;
+                arguments
+            } else {
+                index = binding_expression_end(tokens, index)?;
+                None
+            };
+            ("<Lua dispatcher>".to_owned(), Some(name), arguments)
+        }
+        Some(_) => {
+            index = binding_expression_end(tokens, index)?;
+            ("<Lua dispatcher>".to_owned(), None, None)
+        }
+        None => return Err("the binding command is missing".to_owned()),
     };
-    Some((key, description, command))
+    if !matches!(tokens.get(index), Some(LuaToken::Symbol(')'))) {
+        return Err("the binding command must be followed by a closing parenthesis".to_owned());
+    }
+    Ok((key, description, command, dispatcher, dispatcher_arguments))
 }
 
-fn lex_lua(source: &str) -> Vec<LuaToken> {
+fn parse_dispatcher_arguments(
+    tokens: &[LuaToken],
+    open_index: usize,
+) -> Result<(usize, Option<Vec<String>>), String> {
+    let mut index = open_index + 1;
+    let mut arguments = Vec::new();
+    loop {
+        match tokens.get(index) {
+            Some(LuaToken::String(argument)) => {
+                arguments.push(argument.clone());
+                index += 1;
+            }
+            Some(LuaToken::Symbol(')')) => return Ok((index + 1, Some(arguments))),
+            Some(_) => return Ok((matching_parenthesis(tokens, open_index)?, None)),
+            None => return Err("the dispatcher call is missing a closing parenthesis".to_owned()),
+        }
+        match tokens.get(index) {
+            Some(LuaToken::Symbol(',')) => index += 1,
+            Some(LuaToken::Symbol(')')) => return Ok((index + 1, Some(arguments))),
+            Some(_) => {
+                return Err("the dispatcher arguments must be separated by commas".to_owned())
+            }
+            None => return Err("the dispatcher call is missing a closing parenthesis".to_owned()),
+        }
+    }
+}
+
+fn matching_parenthesis(tokens: &[LuaToken], open_index: usize) -> Result<usize, String> {
+    let mut depth = 0;
+    for (index, token) in tokens.iter().enumerate().skip(open_index) {
+        match token {
+            LuaToken::Symbol('(') => depth += 1,
+            LuaToken::Symbol(')') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(index + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err("the dispatcher call is missing a closing parenthesis".to_owned())
+}
+
+fn binding_expression_end(tokens: &[LuaToken], start_index: usize) -> Result<usize, String> {
+    let mut depth = 0;
+    for (index, token) in tokens.iter().enumerate().skip(start_index) {
+        match token {
+            LuaToken::Symbol('(') => depth += 1,
+            LuaToken::Symbol(')') if depth == 0 => return Ok(index),
+            LuaToken::Symbol(')') => depth -= 1,
+            _ => {}
+        }
+    }
+    Err("the binding command is missing a closing parenthesis".to_owned())
+}
+
+fn lex_lua(source: &str) -> Result<Vec<LuaToken>, String> {
     let mut chars = source.chars().peekable();
     let mut tokens = Vec::new();
     while let Some(character) = chars.next() {
         if character == '-' && chars.peek() == Some(&'-') {
             chars.next();
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                if chars.peek() == Some(&'[') {
-                    chars.next();
-                    let mut previous = None;
-                    for character in chars.by_ref() {
-                        if previous == Some(']') && character == ']' {
-                            break;
-                        }
-                        previous = Some(character);
-                    }
-                    continue;
-                }
+            if let Some(closing) = take_long_bracket_open(&mut chars) {
+                skip_long_bracket(&mut chars, &closing)?;
+                continue;
             }
             for character in chars.by_ref() {
                 if character == '\n' {
@@ -1040,22 +1710,14 @@ fn lex_lua(source: &str) -> Vec<LuaToken> {
             continue;
         }
         if character == '"' || character == '\'' {
-            let quote = character;
-            let mut value = String::new();
-            while let Some(character) = chars.next() {
-                match character {
-                    '\\' => match chars.next() {
-                        Some('n') => value.push('\n'),
-                        Some('r') => value.push('\r'),
-                        Some('t') => value.push('\t'),
-                        Some(escaped) => value.push(escaped),
-                        None => break,
-                    },
-                    character if character == quote => break,
-                    character => value.push(character),
-                }
-            }
+            let value = read_lua_string(&mut chars, character)?;
             tokens.push(LuaToken::String(value));
+            continue;
+        }
+        if character == '[' {
+            if let Some(closing) = take_long_bracket_open(&mut chars) {
+                skip_long_bracket(&mut chars, &closing)?;
+            }
             continue;
         }
         if character.is_ascii_alphabetic() || character == '_' {
@@ -1071,28 +1733,191 @@ fn lex_lua(source: &str) -> Vec<LuaToken> {
             tokens.push(LuaToken::Identifier(identifier));
             continue;
         }
-        if matches!(character, '.' | '(' | ')' | ',' | '{' | '}') {
+        if character.is_ascii_digit() {
+            let mut number = String::from(character);
+            while let Some(next) = chars.peek().copied() {
+                if next.is_ascii_digit() {
+                    number.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            tokens.push(LuaToken::Number(number));
+            continue;
+        }
+        if matches!(character, '.' | '(' | ')' | ',' | '{' | '}' | '=' | ':') {
             tokens.push(LuaToken::Symbol(character));
         }
     }
-    tokens
+    Ok(tokens)
+}
+
+fn take_long_bracket_open(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    let mut lookahead = chars.clone();
+    let mut equals = 0;
+    while lookahead.peek() == Some(&'=') {
+        equals += 1;
+        lookahead.next();
+    }
+    if lookahead.next() != Some('[') {
+        return None;
+    }
+    *chars = lookahead;
+    Some(format!("]{}]", "=".repeat(equals)))
+}
+
+fn skip_long_bracket(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    closing: &str,
+) -> Result<(), String> {
+    let closing: Vec<char> = closing.chars().collect();
+    let mut tail = Vec::new();
+    for character in chars.by_ref() {
+        tail.push(character);
+        if tail.ends_with(&closing) {
+            return Ok(());
+        }
+        if tail.len() > closing.len() {
+            tail.drain(..tail.len() - closing.len());
+        }
+    }
+    Err("unterminated Lua long string or comment".to_owned())
+}
+
+fn read_lua_string(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    quote: char,
+) -> Result<String, String> {
+    let mut value = String::new();
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' => read_lua_escape(chars, &mut value)?,
+            character if character == quote => return Ok(value),
+            '\n' | '\r' => return Err("unterminated Lua string literal".to_owned()),
+            character => value.push(character),
+        }
+    }
+    Err("unterminated Lua string literal".to_owned())
+}
+
+fn read_lua_escape(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    value: &mut String,
+) -> Result<(), String> {
+    let Some(escaped) = chars.next() else {
+        return Err("Lua string ends with an incomplete escape".to_owned());
+    };
+    match escaped {
+        'a' => value.push('\u{7}'),
+        'b' => value.push('\u{8}'),
+        'f' => value.push('\u{c}'),
+        'n' => value.push('\n'),
+        'r' => value.push('\r'),
+        't' => value.push('\t'),
+        'v' => value.push('\u{b}'),
+        '\\' | '"' | '\'' => value.push(escaped),
+        '\n' => value.push('\n'),
+        '\r' => {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            value.push('\n');
+        }
+        'z' => {
+            while chars
+                .peek()
+                .is_some_and(|character| character.is_ascii_whitespace())
+            {
+                chars.next();
+            }
+        }
+        'x' => {
+            let high = chars.next().and_then(|character| character.to_digit(16));
+            let low = chars.next().and_then(|character| character.to_digit(16));
+            let Some(byte) = high.zip(low).map(|(high, low)| (high * 16 + low) as u8) else {
+                return Err("Lua hexadecimal escape must contain two digits".to_owned());
+            };
+            value.push(byte as char);
+        }
+        'u' => {
+            if chars.next() != Some('{') {
+                return Err("Lua Unicode escape must use the form \\u{...}".to_owned());
+            }
+            let mut digits = String::new();
+            let mut closed = false;
+            for character in chars.by_ref() {
+                if character == '}' {
+                    closed = true;
+                    break;
+                }
+                if !character.is_ascii_hexdigit() {
+                    return Err("Lua Unicode escape contains a non-hex digit".to_owned());
+                }
+                digits.push(character);
+            }
+            let Some(codepoint) = closed
+                .then(|| u32::from_str_radix(&digits, 16).ok())
+                .flatten()
+                .and_then(char::from_u32)
+            else {
+                return Err("Lua Unicode escape is invalid".to_owned());
+            };
+            value.push(codepoint);
+        }
+        character if character.is_ascii_digit() => {
+            let mut digits = String::from(character);
+            while digits.len() < 3 {
+                let Some(next) = chars.peek().copied().filter(|next| next.is_ascii_digit()) else {
+                    break;
+                };
+                digits.push(next);
+                chars.next();
+            }
+            let byte = digits
+                .parse::<u8>()
+                .map_err(|_| "Lua decimal escape is outside the byte range".to_owned())?;
+            value.push(byte as char);
+        }
+        other => {
+            return Err(format!("unsupported Lua escape sequence \\\\{other}"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     struct FakeHyprland {
-        reload_succeeds: bool,
+        reload_results: Vec<bool>,
+        reload_calls: usize,
         verification_succeeds: bool,
+    }
+
+    impl FakeHyprland {
+        fn new(reload_results: &[bool], verification_succeeds: bool) -> Self {
+            Self {
+                reload_results: reload_results.to_vec(),
+                reload_calls: 0,
+                verification_succeeds,
+            }
+        }
     }
 
     impl HyprlandController for FakeHyprland {
         fn reload(&mut self) -> Result<(), String> {
-            self.reload_succeeds
+            let succeeds = self
+                .reload_results
+                .get(self.reload_calls)
+                .copied()
+                .unwrap_or(false);
+            self.reload_calls += 1;
+            succeeds
                 .then_some(())
                 .ok_or_else(|| "reload failed".to_owned())
         }
@@ -1134,7 +1959,9 @@ mod tests {
             "last-wins kb_options must include {CAPS_NONE}: {last}"
         );
         assert!(
-            last.split(',').map(str::trim).any(|part| part == BOTH_CAPSLOCK_CANCEL),
+            last.split(',')
+                .map(str::trim)
+                .any(|part| part == BOTH_CAPSLOCK_CANCEL),
             "last-wins kb_options must keep {BOTH_CAPSLOCK_CANCEL}: {last}"
         );
     }
@@ -1167,7 +1994,7 @@ o.bind(
 )
 "#;
 
-        let bindings = parse_lua_bindings(source);
+        let bindings = parse_lua_bindings(source).unwrap();
 
         assert_eq!(bindings.len(), 2);
         assert!(!bindings[0].is_standalone());
@@ -1175,6 +2002,52 @@ o.bind(
         assert!(bindings[1].is_standalone());
         assert_eq!(bindings[1].key, "code:108");
         assert_eq!(bindings[1].command, "kitty");
+    }
+
+    #[test]
+    fn keysym_aliases_occupy_the_same_physical_trigger_keys() {
+        let source = r#"
+o.bind("Caps_Lock", "Launch terminal", "kitty")
+o.bind("ALT, Alt_R", "Modified right alt", "workspace next")
+"#;
+
+        assert_eq!(
+            plan_trigger_binding(source, true),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+
+        let both = r#"
+o.bind("caps_lock", "Launch terminal", "kitty")
+o.bind("Alt_R", "Launcher", "launcher")
+"#;
+        let TriggerBindingPlan::Conflicts { conflicts } = plan_trigger_binding(both, true) else {
+            panic!("Caps_Lock and Alt_R must occupy the preferred physical keys");
+        };
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].candidate, CAPS_LOCK);
+        assert_eq!(conflicts[1].candidate, RIGHT_ALT);
+    }
+
+    #[test]
+    fn left_alt_is_not_a_setup_candidate() {
+        let source = r#"
+o.bind("code:64", "Launch terminal", "kitty")
+o.bind("ALT, code:108", "Modified right alt", "workspace next")
+"#;
+
+        assert_eq!(
+            plan_trigger_binding(source, true),
+            TriggerBindingPlan::Install { key: CAPS_LOCK }
+        );
+        assert!(!LuaBinding {
+            key: "ALT, code:64".to_owned(),
+            description: "Alt Tab".to_owned(),
+            command: "workspace next".to_owned(),
+            dispatcher: None,
+            dispatcher_arguments: None,
+            managed: false,
+        }
+        .is_standalone());
     }
 
     #[test]
@@ -1199,29 +2072,6 @@ o.bind("ALT, code:108", "Modified right alt", "workspace next")
     }
 
     #[test]
-    fn unmanaged_caps_lock_in_sibling_bindings_falls_back_to_right_alt() {
-        let (_directory, path) = config_dir();
-        fs::write(&path, "").unwrap();
-        let bindings = path.with_file_name("bindings.lua");
-        let original_bindings = "o.bind(\"code:66\", \"Launch terminal\", \"kitty\")\n";
-        fs::write(&bindings, original_bindings).unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: true,
-            verification_succeeds: true,
-        };
-
-        let report =
-            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
-        let hyprland_lua = fs::read_to_string(&path).unwrap();
-
-        assert_eq!(report.key, RIGHT_ALT);
-        assert!(!hyprland_lua.contains("code:66"));
-        assert_right_alt_managed_block(&hyprland_lua);
-        assert_eq!(fs::read_to_string(&bindings).unwrap(), original_bindings);
-        assert!(!path.with_file_name("input.lua").exists());
-    }
-
-    #[test]
     fn exact_bindings_with_lua_dispatchers_are_still_conflicts() {
         let source = r#"
 o.bind("code:66", "Terminal", { omarchy = "terminal" })
@@ -1236,6 +2086,234 @@ o.bind("code:108", "Launcher", hl.dsp.exec_cmd("launcher"))
         assert_eq!(conflicts[0].command, "<Lua dispatcher>");
         assert_eq!(conflicts[1].description, "Launcher");
         assert_eq!(conflicts[1].command, "<Lua dispatcher>");
+    }
+
+    #[test]
+    fn managed_binding_does_not_hide_a_new_user_conflict() {
+        let source = format!(
+            "{BEGIN_MARKER}\no.bind(\"code:66\", \"Voisu dictation\", \"voisu toggle\")\n{END_MARKER}\no.bind(\"code:108\", \"Launcher\", \"launcher\")\n"
+        );
+
+        assert_eq!(
+            plan_trigger_binding(&source, true),
+            TriggerBindingPlan::AlreadyInstalled { key: CAPS_LOCK }
+        );
+    }
+
+    #[test]
+    fn same_key_user_binding_is_not_accepted_as_already_installed() {
+        let source = format!(
+            "{BEGIN_MARKER}\no.bind(\"code:66\", \"Voisu dictation\", \"voisu toggle\")\n{END_MARKER}\no.bind(\"code:66\", \"Launcher\", \"launcher\")\n"
+        );
+
+        assert_eq!(
+            plan_trigger_binding(&source, true),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+
+        let both_keys_user_owned =
+            format!("{source}o.bind(\"code:108\", \"Lock\", \"loginctl lock-session\")\n");
+        let TriggerBindingPlan::Conflicts { conflicts } =
+            plan_trigger_binding(&both_keys_user_owned, true)
+        else {
+            panic!("a same-key user binding must not hide conflicts behind AlreadyInstalled");
+        };
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].candidate, CAPS_LOCK);
+        assert_eq!(conflicts[1].candidate, RIGHT_ALT);
+    }
+
+    #[test]
+    fn unparseable_candidate_binding_fails_closed() {
+        let source = r#"
+local caps_lock = "code:66"
+o.bind(caps_lock, "Terminal", "kitty")
+"#;
+
+        let TriggerBindingPlan::Unparseable { detail } = plan_trigger_binding(source, true) else {
+            panic!("a dynamic candidate key must not be treated as free");
+        };
+        assert!(detail.contains("binding key"));
+    }
+
+    #[test]
+    fn imported_lua_bindings_are_checked_before_installing() {
+        let (_directory, path) = config_dir();
+        let imported = path.with_file_name("bindings.lua");
+        fs::write(&path, "dofile(\"bindings.lua\")\n").unwrap();
+        fs::write(
+            &imported,
+            "o.bind(\"code:66\", \"Launch terminal\", \"kitty\")\n",
+        )
+        .unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+        let report = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true)
+            .expect("an imported Caps Lock binding must force the Right Alt fallback");
+
+        assert_eq!(report.key, RIGHT_ALT);
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.starts_with(&(original + "\n-- BEGIN VOISU MANAGED TRIGGER\n")));
+        assert!(updated.contains("code:108"));
+        assert_right_alt_managed_block(&updated);
+        assert_eq!(hyprland.reload_calls, 1);
+    }
+
+    #[test]
+    fn parenthesis_free_lua_imports_are_scanned() {
+        let imports = parse_lua_imports(r#"require "bindings" dofile 'extra.lua'"#).unwrap();
+        assert_eq!(
+            imports,
+            vec![
+                LuaImport {
+                    loader: "require",
+                    path: "bindings".to_owned(),
+                },
+                LuaImport {
+                    loader: "dofile",
+                    path: "extra.lua".to_owned(),
+                },
+            ]
+        );
+
+        let (_directory, path) = config_dir();
+        let imported = path.with_file_name("bindings.lua");
+        fs::write(&path, "require \"bindings\"\n").unwrap();
+        fs::write(
+            &imported,
+            "o.bind(\"code:66\", \"Launch terminal\", \"kitty\")\n",
+        )
+        .unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+    }
+
+    #[test]
+    fn non_string_lua_import_args_fail_closed() {
+        let error = parse_lua_imports(r#"require(module_name)"#).unwrap_err();
+        assert!(error.contains("string literal"));
+    }
+
+    #[test]
+    fn require_skips_a_module_directory_and_loads_lua_candidates() {
+        let (directory, path) = config_dir();
+        fs::create_dir(directory.path().join("bindings")).unwrap();
+        fs::write(
+            directory.path().join("bindings.lua"),
+            "o.bind(\"code:66\", \"Launch terminal\", \"kitty\")\n",
+        )
+        .unwrap();
+        fs::write(&path, "require(\"bindings\")\n").unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+
+        fs::remove_file(directory.path().join("bindings.lua")).unwrap();
+        fs::write(
+            directory.path().join("bindings").join("init.lua"),
+            "o.bind(\"code:66\", \"Launch terminal\", \"kitty\")\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+    }
+
+    #[test]
+    fn missing_dofile_import_fails_closed() {
+        let (directory, path) = config_dir();
+        fs::create_dir(directory.path().join("missing")).unwrap();
+        let missing_file = plan_trigger_binding_with_imports(
+            &path,
+            "dofile(\"absent.lua\")\n",
+            &LocalBindingFileSystem,
+            true,
+        );
+        let TriggerBindingPlan::Unparseable { detail } = missing_file else {
+            panic!("a missing dofile must not be treated as success");
+        };
+        assert!(detail.contains("missing file"));
+
+        let directory_target = plan_trigger_binding_with_imports(
+            &path,
+            "dofile(\"missing\")\n",
+            &LocalBindingFileSystem,
+            true,
+        );
+        let TriggerBindingPlan::Unparseable { detail } = directory_target else {
+            panic!("dofile of a directory must not be treated as success");
+        };
+        assert!(detail.contains("missing file"));
+    }
+
+    #[test]
+    fn long_bracket_utf8_content_does_not_panic() {
+        let source = "--[[é]]\no.bind(\"code:64\", \"Launch terminal\", \"kitty\")\n";
+        let bindings = parse_lua_bindings(source).expect("multibyte long comments must stay UTF-8");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].key, "code:64");
+        assert_eq!(
+            plan_trigger_binding("local docs = [[é]]\n", true),
+            TriggerBindingPlan::Install { key: CAPS_LOCK }
+        );
+    }
+
+    #[test]
+    fn marker_like_lines_inside_lua_long_strings_are_not_managed_blocks() {
+        let source = r#"
+local documentation = [[
+-- BEGIN VOISU MANAGED TRIGGER
+-- END VOISU MANAGED TRIGGER
+]]
+"#;
+
+        assert_eq!(
+            plan_trigger_binding(source, true),
+            TriggerBindingPlan::Install { key: CAPS_LOCK }
+        );
+    }
+
+    #[test]
+    fn unbalanced_managed_markers_fail_closed() {
+        let source =
+            format!("{BEGIN_MARKER}\no.bind(\"code:64\", \"Voisu dictation\", \"voisu toggle\")\n");
+
+        let TriggerBindingPlan::Unparseable { detail } = plan_trigger_binding(&source, true) else {
+            panic!("an unmatched managed marker must not be accepted");
+        };
+        assert!(detail.contains("no matching end marker"));
+    }
+
+    #[test]
+    fn stale_managed_binding_is_not_accepted_as_voisu() {
+        let source = format!(
+            "{BEGIN_MARKER}\no.bind(\"code:66\", \"Voisu dictation\", \"kitty\")\n{END_MARKER}\n"
+        );
+
+        let TriggerBindingPlan::Unparseable { detail } = plan_trigger_binding(&source, true) else {
+            panic!("a managed binding with a different command must not be accepted");
+        };
+        assert!(detail.contains("expected description or command"));
+    }
+
+    #[test]
+    fn lua_hex_escapes_are_decoded_before_conflict_detection() {
+        let source = r#"o.bind("code\x3a66", "Launch terminal", "kitty")
+o.bind("code:108", "Launcher", "launcher")"#;
+
+        let TriggerBindingPlan::Conflicts { conflicts } = plan_trigger_binding(source, true) else {
+            panic!("a Lua hexadecimal escape must still occupy Caps Lock");
+        };
+        assert_eq!(conflicts[0].candidate, CAPS_LOCK);
     }
 
     #[test]
@@ -1327,10 +2405,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let original =
             "-- user bindings\no.bind(\"ALT, code:64\", \"Alt Tab\", \"workspace next\")\n";
         fs::write(&path, original).unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: true,
-            verification_succeeds: true,
-        };
+        let mut hyprland = FakeHyprland::new(&[true], true);
 
         let report =
             install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
@@ -1353,41 +2428,11 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
     }
 
     #[test]
-    fn stock_hyprland_without_input_require_gets_bind_and_kb_options() {
-        let (_directory, path) = config_dir();
-        fs::write(
-            &path,
-            concat!(
-                "-- stock Hyprland Lua has no Omarchy bootstrap\n",
-                "o.bind(\"SUPER, Q\", \"Quit\", \"hyprctl dispatch exit\")\n"
-            ),
-        )
-        .unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: true,
-            verification_succeeds: true,
-        };
-
-        let report =
-            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
-        let updated = fs::read_to_string(&path).unwrap();
-
-        assert_eq!(report.key, CAPS_LOCK);
-        assert!(updated.contains("o.bind(\"SUPER, Q\", \"Quit\", \"hyprctl dispatch exit\")"));
-        assert!(!updated.contains("require("));
-        assert_caps_lock_managed_block(&updated);
-        assert!(!path.with_file_name("input.lua").exists());
-    }
-
-    #[test]
     fn fallback_preserves_the_exact_caps_lock_binding() {
         let (_directory, path) = config_dir();
         let original = "o.bind(\"code:66\", \"Terminal\", \"kitty\")\n";
         fs::write(&path, original).unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: true,
-            verification_succeeds: true,
-        };
+        let mut hyprland = FakeHyprland::new(&[true], true);
 
         let report =
             install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
@@ -1400,25 +2445,6 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
     }
 
     #[test]
-    fn rejected_caps_lock_installs_right_alt_without_input_rewrite() {
-        let (_directory, path) = config_dir();
-        fs::write(&path, "-- user bindings\n").unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: true,
-            verification_succeeds: true,
-        };
-
-        let report =
-            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, false).unwrap();
-
-        assert_eq!(report.key, RIGHT_ALT);
-        let updated = fs::read_to_string(&path).unwrap();
-        assert_right_alt_managed_block(&updated);
-        assert!(!updated.contains("hl.config"));
-        assert!(!path.with_file_name("input.lua").exists());
-    }
-
-    #[test]
     fn both_conflicts_leave_the_file_and_compositor_untouched() {
         let (_directory, path) = config_dir();
         let original = concat!(
@@ -1426,10 +2452,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             "o.bind(\"code:108\", \"Launcher\", \"launcher\")\n"
         );
         fs::write(&path, original).unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: false,
-            verification_succeeds: false,
-        };
+        let mut hyprland = FakeHyprland::new(&[], false);
 
         let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true)
             .expect_err("both conflicts must stop before any external action");
@@ -1443,16 +2466,10 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
     fn rerunning_does_not_duplicate_the_managed_binding() {
         let (_directory, path) = config_dir();
         fs::write(&path, "-- user bindings\n").unwrap();
-        let mut first = FakeHyprland {
-            reload_succeeds: true,
-            verification_succeeds: true,
-        };
+        let mut first = FakeHyprland::new(&[true], true);
         install_trigger_binding(&path, &LocalBindingFileSystem, &mut first, true).unwrap();
         let before = fs::read_to_string(&path).unwrap();
-        let mut second = FakeHyprland {
-            reload_succeeds: false,
-            verification_succeeds: true,
-        };
+        let mut second = FakeHyprland::new(&[true], true);
 
         let report =
             install_trigger_binding(&path, &LocalBindingFileSystem, &mut second, false).unwrap();
@@ -1462,6 +2479,24 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
         assert_eq!(before.matches(BEGIN_MARKER).count(), 1);
         assert_caps_lock_managed_block(&before);
+        assert_eq!(second.reload_calls, 1);
+    }
+
+    #[test]
+    fn already_installed_reload_failure_leaves_the_file_untouched() {
+        let (_directory, path) = config_dir();
+        fs::write(&path, "-- user bindings\n").unwrap();
+        let mut first = FakeHyprland::new(&[true], true);
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut first, true).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let mut second = FakeHyprland::new(&[false], true);
+
+        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut second, true)
+            .expect_err("a stale compositor must not skip reload on rerun");
+
+        assert!(error.to_string().contains("reload"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(second.reload_calls, 1);
     }
 
     #[test]
@@ -1472,10 +2507,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let input_path = path.with_file_name("input.lua");
         let original_input = "require = nil -- user input.lua must stay untouched\n";
         fs::write(&input_path, original_input).unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: false,
-            verification_succeeds: true,
-        };
+        let mut hyprland = FakeHyprland::new(&[false, true], true);
 
         let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true)
             .expect_err("reload failure must fail setup");
@@ -1487,6 +2519,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             original
         );
         assert_eq!(fs::read_to_string(&input_path).unwrap(), original_input);
+        assert_eq!(hyprland.reload_calls, 2);
     }
 
     #[test]
@@ -1494,16 +2527,74 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let (_directory, path) = config_dir();
         let original = "-- original\n";
         fs::write(&path, original).unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: true,
-            verification_succeeds: false,
-        };
+        let mut hyprland = FakeHyprland::new(&[true, true], false);
 
         let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true)
             .expect_err("verification failure must fail setup");
 
         assert!(error.to_string().contains("verification"));
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!path.with_file_name("input.lua").exists());
+        assert_eq!(hyprland.reload_calls, 2);
+    }
+
+    #[test]
+    fn unmanaged_caps_lock_in_sibling_bindings_falls_back_to_right_alt() {
+        let (_directory, path) = config_dir();
+        fs::write(&path, "").unwrap();
+        let bindings = path.with_file_name("bindings.lua");
+        let original_bindings = "o.bind(\"code:66\", \"Launch terminal\", \"kitty\")\n";
+        fs::write(&bindings, original_bindings).unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let hyprland_lua = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(report.key, RIGHT_ALT);
+        assert!(!hyprland_lua.contains("code:66"));
+        assert_right_alt_managed_block(&hyprland_lua);
+        assert_eq!(fs::read_to_string(&bindings).unwrap(), original_bindings);
+        assert!(!path.with_file_name("input.lua").exists());
+    }
+
+    #[test]
+    fn stock_hyprland_without_input_require_gets_bind_and_kb_options() {
+        let (_directory, path) = config_dir();
+        fs::write(
+            &path,
+            concat!(
+                "-- stock Hyprland Lua has no Omarchy bootstrap\n",
+                "o.bind(\"SUPER, Q\", \"Quit\", \"hyprctl dispatch exit\")\n"
+            ),
+        )
+        .unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(report.key, CAPS_LOCK);
+        assert!(updated.contains("o.bind(\"SUPER, Q\", \"Quit\", \"hyprctl dispatch exit\")"));
+        assert!(!updated.contains("require("));
+        assert_caps_lock_managed_block(&updated);
+        assert!(!path.with_file_name("input.lua").exists());
+    }
+
+    #[test]
+    fn rejected_caps_lock_installs_right_alt_without_input_rewrite() {
+        let (_directory, path) = config_dir();
+        fs::write(&path, "-- user bindings\n").unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, false).unwrap();
+
+        assert_eq!(report.key, RIGHT_ALT);
+        let updated = fs::read_to_string(&path).unwrap();
+        assert_right_alt_managed_block(&updated);
+        assert!(!updated.contains("hl.config"));
         assert!(!path.with_file_name("input.lua").exists());
     }
 
@@ -1520,10 +2611,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         )
         .unwrap();
         let before = fs::read_to_string(&path).unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: false,
-            verification_succeeds: true,
-        };
+        let mut hyprland = FakeHyprland::new(&[true], true);
 
         let report =
             install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
@@ -1544,10 +2632,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             "hl.config({\n  input = {\n    kb_options = \"compose:caps,grp:alts_toggle\",\n  },\n})\n",
         )
         .unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: true,
-            verification_succeeds: true,
-        };
+        let mut hyprland = FakeHyprland::new(&[true], true);
 
         let original_input = fs::read_to_string(path.with_file_name("input.lua")).unwrap();
         install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
@@ -1575,10 +2660,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let original_input =
             "hl.config({\n  input = {\n    kb_options = \"caps:none,shift:both_capslock_cancel\",\n  },\n})\n";
         fs::write(&input_path, original_input).unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: true,
-            verification_succeeds: true,
-        };
+        let mut hyprland = FakeHyprland::new(&[true], true);
 
         install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
         let hyprland_lua = fs::read_to_string(&path).unwrap();
@@ -1598,10 +2680,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             ),
         )
         .unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: true,
-            verification_succeeds: true,
-        };
+        let mut hyprland = FakeHyprland::new(&[true], true);
 
         install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
         let updated = fs::read_to_string(&path).unwrap();
@@ -1625,10 +2704,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             ),
         )
         .unwrap();
-        let mut hyprland = FakeHyprland {
-            reload_succeeds: true,
-            verification_succeeds: true,
-        };
+        let mut hyprland = FakeHyprland::new(&[true], true);
 
         let report =
             install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
@@ -1650,9 +2726,20 @@ local function send_shortcut_once(mods, key)
     end, { timeout = 50, type = "oneshot" })
   end
 end
+
 local function active_window_is_terminal()
-  return true
+  local window = hl.get_active_window()
+  if not window then
+    return false
+  end
+  for _, tag in ipairs(window.tags or {}) do
+    if tag:gsub("%*$", "") == "terminal" then
+      return true
+    end
+  end
+  return false
 end
+
 local function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key)
   return function()
     if active_window_is_terminal() then
@@ -1664,6 +2751,61 @@ local function universal_clipboard_shortcut(default_mods, default_key, terminal_
 end
 o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V", "SHIFT", "Insert"))
 "#;
+
+    fn universal_paste_live(key: &str, modmask: u64) -> Value {
+        serde_json::json!([{
+            "key": key,
+            "modmask": modmask,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }])
+    }
+
+    struct MemoryFiles(std::collections::HashMap<PathBuf, String>);
+
+    impl MemoryFiles {
+        fn from_files(files: &[(&str, &str)]) -> Self {
+            Self(
+                files
+                    .iter()
+                    .map(|(path, source)| (normalize_path(Path::new(path)), (*source).to_owned()))
+                    .collect(),
+            )
+        }
+    }
+
+    impl BindingFileSystem for MemoryFiles {
+        fn read_to_string(&self, path: &Path) -> Result<Option<String>, String> {
+            Ok(self.0.get(&normalize_path(path)).cloned())
+        }
+
+        fn write_atomic(&self, _path: &Path, _contents: &str) -> Result<(), String> {
+            Err("memory files are read-only".to_owned())
+        }
+
+        fn remove_file(&self, _path: &Path) -> Result<(), String> {
+            Err("memory files are read-only".to_owned())
+        }
+    }
+
+    struct FakeLiveHyprland {
+        bindings: Value,
+    }
+
+    impl HyprlandController for FakeLiveHyprland {
+        fn reload(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn binding_is_installed(&mut self, _key: &str, _command: &str) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        fn live_bindings(&mut self) -> Result<Value, String> {
+            Ok(self.bindings.clone())
+        }
+    }
 
     #[test]
     fn omarchy_universal_paste_requires_live_dynamic_binding_and_keeps_both_paths() {
@@ -1678,6 +2820,7 @@ o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V",
         let action = discover_paste_action(&[OMARCHY_PASTE_SOURCE], &live)
             .expect("known Omarchy helper should be verified");
         assert_eq!(action.shortcut.binding, "SUPER + V");
+        assert_eq!(action.live_binding_identity, "91");
         assert_eq!(
             action.behavior,
             PasteBehavior::OmarchyUniversal {
@@ -1692,7 +2835,229 @@ o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V",
     }
 
     #[test]
-    fn a_different_literal_paste_binding_is_verified_from_live_hyprland() {
+    fn changed_live_lua_identity_invalidates_the_verified_action() {
+        let first = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+        let second = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "92"
+        }]);
+
+        let first = discover_paste_action(&[OMARCHY_PASTE_SOURCE], &first).unwrap();
+        let second = discover_paste_action(&[OMARCHY_PASTE_SOURCE], &second).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(second.live_binding_identity, "92");
+    }
+
+    #[test]
+    fn lua_paste_binding_requires_a_numeric_live_identity() {
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": ""
+        }]);
+
+        assert!(discover_paste_action(&[OMARCHY_PASTE_SOURCE], &live).is_none());
+    }
+
+    #[test]
+    fn omarchy_helper_markers_in_strings_or_comments_are_not_verified() {
+        let source = r#"
+local fake = "function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key) if active_window_is_terminal() then send_shortcut_once(terminal_mods, terminal_key)() send_shortcut_once(default_mods, default_key)() end"
+-- function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key)
+o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V", "SHIFT", "Insert"))
+"#;
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+
+        assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn omarchy_helper_markers_in_long_comments_and_strings_are_not_verified() {
+        let source = r#"
+--[=[
+function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key)
+  if active_window_is_terminal() then
+    send_shortcut_once(terminal_mods, terminal_key)()
+    send_shortcut_once(default_mods, default_key)()
+  end
+end
+]=]
+local fake = [=[
+function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key)
+  if active_window_is_terminal() then
+    send_shortcut_once(terminal_mods, terminal_key)()
+    send_shortcut_once(default_mods, default_key)()
+  end
+end
+]=]
+o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V", "SHIFT", "Insert"))
+"#;
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+
+        assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn literal_paste_binding_inside_a_long_comment_is_not_verified() {
+        let source = r#"
+--[=[
+o.bind("SUPER + V", "Paste transcript", "safe-paste")
+]=]
+"#;
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Paste transcript",
+            "dispatcher": "exec",
+            "arg": "safe-paste"
+        }]);
+
+        assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn dynamic_paste_binding_with_an_unrelated_helper_shape_fails_closed() {
+        let source = r#"
+local function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key)
+  if active_window_is_terminal() then
+    send_shortcut_once(terminal_mods, terminal_key)()
+    send_shortcut_once(default_mods, default_key)()
+  end
+end
+local function unrelated_paste()
+  os.execute("paste")
+end
+o.bind("SUPER + V", "Universal paste", unrelated_paste)
+"#;
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+
+        assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn omarchy_markers_must_be_inside_the_named_helper_body() {
+        let source = r#"
+local function unrelated_helper()
+  if active_window_is_terminal() then
+    send_shortcut_once(terminal_mods, terminal_key)()
+    send_shortcut_once(default_mods, default_key)()
+  end
+end
+local function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key)
+  return function()
+  end
+end
+o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V", "SHIFT", "Insert"))
+"#;
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+
+        assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn omarchy_helper_rejects_extra_or_reordered_body_logic() {
+        let source = r#"
+local function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key)
+  return function()
+    if active_window_is_terminal() then
+      send_shortcut_once(default_mods, default_key)()
+      send_shortcut_once(terminal_mods, terminal_key)()
+    else
+      send_shortcut_once(default_mods, default_key)()
+    end
+  end
+end
+o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V", "SHIFT", "Insert"))
+"#;
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+
+        assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn omarchy_helper_requires_the_known_shortcut_arguments() {
+        let source = OMARCHY_PASTE_SOURCE.replace(
+            "universal_clipboard_shortcut(\"CTRL\", \"V\", \"SHIFT\", \"Insert\")",
+            "universal_clipboard_shortcut(\"CTRL\", \"V\", \"ALT\", \"Insert\")",
+        );
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+
+        assert!(discover_paste_action(&[&source], &live).is_none());
+    }
+
+    #[test]
+    fn omarchy_desktop_label_accepts_multi_label_values() {
+        assert!(desktop_has_label("Hyprland:Omarchy", "omarchy"));
+        assert!(desktop_has_label("Hyprland;Omarchy", "omarchy"));
+        assert!(!desktop_has_label("Hyprland", "omarchy"));
+    }
+
+    #[test]
+    fn a_literal_lua_paste_binding_is_verified_from_opaque_live_lua() {
+        let source = r#"o.bind("CTRL + SHIFT + P", "Paste transcript", "hyprctl dispatch sendshortcut CTRL V")"#;
+        let live = serde_json::json!([{
+            "key": "",
+            "modmask": 0,
+            "description": "Paste transcript",
+            "dispatcher": "__lua",
+            "arg": "92"
+        }]);
+
+        let action = discover_paste_action(&[source], &live).expect("literal binding is verified");
+        assert_eq!(action.shortcut.binding, "CTRL + SHIFT + P");
+        assert_eq!(action.live_binding_identity, "92");
+        assert_eq!(action.behavior, PasteBehavior::Simple);
+    }
+
+    #[test]
+    fn a_literal_paste_binding_still_verifies_when_live_dispatcher_is_exec() {
         let source = r#"o.bind("CTRL + SHIFT + P", "Paste transcript", "hyprctl dispatch sendshortcut CTRL V")"#;
         let live = serde_json::json!([{
             "key": "P",
@@ -1735,6 +3100,190 @@ o.bind("SUPER + P", "Paste transcript", my_paste)
             "description": "Paste transcript",
             "dispatcher": "__lua",
             "arg": "92"
+        }]);
+
+        assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn omarchy_universal_paste_accepts_opaque_live_lua_keys() {
+        let action = discover_paste_action(&[OMARCHY_PASTE_SOURCE], &universal_paste_live("", 0))
+            .expect("known Omarchy helper should verify against an opaque live Lua key");
+        assert_eq!(action.shortcut.binding, "SUPER + V");
+        assert_eq!(action.live_binding_identity, "91");
+        assert_eq!(
+            action.behavior,
+            PasteBehavior::OmarchyUniversal {
+                normal: PasteShortcut {
+                    binding: "CTRL + V".to_owned()
+                },
+                terminal: PasteShortcut {
+                    binding: "SHIFT + Insert".to_owned()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn opaque_live_lua_key_with_a_different_description_fails_closed() {
+        let live = serde_json::json!([{
+            "key": "",
+            "modmask": 0,
+            "description": "Other paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+
+        assert!(discover_paste_action(&[OMARCHY_PASTE_SOURCE], &live).is_none());
+    }
+
+    #[test]
+    fn opaque_live_lua_key_with_an_unrelated_function_fails_closed() {
+        let source = r#"
+local function unrelated_paste()
+  os.execute("paste")
+end
+o.bind("SUPER + V", "Universal paste", unrelated_paste)
+"#;
+
+        assert!(discover_paste_action(&[source], &universal_paste_live("", 0)).is_none());
+    }
+
+    #[test]
+    fn unimported_bindings_lua_is_not_an_active_paste_source() {
+        let root = PathBuf::from("/hypr/hyprland.lua");
+        let files = MemoryFiles::from_files(&[
+            (root.to_str().unwrap(), "-- no imports\n"),
+            ("/hypr/bindings.lua", OMARCHY_PASTE_SOURCE),
+        ]);
+        let mut hyprland = FakeLiveHyprland {
+            bindings: universal_paste_live("", 0),
+        };
+
+        let action = discover_paste_action_from_sources(&root, &files, &mut hyprland)
+            .expect("discovery should inspect the active root");
+        assert!(action.is_none());
+    }
+
+    #[test]
+    fn imported_bindings_lua_is_an_active_paste_source() {
+        let root = PathBuf::from("/hypr/hyprland.lua");
+        let files = MemoryFiles::from_files(&[
+            (root.to_str().unwrap(), "dofile(\"bindings.lua\")\n"),
+            ("/hypr/bindings.lua", OMARCHY_PASTE_SOURCE),
+        ]);
+        let mut hyprland = FakeLiveHyprland {
+            bindings: universal_paste_live("", 0),
+        };
+
+        let action = discover_paste_action_from_sources(&root, &files, &mut hyprland)
+            .expect("discovery should inspect imported sources")
+            .expect("an imported Omarchy helper must still be verified");
+        assert_eq!(action.shortcut.binding, "SUPER + V");
+    }
+
+    #[test]
+    fn omarchy_helper_rejects_a_replaced_send_shortcut_once_body() {
+        let source = OMARCHY_PASTE_SOURCE.replace(
+            r#"local function send_shortcut_once(mods, key)
+  return function()
+    hl.dispatch(hl.dsp.send_key_state({ mods = mods, key = key, state = "down" }))
+    hl.timer(function()
+      hl.dispatch(hl.dsp.send_key_state({ mods = mods, key = key, state = "up" }))
+    end, { timeout = 50, type = "oneshot" })
+  end
+end"#,
+            r#"local function send_shortcut_once(mods, key)
+  os.execute("malicious")
+end"#,
+        );
+
+        assert!(discover_paste_action(&[&source], &universal_paste_live("V", 64)).is_none());
+    }
+
+    #[test]
+    fn omarchy_helper_rejects_an_unrelated_active_window_is_terminal_body() {
+        let source = OMARCHY_PASTE_SOURCE.replace(
+            r#"local function active_window_is_terminal()
+  local window = hl.get_active_window()
+  if not window then
+    return false
+  end
+  for _, tag in ipairs(window.tags or {}) do
+    if tag:gsub("%*$", "") == "terminal" then
+      return true
+    end
+  end
+  return false
+end"#,
+            r#"local function active_window_is_terminal()
+  return true
+end"#,
+        );
+
+        assert!(discover_paste_action(&[&source], &universal_paste_live("V", 64)).is_none());
+    }
+
+    #[test]
+    fn earlier_unverified_universal_paste_does_not_hide_a_later_helper() {
+        let unrelated = r#"
+local function unrelated_paste()
+  os.execute("paste")
+end
+o.bind("SUPER + V", "Universal paste", unrelated_paste)
+"#;
+
+        let action = discover_paste_action(
+            &[unrelated, OMARCHY_PASTE_SOURCE],
+            &universal_paste_live("", 0),
+        )
+        .expect("a later Omarchy helper must still verify");
+        assert_eq!(action.shortcut.binding, "SUPER + V");
+        assert_eq!(
+            action.behavior,
+            PasteBehavior::OmarchyUniversal {
+                normal: PasteShortcut {
+                    binding: "CTRL + V".to_owned()
+                },
+                terminal: PasteShortcut {
+                    binding: "SHIFT + Insert".to_owned()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn earlier_unverified_function_does_not_hide_a_later_literal_paste() {
+        let function_source = r#"
+local function my_paste()
+  os.execute("dangerous-command")
+end
+o.bind("CTRL + SHIFT + P", "Paste transcript", my_paste)
+"#;
+        let literal = r#"o.bind("CTRL + SHIFT + P", "Paste transcript", "safe-paste")"#;
+        let live = serde_json::json!([{
+            "key": "",
+            "modmask": 0,
+            "description": "Paste transcript",
+            "dispatcher": "__lua",
+            "arg": "92"
+        }]);
+
+        let action = discover_paste_action(&[function_source, literal], &live)
+            .expect("a later string command must still verify");
+        assert_eq!(action.shortcut.binding, "CTRL + SHIFT + P");
+        assert_eq!(action.behavior, PasteBehavior::Simple);
+    }
+
+    #[test]
+    fn a_literal_caps_paste_binding_is_not_verified() {
+        let source = r#"o.bind("CAPS + P", "Paste transcript", "safe-paste")"#;
+        let live = serde_json::json!([{
+            "key": "P",
+            "modmask": 2,
+            "description": "Paste transcript",
+            "dispatcher": "exec",
+            "arg": "safe-paste"
         }]);
 
         assert!(discover_paste_action(&[source], &live).is_none());
