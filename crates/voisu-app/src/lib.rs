@@ -15,5 +15,6 @@ pub mod secret_file;
 pub mod service;
 pub mod setup;
 pub mod setup_profile;
+pub mod hyprland_bindings;
 pub mod smart_writing;
 pub mod system;
