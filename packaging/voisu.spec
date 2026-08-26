@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.38.0
+Version:        0.40.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,24 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Wed Aug 26 2026 Voisu maintainers <voisu@example.invalid> - 0.40.0-1
+- fix(hyprland): treat Alt keysyms as occupied and reload on rerun
+- fix(hyprland): scan paren-free imports and keep managed reruns
+- fix(hyprland): fail closed on imported binding drift
+- fix(hyprland): harden trigger binding rollback and parsing
+- feat(setup): install conflict-safe Hyprland binding
+
+* Tue Aug 25 2026 Voisu maintainers <voisu@example.invalid> - 0.39.0-1
+- fix(service): remove graphical target ordering cycle
+- fix(setup): harden Hyprland profile discovery
+- fix(service): preserve X11 session startup
+- feat(cli): simplify top-level help
+- feat(setup): detect Hyprland setup profile
+- fix(service): align units with graphical session
+
+* Tue Aug 25 2026 Voisu maintainers <voisu@example.invalid> - 0.38.1-1
+- fix(intent): accept Qwen reconstruction response shape (#217)
+
 * Tue Aug 25 2026 Voisu maintainers <voisu@example.invalid> - 0.38.0-1
 - feat(core): add host-only intent reconstruction (#216)
 

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
@@ -75,7 +76,15 @@ impl LuaBinding {
     }
 
     fn is_standalone_for(&self, candidate: TriggerKey) -> bool {
-        self.key.trim() == candidate.code
+        let key = self.key.trim();
+        if key.eq_ignore_ascii_case(candidate.code) {
+            return true;
+        }
+        match candidate.code {
+            "code:64" => key.eq_ignore_ascii_case("Alt_L"),
+            "code:108" => key.eq_ignore_ascii_case("Alt_R"),
+            _ => false,
+        }
     }
 }
 
@@ -221,7 +230,14 @@ impl BindingFileSystem for LocalBindingFileSystem {
     fn read_to_string(&self, path: &Path) -> Result<Option<String>, String> {
         match fs::read_to_string(path) {
             Ok(contents) => Ok(Some(contents)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
+                ) =>
+            {
+                Ok(None)
+            }
             Err(error) => Err(error.to_string()),
         }
     }
@@ -354,26 +370,149 @@ fn live_binding_identity(binding: &Value, dispatcher: &str) -> Option<String> {
 
 pub fn parse_lua_bindings(source: &str) -> Result<Vec<LuaBinding>, String> {
     let mut bindings = Vec::new();
+    for (chunk, managed) in split_lua_chunks(source)? {
+        bindings.extend(parse_lua_chunk(&chunk, managed)?);
+    }
+    Ok(bindings)
+}
+
+fn split_lua_chunks(source: &str) -> Result<Vec<(String, bool)>, String> {
+    let mut chunks = Vec::new();
     let mut chunk = String::new();
     let mut managed = false;
+    let mut state = LuaSourceState::default();
 
     for line in source.split_inclusive('\n') {
-        match line.trim() {
-            BEGIN_MARKER => {
-                bindings.extend(parse_lua_chunk(&chunk, managed)?);
-                chunk.clear();
+        match state.marker_for_line(line) {
+            Some(LuaMarker::Begin) if managed => {
+                return Err("nested Voisu managed trigger begin marker".to_owned());
+            }
+            Some(LuaMarker::Begin) => {
+                chunks.push((std::mem::take(&mut chunk), false));
                 managed = true;
             }
-            END_MARKER => {
-                bindings.extend(parse_lua_chunk(&chunk, managed)?);
-                chunk.clear();
+            Some(LuaMarker::End) if !managed => {
+                return Err(
+                    "Voisu managed trigger end marker has no matching begin marker".to_owned(),
+                );
+            }
+            Some(LuaMarker::End) => {
+                chunks.push((std::mem::take(&mut chunk), true));
                 managed = false;
             }
-            _ => chunk.push_str(line),
+            None => chunk.push_str(line),
+        }
+        state.consume(line);
+    }
+
+    if managed {
+        return Err("Voisu managed trigger begin marker has no matching end marker".to_owned());
+    }
+    chunks.push((chunk, false));
+    Ok(chunks)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LuaMarker {
+    Begin,
+    End,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum LuaSourceMode {
+    #[default]
+    Code,
+    LineComment,
+    Quoted(char),
+    LongBracket(String),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LuaSourceState {
+    mode: LuaSourceMode,
+}
+
+impl LuaSourceState {
+    fn marker_for_line(&self, line: &str) -> Option<LuaMarker> {
+        if self.mode != LuaSourceMode::Code {
+            return None;
+        }
+        match line.trim() {
+            BEGIN_MARKER => Some(LuaMarker::Begin),
+            END_MARKER => Some(LuaMarker::End),
+            _ => None,
         }
     }
-    bindings.extend(parse_lua_chunk(&chunk, managed)?);
-    Ok(bindings)
+
+    fn consume(&mut self, line: &str) {
+        let chars: Vec<char> = line.chars().collect();
+        let mut index = 0;
+        while index < chars.len() {
+            match &self.mode {
+                LuaSourceMode::Code => {
+                    if chars[index] == '-' && chars.get(index + 1) == Some(&'-') {
+                        index += 2;
+                        if let Some((closing, consumed)) = long_bracket_open(&chars, index) {
+                            self.mode = LuaSourceMode::LongBracket(closing);
+                            index = consumed;
+                        } else {
+                            self.mode = LuaSourceMode::LineComment;
+                        }
+                    } else if matches!(chars[index], '\'' | '"') {
+                        self.mode = LuaSourceMode::Quoted(chars[index]);
+                        index += 1;
+                    } else if let Some((closing, consumed)) = long_bracket_open(&chars, index) {
+                        self.mode = LuaSourceMode::LongBracket(closing);
+                        index = consumed;
+                    } else {
+                        index += 1;
+                    }
+                }
+                LuaSourceMode::LineComment => {
+                    if chars[index] == '\n' {
+                        self.mode = LuaSourceMode::Code;
+                    }
+                    index += 1;
+                }
+                LuaSourceMode::Quoted(quote) => {
+                    if chars[index] == '\\' {
+                        index = (index + 2).min(chars.len());
+                    } else {
+                        if chars[index] == *quote {
+                            self.mode = LuaSourceMode::Code;
+                        }
+                        index += 1;
+                    }
+                }
+                LuaSourceMode::LongBracket(closing) => {
+                    if chars[index..].starts_with(&closing.chars().collect::<Vec<_>>()) {
+                        index += closing.chars().count();
+                        self.mode = LuaSourceMode::Code;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+        }
+        if self.mode == LuaSourceMode::LineComment {
+            self.mode = LuaSourceMode::Code;
+        }
+    }
+}
+
+fn long_bracket_open(chars: &[char], start: usize) -> Option<(String, usize)> {
+    if chars.get(start) != Some(&'[') {
+        return None;
+    }
+    let mut index = start + 1;
+    while chars.get(index) == Some(&'=') {
+        index += 1;
+    }
+    if chars.get(index) != Some(&'[') {
+        return None;
+    }
+    let equals = index - start - 1;
+    Some((format!("]{}]", "=".repeat(equals)), index + 1))
 }
 
 /// Finds the first paste binding that is proven by both the active Lua source
@@ -787,40 +926,46 @@ enum LuaBlock {
     Repeat,
 }
 
-fn long_bracket_open(characters: &[char], start: usize) -> Option<(usize, usize)> {
-    (characters.get(start) == Some(&'[')).then(|| {
-        let mut index = start + 1;
-        while characters.get(index) == Some(&'=') {
-            index += 1;
-        }
-        (characters.get(index) == Some(&'[')).then_some((index + 1, index - start - 1))
-    })?
-}
-
-fn skip_long_bracket(characters: &[char], mut index: usize, level: usize) -> Option<usize> {
-    while index < characters.len() {
-        if characters[index] == ']' {
-            let mut close = index + 1;
-            while close < characters.len()
-                && characters[close] == '='
-                && close - index - 1 < level
-            {
-                close += 1;
-            }
-            if close - index - 1 == level && characters.get(close) == Some(&']') {
-                return Some(close + 1);
-            }
-        }
-        index += 1;
-    }
-    None
-}
-
 pub fn plan_trigger_binding(source: &str) -> TriggerBindingPlan {
     let bindings = match parse_lua_bindings(source) {
         Ok(bindings) => bindings,
         Err(detail) => return TriggerBindingPlan::Unparseable { detail },
     };
+
+    plan_trigger_binding_from_bindings(&bindings)
+}
+
+fn plan_trigger_binding_with_imports(
+    path: &Path,
+    source: &str,
+    files: &dyn BindingFileSystem,
+) -> TriggerBindingPlan {
+    let bindings = match load_lua_bindings(path, source, files) {
+        Ok(bindings) => bindings,
+        Err(detail) => return TriggerBindingPlan::Unparseable { detail },
+    };
+
+    plan_trigger_binding_from_bindings(&bindings)
+}
+
+fn plan_trigger_binding_from_bindings(bindings: &[LuaBinding]) -> TriggerBindingPlan {
+    if let Some(binding) = bindings.iter().find(|binding| {
+        binding.managed
+            && binding.is_standalone()
+            && (binding.description != VOISU_TRIGGER_DESCRIPTION
+                || binding.command != VOISU_TOGGLE_COMMAND)
+    }) {
+        let candidate = [LEFT_ALT, RIGHT_ALT]
+            .into_iter()
+            .find(|candidate| binding.is_standalone_for(*candidate))
+            .expect("standalone managed binding has a preferred candidate");
+        return TriggerBindingPlan::Unparseable {
+            detail: format!(
+                "the managed {} binding does not match Voisu's expected description or command",
+                candidate.label
+            ),
+        };
+    }
 
     let mut conflicts = Vec::new();
     for candidate in [LEFT_ALT, RIGHT_ALT] {
@@ -835,14 +980,15 @@ pub fn plan_trigger_binding(source: &str) -> TriggerBindingPlan {
             });
         }
     }
-    if conflicts.is_empty() {
-        for candidate in [LEFT_ALT, RIGHT_ALT] {
-            if bindings
-                .iter()
-                .any(|binding| binding.managed && binding.is_standalone_for(candidate))
-            {
-                return TriggerBindingPlan::AlreadyInstalled { key: candidate };
-            }
+    for candidate in [LEFT_ALT, RIGHT_ALT] {
+        let managed = bindings
+            .iter()
+            .any(|binding| binding.managed && binding.is_standalone_for(candidate));
+        let user_owns_same_key = conflicts
+            .iter()
+            .any(|conflict| conflict.candidate == candidate);
+        if managed && !user_owns_same_key {
+            return TriggerBindingPlan::AlreadyInstalled { key: candidate };
         }
     }
 
@@ -860,6 +1006,169 @@ pub fn plan_trigger_binding(source: &str) -> TriggerBindingPlan {
     }
 
     unreachable!("a conflict-free binding plan always finds an available candidate")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LuaImport {
+    loader: &'static str,
+    path: String,
+}
+
+fn load_lua_bindings(
+    root_path: &Path,
+    root_source: &str,
+    files: &dyn BindingFileSystem,
+) -> Result<Vec<LuaBinding>, String> {
+    let mut visited = HashSet::new();
+    let mut bindings = Vec::new();
+    load_lua_bindings_recursive(root_path, root_source, files, &mut visited, &mut bindings)?;
+    Ok(bindings)
+}
+
+fn load_lua_bindings_recursive(
+    path: &Path,
+    source: &str,
+    files: &dyn BindingFileSystem,
+    visited: &mut HashSet<PathBuf>,
+    bindings: &mut Vec<LuaBinding>,
+) -> Result<(), String> {
+    let path = normalize_path(path);
+    if !visited.insert(path.clone()) {
+        return Ok(());
+    }
+
+    bindings.extend(parse_lua_bindings(source)?);
+    for import in parse_lua_imports(source)? {
+        let Some(imported_path) = resolve_lua_import(&path, &import, files)? else {
+            continue;
+        };
+        let imported_source = files
+            .read_to_string(&imported_path)
+            .map_err(|detail| {
+                format!(
+                    "cannot read imported Lua file {}: {detail}",
+                    imported_path.display()
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "imported Lua file {} does not exist",
+                    imported_path.display()
+                )
+            })?;
+        load_lua_bindings_recursive(&imported_path, &imported_source, files, visited, bindings)?;
+    }
+    Ok(())
+}
+
+fn parse_lua_imports(source: &str) -> Result<Vec<LuaImport>, String> {
+    let tokens = lex_lua(source)?;
+    let mut imports = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let LuaToken::Identifier(loader) = &tokens[index] else {
+            index += 1;
+            continue;
+        };
+        if !matches!(
+            loader.as_str(),
+            "dofile" | "loadfile" | "require" | "source"
+        ) {
+            index += 1;
+            continue;
+        }
+        let (path, consumed) = match tokens.get(index + 1) {
+            Some(LuaToken::Symbol('(')) => match tokens.get(index + 2) {
+                Some(LuaToken::String(path)) => (path, 3),
+                _ => {
+                    return Err(format!(
+                        "the Lua import {loader} must use a string literal path"
+                    ));
+                }
+            },
+            Some(LuaToken::String(path)) => (path, 2),
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        if path.is_empty() {
+            return Err(format!("the Lua import {loader} has an empty path"));
+        }
+        imports.push(LuaImport {
+            loader: match loader.as_str() {
+                "dofile" => "dofile",
+                "loadfile" => "loadfile",
+                "require" => "require",
+                "source" => "source",
+                _ => unreachable!(),
+            },
+            path: path.clone(),
+        });
+        index += consumed;
+    }
+    Ok(imports)
+}
+
+fn resolve_lua_import(
+    importing_path: &Path,
+    import: &LuaImport,
+    files: &dyn BindingFileSystem,
+) -> Result<Option<PathBuf>, String> {
+    let import_path = Path::new(&import.path);
+    let parent = importing_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut candidates = vec![if import_path.is_absolute() {
+        import_path.to_owned()
+    } else {
+        parent.join(import_path)
+    }];
+
+    if import.loader == "require" && import_path.extension().is_none() {
+        let module_path = import.path.replace('.', "/");
+        candidates.push(parent.join(format!("{module_path}.lua")));
+        candidates.push(parent.join(&module_path).join("init.lua"));
+    }
+
+    for candidate in &candidates {
+        if files
+            .read_to_string(candidate)
+            .map_err(|detail| {
+                format!(
+                    "cannot inspect imported Lua file {}: {detail}",
+                    candidate.display()
+                )
+            })?
+            .is_some()
+        {
+            return Ok(Some(normalize_path(candidate)));
+        }
+    }
+
+    if import.loader == "require" {
+        Ok(None)
+    } else {
+        Err(format!(
+            "Lua import {} refers to missing file {}",
+            import.loader,
+            candidates
+                .first()
+                .map_or_else(|| import.path.clone(), |path| path.display().to_string())
+        ))
+    }
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 pub fn backup_path(path: &Path) -> PathBuf {
@@ -893,10 +1202,17 @@ pub fn install_trigger_binding(
         })?;
     let source = original.as_deref().unwrap_or_default();
     let backup = backup_path(path);
-    let plan = plan_trigger_binding(source);
+    let plan = plan_trigger_binding_with_imports(path, source, files);
 
     let key = match plan {
         TriggerBindingPlan::AlreadyInstalled { key } => {
+            if let Err(detail) = hyprland.reload() {
+                return Err(TriggerBindingError::ReloadFailed {
+                    detail,
+                    backup_path: backup,
+                    restore_error: None,
+                });
+            }
             let verified = hyprland
                 .binding_is_installed(key.code, VOISU_TOGGLE_COMMAND)
                 .map_err(|detail| TriggerBindingError::VerificationFailed {
@@ -937,7 +1253,10 @@ pub fn install_trigger_binding(
             detail,
         })?;
 
-    let updated = append_managed_binding(source, key);
+    let updated = match append_managed_binding(source, key) {
+        Ok(updated) => updated,
+        Err(detail) => return Err(TriggerBindingError::Unparseable { detail }),
+    };
     if let Err(detail) = files.write_atomic(path, &updated) {
         let restore_error = restore_original(files, path, original.as_deref()).err();
         return Err(TriggerBindingError::File {
@@ -1014,8 +1333,8 @@ fn restore_original_and_reload(
         .map(|detail| format!("reloading the restored configuration failed: {detail}"))
 }
 
-fn append_managed_binding(source: &str, key: TriggerKey) -> String {
-    let mut content = remove_managed_blocks(source);
+fn append_managed_binding(source: &str, key: TriggerKey) -> Result<String, String> {
+    let mut content = remove_managed_blocks(source)?;
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
@@ -1030,21 +1349,15 @@ fn append_managed_binding(source: &str, key: TriggerKey) -> String {
     ));
     content.push_str(END_MARKER);
     content.push('\n');
-    content
+    Ok(content)
 }
 
-fn remove_managed_blocks(source: &str) -> String {
-    let mut result = String::new();
-    let mut managed = false;
-    for line in source.split_inclusive('\n') {
-        match line.trim() {
-            BEGIN_MARKER => managed = true,
-            END_MARKER if managed => managed = false,
-            _ if !managed => result.push_str(line),
-            _ => {}
-        }
-    }
-    result
+fn remove_managed_blocks(source: &str) -> Result<String, String> {
+    Ok(split_lua_chunks(source)?
+        .into_iter()
+        .filter(|(_, managed)| !managed)
+        .map(|(chunk, _)| chunk)
+        .collect())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1209,73 +1522,39 @@ fn binding_expression_end(tokens: &[LuaToken], start_index: usize) -> Result<usi
 }
 
 fn lex_lua(source: &str) -> Result<Vec<LuaToken>, String> {
-    let characters = source.chars().collect::<Vec<_>>();
+    let mut chars = source.chars().peekable();
     let mut tokens = Vec::new();
-    let mut index = 0;
-    while index < characters.len() {
-        let character = characters[index];
-        if character == '-' && characters.get(index + 1) == Some(&'-') {
-            index += 2;
-            if let Some((content_start, level)) = long_bracket_open(&characters, index) {
-                index = skip_long_bracket(&characters, content_start, level)
-                    .ok_or_else(|| "unterminated Lua long comment".to_owned())?;
-            } else {
-                while index < characters.len() && characters[index] != '\n' {
-                    index += 1;
+    while let Some(character) = chars.next() {
+        if character == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            if let Some(closing) = take_long_bracket_open(&mut chars) {
+                skip_long_bracket(&mut chars, &closing)?;
+                continue;
+            }
+            for character in chars.by_ref() {
+                if character == '\n' {
+                    break;
                 }
             }
             continue;
         }
         if character == '"' || character == '\'' {
-            let quote = character;
-            let mut value = String::new();
-            index += 1;
-            let mut closed = false;
-            while index < characters.len() {
-                match characters[index] {
-                    '\\' => {
-                        index += 1;
-                        let escaped = characters
-                            .get(index)
-                            .copied()
-                            .ok_or_else(|| "unterminated Lua string literal".to_owned())?;
-                        match escaped {
-                            'n' => value.push('\n'),
-                            'r' => value.push('\r'),
-                            't' => value.push('\t'),
-                            escaped => value.push(escaped),
-                        }
-                        index += 1;
-                    }
-                    character if character == quote => {
-                        index += 1;
-                        closed = true;
-                        break;
-                    }
-                    character => {
-                        value.push(character);
-                        index += 1;
-                    }
-                }
-            }
-            if !closed {
-                return Err("unterminated Lua string literal".to_owned());
-            }
+            let value = read_lua_string(&mut chars, character)?;
             tokens.push(LuaToken::String(value));
             continue;
         }
-        if let Some((content_start, level)) = long_bracket_open(&characters, index) {
-            index = skip_long_bracket(&characters, content_start, level)
-                .ok_or_else(|| "unterminated Lua long string literal".to_owned())?;
+        if character == '[' {
+            if let Some(closing) = take_long_bracket_open(&mut chars) {
+                skip_long_bracket(&mut chars, &closing)?;
+            }
             continue;
         }
         if character.is_ascii_alphabetic() || character == '_' {
             let mut identifier = String::from(character);
-            index += 1;
-            while let Some(next) = characters.get(index).copied() {
+            while let Some(next) = chars.peek().copied() {
                 if next.is_ascii_alphanumeric() || next == '_' {
                     identifier.push(next);
-                    index += 1;
+                    chars.next();
                 } else {
                     break;
                 }
@@ -1286,9 +1565,141 @@ fn lex_lua(source: &str) -> Result<Vec<LuaToken>, String> {
         if matches!(character, '.' | '(' | ')' | ',' | '{' | '}') {
             tokens.push(LuaToken::Symbol(character));
         }
-        index += 1;
     }
     Ok(tokens)
+}
+
+fn take_long_bracket_open(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    let mut lookahead = chars.clone();
+    let mut equals = 0;
+    while lookahead.peek() == Some(&'=') {
+        equals += 1;
+        lookahead.next();
+    }
+    if lookahead.next() != Some('[') {
+        return None;
+    }
+    *chars = lookahead;
+    Some(format!("]{}]", "=".repeat(equals)))
+}
+
+fn skip_long_bracket(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    closing: &str,
+) -> Result<(), String> {
+    let closing: Vec<char> = closing.chars().collect();
+    let mut tail = Vec::new();
+    for character in chars.by_ref() {
+        tail.push(character);
+        if tail.ends_with(&closing) {
+            return Ok(());
+        }
+        if tail.len() > closing.len() {
+            tail.drain(..tail.len() - closing.len());
+        }
+    }
+    Err("unterminated Lua long string or comment".to_owned())
+}
+
+fn read_lua_string(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    quote: char,
+) -> Result<String, String> {
+    let mut value = String::new();
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' => read_lua_escape(chars, &mut value)?,
+            character if character == quote => return Ok(value),
+            '\n' | '\r' => return Err("unterminated Lua string literal".to_owned()),
+            character => value.push(character),
+        }
+    }
+    Err("unterminated Lua string literal".to_owned())
+}
+
+fn read_lua_escape(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    value: &mut String,
+) -> Result<(), String> {
+    let Some(escaped) = chars.next() else {
+        return Err("Lua string ends with an incomplete escape".to_owned());
+    };
+    match escaped {
+        'a' => value.push('\u{7}'),
+        'b' => value.push('\u{8}'),
+        'f' => value.push('\u{c}'),
+        'n' => value.push('\n'),
+        'r' => value.push('\r'),
+        't' => value.push('\t'),
+        'v' => value.push('\u{b}'),
+        '\\' | '"' | '\'' => value.push(escaped),
+        '\n' => value.push('\n'),
+        '\r' => {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            value.push('\n');
+        }
+        'z' => {
+            while chars
+                .peek()
+                .is_some_and(|character| character.is_ascii_whitespace())
+            {
+                chars.next();
+            }
+        }
+        'x' => {
+            let high = chars.next().and_then(|character| character.to_digit(16));
+            let low = chars.next().and_then(|character| character.to_digit(16));
+            let Some(byte) = high.zip(low).map(|(high, low)| (high * 16 + low) as u8) else {
+                return Err("Lua hexadecimal escape must contain two digits".to_owned());
+            };
+            value.push(byte as char);
+        }
+        'u' => {
+            if chars.next() != Some('{') {
+                return Err("Lua Unicode escape must use the form \\u{...}".to_owned());
+            }
+            let mut digits = String::new();
+            let mut closed = false;
+            for character in chars.by_ref() {
+                if character == '}' {
+                    closed = true;
+                    break;
+                }
+                if !character.is_ascii_hexdigit() {
+                    return Err("Lua Unicode escape contains a non-hex digit".to_owned());
+                }
+                digits.push(character);
+            }
+            let Some(codepoint) = closed
+                .then(|| u32::from_str_radix(&digits, 16).ok())
+                .flatten()
+                .and_then(char::from_u32)
+            else {
+                return Err("Lua Unicode escape is invalid".to_owned());
+            };
+            value.push(codepoint);
+        }
+        character if character.is_ascii_digit() => {
+            let mut digits = String::from(character);
+            while digits.len() < 3 {
+                let Some(next) = chars.peek().copied().filter(|next| next.is_ascii_digit()) else {
+                    break;
+                };
+                digits.push(next);
+                chars.next();
+            }
+            let byte = digits
+                .parse::<u8>()
+                .map_err(|_| "Lua decimal escape is outside the byte range".to_owned())?;
+            value.push(byte as char);
+        }
+        other => {
+            return Err(format!("unsupported Lua escape sequence \\\\{other}"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1361,6 +1772,30 @@ o.bind(
     }
 
     #[test]
+    fn keysym_aliases_occupy_the_same_physical_alt_keys() {
+        let source = r#"
+o.bind("Alt_L", "Launch terminal", "kitty")
+o.bind("ALT, Alt_R", "Modified right alt", "workspace next")
+"#;
+
+        assert_eq!(
+            plan_trigger_binding(source),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+
+        let both = r#"
+o.bind("alt_l", "Launch terminal", "kitty")
+o.bind("Alt_R", "Launcher", "launcher")
+"#;
+        let TriggerBindingPlan::Conflicts { conflicts } = plan_trigger_binding(both) else {
+            panic!("Alt_L and Alt_R must occupy the preferred physical keys");
+        };
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].candidate, LEFT_ALT);
+        assert_eq!(conflicts[1].candidate, RIGHT_ALT);
+    }
+
+    #[test]
     fn left_alt_conflict_falls_back_to_right_alt() {
         let source = r#"
 o.bind("code:64", "Launch terminal", "kitty")
@@ -1396,11 +1831,33 @@ o.bind("code:108", "Launcher", hl.dsp.exec_cmd("launcher"))
             "{BEGIN_MARKER}\no.bind(\"code:64\", \"Voisu dictation\", \"voisu toggle\")\n{END_MARKER}\no.bind(\"code:108\", \"Launcher\", \"launcher\")\n"
         );
 
-        let TriggerBindingPlan::Conflicts { conflicts } = plan_trigger_binding(&source) else {
-            panic!("a user-owned exact binding must remain a conflict on rerun");
+        assert_eq!(
+            plan_trigger_binding(&source),
+            TriggerBindingPlan::AlreadyInstalled { key: LEFT_ALT }
+        );
+    }
+
+    #[test]
+    fn same_key_user_binding_is_not_accepted_as_already_installed() {
+        let source = format!(
+            "{BEGIN_MARKER}\no.bind(\"code:64\", \"Voisu dictation\", \"voisu toggle\")\n{END_MARKER}\no.bind(\"code:64\", \"Launcher\", \"launcher\")\n"
+        );
+
+        assert_eq!(
+            plan_trigger_binding(&source),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+
+        let both_keys_user_owned =
+            format!("{source}o.bind(\"code:108\", \"Lock\", \"loginctl lock-session\")\n");
+        let TriggerBindingPlan::Conflicts { conflicts } =
+            plan_trigger_binding(&both_keys_user_owned)
+        else {
+            panic!("a same-key user binding must not hide conflicts behind AlreadyInstalled");
         };
-        assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].candidate, RIGHT_ALT);
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].candidate, LEFT_ALT);
+        assert_eq!(conflicts[1].candidate, RIGHT_ALT);
     }
 
     #[test]
@@ -1414,6 +1871,183 @@ o.bind(left_alt, "Terminal", "kitty")
             panic!("a dynamic candidate key must not be treated as free");
         };
         assert!(detail.contains("binding key"));
+    }
+
+    #[test]
+    fn imported_lua_bindings_are_checked_before_installing() {
+        let (_directory, path) = config_dir();
+        let imported = path.with_file_name("bindings.lua");
+        fs::write(&path, "dofile(\"bindings.lua\")\n").unwrap();
+        fs::write(
+            &imported,
+            "o.bind(\"code:64\", \"Launch terminal\", \"kitty\")\n",
+        )
+        .unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+        let report = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland)
+            .expect("an imported Left Alt binding must force the Right Alt fallback");
+
+        assert_eq!(report.key, RIGHT_ALT);
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.starts_with(&(original + "\n-- BEGIN VOISU MANAGED TRIGGER\n")));
+        assert!(updated.contains("code:108"));
+        assert_eq!(hyprland.reload_calls, 1);
+    }
+
+    #[test]
+    fn parenthesis_free_lua_imports_are_scanned() {
+        let imports = parse_lua_imports(r#"require "bindings" dofile 'extra.lua'"#).unwrap();
+        assert_eq!(
+            imports,
+            vec![
+                LuaImport {
+                    loader: "require",
+                    path: "bindings".to_owned(),
+                },
+                LuaImport {
+                    loader: "dofile",
+                    path: "extra.lua".to_owned(),
+                },
+            ]
+        );
+
+        let (_directory, path) = config_dir();
+        let imported = path.with_file_name("bindings.lua");
+        fs::write(&path, "require \"bindings\"\n").unwrap();
+        fs::write(
+            &imported,
+            "o.bind(\"code:64\", \"Launch terminal\", \"kitty\")\n",
+        )
+        .unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+    }
+
+    #[test]
+    fn non_string_lua_import_args_fail_closed() {
+        let error = parse_lua_imports(r#"require(module_name)"#).unwrap_err();
+        assert!(error.contains("string literal"));
+    }
+
+    #[test]
+    fn require_skips_a_module_directory_and_loads_lua_candidates() {
+        let (directory, path) = config_dir();
+        fs::create_dir(directory.path().join("bindings")).unwrap();
+        fs::write(
+            directory.path().join("bindings.lua"),
+            "o.bind(\"code:64\", \"Launch terminal\", \"kitty\")\n",
+        )
+        .unwrap();
+        fs::write(&path, "require(\"bindings\")\n").unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+
+        fs::remove_file(directory.path().join("bindings.lua")).unwrap();
+        fs::write(
+            directory.path().join("bindings").join("init.lua"),
+            "o.bind(\"code:64\", \"Launch terminal\", \"kitty\")\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+    }
+
+    #[test]
+    fn missing_dofile_import_fails_closed() {
+        let (directory, path) = config_dir();
+        fs::create_dir(directory.path().join("missing")).unwrap();
+        let missing_file = plan_trigger_binding_with_imports(
+            &path,
+            "dofile(\"absent.lua\")\n",
+            &LocalBindingFileSystem,
+        );
+        let TriggerBindingPlan::Unparseable { detail } = missing_file else {
+            panic!("a missing dofile must not be treated as success");
+        };
+        assert!(detail.contains("missing file"));
+
+        let directory_target = plan_trigger_binding_with_imports(
+            &path,
+            "dofile(\"missing\")\n",
+            &LocalBindingFileSystem,
+        );
+        let TriggerBindingPlan::Unparseable { detail } = directory_target else {
+            panic!("dofile of a directory must not be treated as success");
+        };
+        assert!(detail.contains("missing file"));
+    }
+
+    #[test]
+    fn long_bracket_utf8_content_does_not_panic() {
+        let source = "--[[é]]\no.bind(\"code:64\", \"Launch terminal\", \"kitty\")\n";
+        let bindings = parse_lua_bindings(source).expect("multibyte long comments must stay UTF-8");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].key, "code:64");
+        assert_eq!(
+            plan_trigger_binding("local docs = [[é]]\n"),
+            TriggerBindingPlan::Install { key: LEFT_ALT }
+        );
+    }
+
+    #[test]
+    fn marker_like_lines_inside_lua_long_strings_are_not_managed_blocks() {
+        let source = r#"
+local documentation = [[
+-- BEGIN VOISU MANAGED TRIGGER
+-- END VOISU MANAGED TRIGGER
+]]
+"#;
+
+        assert_eq!(
+            plan_trigger_binding(source),
+            TriggerBindingPlan::Install { key: LEFT_ALT }
+        );
+    }
+
+    #[test]
+    fn unbalanced_managed_markers_fail_closed() {
+        let source =
+            format!("{BEGIN_MARKER}\no.bind(\"code:64\", \"Voisu dictation\", \"voisu toggle\")\n");
+
+        let TriggerBindingPlan::Unparseable { detail } = plan_trigger_binding(&source) else {
+            panic!("an unmatched managed marker must not be accepted");
+        };
+        assert!(detail.contains("no matching end marker"));
+    }
+
+    #[test]
+    fn stale_managed_binding_is_not_accepted_as_voisu() {
+        let source = format!(
+            "{BEGIN_MARKER}\no.bind(\"code:64\", \"Voisu dictation\", \"kitty\")\n{END_MARKER}\n"
+        );
+
+        let TriggerBindingPlan::Unparseable { detail } = plan_trigger_binding(&source) else {
+            panic!("a managed binding with a different command must not be accepted");
+        };
+        assert!(detail.contains("expected description or command"));
+    }
+
+    #[test]
+    fn lua_hex_escapes_are_decoded_before_conflict_detection() {
+        let source = r#"o.bind("code\x3a64", "Launch terminal", "kitty")
+o.bind("code:108", "Launcher", "launcher")"#;
+
+        let TriggerBindingPlan::Conflicts { conflicts } = plan_trigger_binding(source) else {
+            panic!("a Lua hexadecimal escape must still occupy Left Alt");
+        };
+        assert_eq!(conflicts[0].candidate, LEFT_ALT);
     }
 
     #[test]
@@ -1570,13 +2204,31 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let mut first = FakeHyprland::new(&[true], true);
         install_trigger_binding(&path, &LocalBindingFileSystem, &mut first).unwrap();
         let before = fs::read_to_string(&path).unwrap();
-        let mut second = FakeHyprland::new(&[], true);
+        let mut second = FakeHyprland::new(&[true], true);
 
         let report = install_trigger_binding(&path, &LocalBindingFileSystem, &mut second).unwrap();
 
         assert!(!report.changed);
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
         assert_eq!(before.matches(BEGIN_MARKER).count(), 1);
+        assert_eq!(second.reload_calls, 1);
+    }
+
+    #[test]
+    fn already_installed_reload_failure_leaves_the_file_untouched() {
+        let (_directory, path) = config_dir();
+        fs::write(&path, "-- user bindings\n").unwrap();
+        let mut first = FakeHyprland::new(&[true], true);
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut first).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let mut second = FakeHyprland::new(&[false], true);
+
+        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut second)
+            .expect_err("a stale compositor must not skip reload on rerun");
+
+        assert!(error.to_string().contains("reload"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(second.reload_calls, 1);
     }
 
     #[test]

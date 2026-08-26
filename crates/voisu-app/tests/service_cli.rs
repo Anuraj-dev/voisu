@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
+const PACKAGED_DAEMON_UNIT: &str = include_str!("../../../packaging/voisu.service");
+const PACKAGED_OVERLAY_UNIT: &str = include_str!("../../../packaging/voisu-overlay.service");
+
 struct ServiceFixture {
     root: TempDir,
     cli: PathBuf,
@@ -352,6 +355,141 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+fn assert_unit_assignment(unit_name: &str, unit: &str, assignment: &str, expected: &str) {
+    let matches: Vec<_> = unit
+        .lines()
+        .filter(|line| line.starts_with(assignment))
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "{unit_name} must contain exactly one {assignment} assignment"
+    );
+    assert_eq!(
+        matches[0],
+        format!("{assignment}{expected}"),
+        "{unit_name} {assignment} shape changed"
+    );
+}
+
+fn assert_unit_assignment_absent(unit_name: &str, unit: &str, assignment: &str) {
+    assert!(
+        !unit.lines().any(|line| line.starts_with(assignment)),
+        "{unit_name} must not contain a {assignment} assignment"
+    );
+}
+
+fn assert_graphical_session_unit_shape(
+    unit_name: &str,
+    unit: &str,
+    expected_after: &str,
+    expected_wants: Option<&str>,
+    expected_conditions: &[&str],
+) {
+    assert_unit_assignment(unit_name, unit, "After=", expected_after);
+    match expected_wants {
+        Some(expected) => assert_unit_assignment(unit_name, unit, "Wants=", expected),
+        None => assert_unit_assignment_absent(unit_name, unit, "Wants="),
+    }
+    assert_unit_assignment(unit_name, unit, "PartOf=", "graphical-session.target");
+    let conditions: Vec<_> = unit
+        .lines()
+        .filter_map(|line| line.strip_prefix("ConditionEnvironment="))
+        .collect();
+    assert_eq!(
+        conditions, expected_conditions,
+        "{unit_name} display conditions changed"
+    );
+    assert_unit_assignment(unit_name, unit, "WantedBy=", "graphical-session.target");
+    assert!(
+        !unit.lines().any(|line| {
+            (line.starts_with("After=") || line.starts_with("Wants="))
+                && line.split_once('=').is_some_and(|(_, dependencies)| {
+                    dependencies
+                        .split_whitespace()
+                        .any(|dependency| dependency == "xdg-desktop-portal.service")
+                })
+        }),
+        "{unit_name} must not own the desktop portal"
+    );
+}
+
+fn assert_packaged_daemon_runtime_contract(unit: &str) {
+    for (assignment, expected) in [
+        ("Restart=", "on-failure"),
+        ("RestartSec=", "2s"),
+        ("TimeoutStopSec=", "60s"),
+        ("NoNewPrivileges=", "yes"),
+        ("ProtectSystem=", "strict"),
+        ("ConfigurationDirectory=", "voisu"),
+        ("StateDirectory=", "voisu"),
+        ("ReadWritePaths=", "%t"),
+        ("PrivateTmp=", "yes"),
+        (
+            "RestrictAddressFamilies=",
+            "AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+        ),
+        ("ProtectKernelTunables=", "yes"),
+        ("ProtectKernelModules=", "yes"),
+        ("ProtectKernelLogs=", "yes"),
+        ("ProtectControlGroups=", "yes"),
+        ("ProtectClock=", "yes"),
+        ("ProtectHostname=", "yes"),
+        ("RestrictRealtime=", "yes"),
+        ("RestrictSUIDSGID=", "yes"),
+        ("LockPersonality=", "yes"),
+        ("RestrictNamespaces=", "yes"),
+        ("SystemCallArchitectures=", "native"),
+        ("MemoryDenyWriteExecute=", "yes"),
+    ] {
+        assert_unit_assignment("voisu.service", unit, assignment, expected);
+    }
+}
+
+fn assert_packaged_overlay_runtime_contract(unit: &str) {
+    for (assignment, expected) in [
+        ("Restart=", "on-failure"),
+        ("NoNewPrivileges=", "yes"),
+        ("ProtectSystem=", "strict"),
+        ("ReadWritePaths=", "%t"),
+        ("PrivateTmp=", "yes"),
+        ("RestrictAddressFamilies=", "AF_UNIX"),
+        ("ProtectKernelTunables=", "yes"),
+        ("ProtectKernelModules=", "yes"),
+        ("ProtectKernelLogs=", "yes"),
+        ("ProtectControlGroups=", "yes"),
+        ("ProtectClock=", "yes"),
+        ("ProtectHostname=", "yes"),
+        ("RestrictRealtime=", "yes"),
+        ("RestrictSUIDSGID=", "yes"),
+        ("LockPersonality=", "yes"),
+        ("RestrictNamespaces=", "yes"),
+        ("SystemCallArchitectures=", "native"),
+    ] {
+        assert_unit_assignment("voisu-overlay.service", unit, assignment, expected);
+    }
+}
+
+#[test]
+fn packaged_units_have_graphical_session_readiness_without_portal_ownership() {
+    assert_graphical_session_unit_shape(
+        "voisu.service",
+        PACKAGED_DAEMON_UNIT,
+        "wayland-session-waitenv.service dbus.socket pipewire.service",
+        Some("dbus.socket pipewire.service"),
+        &["|WAYLAND_DISPLAY", "|DISPLAY"],
+    );
+    assert_graphical_session_unit_shape(
+        "voisu-overlay.service",
+        PACKAGED_OVERLAY_UNIT,
+        "wayland-session-waitenv.service voisu.service",
+        None,
+        &["WAYLAND_DISPLAY"],
+    );
+    assert_packaged_daemon_runtime_contract(PACKAGED_DAEMON_UNIT);
+    assert_packaged_overlay_runtime_contract(PACKAGED_OVERLAY_UNIT);
+}
+
 /// Diagnostic dump for managed-lifecycle assertion failures (no behavior change).
 fn lifecycle_failure_evidence(fixture: &ServiceFixture, output: &Output) -> String {
     let systemctl_log = fs::read_to_string(&fixture.systemctl_log).unwrap_or_default();
@@ -447,9 +585,13 @@ fn install_is_idempotent_atomic_and_free_of_stale_session_or_checkout_values() {
     assert!(upgraded.status.success(), "{}", stderr(&upgraded));
 
     let unit = fs::read_to_string(fixture.unit_path()).unwrap();
-    assert!(unit.contains("After=dbus.socket pipewire.service xdg-desktop-portal.service"));
-    assert!(!unit.contains("After=graphical-session.target"));
-    assert!(unit.contains("WantedBy=graphical-session.target"));
+    assert_graphical_session_unit_shape(
+        "generated voisu.service",
+        &unit,
+        "wayland-session-waitenv.service dbus.socket pipewire.service",
+        Some("dbus.socket pipewire.service"),
+        &["|WAYLAND_DISPLAY", "|DISPLAY"],
+    );
     assert!(unit.contains(&format!(
         "ExecStart=\"{}\" --systemd",
         fixture.installed_daemon().display()
@@ -505,6 +647,7 @@ fn packaged_install_migrates_a_stale_user_service_without_shadowing_the_package(
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
     assert!(calls.contains("--user daemon-reload"));
     assert!(calls.contains("--user enable voisu.service"));
+    assert!(calls.contains("--user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP"));
 }
 
 #[test]
@@ -539,6 +682,16 @@ fn packaged_install_enables_and_restarts_the_optional_overlay_service() {
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
     assert!(calls.contains("--user enable voisu.service"));
     assert!(calls.contains("--user enable --now voisu-overlay.service"));
+    let imported = calls
+        .find("--user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP")
+        .expect("service install must import the interactive session environment");
+    let overlay_enabled = calls
+        .find("--user enable --now voisu-overlay.service")
+        .expect("service install must manage the optional Overlay");
+    assert!(
+        imported < overlay_enabled,
+        "Overlay must start after session environment import: {calls}"
+    );
     // `enable --now` does nothing to an already-running unit, so an update that
     // replaced the Overlay binary would leave the old process alive without an
     // explicit restart.
@@ -984,7 +1137,7 @@ fn managed_service_lifecycle_reports_systemd_ownership_and_daemon_ipc() {
 
 #[test]
 fn service_start_and_restart_import_the_session_display_environment() {
-    // Both start and restart must import the graphical session's display
+    // Install, start, and restart must import the graphical session's display
     // variables into the --user manager before launching the daemon, so
     // Delivery can reach the X/Wayland server. The import precedes the daemon
     // start, so this asserts the systemctl log (timing-independent) and does not
@@ -1000,8 +1153,8 @@ fn service_start_and_restart_import_the_session_display_environment() {
         "--user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP";
     assert_eq!(
         calls.matches(expected).count(),
-        2,
-        "start and restart must each issue the complete import-environment list:\n{calls}"
+        3,
+        "install, start, and restart must each issue the complete import-environment list:\n{calls}"
     );
 }
 

@@ -164,6 +164,7 @@ mod tests {
                     completed_ms: 640,
                 },
             ],
+            provider_failures: Vec::new(),
             release_to_text_ms: Some(1_311),
             transcript_selection: None,
             validation_reason: None,

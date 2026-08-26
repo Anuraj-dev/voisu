@@ -6,7 +6,7 @@ use voisu_core::{
     text_sha256_fingerprint, unix_millis_now, AudioChunk, BoundaryFuture, CapturedAudio,
     DebugAudioRecord, DiagnosticRecord, DiagnosticStore, EnglishEligibilityOutcome,
     IntentReconstructionDiagnostic, IntentReconstructionEligibility, IntentReconstructionOutcome,
-    LifecycleStage,
+    IntentReconstructionEvidence, LifecycleStage, PreparedTranscriptDecision,
     Provider, ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream,
     ProviderStreams, RetentionPolicy, SmartWritingDiagnostic, SmartWritingEditEvidence,
     SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode, SourceTranscript, Transcript,
@@ -730,6 +730,48 @@ impl TranscriptValidator for EchoValidator {
     }
 }
 
+struct DelayedPrepareValidator;
+
+impl TranscriptValidator for DelayedPrepareValidator {
+    fn validate(
+        &mut self,
+        _sources: Vec<SourceTranscript>,
+    ) -> BoundaryFuture<'_, TranscriptDecision> {
+        Box::pin(async { panic!("replay must use prepare()") })
+    }
+
+    fn prepare(
+        &mut self,
+        sources: Vec<SourceTranscript>,
+    ) -> BoundaryFuture<'_, PreparedTranscriptDecision> {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let text = sources
+                .first()
+                .map(|source| source.text.clone())
+                .unwrap_or_default();
+            Ok(PreparedTranscriptDecision::Ready(TranscriptDecision {
+                transcript: Transcript(text),
+                selection: TranscriptSelection::NearIdenticalGroq,
+                validation_reason: "delayed fixture preparation".to_owned(),
+                fallback_reason: None,
+                reconciliation_requested: false,
+                recovery_attempted: false,
+                source_selection_diagnostic: voisu_core::SourceSelectionDiagnostic {
+                    sources: Vec::new(),
+                    selected_provider: None,
+                    confidence: None,
+                },
+                intent_reconstruction: Some(IntentReconstructionEvidence {
+                    eligibility: IntentReconstructionEligibility::NearIdenticalHighConfidence,
+                    outcome: IntentReconstructionOutcome::Skipped,
+                    candidate: None,
+                }),
+            }))
+        })
+    }
+}
+
 #[tokio::test]
 async fn replay_runs_a_fixed_fixture_through_provider_and_validation_boundaries() {
     let streams = ProviderStreams {
@@ -745,11 +787,40 @@ async fn replay_runs_a_fixed_fixture_through_provider_and_validation_boundaries(
     let coordinator =
         ProviderCoordinator::start(Duration::from_secs(5), Duration::from_secs(1), streams);
     let mut validator = EchoValidator;
+    let outcome = replay_capture(
+        CapturedAudio::new(vec![0_u8; 3_200]),
+        coordinator,
+        &mut validator,
+    )
+    .await
+    .expect("replay succeeds");
+    assert_eq!(outcome.source_transcripts.len(), 2, "both providers replayed the fixture");
+    assert_eq!(outcome.decision.transcript.0, "replayed dictation");
+}
+
+#[tokio::test]
+async fn replay_reconstruction_clock_excludes_preparation() {
+    let streams = ProviderStreams {
+        deepgram: Box::new(FixtureStream {
+            provider: Provider::Deepgram,
+            text: "replayed dictation".to_owned(),
+        }),
+        groq: Box::new(FixtureStream {
+            provider: Provider::Groq,
+            text: "replayed dictation".to_owned(),
+        }),
+    };
+    let coordinator =
+        ProviderCoordinator::start(Duration::from_secs(5), Duration::from_secs(1), streams);
+    let mut validator = DelayedPrepareValidator;
     let outcome = replay_capture(CapturedAudio::new(vec![0_u8; 3_200]), coordinator, &mut validator)
         .await
         .expect("replay succeeds");
-    assert_eq!(outcome.source_transcripts.len(), 2, "both providers replayed the fixture");
-    assert_eq!(outcome.decision.transcript.0, "replayed dictation");
+    assert!(
+        outcome.reconstruction_elapsed_ms < 100,
+        "preparation latency must not be attributed to reconstruction: {} ms",
+        outcome.reconstruction_elapsed_ms
+    );
 }
 
 #[test]
