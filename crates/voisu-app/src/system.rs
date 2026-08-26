@@ -6512,14 +6512,16 @@ type PasteSetupResult = (
     Box<dyn RemoteDesktopPortal>,
     Result<Box<dyn DirectDeliverySession>, BoundaryError>,
 );
+type LivePasteActionVerifier = Arc<dyn Fn() -> Option<VerifiedPasteAction> + Send + Sync>;
 
 pub struct PortalPasteAction {
     action: VerifiedPasteAction,
     portal: Option<Box<dyn RemoteDesktopPortal>>,
     session: Option<Box<dyn DirectDeliverySession>>,
     setup: Option<tokio::task::JoinHandle<PasteSetupResult>>,
+    live_verification: Option<tokio::task::JoinHandle<Option<VerifiedPasteAction>>>,
     terminal_failure: Option<String>,
-    revalidate_live: bool,
+    live_action_verifier: Option<LivePasteActionVerifier>,
 }
 
 impl PortalPasteAction {
@@ -6527,29 +6529,49 @@ impl PortalPasteAction {
         action: VerifiedPasteAction,
         portal: Box<dyn RemoteDesktopPortal>,
     ) -> Self {
-        Self::with_options(action, portal, false)
+        Self::with_options(action, portal, None)
     }
 
     fn with_live_revalidation(
         action: VerifiedPasteAction,
         portal: Box<dyn RemoteDesktopPortal>,
     ) -> Self {
-        Self::with_options(action, portal, true)
+        Self::with_options(
+            action,
+            portal,
+            Some(Arc::new(
+                crate::hyprland_bindings::discover_live_paste_action,
+            )),
+        )
     }
 
     fn with_options(
         action: VerifiedPasteAction,
         portal: Box<dyn RemoteDesktopPortal>,
-        revalidate_live: bool,
+        live_action_verifier: Option<LivePasteActionVerifier>,
     ) -> Self {
         Self {
             action,
             portal: Some(portal),
             session: None,
             setup: None,
+            live_verification: None,
             terminal_failure: None,
-            revalidate_live,
+            live_action_verifier,
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_revalidation(
+        action: VerifiedPasteAction,
+        portal: Box<dyn RemoteDesktopPortal>,
+        live_action: VerifiedPasteAction,
+    ) -> Self {
+        Self::with_options(
+            action,
+            portal,
+            Some(Arc::new(move || Some(live_action.clone()))),
+        )
     }
 }
 
@@ -6566,17 +6588,31 @@ impl PasteBoundary for PortalPasteAction {
                     "verified Paste Action changed during Delivery",
                 ));
             }
-            if self.revalidate_live
-                && crate::hyprland_bindings::discover_live_paste_action().as_ref()
-                    != Some(&requested)
-            {
-                return Err(BoundaryError::new(
-                    BoundaryKind::Delivery,
-                    "verified Paste Action is no longer active",
-                ));
-            }
             if let Some(reason) = self.terminal_failure.clone() {
                 return Err(BoundaryError::new(BoundaryKind::Delivery, reason));
+            }
+            if let Some(verifier) = self.live_action_verifier.clone() {
+                if self.live_verification.is_none() {
+                    self.live_verification = Some(tokio::task::spawn_blocking(move || verifier()));
+                }
+                let verification = self
+                    .live_verification
+                    .take()
+                    .expect("live Paste Action verification was started");
+                if !verification.is_finished() {
+                    self.live_verification = Some(verification);
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Delivery,
+                        "Paste Action verification pending",
+                    ));
+                }
+                let live_action = verification.await.ok().flatten();
+                if live_action.as_ref() != Some(&requested) {
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Delivery,
+                        "verified Paste Action is no longer active",
+                    ));
+                }
             }
             if self.session.is_none() {
                 if self.setup.is_none() {
@@ -6636,7 +6672,7 @@ impl PasteBoundary for PortalPasteAction {
 impl PortalPasteAction {
     fn remember_failure(&mut self, error: &BoundaryError) {
         let reason = error.diagnostic().to_owned();
-        if terminal_remote_desktop_failure(&reason) {
+        if error.is_permanent() || terminal_remote_desktop_failure(&reason) {
             clear_restore_token();
             self.terminal_failure = Some(reason);
         }
@@ -7191,12 +7227,18 @@ impl RemoteDesktopPortal for FedoraRemoteDesktopPortal {
 }
 
 fn classify_remote_desktop_failure(error: BoundaryError) -> BoundaryError {
-    let reason = if error.diagnostic().contains("denied or cancelled") {
+    let permanent = error.is_permanent();
+    let reason = if error.is_permanent() || error.diagnostic().contains("denied or cancelled") {
         "permission denied"
     } else {
         "RemoteDesktop portal unavailable"
     };
-    BoundaryError::new(BoundaryKind::Delivery, reason)
+    let classified = BoundaryError::new(BoundaryKind::Delivery, reason);
+    if permanent {
+        classified.permanent()
+    } else {
+        classified
+    }
 }
 
 async fn fail_and_close(
@@ -7206,7 +7248,7 @@ async fn fail_and_close(
 ) -> BoundaryError {
     close_portal_session(connection, session_path).await;
     let error = classify_remote_desktop_failure(error);
-    if terminal_remote_desktop_failure(error.diagnostic()) {
+    if error.is_permanent() || terminal_remote_desktop_failure(error.diagnostic()) {
         clear_restore_token();
     }
     error
@@ -7538,10 +7580,10 @@ fn resolve_shortcut_keycodes(
     let keycode = if let Some(raw) = key.strip_prefix("code:") {
         raw.parse::<u32>().ok().and_then(|raw| raw.checked_sub(8))
     } else {
-        let name = if key.len() == 1 {
+        let name = if key.len() == 1 && key.as_bytes()[0].is_ascii_alphabetic() {
             key.to_ascii_lowercase()
         } else {
-            key.to_owned().to_string()
+            (*key).to_owned()
         };
         let keysym = xkb::keysym_from_name(&name, xkb::KEYSYM_CASE_INSENSITIVE);
         (keysym != xkb::Keysym::from(xkb::keysyms::KEY_NoSymbol)).then(|| find(keysym)).flatten()
@@ -10291,9 +10333,118 @@ mod tests {
         let lowercase = resolve_shortcut_keycodes(text.clone(), 0, "SUPER + v").unwrap();
         assert_eq!(uppercase, lowercase);
         assert_eq!(
-            resolve_shortcut_keycodes(text, 0, "code:64").unwrap(),
+            resolve_shortcut_keycodes(text.clone(), 0, "SUPER + INSERT").unwrap(),
+            resolve_shortcut_keycodes(text.clone(), 0, "SUPER + insert").unwrap()
+        );
+        assert_eq!(
+            resolve_shortcut_keycodes(text.clone(), 0, "code:64").unwrap(),
             vec![56]
         );
+        assert_eq!(
+            resolve_shortcut_keycodes(text, 0, "code:108").unwrap(),
+            vec![100]
+        );
+    }
+
+    #[tokio::test]
+    async fn paste_action_rejects_a_cached_binding_after_live_revalidation_changes() {
+        use crate::hyprland_bindings::{PasteBehavior, PasteShortcut};
+
+        let cached = VerifiedPasteAction {
+            shortcut: PasteShortcut {
+                binding: "SUPER + V".to_owned(),
+            },
+            description: "Universal paste".to_owned(),
+            live_binding_identity: "91".to_owned(),
+            behavior: PasteBehavior::Simple,
+        };
+        let live = VerifiedPasteAction {
+            live_binding_identity: "92".to_owned(),
+            ..cached.clone()
+        };
+        let mut paste = PortalPasteAction::with_test_revalidation(
+            cached.clone(),
+            Box::new(DisabledRemoteDesktopPortal),
+            live,
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let error = paste
+                    .invoke(&cached)
+                    .await
+                    .expect_err("a stale cached action must fail closed");
+                if error.diagnostic() == "Paste Action verification pending" {
+                    tokio::task::yield_now().await;
+                } else {
+                    break error;
+                }
+            }
+        })
+        .await
+        .expect("live verification should complete");
+        assert_eq!(error.diagnostic(), "verified Paste Action is no longer active");
+    }
+
+    #[tokio::test]
+    async fn live_paste_revalidation_does_not_block_invoke() {
+        use std::sync::mpsc;
+
+        use crate::hyprland_bindings::{PasteBehavior, PasteShortcut};
+
+        let action = VerifiedPasteAction {
+            shortcut: PasteShortcut {
+                binding: "SUPER + V".to_owned(),
+            },
+            description: "Universal paste".to_owned(),
+            live_binding_identity: "91".to_owned(),
+            behavior: PasteBehavior::Simple,
+        };
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let releaser = std::thread::spawn(move || {
+            started_rx.recv().expect("live verifier should start");
+            release_tx.send(()).expect("live verifier should be released");
+        });
+        let verifier_action = action.clone();
+        let verifier_release = Arc::clone(&release_rx);
+        let verifier = Arc::new(move || {
+            started_tx.send(()).expect("live verifier start should be observed");
+            let _ = verifier_release.lock().unwrap().recv();
+            done_tx.send(()).expect("live verifier completion should be observed");
+            Some(verifier_action.clone())
+        });
+        let mut paste = PortalPasteAction::with_options(
+            action.clone(),
+            Box::new(DisabledRemoteDesktopPortal),
+            Some(verifier),
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(1), paste.invoke(&action))
+            .await
+            .expect("live verification must not block the delivery future")
+            .expect_err("the first invocation must fail closed while verification is pending");
+        assert_eq!(error.diagnostic(), "Paste Action verification pending");
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("live verifier should finish in the background");
+        releaser.join().expect("verifier release thread should finish");
+    }
+
+    #[test]
+    fn remote_desktop_classification_preserves_permanent_denials() {
+        let error = classify_remote_desktop_failure(
+            BoundaryError::new(
+                BoundaryKind::Delivery,
+                "the desktop did not approve the SelectDevices request (response 1)",
+            )
+            .permanent(),
+        );
+
+        assert_eq!(error.diagnostic(), "permission denied");
+        assert!(error.is_permanent());
     }
 
     /// A compositor that populates the keymap memfd with `write()` leaves the

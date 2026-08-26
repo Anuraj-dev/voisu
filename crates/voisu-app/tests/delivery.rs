@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use tempfile::TempDir;
+use tokio::sync::Notify;
 
 use voisu_app::focus::SharedFocusProbe;
 use voisu_app::hyprland_bindings::{PasteBehavior, PasteShortcut, VerifiedPasteAction};
@@ -122,8 +123,35 @@ impl DirectDeliverySession for PasteSession {
 struct PastePortal {
     attempts: Arc<AtomicUsize>,
     events: Arc<Mutex<Vec<String>>>,
-    delay: bool,
+    control: Option<Arc<PastePortalControl>>,
     failure: Option<&'static str>,
+}
+
+struct PastePortalControl {
+    started: Notify,
+    completed: Notify,
+    release: Notify,
+    wait_for_release: bool,
+}
+
+impl PastePortalControl {
+    fn gated() -> Arc<Self> {
+        Arc::new(Self {
+            started: Notify::new(),
+            completed: Notify::new(),
+            release: Notify::new(),
+            wait_for_release: true,
+        })
+    }
+
+    fn immediate() -> Arc<Self> {
+        Arc::new(Self {
+            started: Notify::new(),
+            completed: Notify::new(),
+            release: Notify::new(),
+            wait_for_release: false,
+        })
+    }
 }
 
 impl RemoteDesktopPortal for PastePortal {
@@ -138,12 +166,16 @@ impl RemoteDesktopPortal for PastePortal {
 
     fn connect_paste(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>> {
         self.attempts.fetch_add(1, Ordering::SeqCst);
-        let delay = self.delay;
+        let control = self.control.clone();
         let failure = self.failure;
         let events = Arc::clone(&self.events);
         Box::pin(async move {
-            if delay {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            if let Some(control) = control {
+                control.started.notify_one();
+                if control.wait_for_release {
+                    control.release.notified().await;
+                }
+                control.completed.notify_one();
             }
             match failure {
                 Some(reason) => Err(BoundaryError::new(BoundaryKind::Delivery, reason)),
@@ -194,6 +226,7 @@ fn verified_paste_action() -> VerifiedPasteAction {
             binding: "CTRL + SHIFT + P".to_owned(),
         },
         description: "Paste transcript".to_owned(),
+        live_binding_identity: "test-live-binding".to_owned(),
         behavior: PasteBehavior::Simple,
     }
 }
@@ -413,20 +446,27 @@ async fn paste_failure_keeps_the_final_transcript_on_clipboard_and_does_not_retr
 async fn paste_portal_setup_is_backgrounded_and_later_delivers_the_shortcut() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let attempts = Arc::new(AtomicUsize::new(0));
+    let control = PastePortalControl::gated();
     let action = verified_paste_action();
     let mut paste = PortalPasteAction::with_boundaries(
         action.clone(),
         Box::new(PastePortal {
             attempts: Arc::clone(&attempts),
             events: Arc::clone(&events),
-            delay: true,
+            control: Some(Arc::clone(&control)),
             failure: None,
         }),
     );
 
     let first = paste.invoke(&action).await.expect_err("setup should be pending");
     assert_eq!(first.diagnostic(), "Paste portal permission request pending");
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::timeout(Duration::from_secs(1), control.started.notified())
+        .await
+        .expect("paste portal setup should start");
+    control.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), control.completed.notified())
+        .await
+        .expect("paste portal setup should complete");
     paste.invoke(&action).await.unwrap();
 
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
@@ -434,22 +474,82 @@ async fn paste_portal_setup_is_backgrounded_and_later_delivers_the_shortcut() {
 }
 
 #[tokio::test]
+async fn paste_delivery_returns_before_permission_finishes_and_preserves_each_transcript() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let control = PastePortalControl::gated();
+    let action = verified_paste_action();
+    let paste = PortalPasteAction::with_boundaries(
+        action.clone(),
+        Box::new(PastePortal {
+            attempts: Arc::clone(&attempts),
+            events: Arc::clone(&events),
+            control: Some(Arc::clone(&control)),
+            failure: None,
+        }),
+    );
+    let mut delivery = PortalClipboardDelivery::with_paste_boundaries(
+        Box::new(RecordingClipboard(Arc::clone(&events))),
+        action,
+        Box::new(paste),
+    );
+
+    let first = tokio::time::timeout(
+        Duration::from_secs(1),
+        delivery.deliver(Transcript("first transcript".to_owned())),
+    )
+    .await
+    .expect("permission approval must not block Transcript completion")
+    .unwrap();
+    assert_eq!(first.method, DeliveryMethod::ClipboardFallback);
+    assert!(first
+        .fallback_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("permission request pending")));
+
+    tokio::time::timeout(Duration::from_secs(1), control.started.notified())
+        .await
+        .expect("paste portal setup should start");
+    control.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), control.completed.notified())
+        .await
+        .expect("paste portal setup should complete");
+    let second = delivery
+        .deliver(Transcript("second transcript".to_owned()))
+        .await
+        .unwrap();
+    assert_eq!(second.method, DeliveryMethod::CompositorSubmitted);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [
+            "clipboard:first transcript",
+            "clipboard:second transcript",
+            "shortcut:CTRL + SHIFT + P"
+        ]
+    );
+}
+
+#[tokio::test]
 async fn paste_portal_terminal_denial_is_not_retried() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let attempts = Arc::new(AtomicUsize::new(0));
+    let control = PastePortalControl::immediate();
     let action = verified_paste_action();
     let mut paste = PortalPasteAction::with_boundaries(
         action.clone(),
         Box::new(PastePortal {
             attempts: Arc::clone(&attempts),
             events,
-            delay: false,
+            control: Some(Arc::clone(&control)),
             failure: Some("permission denied"),
         }),
     );
 
     let _ = paste.invoke(&action).await;
-    tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(1), control.completed.notified())
+        .await
+        .expect("paste portal denial should complete");
     let first = paste.invoke(&action).await.expect_err("denial must fail");
     let second = paste.invoke(&action).await.expect_err("denial must stay terminal");
 

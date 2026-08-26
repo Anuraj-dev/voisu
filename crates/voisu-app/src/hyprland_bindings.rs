@@ -39,6 +39,7 @@ pub enum PasteBehavior {
 pub struct VerifiedPasteAction {
     pub shortcut: PasteShortcut,
     pub description: String,
+    pub live_binding_identity: String,
     pub behavior: PasteBehavior,
 }
 
@@ -63,6 +64,8 @@ pub struct LuaBinding {
     pub key: String,
     pub description: String,
     pub command: String,
+    dispatcher: Option<String>,
+    dispatcher_arguments: Option<Vec<String>>,
     managed: bool,
 }
 
@@ -340,6 +343,15 @@ fn binding_argument(binding: &Value) -> Option<&str> {
     })
 }
 
+fn live_binding_identity(binding: &Value, dispatcher: &str) -> Option<String> {
+    let argument = binding_argument(binding)?.trim();
+    match dispatcher {
+        "__lua" => argument.parse::<u64>().ok().map(|_| argument.to_owned()),
+        "exec" => Some(argument.to_owned()),
+        _ => None,
+    }
+}
+
 pub fn parse_lua_bindings(source: &str) -> Result<Vec<LuaBinding>, String> {
     let mut bindings = Vec::new();
     let mut chunk = String::new();
@@ -387,6 +399,9 @@ pub fn discover_paste_action(sources: &[&str], live_bindings: &Value) -> Option<
         let Some(dispatcher) = binding.get("dispatcher").and_then(Value::as_str) else {
             continue;
         };
+        let Some(live_binding_identity) = live_binding_identity(binding, dispatcher) else {
+            continue;
+        };
         let Some(live_description) = binding.get("description").and_then(Value::as_str) else {
             continue;
         };
@@ -405,6 +420,7 @@ pub fn discover_paste_action(sources: &[&str], live_bindings: &Value) -> Option<
                     binding: candidate.key.trim().to_owned(),
                 },
                 description: candidate.description.clone(),
+                live_binding_identity,
                 behavior: PasteBehavior::OmarchyUniversal {
                     normal: PasteShortcut {
                         binding: "CTRL + V".to_owned(),
@@ -429,6 +445,7 @@ pub fn discover_paste_action(sources: &[&str], live_bindings: &Value) -> Option<
                     binding: candidate.key.trim().to_owned(),
                 },
                 description: candidate.description.clone(),
+                live_binding_identity,
                 behavior: PasteBehavior::Simple,
             });
         }
@@ -537,7 +554,11 @@ fn live_binding_matches_source(live: &Value, source: &LuaBinding) -> bool {
         Some("exec") => binding_argument(live)
             .map(str::trim)
             .is_some_and(|argument| argument == source.command.trim()),
-        Some("__lua") => source.command == "<Lua dispatcher>",
+        Some("__lua") => {
+            source.command == "<Lua dispatcher>"
+                && source.dispatcher.as_deref().is_some()
+                && live_binding_identity(live, "__lua").is_some()
+        }
         _ => false,
     }
 }
@@ -582,76 +603,217 @@ fn is_paste_description(description: &str) -> bool {
 
 fn is_omarchy_universal_paste(binding: &LuaBinding, source: &str) -> bool {
     if binding.command != "<Lua dispatcher>"
+        || binding.dispatcher.as_deref() != Some("universal_clipboard_shortcut")
         || binding.description != "Universal paste"
         || !binding.key.contains('+')
+        || !binding
+            .dispatcher_arguments
+            .as_ref()
+            .is_some_and(|arguments| {
+                arguments
+                    .iter()
+                    .map(String::as_str)
+                    .eq(["CTRL", "V", "SHIFT", "Insert"])
+            })
     {
         return false;
     }
-    let compact = compact_lua_code(source);
-    [
-        "universal_clipboard_shortcut(default_mods,default_key,terminal_mods,terminal_key)",
-        "ifactive_window_is_terminal()then",
-        "send_shortcut_once(terminal_mods,terminal_key)()",
-        "send_shortcut_once(default_mods,default_key)()",
-    ]
-    .iter()
-    .all(|marker| compact.contains(marker))
-        && (compact.contains("functionuniversal_clipboard_shortcut(")
-            || compact.contains("localfunctionuniversal_clipboard_shortcut("))
+    let Ok(tokens) = lex_lua(source) else {
+        return false;
+    };
+    let Some(body) = named_function_body(
+        &tokens,
+        "universal_clipboard_shortcut",
+        &[
+            "default_mods",
+            "default_key",
+            "terminal_mods",
+            "terminal_key",
+        ],
+    ) else {
+        return false;
+    };
+
+    let expected_body = [
+        LuaPattern::Identifier("return"),
+        LuaPattern::Identifier("function"),
+        LuaPattern::Symbol('('),
+        LuaPattern::Symbol(')'),
+        LuaPattern::Identifier("if"),
+        LuaPattern::Identifier("active_window_is_terminal"),
+        LuaPattern::Symbol('('),
+        LuaPattern::Symbol(')'),
+        LuaPattern::Identifier("then"),
+        LuaPattern::Identifier("send_shortcut_once"),
+        LuaPattern::Symbol('('),
+        LuaPattern::Identifier("terminal_mods"),
+        LuaPattern::Symbol(','),
+        LuaPattern::Identifier("terminal_key"),
+        LuaPattern::Symbol(')'),
+        LuaPattern::Symbol('('),
+        LuaPattern::Symbol(')'),
+        LuaPattern::Identifier("else"),
+        LuaPattern::Identifier("send_shortcut_once"),
+        LuaPattern::Symbol('('),
+        LuaPattern::Identifier("default_mods"),
+        LuaPattern::Symbol(','),
+        LuaPattern::Identifier("default_key"),
+        LuaPattern::Symbol(')'),
+        LuaPattern::Symbol('('),
+        LuaPattern::Symbol(')'),
+        LuaPattern::Identifier("end"),
+        LuaPattern::Identifier("end"),
+    ];
+    matches_lua_pattern(body, &expected_body)
 }
 
-fn compact_lua_code(source: &str) -> String {
-    let mut code = String::new();
-    let mut characters = source.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '-' && characters.peek() == Some(&'-') {
-            characters.next();
-            if characters.peek() == Some(&'[') {
-                characters.next();
-                if characters.peek() == Some(&'[') {
-                    characters.next();
-                    let mut previous = None;
-                    for character in characters.by_ref() {
-                        if previous == Some(']') && character == ']' {
-                            break;
-                        }
-                        previous = Some(character);
-                    }
-                    continue;
-                }
+#[derive(Clone, Copy)]
+enum LuaPattern<'a> {
+    Identifier(&'a str),
+    Symbol(char),
+}
+
+fn matches_lua_pattern(tokens: &[LuaToken], pattern: &[LuaPattern<'_>]) -> bool {
+    tokens.len() == pattern.len()
+        && tokens.iter().zip(pattern).all(|(token, pattern)| match pattern {
+            LuaPattern::Identifier(expected) => {
+                matches!(token, LuaToken::Identifier(actual) if actual == expected)
             }
-            for character in characters.by_ref() {
-                if character == '\n' {
-                    break;
-                }
+            LuaPattern::Symbol(expected) => {
+                matches!(token, LuaToken::Symbol(actual) if actual == expected)
             }
+        })
+}
+
+fn named_function_body<'a>(
+    tokens: &'a [LuaToken],
+    name: &str,
+    expected_parameters: &[&str],
+) -> Option<&'a [LuaToken]> {
+    for function_index in 0..tokens.len().saturating_sub(3) {
+        if !matches!(
+            (&tokens[function_index], &tokens[function_index + 1]),
+            (LuaToken::Identifier(keyword), LuaToken::Identifier(function_name))
+                if keyword == "function" && function_name == name
+        ) {
             continue;
         }
-        if character == '[' && characters.peek() == Some(&'[') {
-            characters.next();
-            let mut previous = None;
-            for character in characters.by_ref() {
-                if previous == Some(']') && character == ']' {
-                    break;
-                }
-                previous = Some(character);
-            }
+        if !matches!(tokens.get(function_index + 2), Some(LuaToken::Symbol('('))) {
             continue;
         }
-        if character == '"' || character == '\'' {
-            let quote = character;
-            while let Some(character) = characters.next() {
-                if character == '\\' {
-                    let _ = characters.next();
-                } else if character == quote {
-                    break;
-                }
-            }
+        let (body_start, parameters) = parse_function_parameters(tokens, function_index + 2)?;
+        if parameters != expected_parameters {
             continue;
         }
-        code.push(character);
+        let body_end = matching_function_end(tokens, body_start)?;
+        return Some(&tokens[body_start..body_end]);
     }
-    code.chars().filter(|character| !character.is_whitespace()).collect()
+    None
+}
+
+fn parse_function_parameters(tokens: &[LuaToken], open_index: usize) -> Option<(usize, Vec<&str>)> {
+    let mut index = open_index + 1;
+    let mut parameters = Vec::new();
+    loop {
+        match tokens.get(index)? {
+            LuaToken::Identifier(parameter) => {
+                parameters.push(parameter.as_str());
+                index += 1;
+                if !matches!(tokens.get(index), Some(LuaToken::Symbol(','))) {
+                    if !matches!(tokens.get(index), Some(LuaToken::Symbol(')'))) {
+                        return None;
+                    }
+                    return Some((index + 1, parameters));
+                }
+                index += 1;
+            }
+            LuaToken::Symbol(')') => return Some((index + 1, parameters)),
+            _ => return None,
+        }
+    }
+}
+
+fn matching_function_end(tokens: &[LuaToken], body_start: usize) -> Option<usize> {
+    let mut blocks = vec![LuaBlock::Function];
+    let mut awaiting_loop_do = false;
+    for (index, token) in tokens.iter().enumerate().skip(body_start) {
+        let LuaToken::Identifier(keyword) = token else {
+            continue;
+        };
+        match keyword.as_str() {
+            "function" => {
+                blocks.push(LuaBlock::Function);
+                awaiting_loop_do = false;
+            }
+            "if" => {
+                blocks.push(LuaBlock::Conditional);
+                awaiting_loop_do = false;
+            }
+            "for" | "while" => {
+                blocks.push(LuaBlock::Loop);
+                awaiting_loop_do = true;
+            }
+            "do" if awaiting_loop_do => awaiting_loop_do = false,
+            "do" => {
+                blocks.push(LuaBlock::Do);
+                awaiting_loop_do = false;
+            }
+            "repeat" => {
+                blocks.push(LuaBlock::Repeat);
+                awaiting_loop_do = false;
+            }
+            "until" if matches!(blocks.last(), Some(LuaBlock::Repeat)) => {
+                blocks.pop();
+            }
+            "until" => return None,
+            "end" => {
+                blocks.pop()?;
+                if blocks.is_empty() {
+                    return Some(index);
+                }
+                awaiting_loop_do = false;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+enum LuaBlock {
+    Function,
+    Conditional,
+    Loop,
+    Do,
+    Repeat,
+}
+
+fn long_bracket_open(characters: &[char], start: usize) -> Option<(usize, usize)> {
+    (characters.get(start) == Some(&'[')).then(|| {
+        let mut index = start + 1;
+        while characters.get(index) == Some(&'=') {
+            index += 1;
+        }
+        (characters.get(index) == Some(&'[')).then_some((index + 1, index - start - 1))
+    })?
+}
+
+fn skip_long_bracket(characters: &[char], mut index: usize, level: usize) -> Option<usize> {
+    while index < characters.len() {
+        if characters[index] == ']' {
+            let mut close = index + 1;
+            while close < characters.len()
+                && characters[close] == '='
+                && close - index - 1 < level
+            {
+                close += 1;
+            }
+            if close - index - 1 == level && characters.get(close) == Some(&']') {
+                return Some(close + 1);
+            }
+        }
+        index += 1;
+    }
+    None
 }
 
 pub fn plan_trigger_binding(source: &str) -> TriggerBindingPlan {
@@ -892,8 +1054,16 @@ enum LuaToken {
     Symbol(char),
 }
 
+type ParsedBindArguments = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<Vec<String>>,
+);
+
 fn parse_lua_chunk(source: &str, managed: bool) -> Result<Vec<LuaBinding>, String> {
-    let tokens = lex_lua(source);
+    let tokens = lex_lua(source)?;
     let mut bindings = Vec::new();
     let mut index = 0;
     while index + 3 < tokens.len() {
@@ -910,11 +1080,14 @@ fn parse_lua_chunk(source: &str, managed: bool) -> Result<Vec<LuaBinding>, Strin
             index += 1;
             continue;
         }
-        let (key, description, command) = parse_bind_arguments(&tokens[index + 4..])?;
+        let (key, description, command, dispatcher, dispatcher_arguments) =
+            parse_bind_arguments(&tokens[index + 4..])?;
         bindings.push(LuaBinding {
             key,
             description,
             command,
+            dispatcher,
+            dispatcher_arguments,
             managed,
         });
         index += 4;
@@ -922,7 +1095,9 @@ fn parse_lua_chunk(source: &str, managed: bool) -> Result<Vec<LuaBinding>, Strin
     Ok(bindings)
 }
 
-fn parse_bind_arguments(tokens: &[LuaToken]) -> Result<(String, String, String), String> {
+fn parse_bind_arguments(
+    tokens: &[LuaToken],
+) -> Result<ParsedBindArguments, String> {
     let mut index = 0;
     let read_string = |index: &mut usize, label: &str| -> Result<String, String> {
         let value = match tokens.get(*index) {
@@ -943,38 +1118,110 @@ fn parse_bind_arguments(tokens: &[LuaToken]) -> Result<(String, String, String),
         return Err("the binding description must be followed by a comma".to_owned());
     }
     index += 1;
-    let command = match tokens.get(index) {
-        Some(LuaToken::String(value)) => value.clone(),
+    let (command, dispatcher, dispatcher_arguments) = match tokens.get(index) {
+        Some(LuaToken::String(value)) => {
+            index += 1;
+            (value.clone(), None, None)
+        }
         Some(LuaToken::Symbol(')')) => return Err("the binding command is missing".to_owned()),
-        Some(_) => "<Lua dispatcher>".to_owned(),
+        Some(LuaToken::Identifier(name)) => {
+            let name = name.clone();
+            index += 1;
+            let arguments = if matches!(tokens.get(index), Some(LuaToken::Symbol('('))) {
+                let (next, arguments) = parse_dispatcher_arguments(tokens, index)?;
+                index = next;
+                arguments
+            } else {
+                index = binding_expression_end(tokens, index)?;
+                None
+            };
+            ("<Lua dispatcher>".to_owned(), Some(name), arguments)
+        }
+        Some(_) => {
+            index = binding_expression_end(tokens, index)?;
+            ("<Lua dispatcher>".to_owned(), None, None)
+        }
         None => return Err("the binding command is missing".to_owned()),
     };
-    Ok((key, description, command))
+    if !matches!(tokens.get(index), Some(LuaToken::Symbol(')'))) {
+        return Err("the binding command must be followed by a closing parenthesis".to_owned());
+    }
+    Ok((key, description, command, dispatcher, dispatcher_arguments))
 }
 
-fn lex_lua(source: &str) -> Vec<LuaToken> {
-    let mut chars = source.chars().peekable();
-    let mut tokens = Vec::new();
-    while let Some(character) = chars.next() {
-        if character == '-' && chars.peek() == Some(&'-') {
-            chars.next();
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                if chars.peek() == Some(&'[') {
-                    chars.next();
-                    let mut previous = None;
-                    for character in chars.by_ref() {
-                        if previous == Some(']') && character == ']' {
-                            break;
-                        }
-                        previous = Some(character);
-                    }
-                    continue;
+fn parse_dispatcher_arguments(
+    tokens: &[LuaToken],
+    open_index: usize,
+) -> Result<(usize, Option<Vec<String>>), String> {
+    let mut index = open_index + 1;
+    let mut arguments = Vec::new();
+    loop {
+        match tokens.get(index) {
+            Some(LuaToken::String(argument)) => {
+                arguments.push(argument.clone());
+                index += 1;
+            }
+            Some(LuaToken::Symbol(')')) => return Ok((index + 1, Some(arguments))),
+            Some(_) => return Ok((matching_parenthesis(tokens, open_index)?, None)),
+            None => return Err("the dispatcher call is missing a closing parenthesis".to_owned()),
+        }
+        match tokens.get(index) {
+            Some(LuaToken::Symbol(',')) => index += 1,
+            Some(LuaToken::Symbol(')')) => return Ok((index + 1, Some(arguments))),
+            Some(_) => {
+                return Err(
+                    "the dispatcher arguments must be separated by commas".to_owned(),
+                )
+            }
+            None => return Err("the dispatcher call is missing a closing parenthesis".to_owned()),
+        }
+    }
+}
+
+fn matching_parenthesis(tokens: &[LuaToken], open_index: usize) -> Result<usize, String> {
+    let mut depth = 0;
+    for (index, token) in tokens.iter().enumerate().skip(open_index) {
+        match token {
+            LuaToken::Symbol('(') => depth += 1,
+            LuaToken::Symbol(')') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(index + 1);
                 }
             }
-            for character in chars.by_ref() {
-                if character == '\n' {
-                    break;
+            _ => {}
+        }
+    }
+    Err("the dispatcher call is missing a closing parenthesis".to_owned())
+}
+
+fn binding_expression_end(tokens: &[LuaToken], start_index: usize) -> Result<usize, String> {
+    let mut depth = 0;
+    for (index, token) in tokens.iter().enumerate().skip(start_index) {
+        match token {
+            LuaToken::Symbol('(') => depth += 1,
+            LuaToken::Symbol(')') if depth == 0 => return Ok(index),
+            LuaToken::Symbol(')') => depth -= 1,
+            _ => {}
+        }
+    }
+    Err("the binding command is missing a closing parenthesis".to_owned())
+}
+
+fn lex_lua(source: &str) -> Result<Vec<LuaToken>, String> {
+    let characters = source.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+        if character == '-' && characters.get(index + 1) == Some(&'-') {
+            index += 2;
+            if let Some((content_start, level)) = long_bracket_open(&characters, index) {
+                index = skip_long_bracket(&characters, content_start, level)
+                    .ok_or_else(|| "unterminated Lua long comment".to_owned())?;
+            } else {
+                while index < characters.len() && characters[index] != '\n' {
+                    index += 1;
                 }
             }
             continue;
@@ -982,28 +1229,53 @@ fn lex_lua(source: &str) -> Vec<LuaToken> {
         if character == '"' || character == '\'' {
             let quote = character;
             let mut value = String::new();
-            while let Some(character) = chars.next() {
-                match character {
-                    '\\' => match chars.next() {
-                        Some('n') => value.push('\n'),
-                        Some('r') => value.push('\r'),
-                        Some('t') => value.push('\t'),
-                        Some(escaped) => value.push(escaped),
-                        None => break,
-                    },
-                    character if character == quote => break,
-                    character => value.push(character),
+            index += 1;
+            let mut closed = false;
+            while index < characters.len() {
+                match characters[index] {
+                    '\\' => {
+                        index += 1;
+                        let escaped = characters
+                            .get(index)
+                            .copied()
+                            .ok_or_else(|| "unterminated Lua string literal".to_owned())?;
+                        match escaped {
+                            'n' => value.push('\n'),
+                            'r' => value.push('\r'),
+                            't' => value.push('\t'),
+                            escaped => value.push(escaped),
+                        }
+                        index += 1;
+                    }
+                    character if character == quote => {
+                        index += 1;
+                        closed = true;
+                        break;
+                    }
+                    character => {
+                        value.push(character);
+                        index += 1;
+                    }
                 }
+            }
+            if !closed {
+                return Err("unterminated Lua string literal".to_owned());
             }
             tokens.push(LuaToken::String(value));
             continue;
         }
+        if let Some((content_start, level)) = long_bracket_open(&characters, index) {
+            index = skip_long_bracket(&characters, content_start, level)
+                .ok_or_else(|| "unterminated Lua long string literal".to_owned())?;
+            continue;
+        }
         if character.is_ascii_alphabetic() || character == '_' {
             let mut identifier = String::from(character);
-            while let Some(next) = chars.peek().copied() {
+            index += 1;
+            while let Some(next) = characters.get(index).copied() {
                 if next.is_ascii_alphanumeric() || next == '_' {
                     identifier.push(next);
-                    chars.next();
+                    index += 1;
                 } else {
                     break;
                 }
@@ -1014,8 +1286,9 @@ fn lex_lua(source: &str) -> Vec<LuaToken> {
         if matches!(character, '.' | '(' | ')' | ',' | '{' | '}') {
             tokens.push(LuaToken::Symbol(character));
         }
+        index += 1;
     }
-    tokens
+    Ok(tokens)
 }
 
 #[cfg(test)]
@@ -1377,6 +1650,7 @@ o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V",
         let action = discover_paste_action(&[OMARCHY_PASTE_SOURCE], &live)
             .expect("known Omarchy helper should be verified");
         assert_eq!(action.shortcut.binding, "SUPER + V");
+        assert_eq!(action.live_binding_identity, "91");
         assert_eq!(
             action.behavior,
             PasteBehavior::OmarchyUniversal {
@@ -1384,6 +1658,42 @@ o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V",
                 terminal: PasteShortcut { binding: "SHIFT + Insert".to_owned() },
             }
         );
+    }
+
+    #[test]
+    fn changed_live_lua_identity_invalidates_the_verified_action() {
+        let first = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+        let second = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "92"
+        }]);
+
+        let first = discover_paste_action(&[OMARCHY_PASTE_SOURCE], &first).unwrap();
+        let second = discover_paste_action(&[OMARCHY_PASTE_SOURCE], &second).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(second.live_binding_identity, "92");
+    }
+
+    #[test]
+    fn lua_paste_binding_requires_a_numeric_live_identity() {
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": ""
+        }]);
+
+        assert!(discover_paste_action(&[OMARCHY_PASTE_SOURCE], &live).is_none());
     }
 
     #[test]
@@ -1402,6 +1712,150 @@ o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V",
         }]);
 
         assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn omarchy_helper_markers_in_long_comments_and_strings_are_not_verified() {
+        let source = r#"
+--[=[
+function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key)
+  if active_window_is_terminal() then
+    send_shortcut_once(terminal_mods, terminal_key)()
+    send_shortcut_once(default_mods, default_key)()
+  end
+end
+]=]
+local fake = [=[
+function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key)
+  if active_window_is_terminal() then
+    send_shortcut_once(terminal_mods, terminal_key)()
+    send_shortcut_once(default_mods, default_key)()
+  end
+end
+]=]
+o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V", "SHIFT", "Insert"))
+"#;
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+
+        assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn literal_paste_binding_inside_a_long_comment_is_not_verified() {
+        let source = r#"
+--[=[
+o.bind("SUPER + V", "Paste transcript", "safe-paste")
+]=]
+"#;
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Paste transcript",
+            "dispatcher": "exec",
+            "arg": "safe-paste"
+        }]);
+
+        assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn dynamic_paste_binding_with_an_unrelated_helper_shape_fails_closed() {
+        let source = r#"
+local function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key)
+  if active_window_is_terminal() then
+    send_shortcut_once(terminal_mods, terminal_key)()
+    send_shortcut_once(default_mods, default_key)()
+  end
+end
+local function unrelated_paste()
+  os.execute("paste")
+end
+o.bind("SUPER + V", "Universal paste", unrelated_paste)
+"#;
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+
+        assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn omarchy_markers_must_be_inside_the_named_helper_body() {
+        let source = r#"
+local function unrelated_helper()
+  if active_window_is_terminal() then
+    send_shortcut_once(terminal_mods, terminal_key)()
+    send_shortcut_once(default_mods, default_key)()
+  end
+end
+local function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key)
+  return function()
+  end
+end
+o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V", "SHIFT", "Insert"))
+"#;
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+
+        assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn omarchy_helper_rejects_extra_or_reordered_body_logic() {
+        let source = r#"
+local function universal_clipboard_shortcut(default_mods, default_key, terminal_mods, terminal_key)
+  return function()
+    if active_window_is_terminal() then
+      send_shortcut_once(default_mods, default_key)()
+      send_shortcut_once(terminal_mods, terminal_key)()
+    else
+      send_shortcut_once(default_mods, default_key)()
+    end
+  end
+end
+o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V", "SHIFT", "Insert"))
+"#;
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+
+        assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn omarchy_helper_requires_the_known_shortcut_arguments() {
+        let source = OMARCHY_PASTE_SOURCE.replace(
+            "universal_clipboard_shortcut(\"CTRL\", \"V\", \"SHIFT\", \"Insert\")",
+            "universal_clipboard_shortcut(\"CTRL\", \"V\", \"ALT\", \"Insert\")",
+        );
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "__lua",
+            "arg": "91"
+        }]);
+
+        assert!(discover_paste_action(&[&source], &live).is_none());
     }
 
     #[test]
