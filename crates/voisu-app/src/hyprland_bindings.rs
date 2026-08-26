@@ -517,9 +517,9 @@ fn long_bracket_open(chars: &[char], start: usize) -> Option<(String, usize)> {
 
 /// Finds the first paste binding that is proven by both the active Lua source
 /// and the compositor's live binding table. The source is deliberately
-/// conservative: literal dispatchers are accepted only when their description
-/// identifies a paste action, and dynamic Lua functions are accepted only for
-/// the exact Omarchy universal-paste helper shape.
+/// conservative: string-literal third arguments are accepted only when their
+/// description identifies a paste action, and dynamic Lua functions are
+/// accepted only for the exact Omarchy universal-paste helper shape.
 pub fn discover_paste_action(
     sources: &[&str],
     live_bindings: &Value,
@@ -547,49 +547,51 @@ pub fn discover_paste_action(
         let Some(live_description) = binding.get("description").and_then(Value::as_str) else {
             continue;
         };
-        let Some(source) = bindings.iter().find_map(|(candidate, source)| {
-            (candidate.description == live_description
-                && live_binding_matches_source(binding, candidate))
-            .then_some((candidate, source))
-        }) else {
-            continue;
-        };
-        let (candidate, source_text) = source;
+        // One live row can share a description with several source binds. Try
+        // each match so an earlier unverified candidate cannot hide a later
+        // helper or string command.
+        for (candidate, source_text) in &bindings {
+            if candidate.description != live_description
+                || !live_binding_matches_source(binding, candidate)
+            {
+                continue;
+            }
 
-        if dispatcher == "__lua" && is_omarchy_universal_paste(candidate, source_text) {
-            return Some(VerifiedPasteAction {
-                shortcut: PasteShortcut {
-                    binding: candidate.key.trim().to_owned(),
-                },
-                description: candidate.description.clone(),
-                live_binding_identity,
-                behavior: PasteBehavior::OmarchyUniversal {
-                    normal: PasteShortcut {
-                        binding: "CTRL + V".to_owned(),
+            if dispatcher == "__lua" && is_omarchy_universal_paste(candidate, source_text) {
+                return Some(VerifiedPasteAction {
+                    shortcut: PasteShortcut {
+                        binding: candidate.key.trim().to_owned(),
                     },
-                    terminal: PasteShortcut {
-                        binding: "SHIFT + Insert".to_owned(),
+                    description: candidate.description.clone(),
+                    live_binding_identity,
+                    behavior: PasteBehavior::OmarchyUniversal {
+                        normal: PasteShortcut {
+                            binding: "CTRL + V".to_owned(),
+                        },
+                        terminal: PasteShortcut {
+                            binding: "SHIFT + Insert".to_owned(),
+                        },
                     },
-                },
-            });
-        }
+                });
+            }
 
-        // A literal dispatcher is safe to trigger through the compositor. The
-        // command itself is not executed by Voisu; it is only selected after
-        // the source and live dispatcher agree. Dynamic functions and unknown
-        // dispatchers never reach this branch.
-        if dispatcher == "exec"
-            && candidate.command != "<Lua dispatcher>"
-            && is_paste_description(&candidate.description)
-        {
-            return Some(VerifiedPasteAction {
-                shortcut: PasteShortcut {
-                    binding: candidate.key.trim().to_owned(),
-                },
-                description: candidate.description.clone(),
-                live_binding_identity,
-                behavior: PasteBehavior::Simple,
-            });
+            // String o.bind commands are live __lua on current Hyprland, not
+            // exec. The command stays with Hyprland; Voisu only emits the chord.
+            // Identifier and function third arguments stay unverified except
+            // the Omarchy helper above.
+            if matches!(dispatcher, "exec" | "__lua")
+                && is_string_literal_command(candidate)
+                && is_paste_description(&candidate.description)
+            {
+                return Some(VerifiedPasteAction {
+                    shortcut: PasteShortcut {
+                        binding: candidate.key.trim().to_owned(),
+                    },
+                    description: candidate.description.clone(),
+                    live_binding_identity,
+                    behavior: PasteBehavior::Simple,
+                });
+            }
         }
     }
     None
@@ -698,13 +700,17 @@ fn live_binding_matches_source(live: &Value, source: &LuaBinding) -> bool {
         }
     }
     match dispatcher {
-        Some("exec") => binding_argument(live)
-            .map(str::trim)
-            .is_some_and(|argument| argument == source.command.trim()),
+        Some("exec") => {
+            is_string_literal_command(source)
+                && binding_argument(live)
+                    .map(str::trim)
+                    .is_some_and(|argument| argument == source.command.trim())
+        }
         Some("__lua") => {
-            source.command == "<Lua dispatcher>"
-                && source.dispatcher.as_deref().is_some()
-                && live_binding_identity(live, "__lua").is_some()
+            live_binding_identity(live, "__lua").is_some()
+                && (is_string_literal_command(source)
+                    || (source.command == "<Lua dispatcher>"
+                        && source.dispatcher.as_deref().is_some()))
         }
         _ => false,
     }
@@ -749,6 +755,10 @@ fn is_paste_description(description: &str) -> bool {
     let description = description.to_ascii_lowercase();
     description.contains("paste")
         || (description.contains("clipboard") && description.contains("insert"))
+}
+
+fn is_string_literal_command(binding: &LuaBinding) -> bool {
+    binding.command != "<Lua dispatcher>" && binding.dispatcher.is_none()
 }
 
 fn is_omarchy_universal_paste(binding: &LuaBinding, source: &str) -> bool {
@@ -2629,7 +2639,24 @@ o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V",
     }
 
     #[test]
-    fn a_different_literal_paste_binding_is_verified_from_live_hyprland() {
+    fn a_literal_lua_paste_binding_is_verified_from_opaque_live_lua() {
+        let source = r#"o.bind("CTRL + SHIFT + P", "Paste transcript", "hyprctl dispatch sendshortcut CTRL V")"#;
+        let live = serde_json::json!([{
+            "key": "",
+            "modmask": 0,
+            "description": "Paste transcript",
+            "dispatcher": "__lua",
+            "arg": "92"
+        }]);
+
+        let action = discover_paste_action(&[source], &live).expect("literal binding is verified");
+        assert_eq!(action.shortcut.binding, "CTRL + SHIFT + P");
+        assert_eq!(action.live_binding_identity, "92");
+        assert_eq!(action.behavior, PasteBehavior::Simple);
+    }
+
+    #[test]
+    fn a_literal_paste_binding_still_verifies_when_live_dispatcher_is_exec() {
         let source = r#"o.bind("CTRL + SHIFT + P", "Paste transcript", "hyprctl dispatch sendshortcut CTRL V")"#;
         let live = serde_json::json!([{
             "key": "P",
@@ -2794,6 +2821,57 @@ end"#,
         );
 
         assert!(discover_paste_action(&[&source], &universal_paste_live("V", 64)).is_none());
+    }
+
+    #[test]
+    fn earlier_unverified_universal_paste_does_not_hide_a_later_helper() {
+        let unrelated = r#"
+local function unrelated_paste()
+  os.execute("paste")
+end
+o.bind("SUPER + V", "Universal paste", unrelated_paste)
+"#;
+
+        let action = discover_paste_action(
+            &[unrelated, OMARCHY_PASTE_SOURCE],
+            &universal_paste_live("", 0),
+        )
+        .expect("a later Omarchy helper must still verify");
+        assert_eq!(action.shortcut.binding, "SUPER + V");
+        assert_eq!(
+            action.behavior,
+            PasteBehavior::OmarchyUniversal {
+                normal: PasteShortcut {
+                    binding: "CTRL + V".to_owned()
+                },
+                terminal: PasteShortcut {
+                    binding: "SHIFT + Insert".to_owned()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn earlier_unverified_function_does_not_hide_a_later_literal_paste() {
+        let function_source = r#"
+local function my_paste()
+  os.execute("dangerous-command")
+end
+o.bind("CTRL + SHIFT + P", "Paste transcript", my_paste)
+"#;
+        let literal = r#"o.bind("CTRL + SHIFT + P", "Paste transcript", "safe-paste")"#;
+        let live = serde_json::json!([{
+            "key": "",
+            "modmask": 0,
+            "description": "Paste transcript",
+            "dispatcher": "__lua",
+            "arg": "92"
+        }]);
+
+        let action = discover_paste_action(&[function_source, literal], &live)
+            .expect("a later string command must still verify");
+        assert_eq!(action.shortcut.binding, "CTRL + SHIFT + P");
+        assert_eq!(action.behavior, PasteBehavior::Simple);
     }
 
     #[test]
