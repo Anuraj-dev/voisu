@@ -13,7 +13,11 @@ set -euo pipefail
 readonly SCRIPT_NAME=${0##*/}
 readonly -a MANUAL_GATES=(
     clean-account-install
-    trigger-key-conflict
+    trigger-key-accepted
+    trigger-key-rejected
+    trigger-key-occupied
+    trigger-key-both-occupied
+    trigger-key-managed-rerun
     cold-login
     daemon-wayland
     controlled-recording
@@ -58,21 +62,26 @@ Automated probes collected by --check:
   - daemon and Overlay user journal entries
 
 Manual gates, each requiring <name>.pass or <name>.waived evidence:
-  clean-account-install  install the exact `voisu` or `voisu-bin` package
-  trigger-key-conflict   verify Left Alt and Right Alt conflict handling
-  cold-login              reboot, log into Hyprland, and observe both services
-  daemon-wayland          prove the daemon owns the current WAYLAND_DISPLAY
-  controlled-recording    produce exactly one final clipboard Transcript
-  overlay-feedback        observe Recording, Processing, and terminal Overlay feedback
-  verified-paste          verify the configured Paste Action inserts it
-  clipboard-fallback      prove paste failure/unavailability preserves clipboard
-  compositor-recovery     restart Hyprland and its portal, then verify recovery
-  stale-daemon-doctor     create stale daemon state and verify doctor fails
-  upgrade-reinstall       upgrade/reinstall without losing credentials or bindings
+  clean-account-install       install the exact `voisu` or `voisu-bin` package
+  trigger-key-accepted        Caps Lock accepted as Trigger Key; record hyprctl binds -j
+  trigger-key-rejected        Caps Lock declined; Right Alt installed; never auto-install Left Alt
+  trigger-key-occupied        exact unmanaged Caps Lock kept; Right Alt fallback
+  trigger-key-both-occupied   Caps Lock and Right Alt owned; fail closed; no overwrite or Left Alt
+  trigger-key-managed-rerun   existing managed Caps Lock or Right Alt kept on setup rerun
+  cold-login                  reboot, log into Hyprland, and observe both services
+  daemon-wayland              prove the daemon owns the current WAYLAND_DISPLAY
+  controlled-recording        produce exactly one final clipboard Transcript
+  overlay-feedback            observe Recording, Processing, and terminal Overlay feedback
+  verified-paste              verify the configured Paste Action inserts it
+  clipboard-fallback          prove paste failure/unavailability preserves clipboard
+  compositor-recovery         restart Hyprland and its portal, then verify recovery
+  stale-daemon-doctor         create stale daemon state and verify doctor fails
+  upgrade-reinstall           upgrade/reinstall without losing credentials or bindings
 
 The runner never installs packages, changes Hyprland configuration, restarts a
 service, or reboots the machine. Those actions belong to the documented gate
-operator and must be recorded in the marker evidence.
+operator and must be recorded in the marker evidence. Left Alt is not an
+automatically installed Trigger Key.
 EOF
 }
 

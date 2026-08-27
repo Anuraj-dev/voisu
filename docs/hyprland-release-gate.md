@@ -46,9 +46,21 @@ voisu setup
 ```
 
 Do not repair the installation with an undocumented manual unit, binding, or
-environment override. Before changing a trigger binding, record whether Left
-Alt and Right Alt are already owned and preserve the relevant `hyprctl binds -j`
-output.
+environment override. The approved Trigger Key policy is Caps Lock (`code:66`)
+first, then Right Alt (`code:108`). Never auto-install Left Alt, and never
+overwrite an exact unmanaged binding.
+
+Before changing a trigger binding, record Caps Lock and Right Alt occupancy and
+preserve the relevant `hyprctl binds -j` output. The Trigger Key evidence must
+cover all of:
+
+- Caps Lock accepted (default yes), with lock-toggle disabled on that key
+- Caps Lock rejected, with Right Alt installed and Left Alt not auto-installed
+- Caps Lock occupied by an exact unmanaged bind, that bind preserved, Right Alt used
+- both Caps Lock and Right Alt occupied, setup fail-closed, no overwrite
+- rerunning setup with an existing managed Caps Lock binding and with an
+  existing managed Right Alt binding, keeping those binds without rewriting
+  occupancy
 
 Reboot and log into Hyprland. Without manually restarting Voisu, record:
 
@@ -85,7 +97,11 @@ Missing markers block the runner.
 | Marker | Required evidence |
 | --- | --- |
 | `clean-account-install.pass` | exact `voisu` or `voisu-bin` package installed on a clean account |
-| `trigger-key-conflict.pass` | Left Alt/Right Alt conflict behavior and `hyprctl binds -j` |
+| `trigger-key-accepted.pass` | Caps Lock accepted; `hyprctl binds -j` before/after; lock-toggle disabled |
+| `trigger-key-rejected.pass` | Caps Lock declined; Right Alt installed; Left Alt not auto-installed |
+| `trigger-key-occupied.pass` | unmanaged Caps Lock preserved; Right Alt fallback; `hyprctl binds -j` |
+| `trigger-key-both-occupied.pass` | both candidates occupied; fail closed; no overwrite; no Left Alt install |
+| `trigger-key-managed-rerun.pass` | existing managed Caps Lock and Right Alt reruns keep those binds |
 | `cold-login.pass` | reboot/login result; both services started without manual restart |
 | `daemon-wayland.pass` | daemon-owned `WAYLAND_DISPLAY` matches the active session |
 | `controlled-recording.pass` | exactly one final Transcript on the clipboard |

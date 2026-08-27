@@ -178,7 +178,7 @@ passing release claim.
 Do not claim Hyprland support until a packaged installation passes all of these on a clean user account:
 
 1. Install Voisu and run only the documented setup flow.
-2. Confirm the requested Trigger Key was not already owned before Voisu changes it.
+2. Record Caps Lock and Right Alt occupancy with `hyprctl binds -j`, then prove Caps Lock accepted, Caps Lock rejected (Right Alt installed), Caps Lock occupied (unmanaged bind preserved, Right Alt fallback), both candidates occupied (fail closed, no overwrite), and existing managed Caps Lock/Right Alt reruns. Never auto-install Left Alt.
 3. Reboot and log into Hyprland.
 4. Confirm both services start without an ordering cycle or manual restart.
 5. Confirm the daemon process has the active `WAYLAND_DISPLAY` before the first Recording.

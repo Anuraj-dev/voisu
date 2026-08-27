@@ -304,8 +304,9 @@ make_pass_markers() {
     local evidence_dir=$1
     local except=${2:-}
     local gate
-    for gate in clean-account-install trigger-key-conflict cold-login \
-        daemon-wayland controlled-recording overlay-feedback verified-paste \
+    for gate in clean-account-install trigger-key-accepted trigger-key-rejected \
+        trigger-key-occupied trigger-key-both-occupied trigger-key-managed-rerun \
+        cold-login daemon-wayland controlled-recording overlay-feedback verified-paste \
         clipboard-fallback compositor-recovery stale-daemon-doctor upgrade-reinstall; do
         [[ $gate == "$except" ]] || : >"$evidence_dir/$gate.pass"
     done
@@ -601,6 +602,45 @@ test_nonempty_journals() {
     assert_status 0 'nonempty journals must pass'
 }
 
+test_trigger_key_markers() {
+    local evidence_dir
+    local gate
+    local plan_output
+    plan_output=$("$gate_script" --plan)
+    printf '%s\n' "$plan_output" | grep -Eq '^  trigger-key-accepted[[:space:]]' \
+        || fail '--plan must list Caps Lock accepted'
+    printf '%s\n' "$plan_output" | grep -Eq '^  trigger-key-rejected[[:space:]]' \
+        || fail '--plan must list Caps Lock rejected'
+    printf '%s\n' "$plan_output" | grep -Eq '^  trigger-key-occupied[[:space:]]' \
+        || fail '--plan must list Caps Lock occupied'
+    printf '%s\n' "$plan_output" | grep -Eq '^  trigger-key-both-occupied[[:space:]]' \
+        || fail '--plan must list both candidates occupied'
+    printf '%s\n' "$plan_output" | grep -Eq '^  trigger-key-managed-rerun[[:space:]]' \
+        || fail '--plan must list existing managed Caps Lock/Right Alt reruns'
+    [[ $plan_output == *'never auto-install Left Alt'* ]] \
+        || fail '--plan must say Left Alt is never auto-installed'
+    [[ $plan_output == *'The runner never installs packages, changes Hyprland configuration, restarts a'* ]] \
+        || fail '--plan must keep the runner from installing, rebooting, restarting, or editing the compositor'
+    if [[ $plan_output == *'verify Left Alt and Right Alt conflict handling'* ]]; then
+        fail '--plan must not auto-install Left Alt as a Trigger Key candidate'
+    fi
+    if [[ $plan_output == *'trigger-key-conflict'* ]]; then
+        fail '--plan must replace the Left Alt/Right Alt conflict gate'
+    fi
+    for gate in trigger-key-accepted trigger-key-rejected trigger-key-occupied \
+        trigger-key-both-occupied trigger-key-managed-rerun; do
+        evidence_dir=$(new_evidence_dir)
+        initialize_evidence "$evidence_dir"
+        make_pass_markers "$evidence_dir" "$gate"
+        run_gate "$evidence_dir"
+        assert_status 4 "missing $gate marker must block"
+        assert_result "$gate" PENDING "missing $gate must remain pending"
+        : >"$evidence_dir/$gate.pass"
+        run_gate "$evidence_dir"
+        assert_status 0 "complete $gate evidence must pass"
+    done
+}
+
 test_fresh_directory_required() {
     local evidence_dir
     evidence_dir=$(new_evidence_dir)
@@ -621,18 +661,41 @@ test_paste_documentation() {
             fail "Hyprland documentation contains stale clipboard-only wording: $stale_phrase"
         fi
     done
-    grep -Fq 'If a configured Paste Action is verified' "$problems_doc" \
+    grep -Fq 'If a verified Hyprland Paste Action exists' "$problems_doc" \
         || fail 'Hyprland documentation must make Paste Action insertion conditional'
-    grep -Fq 'If the Paste Action is unavailable or fails' "$problems_doc" \
+    grep -Fq 'Unverified or failed paste stays clipboard-only.' "$problems_doc" \
         || fail 'Hyprland documentation must document clipboard fallback for Paste Action failure'
-    grep -Fq 'If setup verified' "$problems_doc" \
-        && grep -Fq 'a Paste Action, confirm it inserts that same Transcript into the focused' "$problems_doc" \
+    grep -Fq 'at most one verified Paste Action' "$problems_doc" \
         || fail 'Hyprland checklist must document verified Paste Action insertion'
-    grep -Fq 'If no verified Paste Action is available or paste fails,' "$problems_doc" \
-        && grep -Fq 'confirm the Transcript remains on the clipboard.' "$problems_doc" \
+    grep -Fq 'paste failure must leave the Transcript on the clipboard' "$problems_doc" \
         || fail 'Hyprland checklist must document clipboard fallback'
     grep -Fq '| `overlay-feedback.pass` | Overlay shows Recording, Processing, and terminal feedback |' "$release_doc" \
         || fail 'release gate documentation must list Overlay feedback evidence'
+    grep -Fq '| `trigger-key-accepted.pass` | Caps Lock accepted; `hyprctl binds -j` before/after; lock-toggle disabled |' "$release_doc" \
+        || fail 'release gate documentation must list Caps Lock accepted evidence'
+    grep -Fq '| `trigger-key-rejected.pass` | Caps Lock declined; Right Alt installed; Left Alt not auto-installed |' "$release_doc" \
+        || fail 'release gate documentation must list Caps Lock rejected evidence'
+    grep -Fq '| `trigger-key-occupied.pass` | unmanaged Caps Lock preserved; Right Alt fallback; `hyprctl binds -j` |' "$release_doc" \
+        || fail 'release gate documentation must list Caps Lock occupied evidence'
+    grep -Fq '| `trigger-key-both-occupied.pass` | both candidates occupied; fail closed; no overwrite; no Left Alt install |' "$release_doc" \
+        || fail 'release gate documentation must list both-candidates-occupied evidence'
+    grep -Fq '| `trigger-key-managed-rerun.pass` | existing managed Caps Lock and Right Alt reruns keep those binds |' "$release_doc" \
+        || fail 'release gate documentation must list managed Caps Lock/Right Alt rerun evidence'
+    grep -Fq 'Never auto-install Left Alt' "$release_doc" \
+        || fail 'release gate documentation must forbid auto-installing Left Alt'
+    grep -Fq 'Never auto-install Left Alt' "$problems_doc" \
+        || fail 'Hyprland problems documentation must forbid auto-installing Left Alt'
+    grep -Fq 'both candidates occupied' "$problems_doc" \
+        || fail 'Hyprland problems documentation must require both-candidates-occupied evidence'
+    grep -Fq 'existing managed Caps Lock/Right Alt reruns' "$problems_doc" \
+        || fail 'Hyprland problems documentation must require managed Caps Lock/Right Alt reruns'
+    if grep -Fq 'Left Alt/Right Alt conflict' "$release_doc" \
+        || grep -Fq 'whether Left Alt and Right Alt are already owned' "$release_doc"; then
+        fail 'release gate documentation must not treat Left Alt as an automatically installed Trigger Key'
+    fi
+    if grep -Fq 'verify Left Alt and Right Alt conflict handling' "$gate_script"; then
+        fail 'release gate plan must not treat Left Alt as an automatically installed Trigger Key'
+    fi
     if grep -Eiq '\b(rpm|nevra|fedora)\b' "$release_doc"; then
         fail 'release gate documentation must describe the Arch package path, not RPM'
     fi
@@ -657,6 +720,7 @@ test_symlink_payload
 test_empty_package_artifact
 test_artifact_byte_replacement
 test_nonempty_journals
+test_trigger_key_markers
 test_fresh_directory_required
 test_paste_documentation
 printf '%s\n' 'Hyprland release-gate tests: PASS'

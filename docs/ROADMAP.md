@@ -46,7 +46,7 @@ Shipped and working in the current release:
 
 As of 2026-08-24, the installed `voisu-bin` `0.35.2-1` works on Raja's
 Omarchy/Hyprland host. Both user services are enabled and active. `voisu doctor`
-passes every check. Left Alt starts and stops Recordings, and clipboard Delivery
+passes every check. Caps Lock starts and stops Recordings, and clipboard Delivery
 works. No active runtime issue is known on this configured host.
 
 The remaining work is release follow-through and transcript-quality experiments.
