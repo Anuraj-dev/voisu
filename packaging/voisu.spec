@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.41.0
+Version:        0.42.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,20 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Thu Aug 27 2026 Voisu maintainers <voisu@example.invalid> - 0.42.0-1
+- fix(setup): read hyprctl binds past the 64KiB helper cap
+- fix(setup): use yay for Arch Overlay recovery and restore bind planner
+- fix(setup): skip computed Hyprland combination binds
+- fix(setup): skip Omarchy bootstrap dofile and prompt Caps Lock
+- fix(setup): force clipboard Delivery on Hyprland reruns
+- fix(setup): close Hyprland review gaps
+- fix(setup): use question-mark after Caps Lock reload
+- fix(setup): apply Caps Lock kb_options without hypr.input require
+- fix(setup): inspect sibling bindings.lua for Trigger occupancy
+- feat(setup): prefer Caps Lock then Right Alt on Hyprland
+- fix(setup): restart daemon after Hyprland settings
+- feat(setup): orchestrate Hyprland configuration
+
 * Wed Aug 26 2026 Voisu maintainers <voisu@example.invalid> - 0.41.0-1
 - fix(paste): verify Hyprland Lua string paste binds as Simple
 - fix(paste): verify opaque Hyprland Lua binds on the first invoke
