@@ -169,16 +169,22 @@ Running `voisu service install` may replace or migrate the host-only daemon unit
 
 ## Release gates
 
+The executable collector and operator-owned evidence procedure live in
+[`docs/hyprland-release-gate.md`](hyprland-release-gate.md) and
+`packaging/hyprland-release-gate.sh`. The collector is fail-closed: it never
+turns an unrun cold-login, recovery, stale-daemon, or upgrade check into a
+passing release claim.
+
 Do not claim Hyprland support until a packaged installation passes all of these on a clean user account:
 
 1. Install Voisu and run only the documented setup flow.
-2. Confirm the requested Trigger Key was not already owned before Voisu changes it.
+2. Record Caps Lock and Right Alt occupancy with `hyprctl binds -j`, then prove Caps Lock accepted, Caps Lock rejected (Right Alt installed), Caps Lock occupied (unmanaged bind preserved, Right Alt fallback), both candidates occupied (fail closed, no overwrite), and existing managed Caps Lock/Right Alt reruns. Never auto-install Left Alt.
 3. Reboot and log into Hyprland.
 4. Confirm both services start without an ordering cycle or manual restart.
 5. Confirm the daemon process has the active `WAYLAND_DISPLAY` before the first Recording.
 6. Press Caps Lock (or the selected Trigger Key) to start and stop a controlled Recording.
 7. Confirm exactly one final Transcript reaches the clipboard, then at most one verified Paste Action; paste failure must leave the Transcript on the clipboard.
-8. Confirm the Overlay shows Recording, Processing, and terminal feedback.
+8. Confirm the Overlay shows Recording, Processing, and terminal feedback, and record that result in the release evidence.
 9. Restart Hyprland or its portal and confirm both Voisu processes recover.
 10. Deliberately create a stale-daemon condition and confirm `voisu doctor` detects it.
 11. Upgrade and reinstall the package, then confirm the settings, keybinding, credentials, and service behavior remain intact.
