@@ -1920,6 +1920,46 @@ fn clipboard_finding_for_candidates(candidates: &[ClipboardTool]) -> ReadinessFi
         ))
 }
 
+/// Read-only check that `tool` can reach the current display.
+///
+/// Used by the daemon at start so `clipboard_usable` is not inferred from a
+/// display env var plus an executable on `PATH`. The probe never writes, so it
+/// cannot clobber the user clipboard. An empty selection still counts as
+/// usable; a connect-failure does not.
+pub fn clipboard_backend_display_reachable(tool: ClipboardTool) -> bool {
+    let (program, arguments) = tool.read_command();
+    match run_restricted(program, arguments, None, false) {
+        Ok(outcome) => clipboard_read_proves_display(outcome.success, &outcome.stderr),
+        Err(_) => false,
+    }
+}
+
+fn clipboard_read_proves_display(success: bool, stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if clipboard_connect_failed(&stderr) {
+        return false;
+    }
+    success || clipboard_empty_selection(&stderr)
+}
+
+fn clipboard_connect_failed(stderr: &str) -> bool {
+    stderr.contains("failed to connect")
+        || stderr.contains("can't open display")
+        || stderr.contains("cannot open display")
+        || stderr.contains("unable to open display")
+        || stderr.contains("unable to connect")
+        || stderr.contains("could not connect")
+        || stderr.contains("connection refused")
+}
+
+fn clipboard_empty_selection(stderr: &str) -> bool {
+    stderr.contains("nothing is copied")
+        || stderr.contains("clipboard is empty")
+        || stderr.contains("no mime type")
+        || stderr.contains("target string not available")
+        || stderr.contains("no owner")
+}
+
 /// Verifies the clipboard backend that the daemon's Delivery adapters use for
 /// Transcript preservation. On Wayland this probes wl-copy/wl-paste
 /// specifically; an installed xclip cannot make a missing or broken
@@ -8885,6 +8925,35 @@ mod tests {
             writes.into_inner(),
             vec![b"probe".to_vec(), b"prior clipboard".to_vec()]
         );
+    }
+
+    #[test]
+    fn clipboard_read_probe_treats_empty_selection_as_usable() {
+        assert!(clipboard_read_proves_display(true, b""));
+        assert!(clipboard_read_proves_display(
+            false,
+            b"Nothing is copied\n"
+        ));
+        assert!(clipboard_read_proves_display(
+            false,
+            b"Error: target STRING not available\n"
+        ));
+    }
+
+    #[test]
+    fn clipboard_read_probe_treats_connect_failure_as_unusable() {
+        assert!(!clipboard_read_proves_display(
+            false,
+            b"failed to connect to a Wayland server: No such file or directory\n"
+        ));
+        assert!(!clipboard_read_proves_display(
+            true,
+            b"failed to connect to a Wayland server: No such file or directory\n"
+        ));
+        assert!(!clipboard_read_proves_display(
+            false,
+            b"Error: Can't open display: :0\n"
+        ));
     }
 
     #[test]

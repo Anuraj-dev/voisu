@@ -3379,6 +3379,7 @@ fn doctor_reports_clipboard_only_when_hyprland_paste_is_unverified() {
     fs::write(voisu_config.join("config.toml"), "delivery_mode = \"clipboard\"\n").unwrap();
     let commands = TempDir::new().unwrap();
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat >/dev/null\n");
+    write_fake_command(commands.path(), "wl-paste", "exit 0\n");
     let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
     let runtime = TempDir::new().unwrap();
     let config_home_value = config_home.path().to_str().unwrap();
@@ -3471,6 +3472,7 @@ printf '[{"key":"P","modmask":5,"description":"Paste transcript","dispatcher":"e
 fn doctor_reports_hyprland_overlay_readiness() {
     let commands = TempDir::new().unwrap();
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat >/dev/null\n");
+    write_fake_command(commands.path(), "wl-paste", "exit 0\n");
     let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start_with_env(
@@ -3547,6 +3549,11 @@ fn doctor_reports_the_overlay_package_install_command_when_the_unit_is_missing()
 fn doctor_accepts_a_recovered_daemon_session_and_reports_backend_state() {
     let commands = TempDir::new().unwrap();
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat >/dev/null\n");
+    write_fake_command(
+        commands.path(),
+        "wl-paste",
+        "echo 'failed to connect to a Wayland server: No such file or directory' >&2\nexit 1\n",
+    );
     let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start_with_env(
@@ -3574,9 +3581,66 @@ fn doctor_accepts_a_recovered_daemon_session_and_reports_backend_state() {
         ],
     );
     let output = stdout(&doctor);
-    assert!(doctor.status.success(), "{output}");
+    assert_eq!(doctor.status.code(), Some(4), "{output}");
     assert!(output.contains(&doctor_line("Daemon session", "Wayland / wayland-3", "PASS")), "{output}");
-    assert!(output.contains(&doctor_line("Daemon clipboard", "wl-copy", "PASS")), "{output}");
+    assert!(
+        output.contains(&doctor_line("Daemon clipboard", "wl-copy", "FAIL")),
+        "session recovery must not false-green Daemon clipboard from PATH plus display env: {output}"
+    );
+}
+
+#[test]
+fn doctor_rejects_daemon_clipboard_when_wl_copy_cannot_reach_the_display() {
+    let commands = TempDir::new().unwrap();
+    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat >/dev/null\n");
+    write_fake_command(
+        commands.path(),
+        "wl-paste",
+        "echo 'failed to connect to a Wayland server: No such file or directory' >&2\nexit 1\n",
+    );
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-9"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", ""),
+            ("PATH", &path),
+            ("VOISU_TEST_REPORT_DAEMON_READINESS", "1"),
+        ],
+    );
+    let status = ipc_request(
+        runtime.path(),
+        &format!(r#"{{"version":{PROTOCOL_VERSION},"command":"status"}}"#),
+    );
+    assert_eq!(status["readiness"]["clipboard_backend"], "wl-copy");
+    assert_eq!(status["readiness"]["clipboard_usable"], false);
+
+    let config_home = TempDir::new().unwrap();
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-9"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", ""),
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
+    );
+    let output = stdout(&doctor);
+    assert_eq!(doctor.status.code(), Some(4), "{output}");
+    assert!(
+        !output.contains(&doctor_line("Daemon clipboard", "wl-copy", "PASS")),
+        "installed wl-copy without a reachable display must not PASS: {output}"
+    );
+    assert!(
+        output.contains(&doctor_line("Daemon clipboard", "wl-copy", "FAIL")),
+        "{output}"
+    );
 }
 
 /// One terse doctor line as the production formatter renders it: label padded to

@@ -450,6 +450,7 @@ pub struct DaemonReadiness {
     /// Presence alone does not mean it can reach the daemon's display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clipboard_backend: Option<String>,
+    /// Proven by a bounded read-only backend probe in the daemon process.
     pub clipboard_usable: bool,
 }
 

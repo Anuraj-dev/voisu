@@ -33,11 +33,11 @@ use voisu_app::smart_writing::{
     GrammarGateCapability, ResolvedRecordingLanguages,
 };
 use voisu_app::system::{
-    groq_transcription_language, CredentialPreparationOwner, DeepgramProvider, DesktopNotifier,
-    FedoraShortcutPortal, GrammarCapability, GroqProvider, GuardedDelivery, MergeResultValidator,
-    PipeWireCapture, PortalClipboardDelivery, ProviderReaper, WlClipboard, CAPTURE_FINALIZE_DEADLINE,
-    DEFAULT_TRANSCRIPTION_LANGUAGE, DIAGNOSTIC_RESPONSE_DEADLINE, PROCESSING_RESPONSE_DEADLINE,
-    PROVIDER_COMPLETION_DEADLINE,
+    clipboard_backend_display_reachable, groq_transcription_language, CredentialPreparationOwner,
+    DeepgramProvider, DesktopNotifier, FedoraShortcutPortal, GrammarCapability, GroqProvider,
+    GuardedDelivery, MergeResultValidator, PipeWireCapture, PortalClipboardDelivery, ProviderReaper,
+    WlClipboard, CAPTURE_FINALIZE_DEADLINE, DEFAULT_TRANSCRIPTION_LANGUAGE,
+    DIAGNOSTIC_RESPONSE_DEADLINE, PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE,
     INTENT_RECONSTRUCTION_DEADLINE, RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
 use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
@@ -1712,10 +1712,11 @@ fn daemon_readiness_snapshot(
         Some(value) if value.eq_ignore_ascii_case("x11") => voisu_core::SessionKind::X11,
         _ => session.session,
     };
-    let clipboard_backend = voisu_core::clipboard_candidates(clipboard_session)
+    let clipboard_tool = voisu_core::clipboard_candidates(clipboard_session)
         .iter()
-        .find(|tool| executable_on_path(tool.write_command().0))
-        .map(|tool| tool.write_command().0.to_owned());
+        .copied()
+        .find(|tool| executable_on_path(tool.write_command().0));
+    let clipboard_backend = clipboard_tool.map(|tool| tool.write_command().0.to_owned());
     // A declared Wayland service must have its Wayland endpoint. Falling back
     // to an inherited X11 DISPLAY would make a stale systemd environment look
     // healthy after the compositor changed sessions.
@@ -1730,6 +1731,10 @@ fn daemon_readiness_snapshot(
             voisu_core::SessionKind::Unknown => false,
         },
     };
+    // Presence of a display env var and a clipboard binary is not usability.
+    // Probe the matching read tool in this process; do not write.
+    let clipboard_usable = display_ready
+        && clipboard_tool.is_some_and(clipboard_backend_display_reachable);
     Some(DaemonReadiness {
         session_type,
         wayland_display,
@@ -1738,7 +1743,7 @@ fn daemon_readiness_snapshot(
         hyprland_instance_signature,
         delivery_mode: delivery_mode.as_str().to_owned(),
         paste_action,
-        clipboard_usable: display_ready && clipboard_backend.is_some(),
+        clipboard_usable,
         clipboard_backend,
     })
 }
