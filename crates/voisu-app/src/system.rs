@@ -71,6 +71,10 @@ const PROCESS_POLL: Duration = Duration::from_millis(10);
 const MAX_DAEMON_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_RETAINED_STDERR_BYTES: usize = 4 * 1024;
 const MAX_RETAINED_STDOUT_BYTES: usize = 64 * 1024;
+/// `hyprctl binds -j` on Omarchy-sized bind tables is ~100 KiB. The shared
+/// helper stdout cap stays 64 KiB; this inspection-only ceiling is 1 MiB and
+/// fail-closes if the dump is truncated.
+const HYPRCTL_BINDS_JSON_CAP: usize = 1024 * 1024;
 const PROVIDER_PROCESS_DEADLINE: Duration = Duration::from_secs(14);
 const RECONCILIATION_PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 /// Default Groq chat-completions model for Transcript reconciliation.
@@ -2188,6 +2192,39 @@ pub(crate) fn run_restricted_stdout(program: &str, arguments: &[&str]) -> Option
         .map(|outcome| outcome.stdout)
 }
 
+/// Reads the compositor bind table without the 64 KiB helper stdout cap.
+/// Truncation is a hard failure so setup never parses a chopped JSON prefix.
+pub(crate) fn run_hyprctl_binds_json() -> Result<Vec<u8>, String> {
+    let started = Instant::now();
+    let mut command = restricted_command("hyprctl");
+    command
+        .args(["binds", "-j"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|_| "`hyprctl binds -j` returned a failure".to_owned())?;
+    let stdout_reader = child.stdout.take().map(|mut stdout| {
+        thread::spawn(move || read_capped_checked(&mut stdout, HYPRCTL_BINDS_JSON_CAP))
+    });
+    let status = wait_for_child(&mut child, started, PROCESS_DEADLINE, None)
+        .map_err(|_| "`hyprctl binds -j` returned a failure".to_owned())?;
+    let payload = match stdout_reader {
+        Some(handle) => bounded_join(handle, started, &mut child, PROCESS_DEADLINE)
+            .map_err(|_| "`hyprctl binds -j` returned a failure".to_owned())?
+            .map_err(|_| "`hyprctl binds -j` returned a failure".to_owned())?,
+        None => CappedRead::Complete(Vec::new()),
+    };
+    match payload {
+        CappedRead::Truncated { .. } => Err(
+            "`hyprctl binds -j` response exceeded the 1 MiB inspection budget".to_owned(),
+        ),
+        CappedRead::Complete(bytes) if status.success() => Ok(bytes),
+        CappedRead::Complete(_) => Err("`hyprctl binds -j` returned a failure".to_owned()),
+    }
+}
+
 /// Runs a helper whose SUCCESS mode is to fork a descendant that keeps
 /// serving after the parent exits — real `wl-copy` serves the clipboard this
 /// way. The descendant inherits the parent's pipes, so capturing output would
@@ -2356,14 +2393,40 @@ fn pipe_bytes(
 /// retains only the first `cap` bytes: a noisy child cannot force unbounded
 /// memory growth inside the deadline window.
 fn read_capped(source: &mut impl Read, cap: usize) -> std::io::Result<Vec<u8>> {
+    match read_capped_checked(source, cap)? {
+        CappedRead::Complete(bytes) | CappedRead::Truncated { retained: bytes } => Ok(bytes),
+    }
+}
+
+enum CappedRead {
+    Complete(Vec<u8>),
+    Truncated { retained: Vec<u8> },
+}
+
+/// Like [`read_capped`], but reports whether any bytes past `cap` were drained.
+fn read_capped_checked(source: &mut impl Read, cap: usize) -> std::io::Result<CappedRead> {
     let mut retained = Vec::new();
+    let mut truncated = false;
     let mut buffer = [0_u8; 1024];
     loop {
         match source.read(&mut buffer) {
-            Ok(0) => return Ok(retained),
+            Ok(0) => {
+                return Ok(if truncated {
+                    CappedRead::Truncated { retained }
+                } else {
+                    CappedRead::Complete(retained)
+                });
+            }
             Ok(read) => {
+                if truncated {
+                    continue;
+                }
                 let room = cap.saturating_sub(retained.len());
-                retained.extend_from_slice(&buffer[..read.min(room)]);
+                let keep = read.min(room);
+                retained.extend_from_slice(&buffer[..keep]);
+                if keep < read {
+                    truncated = true;
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
@@ -8589,6 +8652,24 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use voisu_core::{ProviderCoordinator, ProviderStreams};
+
+    #[test]
+    fn read_capped_checked_completes_when_the_dump_fits() {
+        let payload = vec![b'a'; 64];
+        match read_capped_checked(&mut payload.as_slice(), 64).unwrap() {
+            CappedRead::Complete(bytes) => assert_eq!(bytes, payload),
+            CappedRead::Truncated { .. } => panic!("exact-cap dump must not look truncated"),
+        }
+    }
+
+    #[test]
+    fn read_capped_checked_fail_closes_when_the_dump_exceeds_the_budget() {
+        let payload = vec![b'b'; 65];
+        match read_capped_checked(&mut payload.as_slice(), 64).unwrap() {
+            CappedRead::Truncated { retained } => assert_eq!(retained, payload[..64]),
+            CappedRead::Complete(_) => panic!("over-budget dump must not parse as complete"),
+        }
+    }
 
     #[test]
     fn manager_env_missing_display_is_detected_from_show_environment() {

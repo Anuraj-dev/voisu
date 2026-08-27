@@ -382,16 +382,14 @@ impl HyprlandController for LiveHyprlandController {
     }
 
     fn binding_is_installed(&mut self, key: &str, command: &str) -> Result<bool, String> {
-        let payload = crate::system::run_restricted_stdout("hyprctl", &["binds", "-j"])
-            .ok_or_else(|| "`hyprctl binds -j` returned a failure".to_owned())?;
+        let payload = crate::system::run_hyprctl_binds_json()?;
         serde_json::from_slice::<Value>(&payload)
             .map(|value| hyprland_binding_is_installed(&value, key, command))
             .map_err(|error| format!("invalid `hyprctl binds -j` response: {error}"))
     }
 
     fn live_bindings(&mut self) -> Result<Value, String> {
-        let payload = crate::system::run_restricted_stdout("hyprctl", &["binds", "-j"])
-            .ok_or_else(|| "`hyprctl binds -j` returned a failure".to_owned())?;
+        let payload = crate::system::run_hyprctl_binds_json()?;
         serde_json::from_slice(&payload)
             .map_err(|error| format!("invalid `hyprctl binds -j` response: {error}"))
     }
