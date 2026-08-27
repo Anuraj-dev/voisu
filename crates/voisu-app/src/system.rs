@@ -1747,34 +1747,61 @@ fn probe_clipboard_roundtrip(tool: ClipboardTool) -> ClipboardProbe {
     };
 
     let probe = format!("voisu-readiness-{}", std::process::id());
-    match run_restricted_serving(write_program, write_arguments, Some(probe.as_bytes())) {
-        Ok(outcome) if outcome.success => {}
+    probe_clipboard_roundtrip_with(
+        original,
+        probe.as_bytes(),
+        |value| {
+            run_restricted_serving(write_program, write_arguments, Some(value))
+                .map(|outcome| outcome.success)
+        },
+        || {
+            run_restricted(read_program, read_arguments, None, true)
+                .ok()
+                .filter(|outcome| outcome.success)
+                .map(|outcome| outcome.stdout == probe.as_bytes())
+                .unwrap_or(false)
+        },
+    )
+}
+
+fn probe_clipboard_roundtrip_with<F, R>(
+    original: Option<Vec<u8>>,
+    probe: &[u8],
+    write: F,
+    readback_succeeds: R,
+) -> ClipboardProbe
+where
+    F: Fn(&[u8]) -> Result<bool, ProcessError>,
+    R: Fn() -> bool,
+{
+    // Restore the prior value only if there genuinely was one; writing an empty
+    // string back would install an empty clipboard owner where none existed.
+    let restore = || {
+        original
+            .as_deref()
+            .is_none_or(|original| write(original).is_ok_and(|success| success))
+    };
+
+    match write(probe) {
+        Ok(true) => {}
         // A spawn failure is the only definitive "tool is not installed" signal.
         Err(ProcessError::Unavailable) => return ClipboardProbe::ToolMissing,
-        _ => return ClipboardProbe::Failed,
+        Ok(false) | Err(_) => {
+            let _ = restore();
+            return ClipboardProbe::Failed;
+        }
     }
 
-    let observed = run_restricted(read_program, read_arguments, None, true)
-        .ok()
-        .filter(|outcome| outcome.success)
-        .map(|outcome| outcome.stdout == probe.as_bytes())
-        .unwrap_or(false);
-    if !observed {
+    if !readback_succeeds() {
+        let _ = restore();
         return ClipboardProbe::Failed;
     }
 
-    // Restore the prior value only if there genuinely was one; writing an empty
-    // string back would install an empty clipboard owner where none existed.
-    match original {
-        Some(original) => {
-            let restored = run_restricted_serving(write_program, write_arguments, Some(&original))
-                .is_ok_and(|outcome| outcome.success);
-            if restored {
-                ClipboardProbe::WorkedRestored
-            } else {
-                ClipboardProbe::WorkedNotRestored
-            }
-        }
+    match original.as_deref() {
+        Some(original) => match write(original) {
+            Ok(true) => ClipboardProbe::WorkedRestored,
+            Ok(false) | Err(_) => ClipboardProbe::WorkedNotRestored,
+        },
         None => ClipboardProbe::WorkedRestored,
     }
 }
@@ -1785,35 +1812,56 @@ fn probe_clipboard_roundtrip(tool: ClipboardTool) -> ClipboardProbe {
 /// command for the host package manager.
 fn clipboard_finding() -> ReadinessFinding {
     let resolution = current_session();
-    // A shadowing wrapper is a Wayland-only hazard (harmless on X11). Per the
-    // terseness contract the remediation lives in the reasoning (--verbose),
-    // naming only the exact shadowing paths, shell-quoted.
     if resolution.session == SessionKind::Wayland {
-        let shadows = shadowing_clipboard_wrappers();
-        if !shadows.is_empty() {
-            let names = shadows
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(" and ");
-            let removal = shadows
-                .iter()
-                .map(|path| shell_quote(path))
-                .collect::<Vec<_>>()
-                .join(" ");
-            return ReadinessFinding::new(
-                ReadinessCapability::Clipboard,
-                ReadinessStatus::Warn,
-                format!(
-                    "{names} shadow the packaged wl-clipboard on PATH and reroute the Wayland \
-                     clipboard through the wrong backend; remove with: rm {removal}"
-                ),
-            )
-            .with_value("shadowed wrapper");
+        if let Some(finding) = shadowed_wl_clipboard_finding() {
+            return finding;
         }
     }
 
-    let candidates = clipboard_candidates(resolution.session);
+    clipboard_finding_for_candidates(clipboard_candidates(resolution.session))
+}
+
+fn clipboard_finding_for_backend(tool: ClipboardTool) -> ReadinessFinding {
+    if tool == ClipboardTool::WlClipboard {
+        if let Some(finding) = shadowed_wl_clipboard_finding() {
+            return finding;
+        }
+    }
+    clipboard_finding_for_candidates(std::slice::from_ref(&tool))
+}
+
+fn shadowed_wl_clipboard_finding() -> Option<ReadinessFinding> {
+    // A shadowing wrapper is a Wayland-only hazard (harmless on X11). Per the
+    // terseness contract the remediation lives in the reasoning (--verbose),
+    // naming only the exact shadowing paths, shell-quoted.
+    let shadows = shadowing_clipboard_wrappers();
+    if shadows.is_empty() {
+        return None;
+    }
+    let names = shadows
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let removal = shadows
+        .iter()
+        .map(|path| shell_quote(path))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(
+        ReadinessFinding::new(
+            ReadinessCapability::Clipboard,
+            ReadinessStatus::Warn,
+            format!(
+                "{names} shadow the packaged wl-clipboard on PATH and reroute the Wayland \
+                 clipboard through the wrong backend; remove with: rm {removal}"
+            ),
+        )
+        .with_value("shadowed wrapper"),
+    )
+}
+
+fn clipboard_finding_for_candidates(candidates: &[ClipboardTool]) -> ReadinessFinding {
     let mut a_tool_was_present = false;
     for tool in candidates {
         match probe_clipboard_roundtrip(*tool) {
@@ -1854,6 +1902,33 @@ fn clipboard_finding() -> ReadinessFinding {
             detect_package_manager(),
             primary.install_package(),
         ))
+}
+
+/// Verifies the clipboard backend that the daemon's Delivery adapters use for
+/// Transcript preservation. On Wayland this probes wl-copy/wl-paste
+/// specifically; an installed xclip cannot make a missing or broken
+/// wl-clipboard backend usable.
+pub fn verify_clipboard_delivery() -> Result<(), String> {
+    // Hyprland's Clipboard, Type, and Guarded adapters all preserve through
+    // WlClipboard. Do not use the doctor's Unknown-session fallback here:
+    // xclip being installed cannot satisfy a missing wl-copy/wl-paste pair.
+    let finding = clipboard_finding_for_backend(ClipboardTool::WlClipboard);
+    if clipboard_finding_is_usable(&finding) {
+        return Ok(());
+    }
+
+    let action = finding
+        .action
+        .map(|action| format!(" (install with {action})"))
+        .unwrap_or_default();
+    Err(format!(
+        "selected Clipboard Delivery backend is not usable: {}{action}",
+        finding.detail
+    ))
+}
+
+fn clipboard_finding_is_usable(finding: &ReadinessFinding) -> bool {
+    matches!(finding.status, ReadinessStatus::Pass)
 }
 
 fn secret_service_finding() -> ReadinessFinding {
@@ -8639,6 +8714,82 @@ mod tests {
         let winner = resolve_on_path(&path, "wl-copy").unwrap();
         assert_eq!(winner, wrapper);
         assert!(winner.starts_with(home.path()));
+    }
+
+    #[test]
+    fn setup_clipboard_gate_rejects_shadowed_or_failed_backends() {
+        assert!(!clipboard_finding_is_usable(
+            &ReadinessFinding::new(
+                ReadinessCapability::Clipboard,
+                ReadinessStatus::Warn,
+                "clipboard wrapper shadows wl-clipboard",
+            )
+            .with_value("shadowed wrapper")
+        ));
+        assert!(!clipboard_finding_is_usable(&ReadinessFinding::new(
+            ReadinessCapability::Clipboard,
+            ReadinessStatus::Fail,
+            "wl-copy is missing",
+        )));
+        assert!(clipboard_finding_is_usable(&ReadinessFinding::new(
+            ReadinessCapability::Clipboard,
+            ReadinessStatus::Pass,
+            "clipboard roundtrip succeeds",
+        )));
+    }
+
+    #[test]
+    fn setup_clipboard_gate_rejects_a_probe_that_could_not_restore() {
+        assert!(!clipboard_finding_is_usable(&ReadinessFinding::new(
+            ReadinessCapability::Clipboard,
+            ReadinessStatus::Warn,
+            "clipboard roundtrip succeeds but the prior clipboard could not be restored",
+        )));
+    }
+
+    #[test]
+    fn clipboard_probe_restores_after_readback_failure() {
+        let writes = std::cell::RefCell::new(Vec::new());
+        let result = probe_clipboard_roundtrip_with(
+            Some(b"prior clipboard".to_vec()),
+            b"probe",
+            |value| {
+                writes.borrow_mut().push(value.to_vec());
+                Ok(true)
+            },
+            || false,
+        );
+
+        assert!(matches!(result, ClipboardProbe::Failed));
+        assert_eq!(
+            writes.into_inner(),
+            vec![b"probe".to_vec(), b"prior clipboard".to_vec()]
+        );
+    }
+
+    #[test]
+    fn clipboard_probe_restores_after_a_spawned_write_failure() {
+        let writes = std::cell::RefCell::new(Vec::new());
+        let first_write = std::cell::Cell::new(true);
+        let result = probe_clipboard_roundtrip_with(
+            Some(b"prior clipboard".to_vec()),
+            b"probe",
+            |value| {
+                writes.borrow_mut().push(value.to_vec());
+                if first_write.replace(false) {
+                    Err(ProcessError::Wait)
+                } else {
+                    Ok(true)
+                }
+            },
+            || panic!("readback must not run after a failed write"),
+        );
+
+        assert!(matches!(result, ClipboardProbe::Failed));
+        assert_eq!(
+            writes.into_inner(),
+            vec![b"probe".to_vec(), b"prior clipboard".to_vec()]
+        );
     }
 
     #[test]

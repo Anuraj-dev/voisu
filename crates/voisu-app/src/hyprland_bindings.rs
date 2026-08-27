@@ -1105,6 +1105,93 @@ fn collect_reachable_lua_sources(
     Ok((sources, visited))
 }
 
+fn collect_reachable_kb_options(
+    root_path: &Path,
+    root_source: &str,
+    files: &dyn BindingFileSystem,
+) -> Result<Vec<String>, String> {
+    let mut active = HashSet::new();
+    let mut required = HashSet::new();
+    let mut options = Vec::new();
+    collect_kb_options_in_execution_order(
+        root_path,
+        root_source,
+        files,
+        &mut active,
+        &mut required,
+        &mut options,
+    )?;
+    Ok(options)
+}
+
+fn collect_kb_options_in_execution_order(
+    path: &Path,
+    source: &str,
+    files: &dyn BindingFileSystem,
+    active: &mut HashSet<PathBuf>,
+    required: &mut HashSet<PathBuf>,
+    options: &mut Vec<String>,
+) -> Result<(), String> {
+    let path = normalize_path(path);
+    if !active.insert(path.clone()) {
+        return Ok(());
+    }
+
+    let tokens = lex_lua(source)?;
+    let mut index = 0;
+    while index < tokens.len() {
+        if let (
+            Some(LuaToken::Identifier(name)),
+            Some(LuaToken::Symbol('=')),
+            Some(LuaToken::String(value)),
+        ) = (tokens.get(index), tokens.get(index + 1), tokens.get(index + 2))
+            && name == "kb_options"
+        {
+            options.push(value.clone());
+            index += 3;
+            continue;
+        }
+
+        let Some((import, consumed)) = parse_lua_import_at(&tokens, index)? else {
+            index += 1;
+            continue;
+        };
+        let Some(imported_path) = resolve_lua_import(&path, &import, files)? else {
+            index += consumed;
+            continue;
+        };
+        if import.loader == "require" && !required.insert(imported_path.clone()) {
+            index += consumed;
+            continue;
+        }
+        let imported_source = files
+            .read_to_string(&imported_path)
+            .map_err(|detail| {
+                format!(
+                    "cannot read imported Lua file {}: {detail}",
+                    imported_path.display()
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "imported Lua file {} does not exist",
+                    imported_path.display()
+                )
+            })?;
+        collect_kb_options_in_execution_order(
+            &imported_path,
+            &imported_source,
+            files,
+            active,
+            required,
+            options,
+        )?;
+        index += consumed;
+    }
+    active.remove(&path);
+    Ok(())
+}
+
 fn for_each_lua_source(
     path: &Path,
     source: &str,
@@ -1141,41 +1228,36 @@ fn for_each_lua_source(
     Ok(())
 }
 
-fn parse_lua_imports(source: &str) -> Result<Vec<LuaImport>, String> {
-    let tokens = lex_lua(source)?;
-    let mut imports = Vec::new();
-    let mut index = 0;
-    while index < tokens.len() {
-        let LuaToken::Identifier(loader) = &tokens[index] else {
-            index += 1;
-            continue;
-        };
-        if !matches!(
-            loader.as_str(),
-            "dofile" | "loadfile" | "require" | "source"
-        ) {
-            index += 1;
-            continue;
-        }
-        let (path, consumed) = match tokens.get(index + 1) {
-            Some(LuaToken::Symbol('(')) => match tokens.get(index + 2) {
-                Some(LuaToken::String(path)) => (path, 3),
-                _ => {
-                    return Err(format!(
-                        "the Lua import {loader} must use a string literal path"
-                    ));
-                }
-            },
-            Some(LuaToken::String(path)) => (path, 2),
+fn parse_lua_import_at(
+    tokens: &[LuaToken],
+    index: usize,
+) -> Result<Option<(LuaImport, usize)>, String> {
+    let Some(LuaToken::Identifier(loader)) = tokens.get(index) else {
+        return Ok(None);
+    };
+    if !matches!(
+        loader.as_str(),
+        "dofile" | "loadfile" | "require" | "source"
+    ) {
+        return Ok(None);
+    }
+    let (path, consumed) = match tokens.get(index + 1) {
+        Some(LuaToken::Symbol('(')) => match tokens.get(index + 2) {
+            Some(LuaToken::String(path)) => (path, 3),
             _ => {
-                index += 1;
-                continue;
+                return Err(format!(
+                    "the Lua import {loader} must use a string literal path"
+                ));
             }
-        };
-        if path.is_empty() {
-            return Err(format!("the Lua import {loader} has an empty path"));
-        }
-        imports.push(LuaImport {
+        },
+        Some(LuaToken::String(path)) => (path, 2),
+        _ => return Ok(None),
+    };
+    if path.is_empty() {
+        return Err(format!("the Lua import {loader} has an empty path"));
+    }
+    Ok(Some((
+        LuaImport {
             loader: match loader.as_str() {
                 "dofile" => "dofile",
                 "loadfile" => "loadfile",
@@ -1184,7 +1266,21 @@ fn parse_lua_imports(source: &str) -> Result<Vec<LuaImport>, String> {
                 _ => unreachable!(),
             },
             path: path.clone(),
-        });
+        },
+        consumed,
+    )))
+}
+
+fn parse_lua_imports(source: &str) -> Result<Vec<LuaImport>, String> {
+    let tokens = lex_lua(source)?;
+    let mut imports = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let Some((import, consumed)) = parse_lua_import_at(&tokens, index)? else {
+            index += 1;
+            continue;
+        };
+        imports.push(import);
         index += consumed;
     }
     Ok(imports)
@@ -1303,12 +1399,24 @@ pub fn install_trigger_binding(
         }
         TriggerBindingPlan::AlreadyInstalled { key } | TriggerBindingPlan::Install { key } => key,
     };
-
-    let updated =
-        match desired_hyprland_source(source, key, original_input.as_deref().unwrap_or("")) {
-            Ok(updated) => updated,
+    let ordered_kb_options = if key == CAPS_LOCK {
+        match collect_reachable_kb_options(path, source, files) {
+            Ok(options) => options,
             Err(detail) => return Err(TriggerBindingError::Unparseable { detail }),
-        };
+        }
+    } else {
+        Vec::new()
+    };
+
+    let updated = match desired_hyprland_source(
+        source,
+        key,
+        original_input.as_deref().unwrap_or(""),
+        &ordered_kb_options,
+    ) {
+        Ok(updated) => updated,
+        Err(detail) => return Err(TriggerBindingError::Unparseable { detail }),
+    };
     if updated == source {
         verify_already_installed(hyprland, key, &backup)?;
         return Ok(TriggerBindingInstallReport {
@@ -1439,9 +1547,20 @@ fn desired_hyprland_source(
     source: &str,
     key: TriggerKey,
     input_source: &str,
+    ordered_kb_options: &[String],
 ) -> Result<String, String> {
-    let kb_options = (key == CAPS_LOCK)
-        .then(|| merge_caps_lock_kb_options(last_kb_options(&[input_source, source])));
+    let kb_options = if key == CAPS_LOCK {
+        // input.lua is a special sibling that may be loaded independently of
+        // the active root. The remaining entries follow the root's execution
+        // order, including each imported Lua file at its call site.
+        let existing = ordered_kb_options
+            .last()
+            .cloned()
+            .or_else(|| kb_options_values(input_source).into_iter().next_back());
+        Some(merge_caps_lock_kb_options(existing))
+    } else {
+        None
+    };
     append_managed_binding(source, key, kb_options.as_deref())
 }
 
@@ -1479,6 +1598,7 @@ fn append_managed_binding(
     Ok(content)
 }
 
+#[cfg(test)]
 fn last_kb_options(sources: &[&str]) -> Option<String> {
     sources
         .iter()
@@ -2649,6 +2769,98 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         assert!(
             input.contains("compose:caps"),
             "the original assignment stays; last-wins managed kb_options overrides it"
+        );
+    }
+
+    #[test]
+    fn caps_lock_input_merges_kb_options_from_reachable_imports() {
+        let (_directory, path) = config_dir();
+        let imported = path.with_file_name("layout.lua");
+        fs::write(&path, "dofile(\"layout.lua\")\n").unwrap();
+        fs::write(
+            &imported,
+            "hl.config({\n  input = {\n    kb_options = \"us,compose:ralt,grp:alt_shift_toggle\",\n  },\n})\n",
+        )
+        .unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        let managed = managed_block(&updated);
+        let options = last_kb_options(&[managed]).expect("managed kb_options");
+
+        assert_eq!(
+            options,
+            format!("{CAPS_NONE},{BOTH_CAPSLOCK_CANCEL},us,compose:ralt,grp:alt_shift_toggle")
+        );
+    }
+
+    #[test]
+    fn caps_lock_input_keeps_root_kb_options_after_an_import() {
+        let (_directory, path) = config_dir();
+        let imported = path.with_file_name("layout.lua");
+        fs::write(
+            &path,
+            concat!(
+                "dofile(\"layout.lua\")\n",
+                "hl.config({\n",
+                "  input = {\n",
+                "    kb_options = \"root-option\",\n",
+                "  },\n",
+                "})\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &imported,
+            "hl.config({\n  input = {\n    kb_options = \"imported-option\",\n  },\n})\n",
+        )
+        .unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        let managed = managed_block(&updated);
+        let options = last_kb_options(&[managed]).expect("managed kb_options");
+
+        assert_eq!(
+            options,
+            format!("{CAPS_NONE},{BOTH_CAPSLOCK_CANCEL},root-option")
+        );
+    }
+
+    #[test]
+    fn caps_lock_input_reexecutes_a_repeated_dofile_after_a_root_assignment() {
+        let (_directory, path) = config_dir();
+        let imported = path.with_file_name("layout.lua");
+        fs::write(
+            &path,
+            concat!(
+                "dofile(\"layout.lua\")\n",
+                "hl.config({\n",
+                "  input = {\n",
+                "    kb_options = \"root-option\",\n",
+                "  },\n",
+                "})\n",
+                "dofile(\"layout.lua\")\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &imported,
+            "hl.config({\n  input = {\n    kb_options = \"imported-option\",\n  },\n})\n",
+        )
+        .unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        let managed = managed_block(&updated);
+        let options = last_kb_options(&[managed]).expect("managed kb_options");
+
+        assert_eq!(
+            options,
+            format!("{CAPS_NONE},{BOTH_CAPSLOCK_CANCEL},imported-option")
         );
     }
 

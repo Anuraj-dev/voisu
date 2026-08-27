@@ -76,6 +76,9 @@ pub trait HyprlandSetupActions {
     fn install_trigger_binding(&mut self, config: &Path) -> Result<TriggerKey, String>;
     fn discover_paste_action(&mut self) -> Option<VerifiedPasteAction>;
     fn start_services_and_query_daemon(&mut self) -> Result<(), String>;
+    fn verify_delivery_backend(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Runs the Hyprland setup steps in their dependency order. Every mutating
@@ -85,11 +88,15 @@ pub fn run_hyprland_setup(
     config: &Path,
     actions: &mut dyn HyprlandSetupActions,
 ) -> Result<HyprlandSetupOutcome, String> {
-    actions.install_services()?;
     actions.select_clipboard_delivery()?;
     let trigger_key = actions.install_trigger_binding(config)?;
     let paste_verified = actions.discover_paste_action().is_some();
+    // Service installation can restart an already-running daemon. Keep it
+    // after every setup write and the compositor reload, so no restart can
+    // boot the daemon with stale Delivery or Trigger Key settings.
+    actions.install_services()?;
     actions.start_services_and_query_daemon()?;
+    actions.verify_delivery_backend()?;
     Ok(HyprlandSetupOutcome {
         trigger_key,
         paste_verified,
@@ -103,7 +110,7 @@ pub struct LiveHyprlandSetupActions<'a> {
 
 impl HyprlandSetupActions for LiveHyprlandSetupActions<'_> {
     fn select_clipboard_delivery(&mut self) -> Result<(), String> {
-        config::set_delivery_mode(DeliveryMode::Clipboard).map(|_| ())
+        config::set_delivery_mode_if_missing(DeliveryMode::Clipboard).map(|_| ())
     }
 
     fn install_services(&mut self) -> Result<(), String> {
@@ -134,6 +141,10 @@ impl HyprlandSetupActions for LiveHyprlandSetupActions<'_> {
 
     fn start_services_and_query_daemon(&mut self) -> Result<(), String> {
         service::start_hyprland_services().map(|_| ())
+    }
+
+    fn verify_delivery_backend(&mut self) -> Result<(), String> {
+        crate::system::verify_clipboard_delivery()
     }
 }
 
@@ -925,6 +936,10 @@ mod tests {
         fn start_services_and_query_daemon(&mut self) -> Result<(), String> {
             self.step("start-and-query")
         }
+
+        fn verify_delivery_backend(&mut self) -> Result<(), String> {
+            self.step("verify-delivery")
+        }
     }
 
     #[test]
@@ -943,11 +958,12 @@ mod tests {
         assert_eq!(
             actions.events,
             vec![
-                "services",
                 "clipboard",
                 "trigger",
                 "paste",
-                "start-and-query"
+                "services",
+                "start-and-query",
+                "verify-delivery"
             ]
         );
     }
@@ -964,7 +980,7 @@ mod tests {
             .expect("clipboard-only setup should complete");
 
         assert!(!result.paste_verified);
-        assert_eq!(actions.events.last(), Some(&"start-and-query"));
+        assert_eq!(actions.events.last(), Some(&"verify-delivery"));
     }
 
     #[test]
@@ -979,7 +995,32 @@ mod tests {
             .expect_err("failed trigger setup must remain incomplete");
 
         assert_eq!(error, "trigger failed");
-        assert_eq!(actions.events, vec!["services", "clipboard", "trigger"]);
+        assert_eq!(actions.events, vec!["clipboard", "trigger"]);
+    }
+
+    #[test]
+    fn hyprland_setup_does_not_claim_success_when_delivery_backend_is_unusable() {
+        let mut actions = FakeHyprlandSetup {
+            events: Vec::new(),
+            paste: false,
+            fail_at: Some("verify-delivery"),
+        };
+
+        let error = run_hyprland_setup(Path::new("/tmp/hyprland.lua"), &mut actions)
+            .expect_err("an unusable Delivery backend must fail setup");
+
+        assert_eq!(error, "verify-delivery failed");
+        assert_eq!(
+            actions.events,
+            vec![
+                "clipboard",
+                "trigger",
+                "paste",
+                "services",
+                "start-and-query",
+                "verify-delivery"
+            ]
+        );
     }
 
     #[test]

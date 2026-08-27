@@ -187,6 +187,14 @@ pub fn set_delivery_mode(mode: DeliveryMode) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Persists the Delivery default only when the config has no recognized root
+/// delivery_mode. An explicit user choice, including type or guarded, is
+/// left untouched so Hyprland setup can be rerun without changing it.
+pub fn set_delivery_mode_if_missing(mode: DeliveryMode) -> Result<Option<PathBuf>, String> {
+    let path = config_path();
+    set_delivery_mode_if_missing_at(&path, mode)
+}
+
 /// The configured Writing Mode.
 ///
 /// A missing file or missing key resolves to [`DEFAULT_WRITING_MODE`] (Smart).
@@ -552,6 +560,17 @@ fn write_delivery_mode(path: &Path, mode: DeliveryMode) -> Result<(), String> {
     write_config(path, None, Some(mode), None, None)
 }
 
+fn set_delivery_mode_if_missing_at(
+    path: &Path,
+    mode: DeliveryMode,
+) -> Result<Option<PathBuf>, String> {
+    if read_delivery_mode(path).is_some() {
+        return Ok(None);
+    }
+    write_delivery_mode(path, mode)?;
+    Ok(Some(path.to_owned()))
+}
+
 /// Persists the Writing Mode without discarding the other managed root keys.
 fn write_writing_mode(path: &Path, mode: WritingMode) -> Result<(), String> {
     write_config(path, None, None, Some(mode), None)
@@ -870,6 +889,27 @@ other_key = 5
             parse_delivery_mode("delivery_mode = 'guarded'\n"),
             Some(DeliveryMode::Guarded)
         );
+    }
+
+    #[test]
+    fn setup_delivery_default_is_written_only_when_no_explicit_mode_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voisu").join("config.toml");
+
+        assert_eq!(
+            set_delivery_mode_if_missing_at(&path, DeliveryMode::Clipboard).unwrap(),
+            Some(path.clone())
+        );
+        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Clipboard));
+
+        let explicit = "# user choice\ndelivery_mode = \"guarded\"\n";
+        std::fs::write(&path, explicit).unwrap();
+        assert_eq!(
+            set_delivery_mode_if_missing_at(&path, DeliveryMode::Clipboard).unwrap(),
+            None
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), explicit);
+        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Guarded));
     }
 
     #[test]
