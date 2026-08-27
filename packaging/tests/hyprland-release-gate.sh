@@ -68,13 +68,22 @@ elif [[ ${1:-} == -Qi ]]; then
     printf "%s\\n" "Architecture    : x86_64"
 elif [[ ${1:-} == -Ql ]]; then
     [[ $package == "$pkgname" ]] || exit 1
-    root=${TEST_PAYLOAD_ROOT:?}
-    for path in /usr/ /usr/bin/ /usr/bin/voisu /usr/bin/voisu-cli \
-        /usr/bin/voisu-daemon /usr/bin/voisu-overlay /usr/lib/ /usr/lib/systemd/ \
-        /usr/lib/systemd/user/ /usr/lib/systemd/user/voisu.service \
-        /usr/lib/systemd/user/voisu-overlay.service; do
-        printf "%s %s%s\\n" "$pkgname" "$root" "$path"
-    done
+    if [[ ${TEST_PAYLOAD_MODE:-good} == host-suffix-collision ]]; then
+        for path in /usr/bin/ /usr/bin/voisu /usr/bin/voisu-cli \
+            /usr/bin/voisu-daemon /usr/bin/voisu-overlay /usr/lib/ /usr/lib/systemd/ \
+            /usr/lib/systemd/user/ /usr/lib/systemd/user/voisu.service \
+            /usr/lib/systemd/user/voisu-overlay.service; do
+            printf "%s %s\\n" "$pkgname" "$path"
+        done
+    else
+        root=${TEST_PAYLOAD_ROOT:?}
+        for path in /usr/ /usr/bin/ /usr/bin/voisu /usr/bin/voisu-cli \
+            /usr/bin/voisu-daemon /usr/bin/voisu-overlay /usr/lib/ /usr/lib/systemd/ \
+            /usr/lib/systemd/user/ /usr/lib/systemd/user/voisu.service \
+            /usr/lib/systemd/user/voisu-overlay.service; do
+            printf "%s %s%s\\n" "$pkgname" "$root" "$path"
+        done
+    fi
 else
     exit 1
 fi'
@@ -125,7 +134,9 @@ elif [[ ${1:-} == -xOf && ${3:-} == .MTREE ]]; then
         if [[ ${TEST_PAYLOAD_MODE:-good} == mismatch && $path == /usr/bin/voisu-daemon ]]; then
             digest=0000000000000000000000000000000000000000000000000000000000000000
         fi
-        if [[ ${TEST_PAYLOAD_MODE:-good} == suffix-collision && $path == /usr/bin/voisu ]]; then
+        if [[ ${TEST_PAYLOAD_MODE:-good} == suffix-collision \
+            || ${TEST_PAYLOAD_MODE:-good} == host-suffix-collision ]] \
+            && [[ $path == /usr/bin/voisu ]]; then
             mtree_path=/bin/voisu
         fi
         printf "./%s sha256digest=%s\\n" "${mtree_path#/}" "$digest"
@@ -133,7 +144,9 @@ elif [[ ${1:-} == -xOf && ${3:-} == .MTREE ]]; then
     {
         printf "%s\\n" "#mtree"
         printf "%s\\n" "/set type=file uid=0 gid=0 mode=644"
-        printf "%s\\n" "./usr type=dir"
+        if [[ ${TEST_PAYLOAD_MODE:-good} != host-suffix-collision ]]; then
+            printf "%s\\n" "./usr type=dir"
+        fi
         printf "%s\\n" "./usr/bin type=dir"
         mtree_file /usr/bin/voisu
         printf "%s\\n" "./usr/bin/voisu-cli type=link link=voisu"
@@ -485,6 +498,21 @@ test_mtree_path_suffix_collision() {
     payload_mode=good
 }
 
+test_host_shaped_mtree_suffix_collision() {
+    local evidence_dir
+    evidence_dir=$(new_evidence_dir)
+    initialize_evidence "$evidence_dir"
+    make_pass_markers "$evidence_dir"
+    payload_mode=host-suffix-collision
+    run_gate "$evidence_dir"
+    assert_status 4 'host-shaped suffix-colliding .MTREE path must block'
+    assert_result payload-content FAIL \
+        'artifact /bin/voisu must not match host /usr/bin/voisu via /usr destroot concat'
+    assert_output_contains 'missing the artifact path: /bin/voisu' \
+        'host-shaped suffix-colliding .MTREE path must be reported as missing'
+    payload_mode=good
+}
+
 test_symlink_payload() {
     local evidence_dir
     evidence_dir=$(new_evidence_dir)
@@ -624,6 +652,7 @@ test_split_pkgver_format
 test_malformed_package_metadata
 test_payload_content_binding
 test_mtree_path_suffix_collision
+test_host_shaped_mtree_suffix_collision
 test_symlink_payload
 test_empty_package_artifact
 test_artifact_byte_replacement

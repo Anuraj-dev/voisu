@@ -481,6 +481,7 @@ verify_installed_payload() {
     local link
     local installed_path
     local installed_root
+    local payload_prefix
     local actual_digest
     local actual_link
 
@@ -539,6 +540,26 @@ verify_installed_payload() {
         return 1
     fi
 
+    # Concatenate destroot only when it sits outside every artifact logical path.
+    # A host prefix such as /usr must not turn logical /bin/voisu into /usr/bin/voisu.
+    payload_prefix=
+    if [[ -n $installed_root && $installed_root != / ]]; then
+        payload_prefix=$installed_root
+        while IFS=$'\t' read -r _ mtree_path _ _; do
+            if ! logical_path=$(mtree_path_to_logical_path "$mtree_path"); then
+                printf 'the Arch package artifact has an unsafe .MTREE path: %s\n' \
+                    "$mtree_path" >&2
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            if [[ $logical_path == "$installed_root" \
+                || $logical_path == "$installed_root"/* ]]; then
+                payload_prefix=
+                break
+            fi
+        done <"$entries_file"
+    fi
+
     : >"$artifact_manifest"
     while IFS=$'\t' read -r type mtree_path digest link; do
         if ! logical_path=$(mtree_path_to_logical_path "$mtree_path"); then
@@ -547,13 +568,14 @@ verify_installed_payload() {
             rm -rf "$temp_dir"
             return 1
         fi
-        if ! installed_path=$(awk -v logical="$logical_path" -v prefix="$installed_root" '
+        if ! installed_path=$(awk -v logical="$logical_path" -v prefix="$payload_prefix" '
             $0 == logical {
                 print
                 matches++
                 next
             }
-            prefix != "" && $0 == prefix logical {
+            prefix != "" && prefix != "/" && logical != prefix \
+                && index(logical, prefix "/") != 1 && $0 == prefix logical {
                 print
                 matches++
             }
