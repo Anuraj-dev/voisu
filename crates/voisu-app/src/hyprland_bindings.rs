@@ -1778,22 +1778,47 @@ fn parse_lua_chunk(source: &str, managed: bool) -> Result<Vec<LuaBinding>, Strin
             index += 1;
             continue;
         }
-        let (key, description, command, dispatcher, dispatcher_arguments) =
-            parse_bind_arguments(&tokens[index + 4..])?;
-        bindings.push(LuaBinding {
-            key,
-            description,
-            command,
-            dispatcher,
-            dispatcher_arguments,
-            managed,
-        });
-        index += 4;
+        match parse_bind_arguments(&tokens[index + 4..]) {
+            Ok(Some((key, description, command, dispatcher, dispatcher_arguments))) => {
+                bindings.push(LuaBinding {
+                    key,
+                    description,
+                    command,
+                    dispatcher,
+                    dispatcher_arguments,
+                    managed,
+                });
+                index += 4;
+            }
+            // Computed chords (`"SUPER + " .. key`) and Lua callbacks on
+            // combination keys are not Caps Lock occupancy. Skip the call.
+            Ok(None) => index = matching_parenthesis(&tokens, index + 3)?,
+            Err(error) => match tokens.get(index + 4) {
+                Some(LuaToken::String(key)) if !occupies_preferred_trigger_key(key) => {
+                    index = matching_parenthesis(&tokens, index + 3)?;
+                }
+                _ => return Err(error),
+            },
+        }
     }
     Ok(bindings)
 }
 
-fn parse_bind_arguments(tokens: &[LuaToken]) -> Result<ParsedBindArguments, String> {
+fn occupies_preferred_trigger_key(key: &str) -> bool {
+    PREFERRED_TRIGGER_KEYS.iter().any(|candidate| {
+        LuaBinding {
+            key: key.to_owned(),
+            description: String::new(),
+            command: String::new(),
+            dispatcher: None,
+            dispatcher_arguments: None,
+            managed: false,
+        }
+        .is_standalone_for(*candidate)
+    })
+}
+
+fn parse_bind_arguments(tokens: &[LuaToken]) -> Result<Option<ParsedBindArguments>, String> {
     let mut index = 0;
     let read_string = |index: &mut usize, label: &str| -> Result<String, String> {
         let value = match tokens.get(*index) {
@@ -1806,12 +1831,26 @@ fn parse_bind_arguments(tokens: &[LuaToken]) -> Result<ParsedBindArguments, Stri
     };
     let key = read_string(&mut index, "binding key")?;
     if !matches!(tokens.get(index), Some(LuaToken::Symbol(','))) {
-        return Err("the binding key must be followed by a comma".to_owned());
+        if occupies_preferred_trigger_key(&key) {
+            return Err("the binding key must be followed by a comma".to_owned());
+        }
+        return Ok(None);
     }
     index += 1;
-    let description = read_string(&mut index, "binding description")?;
+    let description = match tokens.get(index) {
+        Some(LuaToken::String(value)) => {
+            index += 1;
+            value.clone()
+        }
+        Some(_) if !occupies_preferred_trigger_key(&key) => return Ok(None),
+        Some(_) => return Err("the binding description must be a string literal".to_owned()),
+        None => return Err("the binding description is missing".to_owned()),
+    };
     if !matches!(tokens.get(index), Some(LuaToken::Symbol(','))) {
-        return Err("the binding description must be followed by a comma".to_owned());
+        if occupies_preferred_trigger_key(&key) {
+            return Err("the binding description must be followed by a comma".to_owned());
+        }
+        return Ok(None);
     }
     index += 1;
     let (command, dispatcher, dispatcher_arguments) = match tokens.get(index) {
@@ -1842,7 +1881,13 @@ fn parse_bind_arguments(tokens: &[LuaToken]) -> Result<ParsedBindArguments, Stri
     if !matches!(tokens.get(index), Some(LuaToken::Symbol(')'))) {
         return Err("the binding command must be followed by a closing parenthesis".to_owned());
     }
-    Ok((key, description, command, dispatcher, dispatcher_arguments))
+    Ok(Some((
+        key,
+        description,
+        command,
+        dispatcher,
+        dispatcher_arguments,
+    )))
 }
 
 fn parse_dispatcher_arguments(
@@ -2344,6 +2389,34 @@ o.bind(caps_lock, "Terminal", "kitty")
             panic!("a dynamic candidate key must not be treated as free");
         };
         assert!(detail.contains("binding key"));
+    }
+
+    #[test]
+    fn concatenated_combination_binds_are_skipped_without_hiding_caps_lock() {
+        let source = r#"
+o.bind("code:66", "Voisu dictation", "voisu toggle")
+o.bind(
+  "SUPER + " .. key,
+  "Switch both monitors to desktop " .. desktop,
+  function() paired_desktop_switch(desktop) end
+)
+o.bind("SUPER + TAB", "Next two-monitor desktop", function() paired_desktop_cycle(1) end)
+o.bind("SUPER + CTRL + TAB", "Former two-monitor desktop", paired_desktop_former)
+"#;
+
+        assert_eq!(
+            plan_trigger_binding(source, true),
+            TriggerBindingPlan::AlreadyInstalled { key: CAPS_LOCK }
+        );
+    }
+
+    #[test]
+    fn concatenated_caps_lock_key_still_fails_closed() {
+        let source = r#"o.bind("code:66" .. suffix, "Terminal", "kitty")"#;
+        let TriggerBindingPlan::Unparseable { detail } = plan_trigger_binding(source, true) else {
+            panic!("concatenating a Caps Lock code must not look free");
+        };
+        assert!(detail.contains("comma"), "{detail}");
     }
 
     #[test]
