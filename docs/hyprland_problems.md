@@ -87,14 +87,15 @@ Hyprland does not provide the Global Shortcuts flow Voisu currently expects. Ret
 
 - Detect Hyprland during setup and stop retrying the unsupported portal path.
 - Offer a compositor keybinding that runs `voisu toggle`.
-- Show the exact proposed key and its existing binding before changing the user's configuration.
+- Ask to use Caps Lock (`code:66`) first, default yes. Fall back to Right Alt (`code:108`) if the user declines or Caps Lock has an exact unmanaged binding. Do not auto-install Left Alt.
 - Never overwrite a binding without explicit approval.
+- When Caps Lock is accepted, disable lock-toggle on that key with a marked `kb_options` change (`caps:none,shift:both_capslock_cancel`) and skip that rewrite for Right Alt.
 - Verify the installed binding through Hyprland after configuration reload.
 
-Omarchy example for physical Left Alt:
+Omarchy example for Caps Lock:
 
 ```lua
-o.bind("code:64", "Voisu dictation", "voisu toggle")
+o.bind("code:66", "Voisu dictation", "voisu toggle")
 ```
 
 ### P1: the default Delivery mode is unsupported
@@ -144,7 +145,7 @@ For a Hyprland session, `voisu setup` should:
 2. Install or select a service definition without a portal ownership dependency.
 3. Enable the daemon and optional Overlay for the graphical session.
 4. Select clipboard Delivery and explain that the Transcript is preserved on the clipboard before any verified Paste Action.
-5. Inspect the requested Trigger Key, ask before changing it, and install the compositor binding.
+5. Ask to use Caps Lock as the Trigger Key (default yes), then install Caps Lock or Right Alt. Never overwrite an exact unmanaged bind.
 6. Reload Hyprland and systemd, then start both services.
 7. Query the running daemon and report its real capture, provider, display, and Delivery readiness.
 8. Print one clear recovery command only when a step fails.
@@ -157,7 +158,7 @@ Raja's host currently uses:
 
 - `voisu-bin` 0.35.2-1.
 - Clipboard Delivery.
-- Physical Left Alt mapped to `voisu toggle` in `~/.config/hypr/bindings.lua`.
+- Caps Lock mapped to `voisu toggle` in `~/.config/hypr/bindings.lua`.
 - `~/.config/systemd/user/voisu.service`, modeled on Omarchy's UWSM graphical-service ordering.
 - `~/.config/systemd/user/voisu-overlay.service.d/override.conf`, which adds graphical readiness to the packaged Overlay unit.
 - Both user units enabled and active.
@@ -175,7 +176,7 @@ Do not claim Hyprland support until a packaged installation passes all of these 
 3. Reboot and log into Hyprland.
 4. Confirm both services start without an ordering cycle or manual restart.
 5. Confirm the daemon process has the active `WAYLAND_DISPLAY` before the first Recording.
-6. Press Left Alt to start and stop a controlled Recording.
+6. Press Caps Lock (or the selected Trigger Key) to start and stop a controlled Recording.
 7. Confirm exactly one final Transcript reaches the clipboard, then at most one verified Paste Action; paste failure must leave the Transcript on the clipboard.
 8. Confirm the Overlay shows Recording, Processing, and terminal feedback.
 9. Restart Hyprland or its portal and confirm both Voisu processes recover.
@@ -193,7 +194,7 @@ Do not claim Hyprland support until a packaged installation passes all of these 
 On 2026-08-24, Raja validated the installed `voisu-bin` `0.35.2-1` on the
 Omarchy/Hyprland host. The daemon and Overlay were enabled and active, the
 daemon had the live Wayland environment, `voisu doctor` passed every check,
-Left Alt started and stopped Recordings, and clipboard Delivery worked.
+Caps Lock started and stopped Recordings, and clipboard Delivery worked.
 
 There is no active runtime issue on this configured host. The remaining items in
 this report are package and setup hardening: preserve the session-correct unit,

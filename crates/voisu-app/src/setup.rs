@@ -7,10 +7,20 @@
 //! terminal, network, or keyring. The thin production glue ([`StdioWizard`],
 //! [`LiveKeyValidator`]) lives at the bottom of this file.
 
+use std::path::Path;
+
 use voisu_core::{
-    Credential, KeyDiagnosis, KeyLocation, Provider, ProviderKeyStatus, SecretStore,
-    provider_free_tier_hint,
+    provider_free_tier_hint, Credential, KeyDiagnosis, KeyLocation, Provider, ProviderKeyStatus,
+    SecretStore,
 };
+
+use crate::config::{self, DeliveryMode};
+use crate::hyprland_bindings::{
+    BindingFileSystem, LiveHyprlandController, LocalBindingFileSystem, RECOVERY_COMMAND,
+    TriggerBindingError, TriggerKey, TriggerOccupancy, VOISU_TOGGLE_COMMAND, VerifiedPasteAction,
+    discover_live_paste_action, inspect_trigger_occupancy, install_trigger_binding,
+};
+use crate::service;
 
 /// Injected terminal IO. Prompts and messages both flow through here so a test
 /// can script every keystroke and capture every line.
@@ -51,6 +61,91 @@ pub struct SetupOutcome {
     pub groq: ProviderOutcome,
 }
 
+/// The observable result of a completed Hyprland setup flow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HyprlandSetupOutcome {
+    pub trigger_key: TriggerKey,
+    pub paste_verified: bool,
+}
+
+/// Desktop seams for the Hyprland setup orchestrator. The provider wizard
+/// remains separate so credentials and user data are preserved across reruns.
+pub trait HyprlandSetupActions {
+    fn select_clipboard_delivery(&mut self) -> Result<(), String>;
+    fn install_services(&mut self) -> Result<(), String>;
+    fn install_trigger_binding(&mut self, config: &Path) -> Result<TriggerKey, String>;
+    fn discover_paste_action(&mut self) -> Option<VerifiedPasteAction>;
+    fn start_services_and_query_daemon(&mut self) -> Result<(), String>;
+    fn verify_delivery_backend(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Runs the Hyprland setup steps in their dependency order. Every mutating
+/// step is behind an injected seam so the ordering and failure boundaries are
+/// testable without a compositor, systemd user manager, or daemon process.
+pub fn run_hyprland_setup(
+    config: &Path,
+    actions: &mut dyn HyprlandSetupActions,
+) -> Result<HyprlandSetupOutcome, String> {
+    actions.select_clipboard_delivery()?;
+    let trigger_key = actions.install_trigger_binding(config)?;
+    let paste_verified = actions.discover_paste_action().is_some();
+    // Service installation can restart an already-running daemon. Keep it
+    // after every setup write and the compositor reload, so no restart can
+    // boot the daemon with stale Delivery or Trigger Key settings.
+    actions.install_services()?;
+    actions.start_services_and_query_daemon()?;
+    actions.verify_delivery_backend()?;
+    Ok(HyprlandSetupOutcome {
+        trigger_key,
+        paste_verified,
+    })
+}
+
+/// Production adapters for the Hyprland setup flow.
+pub struct LiveHyprlandSetupActions<'a> {
+    pub io: &'a mut dyn WizardIo,
+}
+
+impl HyprlandSetupActions for LiveHyprlandSetupActions<'_> {
+    fn select_clipboard_delivery(&mut self) -> Result<(), String> {
+        // Type Delivery is unusable on Hyprland. Reruns rewrite type/guarded.
+        config::set_delivery_mode(DeliveryMode::Clipboard).map(|_| ())
+    }
+
+    fn install_services(&mut self) -> Result<(), String> {
+        service::install_hyprland_services().map(|_| ())
+    }
+
+    fn install_trigger_binding(&mut self, config: &Path) -> Result<TriggerKey, String> {
+        let files = LocalBindingFileSystem;
+        let source = files
+            .read_to_string(config)
+            .map_err(|error| format!("cannot read {}: {error}", config.display()))?
+            .unwrap_or_default();
+        let occupancy = inspect_trigger_occupancy(config, &source, &files)
+            .map_err(|detail| TriggerBindingError::Unparseable { detail }.to_string())?;
+        let prefer_caps_lock = caps_lock_trigger_preferred(&occupancy, self.io)?;
+        let mut hyprland = LiveHyprlandController;
+        install_trigger_binding(config, &files, &mut hyprland, prefer_caps_lock)
+            .map(|report| report.key)
+            .map_err(|error| error.to_string())
+    }
+
+    fn discover_paste_action(&mut self) -> Option<VerifiedPasteAction> {
+        discover_live_paste_action()
+    }
+
+    fn start_services_and_query_daemon(&mut self) -> Result<(), String> {
+        service::start_hyprland_services().map(|_| ())
+    }
+
+    fn verify_delivery_backend(&mut self) -> Result<(), String> {
+        crate::system::verify_clipboard_delivery()
+    }
+}
+
 /// Runs the interactive wizard to completion and reports what became of each
 /// key. Deepgram is configured first (it is on by default), then Groq.
 pub fn run_setup(
@@ -65,7 +160,6 @@ pub fn run_setup(
     io.writeln("");
     let groq = configure_provider(io, store, validator, Provider::Groq);
     io.writeln("");
-    io.writeln("Setup complete. Run `voisu doctor` to re-check your keys and desktop.");
     if deepgram == ProviderOutcome::Skipped {
         io.writeln(
             "No Deepgram key configured — run `voisu deepgram off` for the faster Groq-only path.",
@@ -88,7 +182,10 @@ fn configure_provider(
     // env-override key is a deliberate choice, and migrate a plaintext key back
     // into the keyring on keep when the keyring is available again.
     match store.diagnose(provider) {
-        KeyDiagnosis::Found { location: KeyLocation::EnvOverride, .. } => {
+        KeyDiagnosis::Found {
+            location: KeyLocation::EnvOverride,
+            ..
+        } => {
             io.writeln(&format!(
                 "Note: {name} is set via the {} environment variable, which wins at runtime — \
                  unset it to use a stored key.",
@@ -98,7 +195,10 @@ fn configure_provider(
                 return ProviderOutcome::Kept;
             }
         }
-        KeyDiagnosis::Found { location: KeyLocation::Keyring, .. } => {
+        KeyDiagnosis::Found {
+            location: KeyLocation::Keyring,
+            ..
+        } => {
             if ask_yes_no(
                 io,
                 &format!("A {name} key is already stored in your keyring. Keep it?"),
@@ -108,20 +208,26 @@ fn configure_provider(
                 return ProviderOutcome::Kept;
             }
         }
-        KeyDiagnosis::Found { location: KeyLocation::PlaintextFile, credential } => {
+        KeyDiagnosis::Found {
+            location: KeyLocation::PlaintextFile,
+            credential,
+        } => {
             io.writeln(&format!(
                 "A {name} key is stored in the plaintext fallback file (saved while the keyring \
                  was unavailable)."
             ));
-            if ask_yes_no(io, "Keep it, migrating into your keyring if available?", true) {
+            if ask_yes_no(
+                io,
+                "Keep it, migrating into your keyring if available?",
+                true,
+            ) {
                 match store.replace(provider, credential) {
                     Ok(()) => io.writeln(&format!(
                         "Kept the {name} key (migrated into the keyring if it was available)."
                     )),
-                    Err(error) => io.writeln(&format!(
-                        "Kept the {name} key: {}",
-                        error.public_message()
-                    )),
+                    Err(error) => {
+                        io.writeln(&format!("Kept the {name} key: {}", error.public_message()))
+                    }
                 }
                 return ProviderOutcome::Kept;
             }
@@ -144,7 +250,9 @@ fn configure_provider(
     }
 
     loop {
-        let entered = io.prompt_secret(&format!("Enter your {name} API key (leave blank to skip): "));
+        let entered = io.prompt_secret(&format!(
+            "Enter your {name} API key (leave blank to skip): "
+        ));
         let key = match entered {
             Some(key) => key.trim().to_owned(),
             None => {
@@ -159,7 +267,9 @@ fn configure_provider(
         let credential = match Credential::new(key) {
             Ok(credential) => credential,
             Err(_) => {
-                io.writeln("That key contains a line break; paste the key on one line and try again.");
+                io.writeln(
+                    "That key contains a line break; paste the key on one line and try again.",
+                );
                 continue;
             }
         };
@@ -182,7 +292,10 @@ fn configure_provider(
                 };
             }
             ProviderKeyStatus::InvalidKey => {
-                io.writeln(&format!("{name} rejected that key ({}).", ProviderKeyStatus::InvalidKey.headline()));
+                io.writeln(&format!(
+                    "{name} rejected that key ({}).",
+                    ProviderKeyStatus::InvalidKey.headline()
+                ));
                 io.writeln(provider_free_tier_hint(provider));
                 if ask_yes_no(io, "Try a different key?", true) {
                     continue;
@@ -215,6 +328,68 @@ fn configure_provider(
                 return ProviderOutcome::Skipped;
             }
         }
+    }
+}
+
+/// Wrap-up printed only after the full setup path succeeds. Hyprland still has
+/// daemon/Overlay work after the credential wizard, so this must not run first.
+pub const SETUP_COMPLETE_MESSAGE: &str =
+    "Setup complete. Run `voisu doctor` to re-check your keys and desktop.";
+
+/// Hyprland-only: print the current Caps Lock role, then ask Caps Lock
+/// (default yes) and Right Alt (hold) as fallback. Never overwrite an exact
+/// unmanaged bind. An already-managed Voisu block is kept without prompting.
+fn caps_lock_trigger_preferred(
+    occupancy: &TriggerOccupancy,
+    io: &mut dyn WizardIo,
+) -> Result<bool, String> {
+    if occupancy.managed_key.is_some() {
+        return Ok(false);
+    }
+
+    match occupancy.unmanaged_caps_lock.as_ref() {
+        Some((description, command)) if command == VOISU_TOGGLE_COMMAND => {
+            io.writeln(&format!(
+                "Caps Lock is currently bound to {description} → {command}."
+            ));
+            if ask_yes_no(io, "Keep Caps Lock as the Trigger Key?", true) {
+                return Ok(true);
+            }
+            ask_right_alt_trigger(io)
+        }
+        Some((description, command)) => {
+            io.writeln(&format!(
+                "Caps Lock is currently bound to {description} → {command}."
+            ));
+            io.writeln("That binding will not be replaced.");
+            ask_right_alt_trigger(io)
+        }
+        None => {
+            if occupancy.compose_caps {
+                io.writeln("Caps Lock is currently the Compose key.");
+            } else {
+                io.writeln("Caps Lock currently toggles Caps Lock.");
+            }
+            let question = if occupancy.compose_caps {
+                "Use Caps Lock as the Trigger Key? Caps Lock will not toggle lock state. Compose on Caps Lock will be removed."
+            } else {
+                "Use Caps Lock as the Trigger Key? Caps Lock will not toggle lock state."
+            };
+            if ask_yes_no(io, question, true) {
+                return Ok(true);
+            }
+            ask_right_alt_trigger(io)
+        }
+    }
+}
+
+fn ask_right_alt_trigger(io: &mut dyn WizardIo) -> Result<bool, String> {
+    if ask_yes_no(io, "Use Right Alt as the Trigger Key (hold)?", true) {
+        Ok(false)
+    } else {
+        Err(format!(
+            "No Trigger Key was installed. Recovery: rerun `{RECOVERY_COMMAND}` or bind `{VOISU_TOGGLE_COMMAND}` yourself."
+        ))
     }
 }
 
@@ -752,8 +927,456 @@ impl KeyValidator for LiveKeyValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hyprland_bindings::{
+        CAPS_LOCK, RIGHT_ALT, TriggerBindingPlan, plan_trigger_binding,
+    };
     use std::collections::HashMap;
     use voisu_core::{BoundaryError, BoundaryKind};
+
+    fn free_caps_lock() -> TriggerOccupancy {
+        TriggerOccupancy {
+            managed_key: None,
+            unmanaged_caps_lock: None,
+            compose_caps: false,
+        }
+    }
+
+    struct FakeHyprlandSetup {
+        events: Vec<&'static str>,
+        paste: bool,
+        fail_at: Option<&'static str>,
+    }
+
+    impl FakeHyprlandSetup {
+        fn step(&mut self, name: &'static str) -> Result<(), String> {
+            self.events.push(name);
+            if self.fail_at == Some(name) {
+                Err(format!("{name} failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl HyprlandSetupActions for FakeHyprlandSetup {
+        fn select_clipboard_delivery(&mut self) -> Result<(), String> {
+            self.step("clipboard")
+        }
+
+        fn install_services(&mut self) -> Result<(), String> {
+            self.step("services")
+        }
+
+        fn install_trigger_binding(&mut self, _config: &Path) -> Result<TriggerKey, String> {
+            self.step("trigger")?;
+            Ok(crate::hyprland_bindings::CAPS_LOCK)
+        }
+
+        fn discover_paste_action(&mut self) -> Option<VerifiedPasteAction> {
+            self.events.push("paste");
+            self.paste.then_some(VerifiedPasteAction {
+                shortcut: crate::hyprland_bindings::PasteShortcut {
+                    binding: "SUPER + V".to_owned(),
+                },
+                description: "Universal paste".to_owned(),
+                live_binding_identity: "test-live-binding".to_owned(),
+                behavior: crate::hyprland_bindings::PasteBehavior::Simple,
+            })
+        }
+
+        fn start_services_and_query_daemon(&mut self) -> Result<(), String> {
+            self.step("start-and-query")
+        }
+
+        fn verify_delivery_backend(&mut self) -> Result<(), String> {
+            self.step("verify-delivery")
+        }
+    }
+
+    #[test]
+    fn hyprland_setup_runs_desktop_steps_in_dependency_order() {
+        let mut actions = FakeHyprlandSetup {
+            events: Vec::new(),
+            paste: true,
+            fail_at: None,
+        };
+
+        let result = run_hyprland_setup(Path::new("/tmp/hyprland.lua"), &mut actions)
+            .expect("setup should complete");
+
+        assert_eq!(result.trigger_key, crate::hyprland_bindings::CAPS_LOCK);
+        assert!(result.paste_verified);
+        assert_eq!(
+            actions.events,
+            vec![
+                "clipboard",
+                "trigger",
+                "paste",
+                "services",
+                "start-and-query",
+                "verify-delivery"
+            ]
+        );
+    }
+
+    #[test]
+    fn hyprland_setup_reports_clipboard_only_when_paste_is_not_verified() {
+        let mut actions = FakeHyprlandSetup {
+            events: Vec::new(),
+            paste: false,
+            fail_at: None,
+        };
+
+        let result = run_hyprland_setup(Path::new("/tmp/hyprland.lua"), &mut actions)
+            .expect("clipboard-only setup should complete");
+
+        assert!(!result.paste_verified);
+        assert_eq!(actions.events.last(), Some(&"verify-delivery"));
+    }
+
+    #[test]
+    fn hyprland_setup_stops_before_starting_when_a_required_step_fails() {
+        let mut actions = FakeHyprlandSetup {
+            events: Vec::new(),
+            paste: true,
+            fail_at: Some("trigger"),
+        };
+
+        let error = run_hyprland_setup(Path::new("/tmp/hyprland.lua"), &mut actions)
+            .expect_err("failed trigger setup must remain incomplete");
+
+        assert_eq!(error, "trigger failed");
+        assert_eq!(actions.events, vec!["clipboard", "trigger"]);
+    }
+
+    #[test]
+    fn hyprland_setup_does_not_claim_success_when_delivery_backend_is_unusable() {
+        let mut actions = FakeHyprlandSetup {
+            events: Vec::new(),
+            paste: false,
+            fail_at: Some("verify-delivery"),
+        };
+
+        let error = run_hyprland_setup(Path::new("/tmp/hyprland.lua"), &mut actions)
+            .expect_err("an unusable Delivery backend must fail setup");
+
+        assert_eq!(error, "verify-delivery failed");
+        assert_eq!(
+            actions.events,
+            vec![
+                "clipboard",
+                "trigger",
+                "paste",
+                "services",
+                "start-and-query",
+                "verify-delivery"
+            ]
+        );
+    }
+
+    fn xdg_config_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct XdgConfigHomeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl XdgConfigHomeGuard {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("XDG_CONFIG_HOME");
+            // SAFETY: tests hold xdg_config_test_lock for the guard's lifetime.
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", path) };
+            Self { previous }
+        }
+    }
+
+    impl Drop for XdgConfigHomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests hold xdg_config_test_lock for the guard's lifetime.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hyprland_setup_overwrites_type_and_guarded_delivery_with_clipboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let _lock = xdg_config_test_lock();
+        let _guard = XdgConfigHomeGuard::set(dir.path());
+        let mut io = FakeIo::new(vec![], vec![]);
+        let mut actions = LiveHyprlandSetupActions { io: &mut io };
+
+        for existing in [DeliveryMode::Type, DeliveryMode::Guarded] {
+            config::set_delivery_mode(existing).unwrap();
+            assert_eq!(config::delivery_mode(), existing);
+            actions.select_clipboard_delivery().unwrap();
+            assert_eq!(config::delivery_mode(), DeliveryMode::Clipboard);
+        }
+    }
+
+    #[test]
+    fn caps_lock_prompt_defaults_to_yes_when_the_key_is_free() {
+        let mut io = FakeIo::new(vec![], vec![Some("")]);
+        assert!(caps_lock_trigger_preferred(&free_caps_lock(), &mut io).unwrap());
+        let transcript = io.transcript();
+        assert!(
+            transcript.contains("Caps Lock currently toggles Caps Lock."),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("Use Caps Lock as the Trigger Key?"),
+            "{transcript}"
+        );
+    }
+
+    #[test]
+    fn rejecting_caps_lock_falls_back_without_installing_left_alt() {
+        let mut io = FakeIo::new(vec![], vec![Some("n")]);
+        assert!(!caps_lock_trigger_preferred(&free_caps_lock(), &mut io).unwrap());
+        let transcript = io.transcript();
+        assert!(
+            transcript.contains("Use Right Alt as the Trigger Key (hold)?"),
+            "{transcript}"
+        );
+        assert!(!transcript.contains("Left Alt"), "{transcript}");
+        assert_eq!(
+            plan_trigger_binding("", false),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+    }
+
+    #[test]
+    fn occupied_caps_lock_explains_occupancy_and_offers_right_alt() {
+        let mut io = FakeIo::new(vec![], vec![Some("y")]);
+        let occupancy = TriggerOccupancy {
+            managed_key: None,
+            unmanaged_caps_lock: Some(("Terminal".to_owned(), "kitty".to_owned())),
+            compose_caps: false,
+        };
+        assert!(!caps_lock_trigger_preferred(&occupancy, &mut io).unwrap());
+        let transcript = io.transcript();
+        assert!(
+            transcript.contains("Caps Lock is currently bound to Terminal → kitty."),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("That binding will not be replaced."),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("Use Right Alt as the Trigger Key (hold)?"),
+            "{transcript}"
+        );
+        assert!(
+            !transcript.contains("Use Caps Lock as the Trigger Key?"),
+            "{transcript}"
+        );
+    }
+
+    #[test]
+    fn already_installed_caps_lock_does_not_prompt() {
+        let mut io = FakeIo::new(vec![], vec![Some("n")]);
+        let source = concat!(
+            "-- BEGIN VOISU MANAGED TRIGGER\n",
+            "o.bind(\"code:66\", \"Voisu dictation\", \"voisu toggle\")\n",
+            "-- END VOISU MANAGED TRIGGER\n"
+        );
+        let occupancy = TriggerOccupancy {
+            managed_key: Some(CAPS_LOCK),
+            unmanaged_caps_lock: None,
+            compose_caps: false,
+        };
+        assert!(!caps_lock_trigger_preferred(&occupancy, &mut io).unwrap());
+        assert!(
+            !io.transcript().contains("Caps Lock"),
+            "{}",
+            io.transcript()
+        );
+        assert_eq!(
+            plan_trigger_binding(source, false),
+            TriggerBindingPlan::AlreadyInstalled { key: CAPS_LOCK }
+        );
+    }
+
+    #[test]
+    fn provider_wizard_does_not_prompt_for_hyprland_caps_lock() {
+        let mut io = FakeIo::new(vec![Some("deepgram-key"), Some("groq-key")], vec![]);
+        let mut store = FakeStore::default();
+        let mut validator = FakeValidator {
+            statuses: vec![ProviderKeyStatus::Valid, ProviderKeyStatus::Valid],
+        };
+        run_setup(&mut io, &mut store, &mut validator);
+        assert!(
+            !io.transcript().contains("Caps Lock"),
+            "Fedora KDE/GNOME keep the portal Trigger Key path:\n{}",
+            io.transcript()
+        );
+        assert!(
+            !io.transcript().contains("Setup complete"),
+            "Hyprland still has work after credentials:\n{}",
+            io.transcript()
+        );
+    }
+
+    #[test]
+    fn occupied_caps_lock_in_sibling_bindings_offers_right_alt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hyprland.lua");
+        std::fs::write(&path, "").unwrap();
+        std::fs::write(
+            path.with_file_name("bindings.lua"),
+            r#"o.bind("code:66", "Terminal", "kitty")"#,
+        )
+        .unwrap();
+        let occupancy = inspect_trigger_occupancy(&path, "", &LocalBindingFileSystem).unwrap();
+        assert_eq!(
+            occupancy.unmanaged_caps_lock,
+            Some(("Terminal".to_owned(), "kitty".to_owned()))
+        );
+
+        let mut io = FakeIo::new(vec![], vec![Some("y")]);
+        assert!(!caps_lock_trigger_preferred(&occupancy, &mut io).unwrap());
+        let transcript = io.transcript();
+        assert!(
+            transcript.contains("Caps Lock is currently bound to Terminal → kitty."),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("Use Right Alt as the Trigger Key (hold)?"),
+            "{transcript}"
+        );
+        assert!(
+            !transcript.contains("Use Caps Lock as the Trigger Key?"),
+            "{transcript}"
+        );
+    }
+
+    #[test]
+    fn compose_caps_in_reachable_input_is_printed_and_caps_lock_is_preferred() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hyprland.lua");
+        std::fs::create_dir(directory.path().join("hypr")).unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                r#"dofile((os.getenv("OMARCHY_PATH") or "/usr/share/omarchy") .. "/default/hypr/bootstrap.lua")"#,
+                "\nrequire(\"hypr.input\")\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("hypr").join("input.lua"),
+            "hl.config({\n  input = {\n    kb_options = \"compose:caps\",\n  },\n})\n",
+        )
+        .unwrap();
+        let source = std::fs::read_to_string(&path).unwrap();
+        let occupancy = inspect_trigger_occupancy(&path, &source, &LocalBindingFileSystem).unwrap();
+        assert!(occupancy.compose_caps);
+        assert!(occupancy.unmanaged_caps_lock.is_none());
+
+        let mut io = FakeIo::new(vec![], vec![Some("")]);
+        assert!(caps_lock_trigger_preferred(&occupancy, &mut io).unwrap());
+        let transcript = io.transcript();
+        assert!(
+            transcript.contains("Caps Lock is currently the Compose key."),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("Compose on Caps Lock will be removed."),
+            "{transcript}"
+        );
+        assert!(
+            !transcript.contains("Use Right Alt as the Trigger Key"),
+            "{transcript}"
+        );
+    }
+
+    #[test]
+    fn declining_caps_lock_asks_right_alt_and_accepting_prefers_right_alt() {
+        let mut io = FakeIo::new(vec![], vec![Some("n"), Some("y")]);
+        assert!(!caps_lock_trigger_preferred(&free_caps_lock(), &mut io).unwrap());
+        let transcript = io.transcript();
+        assert!(
+            transcript.contains("Use Caps Lock as the Trigger Key?"),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("Use Right Alt as the Trigger Key (hold)?"),
+            "{transcript}"
+        );
+    }
+
+    #[test]
+    fn declining_caps_lock_and_right_alt_fails_closed_without_installing() {
+        let mut io = FakeIo::new(vec![], vec![Some("n"), Some("n")]);
+        let error = caps_lock_trigger_preferred(&free_caps_lock(), &mut io)
+            .expect_err("declining both keys must not install a Trigger Key");
+        assert!(error.contains("voisu setup"), "{error}");
+        assert!(error.contains("voisu toggle"), "{error}");
+        assert!(!error.contains("Left Alt"), "{error}");
+        assert_eq!(
+            plan_trigger_binding("", false),
+            TriggerBindingPlan::Install { key: RIGHT_ALT },
+            "declining both must fail before install; Right Alt is not auto-written"
+        );
+    }
+
+    #[test]
+    fn unmanaged_voisu_toggle_on_caps_lock_kept_without_right_alt() {
+        let source = r#"o.bind("code:66", "Voisu dictation", "voisu toggle")"#;
+        let occupancy = TriggerOccupancy {
+            managed_key: None,
+            unmanaged_caps_lock: Some(("Voisu dictation".to_owned(), "voisu toggle".to_owned())),
+            compose_caps: false,
+        };
+        let mut io = FakeIo::new(vec![], vec![Some("")]);
+        assert!(caps_lock_trigger_preferred(&occupancy, &mut io).unwrap());
+        let transcript = io.transcript();
+        assert!(
+            transcript.contains("Caps Lock is currently bound to Voisu dictation → voisu toggle."),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("Keep Caps Lock as the Trigger Key?"),
+            "{transcript}"
+        );
+        assert!(
+            !transcript.contains("Use Right Alt as the Trigger Key"),
+            "{transcript}"
+        );
+        assert_eq!(
+            plan_trigger_binding(source, true),
+            TriggerBindingPlan::AlreadyInstalled { key: CAPS_LOCK }
+        );
+    }
+
+    #[test]
+    fn unmanaged_kitty_on_caps_lock_is_not_stolen() {
+        let occupancy = TriggerOccupancy {
+            managed_key: None,
+            unmanaged_caps_lock: Some(("Terminal".to_owned(), "kitty".to_owned())),
+            compose_caps: false,
+        };
+        let mut io = FakeIo::new(vec![], vec![Some("y")]);
+        assert!(!caps_lock_trigger_preferred(&occupancy, &mut io).unwrap());
+        let transcript = io.transcript();
+        assert!(
+            transcript.contains("That binding will not be replaced."),
+            "{transcript}"
+        );
+        assert_eq!(
+            plan_trigger_binding(r#"o.bind("code:66", "Terminal", "kitty")"#, true),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+    }
 
     /// A scripted terminal: pops queued key/line answers and records output.
     struct FakeIo {
@@ -812,14 +1435,24 @@ mod tests {
     }
 
     impl SecretStore for FakeStore {
-        fn replace(&mut self, provider: Provider, credential: Credential) -> Result<(), BoundaryError> {
+        fn replace(
+            &mut self,
+            provider: Provider,
+            credential: Credential,
+        ) -> Result<(), BoundaryError> {
             if self.fail_replace {
-                return Err(BoundaryError::new(BoundaryKind::SecretStorage, "store failed"));
+                return Err(BoundaryError::new(
+                    BoundaryKind::SecretStorage,
+                    "store failed",
+                ));
             }
-            self.keys
-                .insert(provider.secret_service_value(), credential.expose_to_boundary().to_owned());
+            self.keys.insert(
+                provider.secret_service_value(),
+                credential.expose_to_boundary().to_owned(),
+            );
             // A successful store migrates a key into the keyring.
-            self.locations.insert(provider.secret_service_value(), KeyLocation::Keyring);
+            self.locations
+                .insert(provider.secret_service_value(), KeyLocation::Keyring);
             Ok(())
         }
         fn load(&mut self, provider: Provider) -> Result<Credential, BoundaryError> {
@@ -863,10 +1496,7 @@ mod tests {
 
     #[test]
     fn both_valid_keys_are_validated_then_stored() {
-        let mut io = FakeIo::new(
-            vec![Some("deepgram-key"), Some("groq-key")],
-            vec![],
-        );
+        let mut io = FakeIo::new(vec![Some("deepgram-key"), Some("groq-key")], vec![]);
         let mut store = FakeStore::default();
         let mut validator = FakeValidator {
             statuses: vec![ProviderKeyStatus::Valid, ProviderKeyStatus::Valid],
@@ -874,8 +1504,21 @@ mod tests {
         let outcome = run_setup(&mut io, &mut store, &mut validator);
         assert_eq!(outcome.deepgram, ProviderOutcome::Stored);
         assert_eq!(outcome.groq, ProviderOutcome::Stored);
-        assert_eq!(store.keys.get("deepgram").map(String::as_str), Some("deepgram-key"));
+        assert_eq!(
+            store.keys.get("deepgram").map(String::as_str),
+            Some("deepgram-key")
+        );
         assert_eq!(store.keys.get("groq").map(String::as_str), Some("groq-key"));
+        assert!(
+            !io.transcript().contains("Caps Lock"),
+            "the provider wizard must not ask Hyprland Trigger Key questions:\n{}",
+            io.transcript()
+        );
+        assert!(
+            !io.transcript().contains("Setup complete"),
+            "{}",
+            io.transcript()
+        );
     }
 
     #[test]
@@ -896,8 +1539,15 @@ mod tests {
         };
         let outcome = run_setup(&mut io, &mut store, &mut validator);
         assert_eq!(outcome.deepgram, ProviderOutcome::Stored);
-        assert_eq!(store.keys.get("deepgram").map(String::as_str), Some("good-key"));
-        assert!(io.transcript().contains("run `voisu setup`"), "{}", io.transcript());
+        assert_eq!(
+            store.keys.get("deepgram").map(String::as_str),
+            Some("good-key")
+        );
+        assert!(
+            io.transcript().contains("run `voisu setup`"),
+            "{}",
+            io.transcript()
+        );
     }
 
     #[test]
@@ -921,7 +1571,9 @@ mod tests {
     #[test]
     fn an_already_stored_key_can_be_kept_without_re_entering() {
         let mut store = FakeStore::default();
-        store.keys.insert("deepgram", "existing-deepgram".to_owned());
+        store
+            .keys
+            .insert("deepgram", "existing-deepgram".to_owned());
         // Keep Deepgram (yes), then enter a Groq key.
         let mut io = FakeIo::new(vec![Some("groq-key")], vec![Some("y")]);
         let mut validator = FakeValidator {
@@ -930,7 +1582,10 @@ mod tests {
         let outcome = run_setup(&mut io, &mut store, &mut validator);
         assert_eq!(outcome.deepgram, ProviderOutcome::Kept);
         // The stored key is untouched.
-        assert_eq!(store.keys.get("deepgram").map(String::as_str), Some("existing-deepgram"));
+        assert_eq!(
+            store.keys.get("deepgram").map(String::as_str),
+            Some("existing-deepgram")
+        );
         assert_eq!(outcome.groq, ProviderOutcome::Stored);
     }
 
@@ -948,7 +1603,8 @@ mod tests {
         let outcome = run_setup(&mut io, &mut store, &mut validator);
         assert_eq!(outcome.deepgram, ProviderOutcome::Kept);
         assert!(
-            io.transcript().contains("environment variable, which wins at runtime"),
+            io.transcript()
+                .contains("environment variable, which wins at runtime"),
             "{}",
             io.transcript()
         );
@@ -979,7 +1635,10 @@ mod tests {
         );
         // The wizard still prompts so a key can be stored for after the fix.
         assert_eq!(outcome.deepgram, ProviderOutcome::Stored);
-        assert_eq!(store.keys.get("deepgram").map(String::as_str), Some("deepgram-key"));
+        assert_eq!(
+            store.keys.get("deepgram").map(String::as_str),
+            Some("deepgram-key")
+        );
     }
 
     #[test]
@@ -988,13 +1647,19 @@ mod tests {
         // on keep, re-stored (migrated) through replace.
         let mut store = FakeStore::default();
         store.keys.insert("deepgram", "file-deepgram".to_owned());
-        store.locations.insert("deepgram", KeyLocation::PlaintextFile);
+        store
+            .locations
+            .insert("deepgram", KeyLocation::PlaintextFile);
         // Keep+migrate Deepgram (yes), then skip Groq.
         let mut io = FakeIo::new(vec![Some("")], vec![Some("y")]);
         let mut validator = FakeValidator { statuses: vec![] };
         let outcome = run_setup(&mut io, &mut store, &mut validator);
         assert_eq!(outcome.deepgram, ProviderOutcome::Kept);
-        assert!(io.transcript().contains("plaintext fallback file"), "{}", io.transcript());
+        assert!(
+            io.transcript().contains("plaintext fallback file"),
+            "{}",
+            io.transcript()
+        );
         // The migration re-stored it, flipping its location to the keyring.
         assert_eq!(store.locations.get("deepgram"), Some(&KeyLocation::Keyring));
     }
@@ -1012,7 +1677,10 @@ mod tests {
         };
         let outcome = run_setup(&mut io, &mut store, &mut validator);
         assert_eq!(outcome.deepgram, ProviderOutcome::StoredUnverified);
-        assert_eq!(store.keys.get("deepgram").map(String::as_str), Some("deepgram-key"));
+        assert_eq!(
+            store.keys.get("deepgram").map(String::as_str),
+            Some("deepgram-key")
+        );
         assert_eq!(outcome.groq, ProviderOutcome::Skipped);
     }
 
@@ -1225,7 +1893,9 @@ mod tests {
     #[test]
     fn finish_at_eof_returns_a_pending_non_empty_line() {
         let (editor, _, _) = feed(b"partial");
-        assert!(matches!(editor.finish_at_eof(), MaskedOutcome::Entered(line) if line == "partial"));
+        assert!(
+            matches!(editor.finish_at_eof(), MaskedOutcome::Entered(line) if line == "partial")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1234,7 +1904,10 @@ mod tests {
 
     #[test]
     fn reveal_shows_first_four_and_last_four_with_the_count() {
-        assert_eq!(mask_key_reveal("gsk_1234567890abcd"), "gsk_••••abcd   (18 chars)");
+        assert_eq!(
+            mask_key_reveal("gsk_1234567890abcd"),
+            "gsk_••••abcd   (18 chars)"
+        );
         // Exactly at the twelve-character threshold.
         assert_eq!(mask_key_reveal("abcdefghijkl"), "abcd••••ijkl   (12 chars)");
     }
@@ -1268,7 +1941,11 @@ mod tests {
         let masked = masked_lflag(original);
         assert_eq!(masked & libc::ECHO, 0, "ECHO must be cleared");
         assert_eq!(masked & libc::ICANON, 0, "ICANON must be cleared");
-        assert_eq!(masked & libc::ISIG, libc::ISIG, "ISIG must survive so Ctrl-C still signals");
+        assert_eq!(
+            masked & libc::ISIG,
+            libc::ISIG,
+            "ISIG must survive so Ctrl-C still signals"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1358,7 +2035,10 @@ mod tests {
         original.c_lflag |= libc::ECHO | libc::ICANON | libc::ISIG;
         original.c_cc[libc::VMIN] = 7;
         original.c_cc[libc::VTIME] = 13;
-        assert_eq!(unsafe { libc::tcsetattr(slave, libc::TCSANOW, &original) }, 0);
+        assert_eq!(
+            unsafe { libc::tcsetattr(slave, libc::TCSANOW, &original) },
+            0
+        );
 
         // A parent-held slave fd to read the termios back after the child exits.
         let probe = unsafe { libc::dup(slave) };
@@ -1366,13 +2046,22 @@ mod tests {
 
         // Readiness pipe: the child writes one byte once masked mode is live.
         let mut pipe_fds = [0 as libc::c_int; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0, "pipe failed");
+        assert_eq!(
+            unsafe { libc::pipe(pipe_fds.as_mut_ptr()) },
+            0,
+            "pipe failed"
+        );
         let (ready_read, ready_write) = (pipe_fds[0], pipe_fds[1]);
 
         let exe = std::env::current_exe().expect("current_exe");
         let slave_stdin = unsafe { OwnedFd::from_raw_fd(slave) };
         let mut cmd = Command::new(exe);
-        cmd.args(["setup::tests::pty_child_entry", "--exact", "--test-threads=1", "-q"]);
+        cmd.args([
+            "setup::tests::pty_child_entry",
+            "--exact",
+            "--test-threads=1",
+            "-q",
+        ]);
         cmd.env("VOISU_MASKED_PTY_CHILD", mode);
         cmd.stdin(Stdio::from(slave_stdin));
         cmd.stdout(Stdio::null());
@@ -1381,7 +2070,10 @@ mod tests {
         unsafe {
             cmd.pre_exec(move || {
                 // No core dumps from the SIGQUIT path.
-                let limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                let limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
                 libc::setrlimit(libc::RLIMIT_CORE, &limit);
                 // Wire the readiness pipe write-end to fd 3 for the child.
                 if libc::dup2(ready_write, 3) < 0 {
@@ -1395,12 +2087,21 @@ mod tests {
         // Parent drops the write-end so a child that dies early yields EOF on
         // the read-end rather than blocking the parent forever.
         unsafe { libc::close(ready_write) };
-        PtyChild { child, master, probe, ready: ready_read }
+        PtyChild {
+            child,
+            master,
+            probe,
+            ready: ready_read,
+        }
     }
 
     fn termios_of(fd: libc::c_int) -> libc::termios {
         let mut termios: libc::termios = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::tcgetattr(fd, &mut termios) }, 0, "tcgetattr failed");
+        assert_eq!(
+            unsafe { libc::tcgetattr(fd, &mut termios) },
+            0,
+            "tcgetattr failed"
+        );
         termios
     }
 
@@ -1429,7 +2130,11 @@ mod tests {
 
     fn assert_terminal_restored(termios: &libc::termios, context: &str) {
         assert_ne!(termios.c_lflag & libc::ECHO, 0, "ECHO restored ({context})");
-        assert_ne!(termios.c_lflag & libc::ICANON, 0, "ICANON restored ({context})");
+        assert_ne!(
+            termios.c_lflag & libc::ICANON,
+            0,
+            "ICANON restored ({context})"
+        );
         assert_eq!(termios.c_cc[libc::VMIN], 7, "VMIN restored ({context})");
         assert_eq!(termios.c_cc[libc::VTIME], 13, "VTIME restored ({context})");
     }
@@ -1457,12 +2162,19 @@ mod tests {
     fn run_signal_restoration(signal: libc::c_int, name: &str) {
         use std::os::unix::process::ExitStatusExt;
         let mut pty = spawn_pty_child("signal");
-        assert!(wait_ready(pty.ready), "child never reached masked mode ({name})");
+        assert!(
+            wait_ready(pty.ready),
+            "child never reached masked mode ({name})"
+        );
         // Interrupt while the child is parked in the masked read.
         let killed = unsafe { libc::kill(pty.child.id() as libc::pid_t, signal) };
         assert_eq!(killed, 0, "kill {name} failed");
         let status = pty.child.wait().expect("wait child");
-        assert_eq!(status.signal(), Some(signal), "child should die from {name}: {status:?}");
+        assert_eq!(
+            status.signal(),
+            Some(signal),
+            "child should die from {name}: {status:?}"
+        );
         // The async-signal-safe handler must have restored the tty before death.
         assert_terminal_restored(&termios_of(pty.probe), name);
         close_pty(&pty);

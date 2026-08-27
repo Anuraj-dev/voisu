@@ -71,6 +71,10 @@ const PROCESS_POLL: Duration = Duration::from_millis(10);
 const MAX_DAEMON_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_RETAINED_STDERR_BYTES: usize = 4 * 1024;
 const MAX_RETAINED_STDOUT_BYTES: usize = 64 * 1024;
+/// `hyprctl binds -j` on Omarchy-sized bind tables is ~100 KiB. The shared
+/// helper stdout cap stays 64 KiB; this inspection-only ceiling is 1 MiB and
+/// fail-closes if the dump is truncated.
+const HYPRCTL_BINDS_JSON_CAP: usize = 1024 * 1024;
 const PROVIDER_PROCESS_DEADLINE: Duration = Duration::from_secs(14);
 const RECONCILIATION_PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 /// Default Groq chat-completions model for Transcript reconciliation.
@@ -1747,34 +1751,61 @@ fn probe_clipboard_roundtrip(tool: ClipboardTool) -> ClipboardProbe {
     };
 
     let probe = format!("voisu-readiness-{}", std::process::id());
-    match run_restricted_serving(write_program, write_arguments, Some(probe.as_bytes())) {
-        Ok(outcome) if outcome.success => {}
+    probe_clipboard_roundtrip_with(
+        original,
+        probe.as_bytes(),
+        |value| {
+            run_restricted_serving(write_program, write_arguments, Some(value))
+                .map(|outcome| outcome.success)
+        },
+        || {
+            run_restricted(read_program, read_arguments, None, true)
+                .ok()
+                .filter(|outcome| outcome.success)
+                .map(|outcome| outcome.stdout == probe.as_bytes())
+                .unwrap_or(false)
+        },
+    )
+}
+
+fn probe_clipboard_roundtrip_with<F, R>(
+    original: Option<Vec<u8>>,
+    probe: &[u8],
+    write: F,
+    readback_succeeds: R,
+) -> ClipboardProbe
+where
+    F: Fn(&[u8]) -> Result<bool, ProcessError>,
+    R: Fn() -> bool,
+{
+    // Restore the prior value only if there genuinely was one; writing an empty
+    // string back would install an empty clipboard owner where none existed.
+    let restore = || {
+        original
+            .as_deref()
+            .is_none_or(|original| write(original).is_ok_and(|success| success))
+    };
+
+    match write(probe) {
+        Ok(true) => {}
         // A spawn failure is the only definitive "tool is not installed" signal.
         Err(ProcessError::Unavailable) => return ClipboardProbe::ToolMissing,
-        _ => return ClipboardProbe::Failed,
+        Ok(false) | Err(_) => {
+            let _ = restore();
+            return ClipboardProbe::Failed;
+        }
     }
 
-    let observed = run_restricted(read_program, read_arguments, None, true)
-        .ok()
-        .filter(|outcome| outcome.success)
-        .map(|outcome| outcome.stdout == probe.as_bytes())
-        .unwrap_or(false);
-    if !observed {
+    if !readback_succeeds() {
+        let _ = restore();
         return ClipboardProbe::Failed;
     }
 
-    // Restore the prior value only if there genuinely was one; writing an empty
-    // string back would install an empty clipboard owner where none existed.
-    match original {
-        Some(original) => {
-            let restored = run_restricted_serving(write_program, write_arguments, Some(&original))
-                .is_ok_and(|outcome| outcome.success);
-            if restored {
-                ClipboardProbe::WorkedRestored
-            } else {
-                ClipboardProbe::WorkedNotRestored
-            }
-        }
+    match original.as_deref() {
+        Some(original) => match write(original) {
+            Ok(true) => ClipboardProbe::WorkedRestored,
+            Ok(false) | Err(_) => ClipboardProbe::WorkedNotRestored,
+        },
         None => ClipboardProbe::WorkedRestored,
     }
 }
@@ -1785,35 +1816,56 @@ fn probe_clipboard_roundtrip(tool: ClipboardTool) -> ClipboardProbe {
 /// command for the host package manager.
 fn clipboard_finding() -> ReadinessFinding {
     let resolution = current_session();
-    // A shadowing wrapper is a Wayland-only hazard (harmless on X11). Per the
-    // terseness contract the remediation lives in the reasoning (--verbose),
-    // naming only the exact shadowing paths, shell-quoted.
     if resolution.session == SessionKind::Wayland {
-        let shadows = shadowing_clipboard_wrappers();
-        if !shadows.is_empty() {
-            let names = shadows
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(" and ");
-            let removal = shadows
-                .iter()
-                .map(|path| shell_quote(path))
-                .collect::<Vec<_>>()
-                .join(" ");
-            return ReadinessFinding::new(
-                ReadinessCapability::Clipboard,
-                ReadinessStatus::Warn,
-                format!(
-                    "{names} shadow the packaged wl-clipboard on PATH and reroute the Wayland \
-                     clipboard through the wrong backend; remove with: rm {removal}"
-                ),
-            )
-            .with_value("shadowed wrapper");
+        if let Some(finding) = shadowed_wl_clipboard_finding() {
+            return finding;
         }
     }
 
-    let candidates = clipboard_candidates(resolution.session);
+    clipboard_finding_for_candidates(clipboard_candidates(resolution.session))
+}
+
+fn clipboard_finding_for_backend(tool: ClipboardTool) -> ReadinessFinding {
+    if tool == ClipboardTool::WlClipboard {
+        if let Some(finding) = shadowed_wl_clipboard_finding() {
+            return finding;
+        }
+    }
+    clipboard_finding_for_candidates(std::slice::from_ref(&tool))
+}
+
+fn shadowed_wl_clipboard_finding() -> Option<ReadinessFinding> {
+    // A shadowing wrapper is a Wayland-only hazard (harmless on X11). Per the
+    // terseness contract the remediation lives in the reasoning (--verbose),
+    // naming only the exact shadowing paths, shell-quoted.
+    let shadows = shadowing_clipboard_wrappers();
+    if shadows.is_empty() {
+        return None;
+    }
+    let names = shadows
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let removal = shadows
+        .iter()
+        .map(|path| shell_quote(path))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(
+        ReadinessFinding::new(
+            ReadinessCapability::Clipboard,
+            ReadinessStatus::Warn,
+            format!(
+                "{names} shadow the packaged wl-clipboard on PATH and reroute the Wayland \
+                 clipboard through the wrong backend; remove with: rm {removal}"
+            ),
+        )
+        .with_value("shadowed wrapper"),
+    )
+}
+
+fn clipboard_finding_for_candidates(candidates: &[ClipboardTool]) -> ReadinessFinding {
     let mut a_tool_was_present = false;
     for tool in candidates {
         match probe_clipboard_roundtrip(*tool) {
@@ -1854,6 +1906,33 @@ fn clipboard_finding() -> ReadinessFinding {
             detect_package_manager(),
             primary.install_package(),
         ))
+}
+
+/// Verifies the clipboard backend that the daemon's Delivery adapters use for
+/// Transcript preservation. On Wayland this probes wl-copy/wl-paste
+/// specifically; an installed xclip cannot make a missing or broken
+/// wl-clipboard backend usable.
+pub fn verify_clipboard_delivery() -> Result<(), String> {
+    // Hyprland's Clipboard, Type, and Guarded adapters all preserve through
+    // WlClipboard. Do not use the doctor's Unknown-session fallback here:
+    // xclip being installed cannot satisfy a missing wl-copy/wl-paste pair.
+    let finding = clipboard_finding_for_backend(ClipboardTool::WlClipboard);
+    if clipboard_finding_is_usable(&finding) {
+        return Ok(());
+    }
+
+    let action = finding
+        .action
+        .map(|action| format!(" (install with {action})"))
+        .unwrap_or_default();
+    Err(format!(
+        "selected Clipboard Delivery backend is not usable: {}{action}",
+        finding.detail
+    ))
+}
+
+fn clipboard_finding_is_usable(finding: &ReadinessFinding) -> bool {
+    matches!(finding.status, ReadinessStatus::Pass)
 }
 
 fn secret_service_finding() -> ReadinessFinding {
@@ -2113,6 +2192,39 @@ pub(crate) fn run_restricted_stdout(program: &str, arguments: &[&str]) -> Option
         .map(|outcome| outcome.stdout)
 }
 
+/// Reads the compositor bind table without the 64 KiB helper stdout cap.
+/// Truncation is a hard failure so setup never parses a chopped JSON prefix.
+pub(crate) fn run_hyprctl_binds_json() -> Result<Vec<u8>, String> {
+    let started = Instant::now();
+    let mut command = restricted_command("hyprctl");
+    command
+        .args(["binds", "-j"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|_| "`hyprctl binds -j` returned a failure".to_owned())?;
+    let stdout_reader = child.stdout.take().map(|mut stdout| {
+        thread::spawn(move || read_capped_checked(&mut stdout, HYPRCTL_BINDS_JSON_CAP))
+    });
+    let status = wait_for_child(&mut child, started, PROCESS_DEADLINE, None)
+        .map_err(|_| "`hyprctl binds -j` returned a failure".to_owned())?;
+    let payload = match stdout_reader {
+        Some(handle) => bounded_join(handle, started, &mut child, PROCESS_DEADLINE)
+            .map_err(|_| "`hyprctl binds -j` returned a failure".to_owned())?
+            .map_err(|_| "`hyprctl binds -j` returned a failure".to_owned())?,
+        None => CappedRead::Complete(Vec::new()),
+    };
+    match payload {
+        CappedRead::Truncated { .. } => Err(
+            "`hyprctl binds -j` response exceeded the 1 MiB inspection budget".to_owned(),
+        ),
+        CappedRead::Complete(bytes) if status.success() => Ok(bytes),
+        CappedRead::Complete(_) => Err("`hyprctl binds -j` returned a failure".to_owned()),
+    }
+}
+
 /// Runs a helper whose SUCCESS mode is to fork a descendant that keeps
 /// serving after the parent exits — real `wl-copy` serves the clipboard this
 /// way. The descendant inherits the parent's pipes, so capturing output would
@@ -2281,14 +2393,40 @@ fn pipe_bytes(
 /// retains only the first `cap` bytes: a noisy child cannot force unbounded
 /// memory growth inside the deadline window.
 fn read_capped(source: &mut impl Read, cap: usize) -> std::io::Result<Vec<u8>> {
+    match read_capped_checked(source, cap)? {
+        CappedRead::Complete(bytes) | CappedRead::Truncated { retained: bytes } => Ok(bytes),
+    }
+}
+
+enum CappedRead {
+    Complete(Vec<u8>),
+    Truncated { retained: Vec<u8> },
+}
+
+/// Like [`read_capped`], but reports whether any bytes past `cap` were drained.
+fn read_capped_checked(source: &mut impl Read, cap: usize) -> std::io::Result<CappedRead> {
     let mut retained = Vec::new();
+    let mut truncated = false;
     let mut buffer = [0_u8; 1024];
     loop {
         match source.read(&mut buffer) {
-            Ok(0) => return Ok(retained),
+            Ok(0) => {
+                return Ok(if truncated {
+                    CappedRead::Truncated { retained }
+                } else {
+                    CappedRead::Complete(retained)
+                });
+            }
             Ok(read) => {
+                if truncated {
+                    continue;
+                }
                 let room = cap.saturating_sub(retained.len());
-                retained.extend_from_slice(&buffer[..read.min(room)]);
+                let keep = read.min(room);
+                retained.extend_from_slice(&buffer[..keep]);
+                if keep < read {
+                    truncated = true;
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
@@ -8516,6 +8654,24 @@ mod tests {
     use voisu_core::{ProviderCoordinator, ProviderStreams};
 
     #[test]
+    fn read_capped_checked_completes_when_the_dump_fits() {
+        let payload = vec![b'a'; 64];
+        match read_capped_checked(&mut payload.as_slice(), 64).unwrap() {
+            CappedRead::Complete(bytes) => assert_eq!(bytes, payload),
+            CappedRead::Truncated { .. } => panic!("exact-cap dump must not look truncated"),
+        }
+    }
+
+    #[test]
+    fn read_capped_checked_fail_closes_when_the_dump_exceeds_the_budget() {
+        let payload = vec![b'b'; 65];
+        match read_capped_checked(&mut payload.as_slice(), 64).unwrap() {
+            CappedRead::Truncated { retained } => assert_eq!(retained, payload[..64]),
+            CappedRead::Complete(_) => panic!("over-budget dump must not parse as complete"),
+        }
+    }
+
+    #[test]
     fn manager_env_missing_display_is_detected_from_show_environment() {
         let present = "LANG=en_US.UTF-8\nWAYLAND_DISPLAY=wayland-0\nDISPLAY=:0\n";
         assert!(manager_env_has(present, "WAYLAND_DISPLAY"));
@@ -8639,6 +8795,82 @@ mod tests {
         let winner = resolve_on_path(&path, "wl-copy").unwrap();
         assert_eq!(winner, wrapper);
         assert!(winner.starts_with(home.path()));
+    }
+
+    #[test]
+    fn setup_clipboard_gate_rejects_shadowed_or_failed_backends() {
+        assert!(!clipboard_finding_is_usable(
+            &ReadinessFinding::new(
+                ReadinessCapability::Clipboard,
+                ReadinessStatus::Warn,
+                "clipboard wrapper shadows wl-clipboard",
+            )
+            .with_value("shadowed wrapper")
+        ));
+        assert!(!clipboard_finding_is_usable(&ReadinessFinding::new(
+            ReadinessCapability::Clipboard,
+            ReadinessStatus::Fail,
+            "wl-copy is missing",
+        )));
+        assert!(clipboard_finding_is_usable(&ReadinessFinding::new(
+            ReadinessCapability::Clipboard,
+            ReadinessStatus::Pass,
+            "clipboard roundtrip succeeds",
+        )));
+    }
+
+    #[test]
+    fn setup_clipboard_gate_rejects_a_probe_that_could_not_restore() {
+        assert!(!clipboard_finding_is_usable(&ReadinessFinding::new(
+            ReadinessCapability::Clipboard,
+            ReadinessStatus::Warn,
+            "clipboard roundtrip succeeds but the prior clipboard could not be restored",
+        )));
+    }
+
+    #[test]
+    fn clipboard_probe_restores_after_readback_failure() {
+        let writes = std::cell::RefCell::new(Vec::new());
+        let result = probe_clipboard_roundtrip_with(
+            Some(b"prior clipboard".to_vec()),
+            b"probe",
+            |value| {
+                writes.borrow_mut().push(value.to_vec());
+                Ok(true)
+            },
+            || false,
+        );
+
+        assert!(matches!(result, ClipboardProbe::Failed));
+        assert_eq!(
+            writes.into_inner(),
+            vec![b"probe".to_vec(), b"prior clipboard".to_vec()]
+        );
+    }
+
+    #[test]
+    fn clipboard_probe_restores_after_a_spawned_write_failure() {
+        let writes = std::cell::RefCell::new(Vec::new());
+        let first_write = std::cell::Cell::new(true);
+        let result = probe_clipboard_roundtrip_with(
+            Some(b"prior clipboard".to_vec()),
+            b"probe",
+            |value| {
+                writes.borrow_mut().push(value.to_vec());
+                if first_write.replace(false) {
+                    Err(ProcessError::Wait)
+                } else {
+                    Ok(true)
+                }
+            },
+            || panic!("readback must not run after a failed write"),
+        );
+
+        assert!(matches!(result, ClipboardProbe::Failed));
+        assert_eq!(
+            writes.into_inner(),
+            vec![b"probe".to_vec(), b"prior clipboard".to_vec()]
+        );
     }
 
     #[test]

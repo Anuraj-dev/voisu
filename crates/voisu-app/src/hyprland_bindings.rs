@@ -13,6 +13,8 @@ pub const END_MARKER: &str = "-- END VOISU MANAGED TRIGGER";
 pub const VOISU_TOGGLE_COMMAND: &str = "voisu toggle";
 pub const VOISU_TRIGGER_DESCRIPTION: &str = "Voisu dictation";
 pub const RECOVERY_COMMAND: &str = "voisu setup";
+const CAPS_NONE: &str = "caps:none";
+const BOTH_CAPSLOCK_CANCEL: &str = "shift:both_capslock_cancel";
 
 /// A key chord that is safe for the daemon to emit after it has verified the
 /// corresponding Hyprland binding. This is data only: no Lua or shell text is
@@ -50,15 +52,24 @@ pub struct TriggerKey {
     pub code: &'static str,
 }
 
-pub const LEFT_ALT: TriggerKey = TriggerKey {
-    label: "Left Alt",
-    code: "code:64",
+pub const CAPS_LOCK: TriggerKey = TriggerKey {
+    label: "Caps Lock",
+    code: "code:66",
 };
 
 pub const RIGHT_ALT: TriggerKey = TriggerKey {
     label: "Right Alt",
     code: "code:108",
 };
+
+/// Left Alt remains a documented combination example; Hyprland setup never
+/// auto-installs it as the Trigger Key.
+pub const LEFT_ALT: TriggerKey = TriggerKey {
+    label: "Left Alt",
+    code: "code:64",
+};
+
+const PREFERRED_TRIGGER_KEYS: [TriggerKey; 2] = [CAPS_LOCK, RIGHT_ALT];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LuaBinding {
@@ -72,7 +83,9 @@ pub struct LuaBinding {
 
 impl LuaBinding {
     pub fn is_standalone(&self) -> bool {
-        self.is_standalone_for(LEFT_ALT) || self.is_standalone_for(RIGHT_ALT)
+        PREFERRED_TRIGGER_KEYS
+            .iter()
+            .any(|candidate| self.is_standalone_for(*candidate))
     }
 
     fn is_standalone_for(&self, candidate: TriggerKey) -> bool {
@@ -81,8 +94,11 @@ impl LuaBinding {
             return true;
         }
         match candidate.code {
-            "code:64" => key.eq_ignore_ascii_case("Alt_L"),
+            "code:66" => {
+                key.eq_ignore_ascii_case("Caps_Lock") || key.eq_ignore_ascii_case("CapsLock")
+            }
             "code:108" => key.eq_ignore_ascii_case("Alt_R"),
+            "code:64" => key.eq_ignore_ascii_case("Alt_L"),
             _ => false,
         }
     }
@@ -101,6 +117,66 @@ pub enum TriggerBindingPlan {
     AlreadyInstalled { key: TriggerKey },
     Conflicts { conflicts: Vec<BindingConflict> },
     Unparseable { detail: String },
+}
+
+/// Occupancy used by the Hyprland Trigger Key prompt. Bindings come from the
+/// same import walk plus sibling `bindings.lua` that install uses; `compose:caps`
+/// comes from the last `kb_options` in execution order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TriggerOccupancy {
+    pub managed_key: Option<TriggerKey>,
+    pub unmanaged_caps_lock: Option<(String, String)>,
+    pub compose_caps: bool,
+}
+
+pub fn inspect_trigger_occupancy(
+    path: &Path,
+    source: &str,
+    files: &dyn BindingFileSystem,
+) -> Result<TriggerOccupancy, String> {
+    let bindings = load_lua_bindings_with_occupancy(path, source, files)?;
+    let mut options = collect_reachable_kb_options(path, source, files)?;
+    if options.is_empty() {
+        let input_path = path.with_file_name("input.lua");
+        if let Some(input) = files.read_to_string(&input_path)? {
+            options.extend(kb_options_values(&input));
+        }
+    }
+    Ok(occupancy_from_bindings(
+        &bindings,
+        options.last().map(String::as_str),
+    ))
+}
+
+fn occupancy_from_bindings(
+    bindings: &[LuaBinding],
+    last_kb_options: Option<&str>,
+) -> TriggerOccupancy {
+    let managed_key = PREFERRED_TRIGGER_KEYS.into_iter().find(|&candidate| {
+        let managed = bindings
+            .iter()
+            .any(|binding| binding.managed && binding.is_standalone_for(candidate));
+        let unmanaged = bindings
+            .iter()
+            .any(|binding| !binding.managed && binding.is_standalone_for(candidate));
+        managed && !unmanaged
+    });
+    let unmanaged_caps_lock = bindings.iter().find_map(|binding| {
+        (!binding.managed && binding.is_standalone_for(CAPS_LOCK))
+            .then(|| (binding.description.clone(), binding.command.clone()))
+    });
+    TriggerOccupancy {
+        managed_key,
+        unmanaged_caps_lock,
+        compose_caps: last_kb_options.is_some_and(kb_options_contains_compose_caps),
+    }
+}
+
+fn kb_options_contains_compose_caps(value: &str) -> bool {
+    value
+        .split(',')
+        .map(str::trim)
+        .any(|part| part == "compose:caps")
 }
 
 #[derive(Debug)]
@@ -151,7 +227,7 @@ impl fmt::Display for TriggerBindingError {
             Self::Conflicts { conflicts } => {
                 writeln!(
                     formatter,
-                    "both preferred Trigger Key candidates are already bound:"
+                    "preferred Trigger Key candidates are already bound:"
                 )?;
                 for conflict in conflicts {
                     writeln!(
@@ -306,16 +382,14 @@ impl HyprlandController for LiveHyprlandController {
     }
 
     fn binding_is_installed(&mut self, key: &str, command: &str) -> Result<bool, String> {
-        let payload = crate::system::run_restricted_stdout("hyprctl", &["binds", "-j"])
-            .ok_or_else(|| "`hyprctl binds -j` returned a failure".to_owned())?;
+        let payload = crate::system::run_hyprctl_binds_json()?;
         serde_json::from_slice::<Value>(&payload)
             .map(|value| hyprland_binding_is_installed(&value, key, command))
             .map_err(|error| format!("invalid `hyprctl binds -j` response: {error}"))
     }
 
     fn live_bindings(&mut self) -> Result<Value, String> {
-        let payload = crate::system::run_restricted_stdout("hyprctl", &["binds", "-j"])
-            .ok_or_else(|| "`hyprctl binds -j` returned a failure".to_owned())?;
+        let payload = crate::system::run_hyprctl_binds_json()?;
         serde_json::from_slice(&payload)
             .map_err(|error| format!("invalid `hyprctl binds -j` response: {error}"))
     }
@@ -944,36 +1018,58 @@ enum LuaBlock {
     Repeat,
 }
 
-pub fn plan_trigger_binding(source: &str) -> TriggerBindingPlan {
-    let bindings = match parse_lua_bindings(source) {
-        Ok(bindings) => bindings,
-        Err(detail) => return TriggerBindingPlan::Unparseable { detail },
-    };
+pub fn plan_trigger_binding(source: &str, prefer_caps_lock: bool) -> TriggerBindingPlan {
+    plan_trigger_bindings(&[source], prefer_caps_lock)
+}
 
-    plan_trigger_binding_from_bindings(&bindings)
+/// Plans the Trigger Key from every occupancy source. Sibling files such as
+/// `bindings.lua` must be included so an exact unmanaged Caps Lock bind there
+/// is not installed again in `hyprland.lua`.
+pub fn plan_trigger_bindings(sources: &[&str], prefer_caps_lock: bool) -> TriggerBindingPlan {
+    let mut bindings = Vec::new();
+    for source in sources {
+        match parse_lua_bindings(source) {
+            Ok(parsed) => bindings.extend(parsed),
+            Err(detail) => return TriggerBindingPlan::Unparseable { detail },
+        }
+    }
+    plan_trigger_binding_from_bindings(&bindings, prefer_caps_lock)
+}
+
+struct PlannedTriggerBinding {
+    bindings: Vec<LuaBinding>,
+    plan: TriggerBindingPlan,
 }
 
 fn plan_trigger_binding_with_imports(
     path: &Path,
     source: &str,
     files: &dyn BindingFileSystem,
-) -> TriggerBindingPlan {
-    let bindings = match load_lua_bindings(path, source, files) {
-        Ok(bindings) => bindings,
-        Err(detail) => return TriggerBindingPlan::Unparseable { detail },
-    };
-
-    plan_trigger_binding_from_bindings(&bindings)
+    prefer_caps_lock: bool,
+) -> PlannedTriggerBinding {
+    match load_lua_bindings_with_occupancy(path, source, files) {
+        Ok(bindings) => PlannedTriggerBinding {
+            plan: plan_trigger_binding_from_bindings(&bindings, prefer_caps_lock),
+            bindings,
+        },
+        Err(detail) => PlannedTriggerBinding {
+            bindings: Vec::new(),
+            plan: TriggerBindingPlan::Unparseable { detail },
+        },
+    }
 }
 
-fn plan_trigger_binding_from_bindings(bindings: &[LuaBinding]) -> TriggerBindingPlan {
+fn plan_trigger_binding_from_bindings(
+    bindings: &[LuaBinding],
+    prefer_caps_lock: bool,
+) -> TriggerBindingPlan {
     if let Some(binding) = bindings.iter().find(|binding| {
         binding.managed
             && binding.is_standalone()
             && (binding.description != VOISU_TRIGGER_DESCRIPTION
                 || binding.command != VOISU_TOGGLE_COMMAND)
     }) {
-        let candidate = [LEFT_ALT, RIGHT_ALT]
+        let candidate = PREFERRED_TRIGGER_KEYS
             .into_iter()
             .find(|candidate| binding.is_standalone_for(*candidate))
             .expect("standalone managed binding has a preferred candidate");
@@ -985,12 +1081,37 @@ fn plan_trigger_binding_from_bindings(bindings: &[LuaBinding]) -> TriggerBinding
         };
     }
 
-    let mut conflicts = Vec::new();
-    for candidate in [LEFT_ALT, RIGHT_ALT] {
-        if let Some(binding) = bindings
+    let unmanaged = |candidate: TriggerKey| {
+        bindings
             .iter()
             .find(|binding| !binding.managed && binding.is_standalone_for(candidate))
-        {
+    };
+
+    for candidate in PREFERRED_TRIGGER_KEYS {
+        let managed = bindings
+            .iter()
+            .any(|binding| binding.managed && binding.is_standalone_for(candidate));
+        if managed && unmanaged(candidate).is_none() {
+            return TriggerBindingPlan::AlreadyInstalled { key: candidate };
+        }
+    }
+
+    if prefer_caps_lock {
+        match unmanaged(CAPS_LOCK) {
+            None => return TriggerBindingPlan::Install { key: CAPS_LOCK },
+            Some(binding) if binding.command == VOISU_TOGGLE_COMMAND => {
+                return TriggerBindingPlan::AlreadyInstalled { key: CAPS_LOCK };
+            }
+            Some(_) => {}
+        }
+    }
+    if unmanaged(RIGHT_ALT).is_none() {
+        return TriggerBindingPlan::Install { key: RIGHT_ALT };
+    }
+
+    let mut conflicts = Vec::new();
+    for candidate in PREFERRED_TRIGGER_KEYS {
+        if let Some(binding) = unmanaged(candidate) {
             conflicts.push(BindingConflict {
                 candidate,
                 description: binding.description.clone(),
@@ -998,27 +1119,6 @@ fn plan_trigger_binding_from_bindings(bindings: &[LuaBinding]) -> TriggerBinding
             });
         }
     }
-    for candidate in [LEFT_ALT, RIGHT_ALT] {
-        let managed = bindings
-            .iter()
-            .any(|binding| binding.managed && binding.is_standalone_for(candidate));
-        let user_owns_same_key = conflicts
-            .iter()
-            .any(|conflict| conflict.candidate == candidate);
-        if managed && !user_owns_same_key {
-            return TriggerBindingPlan::AlreadyInstalled { key: candidate };
-        }
-    }
-
-    for candidate in [LEFT_ALT, RIGHT_ALT] {
-        if !bindings
-            .iter()
-            .any(|binding| binding.is_standalone_for(candidate))
-        {
-            return TriggerBindingPlan::Install { key: candidate };
-        }
-    }
-
     if !conflicts.is_empty() {
         return TriggerBindingPlan::Conflicts { conflicts };
     }
@@ -1032,7 +1132,7 @@ struct LuaImport {
     path: String,
 }
 
-fn load_lua_bindings(
+fn load_lua_bindings_with_occupancy(
     root_path: &Path,
     root_source: &str,
     files: &dyn BindingFileSystem,
@@ -1049,6 +1149,12 @@ fn load_lua_bindings(
             Ok(())
         },
     )?;
+    let sibling_path = normalize_path(&root_path.with_file_name("bindings.lua"));
+    if !visited.contains(&sibling_path) {
+        if let Some(sibling) = files.read_to_string(&sibling_path)? {
+            bindings.extend(parse_lua_bindings(&sibling)?);
+        }
+    }
     Ok(bindings)
 }
 
@@ -1070,6 +1176,93 @@ fn collect_reachable_lua_sources(
         },
     )?;
     Ok((sources, visited))
+}
+
+fn collect_reachable_kb_options(
+    root_path: &Path,
+    root_source: &str,
+    files: &dyn BindingFileSystem,
+) -> Result<Vec<String>, String> {
+    let mut active = HashSet::new();
+    let mut required = HashSet::new();
+    let mut options = Vec::new();
+    collect_kb_options_in_execution_order(
+        root_path,
+        root_source,
+        files,
+        &mut active,
+        &mut required,
+        &mut options,
+    )?;
+    Ok(options)
+}
+
+fn collect_kb_options_in_execution_order(
+    path: &Path,
+    source: &str,
+    files: &dyn BindingFileSystem,
+    active: &mut HashSet<PathBuf>,
+    required: &mut HashSet<PathBuf>,
+    options: &mut Vec<String>,
+) -> Result<(), String> {
+    let path = normalize_path(path);
+    if !active.insert(path.clone()) {
+        return Ok(());
+    }
+
+    let tokens = lex_lua(source)?;
+    let mut index = 0;
+    while index < tokens.len() {
+        if let (
+            Some(LuaToken::Identifier(name)),
+            Some(LuaToken::Symbol('=')),
+            Some(LuaToken::String(value)),
+        ) = (tokens.get(index), tokens.get(index + 1), tokens.get(index + 2))
+            && name == "kb_options"
+        {
+            options.push(value.clone());
+            index += 3;
+            continue;
+        }
+
+        let Some((import, consumed)) = parse_lua_import_at(&tokens, index)? else {
+            index += 1;
+            continue;
+        };
+        let Some(imported_path) = resolve_lua_import(&path, &import, files)? else {
+            index += consumed;
+            continue;
+        };
+        if import.loader == "require" && !required.insert(imported_path.clone()) {
+            index += consumed;
+            continue;
+        }
+        let imported_source = files
+            .read_to_string(&imported_path)
+            .map_err(|detail| {
+                format!(
+                    "cannot read imported Lua file {}: {detail}",
+                    imported_path.display()
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "imported Lua file {} does not exist",
+                    imported_path.display()
+                )
+            })?;
+        collect_kb_options_in_execution_order(
+            &imported_path,
+            &imported_source,
+            files,
+            active,
+            required,
+            options,
+        )?;
+        index += consumed;
+    }
+    active.remove(&path);
+    Ok(())
 }
 
 fn for_each_lua_source(
@@ -1108,41 +1301,39 @@ fn for_each_lua_source(
     Ok(())
 }
 
-fn parse_lua_imports(source: &str) -> Result<Vec<LuaImport>, String> {
-    let tokens = lex_lua(source)?;
-    let mut imports = Vec::new();
-    let mut index = 0;
-    while index < tokens.len() {
-        let LuaToken::Identifier(loader) = &tokens[index] else {
-            index += 1;
-            continue;
-        };
-        if !matches!(
-            loader.as_str(),
-            "dofile" | "loadfile" | "require" | "source"
-        ) {
-            index += 1;
-            continue;
-        }
-        let (path, consumed) = match tokens.get(index + 1) {
-            Some(LuaToken::Symbol('(')) => match tokens.get(index + 2) {
-                Some(LuaToken::String(path)) => (path, 3),
-                _ => {
-                    return Err(format!(
-                        "the Lua import {loader} must use a string literal path"
-                    ));
-                }
-            },
-            Some(LuaToken::String(path)) => (path, 2),
-            _ => {
-                index += 1;
-                continue;
+fn parse_lua_import_at(
+    tokens: &[LuaToken],
+    index: usize,
+) -> Result<Option<(LuaImport, usize)>, String> {
+    let Some(LuaToken::Identifier(loader)) = tokens.get(index) else {
+        return Ok(None);
+    };
+    if !matches!(
+        loader.as_str(),
+        "dofile" | "loadfile" | "require" | "source"
+    ) {
+        return Ok(None);
+    }
+    let (path, consumed) = match tokens.get(index + 1) {
+        Some(LuaToken::Symbol('(')) => match tokens.get(index + 2) {
+            Some(LuaToken::String(path)) => (path, 3),
+            _ if loader.as_str() == "require" => {
+                return Err(format!(
+                    "the Lua import {loader} must use a string literal path"
+                ));
             }
-        };
-        if path.is_empty() {
-            return Err(format!("the Lua import {loader} has an empty path"));
-        }
-        imports.push(LuaImport {
+            // Non-literal dofile/loadfile/source cannot be resolved; skip this
+            // token so later literal requires are still walked.
+            _ => return Ok(None),
+        },
+        Some(LuaToken::String(path)) => (path, 2),
+        _ => return Ok(None),
+    };
+    if path.is_empty() {
+        return Err(format!("the Lua import {loader} has an empty path"));
+    }
+    Ok(Some((
+        LuaImport {
             loader: match loader.as_str() {
                 "dofile" => "dofile",
                 "loadfile" => "loadfile",
@@ -1151,7 +1342,21 @@ fn parse_lua_imports(source: &str) -> Result<Vec<LuaImport>, String> {
                 _ => unreachable!(),
             },
             path: path.clone(),
-        });
+        },
+        consumed,
+    )))
+}
+
+fn parse_lua_imports(source: &str) -> Result<Vec<LuaImport>, String> {
+    let tokens = lex_lua(source)?;
+    let mut imports = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let Some((import, consumed)) = parse_lua_import_at(&tokens, index)? else {
+            index += 1;
+            continue;
+        };
+        imports.push(import);
         index += consumed;
     }
     Ok(imports)
@@ -1170,7 +1375,10 @@ fn resolve_lua_import(
         parent.join(import_path)
     }];
 
-    if import.loader == "require" && import_path.extension().is_none() {
+    // `Path::extension` treats `hypr.input` as a file with extension `input`.
+    // Lua require names use dots as module separators, so convert unless the
+    // argument already names a `.lua` file.
+    if import.loader == "require" && !import.path.ends_with(".lua") {
         let module_path = import.path.replace('.', "/");
         candidates.push(parent.join(format!("{module_path}.lua")));
         candidates.push(parent.join(&module_path).join("init.lua"));
@@ -1239,6 +1447,7 @@ pub fn install_trigger_binding(
     path: &Path,
     files: &dyn BindingFileSystem,
     hyprland: &mut dyn HyprlandController,
+    prefer_caps_lock: bool,
 ) -> Result<TriggerBindingInstallReport, TriggerBindingError> {
     let original = files
         .read_to_string(path)
@@ -1249,48 +1458,67 @@ pub fn install_trigger_binding(
         })?;
     let source = original.as_deref().unwrap_or_default();
     let backup = backup_path(path);
-    let plan = plan_trigger_binding_with_imports(path, source, files);
+    let PlannedTriggerBinding { bindings, plan } =
+        plan_trigger_binding_with_imports(path, source, files, prefer_caps_lock);
+    let input_path = path.with_file_name("input.lua");
+    let original_input =
+        files
+            .read_to_string(&input_path)
+            .map_err(|detail| TriggerBindingError::File {
+                action: "read",
+                path: input_path,
+                detail,
+            })?;
 
     let key = match plan {
-        TriggerBindingPlan::AlreadyInstalled { key } => {
-            if let Err(detail) = hyprland.reload() {
-                return Err(TriggerBindingError::ReloadFailed {
-                    detail,
-                    backup_path: backup,
-                    restore_error: None,
-                });
-            }
-            let verified = hyprland
-                .binding_is_installed(key.code, VOISU_TOGGLE_COMMAND)
-                .map_err(|detail| TriggerBindingError::VerificationFailed {
-                    detail,
-                    backup_path: backup.clone(),
-                    restore_error: None,
-                })?;
-            if !verified {
-                return Err(TriggerBindingError::VerificationFailed {
-                    detail: format!(
-                        "{} ({}) is managed by Voisu but is not reported by Hyprland",
-                        key.label, key.code
-                    ),
-                    backup_path: backup.clone(),
-                    restore_error: None,
-                });
-            }
-            return Ok(TriggerBindingInstallReport {
-                key,
-                changed: false,
-                backup_path: backup,
-            });
-        }
         TriggerBindingPlan::Conflicts { conflicts } => {
             return Err(TriggerBindingError::from_conflicts(conflicts));
         }
         TriggerBindingPlan::Unparseable { detail } => {
             return Err(TriggerBindingError::Unparseable { detail });
         }
+        TriggerBindingPlan::AlreadyInstalled { key } => {
+            let managed = bindings
+                .iter()
+                .any(|binding| binding.managed && binding.is_standalone_for(key));
+            if !managed {
+                verify_already_installed(hyprland, key, &backup)?;
+                return Ok(TriggerBindingInstallReport {
+                    key,
+                    changed: false,
+                    backup_path: backup,
+                });
+            }
+            key
+        }
         TriggerBindingPlan::Install { key } => key,
     };
+    let ordered_kb_options = if key == CAPS_LOCK {
+        match collect_reachable_kb_options(path, source, files) {
+            Ok(options) => options,
+            Err(detail) => return Err(TriggerBindingError::Unparseable { detail }),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let updated = match desired_hyprland_source(
+        source,
+        key,
+        original_input.as_deref().unwrap_or(""),
+        &ordered_kb_options,
+    ) {
+        Ok(updated) => updated,
+        Err(detail) => return Err(TriggerBindingError::Unparseable { detail }),
+    };
+    if updated == source {
+        verify_already_installed(hyprland, key, &backup)?;
+        return Ok(TriggerBindingInstallReport {
+            key,
+            changed: false,
+            backup_path: backup,
+        });
+    }
 
     files
         .write_atomic(&backup, source)
@@ -1300,10 +1528,6 @@ pub fn install_trigger_binding(
             detail,
         })?;
 
-    let updated = match append_managed_binding(source, key) {
-        Ok(updated) => updated,
-        Err(detail) => return Err(TriggerBindingError::Unparseable { detail }),
-    };
     if let Err(detail) = files.write_atomic(path, &updated) {
         let restore_error = restore_original(files, path, original.as_deref()).err();
         return Err(TriggerBindingError::File {
@@ -1354,6 +1578,39 @@ pub fn install_trigger_binding(
     }
 }
 
+fn verify_already_installed(
+    hyprland: &mut dyn HyprlandController,
+    key: TriggerKey,
+    backup: &Path,
+) -> Result<(), TriggerBindingError> {
+    if let Err(detail) = hyprland.reload() {
+        return Err(TriggerBindingError::ReloadFailed {
+            detail,
+            backup_path: backup.to_owned(),
+            restore_error: None,
+        });
+    }
+    let verified = hyprland
+        .binding_is_installed(key.code, VOISU_TOGGLE_COMMAND)
+        .map_err(|detail| TriggerBindingError::VerificationFailed {
+            detail,
+            backup_path: backup.to_owned(),
+            restore_error: None,
+        })?;
+    if verified {
+        Ok(())
+    } else {
+        Err(TriggerBindingError::VerificationFailed {
+            detail: format!(
+                "{} ({}) is managed by Voisu but is not reported by Hyprland",
+                key.label, key.code
+            ),
+            backup_path: backup.to_owned(),
+            restore_error: None,
+        })
+    }
+}
+
 fn restore_original(
     files: &dyn BindingFileSystem,
     path: &Path,
@@ -1380,7 +1637,32 @@ fn restore_original_and_reload(
         .map(|detail| format!("reloading the restored configuration failed: {detail}"))
 }
 
-fn append_managed_binding(source: &str, key: TriggerKey) -> Result<String, String> {
+fn desired_hyprland_source(
+    source: &str,
+    key: TriggerKey,
+    input_source: &str,
+    ordered_kb_options: &[String],
+) -> Result<String, String> {
+    let kb_options = if key == CAPS_LOCK {
+        // input.lua is a special sibling that may be loaded independently of
+        // the active root. The remaining entries follow the root's execution
+        // order, including each imported Lua file at its call site.
+        let existing = ordered_kb_options
+            .last()
+            .cloned()
+            .or_else(|| kb_options_values(input_source).into_iter().next_back());
+        Some(merge_caps_lock_kb_options(existing))
+    } else {
+        None
+    };
+    append_managed_binding(source, key, kb_options.as_deref())
+}
+
+fn append_managed_binding(
+    source: &str,
+    key: TriggerKey,
+    kb_options: Option<&str>,
+) -> Result<String, String> {
     let mut content = remove_managed_blocks(source)?;
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
@@ -1390,6 +1672,17 @@ fn append_managed_binding(source: &str, key: TriggerKey) -> Result<String, Strin
     }
     content.push_str(BEGIN_MARKER);
     content.push('\n');
+    if let Some(kb_options) = kb_options {
+        // Stock Hyprland Lua has no Omarchy package.path, so a sibling
+        // require("hypr.input") is a hard error. Last-wins hl.config here
+        // applies Caps Lock kb_options without loading another file.
+        content.push_str("-- Caps Lock is the Trigger Key; disable lock on that key.\n");
+        content.push_str("hl.config({\n");
+        content.push_str("  input = {\n");
+        content.push_str(&format!("    kb_options = \"{kb_options}\",\n"));
+        content.push_str("  },\n");
+        content.push_str("})\n");
+    }
     content.push_str(&format!(
         "o.bind(\"{}\", \"{VOISU_TRIGGER_DESCRIPTION}\", \"{VOISU_TOGGLE_COMMAND}\")\n",
         key.code
@@ -1397,6 +1690,60 @@ fn append_managed_binding(source: &str, key: TriggerKey) -> Result<String, Strin
     content.push_str(END_MARKER);
     content.push('\n');
     Ok(content)
+}
+
+#[cfg(test)]
+fn last_kb_options(sources: &[&str]) -> Option<String> {
+    sources
+        .iter()
+        .rev()
+        .find_map(|source| kb_options_values(source).into_iter().next_back())
+}
+
+fn kb_options_values(source: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut rest = source;
+    while let Some(index) = rest.find("kb_options") {
+        rest = &rest[index + "kb_options".len()..];
+        let trimmed = rest.trim_start();
+        let Some(trimmed) = trimmed.strip_prefix('=') else {
+            continue;
+        };
+        let trimmed = trimmed.trim_start();
+        let quote = match trimmed.chars().next() {
+            Some('"') => '"',
+            Some('\'') => '\'',
+            _ => continue,
+        };
+        let inner = &trimmed[1..];
+        if let Some(end) = inner.find(quote) {
+            values.push(inner[..end].to_owned());
+        }
+    }
+    values
+}
+
+fn merge_caps_lock_kb_options(existing: Option<String>) -> String {
+    let mut kept = Vec::new();
+    if let Some(existing) = existing {
+        for option in existing.split(',') {
+            let option = option.trim();
+            if option.is_empty()
+                || option == "compose:caps"
+                || option.starts_with("caps:")
+                || option == BOTH_CAPSLOCK_CANCEL
+                || option == "shift:both_capslock"
+            {
+                continue;
+            }
+            if !kept.iter().any(|kept: &String| kept == option) {
+                kept.push(option.to_owned());
+            }
+        }
+    }
+    let mut result = vec![CAPS_NONE.to_owned(), BOTH_CAPSLOCK_CANCEL.to_owned()];
+    result.extend(kept);
+    result.join(",")
 }
 
 fn remove_managed_blocks(source: &str) -> Result<String, String> {
@@ -1435,22 +1782,47 @@ fn parse_lua_chunk(source: &str, managed: bool) -> Result<Vec<LuaBinding>, Strin
             index += 1;
             continue;
         }
-        let (key, description, command, dispatcher, dispatcher_arguments) =
-            parse_bind_arguments(&tokens[index + 4..])?;
-        bindings.push(LuaBinding {
-            key,
-            description,
-            command,
-            dispatcher,
-            dispatcher_arguments,
-            managed,
-        });
-        index += 4;
+        match parse_bind_arguments(&tokens[index + 4..]) {
+            Ok(Some((key, description, command, dispatcher, dispatcher_arguments))) => {
+                bindings.push(LuaBinding {
+                    key,
+                    description,
+                    command,
+                    dispatcher,
+                    dispatcher_arguments,
+                    managed,
+                });
+                index += 4;
+            }
+            // Computed chords (`"SUPER + " .. key`) and Lua callbacks on
+            // combination keys are not Caps Lock occupancy. Skip the call.
+            Ok(None) => index = matching_parenthesis(&tokens, index + 3)?,
+            Err(error) => match tokens.get(index + 4) {
+                Some(LuaToken::String(key)) if !occupies_preferred_trigger_key(key) => {
+                    index = matching_parenthesis(&tokens, index + 3)?;
+                }
+                _ => return Err(error),
+            },
+        }
     }
     Ok(bindings)
 }
 
-fn parse_bind_arguments(tokens: &[LuaToken]) -> Result<ParsedBindArguments, String> {
+fn occupies_preferred_trigger_key(key: &str) -> bool {
+    PREFERRED_TRIGGER_KEYS.iter().any(|candidate| {
+        LuaBinding {
+            key: key.to_owned(),
+            description: String::new(),
+            command: String::new(),
+            dispatcher: None,
+            dispatcher_arguments: None,
+            managed: false,
+        }
+        .is_standalone_for(*candidate)
+    })
+}
+
+fn parse_bind_arguments(tokens: &[LuaToken]) -> Result<Option<ParsedBindArguments>, String> {
     let mut index = 0;
     let read_string = |index: &mut usize, label: &str| -> Result<String, String> {
         let value = match tokens.get(*index) {
@@ -1463,12 +1835,26 @@ fn parse_bind_arguments(tokens: &[LuaToken]) -> Result<ParsedBindArguments, Stri
     };
     let key = read_string(&mut index, "binding key")?;
     if !matches!(tokens.get(index), Some(LuaToken::Symbol(','))) {
-        return Err("the binding key must be followed by a comma".to_owned());
+        if occupies_preferred_trigger_key(&key) {
+            return Err("the binding key must be followed by a comma".to_owned());
+        }
+        return Ok(None);
     }
     index += 1;
-    let description = read_string(&mut index, "binding description")?;
+    let description = match tokens.get(index) {
+        Some(LuaToken::String(value)) => {
+            index += 1;
+            value.clone()
+        }
+        Some(_) if !occupies_preferred_trigger_key(&key) => return Ok(None),
+        Some(_) => return Err("the binding description must be a string literal".to_owned()),
+        None => return Err("the binding description is missing".to_owned()),
+    };
     if !matches!(tokens.get(index), Some(LuaToken::Symbol(','))) {
-        return Err("the binding description must be followed by a comma".to_owned());
+        if occupies_preferred_trigger_key(&key) {
+            return Err("the binding description must be followed by a comma".to_owned());
+        }
+        return Ok(None);
     }
     index += 1;
     let (command, dispatcher, dispatcher_arguments) = match tokens.get(index) {
@@ -1499,7 +1885,13 @@ fn parse_bind_arguments(tokens: &[LuaToken]) -> Result<ParsedBindArguments, Stri
     if !matches!(tokens.get(index), Some(LuaToken::Symbol(')'))) {
         return Err("the binding command must be followed by a closing parenthesis".to_owned());
     }
-    Ok((key, description, command, dispatcher, dispatcher_arguments))
+    Ok(Some((
+        key,
+        description,
+        command,
+        dispatcher,
+        dispatcher_arguments,
+    )))
 }
 
 fn parse_dispatcher_arguments(
@@ -1800,6 +2192,55 @@ mod tests {
         (directory, path)
     }
 
+    fn managed_block(source: &str) -> &str {
+        let start = source.find(BEGIN_MARKER).expect("managed begin marker");
+        let end = source.find(END_MARKER).expect("managed end marker") + END_MARKER.len();
+        &source[start..end]
+    }
+
+    fn assert_caps_lock_managed_block(source: &str) {
+        let block = managed_block(source);
+        assert!(
+            !block.contains("require("),
+            "managed trigger block must not require a sibling file: {block}"
+        );
+        assert!(
+            !block.contains("require(\"hypr.input\")") && !block.contains("require(\"input\")"),
+            "managed trigger block must not load input.lua: {block}"
+        );
+        assert!(
+            block.contains("o.bind(\"code:66\", \"Voisu dictation\", \"voisu toggle\")"),
+            "{block}"
+        );
+        let last = last_kb_options(&[block]).expect("managed kb_options");
+        assert!(
+            last.split(',').map(str::trim).any(|part| part == CAPS_NONE),
+            "last-wins kb_options must include {CAPS_NONE}: {last}"
+        );
+        assert!(
+            last.split(',')
+                .map(str::trim)
+                .any(|part| part == BOTH_CAPSLOCK_CANCEL),
+            "last-wins kb_options must keep {BOTH_CAPSLOCK_CANCEL}: {last}"
+        );
+    }
+
+    fn assert_right_alt_managed_block(source: &str) {
+        let block = managed_block(source);
+        assert!(
+            block.contains("o.bind(\"code:108\", \"Voisu dictation\", \"voisu toggle\")"),
+            "{block}"
+        );
+        assert!(
+            !block.contains("kb_options"),
+            "Right Alt must not inject kb_options: {block}"
+        );
+        assert!(
+            !block.contains("require("),
+            "Right Alt must not inject a require: {block}"
+        );
+    }
+
     #[test]
     fn lua_parser_keeps_combinations_out_of_standalone_conflicts() {
         let source = r#"
@@ -1823,38 +2264,68 @@ o.bind(
     }
 
     #[test]
-    fn keysym_aliases_occupy_the_same_physical_alt_keys() {
+    fn keysym_aliases_occupy_the_same_physical_trigger_keys() {
         let source = r#"
-o.bind("Alt_L", "Launch terminal", "kitty")
+o.bind("Caps_Lock", "Launch terminal", "kitty")
 o.bind("ALT, Alt_R", "Modified right alt", "workspace next")
 "#;
 
         assert_eq!(
-            plan_trigger_binding(source),
+            plan_trigger_binding(source, true),
             TriggerBindingPlan::Install { key: RIGHT_ALT }
         );
 
         let both = r#"
-o.bind("alt_l", "Launch terminal", "kitty")
+o.bind("caps_lock", "Launch terminal", "kitty")
 o.bind("Alt_R", "Launcher", "launcher")
 "#;
-        let TriggerBindingPlan::Conflicts { conflicts } = plan_trigger_binding(both) else {
-            panic!("Alt_L and Alt_R must occupy the preferred physical keys");
+        let TriggerBindingPlan::Conflicts { conflicts } = plan_trigger_binding(both, true) else {
+            panic!("Caps_Lock and Alt_R must occupy the preferred physical keys");
         };
         assert_eq!(conflicts.len(), 2);
-        assert_eq!(conflicts[0].candidate, LEFT_ALT);
+        assert_eq!(conflicts[0].candidate, CAPS_LOCK);
         assert_eq!(conflicts[1].candidate, RIGHT_ALT);
     }
 
     #[test]
-    fn left_alt_conflict_falls_back_to_right_alt() {
+    fn left_alt_is_not_a_setup_candidate() {
         let source = r#"
 o.bind("code:64", "Launch terminal", "kitty")
 o.bind("ALT, code:108", "Modified right alt", "workspace next")
 "#;
 
         assert_eq!(
-            plan_trigger_binding(source),
+            plan_trigger_binding(source, true),
+            TriggerBindingPlan::Install { key: CAPS_LOCK }
+        );
+        assert!(!LuaBinding {
+            key: "ALT, code:64".to_owned(),
+            description: "Alt Tab".to_owned(),
+            command: "workspace next".to_owned(),
+            dispatcher: None,
+            dispatcher_arguments: None,
+            managed: false,
+        }
+        .is_standalone());
+    }
+
+    #[test]
+    fn caps_lock_conflict_falls_back_to_right_alt() {
+        let source = r#"
+o.bind("code:66", "Launch terminal", "kitty")
+o.bind("ALT, code:108", "Modified right alt", "workspace next")
+"#;
+
+        assert_eq!(
+            plan_trigger_binding(source, true),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+    }
+
+    #[test]
+    fn declining_caps_lock_installs_right_alt() {
+        assert_eq!(
+            plan_trigger_binding("", false),
             TriggerBindingPlan::Install { key: RIGHT_ALT }
         );
     }
@@ -1862,11 +2333,11 @@ o.bind("ALT, code:108", "Modified right alt", "workspace next")
     #[test]
     fn exact_bindings_with_lua_dispatchers_are_still_conflicts() {
         let source = r#"
-o.bind("code:64", "Terminal", { omarchy = "terminal" })
+o.bind("code:66", "Terminal", { omarchy = "terminal" })
 o.bind("code:108", "Launcher", hl.dsp.exec_cmd("launcher"))
 "#;
 
-        let TriggerBindingPlan::Conflicts { conflicts } = plan_trigger_binding(source) else {
+        let TriggerBindingPlan::Conflicts { conflicts } = plan_trigger_binding(source, true) else {
             panic!("non-string dispatchers must not leave exact keys available");
         };
         assert_eq!(conflicts.len(), 2);
@@ -1879,49 +2350,77 @@ o.bind("code:108", "Launcher", hl.dsp.exec_cmd("launcher"))
     #[test]
     fn managed_binding_does_not_hide_a_new_user_conflict() {
         let source = format!(
-            "{BEGIN_MARKER}\no.bind(\"code:64\", \"Voisu dictation\", \"voisu toggle\")\n{END_MARKER}\no.bind(\"code:108\", \"Launcher\", \"launcher\")\n"
+            "{BEGIN_MARKER}\no.bind(\"code:66\", \"Voisu dictation\", \"voisu toggle\")\n{END_MARKER}\no.bind(\"code:108\", \"Launcher\", \"launcher\")\n"
         );
 
         assert_eq!(
-            plan_trigger_binding(&source),
-            TriggerBindingPlan::AlreadyInstalled { key: LEFT_ALT }
+            plan_trigger_binding(&source, true),
+            TriggerBindingPlan::AlreadyInstalled { key: CAPS_LOCK }
         );
     }
 
     #[test]
     fn same_key_user_binding_is_not_accepted_as_already_installed() {
         let source = format!(
-            "{BEGIN_MARKER}\no.bind(\"code:64\", \"Voisu dictation\", \"voisu toggle\")\n{END_MARKER}\no.bind(\"code:64\", \"Launcher\", \"launcher\")\n"
+            "{BEGIN_MARKER}\no.bind(\"code:66\", \"Voisu dictation\", \"voisu toggle\")\n{END_MARKER}\no.bind(\"code:66\", \"Launcher\", \"launcher\")\n"
         );
 
         assert_eq!(
-            plan_trigger_binding(&source),
+            plan_trigger_binding(&source, true),
             TriggerBindingPlan::Install { key: RIGHT_ALT }
         );
 
         let both_keys_user_owned =
             format!("{source}o.bind(\"code:108\", \"Lock\", \"loginctl lock-session\")\n");
         let TriggerBindingPlan::Conflicts { conflicts } =
-            plan_trigger_binding(&both_keys_user_owned)
+            plan_trigger_binding(&both_keys_user_owned, true)
         else {
             panic!("a same-key user binding must not hide conflicts behind AlreadyInstalled");
         };
         assert_eq!(conflicts.len(), 2);
-        assert_eq!(conflicts[0].candidate, LEFT_ALT);
+        assert_eq!(conflicts[0].candidate, CAPS_LOCK);
         assert_eq!(conflicts[1].candidate, RIGHT_ALT);
     }
 
     #[test]
     fn unparseable_candidate_binding_fails_closed() {
         let source = r#"
-local left_alt = "code:64"
-o.bind(left_alt, "Terminal", "kitty")
+local caps_lock = "code:66"
+o.bind(caps_lock, "Terminal", "kitty")
 "#;
 
-        let TriggerBindingPlan::Unparseable { detail } = plan_trigger_binding(source) else {
+        let TriggerBindingPlan::Unparseable { detail } = plan_trigger_binding(source, true) else {
             panic!("a dynamic candidate key must not be treated as free");
         };
         assert!(detail.contains("binding key"));
+    }
+
+    #[test]
+    fn concatenated_combination_binds_are_skipped_without_hiding_caps_lock() {
+        let source = r#"
+o.bind("code:66", "Voisu dictation", "voisu toggle")
+o.bind(
+  "SUPER + " .. key,
+  "Switch both monitors to desktop " .. desktop,
+  function() paired_desktop_switch(desktop) end
+)
+o.bind("SUPER + TAB", "Next two-monitor desktop", function() paired_desktop_cycle(1) end)
+o.bind("SUPER + CTRL + TAB", "Former two-monitor desktop", paired_desktop_former)
+"#;
+
+        assert_eq!(
+            plan_trigger_binding(source, true),
+            TriggerBindingPlan::AlreadyInstalled { key: CAPS_LOCK }
+        );
+    }
+
+    #[test]
+    fn concatenated_caps_lock_key_still_fails_closed() {
+        let source = r#"o.bind("code:66" .. suffix, "Terminal", "kitty")"#;
+        let TriggerBindingPlan::Unparseable { detail } = plan_trigger_binding(source, true) else {
+            panic!("concatenating a Caps Lock code must not look free");
+        };
+        assert!(detail.contains("comma"), "{detail}");
     }
 
     #[test]
@@ -1931,18 +2430,19 @@ o.bind(left_alt, "Terminal", "kitty")
         fs::write(&path, "dofile(\"bindings.lua\")\n").unwrap();
         fs::write(
             &imported,
-            "o.bind(\"code:64\", \"Launch terminal\", \"kitty\")\n",
+            "o.bind(\"code:66\", \"Launch terminal\", \"kitty\")\n",
         )
         .unwrap();
         let original = fs::read_to_string(&path).unwrap();
         let mut hyprland = FakeHyprland::new(&[true], true);
-        let report = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland)
-            .expect("an imported Left Alt binding must force the Right Alt fallback");
+        let report = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true)
+            .expect("an imported Caps Lock binding must force the Right Alt fallback");
 
         assert_eq!(report.key, RIGHT_ALT);
         let updated = fs::read_to_string(&path).unwrap();
         assert!(updated.starts_with(&(original + "\n-- BEGIN VOISU MANAGED TRIGGER\n")));
         assert!(updated.contains("code:108"));
+        assert_right_alt_managed_block(&updated);
         assert_eq!(hyprland.reload_calls, 1);
     }
 
@@ -1968,13 +2468,13 @@ o.bind(left_alt, "Terminal", "kitty")
         fs::write(&path, "require \"bindings\"\n").unwrap();
         fs::write(
             &imported,
-            "o.bind(\"code:64\", \"Launch terminal\", \"kitty\")\n",
+            "o.bind(\"code:66\", \"Launch terminal\", \"kitty\")\n",
         )
         .unwrap();
         let source = fs::read_to_string(&path).unwrap();
 
         assert_eq!(
-            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem),
+            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true).plan,
             TriggerBindingPlan::Install { key: RIGHT_ALT }
         );
     }
@@ -1985,32 +2485,140 @@ o.bind(left_alt, "Terminal", "kitty")
         assert!(error.contains("string literal"));
     }
 
+    const OMARCHY_BOOTSTRAP_DOFILE: &str = r#"dofile((os.getenv("OMARCHY_PATH") or "/usr/share/omarchy") .. "/default/hypr/bootstrap.lua")"#;
+
+    #[test]
+    fn omarchy_bootstrap_dofile_is_skipped_and_later_requires_are_found() {
+        let source = format!("{OMARCHY_BOOTSTRAP_DOFILE}\nrequire(\"hypr.bindings\")\n");
+        assert_eq!(
+            parse_lua_imports(&source).unwrap(),
+            vec![LuaImport {
+                loader: "require",
+                path: "hypr.bindings".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn non_literal_dofile_and_loadfile_skip_while_require_stays_fail_closed() {
+        assert_eq!(
+            parse_lua_imports(
+                r#"dofile(os.getenv("X")) loadfile(foo) source(bar) require("hypr.bindings")"#
+            )
+            .unwrap(),
+            vec![LuaImport {
+                loader: "require",
+                path: "hypr.bindings".to_owned(),
+            }]
+        );
+        let error =
+            parse_lua_imports(r#"dofile(os.getenv("X")) require(module_name)"#).unwrap_err();
+        assert!(error.contains("string literal"));
+        let empty = parse_lua_imports(r#"dofile("")"#).unwrap_err();
+        assert!(empty.contains("empty path"));
+    }
+
+    #[test]
+    fn omarchy_bootstrap_dofile_does_not_hide_sibling_caps_lock_occupancy() {
+        let (_directory, path) = config_dir();
+        fs::write(
+            &path,
+            format!("{OMARCHY_BOOTSTRAP_DOFILE}\nrequire(\"hypr.bindings\")\n"),
+        )
+        .unwrap();
+        fs::write(
+            path.with_file_name("bindings.lua"),
+            "o.bind(\"code:66\", \"Launch terminal\", \"kitty\")\n",
+        )
+        .unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true).plan,
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+    }
+
+    #[test]
+    fn omarchy_bootstrap_dofile_does_not_hide_reachable_kb_options() {
+        let (directory, path) = config_dir();
+        fs::create_dir(directory.path().join("hypr")).unwrap();
+        fs::write(
+            &path,
+            format!("{OMARCHY_BOOTSTRAP_DOFILE}\nrequire(\"hypr.input\")\n"),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("hypr").join("input.lua"),
+            "hl.config({\n  input = {\n    kb_options = \"compose:caps,grp:alt_shift_toggle\",\n  },\n})\n",
+        )
+        .unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+        let options =
+            collect_reachable_kb_options(&path, &source, &LocalBindingFileSystem).unwrap();
+
+        assert_eq!(
+            options.last().map(String::as_str),
+            Some("compose:caps,grp:alt_shift_toggle")
+        );
+        let occupancy = inspect_trigger_occupancy(&path, &source, &LocalBindingFileSystem).unwrap();
+        assert!(occupancy.compose_caps);
+        assert!(occupancy.unmanaged_caps_lock.is_none());
+    }
+
+    #[test]
+    fn sibling_input_lua_kb_options_are_visible_when_not_imported() {
+        let (_directory, path) = config_dir();
+        fs::write(&path, "-- stock hyprland.lua\n").unwrap();
+        fs::write(
+            path.with_file_name("input.lua"),
+            "kb_options = \"compose:caps\"\n",
+        )
+        .unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+        let occupancy = inspect_trigger_occupancy(&path, &source, &LocalBindingFileSystem).unwrap();
+        assert!(occupancy.compose_caps);
+    }
+
+    #[test]
+    fn unmanaged_voisu_toggle_on_caps_lock_is_already_installed_when_preferred() {
+        let source = r#"o.bind("code:66", "Voisu dictation", "voisu toggle")"#;
+        assert_eq!(
+            plan_trigger_binding(source, true),
+            TriggerBindingPlan::AlreadyInstalled { key: CAPS_LOCK }
+        );
+        assert_eq!(
+            plan_trigger_binding(source, false),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+    }
+
     #[test]
     fn require_skips_a_module_directory_and_loads_lua_candidates() {
         let (directory, path) = config_dir();
         fs::create_dir(directory.path().join("bindings")).unwrap();
         fs::write(
             directory.path().join("bindings.lua"),
-            "o.bind(\"code:64\", \"Launch terminal\", \"kitty\")\n",
+            "o.bind(\"code:66\", \"Launch terminal\", \"kitty\")\n",
         )
         .unwrap();
         fs::write(&path, "require(\"bindings\")\n").unwrap();
         let source = fs::read_to_string(&path).unwrap();
 
         assert_eq!(
-            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem),
+            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true).plan,
             TriggerBindingPlan::Install { key: RIGHT_ALT }
         );
 
         fs::remove_file(directory.path().join("bindings.lua")).unwrap();
         fs::write(
             directory.path().join("bindings").join("init.lua"),
-            "o.bind(\"code:64\", \"Launch terminal\", \"kitty\")\n",
+            "o.bind(\"code:66\", \"Launch terminal\", \"kitty\")\n",
         )
         .unwrap();
 
         assert_eq!(
-            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem),
+            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true).plan,
             TriggerBindingPlan::Install { key: RIGHT_ALT }
         );
     }
@@ -2023,7 +2631,9 @@ o.bind(left_alt, "Terminal", "kitty")
             &path,
             "dofile(\"absent.lua\")\n",
             &LocalBindingFileSystem,
-        );
+            true,
+        )
+        .plan;
         let TriggerBindingPlan::Unparseable { detail } = missing_file else {
             panic!("a missing dofile must not be treated as success");
         };
@@ -2033,7 +2643,9 @@ o.bind(left_alt, "Terminal", "kitty")
             &path,
             "dofile(\"missing\")\n",
             &LocalBindingFileSystem,
-        );
+            true,
+        )
+        .plan;
         let TriggerBindingPlan::Unparseable { detail } = directory_target else {
             panic!("dofile of a directory must not be treated as success");
         };
@@ -2047,8 +2659,8 @@ o.bind(left_alt, "Terminal", "kitty")
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].key, "code:64");
         assert_eq!(
-            plan_trigger_binding("local docs = [[é]]\n"),
-            TriggerBindingPlan::Install { key: LEFT_ALT }
+            plan_trigger_binding("local docs = [[é]]\n", true),
+            TriggerBindingPlan::Install { key: CAPS_LOCK }
         );
     }
 
@@ -2062,8 +2674,8 @@ local documentation = [[
 "#;
 
         assert_eq!(
-            plan_trigger_binding(source),
-            TriggerBindingPlan::Install { key: LEFT_ALT }
+            plan_trigger_binding(source, true),
+            TriggerBindingPlan::Install { key: CAPS_LOCK }
         );
     }
 
@@ -2072,7 +2684,7 @@ local documentation = [[
         let source =
             format!("{BEGIN_MARKER}\no.bind(\"code:64\", \"Voisu dictation\", \"voisu toggle\")\n");
 
-        let TriggerBindingPlan::Unparseable { detail } = plan_trigger_binding(&source) else {
+        let TriggerBindingPlan::Unparseable { detail } = plan_trigger_binding(&source, true) else {
             panic!("an unmatched managed marker must not be accepted");
         };
         assert!(detail.contains("no matching end marker"));
@@ -2081,10 +2693,10 @@ local documentation = [[
     #[test]
     fn stale_managed_binding_is_not_accepted_as_voisu() {
         let source = format!(
-            "{BEGIN_MARKER}\no.bind(\"code:64\", \"Voisu dictation\", \"kitty\")\n{END_MARKER}\n"
+            "{BEGIN_MARKER}\no.bind(\"code:66\", \"Voisu dictation\", \"kitty\")\n{END_MARKER}\n"
         );
 
-        let TriggerBindingPlan::Unparseable { detail } = plan_trigger_binding(&source) else {
+        let TriggerBindingPlan::Unparseable { detail } = plan_trigger_binding(&source, true) else {
             panic!("a managed binding with a different command must not be accepted");
         };
         assert!(detail.contains("expected description or command"));
@@ -2092,13 +2704,13 @@ local documentation = [[
 
     #[test]
     fn lua_hex_escapes_are_decoded_before_conflict_detection() {
-        let source = r#"o.bind("code\x3a64", "Launch terminal", "kitty")
+        let source = r#"o.bind("code\x3a66", "Launch terminal", "kitty")
 o.bind("code:108", "Launcher", "launcher")"#;
 
-        let TriggerBindingPlan::Conflicts { conflicts } = plan_trigger_binding(source) else {
-            panic!("a Lua hexadecimal escape must still occupy Left Alt");
+        let TriggerBindingPlan::Conflicts { conflicts } = plan_trigger_binding(source, true) else {
+            panic!("a Lua hexadecimal escape must still occupy Caps Lock");
         };
-        assert_eq!(conflicts[0].candidate, LEFT_ALT);
+        assert_eq!(conflicts[0].candidate, CAPS_LOCK);
     }
 
     #[test]
@@ -2165,11 +2777,11 @@ o.bind("code:108", "Launcher", "launcher")"#;
     #[test]
     fn both_exact_conflicts_describe_bindings_and_recovery() {
         let source = r#"
-o.bind("code:64", "Launch terminal", "kitty")
+o.bind("code:66", "Launch terminal", "kitty")
 o.bind("code:108", "Lock screen", "loginctl lock-session")
 "#;
 
-        let plan = plan_trigger_binding(source);
+        let plan = plan_trigger_binding(source, true);
         let TriggerBindingPlan::Conflicts { conflicts } = plan else {
             panic!("both exact bindings must conflict");
         };
@@ -2193,54 +2805,53 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let mut hyprland = FakeHyprland::new(&[true], true);
 
         let report =
-            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland).unwrap();
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
 
-        assert_eq!(report.key, LEFT_ALT);
+        assert_eq!(report.key, CAPS_LOCK);
         assert!(report.changed);
-        assert_eq!(
-            fs::read_to_string(&path)
-                .unwrap()
-                .matches(BEGIN_MARKER)
-                .count(),
-            1
-        );
+        let updated = fs::read_to_string(&path).unwrap();
+        assert_eq!(updated.matches(BEGIN_MARKER).count(), 1);
+        assert_caps_lock_managed_block(&updated);
+        assert!(updated.contains("-- user bindings"));
         assert_eq!(fs::read_to_string(&report.backup_path).unwrap(), original);
-        assert!(fs::read_dir(path.parent().unwrap())
-            .unwrap()
-            .all(|entry| !entry
+        assert!(!path.with_file_name("input.lua").exists());
+        assert!(fs::read_dir(path.parent().unwrap()).unwrap().all(|entry| {
+            !entry
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .contains(".voisu-hyprland.")));
+                .contains(".voisu-hyprland.")
+        }));
     }
 
     #[test]
-    fn fallback_preserves_the_exact_left_alt_binding() {
+    fn fallback_preserves_the_exact_caps_lock_binding() {
         let (_directory, path) = config_dir();
-        let original = "o.bind(\"code:64\", \"Terminal\", \"kitty\")\n";
+        let original = "o.bind(\"code:66\", \"Terminal\", \"kitty\")\n";
         fs::write(&path, original).unwrap();
         let mut hyprland = FakeHyprland::new(&[true], true);
 
         let report =
-            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland).unwrap();
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
         let updated = fs::read_to_string(&path).unwrap();
 
         assert_eq!(report.key, RIGHT_ALT);
         assert!(updated.contains(original));
-        assert!(updated.contains("o.bind(\"code:108\", \"Voisu dictation\", \"voisu toggle\")"));
+        assert_right_alt_managed_block(&updated);
+        assert!(!path.with_file_name("input.lua").exists());
     }
 
     #[test]
     fn both_conflicts_leave_the_file_and_compositor_untouched() {
         let (_directory, path) = config_dir();
         let original = concat!(
-            "o.bind(\"code:64\", \"Terminal\", \"kitty\")\n",
+            "o.bind(\"code:66\", \"Terminal\", \"kitty\")\n",
             "o.bind(\"code:108\", \"Launcher\", \"launcher\")\n"
         );
         fs::write(&path, original).unwrap();
         let mut hyprland = FakeHyprland::new(&[], false);
 
-        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland)
+        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true)
             .expect_err("both conflicts must stop before any external action");
 
         assert_eq!(error.exit_code(), 4);
@@ -2253,15 +2864,18 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let (_directory, path) = config_dir();
         fs::write(&path, "-- user bindings\n").unwrap();
         let mut first = FakeHyprland::new(&[true], true);
-        install_trigger_binding(&path, &LocalBindingFileSystem, &mut first).unwrap();
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut first, true).unwrap();
         let before = fs::read_to_string(&path).unwrap();
         let mut second = FakeHyprland::new(&[true], true);
 
-        let report = install_trigger_binding(&path, &LocalBindingFileSystem, &mut second).unwrap();
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut second, false).unwrap();
 
+        assert_eq!(report.key, CAPS_LOCK);
         assert!(!report.changed);
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
         assert_eq!(before.matches(BEGIN_MARKER).count(), 1);
+        assert_caps_lock_managed_block(&before);
         assert_eq!(second.reload_calls, 1);
     }
 
@@ -2270,11 +2884,11 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let (_directory, path) = config_dir();
         fs::write(&path, "-- user bindings\n").unwrap();
         let mut first = FakeHyprland::new(&[true], true);
-        install_trigger_binding(&path, &LocalBindingFileSystem, &mut first).unwrap();
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut first, true).unwrap();
         let before = fs::read_to_string(&path).unwrap();
         let mut second = FakeHyprland::new(&[false], true);
 
-        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut second)
+        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut second, true)
             .expect_err("a stale compositor must not skip reload on rerun");
 
         assert!(error.to_string().contains("reload"));
@@ -2287,9 +2901,12 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let (_directory, path) = config_dir();
         let original = "-- original\n";
         fs::write(&path, original).unwrap();
+        let input_path = path.with_file_name("input.lua");
+        let original_input = "require = nil -- user input.lua must stay untouched\n";
+        fs::write(&input_path, original_input).unwrap();
         let mut hyprland = FakeHyprland::new(&[false, true], true);
 
-        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland)
+        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true)
             .expect_err("reload failure must fail setup");
 
         assert!(error.to_string().contains("reload"));
@@ -2298,6 +2915,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
             fs::read_to_string(backup_path(Path::new(&path))).unwrap(),
             original
         );
+        assert_eq!(fs::read_to_string(&input_path).unwrap(), original_input);
         assert_eq!(hyprland.reload_calls, 2);
     }
 
@@ -2308,12 +2926,300 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         fs::write(&path, original).unwrap();
         let mut hyprland = FakeHyprland::new(&[true, true], false);
 
-        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland)
+        let error = install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true)
             .expect_err("verification failure must fail setup");
 
         assert!(error.to_string().contains("verification"));
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!path.with_file_name("input.lua").exists());
         assert_eq!(hyprland.reload_calls, 2);
+    }
+
+    #[test]
+    fn unmanaged_voisu_toggle_caps_lock_is_kept_without_rewrite() {
+        let (_directory, path) = config_dir();
+        let original = "o.bind(\"code:66\", \"Voisu dictation\", \"voisu toggle\")\n";
+        fs::write(&path, original).unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+
+        assert_eq!(report.key, CAPS_LOCK);
+        assert!(!report.changed);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!fs::read_to_string(&path).unwrap().contains("code:108"));
+        assert_eq!(hyprland.reload_calls, 1);
+    }
+
+    #[test]
+    fn unmanaged_caps_lock_in_sibling_bindings_falls_back_to_right_alt() {
+        let (_directory, path) = config_dir();
+        fs::write(&path, "").unwrap();
+        let bindings = path.with_file_name("bindings.lua");
+        let original_bindings = "o.bind(\"code:66\", \"Launch terminal\", \"kitty\")\n";
+        fs::write(&bindings, original_bindings).unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let hyprland_lua = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(report.key, RIGHT_ALT);
+        assert!(!hyprland_lua.contains("code:66"));
+        assert_right_alt_managed_block(&hyprland_lua);
+        assert_eq!(fs::read_to_string(&bindings).unwrap(), original_bindings);
+        assert!(!path.with_file_name("input.lua").exists());
+    }
+
+    #[test]
+    fn stock_hyprland_without_input_require_gets_bind_and_kb_options() {
+        let (_directory, path) = config_dir();
+        fs::write(
+            &path,
+            concat!(
+                "-- stock Hyprland Lua has no Omarchy bootstrap\n",
+                "o.bind(\"SUPER, Q\", \"Quit\", \"hyprctl dispatch exit\")\n"
+            ),
+        )
+        .unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(report.key, CAPS_LOCK);
+        assert!(updated.contains("o.bind(\"SUPER, Q\", \"Quit\", \"hyprctl dispatch exit\")"));
+        assert!(!updated.contains("require("));
+        assert_caps_lock_managed_block(&updated);
+        assert!(!path.with_file_name("input.lua").exists());
+    }
+
+    #[test]
+    fn rejected_caps_lock_installs_right_alt_without_input_rewrite() {
+        let (_directory, path) = config_dir();
+        fs::write(&path, "-- user bindings\n").unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, false).unwrap();
+
+        assert_eq!(report.key, RIGHT_ALT);
+        let updated = fs::read_to_string(&path).unwrap();
+        assert_right_alt_managed_block(&updated);
+        assert!(!updated.contains("hl.config"));
+        assert!(!path.with_file_name("input.lua").exists());
+    }
+
+    #[test]
+    fn already_installed_right_alt_is_kept_without_asking_caps_lock() {
+        let (_directory, path) = config_dir();
+        fs::write(
+            &path,
+            concat!(
+                "-- BEGIN VOISU MANAGED TRIGGER\n",
+                "o.bind(\"code:108\", \"Voisu dictation\", \"voisu toggle\")\n",
+                "-- END VOISU MANAGED TRIGGER\n"
+            ),
+        )
+        .unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+
+        assert_eq!(report.key, RIGHT_ALT);
+        assert!(!report.changed);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert_right_alt_managed_block(&before);
+        assert!(!path.with_file_name("input.lua").exists());
+    }
+
+    #[test]
+    fn caps_lock_input_merges_existing_kb_options() {
+        let (_directory, path) = config_dir();
+        fs::write(&path, "-- user bindings\n").unwrap();
+        fs::write(
+            path.with_file_name("input.lua"),
+            "hl.config({\n  input = {\n    kb_options = \"compose:caps,grp:alts_toggle\",\n  },\n})\n",
+        )
+        .unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        let original_input = fs::read_to_string(path.with_file_name("input.lua")).unwrap();
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let hyprland_lua = fs::read_to_string(&path).unwrap();
+        let input = fs::read_to_string(path.with_file_name("input.lua")).unwrap();
+        let last = last_kb_options(&[&input, &hyprland_lua]).expect("managed kb_options");
+
+        assert_eq!(input, original_input);
+        assert_caps_lock_managed_block(&hyprland_lua);
+        assert_eq!(
+            last,
+            format!("{CAPS_NONE},{BOTH_CAPSLOCK_CANCEL},grp:alts_toggle")
+        );
+        assert!(
+            input.contains("compose:caps"),
+            "the original assignment stays; last-wins managed kb_options overrides it"
+        );
+    }
+
+    #[test]
+    fn caps_lock_input_merges_kb_options_from_reachable_imports() {
+        let (_directory, path) = config_dir();
+        let imported = path.with_file_name("layout.lua");
+        fs::write(&path, "dofile(\"layout.lua\")\n").unwrap();
+        fs::write(
+            &imported,
+            "hl.config({\n  input = {\n    kb_options = \"us,compose:ralt,grp:alt_shift_toggle\",\n  },\n})\n",
+        )
+        .unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        let managed = managed_block(&updated);
+        let options = last_kb_options(&[managed]).expect("managed kb_options");
+
+        assert_eq!(
+            options,
+            format!("{CAPS_NONE},{BOTH_CAPSLOCK_CANCEL},us,compose:ralt,grp:alt_shift_toggle")
+        );
+    }
+
+    #[test]
+    fn caps_lock_input_keeps_root_kb_options_after_an_import() {
+        let (_directory, path) = config_dir();
+        let imported = path.with_file_name("layout.lua");
+        fs::write(
+            &path,
+            concat!(
+                "dofile(\"layout.lua\")\n",
+                "hl.config({\n",
+                "  input = {\n",
+                "    kb_options = \"root-option\",\n",
+                "  },\n",
+                "})\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &imported,
+            "hl.config({\n  input = {\n    kb_options = \"imported-option\",\n  },\n})\n",
+        )
+        .unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        let managed = managed_block(&updated);
+        let options = last_kb_options(&[managed]).expect("managed kb_options");
+
+        assert_eq!(
+            options,
+            format!("{CAPS_NONE},{BOTH_CAPSLOCK_CANCEL},root-option")
+        );
+    }
+
+    #[test]
+    fn caps_lock_input_reexecutes_a_repeated_dofile_after_a_root_assignment() {
+        let (_directory, path) = config_dir();
+        let imported = path.with_file_name("layout.lua");
+        fs::write(
+            &path,
+            concat!(
+                "dofile(\"layout.lua\")\n",
+                "hl.config({\n",
+                "  input = {\n",
+                "    kb_options = \"root-option\",\n",
+                "  },\n",
+                "})\n",
+                "dofile(\"layout.lua\")\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &imported,
+            "hl.config({\n  input = {\n    kb_options = \"imported-option\",\n  },\n})\n",
+        )
+        .unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        let managed = managed_block(&updated);
+        let options = last_kb_options(&[managed]).expect("managed kb_options");
+
+        assert_eq!(
+            options,
+            format!("{CAPS_NONE},{BOTH_CAPSLOCK_CANCEL},imported-option")
+        );
+    }
+
+    #[test]
+    fn existing_caps_lock_input_is_not_rewritten() {
+        let (_directory, path) = config_dir();
+        fs::write(&path, "-- user bindings\n").unwrap();
+        let input_path = path.with_file_name("input.lua");
+        let original_input = "hl.config({\n  input = {\n    kb_options = \"caps:none,shift:both_capslock_cancel\",\n  },\n})\n";
+        fs::write(&input_path, original_input).unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let hyprland_lua = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(fs::read_to_string(&input_path).unwrap(), original_input);
+        assert_caps_lock_managed_block(&hyprland_lua);
+    }
+
+    #[test]
+    fn existing_user_input_require_is_left_outside_the_managed_block() {
+        let (_directory, path) = config_dir();
+        fs::write(
+            &path,
+            concat!(
+                "require(\"hypr.input\")\n",
+                "o.bind(\"SUPER, Return\", \"Terminal\", \"kitty\")\n"
+            ),
+        )
+        .unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+
+        assert!(updated.contains("require(\"hypr.input\")"));
+        assert!(!managed_block(&updated).contains("require("));
+        assert_caps_lock_managed_block(&updated);
+        assert!(!path.with_file_name("input.lua").exists());
+    }
+
+    #[test]
+    fn already_installed_caps_lock_drops_managed_input_require() {
+        let (_directory, path) = config_dir();
+        fs::write(
+            &path,
+            concat!(
+                "-- BEGIN VOISU MANAGED TRIGGER\n",
+                "require(\"hypr.input\")\n",
+                "o.bind(\"code:66\", \"Voisu dictation\", \"voisu toggle\")\n",
+                "-- END VOISU MANAGED TRIGGER\n"
+            ),
+        )
+        .unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(report.key, CAPS_LOCK);
+        assert!(report.changed);
+        assert_caps_lock_managed_block(&updated);
+        assert!(!updated.contains("require("));
+        assert!(!path.with_file_name("input.lua").exists());
     }
 
     const OMARCHY_PASTE_SOURCE: &str = r#"

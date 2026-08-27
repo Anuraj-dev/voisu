@@ -68,28 +68,16 @@ systemctl --user enable --now voisu-overlay.service
 How you pick the Trigger Key depends on your desktop's portal:
 
 - **KDE Plasma / GNOME:** a system dialog appears the first time the daemon
-  starts — choose Left Alt to match Voisu's default, and it persists.
-- **Hyprland:** there is no dialog by design. Install
-  `xdg-desktop-portal-hyprland`, start the daemon, then read the registered
-  shortcut and declare the bind in `hyprland.conf`. Voisu's documented default
-  compositor binding is Left Alt (`code:64`):
-
-  ```sh
-  hyprctl globalshortcuts        # shows the exact appid:voisu-toggle string
-  ```
-
-  ```conf
-  bind = , code:64, global, voisu:voisu-toggle   # use the exact string hyprctl printed
-  ```
-
-  If you choose another key, replace `code:64`; the part after `global,` must match
-  `hyprctl globalshortcuts` verbatim (the app-id half can be empty, e.g.
-  `:voisu-toggle`). Plain wlroots portals do not implement GlobalShortcuts, so
-  the Trigger Key cannot bind without `xdg-desktop-portal-hyprland`.
+  starts — choose a Trigger Key in that dialog, and it persists.
+- **Hyprland:** there is no Global Shortcuts dialog. `voisu setup` installs a
+  compositor bind: Caps Lock (`code:66`) after a default-yes prompt, or Right
+  Alt (`code:108`) if you decline or Caps Lock is already bound. It does not
+  auto-install Left Alt and never overwrites an exact unmanaged binding. Caps
+  Lock as the Trigger Key also disables lock-toggle on that key.
 
   Type Delivery does not work on Hyprland: its portal implements no
-  RemoteDesktop interface, which is Voisu's only text-injection path. Use the
-  clipboard instead:
+  RemoteDesktop interface, which is Voisu's only text-injection path. Setup
+  selects clipboard Delivery:
 
   ```sh
   voisu delivery clipboard

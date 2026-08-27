@@ -1,7 +1,8 @@
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -78,7 +79,8 @@ impl ServiceFixture {
             .env("VOISU_PACKAGED_DAEMON_PATH", &self.packaged_daemon)
             .env("VOISU_DISABLE_SHORTCUTS", "1")
             .env("VOISU_DISABLE_DIRECT_DELIVERY", "1")
-            .env("VOISU_TEST_MODE", "controlled");
+            .env("VOISU_TEST_MODE", "controlled")
+            .env_remove("HYPRLAND_INSTANCE_SIGNATURE");
         command
     }
 
@@ -206,6 +208,11 @@ if test -n "$fail_unit" && test "$last" = "$fail_unit"; then
   exit 1
 fi
 command=${2:-}
+# Generic service commands keep environment import best-effort. Hyprland setup
+# uses a stricter wrapper in the library path.
+if test "${FAKE_SYSTEMCTL_FAIL_IMPORT:-}" = "1" && test "$command" = "import-environment"; then
+  exit 1
+fi
 # Only voisu.service is backed by a real process here. Lifecycle verbs aimed at
 # any other unit (the optional Overlay) are logged and acknowledged, never
 # applied to the daemon's pid file -- otherwise restarting the Overlay would
@@ -1155,6 +1162,117 @@ fn service_start_and_restart_import_the_session_display_environment() {
         calls.matches(expected).count(),
         3,
         "install, start, and restart must each issue the complete import-environment list:\n{calls}"
+    );
+    assert!(
+        !calls.contains("HYPRLAND_INSTANCE_SIGNATURE"),
+        "an unset Hyprland signature must not be named, or systemd fails the whole import:\n{calls}"
+    );
+}
+
+#[test]
+fn generic_service_install_stays_successful_when_environment_import_fails() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    let mut install = fixture.command(&["service", "install"]);
+    install.env("FAKE_SYSTEMCTL_FAIL_IMPORT", "1");
+
+    let installed = install.output().unwrap();
+
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    assert!(calls.contains("--user import-environment"), "{calls}");
+    assert!(fixture.unit_path().exists());
+}
+
+#[test]
+fn hyprland_setup_stops_when_required_environment_import_fails() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    fixture.install_packaged_overlay_unit();
+    fs::write(
+        fixture.root.path().join("fake-bin/hyprctl"),
+        r#"#!/bin/sh
+case "$1" in
+  reload) exit 0 ;;
+  binds) printf '[{"key":"code:66","description":"Voisu dictation","dispatcher":"exec","arg":"voisu toggle","modmask":0}]'; exit 0 ;;
+esac
+exit 1
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(
+        fixture.root.path().join("fake-bin/hyprctl"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::create_dir_all(fixture.config.join("hypr")).unwrap();
+    fs::write(
+        fixture.config.join("hypr/hyprland.lua"),
+        "-- current Hyprland Lua configuration\n",
+    )
+    .unwrap();
+
+    let mut setup = fixture.command(&["setup"]);
+    setup
+        .env("XDG_SESSION_TYPE", "wayland")
+        .env("WAYLAND_DISPLAY", "wayland-test")
+        .env("XDG_CURRENT_DESKTOP", "Hyprland")
+        .env("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test-instance")
+        .env("VOISU_TEST_SECRET_STORE", "unavailable")
+        .env("VOISU_TEST_AUTH_DEEPGRAM", "authorized")
+        .env("VOISU_TEST_AUTH_GROQ", "authorized")
+        .env("FAKE_SYSTEMCTL_FAIL_IMPORT", "1")
+        .env_remove("VOISU_DEEPGRAM_API_KEY")
+        .env_remove("VOISU_GROQ_API_KEY")
+        .env_remove("VOISU_DISABLE_DEEPGRAM")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = setup.spawn().unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"deepgram-secret\ngroq-secret\ny\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(output.status.code(), Some(4), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("Hyprland setup incomplete")
+            && stderr(&output).contains("import-environment"),
+        "{}",
+        stderr(&output)
+    );
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    assert!(
+        calls.contains("--user import-environment WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE"),
+        "{calls}"
+    );
+    assert!(!calls.contains("--user daemon-reload"), "{calls}");
+}
+
+#[test]
+fn service_start_imports_hyprland_signature_when_the_cli_has_it() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    assert!(fixture.run(&["service", "install"]).status.success());
+    fixture.use_real_managed_daemon();
+    let _ = fixture
+        .command(&["service", "start"])
+        .env("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test-instance")
+        .output()
+        .unwrap();
+
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    let imported = calls
+        .find(
+            "--user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE",
+        )
+        .expect("the daemon's Paste Action discovery needs the compositor signature");
+    let started = calls
+        .find("--user start voisu.service")
+        .expect("service start must launch the daemon");
+    assert!(
+        imported < started,
+        "the compositor signature must reach the user manager before daemon startup:\n{calls}"
     );
 }
 

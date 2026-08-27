@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -8,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use voisu_core::{
-    Command, PROTOCOL_VERSION, Request, Response, VersionEnvelope, socket_path,
+    Command, PACKAGE_MANAGERS, PROTOCOL_VERSION, Request, Response, VersionEnvelope, socket_path,
 };
 
 use crate::process::guard_external_child;
@@ -46,6 +47,7 @@ pub enum UserServiceAction {
 pub struct UserServiceReport {
     pub message: String,
     pub exit_code: u8,
+    overlay_failure: Option<String>,
 }
 
 impl UserServiceReport {
@@ -53,7 +55,14 @@ impl UserServiceReport {
         Self {
             message: message.into(),
             exit_code: 0,
+            overlay_failure: None,
         }
+    }
+
+    /// Returns a required-setup failure that was reported as a warning by the
+    /// generic service command because the Overlay is optional there.
+    pub fn overlay_failure(&self) -> Option<&str> {
+        self.overlay_failure.as_deref()
     }
 }
 
@@ -87,7 +96,7 @@ enum OptionalOverlayAction {
 pub fn manage_user_service(action: UserServiceAction) -> Result<UserServiceReport, String> {
     match action {
         UserServiceAction::Install => {
-            import_session_environment();
+            let _ = import_session_environment();
             let report = install()?;
             Ok(append_optional_overlay_report(
                 report,
@@ -117,14 +126,123 @@ pub fn manage_user_service(action: UserServiceAction) -> Result<UserServiceRepor
     }
 }
 
-fn manage_optional_overlay(action: OptionalOverlayAction) -> Option<String> {
+/// Checks the package-level Overlay prerequisite for the Hyprland setup flow.
+/// Setup must not silently complete without the required feedback service.
+pub fn hyprland_overlay_preflight() -> Result<(), String> {
+    if packaged_overlay_unit_exists() {
+        return Ok(());
+    }
+    Err(format!(
+        "required Overlay package is missing; install it with `{}` and re-run `voisu setup`",
+        hyprland_overlay_install_command()
+    ))
+}
+
+/// Installs/enables the corrected daemon and Overlay units without starting
+/// the daemon before the Trigger Key configuration has been reloaded.
+pub fn install_hyprland_services() -> Result<UserServiceReport, String> {
+    hyprland_overlay_preflight()?;
+    require_hyprland_session_environment()?;
+    require_healthy_hyprland_service(manage_user_service(UserServiceAction::Install)?)
+}
+
+/// Restarts the daemon after Hyprland setup has written Delivery and Trigger
+/// Key settings, then verifies that the required Overlay is enabled and active.
+/// `systemctl start` is a no-op when the unit is already running, so a rerun
+/// would otherwise leave the daemon on the previous Delivery mode.
+pub fn start_hyprland_services() -> Result<UserServiceReport, String> {
+    require_hyprland_session_environment()?;
+    let report =
+        require_healthy_hyprland_service(manage_user_service(UserServiceAction::Restart)?)?;
+    require_overlay_state("enabled", "is-enabled")?;
+    require_overlay_state("active", "is-active")?;
+    Ok(report)
+}
+
+fn require_healthy_hyprland_service(
+    report: UserServiceReport,
+) -> Result<UserServiceReport, String> {
+    if report.exit_code != 0 || report.overlay_failure().is_some() {
+        return Err(report.message);
+    }
+    Ok(report)
+}
+
+fn hyprland_overlay_install_command() -> String {
+    hyprland_overlay_install_command_on_path(std::env::var_os("PATH").as_deref())
+}
+
+fn hyprland_overlay_install_command_on_path(path: Option<&OsStr>) -> String {
+    let has = |program: &str| path.is_some_and(|path| resolve_on_path(path, program).is_some());
+    let manager = PACKAGE_MANAGERS
+        .into_iter()
+        .find(|manager| has(manager.probe_binary()));
+    match manager {
+        Some(voisu_core::PackageManager::Dnf) => {
+            voisu_core::PackageManager::Dnf.install_command("voisu-overlay")
+        }
+        Some(voisu_core::PackageManager::Pacman) if has("yay") => "yay -S voisu".to_owned(),
+        Some(voisu_core::PackageManager::Pacman) => {
+            "install the Voisu Overlay package with your package manager".to_owned()
+        }
+        Some(manager) => manager.install_command("voisu"),
+        None if has("yay") => "yay -S voisu".to_owned(),
+        None => "install the Voisu Overlay package with your package manager".to_owned(),
+    }
+}
+
+fn resolve_on_path(path: &OsStr, program: &str) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .map(|directory| directory.join(program))
+        .find(|candidate| {
+            fs::metadata(candidate)
+                .map(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+}
+
+fn require_overlay_state(expected: &str, operation: &str) -> Result<(), String> {
+    let output = systemctl(&[operation, OVERLAY_UNIT_NAME])?;
+    if output.success && output.stdout.trim() == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "Overlay service is not {expected}; systemctl --user {operation} {OVERLAY_UNIT_NAME} reported {}",
+            output.stdout.trim()
+        ))
+    }
+}
+
+struct OptionalOverlayReport {
+    message: String,
+    failure: Option<String>,
+}
+
+impl OptionalOverlayReport {
+    fn success(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            failure: None,
+        }
+    }
+
+    fn warning(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            message: message.clone(),
+            failure: Some(message),
+        }
+    }
+}
+
+fn manage_optional_overlay(action: OptionalOverlayAction) -> Option<OptionalOverlayReport> {
     if !packaged_overlay_unit_exists() {
         return None;
     }
     if let Err(reason) = validate_effective_overlay_unit() {
-        return Some(format!(
+        return Some(OptionalOverlayReport::warning(format!(
             "warning: optional Overlay service was not managed: {reason}"
-        ));
+        )));
     }
 
     // Each step is one systemctl invocation plus the phrase reported if it
@@ -163,10 +281,12 @@ fn manage_optional_overlay(action: OptionalOverlayAction) -> Option<String> {
 
     for (arguments, failure_prefix) in steps {
         if let Err(error) = systemctl_required(arguments) {
-            return Some(format!("warning: {failure_prefix}: {error}"));
+            return Some(OptionalOverlayReport::warning(format!(
+                "warning: {failure_prefix}: {error}"
+            )));
         }
     }
-    Some(success_message.to_owned())
+    Some(OptionalOverlayReport::success(success_message))
 }
 
 fn packaged_overlay_unit_exists() -> bool {
@@ -231,11 +351,12 @@ fn validate_effective_overlay_unit() -> Result<(), String> {
 
 fn append_optional_overlay_report(
     mut report: UserServiceReport,
-    overlay_message: Option<String>,
+    overlay_report: Option<OptionalOverlayReport>,
 ) -> UserServiceReport {
-    if let Some(message) = overlay_message {
+    if let Some(overlay_report) = overlay_report {
+        report.overlay_failure = overlay_report.failure;
         report.message.push_str("; ");
-        report.message.push_str(&message);
+        report.message.push_str(&overlay_report.message);
     }
     report
 }
@@ -318,7 +439,7 @@ fn start() -> Result<UserServiceReport, String> {
             DaemonIpc::Unavailable => {}
         }
     }
-    import_session_environment();
+    let _ = import_session_environment();
     systemctl_required(&["start", UNIT_NAME])?;
     wait_for_managed_daemon()?;
     status()
@@ -329,17 +450,49 @@ fn start() -> Result<UserServiceReport, String> {
 /// daemon it starts can reach the X/Wayland server for Delivery. `systemctl
 /// import-environment` reads the named variables from this process's environment
 /// — which the graphical session populated — and sets them on the manager; they
-/// are not persisted across logins. Best-effort: a failure never blocks the
-/// start, since the daemon still runs and Delivery falls back to the clipboard.
-fn import_session_environment() {
-    let _ = systemctl(&[
+/// are not persisted across logins. Generic service commands intentionally
+/// ignore a failure, since the daemon still runs and Delivery falls back to
+/// the clipboard. Hyprland setup calls [`require_hyprland_session_environment`]
+/// before using these commands.
+///
+/// `HYPRLAND_INSTANCE_SIGNATURE` is imported only when this process has it.
+/// systemd fails the whole import if a named variable is unset, which would
+/// drop DISPLAY/WAYLAND_DISPLAY on KDE/GNOME.
+fn import_session_environment() -> Result<(), String> {
+    let mut arguments = vec![
         "import-environment",
         "DISPLAY",
         "WAYLAND_DISPLAY",
         "XAUTHORITY",
         "XDG_SESSION_TYPE",
         "XDG_CURRENT_DESKTOP",
-    ]);
+    ];
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|value| !value.is_empty()) {
+        arguments.push("HYPRLAND_INSTANCE_SIGNATURE");
+    }
+    systemctl_required(&arguments)
+}
+
+/// Setup runs from the active Hyprland session, so the daemon must inherit the
+/// compositor endpoint and signature that its Paste Action discovery uses.
+fn require_hyprland_session_environment() -> Result<(), String> {
+    let missing: Vec<&str> = ["WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE"]
+        .into_iter()
+        .filter(|name| {
+            std::env::var_os(name).is_none_or(|value| value.is_empty())
+        })
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "Hyprland session is missing required environment: {}",
+            missing.join(", ")
+        ));
+    }
+    systemctl_required(&[
+        "import-environment",
+        "WAYLAND_DISPLAY",
+        "HYPRLAND_INSTANCE_SIGNATURE",
+    ])
 }
 
 fn stop() -> Result<UserServiceReport, String> {
@@ -411,7 +564,7 @@ fn restart() -> Result<UserServiceReport, String> {
             DaemonIpc::Unavailable => {}
         }
     }
-    import_session_environment();
+    let _ = import_session_environment();
     systemctl_required(&["restart", UNIT_NAME])?;
     wait_for_managed_daemon()?;
     status()
@@ -435,6 +588,7 @@ fn status() -> Result<UserServiceReport, String> {
         (true, DaemonIpc::ProtocolMismatch) => UserServiceReport {
             message: "systemd user service active; daemon IPC protocol mismatch".to_owned(),
             exit_code: 5,
+            overlay_failure: None,
         },
         (false, DaemonIpc::ProtocolMismatch) => UserServiceReport {
             message: format!(
@@ -442,14 +596,17 @@ fn status() -> Result<UserServiceReport, String> {
                  daemon IPC protocol mismatch"
             ),
             exit_code: 5,
+            overlay_failure: None,
         },
         (true, DaemonIpc::Unavailable) => UserServiceReport {
             message: "systemd user service active; daemon IPC unavailable".to_owned(),
             exit_code: 4,
+            overlay_failure: None,
         },
         (false, DaemonIpc::Unavailable) => UserServiceReport {
             message: format!("systemd user service {systemd_state}; daemon IPC unavailable"),
             exit_code: if systemd_state == "inactive" { 3 } else { 4 },
+            overlay_failure: None,
         },
     };
     Ok(report)
@@ -1103,4 +1260,76 @@ fn remove_stale_runtime_socket() -> Result<(), String> {
         return Err("daemon runtime socket is still active".to_owned());
     }
     fs::remove_file(path).map_err(|_| "cannot remove stale daemon runtime socket".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hyprland_service_setup_propagates_nonzero_service_reports() {
+        let report = UserServiceReport {
+            message: "daemon IPC unavailable".to_owned(),
+            exit_code: 4,
+            overlay_failure: None,
+        };
+
+        let Err(error) = require_healthy_hyprland_service(report) else {
+            panic!("a nonzero service report must fail Hyprland setup");
+        };
+        assert_eq!(error, "daemon IPC unavailable");
+    }
+
+    #[test]
+    fn hyprland_service_setup_propagates_every_overlay_warning() {
+        let report = append_optional_overlay_report(
+            UserServiceReport::success("daemon restarted"),
+            Some(OptionalOverlayReport::warning(
+                "warning: optional Overlay service was not enabled: systemd failed",
+            )),
+        );
+
+        let Err(error) = require_healthy_hyprland_service(report) else {
+            panic!("a required Overlay warning must fail Hyprland setup");
+        };
+        assert!(error.contains("optional Overlay service was not enabled"));
+    }
+
+    #[test]
+    fn overlay_install_command_on_arch_with_yay_prints_yay() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_on_path(dir.path(), "pacman");
+        write_fake_on_path(dir.path(), "yay");
+        assert_eq!(
+            hyprland_overlay_install_command_on_path(Some(dir.path().as_os_str())),
+            "yay -S voisu"
+        );
+    }
+
+    #[test]
+    fn overlay_install_command_on_fedora_prints_dnf_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_on_path(dir.path(), "dnf");
+        assert_eq!(
+            hyprland_overlay_install_command_on_path(Some(dir.path().as_os_str())),
+            "sudo dnf install voisu-overlay"
+        );
+    }
+
+    #[test]
+    fn overlay_install_command_on_pacman_without_yay_does_not_print_pacman_voisu() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_on_path(dir.path(), "pacman");
+        let command = hyprland_overlay_install_command_on_path(Some(dir.path().as_os_str()));
+        assert!(!command.contains("pacman -S voisu"), "{command}");
+        assert!(!command.contains("sudo pacman"), "{command}");
+    }
+
+    fn write_fake_on_path(dir: &Path, name: &str) {
+        let path = dir.join(name);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
 }

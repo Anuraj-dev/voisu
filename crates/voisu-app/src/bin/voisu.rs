@@ -489,15 +489,28 @@ fn provider_key_rows(runtime: &tokio::runtime::Runtime) -> Vec<DoctorRow> {
 /// live before storing it. All logic lives in the injectable `voisu_app::setup`
 /// core; here we supply the real terminal, keyring, and live validator.
 fn setup() -> ExitCode {
-    use voisu_app::setup::{LiveKeyValidator, ProviderOutcome, StdioWizard, run_setup};
-    use voisu_app::setup_profile::{discover_setup_profile, live_setup_facts};
+    use voisu_app::setup::{
+        LiveHyprlandSetupActions, LiveKeyValidator, ProviderOutcome, SETUP_COMPLETE_MESSAGE,
+        StdioWizard, run_hyprland_setup, run_setup,
+    };
+    use voisu_app::setup_profile::{HyprlandConfig, discover_setup_profile, live_setup_facts};
 
     let discovery = match discover_setup_profile(&live_setup_facts()) {
         Ok(discovery) => discovery,
         Err(error) => return fail(4, &error.message()),
     };
     println!("Detected {} Setup Profile.", discovery.profile.as_str());
-    let outcome = run_setup(&mut StdioWizard, &mut SecretToolStore, &mut LiveKeyValidator);
+    let hyprland_config = discovery.hyprland_config;
+    // Integration tests can isolate the credential wizard while exercising
+    // the real CLI; production never sets this seam.
+    let wizard_only = std::env::var_os("VOISU_TEST_SETUP_WIZARD_ONLY").is_some();
+    if hyprland_config.is_some() && !wizard_only {
+        if let Err(error) = voisu_app::service::hyprland_overlay_preflight() {
+            return fail(4, &error);
+        }
+    }
+    let mut wizard = StdioWizard;
+    let outcome = run_setup(&mut wizard, &mut SecretToolStore, &mut LiveKeyValidator);
     // A run that stored/kept no usable key (every provider skipped or its store
     // failed) did not accomplish setup's job, so it must not report success.
     let usable = |outcome: ProviderOutcome| {
@@ -507,7 +520,38 @@ fn setup() -> ExitCode {
         )
     };
     if usable(outcome.deepgram) || usable(outcome.groq) {
-        ExitCode::SUCCESS
+        if !wizard_only {
+            if let Some(HyprlandConfig::CurrentLua(config)) = hyprland_config {
+                let mut actions = LiveHyprlandSetupActions { io: &mut wizard };
+                match run_hyprland_setup(&config, &mut actions) {
+                    Ok(result) => {
+                        let paste = if result.paste_verified {
+                            "verified Paste Action"
+                        } else {
+                            "clipboard-only paste fallback"
+                        };
+                        println!("{SETUP_COMPLETE_MESSAGE}");
+                        println!(
+                            "Voisu is configured. Press {} to test; {paste}.",
+                            result.trigger_key.label
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => fail(
+                        4,
+                        &format!(
+                            "Hyprland setup incomplete: {error}; recovery: run `voisu setup` after fixing this step"
+                        ),
+                    ),
+                }
+            } else {
+                println!("{SETUP_COMPLETE_MESSAGE}");
+                ExitCode::SUCCESS
+            }
+        } else {
+            println!("{SETUP_COMPLETE_MESSAGE}");
+            ExitCode::SUCCESS
+        }
     } else {
         ExitCode::from(4)
     }
