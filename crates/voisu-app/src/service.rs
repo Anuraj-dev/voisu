@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -8,8 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use voisu_core::{
-    Command, PACKAGE_MANAGERS, PROTOCOL_VERSION, Request, Response, VersionEnvelope,
-    install_instruction, socket_path,
+    Command, PACKAGE_MANAGERS, PROTOCOL_VERSION, Request, Response, VersionEnvelope, socket_path,
 };
 
 use crate::process::guard_external_child;
@@ -169,21 +169,30 @@ fn require_healthy_hyprland_service(
 }
 
 fn hyprland_overlay_install_command() -> String {
-    let manager = PACKAGE_MANAGERS
-        .into_iter()
-        .find(|manager| first_on_path(manager.probe_binary()).is_some());
-    let package = match manager {
-        Some(voisu_core::PackageManager::Dnf) => "voisu-overlay",
-        Some(_) => "voisu",
-        None => return "install the Voisu Overlay package with your package manager".to_owned(),
-    };
-    install_instruction(manager, package)
+    hyprland_overlay_install_command_on_path(std::env::var_os("PATH").as_deref())
 }
 
-fn first_on_path(program: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH")
+fn hyprland_overlay_install_command_on_path(path: Option<&OsStr>) -> String {
+    let has = |program: &str| path.is_some_and(|path| resolve_on_path(path, program).is_some());
+    let manager = PACKAGE_MANAGERS
         .into_iter()
-        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .find(|manager| has(manager.probe_binary()));
+    match manager {
+        Some(voisu_core::PackageManager::Dnf) => {
+            voisu_core::PackageManager::Dnf.install_command("voisu-overlay")
+        }
+        Some(voisu_core::PackageManager::Pacman) if has("yay") => "yay -S voisu".to_owned(),
+        Some(voisu_core::PackageManager::Pacman) => {
+            "install the Voisu Overlay package with your package manager".to_owned()
+        }
+        Some(manager) => manager.install_command("voisu"),
+        None if has("yay") => "yay -S voisu".to_owned(),
+        None => "install the Voisu Overlay package with your package manager".to_owned(),
+    }
+}
+
+fn resolve_on_path(path: &OsStr, program: &str) -> Option<PathBuf> {
+    std::env::split_paths(path)
         .map(|directory| directory.join(program))
         .find(|candidate| {
             fs::metadata(candidate)
@@ -1284,5 +1293,43 @@ mod tests {
             panic!("a required Overlay warning must fail Hyprland setup");
         };
         assert!(error.contains("optional Overlay service was not enabled"));
+    }
+
+    #[test]
+    fn overlay_install_command_on_arch_with_yay_prints_yay() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_on_path(dir.path(), "pacman");
+        write_fake_on_path(dir.path(), "yay");
+        assert_eq!(
+            hyprland_overlay_install_command_on_path(Some(dir.path().as_os_str())),
+            "yay -S voisu"
+        );
+    }
+
+    #[test]
+    fn overlay_install_command_on_fedora_prints_dnf_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_on_path(dir.path(), "dnf");
+        assert_eq!(
+            hyprland_overlay_install_command_on_path(Some(dir.path().as_os_str())),
+            "sudo dnf install voisu-overlay"
+        );
+    }
+
+    #[test]
+    fn overlay_install_command_on_pacman_without_yay_does_not_print_pacman_voisu() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_on_path(dir.path(), "pacman");
+        let command = hyprland_overlay_install_command_on_path(Some(dir.path().as_os_str()));
+        assert!(!command.contains("pacman -S voisu"), "{command}");
+        assert!(!command.contains("sudo pacman"), "{command}");
+    }
+
+    fn write_fake_on_path(dir: &Path, name: &str) {
+        let path = dir.join(name);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
     }
 }

@@ -1038,18 +1038,27 @@ pub fn plan_trigger_bindings(sources: &[&str], prefer_caps_lock: bool) -> Trigge
     plan_trigger_binding_from_bindings(&bindings, prefer_caps_lock)
 }
 
+struct PlannedTriggerBinding {
+    bindings: Vec<LuaBinding>,
+    plan: TriggerBindingPlan,
+}
+
 fn plan_trigger_binding_with_imports(
     path: &Path,
     source: &str,
     files: &dyn BindingFileSystem,
     prefer_caps_lock: bool,
-) -> TriggerBindingPlan {
-    let bindings = match load_lua_bindings_with_occupancy(path, source, files) {
-        Ok(bindings) => bindings,
-        Err(detail) => return TriggerBindingPlan::Unparseable { detail },
-    };
-
-    plan_trigger_binding_from_bindings(&bindings, prefer_caps_lock)
+) -> PlannedTriggerBinding {
+    match load_lua_bindings_with_occupancy(path, source, files) {
+        Ok(bindings) => PlannedTriggerBinding {
+            plan: plan_trigger_binding_from_bindings(&bindings, prefer_caps_lock),
+            bindings,
+        },
+        Err(detail) => PlannedTriggerBinding {
+            bindings: Vec::new(),
+            plan: TriggerBindingPlan::Unparseable { detail },
+        },
+    }
 }
 
 fn plan_trigger_binding_from_bindings(
@@ -1451,11 +1460,8 @@ pub fn install_trigger_binding(
         })?;
     let source = original.as_deref().unwrap_or_default();
     let backup = backup_path(path);
-    let bindings = match load_lua_bindings_with_occupancy(path, source, files) {
-        Ok(bindings) => bindings,
-        Err(detail) => return Err(TriggerBindingError::Unparseable { detail }),
-    };
-    let plan = plan_trigger_binding_from_bindings(&bindings, prefer_caps_lock);
+    let PlannedTriggerBinding { bindings, plan } =
+        plan_trigger_binding_with_imports(path, source, files, prefer_caps_lock);
     let input_path = path.with_file_name("input.lua");
     let original_input =
         files
@@ -2470,7 +2476,7 @@ o.bind("SUPER + CTRL + TAB", "Former two-monitor desktop", paired_desktop_former
         let source = fs::read_to_string(&path).unwrap();
 
         assert_eq!(
-            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true),
+            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true).plan,
             TriggerBindingPlan::Install { key: RIGHT_ALT }
         );
     }
@@ -2530,7 +2536,7 @@ o.bind("SUPER + CTRL + TAB", "Former two-monitor desktop", paired_desktop_former
         let source = fs::read_to_string(&path).unwrap();
 
         assert_eq!(
-            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true),
+            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true).plan,
             TriggerBindingPlan::Install { key: RIGHT_ALT }
         );
     }
@@ -2602,7 +2608,7 @@ o.bind("SUPER + CTRL + TAB", "Former two-monitor desktop", paired_desktop_former
         let source = fs::read_to_string(&path).unwrap();
 
         assert_eq!(
-            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true),
+            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true).plan,
             TriggerBindingPlan::Install { key: RIGHT_ALT }
         );
 
@@ -2614,7 +2620,7 @@ o.bind("SUPER + CTRL + TAB", "Former two-monitor desktop", paired_desktop_former
         .unwrap();
 
         assert_eq!(
-            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true),
+            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true).plan,
             TriggerBindingPlan::Install { key: RIGHT_ALT }
         );
     }
@@ -2628,7 +2634,8 @@ o.bind("SUPER + CTRL + TAB", "Former two-monitor desktop", paired_desktop_former
             "dofile(\"absent.lua\")\n",
             &LocalBindingFileSystem,
             true,
-        );
+        )
+        .plan;
         let TriggerBindingPlan::Unparseable { detail } = missing_file else {
             panic!("a missing dofile must not be treated as success");
         };
@@ -2639,7 +2646,8 @@ o.bind("SUPER + CTRL + TAB", "Former two-monitor desktop", paired_desktop_former
             "dofile(\"missing\")\n",
             &LocalBindingFileSystem,
             true,
-        );
+        )
+        .plan;
         let TriggerBindingPlan::Unparseable { detail } = directory_target else {
             panic!("dofile of a directory must not be treated as success");
         };
