@@ -110,7 +110,8 @@ pub struct LiveHyprlandSetupActions<'a> {
 
 impl HyprlandSetupActions for LiveHyprlandSetupActions<'_> {
     fn select_clipboard_delivery(&mut self) -> Result<(), String> {
-        config::set_delivery_mode_if_missing(DeliveryMode::Clipboard).map(|_| ())
+        // Type Delivery is unusable on Hyprland. Reruns rewrite type/guarded.
+        config::set_delivery_mode(DeliveryMode::Clipboard).map(|_| ())
     }
 
     fn install_services(&mut self) -> Result<(), String> {
@@ -1021,6 +1022,54 @@ mod tests {
                 "verify-delivery"
             ]
         );
+    }
+
+    fn xdg_config_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct XdgConfigHomeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl XdgConfigHomeGuard {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("XDG_CONFIG_HOME");
+            // SAFETY: tests hold xdg_config_test_lock for the guard's lifetime.
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", path) };
+            Self { previous }
+        }
+    }
+
+    impl Drop for XdgConfigHomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests hold xdg_config_test_lock for the guard's lifetime.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hyprland_setup_overwrites_type_and_guarded_delivery_with_clipboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let _lock = xdg_config_test_lock();
+        let _guard = XdgConfigHomeGuard::set(dir.path());
+        let mut io = FakeIo::new(vec![], vec![]);
+        let mut actions = LiveHyprlandSetupActions { io: &mut io };
+
+        for existing in [DeliveryMode::Type, DeliveryMode::Guarded] {
+            config::set_delivery_mode(existing).unwrap();
+            assert_eq!(config::delivery_mode(), existing);
+            actions.select_clipboard_delivery().unwrap();
+            assert_eq!(config::delivery_mode(), DeliveryMode::Clipboard);
+        }
     }
 
     #[test]
