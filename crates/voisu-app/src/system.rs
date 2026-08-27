@@ -124,12 +124,24 @@ const DEEPGRAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// the accumulated prefix would deliver a plausible but truncated Transcript.
 const DEEPGRAM_CLOSE_GRACE: Duration = Duration::from_secs(10);
 
-pub struct FedoraReadiness;
+#[derive(Default)]
+pub struct FedoraReadiness {
+    /// Last Status handshake from `inspect`. Doctor reuses it so a hung
+    /// socket is not held for a second PROCESS_DEADLINE.
+    daemon_status: Option<Response>,
+}
+
+impl FedoraReadiness {
+    pub fn daemon_status(&self) -> Option<&Response> {
+        self.daemon_status.as_ref()
+    }
+}
 
 impl ReadinessInspector for FedoraReadiness {
     fn inspect(&mut self) -> Vec<ReadinessFinding> {
+        self.daemon_status = daemon_status_response();
         if let Some(value) = std::env::var_os("VOISU_TEST_READINESS") {
-            return controlled_readiness(&value.to_string_lossy());
+            return controlled_readiness(&value.to_string_lossy(), self.daemon_status.as_ref());
         }
         let mut findings = vec![
             session_finding(),
@@ -138,7 +150,7 @@ impl ReadinessInspector for FedoraReadiness {
             portals_finding(),
             clipboard_finding(),
             secret_service_finding(),
-            daemon_finding(),
+            daemon_finding(self.daemon_status.as_ref()),
         ];
         // Appended only when it can demonstrate a problem, so the common case
         // stays quiet and the golden table is unaffected.
@@ -1605,7 +1617,7 @@ fn pipewire_finding() -> ReadinessFinding {
     }
 }
 
-fn controlled_readiness(value: &str) -> Vec<ReadinessFinding> {
+fn controlled_readiness(value: &str, daemon_status: Option<&Response>) -> Vec<ReadinessFinding> {
     // Host-independent findings so the doctor-output golden test is stable
     // everywhere: no real probes, no package-manager detection.
     let mut findings = vec![
@@ -1617,7 +1629,7 @@ fn controlled_readiness(value: &str) -> Vec<ReadinessFinding> {
         readiness(ReadinessCapability::Portals, ReadinessStatus::Pass, "desktop portal responds"),
         readiness(ReadinessCapability::Clipboard, ReadinessStatus::Pass, "clipboard roundtrip succeeds"),
         readiness(ReadinessCapability::SecretStorage, ReadinessStatus::Pass, "Secret Service responds"),
-        daemon_finding(),
+        daemon_finding(daemon_status),
     ];
     if value == "pass" {
         return findings;
@@ -1908,6 +1920,46 @@ fn clipboard_finding_for_candidates(candidates: &[ClipboardTool]) -> ReadinessFi
         ))
 }
 
+/// Read-only check that `tool` can reach the current display.
+///
+/// Used by the daemon at start so `clipboard_usable` is not inferred from a
+/// display env var plus an executable on `PATH`. The probe never writes, so it
+/// cannot clobber the user clipboard. An empty selection still counts as
+/// usable; a connect-failure does not.
+pub fn clipboard_backend_display_reachable(tool: ClipboardTool) -> bool {
+    let (program, arguments) = tool.read_command();
+    match run_restricted(program, arguments, None, false) {
+        Ok(outcome) => clipboard_read_proves_display(outcome.success, &outcome.stderr),
+        Err(_) => false,
+    }
+}
+
+fn clipboard_read_proves_display(success: bool, stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if clipboard_connect_failed(&stderr) {
+        return false;
+    }
+    success || clipboard_empty_selection(&stderr)
+}
+
+fn clipboard_connect_failed(stderr: &str) -> bool {
+    stderr.contains("failed to connect")
+        || stderr.contains("can't open display")
+        || stderr.contains("cannot open display")
+        || stderr.contains("unable to open display")
+        || stderr.contains("unable to connect")
+        || stderr.contains("could not connect")
+        || stderr.contains("connection refused")
+}
+
+fn clipboard_empty_selection(stderr: &str) -> bool {
+    stderr.contains("nothing is copied")
+        || stderr.contains("clipboard is empty")
+        || stderr.contains("no mime type")
+        || stderr.contains("target string not available")
+        || stderr.contains("no owner")
+}
+
 /// Verifies the clipboard backend that the daemon's Delivery adapters use for
 /// Transcript preservation. On Wayland this probes wl-copy/wl-paste
 /// specifically; an installed xclip cannot make a missing or broken
@@ -2030,8 +2082,8 @@ fn global_shortcuts_available() -> bool {
     .is_ok_and(|outcome| outcome.success)
 }
 
-fn daemon_finding() -> ReadinessFinding {
-    if daemon_status_handshake().is_ok() {
+fn daemon_finding(response: Option<&Response>) -> ReadinessFinding {
+    if response.is_some() {
         return readiness(
             ReadinessCapability::Daemon,
             ReadinessStatus::Pass,
@@ -2070,23 +2122,25 @@ fn service_reports_failed() -> bool {
     crate::service::service_is_failed()
 }
 
-fn daemon_status_handshake() -> Result<(), ()> {
-    let path = socket_path().map_err(|_| ())?;
-    let mut stream = UnixStream::connect(path).map_err(|_| ())?;
+/// Query the daemon's status response with the same bounded framing used by
+/// the basic daemon readiness check. The CLI uses the additive readiness
+/// payload to compare the daemon's inherited session with its own.
+pub fn daemon_status_response() -> Option<Response> {
+    let path = socket_path().ok()?;
+    let mut stream = UnixStream::connect(path).ok()?;
     // A single Instant budget bounds the whole handshake. A per-read timeout is
     // reset by every byte, so a peer trickling one byte per interval would hold
     // doctor forever; the accumulated response is also capped during reading so
     // an oversized frame can never be fully buffered before the cap is checked.
     let started = Instant::now();
-    stream.set_write_timeout(Some(PROCESS_DEADLINE)).map_err(|_| ())?;
-    serde_json::to_writer(&mut stream, &Request::new(DaemonCommand::Status)).map_err(|_| ())?;
-    stream.write_all(b"\n").map_err(|_| ())?;
-    let response = read_bounded_frame(&mut stream, started)?;
-    let envelope: VersionEnvelope = serde_json::from_str(&response).map_err(|_| ())?;
-    let response: Response = serde_json::from_str(&response).map_err(|_| ())?;
+    stream.set_write_timeout(Some(PROCESS_DEADLINE)).ok()?;
+    serde_json::to_writer(&mut stream, &Request::new(DaemonCommand::Status)).ok()?;
+    stream.write_all(b"\n").ok()?;
+    let response = read_bounded_frame(&mut stream, started).ok()?;
+    let envelope: VersionEnvelope = serde_json::from_str(&response).ok()?;
+    let response: Response = serde_json::from_str(&response).ok()?;
     (envelope.version == PROTOCOL_VERSION && response.ok && response.state.is_some())
-        .then_some(())
-        .ok_or(())
+        .then_some(response)
 }
 
 fn read_bounded_frame(stream: &mut UnixStream, started: Instant) -> Result<String, ()> {
@@ -8871,6 +8925,35 @@ mod tests {
             writes.into_inner(),
             vec![b"probe".to_vec(), b"prior clipboard".to_vec()]
         );
+    }
+
+    #[test]
+    fn clipboard_read_probe_treats_empty_selection_as_usable() {
+        assert!(clipboard_read_proves_display(true, b""));
+        assert!(clipboard_read_proves_display(
+            false,
+            b"Nothing is copied\n"
+        ));
+        assert!(clipboard_read_proves_display(
+            false,
+            b"Error: target STRING not available\n"
+        ));
+    }
+
+    #[test]
+    fn clipboard_read_probe_treats_connect_failure_as_unusable() {
+        assert!(!clipboard_read_proves_display(
+            false,
+            b"failed to connect to a Wayland server: No such file or directory\n"
+        ));
+        assert!(!clipboard_read_proves_display(
+            true,
+            b"failed to connect to a Wayland server: No such file or directory\n"
+        ));
+        assert!(!clipboard_read_proves_display(
+            false,
+            b"Error: Can't open display: :0\n"
+        ));
     }
 
     #[test]

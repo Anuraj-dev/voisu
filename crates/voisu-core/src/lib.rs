@@ -417,6 +417,43 @@ impl ProviderFailure {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PasteActionState {
+    /// The configured Hyprland paste action was found and verified live.
+    Verified,
+    /// Clipboard delivery is selected, but no safe paste action was verified.
+    ClipboardOnly,
+    /// The selected Delivery mode does not use a Hyprland paste action.
+    NotRequired,
+}
+
+/// Readiness captured in the daemon's own environment at process start.
+///
+/// This is intentionally reported by the daemon rather than inferred by the
+/// interactive CLI: a systemd user service can retain an old display endpoint
+/// after a compositor/session change even while the CLI has a healthy one.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DaemonReadiness {
+    pub session_type: Option<String>,
+    pub wayland_display: Option<String>,
+    pub x11_display: Option<String>,
+    /// X11 authority path inherited by the daemon, never the authority data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_authority: Option<String>,
+    /// Hyprland compositor instance identity captured by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyprland_instance_signature: Option<String>,
+    pub delivery_mode: String,
+    pub paste_action: PasteActionState,
+    /// The first clipboard writer available in the daemon's PATH, if any.
+    /// Presence alone does not mean it can reach the daemon's display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clipboard_backend: Option<String>,
+    /// Proven by a bounded read-only backend probe in the daemon process.
+    pub clipboard_usable: bool,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Response {
     pub version: u32,
@@ -442,6 +479,10 @@ pub struct Response {
     /// holding a second copy of the limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording_remaining_ms: Option<u64>,
+    /// Additive daemon-owned session and Delivery diagnostics. Older daemons do
+    /// not send this field and older clients ignore it on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<DaemonReadiness>,
 }
 
 /// One transport page of a serialized diagnostic history or export.
@@ -523,6 +564,7 @@ impl Response {
             overlay_event: None,
             level_frames: None,
             recording_remaining_ms: None,
+            readiness: None,
         }
     }
 
