@@ -25,6 +25,7 @@ use voisu_app::dpr_pipeline::{
     DprCloudCapability, DprPipelineClockOrigin, DprTransformInput, SystemDprPipelineClock,
 };
 use voisu_app::focus::SharedFocusProbe;
+use voisu_app::hyprland_bindings::VerifiedPasteAction;
 use voisu_app::journal::{escape_journal_control, recording_journal_lines};
 use voisu_app::minimal_grammar::MinimalGrammarAdapter;
 use voisu_app::smart_writing::{
@@ -206,7 +207,9 @@ async fn run() -> Result<(), String> {
         None
     };
 
-    let daemon_readiness = daemon_readiness_snapshot(delivery_mode);
+    let (initial_delivery, initial_paste_action) =
+        build_delivery_adapter(controlled, delivery_mode, focus_probe.clone());
+    let daemon_readiness = daemon_readiness_snapshot(delivery_mode, initial_paste_action);
     let (actor_tx, actor_rx) = mpsc::channel(64);
     let levels = LevelRegistry::default();
     // The actor-owned reaper supervises capture and provider-stream cleanup.
@@ -222,6 +225,7 @@ async fn run() -> Result<(), String> {
         focus_probe,
         levels.clone(),
         daemon_readiness,
+        initial_delivery,
     ));
     // The Global Shortcuts portal listener runs off the actor so a slow or
     // unavailable portal never blocks the IPC surface. Each Trigger Key
@@ -575,6 +579,7 @@ async fn actor_loop(
     focus_probe: Option<SharedFocusProbe>,
     levels: LevelRegistry,
     daemon_readiness: Option<DaemonReadiness>,
+    initial_delivery: Box<dyn DeliveryAdapter>,
 ) {
     let mut state = ActorState::Idle;
     // Retained only for the observer-facing Status response. It never controls
@@ -661,11 +666,7 @@ async fn actor_loop(
     } else {
         Some(Box::new(MergeResultValidator::new()))
     };
-    let mut delivery: Option<Box<dyn DeliveryAdapter>> = Some(build_delivery_adapter(
-        controlled,
-        delivery_mode,
-        focus_probe.clone(),
-    ));
+    let mut delivery: Option<Box<dyn DeliveryAdapter>> = Some(initial_delivery);
     // The desktop-approved Trigger Key binding, once the portal listener reports
     // it. `None` means no Trigger Key is bound (portal unavailable or denied),
     // which never prevents CLI Recording control.
@@ -1686,7 +1687,10 @@ fn status_response_with_feedback(
 /// Capture the daemon's session facts once, before the actor starts. A running
 /// systemd service must report the environment it actually inherited, not the
 /// interactive CLI's later environment after a compositor/session change.
-fn daemon_readiness_snapshot(delivery_mode: DeliveryMode) -> Option<DaemonReadiness> {
+fn daemon_readiness_snapshot(
+    delivery_mode: DeliveryMode,
+    paste_action: PasteActionState,
+) -> Option<DaemonReadiness> {
     let controlled = std::env::var_os("VOISU_TEST_MODE").as_deref()
         == Some(std::ffi::OsStr::new("controlled"));
     if controlled && std::env::var_os("VOISU_TEST_REPORT_DAEMON_READINESS").is_none() {
@@ -1696,6 +1700,8 @@ fn daemon_readiness_snapshot(delivery_mode: DeliveryMode) -> Option<DaemonReadin
     let session_type = std::env::var("XDG_SESSION_TYPE").ok();
     let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
     let x11_display = std::env::var("DISPLAY").ok();
+    let x_authority = std::env::var("XAUTHORITY").ok();
+    let hyprland_instance_signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
     let session = resolve_session(
         wayland_display.as_deref(),
         x11_display.as_deref(),
@@ -1724,20 +1730,12 @@ fn daemon_readiness_snapshot(delivery_mode: DeliveryMode) -> Option<DaemonReadin
             voisu_core::SessionKind::Unknown => false,
         },
     };
-    let paste_action = if delivery_mode == DeliveryMode::Clipboard {
-        if voisu_app::hyprland_bindings::discover_live_paste_action().is_some() {
-            PasteActionState::Verified
-        } else {
-            PasteActionState::ClipboardOnly
-        }
-    } else {
-        PasteActionState::NotRequired
-    };
-
     Some(DaemonReadiness {
         session_type,
         wayland_display,
         x11_display,
+        x_authority,
+        hyprland_instance_signature,
         delivery_mode: delivery_mode.as_str().to_owned(),
         paste_action,
         clipboard_usable: display_ready && clipboard_backend.is_some(),
@@ -2746,7 +2744,7 @@ fn rebuild_recording_adapters(
             } else {
                 Box::new(MergeResultValidator::new())
             },
-            build_delivery_adapter(false, delivery_mode, focus_probe),
+            build_delivery_adapter(false, delivery_mode, focus_probe).0,
         )
     }
 }
@@ -2758,19 +2756,39 @@ fn build_delivery_adapter(
     controlled: bool,
     delivery_mode: DeliveryMode,
     focus_probe: Option<SharedFocusProbe>,
-) -> Box<dyn DeliveryAdapter> {
+) -> (Box<dyn DeliveryAdapter>, PasteActionState) {
     if controlled {
-        Box::new(ControlledDelivery)
+        (
+            Box::new(ControlledDelivery),
+            if delivery_mode == DeliveryMode::Clipboard {
+                // The controlled adapter has no paste side effect; model the
+                // configured clipboard mode without probing the live desktop.
+                PasteActionState::ClipboardOnly
+            } else {
+                PasteActionState::NotRequired
+            },
+        )
     } else if std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_some() {
-        Box::new(PortalClipboardDelivery::clipboard_only_with_reason(
-            Box::new(WlClipboard),
-            "direct Delivery disabled by VOISU_DISABLE_DIRECT_DELIVERY; Transcript remains on the clipboard",
-        ))
+        (
+            Box::new(PortalClipboardDelivery::clipboard_only_with_reason(
+                Box::new(WlClipboard),
+                "direct Delivery disabled by VOISU_DISABLE_DIRECT_DELIVERY; Transcript remains on the clipboard",
+            )),
+            if delivery_mode == DeliveryMode::Clipboard {
+                PasteActionState::ClipboardOnly
+            } else {
+                PasteActionState::NotRequired
+            },
+        )
     } else {
         match delivery_mode {
-            DeliveryMode::Type => Box::new(PortalClipboardDelivery::default()),
+            DeliveryMode::Type => (
+                Box::new(PortalClipboardDelivery::default()),
+                PasteActionState::NotRequired,
+            ),
             DeliveryMode::Clipboard => {
-                match voisu_app::hyprland_bindings::discover_live_paste_action() {
+                let (paste_action, verified) = paste_action_selection();
+                let adapter = match verified {
                     Some(action) => {
                         eprintln!("verified Hyprland Paste Action: {}", action.description);
                         Box::new(PortalClipboardDelivery::with_hyprland_paste(action))
@@ -2781,7 +2799,8 @@ fn build_delivery_adapter(
                         );
                         Box::new(PortalClipboardDelivery::clipboard_only())
                     }
-                }
+                };
+                (adapter, paste_action)
             }
             DeliveryMode::Guarded => {
                 let focus = focus_probe.unwrap_or_else(|| {
@@ -2789,14 +2808,24 @@ fn build_delivery_adapter(
                         voisu_app::focus::NullFocusProbe,
                     )))
                 });
-                Box::new(GuardedDelivery::with_boundaries(
-                    focus,
-                    Box::new(PortalClipboardDelivery::default()),
-                    Box::new(PortalClipboardDelivery::clipboard_only()),
-                    Box::new(DesktopNotifier),
-                ))
+                (
+                    Box::new(GuardedDelivery::with_boundaries(
+                        focus,
+                        Box::new(PortalClipboardDelivery::default()),
+                        Box::new(PortalClipboardDelivery::clipboard_only()),
+                        Box::new(DesktopNotifier),
+                    )),
+                    PasteActionState::NotRequired,
+                )
             }
         }
+    }
+}
+
+fn paste_action_selection() -> (PasteActionState, Option<VerifiedPasteAction>) {
+    match voisu_app::hyprland_bindings::discover_live_paste_action() {
+        Some(action) => (PasteActionState::Verified, Some(action)),
+        None => (PasteActionState::ClipboardOnly, None),
     }
 }
 

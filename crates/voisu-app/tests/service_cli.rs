@@ -706,6 +706,24 @@ fn packaged_install_enables_and_restarts_the_optional_overlay_service() {
 }
 
 #[test]
+fn service_start_starts_the_packaged_overlay_with_the_daemon() {
+    let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
+    assert!(fixture.run(&["service", "install"]).status.success());
+    fixture.install_packaged_overlay_unit();
+    fixture.use_real_managed_daemon();
+
+    let started = fixture.run(&["service", "start"]);
+
+    assert!(started.status.success(), "{}", stderr(&started));
+    let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+    assert!(calls.contains("--user start voisu.service"), "{calls}");
+    assert!(
+        calls.contains("--user enable --now voisu-overlay.service"),
+        "service start must restore the Overlay alongside the daemon: {calls}"
+    );
+}
+
+#[test]
 fn overlay_enable_failure_does_not_fail_daemon_service_install() {
     let fixture = ServiceFixture::new(Path::new(env!("CARGO_BIN_EXE_voisu-daemon")));
     fixture.install_packaged_unit();

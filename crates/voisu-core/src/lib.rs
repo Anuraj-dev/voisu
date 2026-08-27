@@ -438,6 +438,12 @@ pub struct DaemonReadiness {
     pub session_type: Option<String>,
     pub wayland_display: Option<String>,
     pub x11_display: Option<String>,
+    /// X11 authority path inherited by the daemon, never the authority data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_authority: Option<String>,
+    /// Hyprland compositor instance identity captured by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyprland_instance_signature: Option<String>,
     pub delivery_mode: String,
     pub paste_action: PasteActionState,
     /// The first clipboard writer available in the daemon's PATH, if any.

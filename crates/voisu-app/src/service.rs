@@ -111,7 +111,13 @@ pub fn manage_user_service(action: UserServiceAction) -> Result<UserServiceRepor
                 manage_optional_overlay(OptionalOverlayAction::Install),
             ))
         }
-        UserServiceAction::Start => start(),
+        UserServiceAction::Start => {
+            let report = start()?;
+            Ok(append_optional_overlay_report(
+                report,
+                manage_optional_overlay(OptionalOverlayAction::Install),
+            ))
+        }
         UserServiceAction::Stop => stop(),
         // An update replaces the Overlay binary on disk, but the running Overlay
         // process survives until its own unit restarts. Restarting only the
@@ -185,7 +191,7 @@ pub fn hyprland_overlay_readiness() -> Result<OverlayReadiness, String> {
     Ok(OverlayReadiness { enabled, active })
 }
 
-fn hyprland_overlay_install_command() -> String {
+pub fn hyprland_overlay_install_command() -> String {
     hyprland_overlay_install_command_on_path(std::env::var_os("PATH").as_deref())
 }
 

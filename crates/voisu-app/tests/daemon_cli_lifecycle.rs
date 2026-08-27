@@ -3288,6 +3288,90 @@ fn doctor_rejects_a_daemon_with_a_stale_wayland_display() {
 }
 
 #[test]
+fn doctor_rejects_a_daemon_from_a_different_hyprland_instance() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-1"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "old-instance"),
+            ("VOISU_TEST_REPORT_DAEMON_READINESS", "1"),
+        ],
+    );
+    let config_home = TempDir::new().unwrap();
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-1"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "new-instance"),
+            ("VOISU_TEST_OVERLAY_READINESS", "ready"),
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
+    );
+    let output = stdout(&doctor);
+    assert_eq!(doctor.status.code(), Some(4), "{output}");
+    assert!(
+        output.contains(&doctor_line("Daemon session", "Wayland / wayland-1", "FAIL")),
+        "{output}"
+    );
+}
+
+#[test]
+fn doctor_rejects_x11_clipboard_readiness_with_stale_xauthority() {
+    let commands = TempDir::new().unwrap();
+    write_fake_command(commands.path(), "xclip", "exit 0\n");
+    let path = commands.path().to_str().unwrap().to_owned();
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("XDG_SESSION_TYPE", "x11"),
+            ("DISPLAY", ":0"),
+            ("XAUTHORITY", "/run/user/1000/old-xauth"),
+            ("PATH", &path),
+            ("VOISU_TEST_REPORT_DAEMON_READINESS", "1"),
+        ],
+    );
+    let status = ipc_request(
+        runtime.path(),
+        &format!(r#"{{"version":{PROTOCOL_VERSION},"command":"status"}}"#),
+    );
+    assert_eq!(status["readiness"]["x_authority"], "/run/user/1000/old-xauth");
+
+    let config_home = TempDir::new().unwrap();
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("PATH", &path),
+            ("XDG_SESSION_TYPE", "x11"),
+            ("DISPLAY", ":0"),
+            ("XAUTHORITY", "/run/user/1000/current-xauth"),
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "none"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
+    );
+    let output = stdout(&doctor);
+    assert_eq!(doctor.status.code(), Some(4), "{output}");
+    assert!(
+        output.contains(&doctor_line("Daemon session", "X11 / :0", "FAIL")),
+        "{output}"
+    );
+    assert!(
+        output.contains(&doctor_line("Daemon clipboard", "xclip", "FAIL")),
+        "X11 clipboard readiness must follow the authenticated session: {output}"
+    );
+}
+
+#[test]
 fn doctor_reports_clipboard_only_when_hyprland_paste_is_unverified() {
     let config_home = TempDir::new().unwrap();
     let voisu_config = config_home.path().join("voisu");
@@ -3331,6 +3415,59 @@ fn doctor_reports_clipboard_only_when_hyprland_paste_is_unverified() {
 }
 
 #[test]
+fn daemon_readiness_reports_clipboard_only_when_direct_delivery_is_disabled() {
+    let config_home = TempDir::new().unwrap();
+    let voisu_config = config_home.path().join("voisu");
+    fs::create_dir_all(voisu_config.join("hypr")).unwrap();
+    fs::write(
+        voisu_config.join("config.toml"),
+        "deepgram_enabled = false\ndelivery_mode = \"clipboard\"\n",
+    )
+    .unwrap();
+    fs::write(
+        voisu_config.join("hypr/hyprland.lua"),
+        r#"o.bind("CTRL + SHIFT + P", "Paste transcript", "hyprctl dispatch sendshortcut CTRL V")"#,
+    )
+    .unwrap();
+
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "hyprctl",
+        r#"dir=$(dirname "$0")
+: > "$dir/hyprctl.called"
+printf '[{"key":"P","modmask":5,"description":"Paste transcript","dispatcher":"exec","arg":"hyprctl dispatch sendshortcut CTRL V"}]'
+"#,
+    );
+    write_fake_command(commands.path(), "wl-copy", "cat >/dev/null\n");
+    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-6"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test"),
+            ("VOISU_DISABLE_DIRECT_DELIVERY", "1"),
+            ("VOISU_DISABLE_SHORTCUTS", "1"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/voisu-no-portal"),
+        ],
+    );
+
+    let status = ipc_request(
+        runtime.path(),
+        &format!(r#"{{"version":{PROTOCOL_VERSION},"command":"status"}}"#),
+    );
+    assert_eq!(status["readiness"]["paste_action"], "clipboard_only");
+    assert!(
+        !commands.path().join("hyprctl.called").exists(),
+        "the opt-out adapter must not perform independent Hyprland paste discovery"
+    );
+}
+
+#[test]
 fn doctor_reports_hyprland_overlay_readiness() {
     let commands = TempDir::new().unwrap();
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat >/dev/null\n");
@@ -3364,6 +3501,46 @@ fn doctor_reports_hyprland_overlay_readiness() {
     let output = stdout(&doctor);
     assert!(doctor.status.success(), "{output}");
     assert!(output.contains(&doctor_line("Overlay", "active", "PASS")), "{output}");
+}
+
+#[test]
+fn doctor_reports_the_overlay_package_install_command_when_the_unit_is_missing() {
+    let commands = TempDir::new().unwrap();
+    write_fake_command(commands.path(), "dnf", "exit 0\n");
+    write_fake_command(commands.path(), "systemctl", "exit 0\n");
+    let path = commands.path().to_str().unwrap().to_owned();
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-7"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test"),
+            ("PATH", &path),
+            ("VOISU_TEST_REPORT_DAEMON_READINESS", "1"),
+        ],
+    );
+    let config_home = TempDir::new().unwrap();
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor", "--verbose"],
+        &[
+            ("PATH", &path),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-7"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test"),
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
+    );
+    let output = stdout(&doctor);
+    assert_eq!(doctor.status.code(), Some(4), "{output}");
+    assert!(
+        output.contains("sudo dnf install voisu-overlay"),
+        "missing Overlay package guidance must name the split package: {output}"
+    );
 }
 
 #[test]

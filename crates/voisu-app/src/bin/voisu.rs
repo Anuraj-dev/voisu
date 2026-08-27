@@ -394,6 +394,7 @@ fn focus_guard_row(backend: voisu_app::focus::FocusBackendKind) -> DoctorRow {
 
 fn daemon_readiness_rows(readiness: &DaemonReadiness) -> Vec<DoctorRow> {
     let mut rows = Vec::with_capacity(5);
+    let daemon_session_matches = daemon_session_matches_cli(readiness);
     rows.push(daemon_session_row(readiness));
 
     let cli_delivery = voisu_app::config::delivery_mode().as_str();
@@ -441,7 +442,7 @@ fn daemon_readiness_rows(readiness: &DaemonReadiness) -> Vec<DoctorRow> {
         .clipboard_backend
         .as_deref()
         .unwrap_or("not installed");
-    rows.push(if readiness.clipboard_usable {
+    rows.push(if readiness.clipboard_usable && daemon_session_matches {
         DoctorRow::new(
             "Daemon clipboard",
             ReadinessStatus::Pass,
@@ -473,10 +474,6 @@ fn daemon_readiness_rows(readiness: &DaemonReadiness) -> Vec<DoctorRow> {
 }
 
 fn daemon_session_row(readiness: &DaemonReadiness) -> DoctorRow {
-    let cli_wayland = std::env::var("WAYLAND_DISPLAY").ok();
-    let cli_x11 = std::env::var("DISPLAY").ok();
-    let cli_type = std::env::var("XDG_SESSION_TYPE").ok();
-    let cli_resolution = resolve_session(cli_wayland.as_deref(), cli_x11.as_deref(), cli_type.as_deref());
     let daemon_resolution = resolve_session(
         readiness.wayland_display.as_deref(),
         readiness.x11_display.as_deref(),
@@ -487,17 +484,7 @@ fn daemon_session_row(readiness: &DaemonReadiness) -> DoctorRow {
         Some(value) if value.eq_ignore_ascii_case("x11") => SessionKind::X11,
         _ => daemon_resolution.session,
     };
-    let same_endpoint = match cli_resolution.session {
-        SessionKind::Wayland => {
-            daemon_session == SessionKind::Wayland
-                && cli_wayland.as_deref() == readiness.wayland_display.as_deref()
-        }
-        SessionKind::X11 => {
-            daemon_session == SessionKind::X11
-                && cli_x11.as_deref() == readiness.x11_display.as_deref()
-        }
-        SessionKind::Unknown => false,
-    };
+    let same_endpoint = daemon_session_matches_cli(readiness);
     let value = daemon_session_value(readiness, daemon_session);
     if same_endpoint {
         DoctorRow::new(
@@ -515,6 +502,51 @@ fn daemon_session_row(readiness: &DaemonReadiness) -> DoctorRow {
         .value(value)
         .action("voisu service restart")
     }
+}
+
+fn daemon_session_matches_cli(readiness: &DaemonReadiness) -> bool {
+    let cli_wayland = std::env::var("WAYLAND_DISPLAY").ok();
+    let cli_x11 = std::env::var("DISPLAY").ok();
+    let cli_type = std::env::var("XDG_SESSION_TYPE").ok();
+    let cli_resolution = resolve_session(
+        cli_wayland.as_deref(),
+        cli_x11.as_deref(),
+        cli_type.as_deref(),
+    );
+    let daemon_resolution = resolve_session(
+        readiness.wayland_display.as_deref(),
+        readiness.x11_display.as_deref(),
+        readiness.session_type.as_deref(),
+    );
+    let daemon_session = match readiness.session_type.as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("wayland") => SessionKind::Wayland,
+        Some(value) if value.eq_ignore_ascii_case("x11") => SessionKind::X11,
+        _ => daemon_resolution.session,
+    };
+    match cli_resolution.session {
+        SessionKind::Wayland => {
+            daemon_session == SessionKind::Wayland
+                && cli_wayland.as_deref() == readiness.wayland_display.as_deref()
+                && same_optional_identity(
+                    std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok().as_deref(),
+                    readiness.hyprland_instance_signature.as_deref(),
+                )
+        }
+        SessionKind::X11 => {
+            daemon_session == SessionKind::X11
+                && cli_x11.as_deref() == readiness.x11_display.as_deref()
+                && same_optional_identity(
+                    std::env::var("XAUTHORITY").ok().as_deref(),
+                    readiness.x_authority.as_deref(),
+                )
+        }
+        SessionKind::Unknown => false,
+    }
+}
+
+fn same_optional_identity(current: Option<&str>, daemon: Option<&str>) -> bool {
+    current.map(str::trim).filter(|value| !value.is_empty())
+        == daemon.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn daemon_session_value(readiness: &DaemonReadiness, session: SessionKind) -> String {
@@ -593,7 +625,7 @@ fn overlay_readiness_row() -> DoctorRow {
         .action("voisu service install"),
         Err(detail) => DoctorRow::new("Overlay", ReadinessStatus::Fail, detail)
             .value("unknown")
-            .action("voisu service install"),
+            .action(voisu_app::service::hyprland_overlay_install_command()),
     }
 }
 
