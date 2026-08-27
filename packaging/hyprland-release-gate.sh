@@ -402,6 +402,63 @@ parse_artifact_mtree() {
     ' "$mtree_file" >"$entries_file"
 }
 
+common_installed_root_prefix() {
+    local paths_file=$1
+    local common
+
+    common=$(awk '
+        function parent(path) {
+            if (path == "/") return "/"
+            sub(/\/[^\/]*$/, "", path)
+            if (path == "") return "/"
+            return path
+        }
+        function is_dir_prefix(path, prefix) {
+            if (prefix == "/") return path ~ /^\//
+            return path == prefix || index(path, prefix "/") == 1
+        }
+        BEGIN { first = 1 }
+        {
+            if ($0 !~ /^\// || $0 ~ /(^|\/)\.\.(\/|$)/) {
+                bad = 1
+                next
+            }
+            p = parent($0)
+            if (first) {
+                common = p
+                first = 0
+                next
+            }
+            while (common != "" && !is_dir_prefix(p, common)) {
+                if (common == "/") {
+                    common = ""
+                    break
+                }
+                common = parent(common)
+            }
+        }
+        END {
+            if (bad || first || common == "") exit 1
+            print common
+        }
+    ' "$paths_file") || return 1
+    if [[ $common == / ]]; then
+        return 0
+    fi
+    if [[ $common != /* || $common == */ || $common == *[[:space:]]* ]]; then
+        return 1
+    fi
+    case "$common" in
+        ..|../*|*/..|*/../*) return 1 ;;
+    esac
+    if ! awk -v prefix="$common" '
+        $0 != prefix && index($0, prefix "/") != 1 { exit 1 }
+    ' "$paths_file"; then
+        return 1
+    fi
+    printf '%s\n' "$common"
+}
+
 verify_installed_payload() {
     local package=$1
     local pacman_path
@@ -423,6 +480,7 @@ verify_installed_payload() {
     local digest
     local link
     local installed_path
+    local installed_root
     local actual_digest
     local actual_link
 
@@ -465,13 +523,18 @@ verify_installed_payload() {
             path = $0
             sub(/^[^[:space:]]+[[:space:]]+/, "", path)
             if (path != "/") sub(/\/+$/, "", path)
-            if (path !~ /^\// || path ~ /[[:space:]]/) malformed = 1
+            if (path !~ /^\// || path ~ /[[:space:]]/ || path ~ /(^|\/)\.\.(\/|$)/) malformed = 1
             else print path
             entries++
         }
         END { if (malformed || entries == 0) exit 1 }
     ' <<<"$package_files" | LC_ALL=C sort -u >"$installed_paths"; then
         printf 'installed package file ownership metadata is malformed\n' >&2
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    if ! installed_root=$(common_installed_root_prefix "$installed_paths"); then
+        printf 'installed package file ownership has no valid common root prefix\n' >&2
         rm -rf "$temp_dir"
         return 1
     fi
@@ -484,9 +547,13 @@ verify_installed_payload() {
             rm -rf "$temp_dir"
             return 1
         fi
-        if ! installed_path=$(awk -v logical="$logical_path" '
-            $0 == logical || (length($0) > length(logical) \
-                && substr($0, length($0) - length(logical) + 1) == logical) {
+        if ! installed_path=$(awk -v logical="$logical_path" -v prefix="$installed_root" '
+            $0 == logical {
+                print
+                matches++
+                next
+            }
+            prefix != "" && $0 == prefix logical {
                 print
                 matches++
             }
@@ -678,17 +745,6 @@ validate_service_state() {
     fi
 }
 
-environment_has_assignment() {
-    local environment=$1
-    local name=$2
-    local expected=$3
-
-    case " $environment " in
-        *" $name=$expected "*) return 0 ;;
-    esac
-    return 1
-}
-
 process_has_assignment() {
     local pid=$1
     local name=$2
@@ -702,7 +758,6 @@ process_has_assignment() {
 validate_daemon_service() {
     local output=$1
     local main_pid
-    local environment
 
     validate_service_state voisu.service "$output" || return 1
     if ! main_pid=$(pkginfo_value MainPID "$output"); then
@@ -718,13 +773,6 @@ validate_daemon_service() {
         || -z ${HYPRLAND_INSTANCE_SIGNATURE-} ]]; then
         printf '%s cannot be checked without a complete Hyprland session\n' voisu.service >&2
         return 1
-    fi
-    if environment=$(pkginfo_value Environment "$output" 2>/dev/null) \
-        && environment_has_assignment "$environment" WAYLAND_DISPLAY "$WAYLAND_DISPLAY" \
-        && environment_has_assignment "$environment" XDG_SESSION_TYPE wayland \
-        && environment_has_assignment "$environment" \
-            HYPRLAND_INSTANCE_SIGNATURE "$HYPRLAND_INSTANCE_SIGNATURE"; then
-        return 0
     fi
     if process_has_assignment "$main_pid" WAYLAND_DISPLAY "$WAYLAND_DISPLAY" \
         && process_has_assignment "$main_pid" XDG_SESSION_TYPE wayland \
@@ -813,6 +861,8 @@ run_journal_probe() {
     rm -f "$stdout_file" "$stderr_file"
     if ((status != 0)); then
         record_result "$name" FAIL "exit=$status"
+    elif [[ $diagnostics == *[![:space:]]* ]]; then
+        record_result "$name" FAIL 'journal diagnostics'
     elif ! journal_has_entries "$output"; then
         record_result "$name" FAIL 'no journal entries'
     else
