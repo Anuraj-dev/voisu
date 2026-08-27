@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.43.0
+Version:        0.43.1
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,13 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Thu Aug 27 2026 Voisu maintainers <voisu@example.invalid> - 0.43.1-1
+- fix(release): test Caps Lock then Right Alt, not Left Alt
+- fix(release): close host-shaped payload suffix collision
+- fix(release): fail-close remaining Hyprland evidence gaps
+- fix(release): fail-close packaged Hyprland evidence
+- test(release): add Hyprland evidence gate
+
 * Thu Aug 27 2026 Voisu maintainers <voisu@example.invalid> - 0.43.0-1
 - fix(doctor): probe daemon clipboard usability instead of PATH
 - fix(doctor): address readiness review findings
