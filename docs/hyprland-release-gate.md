@@ -1,7 +1,7 @@
 # Packaged Hyprland release gate
 
 This is the final gate for claiming out-of-box Hyprland support. It must run on
-a clean user account with the exact packaged Voisu and Overlay artifacts. A
+a clean user account with the exact packaged `voisu` or `voisu-bin` artifact. A
 configured developer desktop is useful for debugging, but it is not release
 evidence.
 
@@ -10,13 +10,36 @@ The gate has two parts:
 1. An operator performs the state-changing checks below and records each result.
 2. `packaging/hyprland-release-gate.sh --check` collects read-only host evidence
    and refuses a pass until every manual check is marked `PASS` or explicitly
-   `WAIVED` with a reason.
+   `WAIVED` with a non-whitespace reason.
+
+Build the exact Arch package first from either `packaging/aur/voisu` or
+`packaging/aur/voisu-bin`. Install that package file with `pacman -U` (or use
+`makepkg -si`, which invokes `pacman` for the install). For a normal AUR
+install, `yay -S voisu` or `yay -S voisu-bin` is the user-facing path. The
+release gate binds evidence to a locally built package artifact, so copy the
+installed package file to `package-artifact` in the evidence directory before
+the first `--check` run. The collector records its `pkgname`, `pkgver`,
+`pkgrel`, architecture, and SHA-256 in `tested-release`, verifies the
+artifact's `.MTREE` manifest and SHA-256 digests against the installed payload,
+then rejects later checks if that identity changes. Use a new evidence directory
+for a new package release.
+
+From the selected PKGBUILD directory, the release flow is:
+
+```sh
+pkgfile=$(makepkg --packagelist | head -n 1)
+makepkg --syncdeps --noconfirm
+sudo pacman -U "$pkgfile"
+cp "$pkgfile" /path/to/hyprland-gate-evidence/package-artifact
+```
+
+Start with a clean build directory so `pkgfile` names the package just built.
 
 ## Procedure
 
-Build the exact release artifact, then use a clean account with Hyprland and
-the required Overlay package available. Install the package through the
-documented Fedora path and run only:
+Build and install the exact `voisu` or `voisu-bin` package artifact through the
+Arch path above, then use a clean account with Hyprland. Both Arch packages
+ship the daemon, CLI, Overlay binary, and user units. Run only:
 
 ```sh
 voisu setup
@@ -35,15 +58,18 @@ Reboot and log into Hyprland. Without manually restarting Voisu, record:
 
 Run one controlled Recording. Verify exactly one final Transcript reaches the
 clipboard, that the verified Paste Action inserts it when enabled, and that a
-failed or unavailable paste leaves the same Transcript available on the
-clipboard. Restart Hyprland and its portal, then repeat the readiness and
-clipboard checks. Deliberately restart or otherwise stale the daemon's session
-environment and verify `voisu doctor` reports the mismatch as a failure.
+failed or unavailable paste leaves that same Transcript available on the
+clipboard. Also verify that the Overlay shows Recording, Processing, and
+terminal feedback. Restart Hyprland and its portal, then repeat the readiness
+and clipboard checks. Deliberately restart or otherwise stale the daemon's
+session environment and verify `voisu doctor` reports the mismatch as a
+failure.
 
 Finally upgrade and reinstall the exact package. Verify that credentials,
 unrelated Hyprland bindings, Voisu's managed binding, Delivery mode, and both
-service behaviors survive. Record package NEVRA, binary versions, commands,
-journals, and observed results in the evidence directory.
+service behaviors survive. Record Arch package identity, artifact SHA-256,
+binary versions, commands, journals, and observed results in the evidence
+directory.
 
 The runner does not install, reboot, restart, edit compositor configuration, or
 upgrade the host. Those actions are intentionally operator-owned release gates.
@@ -52,17 +78,18 @@ upgrade the host. Those actions are intentionally operator-owned release gates.
 
 Create one marker per manual gate in the evidence directory. A `.pass` marker
 means the operator recorded the command output and result in the evidence
-directory. A `.waived` marker is allowed only when it contains a concise reason
-and the release decision explicitly accepts that waiver. Missing markers block
-the runner.
+directory. A `.waived` marker is allowed only when it contains a concise
+non-whitespace reason and the release decision explicitly accepts that waiver.
+Missing markers block the runner.
 
 | Marker | Required evidence |
 | --- | --- |
-| `clean-account-install.pass` | exact Voisu and Overlay packages installed on a clean account |
+| `clean-account-install.pass` | exact `voisu` or `voisu-bin` package installed on a clean account |
 | `trigger-key-conflict.pass` | Left Alt/Right Alt conflict behavior and `hyprctl binds -j` |
 | `cold-login.pass` | reboot/login result; both services started without manual restart |
 | `daemon-wayland.pass` | daemon-owned `WAYLAND_DISPLAY` matches the active session |
 | `controlled-recording.pass` | exactly one final Transcript on the clipboard |
+| `overlay-feedback.pass` | Overlay shows Recording, Processing, and terminal feedback |
 | `verified-paste.pass` | verified Paste Action inserts the Transcript |
 | `clipboard-fallback.pass` | paste failure/unavailability preserves the Transcript |
 | `compositor-recovery.pass` | Hyprland/portal restart and Voisu recovery |

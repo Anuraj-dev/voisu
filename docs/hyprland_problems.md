@@ -184,7 +184,7 @@ Do not claim Hyprland support until a packaged installation passes all of these 
 5. Confirm the daemon process has the active `WAYLAND_DISPLAY` before the first Recording.
 6. Press Caps Lock (or the selected Trigger Key) to start and stop a controlled Recording.
 7. Confirm exactly one final Transcript reaches the clipboard, then at most one verified Paste Action; paste failure must leave the Transcript on the clipboard.
-8. Confirm the Overlay shows Recording, Processing, and terminal feedback.
+8. Confirm the Overlay shows Recording, Processing, and terminal feedback, and record that result in the release evidence.
 9. Restart Hyprland or its portal and confirm both Voisu processes recover.
 10. Deliberately create a stale-daemon condition and confirm `voisu doctor` detects it.
 11. Upgrade and reinstall the package, then confirm the settings, keybinding, credentials, and service behavior remain intact.

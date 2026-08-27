@@ -21,6 +21,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Workspace suite
         run: cargo test --workspace
+      - name: Hyprland release-gate shell suite
+        run: bash packaging/tests/hyprland-release-gate.sh
       - name: Flake gate — 3 consecutive parallel voisu-app runs
         run: |
           for i in 1 2 3; do
