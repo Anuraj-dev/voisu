@@ -16,9 +16,9 @@ use voisu_core::{
 
 use crate::config::{self, DeliveryMode};
 use crate::hyprland_bindings::{
-    discover_live_paste_action, install_trigger_binding, plan_trigger_bindings, BindingFileSystem,
-    LiveHyprlandController, LocalBindingFileSystem, TriggerBindingPlan, TriggerKey,
-    VerifiedPasteAction, CAPS_LOCK,
+    BindingFileSystem, LiveHyprlandController, LocalBindingFileSystem, RECOVERY_COMMAND,
+    TriggerBindingError, TriggerKey, TriggerOccupancy, VOISU_TOGGLE_COMMAND, VerifiedPasteAction,
+    discover_live_paste_action, inspect_trigger_occupancy, install_trigger_binding,
 };
 use crate::service;
 
@@ -124,12 +124,9 @@ impl HyprlandSetupActions for LiveHyprlandSetupActions<'_> {
             .read_to_string(config)
             .map_err(|error| format!("cannot read {}: {error}", config.display()))?
             .unwrap_or_default();
-        let sibling_path = config.with_file_name("bindings.lua");
-        let sibling = files
-            .read_to_string(&sibling_path)
-            .map_err(|error| format!("cannot read {}: {error}", sibling_path.display()))?
-            .unwrap_or_default();
-        let prefer_caps_lock = caps_lock_trigger_preferred(&[&source, &sibling], self.io);
+        let occupancy = inspect_trigger_occupancy(config, &source, &files)
+            .map_err(|detail| TriggerBindingError::Unparseable { detail }.to_string())?;
+        let prefer_caps_lock = caps_lock_trigger_preferred(&occupancy, self.io)?;
         let mut hyprland = LiveHyprlandController;
         install_trigger_binding(config, &files, &mut hyprland, prefer_caps_lock)
             .map(|report| report.key)
@@ -339,17 +336,60 @@ fn configure_provider(
 pub const SETUP_COMPLETE_MESSAGE: &str =
     "Setup complete. Run `voisu doctor` to re-check your keys and desktop.";
 
-/// Hyprland-only: ask to use Caps Lock unless a managed Trigger Key is already
-/// installed or Caps Lock has an exact unmanaged binding.
-fn caps_lock_trigger_preferred(sources: &[&str], io: &mut dyn WizardIo) -> bool {
-    match plan_trigger_bindings(sources, true) {
-        TriggerBindingPlan::AlreadyInstalled { .. } => false,
-        TriggerBindingPlan::Install { key } if key == CAPS_LOCK => ask_yes_no(
-            io,
-            "Use Caps Lock as the Trigger Key? Caps Lock will not toggle lock state.",
-            true,
-        ),
-        _ => false,
+/// Hyprland-only: print the current Caps Lock role, then ask Caps Lock
+/// (default yes) and Right Alt (hold) as fallback. Never overwrite an exact
+/// unmanaged bind. An already-managed Voisu block is kept without prompting.
+fn caps_lock_trigger_preferred(
+    occupancy: &TriggerOccupancy,
+    io: &mut dyn WizardIo,
+) -> Result<bool, String> {
+    if occupancy.managed_key.is_some() {
+        return Ok(false);
+    }
+
+    match occupancy.unmanaged_caps_lock.as_ref() {
+        Some((description, command)) if command == VOISU_TOGGLE_COMMAND => {
+            io.writeln(&format!(
+                "Caps Lock is currently bound to {description} → {command}."
+            ));
+            if ask_yes_no(io, "Keep Caps Lock as the Trigger Key?", true) {
+                return Ok(true);
+            }
+            ask_right_alt_trigger(io)
+        }
+        Some((description, command)) => {
+            io.writeln(&format!(
+                "Caps Lock is currently bound to {description} → {command}."
+            ));
+            io.writeln("That binding will not be replaced.");
+            ask_right_alt_trigger(io)
+        }
+        None => {
+            if occupancy.compose_caps {
+                io.writeln("Caps Lock is currently the Compose key.");
+            } else {
+                io.writeln("Caps Lock currently toggles Caps Lock.");
+            }
+            let question = if occupancy.compose_caps {
+                "Use Caps Lock as the Trigger Key? Caps Lock will not toggle lock state. Compose on Caps Lock will be removed."
+            } else {
+                "Use Caps Lock as the Trigger Key? Caps Lock will not toggle lock state."
+            };
+            if ask_yes_no(io, question, true) {
+                return Ok(true);
+            }
+            ask_right_alt_trigger(io)
+        }
+    }
+}
+
+fn ask_right_alt_trigger(io: &mut dyn WizardIo) -> Result<bool, String> {
+    if ask_yes_no(io, "Use Right Alt as the Trigger Key (hold)?", true) {
+        Ok(false)
+    } else {
+        Err(format!(
+            "No Trigger Key was installed. Recovery: rerun `{RECOVERY_COMMAND}` or bind `{VOISU_TOGGLE_COMMAND}` yourself."
+        ))
     }
 }
 
@@ -887,9 +927,19 @@ impl KeyValidator for LiveKeyValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hyprland_bindings::plan_trigger_binding;
+    use crate::hyprland_bindings::{
+        CAPS_LOCK, RIGHT_ALT, TriggerBindingPlan, plan_trigger_binding,
+    };
     use std::collections::HashMap;
     use voisu_core::{BoundaryError, BoundaryKind};
+
+    fn free_caps_lock() -> TriggerOccupancy {
+        TriggerOccupancy {
+            managed_key: None,
+            unmanaged_caps_lock: None,
+            compose_caps: false,
+        }
+    }
 
     struct FakeHyprlandSetup {
         events: Vec<&'static str>,
@@ -1075,36 +1125,59 @@ mod tests {
     #[test]
     fn caps_lock_prompt_defaults_to_yes_when_the_key_is_free() {
         let mut io = FakeIo::new(vec![], vec![Some("")]);
-        assert!(caps_lock_trigger_preferred(&[""], &mut io));
+        assert!(caps_lock_trigger_preferred(&free_caps_lock(), &mut io).unwrap());
+        let transcript = io.transcript();
         assert!(
-            io.transcript()
-                .contains("Use Caps Lock as the Trigger Key?"),
-            "{}",
-            io.transcript()
+            transcript.contains("Caps Lock currently toggles Caps Lock."),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("Use Caps Lock as the Trigger Key?"),
+            "{transcript}"
         );
     }
 
     #[test]
     fn rejecting_caps_lock_falls_back_without_installing_left_alt() {
         let mut io = FakeIo::new(vec![], vec![Some("n")]);
-        assert!(!caps_lock_trigger_preferred(&[""], &mut io));
+        assert!(!caps_lock_trigger_preferred(&free_caps_lock(), &mut io).unwrap());
+        let transcript = io.transcript();
+        assert!(
+            transcript.contains("Use Right Alt as the Trigger Key (hold)?"),
+            "{transcript}"
+        );
+        assert!(!transcript.contains("Left Alt"), "{transcript}");
         assert_eq!(
             plan_trigger_binding("", false),
-            TriggerBindingPlan::Install {
-                key: crate::hyprland_bindings::RIGHT_ALT
-            }
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
         );
     }
 
     #[test]
-    fn occupied_caps_lock_does_not_prompt() {
+    fn occupied_caps_lock_explains_occupancy_and_offers_right_alt() {
         let mut io = FakeIo::new(vec![], vec![Some("y")]);
-        let source = r#"o.bind("code:66", "Terminal", "kitty")"#;
-        assert!(!caps_lock_trigger_preferred(&[source], &mut io));
+        let occupancy = TriggerOccupancy {
+            managed_key: None,
+            unmanaged_caps_lock: Some(("Terminal".to_owned(), "kitty".to_owned())),
+            compose_caps: false,
+        };
+        assert!(!caps_lock_trigger_preferred(&occupancy, &mut io).unwrap());
+        let transcript = io.transcript();
         assert!(
-            !io.transcript().contains("Caps Lock"),
-            "{}",
-            io.transcript()
+            transcript.contains("Caps Lock is currently bound to Terminal → kitty."),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("That binding will not be replaced."),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("Use Right Alt as the Trigger Key (hold)?"),
+            "{transcript}"
+        );
+        assert!(
+            !transcript.contains("Use Caps Lock as the Trigger Key?"),
+            "{transcript}"
         );
     }
 
@@ -1116,7 +1189,12 @@ mod tests {
             "o.bind(\"code:66\", \"Voisu dictation\", \"voisu toggle\")\n",
             "-- END VOISU MANAGED TRIGGER\n"
         );
-        assert!(!caps_lock_trigger_preferred(&[source], &mut io));
+        let occupancy = TriggerOccupancy {
+            managed_key: Some(CAPS_LOCK),
+            unmanaged_caps_lock: None,
+            compose_caps: false,
+        };
+        assert!(!caps_lock_trigger_preferred(&occupancy, &mut io).unwrap());
         assert!(
             !io.transcript().contains("Caps Lock"),
             "{}",
@@ -1124,9 +1202,7 @@ mod tests {
         );
         assert_eq!(
             plan_trigger_binding(source, false),
-            TriggerBindingPlan::AlreadyInstalled {
-                key: crate::hyprland_bindings::CAPS_LOCK
-            }
+            TriggerBindingPlan::AlreadyInstalled { key: CAPS_LOCK }
         );
     }
 
@@ -1151,14 +1227,154 @@ mod tests {
     }
 
     #[test]
-    fn occupied_caps_lock_in_sibling_bindings_does_not_prompt() {
+    fn occupied_caps_lock_in_sibling_bindings_offers_right_alt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hyprland.lua");
+        std::fs::write(&path, "").unwrap();
+        std::fs::write(
+            path.with_file_name("bindings.lua"),
+            r#"o.bind("code:66", "Terminal", "kitty")"#,
+        )
+        .unwrap();
+        let occupancy = inspect_trigger_occupancy(&path, "", &LocalBindingFileSystem).unwrap();
+        assert_eq!(
+            occupancy.unmanaged_caps_lock,
+            Some(("Terminal".to_owned(), "kitty".to_owned()))
+        );
+
         let mut io = FakeIo::new(vec![], vec![Some("y")]);
-        let sibling = r#"o.bind("code:66", "Terminal", "kitty")"#;
-        assert!(!caps_lock_trigger_preferred(&["", sibling], &mut io));
+        assert!(!caps_lock_trigger_preferred(&occupancy, &mut io).unwrap());
+        let transcript = io.transcript();
         assert!(
-            !io.transcript().contains("Caps Lock"),
-            "{}",
-            io.transcript()
+            transcript.contains("Caps Lock is currently bound to Terminal → kitty."),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("Use Right Alt as the Trigger Key (hold)?"),
+            "{transcript}"
+        );
+        assert!(
+            !transcript.contains("Use Caps Lock as the Trigger Key?"),
+            "{transcript}"
+        );
+    }
+
+    #[test]
+    fn compose_caps_in_reachable_input_is_printed_and_caps_lock_is_preferred() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hyprland.lua");
+        std::fs::create_dir(directory.path().join("hypr")).unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                r#"dofile((os.getenv("OMARCHY_PATH") or "/usr/share/omarchy") .. "/default/hypr/bootstrap.lua")"#,
+                "\nrequire(\"hypr.input\")\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("hypr").join("input.lua"),
+            "hl.config({\n  input = {\n    kb_options = \"compose:caps\",\n  },\n})\n",
+        )
+        .unwrap();
+        let source = std::fs::read_to_string(&path).unwrap();
+        let occupancy = inspect_trigger_occupancy(&path, &source, &LocalBindingFileSystem).unwrap();
+        assert!(occupancy.compose_caps);
+        assert!(occupancy.unmanaged_caps_lock.is_none());
+
+        let mut io = FakeIo::new(vec![], vec![Some("")]);
+        assert!(caps_lock_trigger_preferred(&occupancy, &mut io).unwrap());
+        let transcript = io.transcript();
+        assert!(
+            transcript.contains("Caps Lock is currently the Compose key."),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("Compose on Caps Lock will be removed."),
+            "{transcript}"
+        );
+        assert!(
+            !transcript.contains("Use Right Alt as the Trigger Key"),
+            "{transcript}"
+        );
+    }
+
+    #[test]
+    fn declining_caps_lock_asks_right_alt_and_accepting_prefers_right_alt() {
+        let mut io = FakeIo::new(vec![], vec![Some("n"), Some("y")]);
+        assert!(!caps_lock_trigger_preferred(&free_caps_lock(), &mut io).unwrap());
+        let transcript = io.transcript();
+        assert!(
+            transcript.contains("Use Caps Lock as the Trigger Key?"),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("Use Right Alt as the Trigger Key (hold)?"),
+            "{transcript}"
+        );
+    }
+
+    #[test]
+    fn declining_caps_lock_and_right_alt_fails_closed_without_installing() {
+        let mut io = FakeIo::new(vec![], vec![Some("n"), Some("n")]);
+        let error = caps_lock_trigger_preferred(&free_caps_lock(), &mut io)
+            .expect_err("declining both keys must not install a Trigger Key");
+        assert!(error.contains("voisu setup"), "{error}");
+        assert!(error.contains("voisu toggle"), "{error}");
+        assert!(!error.contains("Left Alt"), "{error}");
+        assert_eq!(
+            plan_trigger_binding("", false),
+            TriggerBindingPlan::Install { key: RIGHT_ALT },
+            "declining both must fail before install; Right Alt is not auto-written"
+        );
+    }
+
+    #[test]
+    fn unmanaged_voisu_toggle_on_caps_lock_kept_without_right_alt() {
+        let source = r#"o.bind("code:66", "Voisu dictation", "voisu toggle")"#;
+        let occupancy = TriggerOccupancy {
+            managed_key: None,
+            unmanaged_caps_lock: Some(("Voisu dictation".to_owned(), "voisu toggle".to_owned())),
+            compose_caps: false,
+        };
+        let mut io = FakeIo::new(vec![], vec![Some("")]);
+        assert!(caps_lock_trigger_preferred(&occupancy, &mut io).unwrap());
+        let transcript = io.transcript();
+        assert!(
+            transcript.contains("Caps Lock is currently bound to Voisu dictation → voisu toggle."),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("Keep Caps Lock as the Trigger Key?"),
+            "{transcript}"
+        );
+        assert!(
+            !transcript.contains("Use Right Alt as the Trigger Key"),
+            "{transcript}"
+        );
+        assert_eq!(
+            plan_trigger_binding(source, true),
+            TriggerBindingPlan::AlreadyInstalled { key: CAPS_LOCK }
+        );
+    }
+
+    #[test]
+    fn unmanaged_kitty_on_caps_lock_is_not_stolen() {
+        let occupancy = TriggerOccupancy {
+            managed_key: None,
+            unmanaged_caps_lock: Some(("Terminal".to_owned(), "kitty".to_owned())),
+            compose_caps: false,
+        };
+        let mut io = FakeIo::new(vec![], vec![Some("y")]);
+        assert!(!caps_lock_trigger_preferred(&occupancy, &mut io).unwrap());
+        let transcript = io.transcript();
+        assert!(
+            transcript.contains("That binding will not be replaced."),
+            "{transcript}"
+        );
+        assert_eq!(
+            plan_trigger_binding(r#"o.bind("code:66", "Terminal", "kitty")"#, true),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
         );
     }
 

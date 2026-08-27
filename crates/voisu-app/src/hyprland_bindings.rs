@@ -119,6 +119,66 @@ pub enum TriggerBindingPlan {
     Unparseable { detail: String },
 }
 
+/// Occupancy used by the Hyprland Trigger Key prompt. Bindings come from the
+/// same import walk plus sibling `bindings.lua` that install uses; `compose:caps`
+/// comes from the last `kb_options` in execution order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TriggerOccupancy {
+    pub managed_key: Option<TriggerKey>,
+    pub unmanaged_caps_lock: Option<(String, String)>,
+    pub compose_caps: bool,
+}
+
+pub fn inspect_trigger_occupancy(
+    path: &Path,
+    source: &str,
+    files: &dyn BindingFileSystem,
+) -> Result<TriggerOccupancy, String> {
+    let bindings = load_lua_bindings_with_occupancy(path, source, files)?;
+    let mut options = collect_reachable_kb_options(path, source, files)?;
+    if options.is_empty() {
+        let input_path = path.with_file_name("input.lua");
+        if let Some(input) = files.read_to_string(&input_path)? {
+            options.extend(kb_options_values(&input));
+        }
+    }
+    Ok(occupancy_from_bindings(
+        &bindings,
+        options.last().map(String::as_str),
+    ))
+}
+
+fn occupancy_from_bindings(
+    bindings: &[LuaBinding],
+    last_kb_options: Option<&str>,
+) -> TriggerOccupancy {
+    let managed_key = PREFERRED_TRIGGER_KEYS.into_iter().find(|&candidate| {
+        let managed = bindings
+            .iter()
+            .any(|binding| binding.managed && binding.is_standalone_for(candidate));
+        let unmanaged = bindings
+            .iter()
+            .any(|binding| !binding.managed && binding.is_standalone_for(candidate));
+        managed && !unmanaged
+    });
+    let unmanaged_caps_lock = bindings.iter().find_map(|binding| {
+        (!binding.managed && binding.is_standalone_for(CAPS_LOCK))
+            .then(|| (binding.description.clone(), binding.command.clone()))
+    });
+    TriggerOccupancy {
+        managed_key,
+        unmanaged_caps_lock,
+        compose_caps: last_kb_options.is_some_and(kb_options_contains_compose_caps),
+    }
+}
+
+fn kb_options_contains_compose_caps(value: &str) -> bool {
+    value
+        .split(',')
+        .map(str::trim)
+        .any(|part| part == "compose:caps")
+}
+
 #[derive(Debug)]
 pub enum TriggerBindingError {
     File {
@@ -1029,8 +1089,14 @@ fn plan_trigger_binding_from_bindings(
         }
     }
 
-    if prefer_caps_lock && unmanaged(CAPS_LOCK).is_none() {
-        return TriggerBindingPlan::Install { key: CAPS_LOCK };
+    if prefer_caps_lock {
+        match unmanaged(CAPS_LOCK) {
+            None => return TriggerBindingPlan::Install { key: CAPS_LOCK },
+            Some(binding) if binding.command == VOISU_TOGGLE_COMMAND => {
+                return TriggerBindingPlan::AlreadyInstalled { key: CAPS_LOCK };
+            }
+            Some(_) => {}
+        }
     }
     if unmanaged(RIGHT_ALT).is_none() {
         return TriggerBindingPlan::Install { key: RIGHT_ALT };
@@ -1244,11 +1310,14 @@ fn parse_lua_import_at(
     let (path, consumed) = match tokens.get(index + 1) {
         Some(LuaToken::Symbol('(')) => match tokens.get(index + 2) {
             Some(LuaToken::String(path)) => (path, 3),
-            _ => {
+            _ if loader.as_str() == "require" => {
                 return Err(format!(
                     "the Lua import {loader} must use a string literal path"
                 ));
             }
+            // Non-literal dofile/loadfile/source cannot be resolved; skip this
+            // token so later literal requires are still walked.
+            _ => return Ok(None),
         },
         Some(LuaToken::String(path)) => (path, 2),
         _ => return Ok(None),
@@ -1299,7 +1368,10 @@ fn resolve_lua_import(
         parent.join(import_path)
     }];
 
-    if import.loader == "require" && import_path.extension().is_none() {
+    // `Path::extension` treats `hypr.input` as a file with extension `input`.
+    // Lua require names use dots as module separators, so convert unless the
+    // argument already names a `.lua` file.
+    if import.loader == "require" && !import.path.ends_with(".lua") {
         let module_path = import.path.replace('.', "/");
         candidates.push(parent.join(format!("{module_path}.lua")));
         candidates.push(parent.join(&module_path).join("init.lua"));
@@ -1379,7 +1451,11 @@ pub fn install_trigger_binding(
         })?;
     let source = original.as_deref().unwrap_or_default();
     let backup = backup_path(path);
-    let plan = plan_trigger_binding_with_imports(path, source, files, prefer_caps_lock);
+    let bindings = match load_lua_bindings_with_occupancy(path, source, files) {
+        Ok(bindings) => bindings,
+        Err(detail) => return Err(TriggerBindingError::Unparseable { detail }),
+    };
+    let plan = plan_trigger_binding_from_bindings(&bindings, prefer_caps_lock);
     let input_path = path.with_file_name("input.lua");
     let original_input =
         files
@@ -1397,7 +1473,21 @@ pub fn install_trigger_binding(
         TriggerBindingPlan::Unparseable { detail } => {
             return Err(TriggerBindingError::Unparseable { detail });
         }
-        TriggerBindingPlan::AlreadyInstalled { key } | TriggerBindingPlan::Install { key } => key,
+        TriggerBindingPlan::AlreadyInstalled { key } => {
+            let managed = bindings
+                .iter()
+                .any(|binding| binding.managed && binding.is_standalone_for(key));
+            if !managed {
+                verify_already_installed(hyprland, key, &backup)?;
+                return Ok(TriggerBindingInstallReport {
+                    key,
+                    changed: false,
+                    backup_path: backup,
+                });
+            }
+            key
+        }
+        TriggerBindingPlan::Install { key } => key,
     };
     let ordered_kb_options = if key == CAPS_LOCK {
         match collect_reachable_kb_options(path, source, files) {
@@ -2318,6 +2408,114 @@ o.bind(caps_lock, "Terminal", "kitty")
         assert!(error.contains("string literal"));
     }
 
+    const OMARCHY_BOOTSTRAP_DOFILE: &str = r#"dofile((os.getenv("OMARCHY_PATH") or "/usr/share/omarchy") .. "/default/hypr/bootstrap.lua")"#;
+
+    #[test]
+    fn omarchy_bootstrap_dofile_is_skipped_and_later_requires_are_found() {
+        let source = format!("{OMARCHY_BOOTSTRAP_DOFILE}\nrequire(\"hypr.bindings\")\n");
+        assert_eq!(
+            parse_lua_imports(&source).unwrap(),
+            vec![LuaImport {
+                loader: "require",
+                path: "hypr.bindings".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn non_literal_dofile_and_loadfile_skip_while_require_stays_fail_closed() {
+        assert_eq!(
+            parse_lua_imports(
+                r#"dofile(os.getenv("X")) loadfile(foo) source(bar) require("hypr.bindings")"#
+            )
+            .unwrap(),
+            vec![LuaImport {
+                loader: "require",
+                path: "hypr.bindings".to_owned(),
+            }]
+        );
+        let error =
+            parse_lua_imports(r#"dofile(os.getenv("X")) require(module_name)"#).unwrap_err();
+        assert!(error.contains("string literal"));
+        let empty = parse_lua_imports(r#"dofile("")"#).unwrap_err();
+        assert!(empty.contains("empty path"));
+    }
+
+    #[test]
+    fn omarchy_bootstrap_dofile_does_not_hide_sibling_caps_lock_occupancy() {
+        let (_directory, path) = config_dir();
+        fs::write(
+            &path,
+            format!("{OMARCHY_BOOTSTRAP_DOFILE}\nrequire(\"hypr.bindings\")\n"),
+        )
+        .unwrap();
+        fs::write(
+            path.with_file_name("bindings.lua"),
+            "o.bind(\"code:66\", \"Launch terminal\", \"kitty\")\n",
+        )
+        .unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            plan_trigger_binding_with_imports(&path, &source, &LocalBindingFileSystem, true),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+    }
+
+    #[test]
+    fn omarchy_bootstrap_dofile_does_not_hide_reachable_kb_options() {
+        let (directory, path) = config_dir();
+        fs::create_dir(directory.path().join("hypr")).unwrap();
+        fs::write(
+            &path,
+            format!("{OMARCHY_BOOTSTRAP_DOFILE}\nrequire(\"hypr.input\")\n"),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("hypr").join("input.lua"),
+            "hl.config({\n  input = {\n    kb_options = \"compose:caps,grp:alt_shift_toggle\",\n  },\n})\n",
+        )
+        .unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+        let options =
+            collect_reachable_kb_options(&path, &source, &LocalBindingFileSystem).unwrap();
+
+        assert_eq!(
+            options.last().map(String::as_str),
+            Some("compose:caps,grp:alt_shift_toggle")
+        );
+        let occupancy = inspect_trigger_occupancy(&path, &source, &LocalBindingFileSystem).unwrap();
+        assert!(occupancy.compose_caps);
+        assert!(occupancy.unmanaged_caps_lock.is_none());
+    }
+
+    #[test]
+    fn sibling_input_lua_kb_options_are_visible_when_not_imported() {
+        let (_directory, path) = config_dir();
+        fs::write(&path, "-- stock hyprland.lua\n").unwrap();
+        fs::write(
+            path.with_file_name("input.lua"),
+            "kb_options = \"compose:caps\"\n",
+        )
+        .unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+        let occupancy = inspect_trigger_occupancy(&path, &source, &LocalBindingFileSystem).unwrap();
+        assert!(occupancy.compose_caps);
+    }
+
+    #[test]
+    fn unmanaged_voisu_toggle_on_caps_lock_is_already_installed_when_preferred() {
+        let source = r#"o.bind("code:66", "Voisu dictation", "voisu toggle")"#;
+        assert_eq!(
+            plan_trigger_binding(source, true),
+            TriggerBindingPlan::AlreadyInstalled { key: CAPS_LOCK }
+        );
+        assert_eq!(
+            plan_trigger_binding(source, false),
+            TriggerBindingPlan::Install { key: RIGHT_ALT }
+        );
+    }
+
     #[test]
     fn require_skips_a_module_directory_and_loads_lua_candidates() {
         let (directory, path) = config_dir();
@@ -2538,13 +2736,13 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         assert!(updated.contains("-- user bindings"));
         assert_eq!(fs::read_to_string(&report.backup_path).unwrap(), original);
         assert!(!path.with_file_name("input.lua").exists());
-        assert!(fs::read_dir(path.parent().unwrap())
-            .unwrap()
-            .all(|entry| !entry
+        assert!(fs::read_dir(path.parent().unwrap()).unwrap().all(|entry| {
+            !entry
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .contains(".voisu-hyprland.")));
+                .contains(".voisu-hyprland.")
+        }));
     }
 
     #[test]
@@ -2656,6 +2854,23 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         assert!(!path.with_file_name("input.lua").exists());
         assert_eq!(hyprland.reload_calls, 2);
+    }
+
+    #[test]
+    fn unmanaged_voisu_toggle_caps_lock_is_kept_without_rewrite() {
+        let (_directory, path) = config_dir();
+        let original = "o.bind(\"code:66\", \"Voisu dictation\", \"voisu toggle\")\n";
+        fs::write(&path, original).unwrap();
+        let mut hyprland = FakeHyprland::new(&[true], true);
+
+        let report =
+            install_trigger_binding(&path, &LocalBindingFileSystem, &mut hyprland, true).unwrap();
+
+        assert_eq!(report.key, CAPS_LOCK);
+        assert!(!report.changed);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!fs::read_to_string(&path).unwrap().contains("code:108"));
+        assert_eq!(hyprland.reload_calls, 1);
     }
 
     #[test]
@@ -2869,8 +3084,7 @@ o.bind("code:108", "Lock screen", "loginctl lock-session")
         let (_directory, path) = config_dir();
         fs::write(&path, "-- user bindings\n").unwrap();
         let input_path = path.with_file_name("input.lua");
-        let original_input =
-            "hl.config({\n  input = {\n    kb_options = \"caps:none,shift:both_capslock_cancel\",\n  },\n})\n";
+        let original_input = "hl.config({\n  input = {\n    kb_options = \"caps:none,shift:both_capslock_cancel\",\n  },\n})\n";
         fs::write(&input_path, original_input).unwrap();
         let mut hyprland = FakeHyprland::new(&[true], true);
 
