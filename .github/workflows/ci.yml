@@ -46,6 +46,18 @@ jobs:
       - name: Clippy (all targets, warnings are errors)
         run: cargo clippy --all-targets --workspace -- -D warnings
 
+  fmt:
+    name: Format gate (rustfmt)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format check (all crates)
+        run: cargo fmt --all -- --check
+
   audit:
     name: Advisory gate (cargo-audit vs Cargo.lock)
     runs-on: ubuntu-latest
