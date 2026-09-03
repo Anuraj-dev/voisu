@@ -200,7 +200,9 @@ Do not claim Hyprland support until a packaged installation passes all of these 
 On 2026-08-25, Raja built and installed the source package `voisu` `0.38.0-1`
 on the Omarchy/Hyprland host. The daemon and Overlay are enabled and active,
 the daemon has the live Wayland environment, `voisu doctor` passes every
-check, Left Alt starts and stops Recordings, and clipboard Delivery works.
+check, the Trigger Key starts and stops Recordings, and clipboard Delivery
+works. (Left Alt was the mapped key on 2026-08-25; the live binding is Caps
+Lock — see Current host configuration.)
 The six private #205 fixtures also replayed through Deepgram and Groq; all six
 selected Groq without requesting Intent Reconstruction, so Qwen quality and
 safety remain unscored pending audio adjudication.
