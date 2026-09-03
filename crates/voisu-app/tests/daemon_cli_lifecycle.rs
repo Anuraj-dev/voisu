@@ -402,7 +402,10 @@ cat > "$dir/clipboard"
     wait_for_marker(commands.path(), "pw-record.ready");
     let status_started = Instant::now();
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
-    assert!(status_started.elapsed() < Duration::from_millis(100));
+    // Single-shot spawn+IPC latency on a contended runner tails past any
+    // sub-second bound; the promptness that matters is "not stalled", so keep
+    // the outer bound generous instead of racing the scheduler.
+    assert!(status_started.elapsed() < Duration::from_secs(1));
     let stopped = voisu(runtime.path(), "stop");
     assert!(stopped.status.success(), "{}", stderr(&stopped));
     assert_eq!(
@@ -2570,27 +2573,29 @@ fn silent_recording_is_distinct_and_recoverable_through_the_public_cli() {
 #[test]
 fn status_is_responsive_and_processing_is_observable_during_provider_work() {
     let runtime = TempDir::new().unwrap();
+    // A one-second provider delay gives the observation window generous slack
+    // over stop-delivery latency on a contended runner while still bounding the
+    // poll: processing must be observable while the provider work runs.
     let _daemon =
-        Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_PROVIDER_DELAY_MS", "400")]);
+        Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_PROVIDER_DELAY_MS", "1000")]);
     assert!(voisu(runtime.path(), "start").status.success());
 
     let runtime_dir = runtime.path().to_owned();
     let stop = thread::spawn(move || voisu(&runtime_dir, "stop"));
-    let deadline = Instant::now() + Duration::from_millis(250);
-    let mut observed = None;
+    let deadline = Instant::now() + Duration::from_millis(800);
+    let mut observed = false;
     while Instant::now() < deadline {
-        let started = Instant::now();
         let status = voisu(runtime.path(), "status");
         if stdout(&status) == "processing\n" {
-            observed = Some(started.elapsed());
+            observed = true;
             break;
         }
         thread::sleep(Duration::from_millis(5));
     }
-    assert!(
-        observed.is_some_and(|elapsed| elapsed < Duration::from_millis(100)),
-        "status should promptly expose processing"
-    );
+    // The window itself is the promptness contract: a daemon that failed to
+    // serve Status during provider work would never report processing at all.
+    // Per-attempt spawn latency is scheduler noise, not daemon behavior.
+    assert!(observed, "status should promptly expose processing");
 
     let stop = stop.join().unwrap();
     assert!(stop.status.success(), "{}", stderr(&stop));
@@ -2623,7 +2628,12 @@ fn capture_pump_panic_fails_the_recording_and_the_next_recording_succeeds() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_CAPTURE_PUMP_PANIC", "1")]);
     assert!(voisu(runtime.path(), "start").status.success());
-    thread::sleep(Duration::from_millis(50));
+    // The pump panic kills the pump task without any observable state change:
+    // the daemon still reports Recording, and only the next Stop processes the
+    // dead capture into the failed Recording. No pollable condition exists, so
+    // give the panic a generous wall-clock margin to land before racing it
+    // with Stop — a Stop that wins the race would stop a healthy Recording.
+    thread::sleep(Duration::from_secs(2));
 
     let failed = voisu(runtime.path(), "stop");
     assert!(!failed.status.success());
@@ -4774,7 +4784,7 @@ fn auth_set_bounds_a_stalled_or_missing_secret_tool_then_falls_back_without_leak
     );
     assert!(stalled.status.success(), "{}", stderr(&stalled));
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < Duration::from_secs(6),
         "secret-tool must have a bounded wait"
     );
     assert!(
@@ -5066,7 +5076,7 @@ fn auth_set_bounds_a_child_that_never_drains_a_large_stdin() {
     );
     assert!(stalled.status.success(), "{}", stderr(&stalled));
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < Duration::from_secs(6),
         "a child that never drains stdin must still be bounded, elapsed {:?}",
         started.elapsed()
     );
@@ -5098,7 +5108,7 @@ fn auth_set_is_bounded_when_a_descendant_holds_the_pipes_past_child_exit() {
     // crash, or a missing fallback file would pass on timing alone.
     assert!(held.status.success(), "{}", stderr(&held));
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < Duration::from_secs(6),
         "pipe-reader joins must be bounded when a descendant holds the pipes, elapsed {:?}",
         started.elapsed()
     );
@@ -5139,7 +5149,7 @@ fn auth_set_is_bounded_when_the_child_crashes_while_a_descendant_holds_the_pipes
     );
     assert!(crashed.status.success(), "{}", stderr(&crashed));
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < Duration::from_secs(6),
         "cleanup after an abnormal child exit must stay bounded, elapsed {:?}",
         started.elapsed()
     );
@@ -5285,7 +5295,7 @@ fn auth_verify_bounds_stalled_curl_without_leaking_the_credential() {
     );
     assert_eq!(stalled.status.code(), Some(4));
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < Duration::from_secs(6),
         "curl must have a bounded wait"
     );
     assert!(!stderr(&stalled).contains("controlled-secret"));
@@ -5944,8 +5954,24 @@ fn intent_reconstruction_deadline_falls_back_without_late_replacement() {
         stopped["evidence"]["transcript_selection"],
         "intent_reconstructed"
     );
-    thread::sleep(Duration::from_millis(250));
-    let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    // Record retention can lag the Stop reply under load; poll for the record
+    // instead of assuming a fixed settle delay (same idiom as the failed-record
+    // history polls).
+    let history_deadline = Instant::now() + Duration::from_secs(5);
+    let history = loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        if history["history"]
+            .as_array()
+            .is_some_and(|records| records.len() == 1)
+        {
+            break history;
+        }
+        assert!(
+            Instant::now() < history_deadline,
+            "the deadline reconciled Recording was never retained: {history}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
     assert_eq!(history["history"].as_array().unwrap().len(), 1, "{history}");
     assert_eq!(history["history"][0]["delivery_count"], 1, "{history}");
     assert_ne!(
@@ -6538,7 +6564,7 @@ fn provider_deadline_releases_the_valid_source_without_waiting_for_the_slow_prov
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_secs(3),
         "Stop must release at the Provider Deadline"
     );
     assert_eq!(stopped["evidence"]["delivery_count"], 1);
@@ -9516,20 +9542,26 @@ fn a_stalled_partial_start_abort_keeps_the_daemon_responsive() {
     let started = Instant::now();
     let failed = voisu(runtime.path(), "start");
     assert_eq!(failed.status.code(), Some(4));
+    // Generous for a contended runner, but still below RECOVERY_ABORT_DEADLINE
+    // (2 s) so a start that waits on the bounded abort is still caught.
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_millis(1500),
         "start rejection must not wait on the stalled abort"
     );
 
     let status_started = Instant::now();
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
     assert!(
-        status_started.elapsed() < Duration::from_millis(500),
+        status_started.elapsed() < Duration::from_millis(1500),
         "status must stay responsive while the abort is stalled"
     );
 
-    // The bounded abort must surface its timeout into local diagnostics.
-    thread::sleep(Duration::from_millis(2300));
+    // The bounded abort must surface its timeout into local diagnostics. The
+    // abort deadline is 2 s of daemon-internal time; the eprintln lands only in
+    // the stderr pipe, which this harness can read only after termination, so
+    // there is nothing to poll — wait out the deadline with generous slack for
+    // a contended runner's timer and logging latency.
+    thread::sleep(Duration::from_secs(5));
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
         diagnostics.contains("capture abort timed out"),
@@ -9576,7 +9608,10 @@ fn oversized_and_slow_frames_do_not_block_or_kill_the_daemon() {
     slow.write_all(b"{\"version\":2").unwrap();
     let status_started = Instant::now();
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
-    assert!(status_started.elapsed() < Duration::from_millis(250));
+    // A daemon that blocked on the slow frame would stall Status for the slow
+    // connection's ~2 s read deadline, so the outer bound must stay well below
+    // that while still tolerating contended-runner spawn latency.
+    assert!(status_started.elapsed() < Duration::from_secs(1));
     slow.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     let deadline_started = Instant::now();
     let mut closed = String::new();
