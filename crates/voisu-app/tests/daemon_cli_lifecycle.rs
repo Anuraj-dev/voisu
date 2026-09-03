@@ -5978,6 +5978,20 @@ fn intent_reconstruction_deadline_falls_back_without_late_replacement() {
         history["history"][0]["final_transcript"],
         "This late wording must never appear."
     );
+    // The record is persisted before the Stop reply, so the poll above almost
+    // always succeeds while the 200 ms reconstruction timer (configured via
+    // VOISU_TEST_RECONCILIATION_DELAY_MS) is still armed. Give the late result
+    // its full window, then re-read: a regression that fails to cancel the
+    // timed-out reconstruction and lets it replace or redeliver must show up
+    // here. 1 s is ~5x the configured delay.
+    thread::sleep(Duration::from_millis(1000));
+    let settled = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    assert_eq!(settled["history"].as_array().unwrap().len(), 1, "{settled}");
+    assert_eq!(settled["history"][0]["delivery_count"], 1, "{settled}");
+    assert_ne!(
+        settled["history"][0]["final_transcript"],
+        "This late wording must never appear."
+    );
 }
 
 #[test]
