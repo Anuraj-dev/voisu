@@ -120,9 +120,8 @@ pub fn ensure_report_path_writable(path: &Path) -> Result<(), String> {
     let resolved = resolve_for_write(&abs);
     check_git_path_writable(&abs)?;
     if resolved != abs {
-        check_git_path_writable(&resolved).map_err(|err| {
-            format!("{err} (resolved from {})", abs.display())
-        })?;
+        check_git_path_writable(&resolved)
+            .map_err(|err| format!("{err} (resolved from {})", abs.display()))?;
     }
     Ok(())
 }
@@ -323,9 +322,7 @@ fn format_arm(arm: &ArmResult) -> String {
             selected_source,
             ..
         } => {
-            let source = selected_source
-                .as_deref()
-                .unwrap_or("-");
+            let source = selected_source.as_deref().unwrap_or("-");
             format!(
                 "scored wer={:.4} I={} D={} S={} critical={} section_loss={} selected={source}",
                 word_error.error_rate,
@@ -362,9 +359,8 @@ pub fn aggregate(recordings: &[RecordingReport]) -> BTreeMap<String, ArmAggregat
                     ..
                 }) => {
                     scored += 1;
-                    error_ops += word_error.insertions
-                        + word_error.deletions
-                        + word_error.substitutions;
+                    error_ops +=
+                        word_error.insertions + word_error.deletions + word_error.substitutions;
                     reference_tokens += word_error.reference_tokens;
                     if section_loss.any() {
                         section_loss_recordings += 1;
@@ -490,10 +486,7 @@ mod tests {
 
     #[test]
     fn default_report_path_sits_beside_manifest_outside_git() {
-        let dir = std::env::temp_dir().join(format!(
-            "voisu-tq-out-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("voisu-tq-out-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let manifest = dir.join("manifest.json");
         let out = default_report_path(&manifest);

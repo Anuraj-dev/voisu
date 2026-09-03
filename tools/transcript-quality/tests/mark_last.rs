@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use transcript_quality::{
-    attach_reference, mark_last, newest_completed, render_promotion, run_mark_last, Label,
-    LabelRecord, MarkConfig, RecordingActivity,
+    Label, LabelRecord, MarkConfig, RecordingActivity, attach_reference, mark_last,
+    newest_completed, render_promotion, run_mark_last,
 };
 use voisu_core::{
     DebugAudioRecord, DiagnosticRecord, LifecycleStage, Provider, SourceTranscriptRecord,
@@ -19,11 +19,7 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn scratch_dir(label: &str) -> PathBuf {
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "voisu-mark-{}-{}-{label}",
-        std::process::id(),
-        n
-    ));
+    let dir = std::env::temp_dir().join(format!("voisu-mark-{}-{}-{label}", std::process::id(), n));
     fs::create_dir_all(&dir).expect("temp dir");
     dir
 }
@@ -136,11 +132,12 @@ fn chmod(path: &Path, mode: u32) {
 fn newest_completed_id_is_resolved_before_copy() {
     let harness = Harness::new("newest");
     seed_newest(&harness);
-    let history: Vec<DiagnosticRecord> = fs::read_to_string(harness.diagnostics.join("history.jsonl"))
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
+    let history: Vec<DiagnosticRecord> =
+        fs::read_to_string(harness.diagnostics.join("history.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
     assert_eq!(
         newest_completed(&history).unwrap().correlation_id,
         "rec-new"
@@ -158,7 +155,10 @@ fn newest_completed_id_is_resolved_before_copy() {
     assert!(!harness.corpus.join("rec-old").join("audio.pcm").exists());
     assert!(harness.corpus.join("rec-new").join("audio.pcm").is_file());
     let rendered = render_promotion(&promotion);
-    assert!(rendered.contains(&harness.corpus.display().to_string()), "{rendered}");
+    assert!(
+        rendered.contains(&harness.corpus.display().to_string()),
+        "{rendered}"
+    );
     assert!(rendered.contains("disk:"), "{rendered}");
     assert!(rendered.contains("checksum:"), "{rendered}");
 
@@ -188,12 +188,7 @@ fn newest_completed_id_is_resolved_before_copy() {
 fn rejects_an_active_recording() {
     let harness = Harness::new("active");
     seed_newest(&harness);
-    let err = mark_last(
-        &harness.config(RecordingActivity::Active),
-        Label::Bad,
-        None,
-    )
-    .unwrap_err();
+    let err = mark_last(&harness.config(RecordingActivity::Active), Label::Bad, None).unwrap_err();
     assert!(err.contains("active"), "{err}");
     assert!(!harness.corpus.exists());
 }
@@ -207,7 +202,13 @@ fn rejects_missing_audio() {
     write_history(&harness.diagnostics, &[present, missing]);
     let err = mark_last(&harness.config(RecordingActivity::Idle), Label::Good, None).unwrap_err();
     assert!(err.contains("missing"), "{err}");
-    assert!(!harness.corpus.join("rec-missing").join("audio.pcm").exists());
+    assert!(
+        !harness
+            .corpus
+            .join("rec-missing")
+            .join("audio.pcm")
+            .exists()
+    );
 }
 
 #[test]
@@ -229,8 +230,7 @@ fn second_mark_is_idempotent() {
         Some("first".to_owned()),
     )
     .unwrap();
-    let snapshot_before =
-        fs::read(harness.corpus.join("rec-new").join("snapshot.json")).unwrap();
+    let snapshot_before = fs::read(harness.corpus.join("rec-new").join("snapshot.json")).unwrap();
     let audio_before = fs::read(harness.corpus.join("rec-new").join("audio.pcm")).unwrap();
 
     let second = mark_last(
@@ -271,7 +271,10 @@ fn promotion_records_checksum_and_private_mode() {
         fs::read(harness.corpus.join("rec-new").join("audio.pcm")).unwrap(),
         AUDIO_BYTES
     );
-    assert_eq!(mode(&harness.corpus.join("rec-new").join("audio.pcm")), 0o600);
+    assert_eq!(
+        mode(&harness.corpus.join("rec-new").join("audio.pcm")),
+        0o600
+    );
     assert_eq!(mode(&harness.corpus.join("rec-new")), 0o700);
     assert!(
         harness
@@ -350,12 +353,7 @@ fn refuses_corpus_path_symlinked_into_git_tree() {
 fn remake_chmods_matching_preexisting_world_readable_files() {
     let harness = Harness::new("chmod");
     seed_newest(&harness);
-    mark_last(
-        &harness.config(RecordingActivity::Idle),
-        Label::Good,
-        None,
-    )
-    .unwrap();
+    mark_last(&harness.config(RecordingActivity::Idle), Label::Good, None).unwrap();
     let entry = harness.corpus.join("rec-new");
     let audio = entry.join("audio.pcm");
     let snapshot = entry.join("snapshot.json");
@@ -371,12 +369,7 @@ fn remake_chmods_matching_preexisting_world_readable_files() {
     assert_eq!(mode(&entry), 0o755);
     assert_eq!(mode(&harness.corpus), 0o755);
 
-    let second = mark_last(
-        &harness.config(RecordingActivity::Idle),
-        Label::Good,
-        None,
-    )
-    .unwrap();
+    let second = mark_last(&harness.config(RecordingActivity::Idle), Label::Good, None).unwrap();
     assert!(second.already_present);
     assert_eq!(mode(&audio), 0o600);
     assert_eq!(mode(&snapshot), 0o600);
@@ -391,8 +384,7 @@ fn adjudicated_reference_does_not_replace_raw_evidence() {
     seed_newest(&harness);
     mark_last(&harness.config(RecordingActivity::Idle), Label::Good, None).unwrap();
     let audio_before = fs::read(harness.corpus.join("rec-new").join("audio.pcm")).unwrap();
-    let snapshot_before =
-        fs::read(harness.corpus.join("rec-new").join("snapshot.json")).unwrap();
+    let snapshot_before = fs::read(harness.corpus.join("rec-new").join("snapshot.json")).unwrap();
     attach_reference(
         &harness.corpus,
         "rec-new",

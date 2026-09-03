@@ -85,21 +85,21 @@ pub fn parse_manifest_text(text: &str) -> Result<Manifest, String> {
         return Err("manifest is empty".to_owned());
     }
     if trimmed.starts_with('{') {
-        let value: serde_json::Value = serde_json::from_str(trimmed)
-            .map_err(|err| format!("manifest JSON: {err}"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(trimmed).map_err(|err| format!("manifest JSON: {err}"))?;
         if value.get("recordings").is_some() {
             return serde_json::from_value(value)
                 .map_err(|err| format!("manifest recordings: {err}"));
         }
-        let recording: ManifestRecording = serde_json::from_value(value)
-            .map_err(|err| format!("manifest Recording: {err}"))?;
+        let recording: ManifestRecording =
+            serde_json::from_value(value).map_err(|err| format!("manifest Recording: {err}"))?;
         return Ok(Manifest {
             recordings: vec![recording],
         });
     }
     if trimmed.starts_with('[') {
-        let recordings: Vec<ManifestRecording> = serde_json::from_str(trimmed)
-            .map_err(|err| format!("manifest array: {err}"))?;
+        let recordings: Vec<ManifestRecording> =
+            serde_json::from_str(trimmed).map_err(|err| format!("manifest array: {err}"))?;
         return Ok(Manifest { recordings });
     }
     let mut recordings = Vec::new();
@@ -189,13 +189,14 @@ fn resolve_reference(
     if reference_is_script(row) {
         return Ok((
             None,
-            Some(
-                "reference is a reading script, not an audio-adjudicated reference".to_owned(),
-            ),
+            Some("reference is a reading script, not an audio-adjudicated reference".to_owned()),
         ));
     }
     if !reference_is_adjudicated(row) {
-        let provided = row.reference_text.as_ref().is_some_and(|t| !t.trim().is_empty())
+        let provided = row
+            .reference_text
+            .as_ref()
+            .is_some_and(|t| !t.trim().is_empty())
             || row
                 .reference_path
                 .as_ref()
@@ -214,14 +215,10 @@ fn resolve_reference(
     )?;
     match text {
         Some(value) if !value.trim().is_empty() => Ok((Some(value), None)),
-        Some(_) => Ok((
-            None,
-            Some("reference file is empty".to_owned()),
-        )),
-        None if row.reference_path.is_some() => Ok((
-            None,
-            Some("reference path is missing on disk".to_owned()),
-        )),
+        Some(_) => Ok((None, Some("reference file is empty".to_owned()))),
+        None if row.reference_path.is_some() => {
+            Ok((None, Some("reference path is missing on disk".to_owned())))
+        }
         None => Ok((
             None,
             Some("no audio-adjudicated reference was provided".to_owned()),

@@ -10,17 +10,17 @@ mod mark;
 mod metrics;
 mod report;
 
-pub use completeness::{select_completeness_aware, CompletenessChoice, SourceProvider};
-pub use evaluate::{evaluate, evaluate_path, EvalConfig};
-pub use manifest::{load_manifest, load_recordings, LoadedRecording, Manifest, ManifestRecording};
-pub use metrics::{
-    align_words, detect_critical_errors, detect_section_loss, tokenize, CriticalError,
-    SectionLoss, WordError,
-};
+pub use completeness::{CompletenessChoice, SourceProvider, select_completeness_aware};
+pub use evaluate::{EvalConfig, evaluate, evaluate_path};
+pub use manifest::{LoadedRecording, Manifest, ManifestRecording, load_manifest, load_recordings};
 pub use mark::{
-    attach_reference, default_corpus_dir, default_diagnostics_dir, mark_last, newest_completed,
-    probe_daemon_activity, render_promotion, run_mark_last, Label, LabelRecord, MarkConfig,
-    Promotion, RecordingActivity, ReferenceMeta,
+    Label, LabelRecord, MarkConfig, Promotion, RecordingActivity, ReferenceMeta, attach_reference,
+    default_corpus_dir, default_diagnostics_dir, mark_last, newest_completed,
+    probe_daemon_activity, render_promotion, run_mark_last,
+};
+pub use metrics::{
+    CriticalError, SectionLoss, WordError, align_words, detect_critical_errors,
+    detect_section_loss, tokenize,
 };
 pub use report::{
     ArmName, ArmResult, EvaluationReport, RecordingReport, StableReport, VolatileReport,

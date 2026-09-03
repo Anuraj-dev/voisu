@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use transcript_quality::{evaluate_path, ArmResult, EvalConfig, EvaluationReport};
+use transcript_quality::{ArmResult, EvalConfig, EvaluationReport, evaluate_path};
 
 fn fixtures_manifest() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/synthetic.json")
@@ -11,11 +11,7 @@ fn fixtures_manifest() -> PathBuf {
 fn scratch_dir(label: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "voisu-tq-{}-{}-{label}",
-        std::process::id(),
-        n
-    ));
+    let dir = std::env::temp_dir().join(format!("voisu-tq-{}-{}-{label}", std::process::id(), n));
     fs::create_dir_all(&dir).expect("temp dir");
     dir
 }
@@ -161,7 +157,10 @@ fn missing_reference_and_missing_source_are_missing() {
             );
         }
         ArmResult::Scored { word_error, .. } => {
-            panic!("completeness scored missing source as wer={}", word_error.error_rate)
+            panic!(
+                "completeness scored missing source as wer={}",
+                word_error.error_rate
+            )
         }
     }
     match arm(&report, "rec-missing-source", "guarded_pipeline") {
@@ -172,7 +171,10 @@ fn missing_reference_and_missing_source_are_missing() {
             );
         }
         ArmResult::Scored { word_error, .. } => {
-            panic!("guarded pipeline scored missing final as wer={}", word_error.error_rate)
+            panic!(
+                "guarded pipeline scored missing final as wer={}",
+                word_error.error_rate
+            )
         }
     }
 }
@@ -232,7 +234,10 @@ fn section_loss_when_organized_text_drops_source_prefix() {
                 "saved pipeline Transcript dropped the reference prefix but section_loss.prefix is false; hypothesis={hypothesis:?} loss={section_loss:?}"
             );
             assert!(
-                section_loss.relative_to.iter().any(|item| item == "reference"),
+                section_loss
+                    .relative_to
+                    .iter()
+                    .any(|item| item == "reference"),
                 "section loss must cite the adjudicated reference: {:?}",
                 section_loss.relative_to
             );

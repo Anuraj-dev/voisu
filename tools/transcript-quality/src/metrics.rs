@@ -39,13 +39,14 @@ pub fn tokenize(text: &str) -> Vec<String> {
 }
 
 fn normalize_token(raw: &str) -> String {
-    let mut tok = raw.trim_matches(|c: char| {
-        matches!(
-            c,
-            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '!' | '?'
-        )
-    })
-    .to_owned();
+    let mut tok = raw
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '!' | '?'
+            )
+        })
+        .to_owned();
     if tok.ends_with('.')
         && !tok.contains("://")
         && tok.matches('.').count() == 1
@@ -206,10 +207,7 @@ fn is_suffix_alignment(original: &[String], hypothesis: &[String], start: usize)
     if rest.len() < 3 {
         return false;
     }
-    let overlap = rest
-        .iter()
-        .filter(|tok| hypothesis.contains(tok))
-        .count();
+    let overlap = rest.iter().filter(|tok| hypothesis.contains(tok)).count();
     overlap * 2 >= rest.len()
 }
 
@@ -236,16 +234,10 @@ fn missing_body_run(original: &[String], hypothesis: &[String], prefix_len: usiz
 pub fn detect_critical_errors(reference: &str, hypothesis: &str) -> Vec<CriticalError> {
     let ref_tokens = tokenize(reference);
     let hyp_tokens = tokenize(hypothesis);
-    let hyp_set: std::collections::BTreeSet<&str> =
-        hyp_tokens.iter().map(String::as_str).collect();
+    let hyp_set: std::collections::BTreeSet<&str> = hyp_tokens.iter().map(String::as_str).collect();
     let mut out = Vec::new();
 
-    push_missing_category(
-        &mut out,
-        "negation",
-        negation_tokens(reference),
-        &hyp_set,
-    );
+    push_missing_category(&mut out, "negation", negation_tokens(reference), &hyp_set);
     let extra_negation: Vec<String> = negation_tokens(hypothesis)
         .into_iter()
         .filter(|tok| !negation_tokens(reference).contains(tok))
@@ -259,18 +251,8 @@ pub fn detect_critical_errors(reference: &str, hypothesis: &str) -> Vec<Critical
 
     push_missing_category(&mut out, "number", number_tokens(reference), &hyp_set);
     push_missing_category(&mut out, "unit", unit_tokens(&ref_tokens), &hyp_set);
-    push_missing_category(
-        &mut out,
-        "name",
-        name_tokens(reference),
-        &hyp_set,
-    );
-    push_missing_category(
-        &mut out,
-        "command",
-        command_tokens(reference),
-        &hyp_set,
-    );
+    push_missing_category(&mut out, "name", name_tokens(reference), &hyp_set);
+    push_missing_category(&mut out, "command", command_tokens(reference), &hyp_set);
     push_missing_category(&mut out, "path", path_tokens(&ref_tokens), &hyp_set);
     push_missing_category(&mut out, "url", url_tokens(&ref_tokens), &hyp_set);
     push_missing_category(&mut out, "code", code_tokens(reference), &hyp_set);
@@ -424,9 +406,7 @@ fn command_tokens(text: &str) -> Vec<String> {
             || (tok.starts_with('-')
                 && tok.len() > 1
                 && tok.chars().nth(1) != Some('-')
-                && tok
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-'));
+                && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
         if flag && tok != "-" {
             out.push(tok);
         }
@@ -543,8 +523,9 @@ mod tests {
             "call format validated then run tool",
         );
         assert!(
-            errors.iter().any(|err| err.category == "code"
-                && err.reference_token == "formatvalidated"),
+            errors
+                .iter()
+                .any(|err| err.category == "code" && err.reference_token == "formatvalidated"),
             "formatValidated should be a code-token error, got {errors:?}"
         );
         assert!(
@@ -557,10 +538,7 @@ mod tests {
 
     #[test]
     fn sentence_initial_please_is_not_a_code_token() {
-        let errors = detect_critical_errors(
-            "Please call formatValidated",
-            "call format validated",
-        );
+        let errors = detect_critical_errors("Please call formatValidated", "call format validated");
         assert!(
             !errors
                 .iter()
@@ -568,8 +546,9 @@ mod tests {
             "sentence-initial Please must not be a code error, got {errors:?}"
         );
         assert!(
-            errors.iter().any(|err| err.category == "code"
-                && err.reference_token == "formatvalidated"),
+            errors
+                .iter()
+                .any(|err| err.category == "code" && err.reference_token == "formatvalidated"),
             "formatValidated should still be a code-token error, got {errors:?}"
         );
     }

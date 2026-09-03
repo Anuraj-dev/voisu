@@ -2,19 +2,17 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::completeness::{select_completeness_aware, CompletenessChoice};
+use crate::completeness::{CompletenessChoice, select_completeness_aware};
 use crate::manifest::{self, EvidencePresence, LoadedRecording};
 use crate::metrics::{align_words, detect_critical_errors, detect_section_loss};
 use crate::report::{
-    aggregate, fingerprint_stable, ArmName, ArmResult, EvaluationReport, RecordingReport,
-    StableReport, VolatileReport, SCHEMA,
+    ArmName, ArmResult, EvaluationReport, RecordingReport, SCHEMA, StableReport, VolatileReport,
+    aggregate, fingerprint_stable,
 };
 
-const RECONSTRUCTION_REASON: &str =
-    "Intent Reconstruction is not implemented (ticket 05 / #204)";
+const RECONSTRUCTION_REASON: &str = "Intent Reconstruction is not implemented (ticket 05 / #204)";
 
-const DELIVERY_UNIMPLEMENTED: &str =
-    "Delivery into a scratch editor is unimplemented in this private tool; evaluation writes report files only and does not type into the focused application";
+const DELIVERY_UNIMPLEMENTED: &str = "Delivery into a scratch editor is unimplemented in this private tool; evaluation writes report files only and does not type into the focused application";
 
 /// Options for one evaluation run.
 #[derive(Clone, Debug, Default)]
