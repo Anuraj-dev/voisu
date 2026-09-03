@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.43.1
+Version:        0.43.2
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,19 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Thu Sep 03 2026 Voisu maintainers <voisu@example.invalid> - 0.43.2-1
+- test(app): wait out the reconstruction window before the settled history assert
+- ci: cover tools/transcript-quality in the format gate
+- style: apply rustfmt to tools/transcript-quality
+- docs(host): resolve Left Alt vs Caps Lock contradiction
+- test(app): deflake the timing-sensitive lifecycle harness
+- refactor(app): split system.rs into subsystem modules
+- ci: add rustfmt format gate
+- style: apply rustfmt across the workspace
+- docs(roadmap): record merged issue 205 repair
+- docs(host): clarify current Arch development host
+- docs(host): update Arch Hyprland status
+
 * Thu Aug 27 2026 Voisu maintainers <voisu@example.invalid> - 0.43.1-1
 - fix(release): test Caps Lock then Right Alt, not Left Alt
 - fix(release): close host-shaped payload suffix collision
