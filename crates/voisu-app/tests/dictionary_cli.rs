@@ -35,7 +35,10 @@ fn dictionary_add_creates_a_user_term() {
     let added = cli.run(&["dictionary", "add", "Anuraj"]);
 
     assert!(added.status.success(), "{added:?}");
-    assert_eq!(fs::read_to_string(cli.dictionary_path()).unwrap(), "Anuraj\n");
+    assert_eq!(
+        fs::read_to_string(cli.dictionary_path()).unwrap(),
+        "Anuraj\n"
+    );
 }
 
 #[test]
@@ -125,7 +128,10 @@ fn dictionary_list_shows_only_stored_user_terms_as_plain_lines_or_json() {
 
     let plain = cli.run(&["dictionary", "list"]);
     assert!(plain.status.success(), "{plain:?}");
-    assert_eq!(String::from_utf8_lossy(&plain.stdout), "Anuraj\nTokio\nC#\n");
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout),
+        "Anuraj\nTokio\nC#\n"
+    );
 
     let json = cli.run(&["dictionary", "list", "--json"]);
     assert!(json.status.success(), "{json:?}");

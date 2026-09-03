@@ -3,11 +3,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use voisu_core::{
-    sanitize_source_transcript_text, sanitize_source_transcripts, BoundaryError, BoundaryFuture,
-    BoundaryKind, CancelRegistry, MergeResult, Provider, ReconciliationKind, ReconciliationModel,
-    IntentReconstructionEligibility, IntentReconstructionOutcome, IntentReconstructionRequest,
-    PreparedTranscriptDecision, SourceTranscript, TranscriptDecisionPipeline, TranscriptSelection,
-    MAX_STORED_TEXT,
+    BoundaryError, BoundaryFuture, BoundaryKind, CancelRegistry, IntentReconstructionEligibility,
+    IntentReconstructionOutcome, IntentReconstructionRequest, MAX_STORED_TEXT, MergeResult,
+    PreparedTranscriptDecision, Provider, ReconciliationKind, ReconciliationModel,
+    SourceTranscript, TranscriptDecisionPipeline, TranscriptSelection,
+    sanitize_source_transcript_text, sanitize_source_transcripts,
 };
 
 struct IntentModel {
@@ -78,12 +78,18 @@ async fn material_disagreement_is_prepared_before_intent_reconstruction_runs() {
         PreparedTranscriptDecision::Reconstruct(attempt) => attempt,
         PreparedTranscriptDecision::Ready(_) => panic!("material disagreement must reconstruct"),
     };
-    assert_eq!(attempt.eligibility, IntentReconstructionEligibility::MaterialDisagreement);
+    assert_eq!(
+        attempt.eligibility,
+        IntentReconstructionEligibility::MaterialDisagreement
+    );
     assert!(requests.lock().unwrap().is_empty());
 
     let decision = pipeline.reconstruct(attempt).await.unwrap();
     assert_eq!(decision.selection, TranscriptSelection::IntentReconstructed);
-    assert_eq!(decision.transcript.0, "Schedule the cache migration after Thursday.");
+    assert_eq!(
+        decision.transcript.0,
+        "Schedule the cache migration after Thursday."
+    );
     let evidence = decision.intent_reconstruction.unwrap();
     assert_eq!(evidence.outcome, IntentReconstructionOutcome::Accepted);
     let requests = requests.lock().unwrap();
@@ -104,18 +110,30 @@ async fn typed_low_confidence_selection_reconstructs_but_same_words_skip() {
         Vec::new(),
     );
     let low_confidence = vec![
-        SourceTranscript { provider: Provider::Deepgram, text: "Please deploy the cache service on Tuesday morning after review.".to_owned() },
-        SourceTranscript { provider: Provider::Groq, text: "Please deploy the cache service on Thursday morning after review.".to_owned() },
+        SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "Please deploy the cache service on Tuesday morning after review.".to_owned(),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: "Please deploy the cache service on Thursday morning after review.".to_owned(),
+        },
     ];
     let attempt = match pipeline.prepare(low_confidence).await.unwrap() {
         PreparedTranscriptDecision::Reconstruct(attempt) => attempt,
         PreparedTranscriptDecision::Ready(_) => panic!("different words must reconstruct"),
     };
-    assert_eq!(attempt.eligibility, IntentReconstructionEligibility::LowConfidenceSelection);
+    assert_eq!(
+        attempt.eligibility,
+        IntentReconstructionEligibility::LowConfidenceSelection
+    );
 
     let reconstructed = pipeline.reconstruct(attempt).await.unwrap();
     let low_evidence = reconstructed.intent_reconstruction.unwrap();
-    assert_eq!(low_evidence.eligibility, IntentReconstructionEligibility::LowConfidenceSelection);
+    assert_eq!(
+        low_evidence.eligibility,
+        IntentReconstructionEligibility::LowConfidenceSelection
+    );
     assert_eq!(
         reconstructed.source_selection_diagnostic.confidence,
         Some(voisu_core::SourceSelectionConfidence::Low),
@@ -123,15 +141,24 @@ async fn typed_low_confidence_selection_reconstructs_but_same_words_skip() {
     );
 
     let same_words = vec![
-        SourceTranscript { provider: Provider::Deepgram, text: "Deploy on Tuesday morning".to_owned() },
-        SourceTranscript { provider: Provider::Groq, text: "Deploy on Tuesday morning.".to_owned() },
+        SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "Deploy on Tuesday morning".to_owned(),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: "Deploy on Tuesday morning.".to_owned(),
+        },
     ];
     let decision = match pipeline.prepare(same_words).await.unwrap() {
         PreparedTranscriptDecision::Ready(decision) => decision,
         PreparedTranscriptDecision::Reconstruct(_) => panic!("same words must skip"),
     };
     let evidence = decision.intent_reconstruction.unwrap();
-    assert_eq!(evidence.eligibility, IntentReconstructionEligibility::NearIdenticalHighConfidence);
+    assert_eq!(
+        evidence.eligibility,
+        IntentReconstructionEligibility::NearIdenticalHighConfidence
+    );
     assert_eq!(evidence.outcome, IntentReconstructionOutcome::Skipped);
     assert_eq!(
         decision.source_selection_diagnostic.confidence,
@@ -169,7 +196,11 @@ fn intent_reconstruction_response_accepts_observed_alias_but_rejects_unknown_sha
 #[tokio::test]
 async fn intent_reconstruction_failures_keep_typed_evidence_and_safe_fallback() {
     let cases = [
-        (true, "unused".to_owned(), IntentReconstructionOutcome::Failed),
+        (
+            true,
+            "unused".to_owned(),
+            IntentReconstructionOutcome::Failed,
+        ),
         (false, String::new(), IntentReconstructionOutcome::Rejected),
         (
             false,
@@ -239,7 +270,9 @@ impl ReconciliationModel for CountingModel {
         _cancel: Arc<CancelRegistry>,
     ) -> BoundaryFuture<'_, MergeResult> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { panic!("near-identical Source Transcripts must not invoke reconciliation") })
+        Box::pin(async {
+            panic!("near-identical Source Transcripts must not invoke reconciliation")
+        })
     }
 }
 
@@ -367,7 +400,9 @@ impl ReconciliationModel for RepairingModel {
                 )),
                 ReconciliationKind::Repair => {
                     assert!(candidate.is_some());
-                    Ok(MergeResult("Schedule the review for Wednesday morning.".to_owned()))
+                    Ok(MergeResult(
+                        "Schedule the review for Wednesday morning.".to_owned(),
+                    ))
                 }
             }
         })
@@ -398,7 +433,10 @@ async fn near_identical_source_transcripts_select_groq_without_reconciliation() 
         .await
         .unwrap();
 
-    assert_eq!(decision.transcript.0, "Schedule the review for Tuesday morning.");
+    assert_eq!(
+        decision.transcript.0,
+        "Schedule the review for Tuesday morning."
+    );
     assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
     assert!(decision.validation_reason.contains("defaulted to Groq"));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -422,8 +460,9 @@ async fn near_identical_lexical_difference_keeps_the_groq_default() {
         .decide(vec![
             SourceTranscript {
                 provider: Provider::Deepgram,
-                text: "Please do deploy the release to production after all integration tests pass."
-                    .to_owned(),
+                text:
+                    "Please do deploy the release to production after all integration tests pass."
+                        .to_owned(),
             },
             SourceTranscript {
                 provider: Provider::Groq,
@@ -441,7 +480,11 @@ async fn near_identical_lexical_difference_keeps_the_groq_default() {
         "{}",
         decision.validation_reason
     );
-    assert!(!decision.validation_reason.contains("one-sided formatting evidence"));
+    assert!(
+        !decision
+            .validation_reason
+            .contains("one-sided formatting evidence")
+    );
 }
 
 #[tokio::test]
@@ -474,7 +517,11 @@ async fn padding_cannot_win_on_formatting_signal_alone() {
     assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(decision.validation_reason.contains("lexically different"));
-    assert!(!decision.validation_reason.contains("one-sided formatting evidence"));
+    assert!(
+        !decision
+            .validation_reason
+            .contains("one-sided formatting evidence")
+    );
 }
 
 /// A dictionary term does not overturn a lexical difference. This is the spec's
@@ -499,10 +546,8 @@ async fn a_dictionary_term_does_not_overturn_a_lexical_difference() {
         Duration::from_millis(50),
         vec!["Voisu".to_owned()],
     );
-    let deepgram =
-        "The Voisu desktop application preserves every spoken word while the final transcript stays available for careful review.";
-    let groq =
-        "The voice so desktop application preserves every spoken word while the final transcript stays available for careful review.";
+    let deepgram = "The Voisu desktop application preserves every spoken word while the final transcript stays available for careful review.";
+    let groq = "The voice so desktop application preserves every spoken word while the final transcript stays available for careful review.";
 
     let decision = pipeline
         .decide(vec![
@@ -526,7 +571,11 @@ async fn a_dictionary_term_does_not_overturn_a_lexical_difference() {
         "{}",
         decision.validation_reason
     );
-    assert!(!decision.validation_reason.contains("one-sided formatting evidence"));
+    assert!(
+        !decision
+            .validation_reason
+            .contains("one-sided formatting evidence")
+    );
 }
 
 /// The pinned safety fixture is one dictionary term away from the defect it
@@ -826,7 +875,11 @@ async fn padding_cannot_win_when_a_dictionary_term_is_present() {
         "{}",
         decision.validation_reason
     );
-    assert!(!decision.validation_reason.contains("one-sided formatting evidence"));
+    assert!(
+        !decision
+            .validation_reason
+            .contains("one-sided formatting evidence")
+    );
     assert!(!decision.validation_reason.contains("dictionary matches"));
 }
 
@@ -845,10 +898,8 @@ async fn equal_length_lexical_difference_keeps_the_groq_default() {
         },
         Duration::from_millis(50),
     );
-    let deepgram =
-        "Please review the final transcript before delivery and confirm every spoken detail remains accurate for the completed dictation.";
-    let groq =
-        "please review the final transcript before delivery and confirm every spoken detail remains accurate for the completed dictations";
+    let deepgram = "Please review the final transcript before delivery and confirm every spoken detail remains accurate for the completed dictation.";
+    let groq = "please review the final transcript before delivery and confirm every spoken detail remains accurate for the completed dictations";
 
     let decision = pipeline
         .decide(vec![
@@ -873,7 +924,11 @@ async fn equal_length_lexical_difference_keeps_the_groq_default() {
         "{}",
         decision.validation_reason
     );
-    assert!(!decision.validation_reason.contains("one-sided formatting evidence"));
+    assert!(
+        !decision
+            .validation_reason
+            .contains("one-sided formatting evidence")
+    );
 }
 
 #[tokio::test]
@@ -1072,7 +1127,11 @@ async fn near_identical_source_transcripts_prefer_an_exact_dictionary_term_match
     assert_eq!(decision.transcript.0, deepgram);
     assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(decision.validation_reason.contains("dictionary matches 1 vs 0"));
+    assert!(
+        decision
+            .validation_reason
+            .contains("dictionary matches 1 vs 0")
+    );
 }
 
 #[tokio::test]
@@ -1105,7 +1164,11 @@ async fn repeated_dictionary_term_does_not_manufacture_a_winning_signal() {
     assert_eq!(decision.transcript.0, groq);
     assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(decision.validation_reason.contains("dictionary matches 1 vs 1"));
+    assert!(
+        decision
+            .validation_reason
+            .contains("dictionary matches 1 vs 1")
+    );
 }
 
 #[tokio::test]
@@ -1139,14 +1202,19 @@ async fn overlapping_dictionary_terms_count_the_canonical_span_once() {
     assert_eq!(decision.transcript.0, deepgram);
     assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(decision.validation_reason.contains("dictionary matches 1 vs 0"));
+    assert!(
+        decision
+            .validation_reason
+            .contains("dictionary matches 1 vs 0")
+    );
 }
 
 #[tokio::test]
 async fn drastically_shorter_merge_falls_back_to_a_full_source() {
     let kinds = Arc::new(Mutex::new(Vec::new()));
     let deepgram = "Book the conference room for Tuesday afternoon and invite the entire design review team today.";
-    let groq = "Schedule the conference room on Wednesday morning and invite the platform review group.";
+    let groq =
+        "Schedule the conference room on Wednesday morning and invite the platform review group.";
     let mut pipeline = TranscriptDecisionPipeline::new(
         SuccessfulModel {
             kinds: Arc::clone(&kinds),
@@ -1176,7 +1244,10 @@ async fn drastically_shorter_merge_falls_back_to_a_full_source() {
     let reason = decision
         .fallback_reason
         .expect("a rejected contraction records its measured ratio");
-    assert!(reason.contains("contraction ratio 0.2667"), "unexpected reason: {reason}");
+    assert!(
+        reason.contains("contraction ratio 0.2667"),
+        "unexpected reason: {reason}"
+    );
     assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
 }
 
@@ -1282,7 +1353,12 @@ async fn contraction_fallback_does_not_restore_uncorroborated_padding() {
 
     assert_eq!(decision.transcript.0, groq);
     assert_eq!(decision.selection, TranscriptSelection::SourceGroq);
-    assert!(decision.fallback_reason.unwrap().contains("contraction ratio"));
+    assert!(
+        decision
+            .fallback_reason
+            .unwrap()
+            .contains("contraction ratio")
+    );
 }
 
 /// The routine streaming failure: one provider truncates its tail and the merge
@@ -1432,8 +1508,15 @@ async fn contraction_fallback_refuses_when_both_sources_fail_quality_guards() {
         .await
         .expect_err("the repair path must refuse when neither source is safe");
 
-    assert_eq!(error.public_message(), "Transcript failed quality validation");
-    assert!(error.diagnostic().contains("neither Source Transcript is safe"));
+    assert_eq!(
+        error.public_message(),
+        "Transcript failed quality validation"
+    );
+    assert!(
+        error
+            .diagnostic()
+            .contains("neither Source Transcript is safe")
+    );
     assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
 }
 
@@ -1473,9 +1556,14 @@ async fn a_wordless_sibling_is_not_a_deliverable_contraction_fallback() {
         .await
         .expect_err("dots must not be delivered as the contraction fallback");
 
-    assert_eq!(error.public_message(), "Transcript failed quality validation");
+    assert_eq!(
+        error.public_message(),
+        "Transcript failed quality validation"
+    );
     assert!(
-        error.diagnostic().contains("neither Source Transcript is safe"),
+        error
+            .diagnostic()
+            .contains("neither Source Transcript is safe"),
         "{}",
         error.diagnostic()
     );
@@ -1547,8 +1635,7 @@ async fn linguistic_contractions_do_not_trigger_the_merge_contraction_guard() {
         .decide(vec![
             SourceTranscript {
                 provider: Provider::Deepgram,
-                text: "We are planning the release and they are reviewing it today."
-                    .to_owned(),
+                text: "We are planning the release and they are reviewing it today.".to_owned(),
             },
             SourceTranscript {
                 provider: Provider::Groq,
@@ -1580,7 +1667,9 @@ async fn observed_production_contraction_ratios_are_rejected() {
     let deepgram = deepgram_words.join(" ");
     let groq = groq_words.join(" ");
 
-    for (candidate_words, expected_ratio) in [(87, "0.87"), (79, "0.79"), (79, "0.79"), (77, "0.77")] {
+    for (candidate_words, expected_ratio) in
+        [(87, "0.87"), (79, "0.79"), (79, "0.79"), (77, "0.77")]
+    {
         let mut pipeline = TranscriptDecisionPipeline::new(
             SuccessfulModel {
                 kinds: Arc::new(Mutex::new(Vec::new())),
@@ -1605,7 +1694,9 @@ async fn observed_production_contraction_ratios_are_rejected() {
 
         assert_eq!(decision.transcript.0.split_whitespace().count(), 100);
         assert!(!decision.recovery_attempted);
-        let reason = decision.fallback_reason.expect("contraction records its ratio");
+        let reason = decision
+            .fallback_reason
+            .expect("contraction records its ratio");
         assert!(
             reason.contains(&format!("contraction ratio {expected_ratio}")),
             "candidate with {candidate_words} words recorded unexpected reason: {reason}"
@@ -1648,8 +1739,13 @@ async fn contraction_ratio_near_the_floor_records_precise_counts() {
         .await
         .unwrap();
 
-    let reason = decision.fallback_reason.expect("contraction records precise evidence");
-    assert!(reason.contains("ratio 0.8990"), "unexpected reason: {reason}");
+    let reason = decision
+        .fallback_reason
+        .expect("contraction records precise evidence");
+    assert!(
+        reason.contains("ratio 0.8990"),
+        "unexpected reason: {reason}"
+    );
     assert!(
         reason.contains("899 candidate words, 1000 longest-source words"),
         "unexpected reason: {reason}"
@@ -1689,12 +1785,18 @@ async fn catastrophically_divergent_sources_select_better_source_without_merging
         .await
         .unwrap();
 
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "a divergent pair must not be merged");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a divergent pair must not be merged"
+    );
     assert_eq!(decision.selection, TranscriptSelection::SourceGroq);
     assert_eq!(decision.transcript.0, groq);
     assert!(!decision.reconciliation_requested);
     assert!(!decision.recovery_attempted);
-    let reason = decision.fallback_reason.expect("gate records a fallback reason");
+    let reason = decision
+        .fallback_reason
+        .expect("gate records a fallback reason");
     assert!(
         reason.contains("catastrophically divergent") && reason.contains("degenerate"),
         "fallback reason must ground the selection in a real garbage signal: {reason}"
@@ -1732,8 +1834,13 @@ async fn a_fragment_source_is_gated_by_length_ratio_not_merged() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(decision.selection, TranscriptSelection::SourceGroq);
     assert_eq!(decision.transcript.0, groq);
-    let reason = decision.fallback_reason.expect("gate records a fallback reason");
-    assert!(reason.contains("length ratio"), "reason must cite length ratio: {reason}");
+    let reason = decision
+        .fallback_reason
+        .expect("gate records a fallback reason");
+    assert!(
+        reason.contains("length ratio"),
+        "reason must cite length ratio: {reason}"
+    );
 }
 
 #[tokio::test]
@@ -1765,7 +1872,12 @@ async fn safe_source_fallback_selects_by_quality_not_a_fixed_provider() {
         "the higher-quality source must win the fallback, not Groq by provider order"
     );
     assert!(decision.reconciliation_requested);
-    assert!(decision.fallback_reason.unwrap().contains("cloud reconciliation failed"));
+    assert!(
+        decision
+            .fallback_reason
+            .unwrap()
+            .contains("cloud reconciliation failed")
+    );
 }
 
 #[tokio::test]
@@ -1792,7 +1904,11 @@ async fn reconciliation_failure_prefers_a_materially_fuller_safe_source_before_c
     assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
     assert_eq!(decision.transcript.0, complete);
     assert!(decision.reconciliation_requested);
-    assert!(decision.validation_reason.contains("materially fuller safe Source Transcript"));
+    assert!(
+        decision
+            .validation_reason
+            .contains("materially fuller safe Source Transcript")
+    );
     assert!(decision.validation_reason.contains("raw words"));
     assert!(decision.validation_reason.contains("adjusted coverage"));
     assert!(decision.validation_reason.contains("repetition discount"));
@@ -1843,8 +1959,12 @@ async fn repeated_filler_does_not_make_a_source_materially_fuller() {
 
 #[tokio::test]
 async fn selection_diagnostics_measure_unclamped_sanitized_source_transcripts() {
-    let complete = std::iter::repeat_n("deploy", 2_000).collect::<Vec<_>>().join(" ");
-    let fragment = std::iter::repeat_n("deploy", 1_000).collect::<Vec<_>>().join(" ");
+    let complete = std::iter::repeat_n("deploy", 2_000)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let fragment = std::iter::repeat_n("deploy", 1_000)
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut pipeline =
         TranscriptDecisionPipeline::new(FailingReconcileModel, Duration::from_millis(50));
     let decision = pipeline
@@ -1868,14 +1988,16 @@ async fn selection_diagnostics_measure_unclamped_sanitized_source_transcripts() 
         .find(|source| source.provider == Provider::Deepgram)
         .unwrap();
     assert_eq!(deepgram.raw_words, 2_000);
-    assert!(voisu_core::SourceTranscriptRecord::new(&SourceTranscript {
-        provider: Provider::Deepgram,
-        text: complete,
-    })
-    .text
-    .split_whitespace()
-    .count()
-        < deepgram.raw_words);
+    assert!(
+        voisu_core::SourceTranscriptRecord::new(&SourceTranscript {
+            provider: Provider::Deepgram,
+            text: complete,
+        })
+        .text
+        .split_whitespace()
+        .count()
+            < deepgram.raw_words
+    );
 }
 
 #[tokio::test]
@@ -1886,8 +2008,9 @@ async fn repeated_negation_and_function_words_are_not_discounted_as_filler() {
         .decide(vec![
             SourceTranscript {
                 provider: Provider::Deepgram,
-                text: "Do not deploy, do not restart, do not delete, and do not approve the release."
-                    .to_owned(),
+                text:
+                    "Do not deploy, do not restart, do not delete, and do not approve the release."
+                        .to_owned(),
             },
             SourceTranscript {
                 provider: Provider::Groq,
@@ -2048,7 +2171,9 @@ async fn an_unsafe_source_beside_a_wordless_sibling_is_refused_not_replaced_with
         .expect_err("dots must not impersonate a delivered dictation");
 
     assert!(
-        error.diagnostic().contains("neither Source Transcript is safe"),
+        error
+            .diagnostic()
+            .contains("neither Source Transcript is safe"),
         "{}",
         error.diagnostic()
     );
@@ -2093,7 +2218,9 @@ async fn unique_word_salad_with_no_cross_agreement_is_gated_and_dictation_wins()
     );
     assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
     assert_eq!(decision.transcript.0, dictation);
-    let reason = decision.fallback_reason.expect("gate records a fallback reason");
+    let reason = decision
+        .fallback_reason
+        .expect("gate records a fallback reason");
     assert!(
         reason.contains("catastrophically divergent"),
         "the gate must ground the selection in cross-source divergence: {reason}"
@@ -2176,14 +2303,22 @@ async fn reconciliation_failure_fallback_is_not_gamed_by_a_partially_overlapping
         .await
         .unwrap();
 
-    assert!(decision.reconciliation_requested, "the pair must reach reconciliation first");
+    assert!(
+        decision.reconciliation_requested,
+        "the pair must reach reconciliation first"
+    );
     assert_eq!(
         decision.selection,
         TranscriptSelection::SourceDeepgram,
         "the fallback must deliver the cross-confirmed dictation, never the salad"
     );
     assert_eq!(decision.transcript.0, dictation);
-    assert!(decision.fallback_reason.unwrap().contains("cloud reconciliation failed"));
+    assert!(
+        decision
+            .fallback_reason
+            .unwrap()
+            .contains("cloud reconciliation failed")
+    );
 }
 
 #[tokio::test]
@@ -2423,7 +2558,9 @@ async fn four_word_stolen_padded_loop_is_gated_not_reconciled() {
     );
     assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
     assert_eq!(decision.transcript.0, dictation);
-    let reason = decision.fallback_reason.expect("gate records a fallback reason");
+    let reason = decision
+        .fallback_reason
+        .expect("gate records a fallback reason");
     assert!(reason.contains("catastrophically divergent"), "{reason}");
 }
 
@@ -2457,7 +2594,11 @@ async fn pure_nonsense_repetition_loop_loses_to_accurate_speech() {
         .await
         .unwrap();
 
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "the pair must be gated, not merged");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the pair must be gated, not merged"
+    );
     assert_eq!(
         decision.selection,
         TranscriptSelection::SourceDeepgram,
@@ -2498,7 +2639,11 @@ async fn nonsense_loop_with_one_accidental_match_still_loses_to_accurate_speech(
         .await
         .unwrap();
 
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "the pair must be gated, not merged");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the pair must be gated, not merged"
+    );
     assert_eq!(
         decision.selection,
         TranscriptSelection::SourceDeepgram,
@@ -2658,7 +2803,11 @@ async fn common_word_repetition_salad_is_gated_not_merged() {
         .await
         .unwrap();
 
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "a common-word salad must not be merged");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a common-word salad must not be merged"
+    );
     assert_eq!(decision.selection, TranscriptSelection::SourceGroq);
     assert_eq!(decision.transcript.0, groq);
 }
@@ -2701,7 +2850,9 @@ async fn fluent_nonsense_with_no_cross_agreement_is_gated_not_merged() {
     assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
     assert_eq!(decision.transcript.0, accurate);
     assert!(!decision.reconciliation_requested);
-    let reason = decision.fallback_reason.expect("gate records a fallback reason");
+    let reason = decision
+        .fallback_reason
+        .expect("gate records a fallback reason");
     assert!(reason.contains("catastrophically divergent"), "{reason}");
 }
 
@@ -2766,7 +2917,10 @@ async fn material_disagreement_uses_the_bounded_reconciliation_model() {
         .await
         .unwrap();
 
-    assert_eq!(decision.transcript.0, "Book the review for Wednesday morning.");
+    assert_eq!(
+        decision.transcript.0,
+        "Book the review for Wednesday morning."
+    );
     assert_eq!(decision.selection, TranscriptSelection::Reconciled);
     assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
     assert!(decision.reconciliation_requested);
@@ -2801,7 +2955,10 @@ async fn source_derived_initial_reconciliation_still_delivers_as_reconciled() {
         .unwrap();
 
     assert_eq!(decision.selection, TranscriptSelection::Reconciled);
-    assert_eq!(decision.transcript.0, "Book the review for Wednesday morning.");
+    assert_eq!(
+        decision.transcript.0,
+        "Book the review for Wednesday morning."
+    );
     assert_eq!(*kinds.lock().unwrap(), vec![ReconciliationKind::Reconcile]);
     assert!(decision.reconciliation_requested);
     assert!(!decision.recovery_attempted);
@@ -2916,7 +3073,10 @@ async fn prompt_artifact_gets_one_bounded_repair_before_delivery() {
         .await
         .unwrap();
 
-    assert_eq!(decision.transcript.0, "Schedule the review for Wednesday morning.");
+    assert_eq!(
+        decision.transcript.0,
+        "Schedule the review for Wednesday morning."
+    );
     assert_eq!(decision.selection, TranscriptSelection::Repaired);
     assert_eq!(
         *kinds.lock().unwrap(),
@@ -3042,11 +3202,20 @@ async fn an_outro_marker_opening_an_earlier_sentence_is_delivered_unrepaired() {
 
 #[test]
 fn sanitize_clears_pure_outro_and_strips_only_anchored_final_outros() {
-    assert_eq!(sanitize_source_transcript_text("Thank you for watching!"), "");
+    assert_eq!(
+        sanitize_source_transcript_text("Thank you for watching!"),
+        ""
+    );
     assert_eq!(sanitize_source_transcript_text("thanks for watching"), "");
     assert_eq!(sanitize_source_transcript_text("Like and subscribe."), "");
-    assert_eq!(sanitize_source_transcript_text("Subtitles by Amara.org"), "");
-    assert_eq!(sanitize_source_transcript_text("Transcribed by otter.ai"), "");
+    assert_eq!(
+        sanitize_source_transcript_text("Subtitles by Amara.org"),
+        ""
+    );
+    assert_eq!(
+        sanitize_source_transcript_text("Transcribed by otter.ai"),
+        ""
+    );
 
     assert_eq!(
         sanitize_source_transcript_text(
@@ -3075,11 +3244,26 @@ fn sanitize_clears_pure_outro_and_strips_only_anchored_final_outros() {
 
     // Pure outro with a trivial / stopword head must clear entirely — not leave
     // "Please" / "OK" / "Yeah" as a selectable Source Transcript.
-    assert_eq!(sanitize_source_transcript_text("Please like and subscribe"), "");
-    assert_eq!(sanitize_source_transcript_text("OK thanks for watching"), "");
-    assert_eq!(sanitize_source_transcript_text("Yeah thank you for watching"), "");
-    assert_eq!(sanitize_source_transcript_text("Ok. Thanks for watching!"), "");
-    assert_eq!(sanitize_source_transcript_text("Yeah. Thank you for watching."), "");
+    assert_eq!(
+        sanitize_source_transcript_text("Please like and subscribe"),
+        ""
+    );
+    assert_eq!(
+        sanitize_source_transcript_text("OK thanks for watching"),
+        ""
+    );
+    assert_eq!(
+        sanitize_source_transcript_text("Yeah thank you for watching"),
+        ""
+    );
+    assert_eq!(
+        sanitize_source_transcript_text("Ok. Thanks for watching!"),
+        ""
+    );
+    assert_eq!(
+        sanitize_source_transcript_text("Yeah. Thank you for watching."),
+        ""
+    );
 
     let mid = "The demo went well and the recording was transcribed by Whisper.";
     assert_eq!(sanitize_source_transcript_text(mid), mid);
@@ -3112,7 +3296,10 @@ async fn pure_outro_sources_refuse_without_model_and_without_delivery() {
         .expect_err("pure-outro silence must not Deliver");
 
     assert_eq!(error.kind(), BoundaryKind::Validation);
-    assert_eq!(error.public_message(), "Transcript failed quality validation");
+    assert_eq!(
+        error.public_message(),
+        "Transcript failed quality validation"
+    );
     assert!(
         error.diagnostic().contains("hallucinated suffix"),
         "{}",
@@ -3479,10 +3666,15 @@ async fn a_refusal_shaped_repair_is_never_delivered() {
                 decision.transcript.0
             ),
         };
-        assert_eq!(error.public_message(), "Transcript failed quality validation");
+        assert_eq!(
+            error.public_message(),
+            "Transcript failed quality validation"
+        );
         assert!(
             error.diagnostic().contains("no Source Transcript contains")
-                || error.diagnostic().contains("neither Source Transcript is safe"),
+                || error
+                    .diagnostic()
+                    .contains("neither Source Transcript is safe"),
             "{refusal}: {}",
             error.diagnostic()
         );
@@ -3529,7 +3721,11 @@ async fn remaining_quality_guardrails_repair_unsafe_merge_results() {
             .await
             .unwrap();
 
-        assert_eq!(decision.selection, TranscriptSelection::Repaired, "{candidate}");
+        assert_eq!(
+            decision.selection,
+            TranscriptSelection::Repaired,
+            "{candidate}"
+        );
         assert!(decision.recovery_attempted);
     }
 }
@@ -3553,7 +3749,10 @@ async fn failed_recovery_falls_back_to_a_safe_groq_source_transcript() {
         .await
         .unwrap();
 
-    assert_eq!(decision.transcript.0, "Schedule the review Wednesday morning.");
+    assert_eq!(
+        decision.transcript.0,
+        "Schedule the review Wednesday morning."
+    );
     assert_eq!(decision.selection, TranscriptSelection::SourceGroq);
     assert!(decision.reconciliation_requested);
     assert!(decision.recovery_attempted);
@@ -3565,10 +3764,8 @@ async fn failed_recovery_falls_back_to_a_safe_groq_source_transcript() {
 
 #[tokio::test]
 async fn unsafe_single_source_transcript_gets_one_repair_attempt() {
-    let mut pipeline = TranscriptDecisionPipeline::new(
-        SingleSourceRepairModel,
-        Duration::from_millis(50),
-    );
+    let mut pipeline =
+        TranscriptDecisionPipeline::new(SingleSourceRepairModel, Duration::from_millis(50));
 
     let decision = pipeline
         .decide(vec![SourceTranscript {
@@ -3589,8 +3786,7 @@ async fn unsafe_single_source_transcript_gets_one_repair_attempt() {
 
 #[tokio::test]
 async fn reconciliation_deadline_falls_back_without_waiting_indefinitely() {
-    let mut pipeline =
-        TranscriptDecisionPipeline::new(StallingModel, Duration::from_millis(20));
+    let mut pipeline = TranscriptDecisionPipeline::new(StallingModel, Duration::from_millis(20));
     let started = std::time::Instant::now();
 
     let decision = pipeline
@@ -3619,10 +3815,8 @@ async fn reconciliation_deadline_falls_back_without_waiting_indefinitely() {
 
 #[tokio::test]
 async fn unsafe_near_identical_sources_are_repaired_instead_of_selected() {
-    let mut pipeline = TranscriptDecisionPipeline::new(
-        SingleSourceRepairModel,
-        Duration::from_millis(50),
-    );
+    let mut pipeline =
+        TranscriptDecisionPipeline::new(SingleSourceRepairModel, Duration::from_millis(50));
 
     let decision = pipeline
         .decide(vec![
@@ -3663,8 +3857,15 @@ async fn failed_recovery_reports_quality_failure_when_neither_source_is_safe() {
         .await
         .unwrap_err();
 
-    assert_eq!(error.public_message(), "Transcript failed quality validation");
-    assert!(error.diagnostic().contains("neither Source Transcript is safe"));
+    assert_eq!(
+        error.public_message(),
+        "Transcript failed quality validation"
+    );
+    assert!(
+        error
+            .diagnostic()
+            .contains("neither Source Transcript is safe")
+    );
 }
 
 /// Stalls until the pipeline cancels it, then simulates the kill/reap of an
@@ -3886,8 +4087,7 @@ async fn fully_greek_extended_token_passes_validation() {
     // Greek token must appear in a Source Transcript so the #98 source-derived
     // gate does not reject a legitimate bilingual Merge Result.
     let kinds = Arc::new(Mutex::new(Vec::new()));
-    let merge =
-        "Tell \u{1f00}\u{03b3}\u{03b1}\u{03b8}\u{03cc}\u{03c2} that the review is Wednesday morning.";
+    let merge = "Tell \u{1f00}\u{03b3}\u{03b1}\u{03b8}\u{03cc}\u{03c2} that the review is Wednesday morning.";
     let mut pipeline = TranscriptDecisionPipeline::new(
         SuccessfulModel {
             kinds: Arc::clone(&kinds),

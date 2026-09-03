@@ -1,26 +1,26 @@
 //! Architecture A Final Transform Gate (Smart Writing SW10 / spec §8).
 
 use std::future::Future;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
 use voisu_core::{
+    BoundaryError, DeliveryAdapter, DeliveryOutcome, EnglishEligibilityOutcome,
+    FORMATTER_CONTRACT_ID, FormatOptions, GrammarErrorCode, GrammarOutcome, GrammarSafetyOptions,
+    LOCAL_FORMATTER_WORK_DEADLINE, MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES, Provider,
+    SmartWritingDiagnostic, SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome,
+    SmartWritingReasonCode, Transcript, WritingMode as CoreWritingMode,
     apply_grammar_candidate_json, format_validated_for_grammar, format_validated_with,
-    parse_formatting_commands, BoundaryError, DeliveryAdapter, DeliveryOutcome,
-    EnglishEligibilityOutcome, FormatOptions, GrammarErrorCode, GrammarOutcome,
-    GrammarSafetyOptions, Provider, SmartWritingDiagnostic, SmartWritingEditEvidence,
-    SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode, Transcript,
-    WritingMode as CoreWritingMode, FORMATTER_CONTRACT_ID, LOCAL_FORMATTER_WORK_DEADLINE,
-    MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES,
+    parse_formatting_commands,
 };
 
 use crate::config::WritingMode;
 use crate::grammar_http::MAX_GRAMMAR_RESPONSE_BYTES;
 use crate::minimal_grammar::{
-    MinimalGrammarAdapter, MinimalGrammarError, GRAMMAR_RESULT_CUTOFF_FROM_GATE_ENTRY,
-    MINIMAL_GRAMMAR_MODEL,
+    GRAMMAR_RESULT_CUTOFF_FROM_GATE_ENTRY, MINIMAL_GRAMMAR_MODEL, MinimalGrammarAdapter,
+    MinimalGrammarError,
 };
 
 pub const FINAL_TRANSFORM_GATE_DEADLINE: Duration = Duration::from_millis(1_000);
@@ -74,19 +74,16 @@ impl ResolvedRecordingLanguages {
 fn is_explicit_english(language: &str) -> bool {
     let normalized = language.trim().to_ascii_lowercase();
     normalized == "en"
-        || normalized
-            .strip_prefix("en-")
-            .is_some_and(|region| {
-                !region.is_empty()
-                    && region
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            })
+        || normalized.strip_prefix("en-").is_some_and(|region| {
+            !region.is_empty()
+                && region
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
-pub type GrammarBoundaryFuture<'a> = Pin<
-    Box<dyn Future<Output = Result<Vec<u8>, MinimalGrammarError>> + Send + 'a>,
->;
+pub type GrammarBoundaryFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<u8>, MinimalGrammarError>> + Send + 'a>>;
 
 /// Injection seam for hermetic gate tests; production is the SW6 adapter.
 pub trait GrammarRequestBoundary: Send + Sync {
@@ -107,12 +104,7 @@ impl GrammarRequestBoundary for MinimalGrammarAdapter {
         baseline: &'a voisu_core::FormattingBaseline,
         gate_entry: Instant,
     ) -> GrammarBoundaryFuture<'a> {
-        Box::pin(self.request_candidate(
-            bearer_token,
-            validated_transcript,
-            baseline,
-            gate_entry,
-        ))
+        Box::pin(self.request_candidate(bearer_token, validated_transcript, baseline, gate_entry))
     }
 }
 
@@ -227,8 +219,13 @@ pub async fn final_transform_and_deliver(
             reasons.push(SmartWritingReasonCode::EnglishIneligible);
         } else if parsed_commands.has_command_span() {
             // D_cmd-A separability: local Formatting survives, provider is skipped.
-        } else if let (Some(baseline), GrammarGateCapability::Ready { boundary, bearer_token }) =
-            (baseline.as_ref(), &input.grammar)
+        } else if let (
+            Some(baseline),
+            GrammarGateCapability::Ready {
+                boundary,
+                bearer_token,
+            },
+        ) = (baseline.as_ref(), &input.grammar)
         {
             if Instant::now() >= candidate_deadline {
                 push_unique_reason(&mut reasons, SmartWritingReasonCode::SafetyDeadline);
@@ -306,9 +303,10 @@ pub async fn final_transform_and_deliver(
                                 &mut reasons,
                                 SmartWritingReasonCode::SafetyDeadline,
                             ),
-                            Err(_) => {
-                                push_unique_reason(&mut reasons, SmartWritingReasonCode::SafetyPanic)
-                            }
+                            Err(_) => push_unique_reason(
+                                &mut reasons,
+                                SmartWritingReasonCode::SafetyPanic,
+                            ),
                         }
                     }
                     Ok(Ok(Ok(_))) | Err(_) => {
@@ -389,8 +387,9 @@ fn map_adapter_error(error: &MinimalGrammarError) -> SmartWritingReasonCode {
         MinimalGrammarError::Transport(GrammarHttpError::BodyTooLarge { .. }) => {
             SmartWritingReasonCode::ResponseOversize
         }
-        MinimalGrammarError::Transport(_)
-        | MinimalGrammarError::InvalidBaselineIdentity => SmartWritingReasonCode::HttpTransport,
+        MinimalGrammarError::Transport(_) | MinimalGrammarError::InvalidBaselineIdentity => {
+            SmartWritingReasonCode::HttpTransport
+        }
         MinimalGrammarError::InvalidProviderEnvelope => SmartWritingReasonCode::Schema,
     }
 }
@@ -453,10 +452,7 @@ fn edit_evidence_from_candidate(
         .collect()
 }
 
-fn push_unique_reason(
-    reasons: &mut Vec<SmartWritingReasonCode>,
-    reason: SmartWritingReasonCode,
-) {
+fn push_unique_reason(reasons: &mut Vec<SmartWritingReasonCode>, reason: SmartWritingReasonCode) {
     if !reasons.contains(&reason) {
         reasons.push(reason);
     }
@@ -469,8 +465,8 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -508,7 +504,11 @@ mod tests {
         }
     }
 
-    fn delivery() -> (RecordingDelivery, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<String>>>) {
+    fn delivery() -> (
+        RecordingDelivery,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         let calls = Arc::new(AtomicUsize::new(0));
         let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
         (
@@ -530,7 +530,10 @@ mod tests {
 
     #[test]
     fn english_resolution_is_declaration_only_and_fail_closed() {
-        assert_eq!(english().english_eligibility(), EnglishEligibilityOutcome::Eligible);
+        assert_eq!(
+            english().english_eligibility(),
+            EnglishEligibilityOutcome::Eligible
+        );
         for declarations in [
             Vec::new(),
             vec![(Provider::Groq, String::new())],
@@ -584,13 +587,18 @@ mod tests {
             },
             &mut delivery,
         )
-        .await
-        ;
+        .await;
         assert_eq!(completion.rendered, "hello\nworld");
-        assert_eq!(completion.diagnostic.outcome, SmartWritingOutcome::LiteralCommands);
+        assert_eq!(
+            completion.diagnostic.outcome,
+            SmartWritingOutcome::LiteralCommands
+        );
         assert!(!completion.diagnostic.request_began);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(delivered.lock().expect("delivered").as_slice(), ["hello\nworld"]);
+        assert_eq!(
+            delivered.lock().expect("delivered").as_slice(),
+            ["hello\nworld"]
+        );
     }
 
     #[tokio::test]
@@ -628,10 +636,12 @@ mod tests {
             },
             &mut delivery,
         )
-        .await
-        ;
+        .await;
         assert_eq!(completion.rendered, "There are two issues.");
-        assert_eq!(completion.diagnostic.outcome, SmartWritingOutcome::FormattingAndGrammar);
+        assert_eq!(
+            completion.diagnostic.outcome,
+            SmartWritingOutcome::FormattingAndGrammar
+        );
         assert!(completion.diagnostic.request_began);
         assert_eq!(completion.diagnostic.edits.len(), 1);
         assert_eq!(
@@ -639,7 +649,10 @@ mod tests {
             SmartWritingReasonCode::EditAccepted
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(delivered.lock().expect("delivered").as_slice(), ["There are two issues."]);
+        assert_eq!(
+            delivered.lock().expect("delivered").as_slice(),
+            ["There are two issues."]
+        );
     }
 
     #[tokio::test]
@@ -661,13 +674,23 @@ mod tests {
             },
             &mut delivery,
         )
-        .await
-        ;
+        .await;
         assert_eq!(completion.rendered, "Hello world.");
-        assert_eq!(completion.diagnostic.outcome, SmartWritingOutcome::FormattingOnly);
-        assert!(completion.diagnostic.reason_codes.contains(&SmartWritingReasonCode::Schema));
+        assert_eq!(
+            completion.diagnostic.outcome,
+            SmartWritingOutcome::FormattingOnly
+        );
+        assert!(
+            completion
+                .diagnostic
+                .reason_codes
+                .contains(&SmartWritingReasonCode::Schema)
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(delivered.lock().expect("delivered").as_slice(), ["Hello world."]);
+        assert_eq!(
+            delivered.lock().expect("delivered").as_slice(),
+            ["Hello world."]
+        );
     }
 
     #[tokio::test]
@@ -797,21 +820,23 @@ mod tests {
         }
         let calls = Arc::new(AtomicUsize::new(0));
         let mut delivery = FailingDelivery(Arc::clone(&calls));
-        assert!(final_transform_and_deliver(
-            FinalTransformInput {
-                validated_transcript: "hello",
-                writing_mode: WritingMode::Smart,
-                languages: &english(),
-                grammar: GrammarGateCapability::Unavailable,
-                dictionary_terms: &[],
-                protected_names: &[],
-                credential: CredentialGateEvidence::default(),
-            },
-            &mut delivery,
-        )
-        .await
-        .delivery
-        .is_err());
+        assert!(
+            final_transform_and_deliver(
+                FinalTransformInput {
+                    validated_transcript: "hello",
+                    writing_mode: WritingMode::Smart,
+                    languages: &english(),
+                    grammar: GrammarGateCapability::Unavailable,
+                    dictionary_terms: &[],
+                    protected_names: &[],
+                    credential: CredentialGateEvidence::default(),
+                },
+                &mut delivery,
+            )
+            .await
+            .delivery
+            .is_err()
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

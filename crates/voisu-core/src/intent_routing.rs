@@ -10,9 +10,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::prompt_rendering::{
-    CloudRequest, RenderingPolicy, RenderingRoute, TimingCertainty,
-};
+use crate::prompt_rendering::{CloudRequest, RenderingPolicy, RenderingRoute, TimingCertainty};
 
 // ---------------------------------------------------------------------------
 // Constants — fixed catalogs; must match #141 corpus weights/thresholds
@@ -319,9 +317,8 @@ static FILE_EXT_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("FILE_EXT_RE")
 });
 /// Bazel-style `//target` tokens (absolute `//` paths with path-ish body).
-static BAZEL_TARGET_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^//[A-Za-z0-9_./:@+-]+$").expect("BAZEL_TARGET_RE")
-});
+static BAZEL_TARGET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^//[A-Za-z0-9_./:@+-]+$").expect("BAZEL_TARGET_RE"));
 
 fn section_header_re(phrase: &str) -> Regex {
     let esc = regex::escape(phrase).replace(' ', r"\s+");
@@ -476,15 +473,87 @@ static PROSE_RUNNER_SECONDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| 
 
 static KNOWN_CLI_SUBCOMMANDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     HashSet::from([
-        "test", "build", "run", "check", "clippy", "fmt", "bench", "doc", "install", "clean",
-        "status", "commit", "push", "pull", "clone", "diff", "log", "add", "checkout", "branch",
-        "merge", "rebase", "fetch", "exec", "ps", "images", "compose", "apply", "get", "describe",
-        "logs", "delete", "create", "scale", "rollout", "config", "init", "start", "stop",
-        "restart", "up", "down", "serve", "dev", "publish", "pack", "login", "logout", "whoami",
-        "version", "help", "mod", "env", "list", "info", "search", "uninstall", "update",
-        "upgrade", "remove", "sync", "lock", "audit", "outdated", "workspace", "package",
-        "target", "release", "debug", "all", "dist", "deploy", "vet", "generate", "tool", "work",
-        "tidy", "vendor", "query", "coverage", "nextest",
+        "test",
+        "build",
+        "run",
+        "check",
+        "clippy",
+        "fmt",
+        "bench",
+        "doc",
+        "install",
+        "clean",
+        "status",
+        "commit",
+        "push",
+        "pull",
+        "clone",
+        "diff",
+        "log",
+        "add",
+        "checkout",
+        "branch",
+        "merge",
+        "rebase",
+        "fetch",
+        "exec",
+        "ps",
+        "images",
+        "compose",
+        "apply",
+        "get",
+        "describe",
+        "logs",
+        "delete",
+        "create",
+        "scale",
+        "rollout",
+        "config",
+        "init",
+        "start",
+        "stop",
+        "restart",
+        "up",
+        "down",
+        "serve",
+        "dev",
+        "publish",
+        "pack",
+        "login",
+        "logout",
+        "whoami",
+        "version",
+        "help",
+        "mod",
+        "env",
+        "list",
+        "info",
+        "search",
+        "uninstall",
+        "update",
+        "upgrade",
+        "remove",
+        "sync",
+        "lock",
+        "audit",
+        "outdated",
+        "workspace",
+        "package",
+        "target",
+        "release",
+        "debug",
+        "all",
+        "dist",
+        "deploy",
+        "vet",
+        "generate",
+        "tool",
+        "work",
+        "tidy",
+        "vendor",
+        "query",
+        "coverage",
+        "nextest",
     ])
 });
 
@@ -697,13 +766,9 @@ fn collect_section_cue_hits(primary_text: &str) -> Vec<(String, String, Strength
                     i += n;
                     break;
                 }
-                found.entry(cue.signal_id.to_string()).or_insert_with(|| {
-                    (
-                        cue.tokens.join(" "),
-                        cue.strength,
-                        "stream",
-                    )
-                });
+                found
+                    .entry(cue.signal_id.to_string())
+                    .or_insert_with(|| (cue.tokens.join(" "), cue.strength, "stream"));
                 matched = true;
                 i += n;
                 break;
@@ -818,8 +883,7 @@ fn score_complexity(
             detail: format!("messaging short word_count={wc}"),
         });
     }
-    if surface_hint == Some(SurfaceHint::Browser) && wc < BROWSER_SHORT_WORDS && section_hits == 0
-    {
+    if surface_hint == Some(SurfaceHint::Browser) && wc < BROWSER_SHORT_WORDS && section_hits == 0 {
         let weight = weights::SURFACE_BROWSER_SHORT;
         score += weight;
         contributions.push(ScoreContribution {
@@ -923,8 +987,7 @@ fn decision(
 /// 6. Complexity ≥ threshold → policy cloud table
 /// 7. Default → local
 pub fn route_intent(observation: &IntentObservation) -> RoutingDecision {
-    let surface_degraded =
-        observation.surface_hint.is_none() && observation.process_hint.is_none();
+    let surface_degraded = observation.surface_hint.is_none() && observation.process_hint.is_none();
 
     let (score, contributions, section_hits) = score_complexity(
         &observation.primary_text,
@@ -1053,9 +1116,9 @@ mod tests {
     fn observation_from_fixture(fx: &Value) -> IntentObservation {
         let surface_hint = match fx.get("surface_hint") {
             None | Some(Value::Null) => None,
-            Some(Value::String(s)) => Some(
-                SurfaceHint::parse(s).unwrap_or_else(|| panic!("bad surface_hint {s}")),
-            ),
+            Some(Value::String(s)) => {
+                Some(SurfaceHint::parse(s).unwrap_or_else(|| panic!("bad surface_hint {s}")))
+            }
             other => panic!("bad surface_hint {other:?}"),
         };
 
@@ -1141,7 +1204,11 @@ mod tests {
     fn promotes_all_iri_corpus_fixtures() {
         let corpus = load_corpus();
         let fixtures = corpus["fixtures"].as_array().expect("fixtures");
-        assert_eq!(fixtures.len(), 40, "expected full #141 corpus (40 fixtures)");
+        assert_eq!(
+            fixtures.len(),
+            40,
+            "expected full #141 corpus (40 fixtures)"
+        );
 
         let mut seen_rules: HashSet<&'static str> = HashSet::new();
 

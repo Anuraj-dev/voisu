@@ -2,19 +2,19 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use voisu_core::{
-    clamp_utf8_bytes, correlation_id, export_record, is_text_sha256_fingerprint, replay_capture,
-    text_sha256_fingerprint, unix_millis_now, AudioChunk, BoundaryFuture, CapturedAudio,
+    AudioChunk, BoundaryFuture, CapturedAudio, DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS,
     DebugAudioRecord, DiagnosticRecord, DiagnosticStore, EnglishEligibilityOutcome,
-    IntentReconstructionDiagnostic, IntentReconstructionEligibility, IntentReconstructionOutcome,
-    IntentReconstructionEvidence, LifecycleStage, PreparedTranscriptDecision,
-    Provider, ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream,
-    ProviderStreams, RetentionPolicy, SmartWritingDiagnostic, SmartWritingEditEvidence,
-    SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode, SourceTranscript, Transcript,
-    TranscriptDecision, TranscriptSelection, TranscriptValidator, DEFAULT_MAX_AGE,
-    DEFAULT_MAX_RECORDS, MAX_MODEL_ID_UTF8_BYTES, MAX_SMART_WRITING_DIAGNOSTIC_EDITS,
-    MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES, MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES,
-    MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES, REDACTED, SMART_WRITING_DIAGNOSTIC_VERSION,
-    TEXT_SHA256_FINGERPRINT_LEN,
+    IntentReconstructionDiagnostic, IntentReconstructionEligibility, IntentReconstructionEvidence,
+    IntentReconstructionOutcome, LifecycleStage, MAX_MODEL_ID_UTF8_BYTES,
+    MAX_SMART_WRITING_DIAGNOSTIC_EDITS, MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES,
+    MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES, MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES,
+    PreparedTranscriptDecision, Provider, ProviderCoordinator, ProviderFailure,
+    ProviderFailureStage, ProviderStream, ProviderStreams, REDACTED, RetentionPolicy,
+    SMART_WRITING_DIAGNOSTIC_VERSION, SmartWritingDiagnostic, SmartWritingEditEvidence,
+    SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode, SourceTranscript,
+    TEXT_SHA256_FINGERPRINT_LEN, Transcript, TranscriptDecision, TranscriptSelection,
+    TranscriptValidator, clamp_utf8_bytes, correlation_id, export_record,
+    is_text_sha256_fingerprint, replay_capture, text_sha256_fingerprint, unix_millis_now,
 };
 
 fn record_at(id: u64, recorded_at_unix_ms: u64) -> DiagnosticRecord {
@@ -170,7 +170,9 @@ fn a_torn_final_line_costs_one_record_not_the_whole_history() {
         .record(DiagnosticRecord::new("corr-4".to_owned(), 4))
         .unwrap();
     assert!(
-        returned.iter().any(|record| record.correlation_id == "corr-4"),
+        returned
+            .iter()
+            .any(|record| record.correlation_id == "corr-4"),
         "record() accepted the post-tear record"
     );
     assert!(
@@ -184,7 +186,10 @@ fn correlation_id_is_unique_and_carries_the_recording_id() {
     let first = correlation_id(7);
     let second = correlation_id(7);
     assert_ne!(first, second, "correlation IDs must not collide");
-    assert!(first.contains("-7-"), "correlation ID must carry recording id: {first}");
+    assert!(
+        first.contains("-7-"),
+        "correlation ID must carry recording id: {first}"
+    );
 }
 
 #[test]
@@ -195,10 +200,22 @@ fn retention_drops_records_beyond_the_count_bound_newest_first() {
         debug_audio_ttl: Duration::from_secs(3600),
     };
     let now = 10_000;
-    let records = vec![record_at(1, now - 300), record_at(2, now - 200), record_at(3, now - 100)];
+    let records = vec![
+        record_at(1, now - 300),
+        record_at(2, now - 200),
+        record_at(3, now - 100),
+    ];
     let outcome = policy.prune(records, now);
-    let kept: Vec<u64> = outcome.kept.iter().map(|record| record.recording_id).collect();
-    assert_eq!(kept, vec![2, 3], "the two newest records are retained, in chronological order");
+    let kept: Vec<u64> = outcome
+        .kept
+        .iter()
+        .map(|record| record.recording_id)
+        .collect();
+    assert_eq!(
+        kept,
+        vec![2, 3],
+        "the two newest records are retained, in chronological order"
+    );
 }
 
 #[test]
@@ -211,8 +228,16 @@ fn retention_expires_records_past_the_age_bound() {
     let now = 10_000;
     let records = vec![record_at(1, now - 5_000), record_at(2, now - 100)];
     let outcome = policy.prune(records, now);
-    let kept: Vec<u64> = outcome.kept.iter().map(|record| record.recording_id).collect();
-    assert_eq!(kept, vec![2], "only the fresh record survives the age bound");
+    let kept: Vec<u64> = outcome
+        .kept
+        .iter()
+        .map(|record| record.recording_id)
+        .collect();
+    assert_eq!(
+        kept,
+        vec![2],
+        "only the fresh record survives the age bound"
+    );
 }
 
 #[test]
@@ -242,7 +267,11 @@ fn default_retention_fills_the_count_bound_from_a_week_of_recordings() {
         .collect();
 
     let outcome = policy.prune(week, now);
-    let kept: Vec<u64> = outcome.kept.iter().map(|record| record.recording_id).collect();
+    let kept: Vec<u64> = outcome
+        .kept
+        .iter()
+        .map(|record| record.recording_id)
+        .collect();
     assert_eq!(
         kept.len(),
         DEFAULT_MAX_RECORDS,
@@ -281,7 +310,11 @@ fn default_retention_prunes_past_the_age_bound_and_keeps_everything_newer() {
     ];
 
     let outcome = policy.prune(records, now);
-    let kept: Vec<u64> = outcome.kept.iter().map(|record| record.recording_id).collect();
+    let kept: Vec<u64> = outcome
+        .kept
+        .iter()
+        .map(|record| record.recording_id)
+        .collect();
     assert_eq!(
         kept,
         vec![3, 4, 5, 6],
@@ -325,8 +358,15 @@ fn retention_detaches_expired_debug_audio_but_keeps_the_record() {
     });
     let outcome = policy.prune(vec![record], now);
     assert_eq!(outcome.kept.len(), 1, "the record survives");
-    assert!(outcome.kept[0].debug_audio.is_none(), "expired audio is detached");
-    assert_eq!(outcome.expired_audio.len(), 1, "the expired audio path is returned for deletion");
+    assert!(
+        outcome.kept[0].debug_audio.is_none(),
+        "expired audio is detached"
+    );
+    assert_eq!(
+        outcome.expired_audio.len(),
+        1,
+        "the expired audio path is returned for deletion"
+    );
 }
 
 #[test]
@@ -334,7 +374,10 @@ fn export_environment_is_an_explicit_allowlist_with_no_secret_keys() {
     let record = record_at(1, unix_millis_now());
     let environment = vec![
         ("VOISU_GROQ_API_KEY".to_owned(), "super-secret".to_owned()),
-        ("VOISU_GROQ_TRANSCRIPTION_URL".to_owned(), "https://groq.test/v1".to_owned()),
+        (
+            "VOISU_GROQ_TRANSCRIPTION_URL".to_owned(),
+            "https://groq.test/v1".to_owned(),
+        ),
         ("VOISU_CUSTOM_NOTE".to_owned(), "maybe-a-secret".to_owned()),
         ("HOME".to_owned(), "/home/person".to_owned()),
         ("AWS_SECRET_ACCESS_KEY".to_owned(), "leak".to_owned()),
@@ -345,18 +388,30 @@ fn export_environment_is_an_explicit_allowlist_with_no_secret_keys() {
         "secret keys never appear in an export, even masked"
     );
     assert_eq!(
-        export.environment.get("VOISU_GROQ_TRANSCRIPTION_URL").map(String::as_str),
+        export
+            .environment
+            .get("VOISU_GROQ_TRANSCRIPTION_URL")
+            .map(String::as_str),
         Some("https://groq.test/v1"),
     );
     assert!(
         !export.environment.contains_key("VOISU_CUSTOM_NOTE"),
         "unknown VOISU_* values are omitted, not trusted"
     );
-    assert!(!export.environment.contains_key("HOME"), "unrelated env is dropped");
+    assert!(
+        !export.environment.contains_key("HOME"),
+        "unrelated env is dropped"
+    );
     assert!(!export.environment.contains_key("AWS_SECRET_ACCESS_KEY"));
     let encoded = serde_json::to_string(&export).unwrap();
-    assert!(!encoded.contains("super-secret"), "no credential value survives export: {encoded}");
-    assert!(!encoded.contains("maybe-a-secret"), "no unlisted value survives export: {encoded}");
+    assert!(
+        !encoded.contains("super-secret"),
+        "no credential value survives export: {encoded}"
+    );
+    assert!(
+        !encoded.contains("maybe-a-secret"),
+        "no unlisted value survives export: {encoded}"
+    );
 }
 
 #[test]
@@ -371,16 +426,20 @@ fn export_scrubs_secret_values_from_transcripts_and_reasons() {
     record.set_final_transcript("use sk-live-hostile-123 for auth".to_owned());
     record.validation_reason = Some("candidate contained sk-live-hostile-123".to_owned());
     record.fallback_reason = Some("sk-live-hostile-123 rejected".to_owned());
-    let environment = vec![
-        ("VOISU_GROQ_API_KEY".to_owned(), "sk-live-hostile-123".to_owned()),
-    ];
+    let environment = vec![(
+        "VOISU_GROQ_API_KEY".to_owned(),
+        "sk-live-hostile-123".to_owned(),
+    )];
     let export = export_record(record, environment);
     let encoded = serde_json::to_string(&export).unwrap();
     assert!(
         !encoded.contains("sk-live-hostile-123"),
         "a known secret value must not survive anywhere in an export: {encoded}"
     );
-    assert!(encoded.contains(REDACTED), "the secret is masked, not silently dropped");
+    assert!(
+        encoded.contains(REDACTED),
+        "the secret is masked, not silently dropped"
+    );
 }
 
 #[test]
@@ -461,8 +520,14 @@ fn export_structurally_scrubs_url_secrets_not_derived_from_secret_env_keys() {
     )];
     let export = export_record(record, environment);
     let encoded = serde_json::to_string(&export).unwrap();
-    assert!(!encoded.contains("hunter2"), "URL userinfo must be stripped: {encoded}");
-    assert!(!encoded.contains("token=abc123"), "URL query secret must be stripped: {encoded}");
+    assert!(
+        !encoded.contains("hunter2"),
+        "URL userinfo must be stripped: {encoded}"
+    );
+    assert!(
+        !encoded.contains("token=abc123"),
+        "URL query secret must be stripped: {encoded}"
+    );
     assert!(
         encoded.contains("https://api.deepgram.test/v1/listen"),
         "the non-secret host and path are preserved: {encoded}"
@@ -482,9 +547,15 @@ fn url_scrubbing_handles_nested_json_uppercase_and_websocket_schemes() {
     let nested = scrub_embedded_urls(
         r#"{"httpStatus":500,"url":"https://user:hunter2@h.test/listen?token=abc"}"#,
     );
-    assert!(!nested.contains("hunter2"), "later URL must still be scrubbed: {nested}");
+    assert!(
+        !nested.contains("hunter2"),
+        "later URL must still be scrubbed: {nested}"
+    );
     assert!(!nested.contains("token=abc"), "{nested}");
-    assert!(nested.contains("https://h.test/listen"), "host/path preserved: {nested}");
+    assert!(
+        nested.contains("https://h.test/listen"),
+        "host/path preserved: {nested}"
+    );
     // Uppercase scheme is caught.
     assert!(!scrub_embedded_urls("HTTPS://user:pw@h.test/x").contains("pw"));
     // Websocket schemes (Deepgram streaming) are caught.
@@ -500,7 +571,10 @@ fn export_scrubs_secret_values_from_the_delivery_fallback_reason() {
     let mut record = record_at(1, unix_millis_now());
     record.delivery_fallback_reason =
         Some("clipboard fallback: key sk-live-hostile-123 rejected".to_owned());
-    let environment = vec![("VOISU_GROQ_API_KEY".to_owned(), "sk-live-hostile-123".to_owned())];
+    let environment = vec![(
+        "VOISU_GROQ_API_KEY".to_owned(),
+        "sk-live-hostile-123".to_owned(),
+    )];
     let export = export_record(record, environment);
     let encoded = serde_json::to_string(&export).unwrap();
     assert!(
@@ -520,7 +594,10 @@ fn export_scrubs_secret_values_from_provider_failure_diagnostics() {
         ProviderFailureStage::Completion,
         "auth failed with token sk-live-hostile-123".to_owned(),
     )];
-    let environment = vec![("VOISU_DEEPGRAM_API_KEY".to_owned(), "sk-live-hostile-123".to_owned())];
+    let environment = vec![(
+        "VOISU_DEEPGRAM_API_KEY".to_owned(),
+        "sk-live-hostile-123".to_owned(),
+    )];
     let export = export_record(record, environment);
     let encoded = serde_json::to_string(&export).unwrap();
     assert!(
@@ -546,8 +623,14 @@ fn exported_endpoint_urls_lose_userinfo_credentials_and_query_parameters() {
     )];
     let export = export_record(record_at(1, unix_millis_now()), environment);
     let encoded = serde_json::to_string(&export).unwrap();
-    assert!(!encoded.contains("hunter2"), "URL userinfo must be stripped: {encoded}");
-    assert!(!encoded.contains("token=leak"), "URL query must be stripped: {encoded}");
+    assert!(
+        !encoded.contains("hunter2"),
+        "URL userinfo must be stripped: {encoded}"
+    );
+    assert!(
+        !encoded.contains("token=leak"),
+        "URL query must be stripped: {encoded}"
+    );
 }
 
 #[test]
@@ -562,7 +645,10 @@ fn store_appends_prunes_and_finds_by_correlation_id() {
 
     for id in 1..=3 {
         let mut record = DiagnosticRecord::new(format!("corr-{id}"), id);
-        record.stages = vec![LifecycleStage::CaptureStarted, LifecycleStage::DeliveryCompleted];
+        record.stages = vec![
+            LifecycleStage::CaptureStarted,
+            LifecycleStage::DeliveryCompleted,
+        ];
         record.set_final_transcript(format!("transcript {id}"));
         store.record(record).unwrap();
     }
@@ -571,7 +657,10 @@ fn store_appends_prunes_and_finds_by_correlation_id() {
     assert_eq!(history.len(), 2, "retention bounds the stored history");
     assert_eq!(history[0].correlation_id, "corr-3", "newest first");
     assert!(store.find("corr-3").unwrap().is_some());
-    assert!(store.find("corr-1").unwrap().is_none(), "pruned record is gone");
+    assert!(
+        store.find("corr-1").unwrap().is_none(),
+        "pruned record is gone"
+    );
 }
 
 #[test]
@@ -583,9 +672,13 @@ fn store_debug_audio_is_written_privately_and_cleaned_up_on_expiry() {
         debug_audio_ttl: Duration::from_secs(0),
     };
     let store = DiagnosticStore::open(dir.path().join("diag"), policy).unwrap();
-    let audio = store.store_debug_audio("corr-audio", &[1, 2, 3, 4]).unwrap();
+    let audio = store
+        .store_debug_audio("corr-audio", &[1, 2, 3, 4])
+        .unwrap();
     assert!(
-        audio.file_name.contains(&format!("exp{}", audio.expires_at_unix_ms)),
+        audio
+            .file_name
+            .contains(&format!("exp{}", audio.expires_at_unix_ms)),
         "the expiry is encoded in the file name: {}",
         audio.file_name
     );
@@ -598,7 +691,10 @@ fn store_debug_audio_is_written_privately_and_cleaned_up_on_expiry() {
 
     // With a zero TTL the next history read must expire and remove the capture.
     let history = store.history().unwrap();
-    assert!(history[0].debug_audio.is_none(), "expired audio is detached from the record");
+    assert!(
+        history[0].debug_audio.is_none(),
+        "expired audio is detached from the record"
+    );
     assert!(!path.exists(), "expired debug audio file is removed safely");
 }
 
@@ -624,7 +720,10 @@ fn startup_cleanup_purges_orphaned_and_expired_debug_audio() {
 
     assert!(!expired_orphan.exists(), "expired orphan is purged");
     assert!(!junk.exists(), "unparsable orphan is purged");
-    assert!(live_path.exists(), "a referenced, unexpired capture survives");
+    assert!(
+        live_path.exists(),
+        "a referenced, unexpired capture survives"
+    );
 }
 
 #[test]
@@ -649,7 +748,10 @@ fn tampered_history_audio_paths_cannot_steer_deletion_outside_the_store() {
     store.record(record).unwrap();
     let _ = store.history().unwrap();
 
-    assert!(victim.exists(), "cleanup must never delete outside the audio directory");
+    assert!(
+        victim.exists(),
+        "cleanup must never delete outside the audio directory"
+    );
 }
 
 #[test]
@@ -678,7 +780,11 @@ fn concurrent_writers_never_lose_records_or_corrupt_history() {
         handle.join().unwrap();
     }
     let history = store.history().unwrap();
-    assert_eq!(history.len(), 100, "no record is lost to a concurrent stale rewrite");
+    assert_eq!(
+        history.len(),
+        100,
+        "no record is lost to a concurrent stale rewrite"
+    );
 }
 
 struct FixtureStream {
@@ -709,9 +815,15 @@ impl ProviderStream for FixtureStream {
 struct EchoValidator;
 
 impl TranscriptValidator for EchoValidator {
-    fn validate(&mut self, sources: Vec<SourceTranscript>) -> BoundaryFuture<'_, TranscriptDecision> {
+    fn validate(
+        &mut self,
+        sources: Vec<SourceTranscript>,
+    ) -> BoundaryFuture<'_, TranscriptDecision> {
         Box::pin(async move {
-            let text = sources.first().map(|source| source.text.clone()).unwrap_or_default();
+            let text = sources
+                .first()
+                .map(|source| source.text.clone())
+                .unwrap_or_default();
             Ok(TranscriptDecision {
                 transcript: Transcript(text),
                 selection: TranscriptSelection::NearIdenticalGroq,
@@ -794,7 +906,11 @@ async fn replay_runs_a_fixed_fixture_through_provider_and_validation_boundaries(
     )
     .await
     .expect("replay succeeds");
-    assert_eq!(outcome.source_transcripts.len(), 2, "both providers replayed the fixture");
+    assert_eq!(
+        outcome.source_transcripts.len(),
+        2,
+        "both providers replayed the fixture"
+    );
     assert_eq!(outcome.decision.transcript.0, "replayed dictation");
 }
 
@@ -813,9 +929,13 @@ async fn replay_reconstruction_clock_excludes_preparation() {
     let coordinator =
         ProviderCoordinator::start(Duration::from_secs(5), Duration::from_secs(1), streams);
     let mut validator = DelayedPrepareValidator;
-    let outcome = replay_capture(CapturedAudio::new(vec![0_u8; 3_200]), coordinator, &mut validator)
-        .await
-        .expect("replay succeeds");
+    let outcome = replay_capture(
+        CapturedAudio::new(vec![0_u8; 3_200]),
+        coordinator,
+        &mut validator,
+    )
+    .await
+    .expect("replay succeeds");
     assert!(
         outcome.reconstruction_elapsed_ms < 100,
         "preparation latency must not be attributed to reconstruction: {} ms",
@@ -827,11 +947,17 @@ async fn replay_reconstruction_clock_excludes_preparation() {
 fn sanitize_url_fails_closed_on_malformed_and_unrecognized_inputs() {
     // Adversarial: scheme-less URLs still carry credentials — the naive parse
     // would pass "user:pass@host/path" straight through.
-    assert_eq!(voisu_core::sanitize_url("user:hunter2@groq.test/v1"), REDACTED);
+    assert_eq!(
+        voisu_core::sanitize_url("user:hunter2@groq.test/v1"),
+        REDACTED
+    );
     assert_eq!(voisu_core::sanitize_url("groq.test/v1?key=leak"), REDACTED);
     assert_eq!(voisu_core::sanitize_url(""), REDACTED);
     // Unrecognized schemes are not reasoned about — redact entirely.
-    assert_eq!(voisu_core::sanitize_url("ftp://user:pass@host/file"), REDACTED);
+    assert_eq!(
+        voisu_core::sanitize_url("ftp://user:pass@host/file"),
+        REDACTED
+    );
     assert_eq!(voisu_core::sanitize_url("javascript://alert(1)"), REDACTED);
     // Malformed: empty authority.
     assert_eq!(voisu_core::sanitize_url("http://"), REDACTED);
@@ -841,7 +967,10 @@ fn sanitize_url_fails_closed_on_malformed_and_unrecognized_inputs() {
         voisu_core::sanitize_url("https://host.test:8443/v1/audio?k=leak"),
         "https://host.test:8443/v1/audio"
     );
-    assert_eq!(voisu_core::sanitize_url("HTTPS://host.test"), "HTTPS://host.test");
+    assert_eq!(
+        voisu_core::sanitize_url("HTTPS://host.test"),
+        "HTTPS://host.test"
+    );
 }
 
 #[test]
@@ -863,7 +992,10 @@ fn export_allowlist_passes_the_groq_model_name_through() {
     let environment = vec![("VOISU_GROQ_MODEL".to_owned(), "whisper-large-v3".to_owned())];
     let export = export_record(record_at(1, unix_millis_now()), environment);
     assert_eq!(
-        export.environment.get("VOISU_GROQ_MODEL").map(String::as_str),
+        export
+            .environment
+            .get("VOISU_GROQ_MODEL")
+            .map(String::as_str),
         Some("whisper-large-v3"),
     );
 }
@@ -932,13 +1064,22 @@ fn sanitize_url_rejects_malformed_hosts_and_invalid_ports() {
     // Adversarial: hosts containing whitespace or backslashes are not DNS-safe
     // and must redact, not pass through.
     assert_eq!(voisu_core::sanitize_url("http://ho st.test/v1"), REDACTED);
-    assert_eq!(voisu_core::sanitize_url("http://host\\evil.test/v1"), REDACTED);
+    assert_eq!(
+        voisu_core::sanitize_url("http://host\\evil.test/v1"),
+        REDACTED
+    );
     assert_eq!(voisu_core::sanitize_url("https://host.test\t/v1"), REDACTED);
     assert_eq!(voisu_core::sanitize_url("https://host_test/v1"), REDACTED);
     // Ports must parse as a non-zero u16.
     assert_eq!(voisu_core::sanitize_url("https://host.test:0/v1"), REDACTED);
-    assert_eq!(voisu_core::sanitize_url("https://host.test:99999/v1"), REDACTED);
-    assert_eq!(voisu_core::sanitize_url("https://host.test:+443/v1"), REDACTED);
+    assert_eq!(
+        voisu_core::sanitize_url("https://host.test:99999/v1"),
+        REDACTED
+    );
+    assert_eq!(
+        voisu_core::sanitize_url("https://host.test:+443/v1"),
+        REDACTED
+    );
     assert_eq!(voisu_core::sanitize_url("https://host.test:/v1"), REDACTED);
     // Valid shapes still sanitize rather than redact.
     assert_eq!(
@@ -954,7 +1095,10 @@ fn sanitize_url_rejects_malformed_hosts_and_invalid_ports() {
         "https://[2001:db8::1]/v1"
     );
     // Malformed IPv6 literals redact.
-    assert_eq!(voisu_core::sanitize_url("https://[2001:db8::1/v1"), REDACTED);
+    assert_eq!(
+        voisu_core::sanitize_url("https://[2001:db8::1/v1"),
+        REDACTED
+    );
     assert_eq!(voisu_core::sanitize_url("https://[bad host]/v1"), REDACTED);
 }
 
@@ -999,7 +1143,10 @@ fn sanitize_url_validates_ipv6_structure_not_just_characters() {
     // Adversarial: hex-and-colon soup that a character check accepts but a
     // structural parse rejects.
     assert_eq!(voisu_core::sanitize_url("https://[deadbeef]/v1"), REDACTED);
-    assert_eq!(voisu_core::sanitize_url("https://[2001:db8::1::2]/v1"), REDACTED);
+    assert_eq!(
+        voisu_core::sanitize_url("https://[2001:db8::1::2]/v1"),
+        REDACTED
+    );
     // A well-formed literal still sanitizes rather than redacts.
     assert_eq!(
         voisu_core::sanitize_url("https://[2001:db8::1]/v1?k=leak"),
@@ -1015,9 +1162,10 @@ fn smart_writing_for_outcome(outcome: SmartWritingOutcome) -> SmartWritingDiagno
     let (mode, eligibility) = match outcome {
         SmartWritingOutcome::Literal
         | SmartWritingOutcome::LiteralCommands
-        | SmartWritingOutcome::LiteralFallback => {
-            (SmartWritingMode::Literal, EnglishEligibilityOutcome::Eligible)
-        }
+        | SmartWritingOutcome::LiteralFallback => (
+            SmartWritingMode::Literal,
+            EnglishEligibilityOutcome::Eligible,
+        ),
         SmartWritingOutcome::FormattingOnly
         | SmartWritingOutcome::FormattingAndGrammar
         | SmartWritingOutcome::IdentityFallback => {
@@ -1116,7 +1264,9 @@ fn smart_writing_every_outcome_and_major_reason_path_round_trips_on_a_record() {
         smart.total_gate_latency_ms = Some(50);
         smart.credential_prep_latency_ms = Some(12);
         smart.reap_watchdog_crossed = *outcome == SmartWritingOutcome::IdentityFallback
-            && smart.reason_codes.contains(&SmartWritingReasonCode::CleanupOverrun);
+            && smart
+                .reason_codes
+                .contains(&SmartWritingReasonCode::CleanupOverrun);
 
         let mut record = DiagnosticRecord::new(format!("sw-outcome-{index}"), index as u64 + 1);
         record.smart_writing = Some(smart.clone());
@@ -1163,7 +1313,11 @@ fn smart_writing_text_and_model_clamps_preserve_full_fingerprints() {
     );
     assert!(smart.validated_before.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
     assert!(smart.rendered_after.len() <= MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES);
-    assert!(smart.validated_before.is_char_boundary(smart.validated_before.len()));
+    assert!(
+        smart
+            .validated_before
+            .is_char_boundary(smart.validated_before.len())
+    );
     // Fingerprints cover the unclamped source so equality remains inspectable.
     assert_eq!(
         smart.validated_before_sha256,
@@ -1292,8 +1446,14 @@ fn smart_writing_export_structurally_scrubs_url_secrets_in_free_form_error() {
     record.smart_writing = Some(smart);
     let export = export_record(record, Vec::<(String, String)>::new());
     let encoded = serde_json::to_string(&export).unwrap();
-    assert!(!encoded.contains("user:pw"), "userinfo must be stripped: {encoded}");
-    assert!(!encoded.contains("token=xyz"), "query secrets must be stripped: {encoded}");
+    assert!(
+        !encoded.contains("user:pw"),
+        "userinfo must be stripped: {encoded}"
+    );
+    assert!(
+        !encoded.contains("token=xyz"),
+        "query secrets must be stripped: {encoded}"
+    );
 }
 
 #[test]
@@ -1334,9 +1494,15 @@ fn pre_smart_writing_history_records_deserialize_without_smart_writing() {
     store.record(with_sw).unwrap();
     let mixed = store.history().unwrap();
     assert_eq!(mixed.len(), 2);
-    let post = mixed.iter().find(|r| r.correlation_id == "post-sw").unwrap();
+    let post = mixed
+        .iter()
+        .find(|r| r.correlation_id == "post-sw")
+        .unwrap();
     assert!(post.smart_writing.is_some());
-    let pre = mixed.iter().find(|r| r.correlation_id == "pre-sw-1").unwrap();
+    let pre = mixed
+        .iter()
+        .find(|r| r.correlation_id == "pre-sw-1")
+        .unwrap();
     assert!(pre.smart_writing.is_none());
 }
 
@@ -1381,7 +1547,10 @@ fn smart_writing_persistence_normalizes_publicly_mutated_oversized_fields() {
     smart.free_form_error = Some("e".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES + 70));
     smart.edits = (0..(MAX_SMART_WRITING_DIAGNOSTIC_EDITS + 12))
         .map(|i| SmartWritingEditEvidence {
-            edit_id: format!("e{i}-{}", "i".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES)),
+            edit_id: format!(
+                "e{i}-{}",
+                "i".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES)
+            ),
             rule_id: "r".repeat(MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES + 30),
             start_utf8: i as u64,
             end_utf8: i as u64 + 1,
@@ -1523,7 +1692,10 @@ fn smart_writing_export_reclamp_after_redaction_expansion_past_bound() {
     // Scrub expanded (REDACTED is longer than SECRET) then re-clamped to exact
     // budgets. At a max-full field the clamp cuts inside REDACTED, so only a
     // leading prefix of the mask remains — still within budget, secret gone.
-    let free = sw.free_form_error.as_ref().expect("free_form_error present");
+    let free = sw
+        .free_form_error
+        .as_ref()
+        .expect("free_form_error present");
     assert_eq!(free.len(), MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
     assert!(
         free.contains('<'),
@@ -1598,10 +1770,22 @@ fn text_sha256_fingerprint_is_stable_and_prefixed() {
     );
     // Form validator rejects free-form, wrong case, wrong length, and uppercase hex.
     assert!(!is_text_sha256_fingerprint("sk-not-a-fingerprint"));
-    assert!(!is_text_sha256_fingerprint(&format!("sha256:{}", "A".repeat(64))));
-    assert!(!is_text_sha256_fingerprint(&format!("sha256:{}", "a".repeat(63))));
-    assert!(!is_text_sha256_fingerprint(&format!("SHA256:{}", "a".repeat(64))));
-    assert!(!is_text_sha256_fingerprint(&format!("sha256:{}", "g".repeat(64))));
+    assert!(!is_text_sha256_fingerprint(&format!(
+        "sha256:{}",
+        "A".repeat(64)
+    )));
+    assert!(!is_text_sha256_fingerprint(&format!(
+        "sha256:{}",
+        "a".repeat(63)
+    )));
+    assert!(!is_text_sha256_fingerprint(&format!(
+        "SHA256:{}",
+        "a".repeat(64)
+    )));
+    assert!(!is_text_sha256_fingerprint(&format!(
+        "sha256:{}",
+        "g".repeat(64)
+    )));
 }
 
 #[test]
@@ -1669,7 +1853,10 @@ fn smart_writing_persistence_rejects_invalid_fingerprints() {
     store.record(record).unwrap();
     let loaded = store.find("sw-fp-oversized").unwrap().unwrap();
     let sw = loaded.smart_writing.as_ref().unwrap();
-    assert_eq!(sw.validated_before_sha256.len(), TEXT_SHA256_FINGERPRINT_LEN);
+    assert_eq!(
+        sw.validated_before_sha256.len(),
+        TEXT_SHA256_FINGERPRINT_LEN
+    );
     assert_eq!(sw.rendered_after_sha256.len(), TEXT_SHA256_FINGERPRINT_LEN);
     assert!(is_text_sha256_fingerprint(&sw.validated_before_sha256));
     assert!(is_text_sha256_fingerprint(&sw.rendered_after_sha256));

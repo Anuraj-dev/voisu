@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -268,9 +268,9 @@ fn guarded_delivery(
     focus: Vec<Option<WindowIdentity>>,
     events: Arc<Mutex<Vec<String>>>,
 ) -> GuardedDelivery {
-    let probe: SharedFocusProbe = Arc::new(tokio::sync::Mutex::new(Box::new(
-        SequenceFocusProbe(focus.into()),
-    )));
+    let probe: SharedFocusProbe = Arc::new(tokio::sync::Mutex::new(Box::new(SequenceFocusProbe(
+        focus.into(),
+    ))));
     GuardedDelivery::with_boundaries(
         probe,
         Box::new(RecordingDelivery {
@@ -407,13 +407,16 @@ async fn verified_paste_preserves_clipboard_then_attempts_one_paste_action() {
         }),
     );
 
-    let outcome = delivery.deliver(Transcript("final transcript".to_owned())).await.unwrap();
+    let outcome = delivery
+        .deliver(Transcript("final transcript".to_owned()))
+        .await
+        .unwrap();
 
     assert_eq!(outcome.method, DeliveryMethod::CompositorSubmitted);
-    assert_eq!(events.lock().unwrap().as_slice(), [
-        "clipboard:final transcript",
-        "paste:CTRL + SHIFT + P",
-    ]);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["clipboard:final transcript", "paste:CTRL + SHIFT + P",]
+    );
 }
 
 #[tokio::test]
@@ -429,17 +432,22 @@ async fn paste_failure_keeps_the_final_transcript_on_clipboard_and_does_not_retr
         }),
     );
 
-    let outcome = delivery.deliver(Transcript("recoverable transcript".to_owned())).await.unwrap();
+    let outcome = delivery
+        .deliver(Transcript("recoverable transcript".to_owned()))
+        .await
+        .unwrap();
 
     assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
-    assert!(outcome
-        .fallback_reason
-        .as_deref()
-        .is_some_and(|reason| reason.contains("Transcript remains on the clipboard")));
-    assert_eq!(events.lock().unwrap().as_slice(), [
-        "clipboard:recoverable transcript",
-        "paste:CTRL + SHIFT + P",
-    ]);
+    assert!(
+        outcome
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Transcript remains on the clipboard"))
+    );
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["clipboard:recoverable transcript", "paste:CTRL + SHIFT + P",]
+    );
 }
 
 #[tokio::test]
@@ -458,8 +466,14 @@ async fn paste_portal_setup_is_backgrounded_and_later_delivers_the_shortcut() {
         }),
     );
 
-    let first = paste.invoke(&action).await.expect_err("setup should be pending");
-    assert_eq!(first.diagnostic(), "Paste portal permission request pending");
+    let first = paste
+        .invoke(&action)
+        .await
+        .expect_err("setup should be pending");
+    assert_eq!(
+        first.diagnostic(),
+        "Paste portal permission request pending"
+    );
     tokio::time::timeout(Duration::from_secs(1), control.started.notified())
         .await
         .expect("paste portal setup should start");
@@ -470,7 +484,10 @@ async fn paste_portal_setup_is_backgrounded_and_later_delivers_the_shortcut() {
     paste.invoke(&action).await.unwrap();
 
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
-    assert_eq!(events.lock().unwrap().as_slice(), ["shortcut:CTRL + SHIFT + P"]);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["shortcut:CTRL + SHIFT + P"]
+    );
 }
 
 #[tokio::test]
@@ -502,10 +519,12 @@ async fn paste_delivery_returns_before_permission_finishes_and_preserves_each_tr
     .expect("permission approval must not block Transcript completion")
     .unwrap();
     assert_eq!(first.method, DeliveryMethod::ClipboardFallback);
-    assert!(first
-        .fallback_reason
-        .as_deref()
-        .is_some_and(|reason| reason.contains("permission request pending")));
+    assert!(
+        first
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("permission request pending"))
+    );
 
     tokio::time::timeout(Duration::from_secs(1), control.started.notified())
         .await
@@ -551,7 +570,10 @@ async fn paste_portal_terminal_denial_is_not_retried() {
         .await
         .expect("paste portal denial should complete");
     let first = paste.invoke(&action).await.expect_err("denial must fail");
-    let second = paste.invoke(&action).await.expect_err("denial must stay terminal");
+    let second = paste
+        .invoke(&action)
+        .await
+        .expect_err("denial must stay terminal");
 
     assert_eq!(first.diagnostic(), "permission denied");
     assert_eq!(second.diagnostic(), "permission denied");
@@ -566,7 +588,10 @@ async fn direct_delivery_opt_out_reports_its_actual_reason() {
         "direct Delivery disabled by test; Transcript remains on the clipboard",
     );
 
-    let outcome = delivery.deliver(Transcript("opt out".to_owned())).await.unwrap();
+    let outcome = delivery
+        .deliver(Transcript("opt out".to_owned()))
+        .await
+        .unwrap();
 
     assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
     assert_eq!(
@@ -582,14 +607,20 @@ async fn no_verified_paste_action_is_explicitly_clipboard_only() {
         RecordingClipboard(Arc::clone(&events)),
     ));
 
-    let outcome = delivery.deliver(Transcript("clipboard only".to_owned())).await.unwrap();
+    let outcome = delivery
+        .deliver(Transcript("clipboard only".to_owned()))
+        .await
+        .unwrap();
 
     assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
     assert_eq!(
         outcome.fallback_reason.as_deref(),
         Some("no verified Hyprland Paste Action; Transcript remains on the clipboard")
     );
-    assert_eq!(events.lock().unwrap().as_slice(), ["clipboard:clipboard only"]);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["clipboard:clipboard only"]
+    );
 }
 
 #[tokio::test]
@@ -618,7 +649,10 @@ async fn portal_denial_and_unavailable_input_capability_fall_back_explicitly() {
             Box::new(FailingPortal(reason)),
         );
 
-        let outcome = delivery.deliver(Transcript("final only".to_owned())).await.unwrap();
+        let outcome = delivery
+            .deliver(Transcript("final only".to_owned()))
+            .await
+            .unwrap();
 
         assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
         assert_eq!(outcome.fallback_reason.as_deref(), Some(reason));
@@ -641,7 +675,10 @@ async fn permission_denial_is_terminal_for_the_daemon_lifetime() {
     for text in ["first", "second"] {
         let outcome = delivery.deliver(Transcript(text.to_owned())).await.unwrap();
         assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
-        assert_eq!(outcome.fallback_reason.as_deref(), Some("permission denied"));
+        assert_eq!(
+            outcome.fallback_reason.as_deref(),
+            Some("permission denied")
+        );
     }
 
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
@@ -664,7 +701,10 @@ async fn revocation_disconnection_and_compositor_rejection_fall_back_explicitly(
             Box::new(SessionPortal(Some(Box::new(FailingSession(reason))))),
         );
 
-        let outcome = delivery.deliver(Transcript("final only".to_owned())).await.unwrap();
+        let outcome = delivery
+            .deliver(Transcript("final only".to_owned()))
+            .await
+            .unwrap();
 
         assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
         assert_eq!(outcome.fallback_reason.as_deref(), Some(reason));
@@ -791,7 +831,11 @@ impl RemoteDesktopService {
             "/org/freedesktop/portal/desktop/session/{sender}/{}",
             token(&options, "session_handle_token")
         );
-        connection.object_server().at(session.as_str(), SessionService).await.unwrap();
+        connection
+            .object_server()
+            .at(session.as_str(), SessionService)
+            .await
+            .unwrap();
         respond(
             connection,
             &request,
@@ -888,7 +932,10 @@ async fn production_portal_rotates_persistent_permission_and_connects_libei() {
     let address = bus.address.clone();
     let service_calls = Arc::clone(&calls);
     let service = thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         runtime.block_on(async move {
             let _connection = zbus::connection::Builder::address(address.as_str())
                 .unwrap()
@@ -940,7 +987,10 @@ async fn production_portal_rotates_persistent_permission_and_connects_libei() {
     let calls = calls.lock().unwrap();
     assert_eq!(calls.selected_types, 1);
     assert_eq!(calls.persist_mode, 2);
-    assert_eq!(calls.restore_tokens, vec![None, Some("restore-1".to_owned())]);
+    assert_eq!(
+        calls.restore_tokens,
+        vec![None, Some("restore-1".to_owned())]
+    );
     assert_eq!(calls.started, 2);
     assert_eq!(calls.connected_to_eis, 2);
     assert_eq!(fs::read_to_string(token_file).unwrap(), "restore-2");

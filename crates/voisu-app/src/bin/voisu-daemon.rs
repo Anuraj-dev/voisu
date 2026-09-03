@@ -4,60 +4,57 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use futures_util::future::{select, Either};
 use futures_util::FutureExt;
+use futures_util::future::{Either, select};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use voisu_app::audio_level::{LevelRegistry, LevelRing};
-use voisu_app::grammar_http::GrammarHttpClient;
+use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
 use voisu_app::dpr_cloud::DprCloudClient;
 use voisu_app::dpr_pipeline::{
-    dpr_pipeline_clock_origin, dpr_protected_tokens, dpr_source_context, dpr_transform_and_deliver,
     DprCloudCapability, DprPipelineClockOrigin, DprTransformInput, SystemDprPipelineClock,
+    dpr_pipeline_clock_origin, dpr_protected_tokens, dpr_source_context, dpr_transform_and_deliver,
 };
 use voisu_app::focus::SharedFocusProbe;
+use voisu_app::grammar_http::GrammarHttpClient;
 use voisu_app::hyprland_bindings::VerifiedPasteAction;
 use voisu_app::journal::{escape_journal_control, recording_journal_lines};
 use voisu_app::minimal_grammar::MinimalGrammarAdapter;
 use voisu_app::smart_writing::{
-    final_transform_and_deliver, CredentialGateEvidence, FinalTransformInput,
-    GrammarGateCapability, ResolvedRecordingLanguages,
+    CredentialGateEvidence, FinalTransformInput, GrammarGateCapability, ResolvedRecordingLanguages,
+    final_transform_and_deliver,
 };
 use voisu_app::system::{
-    clipboard_backend_display_reachable, groq_transcription_language, CredentialPreparationOwner,
-    DeepgramProvider, DesktopNotifier, FedoraShortcutPortal, GrammarCapability, GroqProvider,
-    GuardedDelivery, MergeResultValidator, PipeWireCapture, PortalClipboardDelivery, ProviderReaper,
-    WlClipboard, CAPTURE_FINALIZE_DEADLINE, DEFAULT_TRANSCRIPTION_LANGUAGE,
-    DIAGNOSTIC_RESPONSE_DEADLINE, PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE,
-    INTENT_RECONSTRUCTION_DEADLINE, RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
+    CAPTURE_FINALIZE_DEADLINE, CredentialPreparationOwner, DEFAULT_TRANSCRIPTION_LANGUAGE,
+    DIAGNOSTIC_RESPONSE_DEADLINE, DeepgramProvider, DesktopNotifier, FedoraShortcutPortal,
+    GrammarCapability, GroqProvider, GuardedDelivery, INTENT_RECONSTRUCTION_DEADLINE,
+    MergeResultValidator, PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE,
+    PipeWireCapture, PortalClipboardDelivery, ProviderReaper, RECONCILIATION_DEADLINE,
+    RECOVERY_ABORT_DEADLINE, WlClipboard, clipboard_backend_display_reachable,
+    groq_transcription_language,
 };
-use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
-    CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonReadiness,
-    DaemonState, DeadlineClock, DeliveryAdapter,
-    DeliveryMethod, DeliveryOutcome, DiagnosticPage, DiagnosticRecord, DiagnosticStore,
-    DprDiagnostic, IntentReconstructionDiagnostic,
-    LifecycleEvidence, LifecycleStage,
-    OverlayEvent, OverlayOutcome,
-    MergeResult, PasteActionState, PROTOCOL_VERSION, Provider,
+    CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonReadiness, DaemonState,
+    DeadlineClock, DeliveryAdapter, DeliveryMethod, DeliveryOutcome, DiagnosticPage,
+    DiagnosticRecord, DiagnosticStore, DprDiagnostic, EnglishEligibilityOutcome,
+    IntentReconstructionDiagnostic, LifecycleEvidence, LifecycleStage, MergeResult, OverlayEvent,
+    OverlayOutcome, PROTOCOL_VERSION, PasteActionState, PreparedTranscriptDecision, Provider,
     ProviderCompletion, ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream,
-    ProviderStreams,
-    ReconciliationKind, ReconciliationModel,
-    PreparedTranscriptDecision, ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SourceTranscript,
+    ProviderStreams, ReconciliationKind, ReconciliationModel, ReplayOutcome, Request, Response,
+    RetentionPolicy, ShortcutPortal, SmartWritingDiagnostic, SourceTranscript,
     SourceTranscriptRecord, Transcript, TranscriptDecision, TranscriptDecisionPipeline,
-    TranscriptProvider, TranscriptValidator, TriggerKeyBinding, VersionEnvelope,
-    SmartWritingDiagnostic, EnglishEligibilityOutcome, replay_capture, sanitize_source_transcripts,
-    resolve_session, socket_path,
+    TranscriptProvider, TranscriptValidator, TriggerKeyBinding, VersionEnvelope, replay_capture,
+    resolve_session, sanitize_source_transcripts, socket_path,
 };
 
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
@@ -194,8 +191,8 @@ async fn run() -> Result<(), String> {
     }
 
     let delivery_mode = voisu_app::config::delivery_mode();
-    let controlled = std::env::var_os("VOISU_TEST_MODE").as_deref()
-        == Some(std::ffi::OsStr::new("controlled"));
+    let controlled =
+        std::env::var_os("VOISU_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("controlled"));
     let focus_probe = if delivery_mode == DeliveryMode::Guarded
         && !controlled
         && std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_none()
@@ -313,12 +310,17 @@ fn create_private_runtime_dirs(parent: &Path) -> Result<(), String> {
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                    return Err(format!("unsafe runtime path component: {}", current.display()));
+                    return Err(format!(
+                        "unsafe runtime path component: {}",
+                        current.display()
+                    ));
                 }
-                if metadata.uid() != unsafe { libc::geteuid() }
-                    || metadata.mode() & 0o777 != 0o700
+                if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o700
                 {
-                    return Err(format!("runtime directory is not private: {}", current.display()));
+                    return Err(format!(
+                        "runtime directory is not private: {}",
+                        current.display()
+                    ));
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -536,7 +538,10 @@ struct PumpOutput {
 
 enum ActorState {
     Idle,
-    Starting { id: u64, correlation_id: String },
+    Starting {
+        id: u64,
+        correlation_id: String,
+    },
     Recording(ActiveRecording),
     Processing(LifecycleEvidence),
     /// A failed start's aborts are still in flight. Publicly the daemon reads
@@ -594,8 +599,8 @@ async fn actor_loop(
     let debug_capture = std::env::var_os("VOISU_DEBUG_CAPTURE").is_some();
     let test_mode = std::env::var_os("VOISU_TEST_MODE");
     let controlled = test_mode.as_deref() == Some(std::ffi::OsStr::new("controlled"));
-    let controlled_deadlines = controlled
-        || test_mode.as_deref() == Some(std::ffi::OsStr::new("system-boundaries"));
+    let controlled_deadlines =
+        controlled || test_mode.as_deref() == Some(std::ffi::OsStr::new("system-boundaries"));
     let grammar_adapter = if controlled {
         std::env::var("VOISU_TEST_MINIMAL_GRAMMAR_ENDPOINT")
             .ok()
@@ -643,9 +648,8 @@ async fn actor_loop(
     // Production adapters are built only at a Recording or replay boundary,
     // after resolving that operation's dictionary snapshot below. Controlled
     // adapters keep their existing one-shot failure seams across retries.
-    let mut deepgram: Option<Box<dyn TranscriptProvider>> = controlled.then(|| {
-        build_deepgram_provider(deepgram_enabled, true, &[], &reaper)
-    });
+    let mut deepgram: Option<Box<dyn TranscriptProvider>> =
+        controlled.then(|| build_deepgram_provider(deepgram_enabled, true, &[], &reaper));
     let mut groq: Option<Box<dyn TranscriptProvider>> = controlled.then(|| {
         build_groq_provider(
             true,
@@ -660,9 +664,13 @@ async fn actor_loop(
     let configured_providers = vec![Provider::Deepgram, Provider::Groq];
     let intent_reconstruction = voisu_app::config::intent_reconstruction_enabled();
     let mut validator: Option<Box<dyn TranscriptValidator>> = if controlled {
-        Some(Box::new(ControlledValidator::from_env(intent_reconstruction)))
+        Some(Box::new(ControlledValidator::from_env(
+            intent_reconstruction,
+        )))
     } else if intent_reconstruction {
-        Some(Box::new(MergeResultValidator::intent_reconstruction(reaper.clone())))
+        Some(Box::new(MergeResultValidator::intent_reconstruction(
+            reaper.clone(),
+        )))
     } else {
         Some(Box::new(MergeResultValidator::new()))
     };
@@ -771,9 +779,8 @@ async fn actor_loop(
                     // replay supervisor only receives these values; its tail is
                     // deliberately filesystem-free.
                     let replay_terms = voisu_app::dictionary::merged_terms();
-                    let replay_keyterms = Arc::new(voisu_app::dictionary::deepgram_keyterms(
-                        &replay_terms,
-                    ));
+                    let replay_keyterms =
+                        Arc::new(voisu_app::dictionary::deepgram_keyterms(&replay_terms));
                     let replay_whisper_prompt = Arc::new(
                         voisu_app::dictionary::whisper_prompt_for_terms(&replay_terms),
                     );
@@ -795,8 +802,7 @@ async fn actor_loop(
                             &reaper,
                         ));
                     }
-                    let current_deepgram =
-                        deepgram.take().expect("Deepgram adapter is available");
+                    let current_deepgram = deepgram.take().expect("Deepgram adapter is available");
                     let current_groq = groq.take().expect("Groq adapter is available");
                     let current_validator = validator.take().expect("validator is available");
                     let provider_deadline = if controlled_deadlines
@@ -866,8 +872,7 @@ async fn actor_loop(
                     let writing_mode = voisu_app::config::writing_mode();
                     let rendering_policy = voisu_app::config::rendering_policy();
                     let groq_language = groq_transcription_language();
-                    let mut language_declarations =
-                        vec![(Provider::Groq, groq_language.clone())];
+                    let mut language_declarations = vec![(Provider::Groq, groq_language.clone())];
                     if deepgram_enabled {
                         language_declarations.push((
                             Provider::Deepgram,
@@ -921,19 +926,21 @@ async fn actor_loop(
                             &mut current_groq,
                             id,
                         );
-                        let _ = actor.blocking_send(ActorMessage::Started(Box::new(StartupCompletion {
-                            id,
-                            capture: current_capture,
-                            deepgram: current_deepgram,
-                            groq: current_groq,
-                            result,
-                            level_ring,
-                            writing_mode,
-                            rendering_policy,
-                            dictionary_terms: smart_dictionary_terms,
-                            languages,
-                            reply,
-                        })));
+                        let _ = actor.blocking_send(ActorMessage::Started(Box::new(
+                            StartupCompletion {
+                                id,
+                                capture: current_capture,
+                                deepgram: current_deepgram,
+                                groq: current_groq,
+                                result,
+                                level_ring,
+                                writing_mode,
+                                rendering_policy,
+                                dictionary_terms: smart_dictionary_terms,
+                                languages,
+                                reply,
+                            },
+                        )));
                     });
                 }
                 Command::Start => {
@@ -1154,10 +1161,8 @@ async fn actor_loop(
                                 tx.clone(),
                             ));
                             if controlled
-                                && std::env::var_os(
-                                    "VOISU_TEST_WAIT_FOR_FIRST_CHUNK_BEFORE_START",
-                                )
-                                .is_some()
+                                && std::env::var_os("VOISU_TEST_WAIT_FOR_FIRST_CHUNK_BEFORE_START")
+                                    .is_some()
                             {
                                 // Two exits, never one. The counter is the
                                 // intended marker, but a pump that terminates
@@ -1211,8 +1216,7 @@ async fn actor_loop(
                             level_ring.deactivate();
                             let recovering =
                                 failure.capture.is_some() || failure.provider_stream.is_some();
-                            let mut evidence =
-                                base_evidence(id, correlation.clone(), Vec::new());
+                            let mut evidence = base_evidence(id, correlation.clone(), Vec::new());
                             evidence.recovery_attempted = recovering;
                             let journal = recording_journal_lines(
                                 id,
@@ -1229,8 +1233,7 @@ async fn actor_loop(
                             // locally and the rejection carries the correlated
                             // evidence back to the client.
                             let mut record = DiagnosticRecord::new(correlation.clone(), id);
-                            record.error =
-                                Some(failure.error.public_message().to_owned());
+                            record.error = Some(failure.error.public_message().to_owned());
                             record.recovery_attempted = recovering;
                             // Every configured provider ends this record with an
                             // entry matching how far it actually reached — no
@@ -1271,9 +1274,9 @@ async fn actor_loop(
                                         "provider not reached; startup aborted before it began",
                                     )
                                 };
-                                record.provider_failures.push(ProviderFailure::new(
-                                    provider, stage, diagnostic,
-                                ));
+                                record
+                                    .provider_failures
+                                    .push(ProviderFailure::new(provider, stage, diagnostic));
                             }
                             if !deepgram_enabled {
                                 normalize_disabled_deepgram(&mut record.provider_failures);
@@ -1380,7 +1383,11 @@ async fn actor_loop(
                     }
                 }
             }
-            ActorMessage::AuthorizeDelivery { id, correlation_id, reply } => {
+            ActorMessage::AuthorizeDelivery {
+                id,
+                correlation_id,
+                reply,
+            } => {
                 let authorized = matches!(
                     &state,
                     ActorState::Processing(evidence)
@@ -1407,38 +1414,38 @@ async fn actor_loop(
                             // outlives the retention ring, so the healthy path
                             // reports its per-stage timings there too — not just
                             // the failing one.
-                            let journal = recording_journal_lines(
-                                completed.id,
-                                &completed.evidence,
-                                None,
-                            );
+                            let journal =
+                                recording_journal_lines(completed.id, &completed.evidence, None);
                             eprintln!("{}", journal.human);
                             eprintln!("{}", journal.structured);
                             let response = Response::with_evidence(
-                            true,
-                            Some(DaemonState::Idle),
-                            match (delivery_method, truncated) {
-                                (Some(DeliveryMethod::ClipboardFallback), true) => {
-                                    "Direct Delivery unavailable; Transcript is on the clipboard, \
+                                true,
+                                Some(DaemonState::Idle),
+                                match (delivery_method, truncated) {
+                                    (Some(DeliveryMethod::ClipboardFallback), true) => {
+                                        "Direct Delivery unavailable; Transcript is on the clipboard, \
                                      but the Recording was truncated; check the end"
-                                }
-                                (Some(DeliveryMethod::ClipboardFallback), false) => {
-                                    "Direct Delivery unavailable; Transcript is on the clipboard"
-                                }
-                                (_, true) => {
-                                    "Delivered, but the Recording was truncated; check the end"
-                                }
-                                _ => "Transcript submitted through the compositor; preserved on the clipboard",
-                            },
-                            Some(completed.evidence),
-                        );
+                                    }
+                                    (Some(DeliveryMethod::ClipboardFallback), false) => {
+                                        "Direct Delivery unavailable; Transcript is on the clipboard"
+                                    }
+                                    (_, true) => {
+                                        "Delivered, but the Recording was truncated; check the end"
+                                    }
+                                    _ => {
+                                        "Transcript submitted through the compositor; preserved on the clipboard"
+                                    }
+                                },
+                                Some(completed.evidence),
+                            );
                             retain_overlay_event(
                                 &mut next_overlay_event_id,
                                 &mut last_overlay_event,
                                 daemon_instance,
                                 OverlayOutcome::Delivered,
                                 if truncated {
-                                    "Delivered, but the Recording was truncated; check the end".to_owned()
+                                    "Delivered, but the Recording was truncated; check the end"
+                                        .to_owned()
                                 } else {
                                     "Delivered".to_owned()
                                 },
@@ -1691,8 +1698,8 @@ fn daemon_readiness_snapshot(
     delivery_mode: DeliveryMode,
     paste_action: PasteActionState,
 ) -> Option<DaemonReadiness> {
-    let controlled = std::env::var_os("VOISU_TEST_MODE").as_deref()
-        == Some(std::ffi::OsStr::new("controlled"));
+    let controlled =
+        std::env::var_os("VOISU_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("controlled"));
     if controlled && std::env::var_os("VOISU_TEST_REPORT_DAEMON_READINESS").is_none() {
         return None;
     }
@@ -1721,9 +1728,7 @@ fn daemon_readiness_snapshot(
     // to an inherited X11 DISPLAY would make a stale systemd environment look
     // healthy after the compositor changed sessions.
     let display_ready = match session_type.as_deref() {
-        Some(value) if value.eq_ignore_ascii_case("wayland") => {
-            present(wayland_display.as_deref())
-        }
+        Some(value) if value.eq_ignore_ascii_case("wayland") => present(wayland_display.as_deref()),
         Some(value) if value.eq_ignore_ascii_case("x11") => present(x11_display.as_deref()),
         _ => match session.session {
             voisu_core::SessionKind::Wayland => present(wayland_display.as_deref()),
@@ -1733,8 +1738,8 @@ fn daemon_readiness_snapshot(
     };
     // Presence of a display env var and a clipboard binary is not usability.
     // Probe the matching read tool in this process; do not write.
-    let clipboard_usable = display_ready
-        && clipboard_tool.is_some_and(clipboard_backend_display_reachable);
+    let clipboard_usable =
+        display_ready && clipboard_tool.is_some_and(clipboard_backend_display_reachable);
     Some(DaemonReadiness {
         session_type,
         wayland_display,
@@ -2000,9 +2005,7 @@ async fn recover_failed_start(
     // A timed-out capture/provider abort dropped its adapter above, adopting
     // still-live cleanup into the reaper. Drain to completion before
     // acknowledging: Recovered alone permits the Idle transition.
-    reaper
-        .drain_to_completion(RECOVERY_ABORT_DEADLINE)
-        .await;
+    reaper.drain_to_completion(RECOVERY_ABORT_DEADLINE).await;
     let _ = actor.send(ActorMessage::Recovered(id)).await;
 }
 
@@ -2189,11 +2192,7 @@ async fn process_recording(
                 format!("capture pump task failed: {join_error}"),
             );
             let mut provider_failures = Vec::new();
-            account_for_missing_providers(
-                &[],
-                &mut provider_failures,
-                error.diagnostic(),
-            );
+            account_for_missing_providers(&[], &mut provider_failures, error.diagnostic());
             if !deepgram_enabled {
                 normalize_disabled_deepgram(&mut provider_failures);
             }
@@ -2363,8 +2362,7 @@ async fn process_recording(
         };
         let delivery_outcome = if let Some(context) = dpr_context {
             let selected_source = decision.transcript.0.as_str();
-            let protected_tokens =
-                dpr_protected_tokens(selected_source, &dictionary_terms);
+            let protected_tokens = dpr_protected_tokens(selected_source, &dictionary_terms);
             let protected_token_refs: Vec<&str> =
                 protected_tokens.iter().map(String::as_str).collect();
             let cloud = match (dpr_client.as_ref(), grammar_capability.as_ref()) {
@@ -2500,12 +2498,18 @@ async fn authorize_delivery(
 ) -> Result<(), BoundaryError> {
     let (reply, authorized) = oneshot::channel();
     actor
-        .send(ActorMessage::AuthorizeDelivery { id, correlation_id, reply })
+        .send(ActorMessage::AuthorizeDelivery {
+            id,
+            correlation_id,
+            reply,
+        })
         .await
-        .map_err(|_| BoundaryError::new(
-            BoundaryKind::Delivery,
-            "active Recording correlation unavailable",
-        ))?;
+        .map_err(|_| {
+            BoundaryError::new(
+                BoundaryKind::Delivery,
+                "active Recording correlation unavailable",
+            )
+        })?;
     match authorized.await {
         Ok(true) => Ok(()),
         _ => Err(BoundaryError::new(
@@ -2527,13 +2531,12 @@ struct CorrelationAuthorizedDelivery<'a> {
 impl DeliveryAdapter for CorrelationAuthorizedDelivery<'_> {
     fn deliver(&mut self, transcript: Transcript) -> BoundaryFuture<'_, DeliveryOutcome> {
         Box::pin(async move {
-            let correlation_id = if std::env::var_os("VOISU_TEST_STALE_DELIVERY_CORRELATION")
-                .is_some()
-            {
-                format!("{}-stale", self.correlation_id)
-            } else {
-                self.correlation_id.clone()
-            };
+            let correlation_id =
+                if std::env::var_os("VOISU_TEST_STALE_DELIVERY_CORRELATION").is_some() {
+                    format!("{}-stale", self.correlation_id)
+                } else {
+                    self.correlation_id.clone()
+                };
             authorize_delivery(&self.actor, self.recording_id, correlation_id).await?;
             self.inner.deliver(transcript).await
         })
@@ -2567,11 +2570,7 @@ async fn complete_with_grammar_capability(
 
     let lane = reaper.credential_lane().clone();
     let entry = lane.register();
-    let mut owner = CredentialPreparationOwner::new(
-        Arc::clone(&entry),
-        lane,
-        Provider::Groq,
-    );
+    let mut owner = CredentialPreparationOwner::new(Arc::clone(&entry), lane, Provider::Groq);
     let prep_started = Instant::now();
     let provider_future = Box::pin(providers.complete_with_timings(audio));
     let prep_future = Box::pin(owner.poll_outcome());
@@ -2689,12 +2688,8 @@ async fn supervise_recording(
                     ));
                 }
             }
-            let (validator, delivery) = rebuild_recording_adapters(
-                controlled,
-                delivery_mode,
-                focus_probe.clone(),
-                &reaper,
-            );
+            let (validator, delivery) =
+                rebuild_recording_adapters(controlled, delivery_mode, focus_probe.clone(), &reaper);
             RecordingResult {
                 result: Err(error),
                 evidence: panic_evidence,
@@ -2964,14 +2959,13 @@ async fn supervise_replay(
             log_best_effort(format_args!(
                 "Replay {id}: replay task failed: {join_error}"
             ));
-            let (deepgram, groq, validator) =
-                rebuild_replay_adapters(
-                    controlled,
-                    deepgram_enabled,
-                    &keyterms,
-                    whisper_prompt.as_ref(),
-                    &reaper,
-                );
+            let (deepgram, groq, validator) = rebuild_replay_adapters(
+                controlled,
+                deepgram_enabled,
+                &keyterms,
+                whisper_prompt.as_ref(),
+                &reaper,
+            );
             ReplayCompletion {
                 id,
                 deepgram,
@@ -3144,10 +3138,16 @@ fn read_fixture(fixture_dir: &Path, name: &str) -> Result<Vec<u8>, BoundaryError
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(&path)
         .map_err(|error| {
-            BoundaryError::new(BoundaryKind::Capture, format!("cannot open fixture: {error}"))
+            BoundaryError::new(
+                BoundaryKind::Capture,
+                format!("cannot open fixture: {error}"),
+            )
         })?;
     let metadata = file.metadata().map_err(|error| {
-        BoundaryError::new(BoundaryKind::Capture, format!("cannot inspect fixture: {error}"))
+        BoundaryError::new(
+            BoundaryKind::Capture,
+            format!("cannot inspect fixture: {error}"),
+        )
     })?;
     if !metadata.is_file() {
         return Err(BoundaryError::new(
@@ -3163,19 +3163,31 @@ fn read_fixture(fixture_dir: &Path, name: &str) -> Result<Vec<u8>, BoundaryError
         ));
     }
     if metadata.len() > MAX_FIXTURE_BYTES {
-        return Err(BoundaryError::new(BoundaryKind::Capture, "fixture is too large"));
+        return Err(BoundaryError::new(
+            BoundaryKind::Capture,
+            "fixture is too large",
+        ));
     }
     let mut bytes = Vec::new();
     std::io::Read::take(file, MAX_FIXTURE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| {
-            BoundaryError::new(BoundaryKind::Capture, format!("cannot read fixture: {error}"))
+            BoundaryError::new(
+                BoundaryKind::Capture,
+                format!("cannot read fixture: {error}"),
+            )
         })?;
     if bytes.len() as u64 > MAX_FIXTURE_BYTES {
-        return Err(BoundaryError::new(BoundaryKind::Capture, "fixture is too large"));
+        return Err(BoundaryError::new(
+            BoundaryKind::Capture,
+            "fixture is too large",
+        ));
     }
     if bytes.is_empty() {
-        return Err(BoundaryError::new(BoundaryKind::EmptyRecording, "fixture is empty"));
+        return Err(BoundaryError::new(
+            BoundaryKind::EmptyRecording,
+            "fixture is empty",
+        ));
     }
     Ok(bytes)
 }
@@ -3253,8 +3265,11 @@ impl RebindBackoff {
     fn from_env() -> Self {
         // A one-millisecond floor keeps the interval from collapsing to a busy
         // loop even if a test sets it to zero.
-        let initial = env_millis_or("VOISU_TEST_SHORTCUT_REBIND_INITIAL_MS", SHORTCUT_REBIND_INITIAL)
-            .max(Duration::from_millis(1));
+        let initial = env_millis_or(
+            "VOISU_TEST_SHORTCUT_REBIND_INITIAL_MS",
+            SHORTCUT_REBIND_INITIAL,
+        )
+        .max(Duration::from_millis(1));
         let max =
             env_millis_or("VOISU_TEST_SHORTCUT_REBIND_MAX_MS", SHORTCUT_REBIND_MAX).max(initial);
         Self {
@@ -3384,9 +3399,7 @@ async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>) {
                     }
                 }
                 Ok(voisu_core::ShortcutEvent::SessionClosed) => {
-                    eprintln!(
-                        "Trigger Key session closed; rebinding the Trigger Key"
-                    );
+                    eprintln!("Trigger Key session closed; rebinding the Trigger Key");
                     // A closed session is recoverable: clear the displayed
                     // binding and rebind with backoff. A genuine revocation is
                     // expected to answer that rebind with a refusal (response
@@ -3402,9 +3415,7 @@ async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>) {
                     continue 'rebind;
                 }
                 Ok(voisu_core::ShortcutEvent::PortalLost) => {
-                    eprintln!(
-                        "Trigger Key portal left the bus; binding cleared until it returns"
-                    );
+                    eprintln!("Trigger Key portal left the bus; binding cleared until it returns");
                     let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
                     // Keep polling the SAME session: its portal owner watch
                     // stays live and yields PortalRestarted on a new owner.
@@ -3817,7 +3828,10 @@ impl ActiveCapture for ControlledActiveCapture {
                     "over-deadline" => BoundaryKind::RecordingDeadline,
                     _ => BoundaryKind::Capture,
                 };
-                return Err(BoundaryError::new(kind, format!("controlled {outcome} Recording")));
+                return Err(BoundaryError::new(
+                    kind,
+                    format!("controlled {outcome} Recording"),
+                ));
             }
             if self.fail_finish {
                 Err(BoundaryError::new(
@@ -3945,9 +3959,9 @@ impl ControlledProvider {
         };
         let fail_abort = std::env::var_os("VOISU_TEST_PROVIDER_ABORT_FAILURE").is_some();
         let targets = |name: &str| {
-            std::env::var(name).ok().is_some_and(|value| {
-                value == provider.secret_service_value() || value == "both"
-            })
+            std::env::var(name)
+                .ok()
+                .is_some_and(|value| value == provider.secret_service_value() || value == "both")
         };
         let fail_complete = targets("VOISU_TEST_PROVIDER_COMPLETE_FAILURE");
         let fail_send = targets("VOISU_TEST_PROVIDER_SEND_FAILURE");
@@ -4060,10 +4074,7 @@ impl ProviderStream for ControlledProviderStream {
                     "controlled-provider-completion-detail",
                 ));
             }
-            Ok(SourceTranscript {
-                provider,
-                text,
-            })
+            Ok(SourceTranscript { provider, text })
         })
     }
 }
@@ -4276,9 +4287,9 @@ mod tests {
             DIAGNOSTIC_RESPONSE_DEADLINE
         );
         assert_eq!(
-            command_write_deadline(&Command::Export(
-                voisu_core::ExportCorrelationId::new("rec-1"),
-            )),
+            command_write_deadline(&Command::Export(voisu_core::ExportCorrelationId::new(
+                "rec-1"
+            ),)),
             DIAGNOSTIC_RESPONSE_DEADLINE
         );
         assert_eq!(command_write_deadline(&Command::Status), IO_DEADLINE);
@@ -4288,11 +4299,8 @@ mod tests {
     async fn processing_panic_records_only_the_configured_providers() {
         let dir = tempfile::tempdir().unwrap();
         let diagnostics = Arc::new(
-            DiagnosticStore::open(
-                dir.path().join("diagnostics"),
-                RetentionPolicy::default(),
-            )
-            .unwrap(),
+            DiagnosticStore::open(dir.path().join("diagnostics"), RetentionPolicy::default())
+                .unwrap(),
         );
         let evidence = base_evidence(7, "configured-provider-panic".to_owned(), Vec::new());
         let processing: JoinHandle<RecordingResult> = tokio::spawn(async {
@@ -4316,7 +4324,10 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(messages.recv().await, Some(ActorMessage::Completed(_))));
+        assert!(matches!(
+            messages.recv().await,
+            Some(ActorMessage::Completed(_))
+        ));
         let history = diagnostics.history().unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].provider_failures.len(), 1);

@@ -1217,8 +1217,11 @@ fn collect_kb_options_in_execution_order(
             Some(LuaToken::Identifier(name)),
             Some(LuaToken::Symbol('=')),
             Some(LuaToken::String(value)),
-        ) = (tokens.get(index), tokens.get(index + 1), tokens.get(index + 2))
-            && name == "kb_options"
+        ) = (
+            tokens.get(index),
+            tokens.get(index + 1),
+            tokens.get(index + 2),
+        ) && name == "kb_options"
         {
             options.push(value.clone());
             index += 3;
@@ -1914,7 +1917,7 @@ fn parse_dispatcher_arguments(
             Some(LuaToken::Symbol(',')) => index += 1,
             Some(LuaToken::Symbol(')')) => return Ok((index + 1, Some(arguments))),
             Some(_) => {
-                return Err("the dispatcher arguments must be separated by commas".to_owned())
+                return Err("the dispatcher arguments must be separated by commas".to_owned());
             }
             None => return Err("the dispatcher call is missing a closing parenthesis".to_owned()),
         }
@@ -2298,15 +2301,17 @@ o.bind("ALT, code:108", "Modified right alt", "workspace next")
             plan_trigger_binding(source, true),
             TriggerBindingPlan::Install { key: CAPS_LOCK }
         );
-        assert!(!LuaBinding {
-            key: "ALT, code:64".to_owned(),
-            description: "Alt Tab".to_owned(),
-            command: "workspace next".to_owned(),
-            dispatcher: None,
-            dispatcher_arguments: None,
-            managed: false,
-        }
-        .is_standalone());
+        assert!(
+            !LuaBinding {
+                key: "ALT, code:64".to_owned(),
+                description: "Alt Tab".to_owned(),
+                command: "workspace next".to_owned(),
+                dispatcher: None,
+                dispatcher_arguments: None,
+                managed: false,
+            }
+            .is_standalone()
+        );
     }
 
     #[test]

@@ -209,10 +209,7 @@ mod tests {
 
     #[test]
     fn route_wire_names_match_research() {
-        assert_eq!(
-            RenderingRoute::LiteralIdentity.as_str(),
-            "literal_identity"
-        );
+        assert_eq!(RenderingRoute::LiteralIdentity.as_str(), "literal_identity");
         assert_eq!(
             RenderingRoute::DeterministicLocal.as_str(),
             "deterministic_local"
@@ -285,7 +282,10 @@ mod tests {
     fn timing_certainty_wire_names_round_trip() {
         assert_eq!(TimingCertainty::Clear.as_str(), "clear");
         assert_eq!(TimingCertainty::Uncertain.as_str(), "uncertain");
-        assert_eq!(TimingCertainty::parse("clear"), Some(TimingCertainty::Clear));
+        assert_eq!(
+            TimingCertainty::parse("clear"),
+            Some(TimingCertainty::Clear)
+        );
         assert_eq!(
             TimingCertainty::parse("uncertain"),
             Some(TimingCertainty::Uncertain)

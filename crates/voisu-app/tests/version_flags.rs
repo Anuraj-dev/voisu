@@ -81,7 +81,11 @@ fn voisu_daemon_version_flag_prints_name_and_version() {
     for flag in ["--version", "-V"] {
         let output = run(env!("CARGO_BIN_EXE_voisu-daemon"), &[flag]);
         assert!(output.status.success(), "{flag}: {output:?}");
-        assert_eq!(stdout(&output), format!("voisu-daemon {VERSION}\n"), "{flag}");
+        assert_eq!(
+            stdout(&output),
+            format!("voisu-daemon {VERSION}\n"),
+            "{flag}"
+        );
     }
 }
 

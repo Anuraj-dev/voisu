@@ -17,21 +17,21 @@ use serde_json::Value;
 use voisu_app::config::WritingMode;
 use voisu_app::dpr_cloud::{DprCloudAttempt, DprCloudErrorClass, DprCloudRequest};
 use voisu_app::dpr_pipeline::{
-    dpr_source_context, dpr_transform_and_deliver, DprCloudBoundary, DprCloudCapability,
-    DprCloudFuture, DprPipelineClock, DprTransformInput,
+    DprCloudBoundary, DprCloudCapability, DprCloudFuture, DprPipelineClock, DprTransformInput,
+    dpr_source_context, dpr_transform_and_deliver,
 };
 use voisu_app::smart_writing::{
-    final_transform_and_deliver, CredentialGateEvidence, FinalTransformInput,
-    GrammarGateCapability, ResolvedRecordingLanguages,
+    CredentialGateEvidence, FinalTransformInput, GrammarGateCapability, ResolvedRecordingLanguages,
+    final_transform_and_deliver,
 };
 use voisu_core::{
-    compose_structured_candidate, organize_local_baseline, parse_format_edit_candidate_json,
-    parse_structured_candidate_json, BoundaryFuture, CloudOutcome, CloudRequest, ComposeInput,
-    ComposeOutcome, ComposeSource, CompositionDecision, Credential, DeliveryAdapter,
-    DeliveryFlags, DeliveryOutcome, DprDiagnosticMode, FormatEditCandidate, LocalBaseline,
-    LocalBaselineOptions, LocalTiming, PauseBoundary, Provider, ProviderState, RenderingPolicy,
-    RenderingRoute, SourceSelection, SourceTranscript, SttProvider, StructuredCandidate,
-    SurfaceHint, TimingCertainty, Transcript, TranscriptSelection,
+    BoundaryFuture, CloudOutcome, CloudRequest, ComposeInput, ComposeOutcome, ComposeSource,
+    CompositionDecision, Credential, DeliveryAdapter, DeliveryFlags, DeliveryOutcome,
+    DprDiagnosticMode, FormatEditCandidate, LocalBaseline, LocalBaselineOptions, LocalTiming,
+    PauseBoundary, Provider, ProviderState, RenderingPolicy, RenderingRoute, SourceSelection,
+    SourceTranscript, StructuredCandidate, SttProvider, SurfaceHint, TimingCertainty, Transcript,
+    TranscriptSelection, compose_structured_candidate, organize_local_baseline,
+    parse_format_edit_candidate_json, parse_structured_candidate_json,
 };
 
 const BEHAVIOR_CORPUS: &str = include_str!(
@@ -119,7 +119,9 @@ fn behavior_corpus_all_48_local_baselines_match() {
             .unwrap_or_else(|| panic!("{id}: source context"));
         assert_eq!(
             context.source_selection.reason,
-            fixture["source_selection"]["reason"].as_str().expect("reason"),
+            fixture["source_selection"]["reason"]
+                .as_str()
+                .expect("reason"),
             "{id}: selection reason"
         );
         assert_eq!(
@@ -141,13 +143,22 @@ fn behavior_corpus_all_48_local_baselines_match() {
             "{id}: local baseline"
         );
         assert_eq!(
-            fixture["local_baseline"],
-            fixture["expected_final"],
+            fixture["local_baseline"], fixture["expected_final"],
             "{id}: #138 v1.7 requires fallback/local final to equal its baseline"
         );
         assert_eq!(fixture["delivery"]["state"], "unsent", "{id}: state");
-        assert!(!fixture["delivery"]["auto_send"].as_bool().expect("auto-send"), "{id}: auto-send");
-        assert!(!fixture["delivery"]["live_type"].as_bool().expect("live-type"), "{id}: live-type");
+        assert!(
+            !fixture["delivery"]["auto_send"]
+                .as_bool()
+                .expect("auto-send"),
+            "{id}: auto-send"
+        );
+        assert!(
+            !fixture["delivery"]["live_type"]
+                .as_bool()
+                .expect("live-type"),
+            "{id}: live-type"
+        );
         assert!(
             !fixture["delivery"]["replace_delivered"]
                 .as_bool()
@@ -199,14 +210,22 @@ fn complementary_merge_rejects_semantic_and_negation_gaps() {
             ProviderState::SemanticDisagreement,
         ),
     ] {
-        let context = dpr_source_context(&[
-            SourceTranscript { provider: Provider::Groq, text: left.to_owned() },
-            SourceTranscript { provider: Provider::Deepgram, text: right.to_owned() },
-        ], &[])
+        let context = dpr_source_context(
+            &[
+                SourceTranscript {
+                    provider: Provider::Groq,
+                    text: left.to_owned(),
+                },
+                SourceTranscript {
+                    provider: Provider::Deepgram,
+                    text: right.to_owned(),
+                },
+            ],
+            &[],
+        )
         .expect("source context");
         assert_eq!(
-            context.provider_state,
-            expected_state,
+            context.provider_state, expected_state,
             "unsafe merge for {left:?} / {right:?}"
         );
         assert_eq!(context.selected_source, left);
@@ -231,7 +250,10 @@ fn complementary_merge_is_order_independent_and_truthfully_attributed() {
             "open crates/voisu-core/src/lib.rs and check correlation_id"
         );
         assert_eq!(context.provider_state, ProviderState::SafeComplementary);
-        assert_eq!(context.transcript_selection, TranscriptSelection::Complementary);
+        assert_eq!(
+            context.transcript_selection,
+            TranscriptSelection::Complementary
+        );
         assert_eq!(context.sources[0].provider, SttProvider::ProviderA);
         assert!(context.sources[0].primary);
     }
@@ -306,10 +328,8 @@ fn compose_fixture(fixture: &Value) -> ComposeFixture {
             .map(|token| token.as_str().expect("protected token").to_owned())
             .collect(),
         policy,
-        cloud: CloudOutcome::parse(
-            fixture["cloud_outcome"].as_str().expect("cloud outcome"),
-        )
-        .expect("known cloud outcome"),
+        cloud: CloudOutcome::parse(fixture["cloud_outcome"].as_str().expect("cloud outcome"))
+            .expect("known cloud outcome"),
         candidate,
     }
 }
@@ -339,12 +359,7 @@ fn corpus_fixture(corpus: &Value, id: &str) -> Value {
         .clone()
 }
 
-fn rejected_mutation(
-    corpus: &Value,
-    id: &str,
-    name: &str,
-    mutate: impl FnOnce(&mut Value),
-) {
+fn rejected_mutation(corpus: &Value, id: &str, name: &str, mutate: impl FnOnce(&mut Value)) {
     let mut fixture = corpus_fixture(corpus, id);
     mutate(&mut fixture);
     let outcome = compose(&fixture);
@@ -392,8 +407,16 @@ fn combined_call_all_24_decisions_and_19_product_mutations_match() {
             .iter()
             .map(|code| code.as_str().expect("error code"))
             .collect();
-        assert_eq!(outcome.error_code_strs(), expected_codes, "{id}: error codes");
-        assert_eq!(outcome.delivery(), DeliveryFlags::dpr_default(), "{id}: flags");
+        assert_eq!(
+            outcome.error_code_strs(),
+            expected_codes,
+            "{id}: error codes"
+        );
+        assert_eq!(
+            outcome.delivery(),
+            DeliveryFlags::dpr_default(),
+            "{id}: flags"
+        );
     }
 
     rejected_mutation(&corpus, "CC-14", "protected_missing", |fixture| {
@@ -428,7 +451,8 @@ fn combined_call_all_24_decisions_and_19_product_mutations_match() {
     });
     rejected_mutation(&corpus, "CC-14", "protected_name", |fixture| {
         fixture["cloud_outcome"] = "succeeded".into();
-        fixture["candidate"]["derivation"][0]["output_text"] = "Call anuraj about the release.".into();
+        fixture["candidate"]["derivation"][0]["output_text"] =
+            "Call anuraj about the release.".into();
     });
     rejected_mutation(&corpus, "CC-01", "remove_without_removals", |fixture| {
         fixture["candidate"]["removals"] = serde_json::json!([]);
@@ -453,7 +477,8 @@ fn combined_call_all_24_decisions_and_19_product_mutations_match() {
         ("natural_adjacent_newlines", serde_json::json!(["\n", "\n"])),
     ] {
         rejected_mutation(&corpus, "CC-18", name, |fixture| {
-            fixture["candidate"]["layout"] = serde_json::json!({"decision":"natural","certainty":"clear"});
+            fixture["candidate"]["layout"] =
+                serde_json::json!({"decision":"natural","certainty":"clear"});
             let mut derivation = vec![serde_json::json!({
                 "kind":"keep","source_provider":"provider_a",
                 "source_text":"hey can you send the notes",
@@ -473,7 +498,8 @@ fn combined_call_all_24_decisions_and_19_product_mutations_match() {
         });
     }
     rejected_mutation(&corpus, "CC-18", "natural_keep_edge_newlines", |fixture| {
-        fixture["candidate"]["layout"] = serde_json::json!({"decision":"natural","certainty":"clear"});
+        fixture["candidate"]["layout"] =
+            serde_json::json!({"decision":"natural","certainty":"clear"});
         fixture["candidate"]["derivation"] = serde_json::json!([
             {"kind":"keep","source_provider":"provider_a","source_text":"hey can you send the notes","output_text":"Hey, can you send the notes\n","conversion_id":null,"label":null},
             {"kind":"keep","source_provider":"provider_a","source_text":"when you get a chance","output_text":"\nwhen you get a chance?","conversion_id":null,"label":null}
@@ -514,7 +540,10 @@ struct RecordingDelivery {
 impl DeliveryAdapter for RecordingDelivery {
     fn deliver(&mut self, transcript: Transcript) -> BoundaryFuture<'_, DeliveryOutcome> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.delivered.lock().expect("delivery lock").push(transcript.0);
+        self.delivered
+            .lock()
+            .expect("delivery lock")
+            .push(transcript.0);
         if let Some((clock, at)) = &self.clock {
             at.store(clock.millis.load(Ordering::SeqCst), Ordering::SeqCst);
         }
@@ -529,7 +558,9 @@ struct ControlledClock {
 
 impl ControlledClock {
     fn at(millis: u64) -> Self {
-        Self { millis: Arc::new(AtomicU64::new(millis)) }
+        Self {
+            millis: Arc::new(AtomicU64::new(millis)),
+        }
     }
 }
 
@@ -559,17 +590,25 @@ impl DprCloudBoundary for CannedCloud {
             .millis
             .load(Ordering::SeqCst)
             .saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX));
-        self.clock.millis.store(self.complete_at.min(deadline), Ordering::SeqCst);
+        self.clock
+            .millis
+            .store(self.complete_at.min(deadline), Ordering::SeqCst);
         let result = if self.complete_at > deadline {
             DprCloudAttempt::failure(DprCloudErrorClass::DeadlineExceeded)
         } else {
-            self.result.lock().expect("cloud result").take().expect("one attempt")
+            self.result
+                .lock()
+                .expect("cloud result")
+                .take()
+                .expect("one attempt")
         };
         Box::pin(async move { result })
     }
 }
 
-fn delivery(clock: Option<ControlledClock>) -> (RecordingDelivery, Arc<AtomicUsize>, Arc<AtomicU64>) {
+fn delivery(
+    clock: Option<ControlledClock>,
+) -> (RecordingDelivery, Arc<AtomicUsize>, Arc<AtomicU64>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let at = Arc::new(AtomicU64::new(u64::MAX));
     (
@@ -607,20 +646,51 @@ fn accepted_candidate(source: &str, output: &str) -> StructuredCandidate {
 async fn orchestration_deadline_compose_call_count_delivery_and_diagnostics() {
     let source = "hello from voisu";
     let sources = [
-        ComposeSource { provider: SttProvider::ProviderA, available: true, text: source.to_owned(), primary: true },
-        ComposeSource { provider: SttProvider::ProviderB, available: true, text: "hello from voice you".to_owned(), primary: false },
+        ComposeSource {
+            provider: SttProvider::ProviderA,
+            available: true,
+            text: source.to_owned(),
+            primary: true,
+        },
+        ComposeSource {
+            provider: SttProvider::ProviderB,
+            available: true,
+            text: "hello from voice you".to_owned(),
+            primary: false,
+        },
     ];
-    let selection = SourceSelection { selected_provider: SttProvider::ProviderA, reason: "configured_primary_rank".to_owned() };
+    let selection = SourceSelection {
+        selected_provider: SttProvider::ProviderA,
+        reason: "configured_primary_rank".to_owned(),
+    };
     let credential = Credential::new("hermetic-secret".to_owned()).expect("credential");
 
     for (name, complete_at, candidate, expected, decision) in [
-        ("accepted", 200, accepted_candidate(source, "Hello from voisu!"), "Hello from voisu!", CompositionDecision::Accept),
-        ("late", 5_000, accepted_candidate(source, "Hello from voisu!"), "Hello from voisu.", CompositionDecision::FallbackBaseline),
-        ("stale", 200, {
-            let mut stale = accepted_candidate(source, "Hello from voisu!");
-            stale.base_fingerprint = format!("sha256:{}", "0".repeat(64));
-            stale
-        }, "Hello from voisu.", CompositionDecision::FallbackBaseline),
+        (
+            "accepted",
+            200,
+            accepted_candidate(source, "Hello from voisu!"),
+            "Hello from voisu!",
+            CompositionDecision::Accept,
+        ),
+        (
+            "late",
+            5_000,
+            accepted_candidate(source, "Hello from voisu!"),
+            "Hello from voisu.",
+            CompositionDecision::FallbackBaseline,
+        ),
+        (
+            "stale",
+            200,
+            {
+                let mut stale = accepted_candidate(source, "Hello from voisu!");
+                stale.base_fingerprint = format!("sha256:{}", "0".repeat(64));
+                stale
+            },
+            "Hello from voisu.",
+            CompositionDecision::FallbackBaseline,
+        ),
     ] {
         let clock = ControlledClock::at(0);
         let cloud_calls = Arc::new(AtomicUsize::new(0));
@@ -643,23 +713,51 @@ async fn orchestration_deadline_compose_call_count_delivery_and_diagnostics() {
                 process_hint: None,
                 timing: None,
                 protected_tokens: &[],
-                cloud: DprCloudCapability::Ready { boundary: &cloud, credential: &credential },
+                cloud: DprCloudCapability::Ready {
+                    boundary: &cloud,
+                    credential: &credential,
+                },
                 clock: &clock,
                 small_edit_contract: false,
             },
             &mut delivery,
-        ).await;
+        )
+        .await;
         assert_eq!(cloud_calls.load(Ordering::SeqCst), 1, "{name}: cloud calls");
-        assert_eq!(delivery_calls.load(Ordering::SeqCst), 1, "{name}: Delivery calls");
-        assert!(delivery_at.load(Ordering::SeqCst) <= 1_500, "{name}: late Delivery");
+        assert_eq!(
+            delivery_calls.load(Ordering::SeqCst),
+            1,
+            "{name}: Delivery calls"
+        );
+        assert!(
+            delivery_at.load(Ordering::SeqCst) <= 1_500,
+            "{name}: late Delivery"
+        );
         assert_eq!(completion.rendered, expected, "{name}: rendered");
         assert_eq!(completion.compose_decision, decision, "{name}: decision");
-        assert_eq!(completion.delivery_flags, DeliveryFlags::dpr_default(), "{name}: flags");
-        assert_eq!(completion.diagnostic.mode(), DprDiagnosticMode::Production, "{name}: mode");
+        assert_eq!(
+            completion.delivery_flags,
+            DeliveryFlags::dpr_default(),
+            "{name}: flags"
+        );
+        assert_eq!(
+            completion.diagnostic.mode(),
+            DprDiagnosticMode::Production,
+            "{name}: mode"
+        );
         let diagnostic = serde_json::to_string(&completion.diagnostic).expect("diagnostic JSON");
-        assert!(!diagnostic.contains("late_evaluation"), "{name}: eval lane in production");
-        assert!(!diagnostic.contains("candidate_text"), "{name}: retained text in production");
-        assert!(!diagnostic.contains("apply_late"), "{name}: apply-late path in production");
+        assert!(
+            !diagnostic.contains("late_evaluation"),
+            "{name}: eval lane in production"
+        );
+        assert!(
+            !diagnostic.contains("candidate_text"),
+            "{name}: retained text in production"
+        );
+        assert!(
+            !diagnostic.contains("apply_late"),
+            "{name}: apply-late path in production"
+        );
     }
 }
 
@@ -761,9 +859,7 @@ async fn cloud_call_budget_covers_zero_call_and_failed_attempt_paths() {
             calls: Arc::clone(&cloud_calls),
             clock: clock.clone(),
             complete_at: 10,
-            result: Mutex::new(Some(DprCloudAttempt::failure(
-                DprCloudErrorClass::Http5xx,
-            ))),
+            result: Mutex::new(Some(DprCloudAttempt::failure(DprCloudErrorClass::Http5xx))),
         };
         let (mut delivery, delivery_calls, _) = delivery(Some(clock.clone()));
         let completion = dpr_transform_and_deliver(
@@ -861,14 +957,21 @@ async fn cloud_call_budget_covers_zero_call_and_failed_attempt_paths() {
         )
         .await;
         assert_eq!(cloud_calls.load(Ordering::SeqCst), 1, "{error:?}: attempts");
-        assert_eq!(delivery_calls.load(Ordering::SeqCst), 1, "{error:?}: Delivery");
+        assert_eq!(
+            delivery_calls.load(Ordering::SeqCst),
+            1,
+            "{error:?}: Delivery"
+        );
         assert_eq!(
             completion.delivery_flags,
             DeliveryFlags::dpr_default(),
             "{error:?}: flags"
         );
         assert_eq!(completion.rendered, "Hello from voisu.");
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
         assert_eq!(completion.cloud_error, Some(error));
     }
 }
@@ -1020,7 +1123,10 @@ async fn formatting_apply_relaxes_lexical_source_words_without_dropping_safety()
     assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
     assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
     assert_eq!(rejected.rendered, baseline.rendered());
-    assert_eq!(rejected.compose_decision, CompositionDecision::FallbackBaseline);
+    assert_eq!(
+        rejected.compose_decision,
+        CompositionDecision::FallbackBaseline
+    );
 }
 
 /// Ship gate 6 persistence half: all policies round-trip through the real CLI.
@@ -1041,7 +1147,11 @@ fn all_three_policies_persist_via_cli() {
     };
     for policy in ["natural", "adaptive", "structured"] {
         let set = run(&["rendering", policy]);
-        assert!(set.status.success(), "set {policy}: {}", String::from_utf8_lossy(&set.stderr));
+        assert!(
+            set.status.success(),
+            "set {policy}: {}",
+            String::from_utf8_lossy(&set.stderr)
+        );
         let query = run(&["rendering"]);
         assert!(query.status.success(), "query {policy}");
         assert_eq!(
@@ -1070,9 +1180,13 @@ async fn dpr_flag_off_smart_writing_regression() {
             credential: CredentialGateEvidence::default(),
         },
         &mut delivery,
-    ).await;
+    )
+    .await;
     assert_eq!(completion.rendered, "Hello world.");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(!completion.diagnostic.request_began);
-    assert_eq!(completion.diagnostic.outcome, voisu_core::SmartWritingOutcome::FormattingOnly);
+    assert_eq!(
+        completion.diagnostic.outcome,
+        voisu_core::SmartWritingOutcome::FormattingOnly
+    );
 }

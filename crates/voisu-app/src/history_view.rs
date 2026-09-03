@@ -110,7 +110,11 @@ pub fn render_page(records: &Value, start: usize, page_size: usize, style: &Rend
 /// exactly `page_size` Recordings with no blocking prompt. If older Recordings
 /// remain, a single non-blocking footer line notes how many and points at the
 /// `--json` escape hatch. Never waits on stdin.
-pub fn render_history_noninteractive(records: &Value, page_size: usize, style: &RenderStyle) -> String {
+pub fn render_history_noninteractive(
+    records: &Value,
+    page_size: usize,
+    style: &RenderStyle,
+) -> String {
     let page = render_page(records, 0, page_size, style);
     let mut out = page.body;
     if page.remaining > 0 {
@@ -280,7 +284,10 @@ fn render_one_provider(
     }
     if let Some(failure) = failure {
         let stage = failure.get("stage").and_then(Value::as_str).unwrap_or("");
-        let diagnostic = failure.get("diagnostic").and_then(Value::as_str).unwrap_or("");
+        let diagnostic = failure
+            .get("diagnostic")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if stage == "not_started" {
             // A disabled Provider is a deliberate configuration, not a fault.
             if diagnostic.contains("disabled") {
@@ -315,7 +322,11 @@ fn render_one_provider(
             style.paint("ok", Ansi::Green),
         );
     }
-    format!("{} {}", style.paint(&name, Ansi::Bold), style.paint("—", Ansi::Dim))
+    format!(
+        "{} {}",
+        style.paint(&name, Ansi::Bold),
+        style.paint("—", Ansi::Dim)
+    )
 }
 
 /// A short delivery caveat when the Transcript landed via the clipboard fallback
@@ -635,8 +646,14 @@ mod tests {
                  "diagnostic": "Provider Deadline elapsed"}
             ]
         }));
-        assert!(out.contains("no Transcript delivered — quality validation failed"), "{out}");
-        assert!(out.contains("Deepgram failed (completion): upstream returned HTTP 503"), "{out}");
+        assert!(
+            out.contains("no Transcript delivered — quality validation failed"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Deepgram failed (completion): upstream returned HTTP 503"),
+            "{out}"
+        );
         assert!(out.contains("Groq failed (missed deadline)"), "{out}");
         // No JSON blob leaked into the failure view.
         assert!(!out.contains('{'), "{out}");
@@ -649,7 +666,10 @@ mod tests {
             "final_transcript": null,
             "error": "Recording Deadline elapsed"
         }));
-        assert!(out.contains("no Transcript delivered — Recording Deadline elapsed"), "{out}");
+        assert!(
+            out.contains("no Transcript delivered — Recording Deadline elapsed"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -669,7 +689,11 @@ mod tests {
             .lines()
             .find(|line| line.contains("Reconciled"))
             .expect("selection line present");
-        assert!(line.chars().count() <= 3 + "Reconciled (merged): ".len() + DEFAULT_TRANSCRIPT_WIDTH + 2, "{line}");
+        assert!(
+            line.chars().count()
+                <= 3 + "Reconciled (merged): ".len() + DEFAULT_TRANSCRIPT_WIDTH + 2,
+            "{line}"
+        );
     }
 
     #[test]
@@ -732,8 +756,10 @@ mod tests {
     #[test]
     fn pagination_advances_and_reports_remaining() {
         let records: Vec<Value> = (0..45)
-            .map(|i| json!({"recorded_at_unix_ms": NOW - (i as u64) * 1000,
-                            "final_transcript": format!("record {i}"), "selection": "source_groq"}))
+            .map(|i| {
+                json!({"recorded_at_unix_ms": NOW - (i as u64) * 1000,
+                            "final_transcript": format!("record {i}"), "selection": "source_groq"})
+            })
             .collect();
         let value = json!(records);
         let first = render_page(&value, 0, DEFAULT_PAGE_SIZE, &plain());
@@ -742,7 +768,12 @@ mod tests {
         let second = render_page(&value, first.shown, DEFAULT_PAGE_SIZE, &plain());
         assert_eq!(second.shown, 20);
         assert_eq!(second.remaining, 5);
-        let third = render_page(&value, first.shown + second.shown, DEFAULT_PAGE_SIZE, &plain());
+        let third = render_page(
+            &value,
+            first.shown + second.shown,
+            DEFAULT_PAGE_SIZE,
+            &plain(),
+        );
         assert_eq!(third.shown, 5);
         assert_eq!(third.remaining, 0);
     }
@@ -754,7 +785,11 @@ mod tests {
                             "release_to_text_ms": 2});
         let plain = render_page(&json!([record.clone()]), 0, 20, &RenderStyle::plain(NOW)).body;
         assert!(!plain.contains('\x1b'), "{plain}");
-        let colored_style = RenderStyle { now_ms: NOW, color: true, transcript_width: DEFAULT_TRANSCRIPT_WIDTH };
+        let colored_style = RenderStyle {
+            now_ms: NOW,
+            color: true,
+            transcript_width: DEFAULT_TRANSCRIPT_WIDTH,
+        };
         let colored = render_page(&json!([record]), 0, 20, &colored_style).body;
         assert!(colored.contains('\x1b'), "{colored}");
     }
@@ -786,7 +821,10 @@ mod tests {
         assert!(!out.contains('\u{8}'), "BS survived: {out:?}");
         assert!(!out.contains('\u{7f}'), "DEL survived: {out:?}");
         // No C0/C1 control byte survives anywhere in the rendered record.
-        assert!(!out.chars().any(|c| c.is_control() && c != '\n'), "control byte survived: {out:?}");
+        assert!(
+            !out.chars().any(|c| c.is_control() && c != '\n'),
+            "control byte survived: {out:?}"
+        );
         // Ordinary letters are preserved.
         assert!(out.contains("there"), "{out}");
     }
@@ -802,9 +840,18 @@ mod tests {
                  "diagnostic": "upstream\u{1b}[2J failed\u{7}"}
             ]
         }));
-        assert!(!out.contains('\u{1b}'), "ESC survived in diagnostic path: {out:?}");
-        assert!(!out.contains('\u{7}'), "BEL survived in diagnostic path: {out:?}");
-        assert!(!out.chars().any(|c| c.is_control() && c != '\n'), "control byte survived: {out:?}");
+        assert!(
+            !out.contains('\u{1b}'),
+            "ESC survived in diagnostic path: {out:?}"
+        );
+        assert!(
+            !out.contains('\u{7}'),
+            "BEL survived in diagnostic path: {out:?}"
+        );
+        assert!(
+            !out.chars().any(|c| c.is_control() && c != '\n'),
+            "control byte survived: {out:?}"
+        );
         assert!(out.contains("failed"), "{out}");
     }
 

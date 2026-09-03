@@ -76,7 +76,10 @@ pub struct FeedbackSelection {
 impl FeedbackSelection {
     /// Stable structured text for stderr/journal logs and `--report-backend`.
     pub fn report_line(self) -> String {
-        let degradation = self.degradation.map(FeedbackDegradation::label).unwrap_or("none");
+        let degradation = self
+            .degradation
+            .map(FeedbackDegradation::label)
+            .unwrap_or("none");
         format!(
             "overlay_feedback backend={} degradation={degradation}",
             self.backend.label(),
@@ -161,7 +164,10 @@ mod tests {
         });
 
         assert_eq!(selection.backend, FeedbackBackend::JournalLog);
-        assert_eq!(selection.degradation, Some(FeedbackDegradation::MissingDisplay));
+        assert_eq!(
+            selection.degradation,
+            Some(FeedbackDegradation::MissingDisplay)
+        );
     }
 
     #[test]
@@ -189,7 +195,10 @@ mod tests {
         // Only genuine local absence degrades to a desktop notification.
         let fallback = after_surface_creation(layer, false);
         assert_eq!(fallback.backend, FeedbackBackend::DesktopNotification);
-        assert_eq!(fallback.degradation, Some(FeedbackDegradation::SurfaceCreationFailure));
+        assert_eq!(
+            fallback.degradation,
+            Some(FeedbackDegradation::SurfaceCreationFailure)
+        );
     }
 
     #[test]
@@ -204,7 +213,10 @@ mod tests {
         // Rung 2 is skipped: an X11/XWayland session goes to the notification
         // rung, still naming the XWayland fallback as the cause.
         assert_eq!(selection.backend, FeedbackBackend::DesktopNotification);
-        assert_eq!(selection.degradation, Some(FeedbackDegradation::XwaylandFallback));
+        assert_eq!(
+            selection.degradation,
+            Some(FeedbackDegradation::XwaylandFallback)
+        );
     }
 
     #[test]
@@ -245,8 +257,14 @@ pub struct OverlayRestartPolicy {
 
 impl OverlayRestartPolicy {
     pub fn record_failure(&mut self, now: Duration) -> OverlayRestartDecision {
-        let earliest = now.checked_sub(OVERLAY_RESTART_WINDOW).unwrap_or(Duration::ZERO);
-        while self.failures.front().is_some_and(|failure| *failure < earliest) {
+        let earliest = now
+            .checked_sub(OVERLAY_RESTART_WINDOW)
+            .unwrap_or(Duration::ZERO);
+        while self
+            .failures
+            .front()
+            .is_some_and(|failure| *failure < earliest)
+        {
             self.failures.pop_front();
         }
         self.failures.push_back(now);

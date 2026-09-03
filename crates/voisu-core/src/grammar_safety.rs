@@ -8,13 +8,13 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
 use crate::{
+    FormattingBaseline, MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES, SourceAnchor, SourceSpan,
     is_text_sha256_fingerprint, parse_formatting_commands, text_sha256_fingerprint,
-    FormattingBaseline, SourceAnchor, SourceSpan, MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES,
 };
 
 pub const MAX_GRAMMAR_RESPONSE_BYTES: usize = 65_536;
@@ -204,7 +204,7 @@ pub fn apply_grammar_candidate_json(
                 baseline,
                 GrammarErrorCode::Malformed,
                 "grammar response is not valid bounded JSON",
-            )
+            );
         }
     };
     let (depth, nodes) = json_shape(&value);
@@ -361,7 +361,10 @@ fn parse_edits(
             object,
             &["id", "rule_id", "start_utf8", "end_utf8", "before", "after"],
         ) {
-            return Err((GrammarErrorCode::Malformed, "grammar edit keys are not exact"));
+            return Err((
+                GrammarErrorCode::Malformed,
+                "grammar edit keys are not exact",
+            ));
         }
         let (Some(id), Some(rule_id), Some(before), Some(after)) = (
             object.get("id").and_then(Value::as_str),
@@ -369,25 +372,40 @@ fn parse_edits(
             object.get("before").and_then(Value::as_str),
             object.get("after").and_then(Value::as_str),
         ) else {
-            return Err((GrammarErrorCode::Malformed, "grammar edit string field is invalid"));
+            return Err((
+                GrammarErrorCode::Malformed,
+                "grammar edit string field is invalid",
+            ));
         };
         if id.is_empty() || rule_id.is_empty() {
-            return Err((GrammarErrorCode::Malformed, "grammar edit identifier is empty"));
+            return Err((
+                GrammarErrorCode::Malformed,
+                "grammar edit identifier is empty",
+            ));
         }
         if [id, rule_id, before, after]
             .iter()
             .any(|field| field.len() > MAX_GRAMMAR_EDIT_FIELD_UTF8_BYTES)
         {
-            return Err((GrammarErrorCode::Oversize, "grammar edit field exceeds bound"));
+            return Err((
+                GrammarErrorCode::Oversize,
+                "grammar edit field exceeds bound",
+            ));
         }
         let (Some(start), Some(end)) = (
             object.get("start_utf8").and_then(Value::as_u64),
             object.get("end_utf8").and_then(Value::as_u64),
         ) else {
-            return Err((GrammarErrorCode::Malformed, "grammar edit offset is invalid"));
+            return Err((
+                GrammarErrorCode::Malformed,
+                "grammar edit offset is invalid",
+            ));
         };
         let (Ok(start_utf8), Ok(end_utf8)) = (usize::try_from(start), usize::try_from(end)) else {
-            return Err((GrammarErrorCode::Oversize, "grammar edit offset exceeds platform bound"));
+            return Err((
+                GrammarErrorCode::Oversize,
+                "grammar edit offset exceeds platform bound",
+            ));
         };
         edits.push(GrammarEdit {
             id: id.to_owned(),
@@ -399,11 +417,13 @@ fn parse_edits(
         });
     }
 
-    if !edits
-        .windows(2)
-        .all(|pair| (pair[0].start_utf8, pair[0].end_utf8) <= (pair[1].start_utf8, pair[1].end_utf8))
-    {
-        return Err((GrammarErrorCode::Unsorted, "grammar edits are not source ordered"));
+    if !edits.windows(2).all(|pair| {
+        (pair[0].start_utf8, pair[0].end_utf8) <= (pair[1].start_utf8, pair[1].end_utf8)
+    }) {
+        return Err((
+            GrammarErrorCode::Unsorted,
+            "grammar edits are not source ordered",
+        ));
     }
     Ok(GrammarCandidate {
         base_version: base_version.to_owned(),
@@ -635,7 +655,9 @@ fn rule_matches(base: &str, tokens: &[Token<'_>], edit: &GrammarEdit) -> bool {
                 && edit.after == "let's"
                 && index == 0
                 && base[..edit.start_utf8].bytes().all(|byte| byte == b' ')
-                && tokens.get(1).is_some_and(|token| token.text.eq_ignore_ascii_case("meet"))
+                && tokens
+                    .get(1)
+                    .is_some_and(|token| token.text.eq_ignore_ascii_case("meet"))
                 && ascii_spaces(base, tokens[0].end, tokens[1].start)
                 && !parse_formatting_commands(base).has_command_span()
         }
@@ -888,11 +910,7 @@ fn push_diagnostic(
     }
 }
 
-fn diagnostic(
-    code: GrammarErrorCode,
-    message: &'static str,
-    edit_id: &str,
-) -> GrammarDiagnostic {
+fn diagnostic(code: GrammarErrorCode, message: &'static str, edit_id: &str) -> GrammarDiagnostic {
     GrammarDiagnostic {
         code,
         message: clamp_utf8(message, MAX_GRAMMAR_DIAGNOSTIC_UTF8_BYTES),
@@ -983,14 +1001,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{format_validated_for_grammar, FormatOptions};
+    use crate::{FormatOptions, format_validated_for_grammar};
 
-    const SAFETY_CORPUS: &str = include_str!(
-        "../../../docs/research/smart-writing-edit-safety-corpus-2026-08-09.json"
-    );
-    const SPEC_CONSTANTS: &str = include_str!(
-        "../../../docs/research/smart-writing-spec-constants-2026-08-09.json"
-    );
+    const SAFETY_CORPUS: &str =
+        include_str!("../../../docs/research/smart-writing-edit-safety-corpus-2026-08-09.json");
+    const SPEC_CONSTANTS: &str =
+        include_str!("../../../docs/research/smart-writing-spec-constants-2026-08-09.json");
 
     #[derive(Deserialize)]
     struct Corpus {
@@ -1077,7 +1093,11 @@ mod tests {
         assert_eq!(corpus.fixtures.len(), 18);
         let mut failures = Vec::new();
         for fixture in corpus.fixtures {
-            let dictionary: Vec<&str> = fixture.dictionary_terms.iter().map(String::as_str).collect();
+            let dictionary: Vec<&str> = fixture
+                .dictionary_terms
+                .iter()
+                .map(String::as_str)
+                .collect();
             let names: Vec<&str> = fixture.protected_names.iter().map(String::as_str).collect();
             let baseline = baseline(&fixture.base.text, &dictionary, &names);
             let raw = serde_json::to_vec(&fixture.grammar_candidate).unwrap();
@@ -1119,7 +1139,10 @@ mod tests {
     fn production_limits_and_release_counts_match_the_spec_manifest() {
         let manifest: Value = serde_json::from_str(SPEC_CONSTANTS).unwrap();
         let limits = &manifest["limits"];
-        assert_eq!(limits["MAX_GRAMMAR_RESPONSE_BYTES"], MAX_GRAMMAR_RESPONSE_BYTES);
+        assert_eq!(
+            limits["MAX_GRAMMAR_RESPONSE_BYTES"],
+            MAX_GRAMMAR_RESPONSE_BYTES
+        );
         assert_eq!(limits["MAX_GRAMMAR_JSON_DEPTH"], MAX_GRAMMAR_JSON_DEPTH);
         assert_eq!(limits["MAX_GRAMMAR_JSON_NODES"], MAX_GRAMMAR_JSON_NODES);
         assert_eq!(limits["MAX_GRAMMAR_EDITS"], MAX_GRAMMAR_EDITS);
@@ -1170,9 +1193,30 @@ mod tests {
     #[test]
     fn closed_rules_reject_tabs_commands_and_false_contexts() {
         let cases = [
-            ("there\tis two issues", 6, 8, "G_THERE_IS_PLURAL_QUANTITY", "is", "are"),
-            ("there is two issues command period", 6, 8, "G_THERE_IS_PLURAL_QUANTITY", "is", "are"),
-            ("the app lets users export", 8, 12, "G_LETS_MEET_CONTRACTION", "lets", "let's"),
+            (
+                "there\tis two issues",
+                6,
+                8,
+                "G_THERE_IS_PLURAL_QUANTITY",
+                "is",
+                "are",
+            ),
+            (
+                "there is two issues command period",
+                6,
+                8,
+                "G_THERE_IS_PLURAL_QUANTITY",
+                "is",
+                "are",
+            ),
+            (
+                "the app lets users export",
+                8,
+                12,
+                "G_LETS_MEET_CONTRACTION",
+                "lets",
+                "let's",
+            ),
         ];
         for (text, start, end, rule, before, after) in cases {
             let baseline = baseline(text, &[], &[]);
@@ -1231,7 +1275,10 @@ mod tests {
     fn all_release_limits_are_exact_at_and_over_the_boundary() {
         let text = "i didnt work";
         let base_capability = baseline(text, &[], &[]);
-        let valid = candidate(text, json!([edit(text, "didnt", "G_DIDNT_APOSTROPHE", "didn't")]));
+        let valid = candidate(
+            text,
+            json!([edit(text, "didnt", "G_DIDNT_APOSTROPHE", "didn't")]),
+        );
 
         let mut exact_raw = valid.clone();
         exact_raw.resize(MAX_GRAMMAR_RESPONSE_BYTES, b' ');
@@ -1322,8 +1369,8 @@ mod tests {
         let result = apply_value(text, many_nodes, &[], &[]);
         assert_eq!(result.error_codes(), ["E_OVERSIZE"]);
 
-        let depth_at = (0..MAX_GRAMMAR_JSON_DEPTH - 1)
-            .fold(Value::Null, |value, _| Value::Array(vec![value]));
+        let depth_at =
+            (0..MAX_GRAMMAR_JSON_DEPTH - 1).fold(Value::Null, |value, _| Value::Array(vec![value]));
         assert_eq!(json_shape(&depth_at).0, MAX_GRAMMAR_JSON_DEPTH);
         let depth_over = Value::Array(vec![depth_at]);
         assert_eq!(json_shape(&depth_over).0, MAX_GRAMMAR_JSON_DEPTH + 1);
@@ -1351,14 +1398,60 @@ mod tests {
             )
         };
 
-        record("A01_INVALID_JSON", raw_result(b"{").error_codes() == ["E_MALFORMED"]);
-        record("A02_TOP_ARRAY", apply_value(text, json!([]), &[], &[]).error_codes() == ["E_MALFORMED"]);
+        record(
+            "A01_INVALID_JSON",
+            raw_result(b"{").error_codes() == ["E_MALFORMED"],
+        );
+        record(
+            "A02_TOP_ARRAY",
+            apply_value(text, json!([]), &[], &[]).error_codes() == ["E_MALFORMED"],
+        );
         record("A03_EXTRA_TOP", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[],"rendered":"owned"}), &[], &[]).error_codes() == ["E_MALFORMED"]);
-        record("A04_MISSING_TOP", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp}), &[], &[]).error_codes() == ["E_MALFORMED"]);
-        record("A05_EMPTY_VERSION", apply_value(text, json!({"base_version":"","base_fingerprint":fp,"edits":[]}), &[], &[]).error_codes() == ["E_MALFORMED"]);
+        record(
+            "A04_MISSING_TOP",
+            apply_value(
+                text,
+                json!({"base_version":"validated-en-v1","base_fingerprint":fp}),
+                &[],
+                &[],
+            )
+            .error_codes()
+                == ["E_MALFORMED"],
+        );
+        record(
+            "A05_EMPTY_VERSION",
+            apply_value(
+                text,
+                json!({"base_version":"","base_fingerprint":fp,"edits":[]}),
+                &[],
+                &[],
+            )
+            .error_codes()
+                == ["E_MALFORMED"],
+        );
         record("A06_BAD_FINGERPRINT", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":"sha256:ABC","edits":[]}), &[], &[]).error_codes() == ["E_MALFORMED"]);
-        record("A07_EDITS_NOT_ARRAY", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":{}}), &[], &[]).error_codes() == ["E_MALFORMED"]);
-        record("A08_EDIT_NOT_OBJECT", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[null]}), &[], &[]).error_codes() == ["E_MALFORMED"]);
+        record(
+            "A07_EDITS_NOT_ARRAY",
+            apply_value(
+                text,
+                json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":{}}),
+                &[],
+                &[],
+            )
+            .error_codes()
+                == ["E_MALFORMED"],
+        );
+        record(
+            "A08_EDIT_NOT_OBJECT",
+            apply_value(
+                text,
+                json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[null]}),
+                &[],
+                &[],
+            )
+            .error_codes()
+                == ["E_MALFORMED"],
+        );
         record("A09_EDIT_EXTRA_KEY", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[{"id":"g","rule_id":"G_DIDNT_APOSTROPHE","start_utf8":2,"end_utf8":7,"before":"didnt","after":"didn't","rendered":"x"}]}), &[], &[]).error_codes() == ["E_MALFORMED"]);
         record("A10_EDIT_MISSING_KEY", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[{"id":"g"}]}), &[], &[]).error_codes() == ["E_MALFORMED"]);
         record("A11_ID_WRONG_TYPE", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[{"id":1,"rule_id":"G_DIDNT_APOSTROPHE","start_utf8":2,"end_utf8":7,"before":"didnt","after":"didn't"}]}), &[], &[]).error_codes() == ["E_MALFORMED"]);
@@ -1369,85 +1462,317 @@ mod tests {
         let long = "x".repeat(MAX_GRAMMAR_EDIT_FIELD_UTF8_BYTES + 1);
         record("A16_FIELD_OVERSIZE", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[{"id":long,"rule_id":"G_DIDNT_APOSTROPHE","start_utf8":2,"end_utf8":7,"before":"didnt","after":"didn't"}]}), &[], &[]).error_codes() == ["E_OVERSIZE"]);
         record("A17_EDIT_COUNT", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":vec![valid_edit.clone(); MAX_GRAMMAR_EDITS + 1]}), &[], &[]).error_codes() == ["E_OVERSIZE"]);
-        record("A18_RAW_OVERSIZE", raw_result(&vec![b' '; MAX_GRAMMAR_RESPONSE_BYTES + 1]).error_codes() == ["E_OVERSIZE"]);
-        let nested = format!("{{\"base_version\":\"validated-en-v1\",\"base_fingerprint\":\"{fp}\",\"edits\":[{}]}}", "[".repeat(9) + &"]".repeat(9));
-        record("A19_DEPTH", raw_result(nested.as_bytes()).error_codes() == ["E_OVERSIZE"]);
+        record(
+            "A18_RAW_OVERSIZE",
+            raw_result(&vec![b' '; MAX_GRAMMAR_RESPONSE_BYTES + 1]).error_codes() == ["E_OVERSIZE"],
+        );
+        let nested = format!(
+            "{{\"base_version\":\"validated-en-v1\",\"base_fingerprint\":\"{fp}\",\"edits\":[{}]}}",
+            "[".repeat(9) + &"]".repeat(9)
+        );
+        record(
+            "A19_DEPTH",
+            raw_result(nested.as_bytes()).error_codes() == ["E_OVERSIZE"],
+        );
         record("A20_NODES", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":vec![Value::Null; MAX_GRAMMAR_JSON_NODES]}), &[], &[]).error_codes() == ["E_OVERSIZE"]);
 
         let stale_bad = json!({"base_version":"validated-en-v0","base_fingerprint":"sha256:0000000000000000000000000000000000000000000000000000000000000000","edits":[{"bad":true}]});
-        record("A21_STALE_PRECEDENCE", apply_value(text, stale_bad, &[], &[]).error_codes() == ["E_STALE_GRAMMAR"]);
+        record(
+            "A21_STALE_PRECEDENCE",
+            apply_value(text, stale_bad, &[], &[]).error_codes() == ["E_STALE_GRAMMAR"],
+        );
         let second = json!({"id":"g2","rule_id":"G_DIDNT_APOSTROPHE","start_utf8":0,"end_utf8":1,"before":"i","after":"didn't"});
         record("A22_UNSORTED", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[valid_edit.clone(),second]}), &[], &[]).error_codes() == ["E_UNSORTED"]);
         let out = json!({"id":"g","rule_id":"G_DIDNT_APOSTROPHE","start_utf8":2,"end_utf8":999,"before":"didnt","after":"didn't"});
-        record("A23_OUT_OF_BOUNDS", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[out]}), &[], &[]).error_codes() == ["E_SPAN_OUT_OF_BOUNDS"]);
+        record(
+            "A23_OUT_OF_BOUNDS",
+            apply_value(
+                text,
+                json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[out]}),
+                &[],
+                &[],
+            )
+            .error_codes()
+                == ["E_SPAN_OUT_OF_BOUNDS"],
+        );
         let reversed = json!({"id":"g","rule_id":"G_DIDNT_APOSTROPHE","start_utf8":7,"end_utf8":2,"before":"didnt","after":"didn't"});
-        record("A24_REVERSED", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[reversed]}), &[], &[]).error_codes() == ["E_SPAN_OUT_OF_BOUNDS"]);
+        record(
+            "A24_REVERSED",
+            apply_value(
+                text,
+                json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[reversed]}),
+                &[],
+                &[],
+            )
+            .error_codes()
+                == ["E_SPAN_OUT_OF_BOUNDS"],
+        );
         let unicode = "naïve didnt work";
         let mid = json!({"id":"g","rule_id":"G_DIDNT_APOSTROPHE","start_utf8":2,"end_utf8":3,"before":"","after":"didn't"});
         record("A25_UTF8_BOUNDARY", apply_value(unicode, json!({"base_version":"validated-en-v1","base_fingerprint":text_sha256_fingerprint(unicode),"edits":[mid]}), &[], &[]).error_codes() == ["E_SPAN_NOT_CHAR_BOUNDARY"]);
         let zero = json!({"id":"g","rule_id":"G_DIDNT_APOSTROPHE","start_utf8":2,"end_utf8":2,"before":"","after":"didn't"});
-        record("A26_ZERO_WIDTH", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[zero]}), &[], &[]).error_codes().contains(&"E_NOT_TOKEN_BOUNDARY"));
+        record(
+            "A26_ZERO_WIDTH",
+            apply_value(
+                text,
+                json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[zero]}),
+                &[],
+                &[],
+            )
+            .error_codes()
+            .contains(&"E_NOT_TOKEN_BOUNDARY"),
+        );
         let multi = json!({"id":"g","rule_id":"G_DIDNT_APOSTROPHE","start_utf8":0,"end_utf8":7,"before":"i didnt","after":"didn't"});
-        record("A27_MULTI_TOKEN", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[multi]}), &[], &[]).error_codes().contains(&"E_NOT_TOKEN_BOUNDARY"));
+        record(
+            "A27_MULTI_TOKEN",
+            apply_value(
+                text,
+                json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[multi]}),
+                &[],
+                &[],
+            )
+            .error_codes()
+            .contains(&"E_NOT_TOKEN_BOUNDARY"),
+        );
         let mismatch = json!({"id":"g","rule_id":"G_DIDNT_APOSTROPHE","start_utf8":2,"end_utf8":7,"before":"other","after":"didn't"});
-        record("A28_ANCHOR_MISMATCH", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[mismatch]}), &[], &[]).error_codes().contains(&"E_ANCHOR_MISMATCH"));
+        record(
+            "A28_ANCHOR_MISMATCH",
+            apply_value(
+                text,
+                json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[mismatch]}),
+                &[],
+                &[],
+            )
+            .error_codes()
+            .contains(&"E_ANCHOR_MISMATCH"),
+        );
         let unknown = json!({"id":"g","rule_id":"F_trusted_precomputed","start_utf8":2,"end_utf8":7,"before":"didnt","after":"didn't"});
-        record("A29_UNKNOWN_RULE", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[unknown]}), &[], &[]).error_codes().contains(&"E_UNKNOWN_RULE"));
+        record(
+            "A29_UNKNOWN_RULE",
+            apply_value(
+                text,
+                json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[unknown]}),
+                &[],
+                &[],
+            )
+            .error_codes()
+            .contains(&"E_UNKNOWN_RULE"),
+        );
         let wrong_after = edit(text, "didnt", "G_DIDNT_APOSTROPHE", "did");
         record("A30_WRONG_AFTER", apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[wrong_after]}), &[], &[]).error_codes().contains(&"E_RULE_CONTEXT"));
 
         for (name, base_text, needle, rule, after) in [
-            ("A31_THERE_PRICE", "the price is two dollars", "is", "G_THERE_IS_PLURAL_QUANTITY", "are"),
-            ("A32_THERE_PERIOD", "there. is two issues", "is", "G_THERE_IS_PLURAL_QUANTITY", "are"),
-            ("A33_THERE_TAB", "there\tis two issues", "is", "G_THERE_IS_PLURAL_QUANTITY", "are"),
-            ("A34_THERE_COMMAND", "there is two issues command period", "is", "G_THERE_IS_PLURAL_QUANTITY", "are"),
-            ("A35_LETS_APP", "the app lets users export", "lets", "G_LETS_MEET_CONTRACTION", "let's"),
-            ("A36_LETS_PERIOD", "lets. meet tomorrow", "lets", "G_LETS_MEET_CONTRACTION", "let's"),
+            (
+                "A31_THERE_PRICE",
+                "the price is two dollars",
+                "is",
+                "G_THERE_IS_PLURAL_QUANTITY",
+                "are",
+            ),
+            (
+                "A32_THERE_PERIOD",
+                "there. is two issues",
+                "is",
+                "G_THERE_IS_PLURAL_QUANTITY",
+                "are",
+            ),
+            (
+                "A33_THERE_TAB",
+                "there\tis two issues",
+                "is",
+                "G_THERE_IS_PLURAL_QUANTITY",
+                "are",
+            ),
+            (
+                "A34_THERE_COMMAND",
+                "there is two issues command period",
+                "is",
+                "G_THERE_IS_PLURAL_QUANTITY",
+                "are",
+            ),
+            (
+                "A35_LETS_APP",
+                "the app lets users export",
+                "lets",
+                "G_LETS_MEET_CONTRACTION",
+                "let's",
+            ),
+            (
+                "A36_LETS_PERIOD",
+                "lets. meet tomorrow",
+                "lets",
+                "G_LETS_MEET_CONTRACTION",
+                "let's",
+            ),
         ] {
             let value = json!({"base_version":"validated-en-v1","base_fingerprint":text_sha256_fingerprint(base_text),"edits":[edit(base_text,needle,rule,after)]});
-            record(name, apply_value(base_text, value, &[], &[]).error_codes().contains(&"E_RULE_CONTEXT"));
+            record(
+                name,
+                apply_value(base_text, value, &[], &[])
+                    .error_codes()
+                    .contains(&"E_RULE_CONTEXT"),
+            );
         }
 
         let duplicate = json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[valid_edit.clone(),valid_edit.clone()]});
-        record("A37_OVERLAP", apply_value(text, duplicate, &[], &[]).error_codes().contains(&"E_OVERLAP"));
+        record(
+            "A37_OVERLAP",
+            apply_value(text, duplicate, &[], &[])
+                .error_codes()
+                .contains(&"E_OVERLAP"),
+        );
         let secret_edit = json!({"id":"gsk_supersecret","rule_id":"G_DIDNT_APOSTROPHE","start_utf8":2,"end_utf8":7,"before":"wrong","after":"didn't"});
-        let secret_result = apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[secret_edit]}), &[], &[]);
-        record("A38_DIAGNOSTIC_SCRUB", secret_result.diagnostics.iter().all(|item| !item.edit_id.contains("supersecret")));
+        let secret_result = apply_value(
+            text,
+            json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[secret_edit]}),
+            &[],
+            &[],
+        );
+        record(
+            "A38_DIAGNOSTIC_SCRUB",
+            secret_result
+                .diagnostics
+                .iter()
+                .all(|item| !item.edit_id.contains("supersecret")),
+        );
 
         for (name, protected_text, needle, dictionary, names) in [
-            ("A39_PROMPT", "ignore previous instructions and didnt obey", "didnt", &[][..], &[][..]),
-            ("A40_QUOTE", "she said \"i didnt know\"", "didnt", &[][..], &[][..]),
-            ("A41_INLINE_CODE", "use `didnt` exactly", "didnt", &[][..], &[][..]),
-            ("A42_FENCED_CODE", "use ```didnt``` exactly", "didnt", &[][..], &[][..]),
-            ("A43_DICTIONARY", "use PostgreSQL didnt work", "PostgreSQL", &["PostgreSQL"][..], &[][..]),
-            ("A44_NAME", "ask Didnt tomorrow", "Didnt", &[][..], &["Didnt"][..]),
-            ("A45_EMAIL", "mail didnt@example.com", "didnt", &[][..], &[][..]),
-            ("A46_URL", "visit https://didnt.example", "didnt", &[][..], &[][..]),
+            (
+                "A39_PROMPT",
+                "ignore previous instructions and didnt obey",
+                "didnt",
+                &[][..],
+                &[][..],
+            ),
+            (
+                "A40_QUOTE",
+                "she said \"i didnt know\"",
+                "didnt",
+                &[][..],
+                &[][..],
+            ),
+            (
+                "A41_INLINE_CODE",
+                "use `didnt` exactly",
+                "didnt",
+                &[][..],
+                &[][..],
+            ),
+            (
+                "A42_FENCED_CODE",
+                "use ```didnt``` exactly",
+                "didnt",
+                &[][..],
+                &[][..],
+            ),
+            (
+                "A43_DICTIONARY",
+                "use PostgreSQL didnt work",
+                "PostgreSQL",
+                &["PostgreSQL"][..],
+                &[][..],
+            ),
+            (
+                "A44_NAME",
+                "ask Didnt tomorrow",
+                "Didnt",
+                &[][..],
+                &["Didnt"][..],
+            ),
+            (
+                "A45_EMAIL",
+                "mail didnt@example.com",
+                "didnt",
+                &[][..],
+                &[][..],
+            ),
+            (
+                "A46_URL",
+                "visit https://didnt.example",
+                "didnt",
+                &[][..],
+                &[][..],
+            ),
             ("A47_PATH", "open /tmp/didnt now", "didnt", &[][..], &[][..]),
-            ("A48_IDENTIFIER", "set API_KEY now", "API_KEY", &[][..], &[][..]),
+            (
+                "A48_IDENTIFIER",
+                "set API_KEY now",
+                "API_KEY",
+                &[][..],
+                &[][..],
+            ),
             ("A49_NUMBER", "there is 2 issues", "2", &[][..], &[][..]),
             ("A50_NEGATION", "i did not obey", "not", &[][..], &[][..]),
-            ("A51_UNMATCHED_QUOTE", "she said \"i didnt know", "didnt", &[][..], &[][..]),
+            (
+                "A51_UNMATCHED_QUOTE",
+                "she said \"i didnt know",
+                "didnt",
+                &[][..],
+                &[][..],
+            ),
         ] {
             let value = json!({"base_version":"validated-en-v1","base_fingerprint":text_sha256_fingerprint(protected_text),"edits":[edit(protected_text,needle,"G_DIDNT_APOSTROPHE","didn't")]});
-            record(name, apply_value(protected_text, value, dictionary, names).error_codes().contains(&"E_PROTECTED_SPAN"));
+            record(
+                name,
+                apply_value(protected_text, value, dictionary, names)
+                    .error_codes()
+                    .contains(&"E_PROTECTED_SPAN"),
+            );
         }
 
         for (name, good_text, needle, rule, after) in [
-            ("A52_VALID_DIDNT", "i didnt work", "didnt", "G_DIDNT_APOSTROPHE", "didn't"),
-            ("A53_VALID_LETS", "lets meet tomorrow", "lets", "G_LETS_MEET_CONTRACTION", "let's"),
-            ("A54_VALID_THERE", "there is two issues", "is", "G_THERE_IS_PLURAL_QUANTITY", "are"),
+            (
+                "A52_VALID_DIDNT",
+                "i didnt work",
+                "didnt",
+                "G_DIDNT_APOSTROPHE",
+                "didn't",
+            ),
+            (
+                "A53_VALID_LETS",
+                "lets meet tomorrow",
+                "lets",
+                "G_LETS_MEET_CONTRACTION",
+                "let's",
+            ),
+            (
+                "A54_VALID_THERE",
+                "there is two issues",
+                "is",
+                "G_THERE_IS_PLURAL_QUANTITY",
+                "are",
+            ),
         ] {
             let value = json!({"base_version":"validated-en-v1","base_fingerprint":text_sha256_fingerprint(good_text),"edits":[edit(good_text,needle,rule,after)]});
             let result = apply_value(good_text, value, &[], &[]);
-            record(name, result.diagnostics.is_empty() && matches!(result.outcome, GrammarOutcome::Both | GrammarOutcome::GrammarOnly));
+            record(
+                name,
+                result.diagnostics.is_empty()
+                    && matches!(
+                        result.outcome,
+                        GrammarOutcome::Both | GrammarOutcome::GrammarOnly
+                    ),
+            );
         }
         let multi_text = "there is two issues and i didnt know";
         let multi_value = json!({"base_version":"validated-en-v1","base_fingerprint":text_sha256_fingerprint(multi_text),"edits":[edit(multi_text,"is","G_THERE_IS_PLURAL_QUANTITY","are"),edit(multi_text,"didnt","G_DIDNT_APOSTROPHE","didn't")]});
         let multi_result = apply_value(multi_text, multi_value, &[], &[]);
-        record("A55_MULTI_ACCEPT", multi_result.diagnostics.is_empty() && multi_result.rendered.contains("are") && multi_result.rendered.contains("didn't"));
-        let empty_result = apply_value(text, json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[]}), &[], &[]);
-        record("A56_EMPTY_SAFE", empty_result.diagnostics.is_empty() && empty_result.rendered == baseline.rendered());
+        record(
+            "A55_MULTI_ACCEPT",
+            multi_result.diagnostics.is_empty()
+                && multi_result.rendered.contains("are")
+                && multi_result.rendered.contains("didn't"),
+        );
+        let empty_result = apply_value(
+            text,
+            json!({"base_version":"validated-en-v1","base_fingerprint":fp,"edits":[]}),
+            &[],
+            &[],
+        );
+        record(
+            "A56_EMPTY_SAFE",
+            empty_result.diagnostics.is_empty() && empty_result.rendered == baseline.rendered(),
+        );
 
         assert_eq!(cases.len(), 56);
         let len = cases.len();

@@ -54,22 +54,34 @@ impl OverlayView {
 
     pub const fn from_terminal_event(event: &OverlayEvent) -> Self {
         match event.outcome {
-            OverlayOutcome::Delivered => Self { phase: OverlayPhase::Success,
-                visible_label: "Delivered", accessible_label: "Transcript Delivered" },
+            OverlayOutcome::Delivered => Self {
+                phase: OverlayPhase::Success,
+                visible_label: "Delivered",
+                accessible_label: "Transcript Delivered",
+            },
             OverlayOutcome::QualityFailure => Self::no_speech(),
-            _ => Self { phase: OverlayPhase::Failure,
-                visible_label: "Failure", accessible_label: "Recording failed" },
+            _ => Self {
+                phase: OverlayPhase::Failure,
+                visible_label: "Failure",
+                accessible_label: "Recording failed",
+            },
         }
     }
 
     pub const fn success() -> Self {
-        Self { phase: OverlayPhase::Success,
-            visible_label: "Delivered", accessible_label: "Transcript Delivered" }
+        Self {
+            phase: OverlayPhase::Success,
+            visible_label: "Delivered",
+            accessible_label: "Transcript Delivered",
+        }
     }
 
     pub const fn failure() -> Self {
-        Self { phase: OverlayPhase::Failure,
-            visible_label: "Quality Failure", accessible_label: "Quality Failure" }
+        Self {
+            phase: OverlayPhase::Failure,
+            visible_label: "Quality Failure",
+            accessible_label: "Quality Failure",
+        }
     }
 
     /// The Failure view shown when the optional Overlay cannot reach the
@@ -107,8 +119,9 @@ impl OverlayView {
         }
     }
 
-    pub const fn is_visible(self) -> bool { !matches!(self.phase, OverlayPhase::Hidden) }
-
+    pub const fn is_visible(self) -> bool {
+        !matches!(self.phase, OverlayPhase::Hidden)
+    }
 }
 
 /// The text glyph shown in the capsule's glyph slot. Graphics-first phases
@@ -171,8 +184,11 @@ impl PresentationController {
             return OverlayView::from_terminal_event(event);
         }
         if self.terminal_until.is_some_and(|until| now < until) {
-            return response.overlay_event.as_ref()
-                .map(OverlayView::from_terminal_event).unwrap_or(OverlayView::HIDDEN);
+            return response
+                .overlay_event
+                .as_ref()
+                .map(OverlayView::from_terminal_event)
+                .unwrap_or(OverlayView::HIDDEN);
         }
         self.terminal_until = None;
         OverlayView::HIDDEN
@@ -393,7 +409,12 @@ pub fn recording_bar_height(level: u8, drawable_height: f64) -> f64 {
 /// left→right across the row every `SWEEP_PERIOD_SECS`, entering from before
 /// bar 0 and exiting past the last bar so the loop has no visible snap.
 /// Reduced motion: uniform raised brightness, no movement.
-pub fn sweep_brightness(index: usize, count: usize, elapsed_secs: f64, reduced_motion: bool) -> f64 {
+pub fn sweep_brightness(
+    index: usize,
+    count: usize,
+    elapsed_secs: f64,
+    reduced_motion: bool,
+) -> f64 {
     if reduced_motion {
         return SWEEP_REDUCED_MOTION_BRIGHTNESS;
     }
@@ -799,7 +820,12 @@ pub fn poll_tick(
     no_speech_latch: &mut NoSpeechNotifyLatch,
     limit_latch: &mut LimitWarningLatch,
 ) -> TickAction {
-    let TickObservation { view, signal, identity, warning } = observation;
+    let TickObservation {
+        view,
+        signal,
+        identity,
+        warning,
+    } = observation;
     if switched_after_render {
         return TickAction::Break;
     }
@@ -818,13 +844,20 @@ pub fn poll_tick(
     }
     let resurface = tracker.observe(view);
     let notify = notify_latch.observe(signal);
-    TickAction::Continue { resurface, notify, notify_no_speech, notify_limit }
+    TickAction::Continue {
+        resurface,
+        notify,
+        notify_no_speech,
+        notify_limit,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feedback::{select_feedback_backend, FeedbackBackend, FeedbackCapabilities, SessionKind};
+    use crate::feedback::{
+        FeedbackBackend, FeedbackCapabilities, SessionKind, select_feedback_backend,
+    };
     use voisu_core::{DaemonState, OverlayEvent, OverlayOutcome, Response, VersionEnvelope};
 
     #[test]
@@ -850,15 +883,30 @@ mod tests {
     #[test]
     fn red_level_poll_timer_uses_observed_recording_edges() {
         let mut latch = LevelPollLatch::default();
-        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)), LevelPollAction::Arm);
-        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)), LevelPollAction::Keep);
-        assert_eq!(latch.observe(ObservedSignal::Unreachable), LevelPollAction::Keep);
+        assert_eq!(
+            latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)),
+            LevelPollAction::Arm
+        );
         assert_eq!(
             latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)),
             LevelPollAction::Keep
         );
-        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Processing)), LevelPollAction::Disarm);
-        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Hidden)), LevelPollAction::Keep);
+        assert_eq!(
+            latch.observe(ObservedSignal::Unreachable),
+            LevelPollAction::Keep
+        );
+        assert_eq!(
+            latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)),
+            LevelPollAction::Keep
+        );
+        assert_eq!(
+            latch.observe(ObservedSignal::Reachable(OverlayPhase::Processing)),
+            LevelPollAction::Disarm
+        );
+        assert_eq!(
+            latch.observe(ObservedSignal::Reachable(OverlayPhase::Hidden)),
+            LevelPollAction::Keep
+        );
     }
 
     #[test]
@@ -868,7 +916,10 @@ mod tests {
             latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)),
             LevelPollAction::Arm
         );
-        assert_eq!(latch.observe(ObservedSignal::Unreachable), LevelPollAction::Keep);
+        assert_eq!(
+            latch.observe(ObservedSignal::Unreachable),
+            LevelPollAction::Keep
+        );
         assert_eq!(
             latch.observe(ObservedSignal::Unreachable),
             LevelPollAction::Disarm
@@ -893,11 +944,17 @@ mod tests {
         let now = Instant::now();
         let mut controller = PresentationController::default();
         let response = overlay_status(DaemonState::Recording, None);
-        assert_eq!(controller.observe(&response, now).phase, OverlayPhase::Recording);
+        assert_eq!(
+            controller.observe(&response, now).phase,
+            OverlayPhase::Recording
+        );
         let mut smoother = BarSmoother::default();
         smoother.observe([200; 20]);
         assert!(smoother.observe_failure()[0] < 200);
-        assert_eq!(controller.observe(&response, now).phase, OverlayPhase::Recording);
+        assert_eq!(
+            controller.observe(&response, now).phase,
+            OverlayPhase::Recording
+        );
     }
 
     fn event(id: u64, outcome: OverlayOutcome) -> OverlayEvent {
@@ -905,7 +962,12 @@ mod tests {
     }
 
     fn event_from(instance: u64, id: u64, outcome: OverlayOutcome) -> OverlayEvent {
-        OverlayEvent { id, instance, outcome, message: "exact public outcome".into() }
+        OverlayEvent {
+            id,
+            instance,
+            outcome,
+            message: "exact public outcome".into(),
+        }
     }
 
     /// Mirrors a real `OverlayStatus` reply: the observer path always attaches
@@ -943,12 +1005,24 @@ mod tests {
 
     #[test]
     fn public_observer_response_is_typed_and_terminal_events_are_displayed_once() {
-        let terminal = overlay_status(DaemonState::Idle, Some(event(7, OverlayOutcome::DeliveryFailure)));
+        let terminal = overlay_status(
+            DaemonState::Idle,
+            Some(event(7, OverlayOutcome::DeliveryFailure)),
+        );
         let mut controller = PresentationController::default();
         let now = Instant::now();
-        assert_eq!(controller.observe(&terminal, now).phase, OverlayPhase::Failure);
-        assert_eq!(controller.observe(&terminal, now).phase, OverlayPhase::Failure);
-        assert_eq!(controller.observe(&terminal, now + TERMINAL_DISPLAY).phase, OverlayPhase::Hidden);
+        assert_eq!(
+            controller.observe(&terminal, now).phase,
+            OverlayPhase::Failure
+        );
+        assert_eq!(
+            controller.observe(&terminal, now).phase,
+            OverlayPhase::Failure
+        );
+        assert_eq!(
+            controller.observe(&terminal, now + TERMINAL_DISPLAY).phase,
+            OverlayPhase::Hidden
+        );
     }
 
     #[test]
@@ -961,11 +1035,17 @@ mod tests {
         let now = Instant::now();
         let stale = event(1, OverlayOutcome::QualityFailure);
         let terminal = overlay_status(DaemonState::Idle, Some(stale.clone()));
-        assert_eq!(controller.observe(&terminal, now).phase, OverlayPhase::NoSpeech);
+        assert_eq!(
+            controller.observe(&terminal, now).phase,
+            OverlayPhase::NoSpeech
+        );
         // The next Recording (with the stale event still retained) overrides the
         // terminal feedback and is driven live from status.
         let recording = overlay_status(DaemonState::Recording, Some(stale.clone()));
-        assert_eq!(controller.observe(&recording, now).phase, OverlayPhase::Recording);
+        assert_eq!(
+            controller.observe(&recording, now).phase,
+            OverlayPhase::Recording
+        );
         // Returning to Idle with the same already-shown, expired event stays hidden.
         let idle = overlay_status(DaemonState::Idle, Some(stale));
         assert_eq!(controller.observe(&idle, now).phase, OverlayPhase::Hidden);
@@ -980,24 +1060,45 @@ mod tests {
         let now = Instant::now();
         let delivered = event(5, OverlayOutcome::Delivered);
         assert_eq!(
-            controller.observe(&overlay_status(DaemonState::Idle, Some(delivered.clone())), now).phase,
+            controller
+                .observe(
+                    &overlay_status(DaemonState::Idle, Some(delivered.clone())),
+                    now
+                )
+                .phase,
             OverlayPhase::Success,
         );
         assert_eq!(
-            controller.observe(&overlay_status(DaemonState::Recording, Some(delivered.clone())), now).phase,
+            controller
+                .observe(
+                    &overlay_status(DaemonState::Recording, Some(delivered.clone())),
+                    now
+                )
+                .phase,
             OverlayPhase::Recording,
         );
         // Already-displayed retained event + Processing must render Processing,
         // not the stale terminal event and not hidden.
         assert_eq!(
-            controller.observe(&overlay_status(DaemonState::Processing, Some(delivered)), now).phase,
+            controller
+                .observe(
+                    &overlay_status(DaemonState::Processing, Some(delivered)),
+                    now
+                )
+                .phase,
             OverlayPhase::Processing,
         );
         // A fresh observer that first sees Processing with an undisplayed
         // retained event still renders Processing, never the terminal event.
         assert_eq!(
             PresentationController::default()
-                .observe(&overlay_status(DaemonState::Processing, Some(event(9, OverlayOutcome::DeliveryFailure))), now)
+                .observe(
+                    &overlay_status(
+                        DaemonState::Processing,
+                        Some(event(9, OverlayOutcome::DeliveryFailure))
+                    ),
+                    now
+                )
                 .phase,
             OverlayPhase::Processing,
         );
@@ -1015,7 +1116,13 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(
             controller
-                .observe(&overlay_status(DaemonState::Idle, Some(event_from(instance_a, 1, OverlayOutcome::Delivered))), t0)
+                .observe(
+                    &overlay_status(
+                        DaemonState::Idle,
+                        Some(event_from(instance_a, 1, OverlayOutcome::Delivered))
+                    ),
+                    t0
+                )
                 .phase,
             OverlayPhase::Success,
         );
@@ -1023,14 +1130,26 @@ mod tests {
         let t1 = t0 + TERMINAL_DISPLAY + Duration::from_millis(1);
         assert_eq!(
             controller
-                .observe(&overlay_status(DaemonState::Idle, Some(event_from(instance_a, 1, OverlayOutcome::Delivered))), t1)
+                .observe(
+                    &overlay_status(
+                        DaemonState::Idle,
+                        Some(event_from(instance_a, 1, OverlayOutcome::Delivered))
+                    ),
+                    t1
+                )
                 .phase,
             OverlayPhase::Hidden,
         );
         // Daemon restarts: new instance, id counter reset to 1 (exact collision).
         assert_eq!(
             controller
-                .observe(&overlay_status(DaemonState::Idle, Some(event_from(instance_b, 1, OverlayOutcome::DeliveryFailure))), t1)
+                .observe(
+                    &overlay_status(
+                        DaemonState::Idle,
+                        Some(event_from(instance_b, 1, OverlayOutcome::DeliveryFailure))
+                    ),
+                    t1
+                )
                 .phase,
             OverlayPhase::Failure,
         );
@@ -1046,7 +1165,10 @@ mod tests {
         let t0 = Instant::now();
         let delivered = event(3, OverlayOutcome::Delivered);
         let terminal = overlay_status(DaemonState::Idle, Some(delivered));
-        assert_eq!(controller.observe(&terminal, t0).phase, OverlayPhase::Success);
+        assert_eq!(
+            controller.observe(&terminal, t0).phase,
+            OverlayPhase::Success
+        );
         // Daemon drops just before the terminal window expires: the
         // unavailable capsule flashes on its own deadline.
         let near_expiry = t0 + TERMINAL_DISPLAY - Duration::from_millis(100);
@@ -1068,7 +1190,9 @@ mod tests {
         assert_eq!(symmetric.observe(&fresh, t0).phase, OverlayPhase::Success);
         symmetric.observe_unreachable(t0 + Duration::from_millis(500));
         assert_eq!(
-            symmetric.observe(&fresh, t0 + Duration::from_millis(600)).phase,
+            symmetric
+                .observe(&fresh, t0 + Duration::from_millis(600))
+                .phase,
             OverlayPhase::Success,
         );
         assert_eq!(
@@ -1101,10 +1225,15 @@ mod tests {
         // stays down instead of pinning on screen forever.
         let mut controller = PresentationController::default();
         let now = Instant::now();
-        assert_eq!(controller.observe_unreachable(now).phase, OverlayPhase::Failure);
+        assert_eq!(
+            controller.observe_unreachable(now).phase,
+            OverlayPhase::Failure
+        );
         // Still within the window: the capsule remains up.
         assert_eq!(
-            controller.observe_unreachable(now + Duration::from_millis(500)).phase,
+            controller
+                .observe_unreachable(now + Duration::from_millis(500))
+                .phase,
             OverlayPhase::Failure,
         );
         // The window elapses while the daemon is still unreachable: hidden.
@@ -1127,17 +1256,27 @@ mod tests {
         // then drops again, the fresh transition flashes once more.
         let mut controller = PresentationController::default();
         let now = Instant::now();
-        assert_eq!(controller.observe_unreachable(now).phase, OverlayPhase::Failure);
+        assert_eq!(
+            controller.observe_unreachable(now).phase,
+            OverlayPhase::Failure
+        );
         let expired = now + TERMINAL_DISPLAY;
-        assert_eq!(controller.observe_unreachable(expired).phase, OverlayPhase::Hidden);
+        assert_eq!(
+            controller.observe_unreachable(expired).phase,
+            OverlayPhase::Hidden
+        );
         // Daemon reachable again (idle) clears the unreachable edge.
         assert_eq!(
-            controller.observe(&overlay_status(DaemonState::Idle, None), expired).phase,
+            controller
+                .observe(&overlay_status(DaemonState::Idle, None), expired)
+                .phase,
             OverlayPhase::Hidden,
         );
         // A later reachable->unreachable transition flashes again.
         assert_eq!(
-            controller.observe_unreachable(expired + Duration::from_secs(1)).phase,
+            controller
+                .observe_unreachable(expired + Duration::from_secs(1))
+                .phase,
             OverlayPhase::Failure,
         );
     }
@@ -1148,7 +1287,10 @@ mod tests {
         // not re-arm the flash; only a reachable->unreachable edge does.
         let mut controller = PresentationController::default();
         let now = Instant::now();
-        assert_eq!(controller.observe_unreachable(now).phase, OverlayPhase::Failure);
+        assert_eq!(
+            controller.observe_unreachable(now).phase,
+            OverlayPhase::Failure
+        );
         assert_eq!(
             controller.observe_unreachable(now + TERMINAL_DISPLAY).phase,
             OverlayPhase::Hidden,
@@ -1171,9 +1313,14 @@ mod tests {
         let response: Response = serde_json::from_str(
             r#"{"version":1,"ok":true,"state":"idle","message":"idle","overlay_event":{"id":9,"outcome":"teleported_transcript","message":"x"}}"#,
         ).unwrap();
-        assert_eq!(response.overlay_event.as_ref().unwrap().outcome, OverlayOutcome::Unknown);
         assert_eq!(
-            PresentationController::default().observe(&response, Instant::now()).phase,
+            response.overlay_event.as_ref().unwrap().outcome,
+            OverlayOutcome::Unknown
+        );
+        assert_eq!(
+            PresentationController::default()
+                .observe(&response, Instant::now())
+                .phase,
             OverlayPhase::Failure,
         );
     }
@@ -1181,12 +1328,14 @@ mod tests {
     #[test]
     fn responses_from_a_pre_event_daemon_are_safe_and_have_no_stale_feedback() {
         // New client, old daemon: the observer field is simply absent.
-        let response: Response = serde_json::from_str(
-            r#"{"version":1,"ok":true,"state":"idle","message":"idle"}"#,
-        ).unwrap();
+        let response: Response =
+            serde_json::from_str(r#"{"version":1,"ok":true,"state":"idle","message":"idle"}"#)
+                .unwrap();
         assert!(response.overlay_event.is_none());
-        assert_eq!(PresentationController::default().observe(&response, Instant::now()),
-            OverlayView::HIDDEN);
+        assert_eq!(
+            PresentationController::default().observe(&response, Instant::now()),
+            OverlayView::HIDDEN
+        );
     }
 
     #[test]
@@ -1221,31 +1370,60 @@ mod tests {
         // silently ignored or crash in GTK-dependent tests.
         let cases = [
             (
-                FeedbackCapabilities { session: SessionKind::X11, display_available: true, xwayland_fallback: false, layer_shell_supported: false },
+                FeedbackCapabilities {
+                    session: SessionKind::X11,
+                    display_available: true,
+                    xwayland_fallback: false,
+                    layer_shell_supported: false,
+                },
                 FeedbackBackend::DesktopNotification,
                 Some(crate::feedback::FeedbackDegradation::X11),
             ),
             (
-                FeedbackCapabilities { session: SessionKind::Wayland, display_available: true, xwayland_fallback: false, layer_shell_supported: false },
+                FeedbackCapabilities {
+                    session: SessionKind::Wayland,
+                    display_available: true,
+                    xwayland_fallback: false,
+                    layer_shell_supported: false,
+                },
                 FeedbackBackend::DesktopNotification,
                 Some(crate::feedback::FeedbackDegradation::LayerShellUnavailable),
             ),
             (
-                FeedbackCapabilities { session: SessionKind::Wayland, display_available: false, xwayland_fallback: false, layer_shell_supported: true },
+                FeedbackCapabilities {
+                    session: SessionKind::Wayland,
+                    display_available: false,
+                    xwayland_fallback: false,
+                    layer_shell_supported: true,
+                },
                 FeedbackBackend::JournalLog,
                 Some(crate::feedback::FeedbackDegradation::MissingDisplay),
             ),
         ];
         for (capabilities, backend, degradation) in cases {
             let selection = select_feedback_backend(capabilities);
-            assert_eq!((selection.backend, selection.degradation), (backend, degradation));
+            assert_eq!(
+                (selection.backend, selection.degradation),
+                (backend, degradation)
+            );
         }
         let surface_failure = crate::feedback::after_surface_creation(
-            select_feedback_backend(FeedbackCapabilities { session: SessionKind::Wayland, display_available: true, xwayland_fallback: false, layer_shell_supported: true }),
+            select_feedback_backend(FeedbackCapabilities {
+                session: SessionKind::Wayland,
+                display_available: true,
+                xwayland_fallback: false,
+                layer_shell_supported: true,
+            }),
             false,
         );
-        assert_eq!(surface_failure.backend, FeedbackBackend::DesktopNotification);
-        assert_eq!(surface_failure.degradation, Some(crate::feedback::FeedbackDegradation::SurfaceCreationFailure));
+        assert_eq!(
+            surface_failure.backend,
+            FeedbackBackend::DesktopNotification
+        );
+        assert_eq!(
+            surface_failure.degradation,
+            Some(crate::feedback::FeedbackDegradation::SurfaceCreationFailure)
+        );
     }
 
     #[test]
@@ -1377,11 +1555,22 @@ mod tests {
             poll_tick(
                 false,
                 true,
-                TickObservation { view: recording, signal, identity: None, warning: None },
-                &mut tracker, &mut latch, &mut no_speech_latch, &mut limit_latch,
+                TickObservation {
+                    view: recording,
+                    signal,
+                    identity: None,
+                    warning: None
+                },
+                &mut tracker,
+                &mut latch,
+                &mut no_speech_latch,
+                &mut limit_latch,
             ),
             TickAction::Continue {
-                resurface: true, notify: true, notify_no_speech: false, notify_limit: None,
+                resurface: true,
+                notify: true,
+                notify_no_speech: false,
+                notify_limit: None,
             },
         );
         // The layer-shell (non-fallback) path never resurfaces or notifies here.
@@ -1393,11 +1582,22 @@ mod tests {
             poll_tick(
                 false,
                 false,
-                TickObservation { view: recording, signal, identity: None, warning: None },
-                &mut tracker, &mut latch, &mut no_speech_latch, &mut limit_latch,
+                TickObservation {
+                    view: recording,
+                    signal,
+                    identity: None,
+                    warning: None
+                },
+                &mut tracker,
+                &mut latch,
+                &mut no_speech_latch,
+                &mut limit_latch,
             ),
             TickAction::Continue {
-                resurface: false, notify: false, notify_no_speech: false, notify_limit: None,
+                resurface: false,
+                notify: false,
+                notify_no_speech: false,
+                notify_limit: None,
             },
         );
     }
@@ -1449,19 +1649,32 @@ mod tests {
             warning: None,
         };
         let action = poll_tick(
-            false, false, observation,
-            &mut tracker, &mut notify_latch, &mut no_speech_latch, &mut limit_latch,
+            false,
+            false,
+            observation,
+            &mut tracker,
+            &mut notify_latch,
+            &mut no_speech_latch,
+            &mut limit_latch,
         );
         assert_eq!(
             action,
             TickAction::Continue {
-                resurface: false, notify: false, notify_no_speech: true, notify_limit: None,
+                resurface: false,
+                notify: false,
+                notify_no_speech: true,
+                notify_limit: None,
             },
         );
         // Break still wins over everything and consumes no latch state.
         let action = poll_tick(
-            true, false, observation,
-            &mut tracker, &mut notify_latch, &mut no_speech_latch, &mut limit_latch,
+            true,
+            false,
+            observation,
+            &mut tracker,
+            &mut notify_latch,
+            &mut no_speech_latch,
+            &mut limit_latch,
         );
         assert_eq!(action, TickAction::Break);
     }
@@ -1472,10 +1685,26 @@ mod tests {
         // it with an unbounded retry loop or a daemon restart cannot satisfy
         // this contract test.
         let mut policy = crate::feedback::OverlayRestartPolicy::default();
-        assert!(policy.record_failure(Duration::from_secs(0)).should_restart());
-        assert!(policy.record_failure(Duration::from_secs(10)).should_restart());
-        assert!(!policy.record_failure(Duration::from_secs(20)).should_restart());
-        assert!(policy.record_failure(Duration::from_secs(51)).should_restart());
+        assert!(
+            policy
+                .record_failure(Duration::from_secs(0))
+                .should_restart()
+        );
+        assert!(
+            policy
+                .record_failure(Duration::from_secs(10))
+                .should_restart()
+        );
+        assert!(
+            !policy
+                .record_failure(Duration::from_secs(20))
+                .should_restart()
+        );
+        assert!(
+            policy
+                .record_failure(Duration::from_secs(51))
+                .should_restart()
+        );
     }
 
     fn sample_event() -> OverlayEvent {
@@ -1492,23 +1721,41 @@ mod tests {
 
     #[test]
     fn quality_failure_maps_to_no_speech_view() {
-        let event = OverlayEvent { outcome: OverlayOutcome::QualityFailure, ..sample_event() };
+        let event = OverlayEvent {
+            outcome: OverlayOutcome::QualityFailure,
+            ..sample_event()
+        };
         let view = OverlayView::from_terminal_event(&event);
         assert_eq!(view.phase, OverlayPhase::NoSpeech);
         assert_eq!(view.visible_label, "Didn't catch any speech");
-        assert_eq!(view.accessible_label, "No speech detected; nothing was delivered");
+        assert_eq!(
+            view.accessible_label,
+            "No speech detected; nothing was delivered"
+        );
     }
 
     #[test]
     fn capsule_text_is_empty_for_graphics_first_phases() {
-        assert_eq!(OverlayView::from_response(&recording_response()).capsule_text(), "");
-        assert_eq!(OverlayView::from_response(&processing_response()).capsule_text(), "");
+        assert_eq!(
+            OverlayView::from_response(&recording_response()).capsule_text(),
+            ""
+        );
+        assert_eq!(
+            OverlayView::from_response(&processing_response()).capsule_text(),
+            ""
+        );
         assert_eq!(OverlayView::success().capsule_text(), "");
         // Text-bearing phases keep their words on the capsule.
-        assert_eq!(OverlayView::daemon_unavailable().capsule_text(), "Daemon unavailable");
+        assert_eq!(
+            OverlayView::daemon_unavailable().capsule_text(),
+            "Daemon unavailable"
+        );
         assert_eq!(OverlayView::no_speech().capsule_text(), "");
         // The notification rung still gets full labels everywhere.
-        assert_eq!(OverlayView::from_response(&recording_response()).visible_label, "Recording");
+        assert_eq!(
+            OverlayView::from_response(&recording_response()).visible_label,
+            "Recording"
+        );
         assert_eq!(OverlayView::success().visible_label, "Delivered");
     }
 
@@ -1525,7 +1772,10 @@ mod tests {
         let first = edge_falloff_alpha(0, 20);
         let mid = edge_falloff_alpha(10, 20);
         let last = edge_falloff_alpha(19, 20);
-        assert!((0.45..0.55).contains(&first), "outer bar should be ~0.45–0.55, got {first}");
+        assert!(
+            (0.45..0.55).contains(&first),
+            "outer bar should be ~0.45–0.55, got {first}"
+        );
         assert!((first - last).abs() < 0.05, "falloff must be symmetric");
         assert!(mid > 0.97, "center bar should be ~full opacity, got {mid}");
         // Monotone from edge to center — no ripples in the ramp.
@@ -1537,8 +1787,14 @@ mod tests {
     #[test]
     fn resting_floor_reads_as_a_dotted_baseline_not_a_flatline() {
         let floor = resting_floor(38.0); // 40px meter minus the 2px inset
-        assert!((floor - 3.8).abs() < 1e-9, "floor is 10% of drawable height");
-        assert!(resting_floor(10.0) >= 1.5, "floor never collapses below the old 1.5px minimum");
+        assert!(
+            (floor - 3.8).abs() < 1e-9,
+            "floor is 10% of drawable height"
+        );
+        assert!(
+            resting_floor(10.0) >= 1.5,
+            "floor never collapses below the old 1.5px minimum"
+        );
         // Silence (level 0) sits exactly on the floor; full level fills the height.
         assert!((recording_bar_height(0, 38.0) - floor).abs() < 1e-9);
         assert!((recording_bar_height(255, 38.0) - 38.0).abs() < 1e-9);
@@ -1556,10 +1812,16 @@ mod tests {
         // Full motion: brightness peaks near the sweep position and the peak moves.
         let early_left = sweep_brightness(2, 20, 0.15, false);
         let early_right = sweep_brightness(17, 20, 0.15, false);
-        assert!(early_left > early_right, "early in the pass the bump is on the left");
+        assert!(
+            early_left > early_right,
+            "early in the pass the bump is on the left"
+        );
         let late_left = sweep_brightness(2, 20, 1.05, false);
         let late_right = sweep_brightness(17, 20, 1.05, false);
-        assert!(late_right > late_left, "late in the pass the bump is on the right");
+        assert!(
+            late_right > late_left,
+            "late in the pass the bump is on the right"
+        );
         // Everything stays in a sane [0.25, 1.0] display range.
         for index in 0..20 {
             for t in [0.0, 0.4, 0.8, 1.19] {
@@ -1572,7 +1834,10 @@ mod tests {
     #[test]
     fn interpolate_bands_length_matches_count() {
         let bands = [7u8; 20];
-        assert_eq!(interpolate_bands(&bands, VISUAL_BAR_COUNT).len(), VISUAL_BAR_COUNT);
+        assert_eq!(
+            interpolate_bands(&bands, VISUAL_BAR_COUNT).len(),
+            VISUAL_BAR_COUNT
+        );
         assert_eq!(interpolate_bands(&bands, 44).len(), 44);
         assert_eq!(interpolate_bands(&bands, 20).len(), 20);
     }
@@ -1582,7 +1847,10 @@ mod tests {
         let bands: [u8; 20] = std::array::from_fn(|i| (i * 13 % 256) as u8);
         let out = interpolate_bands(&bands, 20);
         for (i, &b) in bands.iter().enumerate() {
-            assert!((out[i] - f64::from(b)).abs() < 1e-9, "identity broke at {i}");
+            assert!(
+                (out[i] - f64::from(b)).abs() < 1e-9,
+                "identity broke at {i}"
+            );
         }
     }
 
@@ -1600,7 +1868,12 @@ mod tests {
         let bands: [u8; 20] = std::array::from_fn(|i| (i * 13) as u8); // 0,13,...,247
         let out = interpolate_bands(&bands, VISUAL_BAR_COUNT);
         for w in out.windows(2) {
-            assert!(w[1] >= w[0] - 1e-9, "ramp not monotonic: {} -> {}", w[0], w[1]);
+            assert!(
+                w[1] >= w[0] - 1e-9,
+                "ramp not monotonic: {} -> {}",
+                w[0],
+                w[1]
+            );
         }
     }
 
@@ -1650,10 +1923,16 @@ mod tests {
         // Full motion: bump enters on the left early and reaches the right late.
         let early_left = sweep_brightness(4, VISUAL_BAR_COUNT, 0.15, false);
         let early_right = sweep_brightness(39, VISUAL_BAR_COUNT, 0.15, false);
-        assert!(early_left > early_right, "early in the pass the bump is on the left");
+        assert!(
+            early_left > early_right,
+            "early in the pass the bump is on the left"
+        );
         let late_left = sweep_brightness(4, VISUAL_BAR_COUNT, 1.05, false);
         let late_right = sweep_brightness(39, VISUAL_BAR_COUNT, 1.05, false);
-        assert!(late_right > late_left, "late in the pass the bump is on the right");
+        assert!(
+            late_right > late_left,
+            "late in the pass the bump is on the right"
+        );
         // Stays in the sane display range across the whole 44-bar row.
         for index in 0..VISUAL_BAR_COUNT {
             for t in [0.0, 0.4, 0.8, 1.19] {
@@ -1684,7 +1963,13 @@ mod tests {
         assert_eq!(approaching, Duration::from_secs(540));
         assert_eq!(final_warning, Duration::from_secs(590));
         // And the stages agree with the onsets at the boundary.
-        assert_eq!(limit_warning_at(approaching - Duration::from_millis(1), MAX_RECORDING_DURATION), None);
+        assert_eq!(
+            limit_warning_at(
+                approaching - Duration::from_millis(1),
+                MAX_RECORDING_DURATION
+            ),
+            None
+        );
         assert_eq!(
             limit_warning_at(approaching, MAX_RECORDING_DURATION),
             Some(LimitWarning::Approaching)
@@ -1710,18 +1995,30 @@ mod tests {
             (Duration::from_secs(60), Duration::from_secs(110))
         );
         assert_eq!(limit_warning_at(Duration::from_secs(59), ceiling), None);
-        assert_eq!(limit_warning_at(Duration::from_secs(60), ceiling), Some(LimitWarning::Approaching));
-        assert_eq!(limit_warning_at(Duration::from_secs(110), ceiling), Some(LimitWarning::Final));
+        assert_eq!(
+            limit_warning_at(Duration::from_secs(60), ceiling),
+            Some(LimitWarning::Approaching)
+        );
+        assert_eq!(
+            limit_warning_at(Duration::from_secs(110), ceiling),
+            Some(LimitWarning::Final)
+        );
         // A ceiling shorter than a lead saturates instead of wrapping.
         let tiny = Duration::from_secs(5);
         assert_eq!(limit_warning_onsets(tiny), (Duration::ZERO, Duration::ZERO));
-        assert_eq!(limit_warning_at(Duration::ZERO, tiny), Some(LimitWarning::Final));
+        assert_eq!(
+            limit_warning_at(Duration::ZERO, tiny),
+            Some(LimitWarning::Final)
+        );
     }
 
     #[test]
     fn limit_warning_reads_the_headroom_the_daemon_reports() {
         assert_eq!(limit_warning_for_remaining(None), None);
-        assert_eq!(limit_warning_for_remaining(Some(Duration::from_secs(61))), None);
+        assert_eq!(
+            limit_warning_for_remaining(Some(Duration::from_secs(61))),
+            None
+        );
         assert_eq!(
             limit_warning_for_remaining(Some(APPROACHING_LIMIT_LEAD)),
             Some(LimitWarning::Approaching)
@@ -1768,17 +2065,27 @@ mod tests {
         );
         // A failed status read is not an observation of a new Recording.
         assert_eq!(
-            latch.observe(ObservedSignal::Unreachable, None, Some(LimitWarning::Approaching)),
+            latch.observe(
+                ObservedSignal::Unreachable,
+                None,
+                Some(LimitWarning::Approaching)
+            ),
             None
         );
         assert_eq!(latch.fired(), Some(LimitWarning::Approaching));
-        assert_eq!(latch.observe(recording(), None, Some(LimitWarning::Approaching)), None);
+        assert_eq!(
+            latch.observe(recording(), None, Some(LimitWarning::Approaching)),
+            None
+        );
         // Escalation still gets through once.
         assert_eq!(
             latch.observe(recording(), None, Some(LimitWarning::Final)),
             Some(LimitWarning::Final)
         );
-        assert_eq!(latch.observe(recording(), None, Some(LimitWarning::Final)), None);
+        assert_eq!(
+            latch.observe(recording(), None, Some(LimitWarning::Final)),
+            None
+        );
     }
 
     /// The poll is 200 ms and a stop plus a restart can both complete inside
@@ -1789,31 +2096,55 @@ mod tests {
     fn a_new_recording_warns_again_even_with_no_phase_change_between_them() {
         let mut latch = LimitWarningLatch::default();
         assert_eq!(
-            latch.observe(recording(), Some("correlation-1"), Some(LimitWarning::Approaching)),
+            latch.observe(
+                recording(),
+                Some("correlation-1"),
+                Some(LimitWarning::Approaching)
+            ),
             Some(LimitWarning::Approaching)
         );
         assert_eq!(
-            latch.observe(recording(), Some("correlation-1"), Some(LimitWarning::Final)),
+            latch.observe(
+                recording(),
+                Some("correlation-1"),
+                Some(LimitWarning::Final)
+            ),
             Some(LimitWarning::Final)
         );
         // A different Recording, observed back to back with the first.
         assert_eq!(
-            latch.observe(recording(), Some("correlation-2"), Some(LimitWarning::Approaching)),
+            latch.observe(
+                recording(),
+                Some("correlation-2"),
+                Some(LimitWarning::Approaching)
+            ),
             Some(LimitWarning::Approaching),
             "the next Recording must warn from scratch"
         );
         assert_eq!(
-            latch.observe(recording(), Some("correlation-2"), Some(LimitWarning::Approaching)),
+            latch.observe(
+                recording(),
+                Some("correlation-2"),
+                Some(LimitWarning::Approaching)
+            ),
             None,
             "and must still be latched within itself"
         );
         // An unreachable poll is not an identity change, so nothing replays.
         assert_eq!(
-            latch.observe(ObservedSignal::Unreachable, None, Some(LimitWarning::Approaching)),
+            latch.observe(
+                ObservedSignal::Unreachable,
+                None,
+                Some(LimitWarning::Approaching)
+            ),
             None
         );
         assert_eq!(
-            latch.observe(recording(), Some("correlation-2"), Some(LimitWarning::Approaching)),
+            latch.observe(
+                recording(),
+                Some("correlation-2"),
+                Some(LimitWarning::Approaching)
+            ),
             None
         );
     }
@@ -1849,15 +2180,28 @@ mod tests {
             assert_eq!(latch.observe(recording(), None, warning), None);
         }
         // Then the Recording ends: Processing, then Idle (Hidden).
-        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Processing), None, None), None);
-        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Hidden), None, None), None);
+        assert_eq!(
+            latch.observe(
+                ObservedSignal::Reachable(OverlayPhase::Processing),
+                None,
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            latch.observe(ObservedSignal::Reachable(OverlayPhase::Hidden), None, None),
+            None
+        );
         assert_eq!(latch.fired(), None, "no residue survives the Recording");
         // A long Recording that warns must also leave the latch clean.
         assert_eq!(
             latch.observe(recording(), None, Some(LimitWarning::Final)),
             Some(LimitWarning::Final)
         );
-        assert_eq!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Success), None, None), None);
+        assert_eq!(
+            latch.observe(ObservedSignal::Reachable(OverlayPhase::Success), None, None),
+            None
+        );
         assert_eq!(latch.fired(), None);
         // The next Recording therefore warns again from scratch.
         assert_eq!(
@@ -1875,12 +2219,21 @@ mod tests {
         assert_eq!(limit_warning_from_response(&idle), None);
         let mut recording = recording_response();
         recording.recording_remaining_ms = Some(120_000);
-        assert_eq!(recording_remaining(&recording), Some(Duration::from_secs(120)));
+        assert_eq!(
+            recording_remaining(&recording),
+            Some(Duration::from_secs(120))
+        );
         assert_eq!(limit_warning_from_response(&recording), None);
         recording.recording_remaining_ms = Some(45_000);
-        assert_eq!(limit_warning_from_response(&recording), Some(LimitWarning::Approaching));
+        assert_eq!(
+            limit_warning_from_response(&recording),
+            Some(LimitWarning::Approaching)
+        );
         recording.recording_remaining_ms = Some(4_000);
-        assert_eq!(limit_warning_from_response(&recording), Some(LimitWarning::Final));
+        assert_eq!(
+            limit_warning_from_response(&recording),
+            Some(LimitWarning::Final)
+        );
     }
 
     #[test]
@@ -1901,8 +2254,16 @@ mod tests {
                 match poll_tick(
                     false,
                     is_fallback,
-                    TickObservation { view, signal, identity: None, warning },
-                    &mut tracker, &mut notify_latch, &mut no_speech_latch, &mut limit_latch,
+                    TickObservation {
+                        view,
+                        signal,
+                        identity: None,
+                        warning,
+                    },
+                    &mut tracker,
+                    &mut notify_latch,
+                    &mut no_speech_latch,
+                    &mut limit_latch,
                 ) {
                     TickAction::Continue { notify_limit, .. } => announced.extend(notify_limit),
                     TickAction::Break => unreachable!("no handoff in this test"),
@@ -1919,12 +2280,21 @@ mod tests {
     #[test]
     fn the_capsule_turns_amber_for_both_stages_and_borders_only_at_the_final_one() {
         assert_eq!(recording_bar_rgb(None), RECORDING_BAR_RGB);
-        assert_eq!(recording_bar_rgb(Some(LimitWarning::Approaching)), LIMIT_WARNING_BAR_RGB);
+        assert_eq!(
+            recording_bar_rgb(Some(LimitWarning::Approaching)),
+            LIMIT_WARNING_BAR_RGB
+        );
         // Amber bars are RETAINED at the final stage; the border is additive.
-        assert_eq!(recording_bar_rgb(Some(LimitWarning::Final)), LIMIT_WARNING_BAR_RGB);
+        assert_eq!(
+            recording_bar_rgb(Some(LimitWarning::Final)),
+            LIMIT_WARNING_BAR_RGB
+        );
         assert_eq!(limit_warning_class(None), None);
         assert_eq!(limit_warning_class(Some(LimitWarning::Approaching)), None);
-        assert_eq!(limit_warning_class(Some(LimitWarning::Final)), Some(LIMIT_WARNING_CLASS));
+        assert_eq!(
+            limit_warning_class(Some(LimitWarning::Final)),
+            Some(LIMIT_WARNING_CLASS)
+        );
     }
 
     #[test]
@@ -1933,7 +2303,10 @@ mod tests {
             limit_warning_body(LimitWarning::Approaching),
             "Approaching the recording limit — about a minute left"
         );
-        assert_eq!(limit_warning_body(LimitWarning::Final), "Recording stops in 10 seconds");
+        assert_eq!(
+            limit_warning_body(LimitWarning::Final),
+            "Recording stops in 10 seconds"
+        );
         // At the real ceiling the approved wording is what actually goes out:
         // the first poll inside each window still rounds to the nominal lead.
         let (approaching, final_warning) = limit_warning_onsets(MAX_RECORDING_DURATION);
@@ -1960,7 +2333,10 @@ mod tests {
     fn a_short_ceiling_is_told_the_truth_instead_of_the_nominal_wording() {
         // A 30 s ceiling: the approaching warning is live from the first tick.
         let ceiling = Duration::from_secs(30);
-        assert_eq!(limit_warning_at(Duration::ZERO, ceiling), Some(LimitWarning::Approaching));
+        assert_eq!(
+            limit_warning_at(Duration::ZERO, ceiling),
+            Some(LimitWarning::Approaching)
+        );
         assert_eq!(
             limit_notification_body(LimitWarning::Approaching, ceiling).as_deref(),
             Some("Approaching the recording limit — about 30 seconds left"),
@@ -1968,7 +2344,10 @@ mod tests {
         );
         // A 5 s ceiling: the final warning is live from the first tick.
         let ceiling = Duration::from_secs(5);
-        assert_eq!(limit_warning_at(Duration::ZERO, ceiling), Some(LimitWarning::Final));
+        assert_eq!(
+            limit_warning_at(Duration::ZERO, ceiling),
+            Some(LimitWarning::Final)
+        );
         assert_eq!(
             limit_notification_body(LimitWarning::Final, ceiling).as_deref(),
             Some("Recording stops in 5 seconds"),
@@ -2044,10 +2423,13 @@ mod tests {
         // Sixty ticks (twelve seconds at the 200 ms poll) of a Recording that
         // is inside the approaching window throughout.
         for _ in 0..60 {
-            let chosen = latch.observe(recording(), Some("correlation-1"), Some(LimitWarning::Approaching));
-            let body = chosen.and_then(|warning| {
-                limit_notification_body(warning, Duration::from_secs(30))
-            });
+            let chosen = latch.observe(
+                recording(),
+                Some("correlation-1"),
+                Some(LimitWarning::Approaching),
+            );
+            let body = chosen
+                .and_then(|warning| limit_notification_body(warning, Duration::from_secs(30)));
             if let Some(RungNotification::Limit) =
                 notification_rung_choice(view, previous_phase, body.is_some(), false)
                 && let Some(body) = body
@@ -2149,8 +2531,14 @@ mod tests {
         // A status reply that arrives while the stop is already in flight. The
         // stage is still Final (the capsule stays bordered), but counting down
         // to a moment that has passed is worse than silence.
-        assert_eq!(limit_warning_for_remaining(Some(Duration::ZERO)), Some(LimitWarning::Final));
-        assert_eq!(limit_notification_body(LimitWarning::Final, Duration::ZERO), None);
+        assert_eq!(
+            limit_warning_for_remaining(Some(Duration::ZERO)),
+            Some(LimitWarning::Final)
+        );
+        assert_eq!(
+            limit_notification_body(LimitWarning::Final, Duration::ZERO),
+            None
+        );
         assert_eq!(
             limit_notification_body(LimitWarning::Final, Duration::from_millis(400)),
             None,

@@ -126,8 +126,7 @@ const INFRA_FULLSTACK: &[&str] = &[
 
 /// The built-in categories in priority order. Categories earlier in this list
 /// survive prompt truncation ahead of later ones.
-const BUILTIN_CATEGORIES: &[&[&str]] =
-    &[AI_TOOLING, LINUX_SYSTEM, PROGRAMMING, INFRA_FULLSTACK];
+const BUILTIN_CATEGORIES: &[&[&str]] = &[AI_TOOLING, LINUX_SYSTEM, PROGRAMMING, INFRA_FULLSTACK];
 
 /// The flattened built-in developer dictionary, in category priority order.
 fn builtin_terms() -> Vec<String> {
@@ -194,7 +193,10 @@ fn remove_user_term_at(path: &Path, term: &str) -> Result<bool, String> {
     let mut removed = false;
     let mut updated = String::with_capacity(existing.len());
     for line in existing.split_inclusive('\n') {
-        let content = line.strip_suffix('\n').unwrap_or(line).trim_end_matches('\r');
+        let content = line
+            .strip_suffix('\n')
+            .unwrap_or(line)
+            .trim_end_matches('\r');
         let matches = comparison_key(strip_comment(content)) == comparison_key(term);
         if matches {
             removed = true;
@@ -318,11 +320,17 @@ struct DictionaryLock {
 
 impl DictionaryLock {
     fn acquire(dictionary_path: &Path) -> Result<Self, String> {
-        let parent = dictionary_path
-            .parent()
-            .ok_or_else(|| format!("dictionary path has no parent: {}", dictionary_path.display()))?;
+        let parent = dictionary_path.parent().ok_or_else(|| {
+            format!(
+                "dictionary path has no parent: {}",
+                dictionary_path.display()
+            )
+        })?;
         std::fs::create_dir_all(parent).map_err(|error| {
-            format!("cannot create dictionary directory {}: {error}", parent.display())
+            format!(
+                "cannot create dictionary directory {}: {error}",
+                parent.display()
+            )
         })?;
         let lock_path = dictionary_lock_path(dictionary_path);
         let file = OpenOptions::new()
@@ -330,7 +338,12 @@ impl DictionaryLock {
             .truncate(false)
             .write(true)
             .open(&lock_path)
-            .map_err(|error| format!("cannot open dictionary lock {}: {error}", lock_path.display()))?;
+            .map_err(|error| {
+                format!(
+                    "cannot open dictionary lock {}: {error}",
+                    lock_path.display()
+                )
+            })?;
         // Blocking exclusive advisory lock. flock is tied to the open file
         // description, so two threads in this process (each with its own open
         // fd) serialise against each other exactly as separate processes do.
@@ -385,17 +398,31 @@ fn write_user_dictionary(path: &Path, contents: &str) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("dictionary path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("cannot create dictionary directory {}: {error}", parent.display()))?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "cannot create dictionary directory {}: {error}",
+            parent.display()
+        )
+    })?;
     let mut file = tempfile::Builder::new()
         .prefix(".dictionary.txt.")
         .tempfile_in(parent)
-        .map_err(|error| format!("cannot stage dictionary write in {}: {error}", parent.display()))?;
+        .map_err(|error| {
+            format!(
+                "cannot stage dictionary write in {}: {error}",
+                parent.display()
+            )
+        })?;
     file.write_all(contents.as_bytes())
         .and_then(|()| file.as_file().sync_all())
         .map_err(|error| format!("cannot write user dictionary {}: {error}", path.display()))?;
-    file.persist(path)
-        .map_err(|error| format!("cannot persist user dictionary {}: {}", path.display(), error.error))?;
+    file.persist(path).map_err(|error| {
+        format!(
+            "cannot persist user dictionary {}: {}",
+            path.display(),
+            error.error
+        )
+    })?;
     Ok(())
 }
 
@@ -514,7 +541,10 @@ mod tests {
         assert_eq!(merged[0], "Voisu");
         assert_eq!(merged[1], "wayfinder");
         // A built-in term still appears, after the user terms.
-        let claude = merged.iter().position(|t| t == "Claude").expect("built-ins present");
+        let claude = merged
+            .iter()
+            .position(|t| t == "Claude")
+            .expect("built-ins present");
         assert!(claude > 1, "built-ins follow the user terms");
     }
 
@@ -530,7 +560,10 @@ mod tests {
     fn merged_terms_dedupe_case_insensitively_keeping_user_casing() {
         // "groq" is a user term that collides with the built-in "Groq".
         let merged = merged_terms_with(vec!["groq".to_owned()]);
-        let hits: Vec<&String> = merged.iter().filter(|t| t.eq_ignore_ascii_case("groq")).collect();
+        let hits: Vec<&String> = merged
+            .iter()
+            .filter(|t| t.eq_ignore_ascii_case("groq"))
+            .collect();
         assert_eq!(hits.len(), 1, "the duplicate is collapsed");
         assert_eq!(hits[0], "groq", "the user's casing wins");
     }
@@ -576,7 +609,10 @@ Tokio   # inline comment
         let prompt = whisper_prompt_from_terms(&merged_terms_with(user));
         assert!(token_upper_bound(prompt.len()) <= WHISPER_PROMPT_TOKEN_BUDGET);
         assert!(prompt.contains("term0000"), "early user terms survive");
-        assert!(!prompt.contains("term1999"), "late terms are truncated away");
+        assert!(
+            !prompt.contains("term1999"),
+            "late terms are truncated away"
+        );
         // Truncation dropped the built-ins entirely (they sort after the user terms).
         assert!(!prompt.contains("Kubernetes"));
     }
@@ -587,7 +623,13 @@ Tokio   # inline comment
         // they must fit inside the truncated Whisper prompt with builtins
         // only, not merely exist somewhere in the merged list.
         let prompt = whisper_prompt_from_terms(&merged_terms_with(Vec::new()));
-        for term in ["daemon-reload", "rpmbuild", "changelog", "dist tag", "voisu-daemon"] {
+        for term in [
+            "daemon-reload",
+            "rpmbuild",
+            "changelog",
+            "dist tag",
+            "voisu-daemon",
+        ] {
             assert!(prompt.contains(term), "{term:?} truncated out of: {prompt}");
         }
     }
@@ -621,7 +663,10 @@ Tokio   # inline comment
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dictionary.txt");
         std::fs::write(&path, "serde\nTokio\n").unwrap();
-        assert_eq!(read_user_terms(&path), Ok(vec!["serde".to_owned(), "Tokio".to_owned()]));
+        assert_eq!(
+            read_user_terms(&path),
+            Ok(vec!["serde".to_owned(), "Tokio".to_owned()])
+        );
     }
 
     #[test]
@@ -638,7 +683,10 @@ Tokio   # inline comment
         let path = dir.path().join("dictionary.txt");
         std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
         let result = read_user_terms(&path);
-        assert!(result.is_err(), "an unreadable dictionary is a diagnostic, not empty terms");
+        assert!(
+            result.is_err(),
+            "an unreadable dictionary is a diagnostic, not empty terms"
+        );
         assert!(
             result.unwrap_err().contains("dictionary"),
             "the diagnostic names the dictionary"
@@ -687,7 +735,11 @@ Tokio   # inline comment
 
     #[test]
     fn deepgram_keyterms_leave_lists_within_both_budgets_unchanged() {
-        let terms = vec!["Voisu".to_owned(), "Deepgram".to_owned(), "systemctl".to_owned()];
+        let terms = vec![
+            "Voisu".to_owned(),
+            "Deepgram".to_owned(),
+            "systemctl".to_owned(),
+        ];
 
         assert_eq!(deepgram_keyterms(&terms), terms);
     }
@@ -729,7 +781,10 @@ Tokio   # inline comment
 
     #[test]
     fn deepgram_keyterms_stop_when_the_first_term_exceeds_the_token_budget() {
-        let terms = vec!["a".repeat(DEEPGRAM_KEYTERM_TOKEN_BUDGET + 1), "later".to_owned()];
+        let terms = vec![
+            "a".repeat(DEEPGRAM_KEYTERM_TOKEN_BUDGET + 1),
+            "later".to_owned(),
+        ];
 
         assert_eq!(deepgram_keyterms(&terms), Vec::<String>::new());
     }
@@ -795,6 +850,10 @@ Tokio   # inline comment
         assert_eq!(add_user_term_at(&path, "Tokio"), Ok(true));
         assert_eq!(add_user_term_at(&path, "tokio"), Ok(false), "idempotent");
         assert_eq!(remove_user_term_at(&path, "TOKIO"), Ok(true));
-        assert_eq!(remove_user_term_at(&path, "Tokio"), Ok(false), "already gone");
+        assert_eq!(
+            remove_user_term_at(&path, "Tokio"),
+            Ok(false),
+            "already gone"
+        );
     }
 }

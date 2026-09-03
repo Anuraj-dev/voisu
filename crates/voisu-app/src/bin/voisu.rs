@@ -3,19 +3,19 @@ use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use voisu_core::{
-    BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, DaemonReadiness,
-    ExportCorrelationId, KeyDiagnosis, KeyLocation, PasteActionState, PROTOCOL_VERSION, Provider,
-    ProviderAuthenticator, ProviderKeyStatus, ReadinessInspector, ReadinessStatus,
-    ReplayFixturePath, Request, Response, SecretStore, SessionKind, VersionEnvelope,
-    provider_free_tier_hint, resolve_session, socket_path,
-};
+use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
 use voisu_app::service::{UserServiceAction, manage_user_service};
 use voisu_app::system::{
     DIAGNOSTIC_RESPONSE_DEADLINE, FedoraReadiness, PROCESSING_RESPONSE_DEADLINE,
     ProviderHttpClient, SecretToolStore,
 };
-use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
+use voisu_core::{
+    BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, DaemonReadiness,
+    ExportCorrelationId, KeyDiagnosis, KeyLocation, PROTOCOL_VERSION, PasteActionState, Provider,
+    ProviderAuthenticator, ProviderKeyStatus, ReadinessInspector, ReadinessStatus,
+    ReplayFixturePath, Request, Response, SecretStore, SessionKind, VersionEnvelope,
+    provider_free_tier_hint, resolve_session, socket_path,
+};
 
 /// The most response the CLI will buffer — per transport frame, and in total
 /// across the pages of one diagnostic payload.
@@ -213,7 +213,8 @@ fn history_command(json: bool) -> ExitCode {
 fn render_history_pretty(records: &serde_json::Value) -> ExitCode {
     use std::io::IsTerminal;
     use voisu_app::history_view::{
-        DEFAULT_PAGE_SIZE, RenderStyle, pagination_prompt, render_history_noninteractive, render_page,
+        DEFAULT_PAGE_SIZE, RenderStyle, pagination_prompt, render_history_noninteractive,
+        render_page,
     };
 
     let stdout = std::io::stdout();
@@ -257,7 +258,6 @@ fn render_history_pretty(records: &serde_json::Value) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-
 /// One rendered doctor line: `label  value  STATUS`, with an optional runnable
 /// action (shown indented only on FAIL) and reasoning (shown only under
 /// --verbose). Capability findings, the focus guard, and the provider-key
@@ -273,7 +273,13 @@ struct DoctorRow {
 
 impl DoctorRow {
     fn new(label: impl Into<String>, status: ReadinessStatus, detail: impl Into<String>) -> Self {
-        Self { label: label.into(), value: None, status, action: None, detail: detail.into() }
+        Self {
+            label: label.into(),
+            value: None,
+            status,
+            action: None,
+            detail: detail.into(),
+        }
     }
 
     fn value(mut self, value: impl Into<String>) -> Self {
@@ -650,7 +656,10 @@ fn provider_key_rows(runtime: &tokio::runtime::Runtime) -> Vec<DoctorRow> {
             continue;
         }
         let row = match SecretToolStore.diagnose(provider) {
-            KeyDiagnosis::Found { location, credential } => {
+            KeyDiagnosis::Found {
+                location,
+                credential,
+            } => {
                 let status = runtime.block_on(ProviderHttpClient.check(provider, credential));
                 let location_note = match location {
                     KeyLocation::PlaintextFile => {
@@ -838,7 +847,10 @@ fn set_deepgram(enabled: bool) -> ExitCode {
 /// only at start, so writes apply after the next restart.
 fn delivery(mode: Option<DeliveryMode>) -> ExitCode {
     let Some(mode) = mode else {
-        println!("delivery mode: {}", voisu_app::config::delivery_mode().as_str());
+        println!(
+            "delivery mode: {}",
+            voisu_app::config::delivery_mode().as_str()
+        );
         return ExitCode::SUCCESS;
     };
     match voisu_app::config::set_delivery_mode(mode) {
@@ -858,7 +870,10 @@ fn delivery(mode: Option<DeliveryMode>) -> ExitCode {
 /// only at start, so writes apply after the next restart.
 fn writing(mode: Option<WritingMode>) -> ExitCode {
     let Some(mode) = mode else {
-        println!("writing mode: {}", voisu_app::config::writing_mode().as_str());
+        println!(
+            "writing mode: {}",
+            voisu_app::config::writing_mode().as_str()
+        );
         return ExitCode::SUCCESS;
     };
     match voisu_app::config::set_writing_mode(mode) {
@@ -945,7 +960,12 @@ fn credential_from_stdin() -> Result<Credential, BoundaryError> {
     let mut credential = String::new();
     std::io::stdin()
         .read_to_string(&mut credential)
-        .map_err(|_| BoundaryError::new(BoundaryKind::SecretStorage, "cannot read credential from standard input"))?;
+        .map_err(|_| {
+            BoundaryError::new(
+                BoundaryKind::SecretStorage,
+                "cannot read credential from standard input",
+            )
+        })?;
     Credential::new(credential.trim_end().to_owned())
 }
 
@@ -955,7 +975,11 @@ fn auth_verify(provider: Provider) -> ExitCode {
         Err(error) => return fail(4, error.public_message()),
     };
     let mut authenticator = ProviderHttpClient;
-    match block_on(ProviderAuthenticator::verify(&mut authenticator, provider, credential)) {
+    match block_on(ProviderAuthenticator::verify(
+        &mut authenticator,
+        provider,
+        credential,
+    )) {
         Ok(()) => {
             println!("{} authentication verified", provider.cli_label());
             ExitCode::SUCCESS
@@ -971,7 +995,9 @@ fn block_on<T>(future: BoundaryFuture<'_, T>) -> Result<T, BoundaryError> {
     tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
-        .map_err(|_| BoundaryError::new(BoundaryKind::ProviderAuthentication, "runtime unavailable"))?
+        .map_err(|_| {
+            BoundaryError::new(BoundaryKind::ProviderAuthentication, "runtime unavailable")
+        })?
         .block_on(future)
 }
 
@@ -1059,13 +1085,22 @@ fn read_response(
             if expected_sequence == 0 {
                 return Ok(response);
             }
-            return Err((1, "daemon returned an incomplete diagnostic response".to_owned()));
+            return Err((
+                1,
+                "daemon returned an incomplete diagnostic response".to_owned(),
+            ));
         };
         let Some(kind) = diagnostic_kind else {
-            return Err((1, "daemon returned an unexpected diagnostic page".to_owned()));
+            return Err((
+                1,
+                "daemon returned an unexpected diagnostic page".to_owned(),
+            ));
         };
         if page.sequence != expected_sequence {
-            return Err((1, "daemon returned diagnostic pages out of order".to_owned()));
+            return Err((
+                1,
+                "daemon returned diagnostic pages out of order".to_owned(),
+            ));
         }
         expected_sequence += 1;
         payload.push_str(&page.payload);
@@ -1075,13 +1110,17 @@ fn read_response(
         match kind {
             DiagnosticResponseKind::History => {
                 response.history = Some(serde_json::from_str(&payload).map_err(|_| {
-                    (1, "daemon returned an invalid diagnostic history".to_owned())
+                    (
+                        1,
+                        "daemon returned an invalid diagnostic history".to_owned(),
+                    )
                 })?);
             }
             DiagnosticResponseKind::Export => {
-                response.export = Some(serde_json::from_str(&payload).map_err(|_| {
-                    (1, "daemon returned an invalid diagnostic export".to_owned())
-                })?);
+                response.export =
+                    Some(serde_json::from_str(&payload).map_err(|_| {
+                        (1, "daemon returned an invalid diagnostic export".to_owned())
+                    })?);
             }
         }
         return Ok(response);
@@ -1100,14 +1139,12 @@ fn parse_command() -> Result<CliAction, String> {
         [command, flag] if command == "history" && flag == "--json" => {
             Ok(CliAction::History { json: true })
         }
-        [command, correlation_id] if command == "export" => {
-            Ok(CliAction::Daemon(Command::Export(ExportCorrelationId::new(
-                correlation_id.clone(),
-            ))))
-        }
-        [command, path] if command == "replay" => {
-            Ok(CliAction::Daemon(Command::Replay(ReplayFixturePath::new(path.clone()))))
-        }
+        [command, correlation_id] if command == "export" => Ok(CliAction::Daemon(Command::Export(
+            ExportCorrelationId::new(correlation_id.clone()),
+        ))),
+        [command, path] if command == "replay" => Ok(CliAction::Daemon(Command::Replay(
+            ReplayFixturePath::new(path.clone()),
+        ))),
         [command] if command == "doctor" => Ok(CliAction::Doctor { verbose: false }),
         [command, flag] if command == "doctor" && (flag == "--verbose" || flag == "-v") => {
             Ok(CliAction::Doctor { verbose: true })

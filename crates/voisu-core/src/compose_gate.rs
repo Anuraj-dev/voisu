@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::local_baseline::LocalBaseline;
 use crate::prompt_rendering::{
-    RenderingPolicy, CLOSED_STRUCTURED_LABELS, DELIVERY_AUTO_SEND, DELIVERY_LIVE_TYPE,
-    DELIVERY_REPLACE_DELIVERED, DELIVERY_STATE_UNSENT,
+    CLOSED_STRUCTURED_LABELS, DELIVERY_AUTO_SEND, DELIVERY_LIVE_TYPE, DELIVERY_REPLACE_DELIVERED,
+    DELIVERY_STATE_UNSENT, RenderingPolicy,
 };
 use crate::text_sha256_fingerprint;
 
@@ -587,12 +587,7 @@ fn candidate_json_has_exact_keys(value: &serde_json::Value) -> bool {
         "derivation",
     ];
     const RECON_KEYS: &[&str] = &["selected_provider", "reason"];
-    const REMOVAL_KEYS: &[&str] = &[
-        "kind",
-        "certainty",
-        "source_provider",
-        "source_span_text",
-    ];
+    const REMOVAL_KEYS: &[&str] = &["kind", "certainty", "source_provider", "source_span_text"];
     const CONVERSION_KEYS: &[&str] = &["id", "source_provider", "source_span_text"];
     const LAYOUT_KEYS: &[&str] = &["decision", "certainty"];
     const LABEL_KEYS: &[&str] = &["label", "source_provider", "source_span_text"];
@@ -646,10 +641,7 @@ fn candidate_json_has_exact_keys(value: &serde_json::Value) -> bool {
     true
 }
 
-fn has_exact_keys(
-    object: &serde_json::Map<String, serde_json::Value>,
-    expected: &[&str],
-) -> bool {
+fn has_exact_keys(object: &serde_json::Map<String, serde_json::Value>, expected: &[&str]) -> bool {
     object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
 }
 
@@ -849,7 +841,10 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
         return baseline_result(
             baseline,
             Some(FallbackTrigger::UnsafeSemantics),
-            vec![ComposeErrorCode::Reconcile, ComposeErrorCode::UnsafeSemantics],
+            vec![
+                ComposeErrorCode::Reconcile,
+                ComposeErrorCode::UnsafeSemantics,
+            ],
         );
     }
 
@@ -866,7 +861,10 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
             return baseline_result(
                 baseline,
                 Some(FallbackTrigger::UnsafeSemantics),
-                vec![ComposeErrorCode::Reconcile, ComposeErrorCode::UnsafeSemantics],
+                vec![
+                    ComposeErrorCode::Reconcile,
+                    ComposeErrorCode::UnsafeSemantics,
+                ],
             );
         }
         if (selection.reason == "only_available" || recon.reason == "only_available")
@@ -875,7 +873,10 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
             return baseline_result(
                 baseline,
                 Some(FallbackTrigger::UnsafeSemantics),
-                vec![ComposeErrorCode::Reconcile, ComposeErrorCode::UnsafeSemantics],
+                vec![
+                    ComposeErrorCode::Reconcile,
+                    ComposeErrorCode::UnsafeSemantics,
+                ],
             );
         }
     }
@@ -944,8 +945,11 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
         }
     }
 
-    let declared_conversion_ids: HashSet<&str> =
-        candidate.conversions.iter().map(|c| c.id.as_str()).collect();
+    let declared_conversion_ids: HashSet<&str> = candidate
+        .conversions
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
     let declared_labels: HashSet<&str> =
         candidate.labels.iter().map(|l| l.label.as_str()).collect();
     let declared_removals: HashSet<(String, String)> = candidate
@@ -967,7 +971,9 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
             SpanKind::LayoutBreak => {
                 let out_lb = span.output_text.as_str();
                 if !matches!(out_lb, "\n" | "\n\n" | " " | "\t" | "")
-                    && !out_lb.chars().all(|c| matches!(c, '\n' | '\r' | '\t' | ' '))
+                    && !out_lb
+                        .chars()
+                        .all(|c| matches!(c, '\n' | '\r' | '\t' | ' '))
                 {
                     return baseline_result(
                         baseline,
@@ -1011,7 +1017,10 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
                             vec![ComposeErrorCode::Malformed],
                         );
                     }
-                    let rem_key = (provider.to_owned(), normalize_ws(source_text).to_lowercase());
+                    let rem_key = (
+                        provider.to_owned(),
+                        normalize_ws(source_text).to_lowercase(),
+                    );
                     if !declared_removals.contains(&rem_key) {
                         return baseline_result(
                             baseline,
@@ -1148,7 +1157,10 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
                 return baseline_result(
                     baseline,
                     Some(FallbackTrigger::UnsafeSemantics),
-                    vec![ComposeErrorCode::Protected, ComposeErrorCode::UnsafeSemantics],
+                    vec![
+                        ComposeErrorCode::Protected,
+                        ComposeErrorCode::UnsafeSemantics,
+                    ],
                 );
             }
         }
@@ -1181,7 +1193,10 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
                 return baseline_result(
                     baseline,
                     Some(FallbackTrigger::UnsafeSemantics),
-                    vec![ComposeErrorCode::Protected, ComposeErrorCode::UnsafeSemantics],
+                    vec![
+                        ComposeErrorCode::Protected,
+                        ComposeErrorCode::UnsafeSemantics,
+                    ],
                 );
             }
         }
@@ -1204,7 +1219,10 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
                 return baseline_result(
                     baseline,
                     Some(FallbackTrigger::UnsafeSemantics),
-                    vec![ComposeErrorCode::Protected, ComposeErrorCode::UnsafeSemantics],
+                    vec![
+                        ComposeErrorCode::Protected,
+                        ComposeErrorCode::UnsafeSemantics,
+                    ],
                 );
             }
         }
@@ -1221,7 +1239,10 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
             return baseline_result(
                 baseline,
                 Some(FallbackTrigger::UnsafeSemantics),
-                vec![ComposeErrorCode::Protected, ComposeErrorCode::UnsafeSemantics],
+                vec![
+                    ComposeErrorCode::Protected,
+                    ComposeErrorCode::UnsafeSemantics,
+                ],
             );
         }
     }
@@ -1274,25 +1295,22 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
         }
     }
 
-    outcome(
-        CompositionDecision::Accept,
-        composed,
-        None,
-        vec![],
-    )
+    outcome(CompositionDecision::Accept, composed, None, vec![])
 }
 
 fn hard_outcome_map(outcome: CloudOutcome) -> Option<(FallbackTrigger, ComposeErrorCode)> {
     match outcome {
-        CloudOutcome::SchemaFailure => {
-            Some((FallbackTrigger::ResponseSchemaFailure, ComposeErrorCode::Schema))
-        }
+        CloudOutcome::SchemaFailure => Some((
+            FallbackTrigger::ResponseSchemaFailure,
+            ComposeErrorCode::Schema,
+        )),
         CloudOutcome::ProviderFailure => {
             Some((FallbackTrigger::ProviderFailure, ComposeErrorCode::Provider))
         }
-        CloudOutcome::DeadlineExceeded => {
-            Some((FallbackTrigger::DeadlineExceeded, ComposeErrorCode::Deadline))
-        }
+        CloudOutcome::DeadlineExceeded => Some((
+            FallbackTrigger::DeadlineExceeded,
+            ComposeErrorCode::Deadline,
+        )),
         _ => None,
     }
 }
@@ -1680,10 +1698,7 @@ fn find_literal_spans(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
     }
     let re = atom_re();
     let h_atoms: Vec<_> = re.find_iter(haystack).collect();
-    let seq: Vec<String> = h_atoms
-        .iter()
-        .map(|m| m.as_str().to_lowercase())
-        .collect();
+    let seq: Vec<String> = h_atoms.iter().map(|m| m.as_str().to_lowercase()).collect();
     // Fail closed when haystack has fewer atoms than needle (e.g. "İ" vs
     // "i\u{307}" where norm contains matches but ASCII atom seq is empty).
     // Never index empty `seq` / never `seq[i..i+atoms.len()]` when short.
@@ -1719,10 +1734,8 @@ fn claim_source_ranges(
     derivation: &[DerivationSpan],
     selected_provider: Option<&str>,
 ) -> Vec<ComposeErrorCode> {
-    let mut claimed: HashMap<String, Vec<(usize, usize)>> = source_map
-        .keys()
-        .map(|p| (p.clone(), Vec::new()))
-        .collect();
+    let mut claimed: HashMap<String, Vec<(usize, usize)>> =
+        source_map.keys().map(|p| (p.clone(), Vec::new())).collect();
     let mut prev_start: HashMap<String, isize> =
         source_map.keys().map(|p| (p.clone(), -1isize)).collect();
 
@@ -1827,10 +1840,7 @@ fn licensed_atoms(
 }
 
 fn compose_render(derivation: &[DerivationSpan]) -> String {
-    derivation
-        .iter()
-        .map(|s| s.output_text.as_str())
-        .collect()
+    derivation.iter().map(|s| s.output_text.as_str()).collect()
 }
 
 fn is_multiparagraph_text(text: &str) -> bool {
@@ -1982,7 +1992,11 @@ mod tests {
         let c = corpus();
         assert_eq!(c["version"].as_str().unwrap(), "1.1.2");
         let fixtures = c["fixtures"].as_array().unwrap();
-        assert_eq!(fixtures.len(), 24, "expected full #139 corpus (24 fixtures)");
+        assert_eq!(
+            fixtures.len(),
+            24,
+            "expected full #139 corpus (24 fixtures)"
+        );
 
         let mut mismatches = Vec::new();
         for fx in fixtures {
@@ -2058,9 +2072,7 @@ mod tests {
         fx["candidate"]["derivation"] = Value::Array(vec![first]);
         let got = run_fx(fx);
         assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
-        assert!(got
-            .error_codes()
-            .contains(&ComposeErrorCode::Unverifiable));
+        assert!(got.error_codes().contains(&ComposeErrorCode::Unverifiable));
     }
 
     #[test]
@@ -2087,9 +2099,7 @@ mod tests {
         ]);
         let got = run_fx(fx);
         assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
-        assert!(got
-            .error_codes()
-            .contains(&ComposeErrorCode::Unverifiable));
+        assert!(got.error_codes().contains(&ComposeErrorCode::Unverifiable));
     }
 
     #[test]
@@ -2192,9 +2202,7 @@ mod tests {
         ]);
         let got = run_fx(fx);
         assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
-        assert!(got
-            .error_codes()
-            .contains(&ComposeErrorCode::Unverifiable));
+        assert!(got.error_codes().contains(&ComposeErrorCode::Unverifiable));
     }
 
     #[test]
@@ -2203,16 +2211,16 @@ mod tests {
         fx["candidate"]["conversions"][0]["id"] = Value::String("hey→Restart".into());
         let got = run_fx(fx);
         assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
-        assert!(got
-            .error_codes()
-            .contains(&ComposeErrorCode::UnknownConversion));
+        assert!(
+            got.error_codes()
+                .contains(&ComposeErrorCode::UnknownConversion)
+        );
     }
 
     #[test]
     fn mutation_stale_fingerprint_rejects() {
         let mut fx = clone_fixture("CC-01");
-        fx["candidate"]["base_fingerprint"] =
-            Value::String(format!("sha256:{}", "a".repeat(64)));
+        fx["candidate"]["base_fingerprint"] = Value::String(format!("sha256:{}", "a".repeat(64)));
         let got = run_fx(fx);
         assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
         assert!(got.error_codes().contains(&ComposeErrorCode::Stale));
@@ -2221,7 +2229,8 @@ mod tests {
     #[test]
     fn mutation_clear_natural_multiparagraph_rejects() {
         let mut fx = clone_fixture("CC-18");
-        fx["candidate"]["layout"] = serde_json::json!({"decision": "natural", "certainty": "clear"});
+        fx["candidate"]["layout"] =
+            serde_json::json!({"decision": "natural", "certainty": "clear"});
         fx["candidate"]["derivation"] = serde_json::json!([
             {
                 "kind": "keep",
@@ -2250,9 +2259,10 @@ mod tests {
         ]);
         let got = run_fx(fx);
         assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
-        assert!(got
-            .error_codes()
-            .contains(&ComposeErrorCode::UnsafeSemantics));
+        assert!(
+            got.error_codes()
+                .contains(&ComposeErrorCode::UnsafeSemantics)
+        );
     }
 
     /// Type-level / API invariant: the sole public compose entry takes a
@@ -2457,8 +2467,8 @@ mod tests {
         let huge = "x".repeat(MAX_COMPOSE_FIELD_UTF8_BYTES + 1);
         let cand = StructuredCandidate {
             schema_version: "1".into(),
-            base_fingerprint: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .into(),
+            base_fingerprint:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             reconciliation: Reconciliation {
                 selected_provider: "provider_a".into(),
                 reason: "only_available".into(),
@@ -2643,7 +2653,10 @@ mod tests {
             "label should win last-write, codes={:?}",
             got.error_codes()
         );
-        assert!(!got.error_codes().contains(&ComposeErrorCode::UnknownConversion));
+        assert!(
+            !got.error_codes()
+                .contains(&ComposeErrorCode::UnknownConversion)
+        );
     }
 
     #[test]

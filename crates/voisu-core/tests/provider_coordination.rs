@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use voisu_core::{
@@ -181,7 +181,10 @@ async fn coordinator_starts_both_completions_once_and_orders_attributed_sources(
             ),
         },
     );
-    coordinator.stream_audio(AudioChunk(vec![1, 2, 3])).await.unwrap();
+    coordinator
+        .stream_audio(AudioChunk(vec![1, 2, 3]))
+        .await
+        .unwrap();
     let sources = coordinator.complete(CapturedAudio::empty()).await.unwrap();
 
     assert_eq!(deepgram.load(Ordering::SeqCst), 1);
@@ -189,7 +192,10 @@ async fn coordinator_starts_both_completions_once_and_orders_attributed_sources(
     assert_eq!(deepgram_chunks.load(Ordering::SeqCst), 1);
     assert_eq!(groq_chunks.load(Ordering::SeqCst), 1);
     assert_eq!(
-        sources.iter().map(|source| source.provider).collect::<Vec<_>>(),
+        sources
+            .iter()
+            .map(|source| source.provider)
+            .collect::<Vec<_>>(),
         vec![Provider::Deepgram, Provider::Groq]
     );
 }
@@ -216,9 +222,9 @@ async fn provider_deadline_returns_the_valid_source_already_available() {
             ),
         },
     )
-        .complete(CapturedAudio::empty())
-        .await
-        .unwrap();
+    .complete(CapturedAudio::empty())
+    .await
+    .unwrap();
 
     assert_eq!(deepgram.load(Ordering::SeqCst), 1);
     assert_eq!(groq.load(Ordering::SeqCst), 1);
@@ -302,7 +308,10 @@ async fn ready_sources_at_the_deadline_instant_are_not_discarded() {
     .expect("ready sources at the deadline instant must not be discarded");
 
     assert_eq!(
-        sources.iter().map(|source| source.provider).collect::<Vec<_>>(),
+        sources
+            .iter()
+            .map(|source| source.provider)
+            .collect::<Vec<_>>(),
         vec![Provider::Deepgram, Provider::Groq]
     );
 }
@@ -370,11 +379,23 @@ async fn all_providers_failing_attaches_failures_to_the_error() {
 
     assert_eq!(error.kind(), BoundaryKind::Provider);
     let failures = error.provider_failures();
-    assert_eq!(failures.len(), 2, "both providers' failures must ride on the error");
-    assert!(failures.iter().any(|failure| failure.provider == Provider::Deepgram
-        && failure.stage == ProviderFailureStage::Completion));
-    assert!(failures.iter().any(|failure| failure.provider == Provider::Groq
-        && failure.stage == ProviderFailureStage::Completion));
+    assert_eq!(
+        failures.len(),
+        2,
+        "both providers' failures must ride on the error"
+    );
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.provider == Provider::Deepgram
+                && failure.stage == ProviderFailureStage::Completion)
+    );
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.provider == Provider::Groq
+                && failure.stage == ProviderFailureStage::Completion)
+    );
 }
 
 #[tokio::test]
@@ -527,9 +548,6 @@ fn boundary_errors_separate_redacted_public_text_from_local_diagnostics() {
         "authorization=Bearer controlled-secret",
     );
     assert_eq!(error.public_message(), "Source Transcripts are unavailable");
-    assert_eq!(
-        error.diagnostic(),
-        "authorization=Bearer controlled-secret"
-    );
+    assert_eq!(error.diagnostic(), "authorization=Bearer controlled-secret");
     assert!(!error.public_message().contains("controlled-secret"));
 }
