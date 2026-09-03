@@ -57,6 +57,10 @@ jobs:
           components: rustfmt
       - name: Format check (all crates)
         run: cargo fmt --all -- --check
+      # tools/transcript-quality is excluded from the root workspace and
+      # declares its own, so `cargo fmt --all` cannot see it from the root.
+      - name: Format check (tools/transcript-quality)
+        run: cargo fmt --manifest-path tools/transcript-quality/Cargo.toml -- --check
 
   audit:
     name: Advisory gate (cargo-audit vs Cargo.lock)
