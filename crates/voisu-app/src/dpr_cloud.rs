@@ -9,14 +9,15 @@ use std::fmt;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use voisu_core::{
-    parse_format_edit_candidate_json, parse_structured_candidate_json, ComposeSource, Credential,
-    FormatEditCandidate, Provider, RenderingPolicy, SecretStore, SourceSelection,
-    StructuredCandidate, CLOSED_CONVERSIONS, CLOSED_FORMAT_EDIT_KINDS,
-    CLOSED_SOURCE_SELECTION_REASONS, CLOSED_STRUCTURED_LABELS, FORMAT_EDIT_CONTRACT_VERSION,
-    MAX_COMPOSE_CONVERSIONS, MAX_COMPOSE_DERIVATION_SPANS, MAX_COMPOSE_FIELD_UTF8_BYTES,
-    MAX_COMPOSE_LABELS, MAX_COMPOSE_REMOVALS, MAX_FORMAT_EDITS, MAX_FORMAT_EDIT_FIELD_UTF8_BYTES,
+    CLOSED_CONVERSIONS, CLOSED_FORMAT_EDIT_KINDS, CLOSED_SOURCE_SELECTION_REASONS,
+    CLOSED_STRUCTURED_LABELS, ComposeSource, Credential, FORMAT_EDIT_CONTRACT_VERSION,
+    FormatEditCandidate, MAX_COMPOSE_CONVERSIONS, MAX_COMPOSE_DERIVATION_SPANS,
+    MAX_COMPOSE_FIELD_UTF8_BYTES, MAX_COMPOSE_LABELS, MAX_COMPOSE_REMOVALS,
+    MAX_FORMAT_EDIT_FIELD_UTF8_BYTES, MAX_FORMAT_EDITS, Provider, RenderingPolicy, SecretStore,
+    SourceSelection, StructuredCandidate, parse_format_edit_candidate_json,
+    parse_structured_candidate_json,
 };
 
 /// Preferred in-budget candidate from the approved #140 matrix.
@@ -297,16 +298,15 @@ fn request_is_bounded(request: &DprCloudRequest<'_>) -> bool {
     request.sources.iter().all(|source| {
         source.text.len() <= MAX_DPR_SOURCE_UTF8_BYTES
             && source.provider.as_str().len() <= MAX_COMPOSE_FIELD_UTF8_BYTES
-    }) && request.protected_tokens.iter().all(|token| {
-        !token.is_empty() && token.len() <= MAX_COMPOSE_FIELD_UTF8_BYTES
-    })
+    }) && request
+        .protected_tokens
+        .iter()
+        .all(|token| !token.is_empty() && token.len() <= MAX_COMPOSE_FIELD_UTF8_BYTES)
 }
 
 /// Resolve the existing Groq credential seam without exposing provider errors,
 /// values, or keyring output to T4 diagnostics.
-pub fn load_groq_credential(
-    store: &mut dyn SecretStore,
-) -> Result<Credential, DprCloudErrorClass> {
+pub fn load_groq_credential(store: &mut dyn SecretStore) -> Result<Credential, DprCloudErrorClass> {
     store
         .load(Provider::Groq)
         .map_err(|_| DprCloudErrorClass::CredentialUnavailable)
@@ -566,8 +566,8 @@ fn extract_payload(
 }
 
 fn extract_message_content(envelope: &[u8]) -> Result<String, DprCloudErrorClass> {
-    let root: Value = serde_json::from_slice(envelope)
-        .map_err(|_| DprCloudErrorClass::ProviderEnvelope)?;
+    let root: Value =
+        serde_json::from_slice(envelope).map_err(|_| DprCloudErrorClass::ProviderEnvelope)?;
     let choices = root
         .get("choices")
         .and_then(Value::as_array)
@@ -620,17 +620,17 @@ fn endpoint_is_allowed(endpoint: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use voisu_core::{
-        compose_structured_candidate, organize_local_baseline, BoundaryError, BoundaryKind,
-        CloudOutcome, ComposeInput, ComposeSource, CompositionDecision, LocalBaselineOptions,
-        Provider, SecretStore, SttProvider,
+        BoundaryError, BoundaryKind, CloudOutcome, ComposeInput, ComposeSource,
+        CompositionDecision, LocalBaselineOptions, Provider, SecretStore, SttProvider,
+        compose_structured_candidate, organize_local_baseline,
     };
 
     use super::*;
@@ -756,12 +756,8 @@ mod tests {
     #[tokio::test]
     async fn happy_json_returns_typed_candidate_and_exact_request_contract() {
         let secret = "controlled-secret-not-for-logs";
-        let (endpoint, request_rx, count) = canned_server(
-            200,
-            provider_response(valid_candidate()),
-            Duration::ZERO,
-        )
-        .await;
+        let (endpoint, request_rx, count) =
+            canned_server(200, provider_response(valid_candidate()), Duration::ZERO).await;
         let client = DprCloudClient::with_endpoint(endpoint).expect("client");
         let credential = Credential::new(secret.to_owned()).expect("credential");
         let sources = [ComposeSource {
@@ -805,9 +801,11 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 1);
         let raw_request = request_rx.await.expect("captured request");
         let request_text = String::from_utf8_lossy(&raw_request);
-        assert!(request_text.lines().any(|line| {
-            line.eq_ignore_ascii_case(&format!("authorization: bearer {secret}"))
-        }));
+        assert!(
+            request_text.lines().any(|line| {
+                line.eq_ignore_ascii_case(&format!("authorization: bearer {secret}"))
+            })
+        );
         let body = body_from_request(&raw_request);
         assert_eq!(body["model"], DPR_GROQ_MODEL);
         assert_eq!(body["reasoning_effort"], DPR_GROQ_REASONING_EFFORT);
@@ -817,8 +815,8 @@ mod tests {
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
         let schema = &body["response_format"]["json_schema"]["schema"];
         assert_eq!(
-            schema["properties"]["derivation"]["items"]["properties"]
-                ["source_provider"]["anyOf"][0]["enum"],
+            schema["properties"]["derivation"]["items"]["properties"]["source_provider"]["anyOf"]
+                [0]["enum"],
             json!(["provider_a", "provider_b"])
         );
         let public_error = format!("{:?}", DprCloudErrorClass::Transport);
@@ -957,9 +955,11 @@ mod tests {
             )
             .await;
         assert_eq!(attempt.error(), Some(DprCloudErrorClass::RequestInvalid));
-        assert!(tokio::time::timeout(Duration::from_millis(10), listener.accept())
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1071,12 +1071,8 @@ mod tests {
 
     #[tokio::test]
     async fn small_edit_contract_requests_qwen_json_object_not_derivation() {
-        let (endpoint, request_rx, count) = canned_server(
-            200,
-            provider_response(valid_format_edits()),
-            Duration::ZERO,
-        )
-        .await;
+        let (endpoint, request_rx, count) =
+            canned_server(200, provider_response(valid_format_edits()), Duration::ZERO).await;
         let client = DprCloudClient::with_endpoint(endpoint).expect("client");
         let credential = Credential::new("secret".to_owned()).expect("credential");
         let sources = [ComposeSource {
@@ -1107,29 +1103,24 @@ mod tests {
 
         let body = body_from_request(&request_rx.await.expect("captured request"));
         assert_eq!(body["model"], DPR_FORMAT_GROQ_MODEL);
-        assert_eq!(
-            body["reasoning_effort"],
-            DPR_FORMAT_GROQ_REASONING_EFFORT
-        );
-        assert_eq!(
-            body["reasoning_format"],
-            DPR_FORMAT_GROQ_REASONING_FORMAT
-        );
+        assert_eq!(body["reasoning_effort"], DPR_FORMAT_GROQ_REASONING_EFFORT);
+        assert_eq!(body["reasoning_format"], DPR_FORMAT_GROQ_REASONING_FORMAT);
         assert_eq!(body["temperature"], 0);
         assert_eq!(body["response_format"], json!({"type": "json_object"}));
         let user = body["messages"][1]["content"].as_str().expect("user");
         let payload: Value = serde_json::from_str(user).expect("user payload");
         assert_eq!(
-            payload["response_schema"]["properties"]["edits"]["items"]["properties"]["kind"]
-                ["enum"],
+            payload["response_schema"]["properties"]["edits"]["items"]["properties"]["kind"]["enum"],
             json!(CLOSED_FORMAT_EDIT_KINDS)
         );
         assert!(payload.get("closed_conversions").is_none());
         assert!(payload.get("host_selection").is_none());
-        assert!(body["messages"][0]["content"]
-            .as_str()
-            .expect("system")
-            .contains("Reconciliation is a different job"));
+        assert!(
+            body["messages"][0]["content"]
+                .as_str()
+                .expect("system")
+                .contains("Reconciliation is a different job")
+        );
     }
 
     #[tokio::test]

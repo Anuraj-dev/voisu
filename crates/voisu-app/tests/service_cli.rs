@@ -72,7 +72,10 @@ impl ServiceFixture {
             .env("XDG_RUNTIME_DIR", &self.runtime)
             .env("XDG_CONFIG_HOME", &self.config)
             .env("XDG_DATA_HOME", &self.data)
-            .env("PATH", format!("{}/fake-bin:/usr/bin:/bin", self.root.path().display()))
+            .env(
+                "PATH",
+                format!("{}/fake-bin:/usr/bin:/bin", self.root.path().display()),
+            )
             .env("FAKE_SYSTEMCTL_LOG", &self.systemctl_log)
             .env("FAKE_SYSTEMCTL_STATE", &self.systemctl_state)
             .env("VOISU_PACKAGED_UNIT_DIR", &self.packaged_unit_dir)
@@ -502,7 +505,8 @@ fn lifecycle_failure_evidence(fixture: &ServiceFixture, output: &Output) -> Stri
     let systemctl_log = fs::read_to_string(&fixture.systemctl_log).unwrap_or_default();
     let systemctl_state = fs::read_to_string(&fixture.systemctl_state).unwrap_or_default();
     let pid_path = PathBuf::from(format!("{}.pid", fixture.systemctl_state.display()));
-    let daemon_log_path = PathBuf::from(format!("{}.daemon.log", fixture.systemctl_state.display()));
+    let daemon_log_path =
+        PathBuf::from(format!("{}.daemon.log", fixture.systemctl_state.display()));
     let pid_raw = fs::read_to_string(&pid_path).unwrap_or_else(|_| "<missing>".into());
     let daemon_log = fs::read_to_string(&daemon_log_path).unwrap_or_else(|_| "<missing>".into());
     let active_marker = pid_raw
@@ -546,7 +550,10 @@ fn wait_for_socket(runtime: &Path, present: bool) {
         }
         thread::sleep(Duration::from_millis(10));
     }
-    panic!("daemon socket did not reach present={present}: {}", socket.display());
+    panic!(
+        "daemon socket did not reach present={present}: {}",
+        socket.display()
+    );
 }
 
 /// Waits until `status` reports the manually spawned daemon as reachable over
@@ -610,13 +617,23 @@ fn install_is_idempotent_atomic_and_free_of_stale_session_or_checkout_values() {
         "XAUTHORITY=",
         "/target/",
     ] {
-        assert!(!unit.contains(stale), "unit baked stale value {stale}: {unit}");
+        assert!(
+            !unit.contains(stale),
+            "unit baked stale value {stale}: {unit}"
+        );
     }
     assert_eq!(
-        fs::metadata(fixture.installed_daemon()).unwrap().permissions().mode() & 0o777,
+        fs::metadata(fixture.installed_daemon())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
         0o700
     );
-    assert_ne!(first_inode, fs::metadata(fixture.installed_daemon()).unwrap().ino());
+    assert_ne!(
+        first_inode,
+        fs::metadata(fixture.installed_daemon()).unwrap().ino()
+    );
     assert_eq!(
         fs::read(&fixture.source_daemon).unwrap(),
         fs::read(fixture.installed_daemon()).unwrap()
@@ -645,7 +662,10 @@ fn packaged_install_migrates_a_stale_user_service_without_shadowing_the_package(
 
     assert!(installed.status.success(), "{}", stderr(&installed));
     assert!(stdout(&installed).contains("packaged systemd user service selected"));
-    assert!(!fixture.unit_path().exists(), "user unit must not shadow the package");
+    assert!(
+        !fixture.unit_path().exists(),
+        "user unit must not shadow the package"
+    );
     assert!(
         !fixture.installed_daemon().exists(),
         "stale XDG user-data daemon must not own the package service"
@@ -683,9 +703,7 @@ fn packaged_install_enables_and_restarts_the_optional_overlay_service() {
     let installed = fixture.run(&["service", "install"]);
 
     assert!(installed.status.success(), "{}", stderr(&installed));
-    assert!(
-        stdout(&installed).contains("optional Overlay service enabled and restarted")
-    );
+    assert!(stdout(&installed).contains("optional Overlay service enabled and restarted"));
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
     assert!(calls.contains("--user enable voisu.service"));
     assert!(calls.contains("--user enable --now voisu-overlay.service"));
@@ -702,7 +720,10 @@ fn packaged_install_enables_and_restarts_the_optional_overlay_service() {
     // `enable --now` does nothing to an already-running unit, so an update that
     // replaced the Overlay binary would leave the old process alive without an
     // explicit restart.
-    assert!(calls.contains("--user restart voisu-overlay.service"), "{calls}");
+    assert!(
+        calls.contains("--user restart voisu-overlay.service"),
+        "{calls}"
+    );
 }
 
 #[test]
@@ -734,9 +755,7 @@ fn overlay_enable_failure_does_not_fail_daemon_service_install() {
     let installed = output_retrying(&mut install);
 
     assert!(installed.status.success(), "{}", stderr(&installed));
-    assert!(
-        stdout(&installed).contains("warning: optional Overlay service was not enabled")
-    );
+    assert!(stdout(&installed).contains("warning: optional Overlay service was not enabled"));
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
     assert!(calls.contains("--user enable voisu.service"));
     assert!(calls.contains("--user enable --now voisu-overlay.service"));
@@ -800,7 +819,10 @@ fn effective_execstart_override_selects_packaged_when_the_static_daemon_is_absen
         "{}",
         stdout(&installed)
     );
-    assert!(!fixture.unit_path().exists(), "user unit must not shadow the package");
+    assert!(
+        !fixture.unit_path().exists(),
+        "user unit must not shadow the package"
+    );
 }
 
 #[test]
@@ -947,7 +969,10 @@ fn an_execstart_reset_in_the_packaged_unit_clears_earlier_commands() {
         "{}",
         stdout(&installed)
     );
-    assert!(!fixture.unit_path().exists(), "user unit must not shadow the package");
+    assert!(
+        !fixture.unit_path().exists(),
+        "user unit must not shadow the package"
+    );
 }
 
 #[test]
@@ -1174,8 +1199,7 @@ fn service_start_and_restart_import_the_session_display_environment() {
     let _ = fixture.run(&["service", "restart"]);
 
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
-    let expected =
-        "--user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP";
+    let expected = "--user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP";
     assert_eq!(
         calls.matches(expected).count(),
         3,
@@ -1302,7 +1326,10 @@ fn stop_fails_when_systemd_still_owns_the_daemon_after_the_deadline() {
     assert!(fixture.run(&["service", "start"]).status.success());
     fs::write(
         &fixture.systemctl_state,
-        format!("daemon={}\nstuck_stop=1\n", fixture.installed_daemon().display()),
+        format!(
+            "daemon={}\nstuck_stop=1\n",
+            fixture.installed_daemon().display()
+        ),
     )
     .unwrap();
 
@@ -1334,7 +1361,11 @@ fn a_manual_daemon_is_reported_and_service_start_does_not_create_a_crash_loop() 
     assert!(started.status.success(), "{}", stderr(&started));
     assert!(stdout(&started).contains("daemon running outside systemd; service not started"));
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
-    assert!(!calls.lines().any(|line| line == "--user start voisu.service"));
+    assert!(
+        !calls
+            .lines()
+            .any(|line| line == "--user start voisu.service")
+    );
 
     let result = unsafe { libc::kill(manual.id() as libc::pid_t, libc::SIGTERM) };
     assert_eq!(result, 0);
@@ -1402,9 +1433,7 @@ fn packaged_uninstall_disables_and_stops_the_optional_overlay_service() {
     let removed = fixture.run(&["service", "uninstall"]);
 
     assert!(removed.status.success(), "{}", stderr(&removed));
-    assert!(
-        stdout(&removed).contains("optional Overlay service disabled and stopped")
-    );
+    assert!(stdout(&removed).contains("optional Overlay service disabled and stopped"));
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
     assert!(calls.contains("--user disable --now voisu-overlay.service"));
     assert!(calls.contains("--user disable --now voisu.service"));
@@ -1421,9 +1450,7 @@ fn overlay_disable_failure_does_not_fail_daemon_service_uninstall() {
     let removed = output_retrying(&mut uninstall);
 
     assert!(removed.status.success(), "{}", stderr(&removed));
-    assert!(
-        stdout(&removed).contains("warning: optional Overlay service was not disabled")
-    );
+    assert!(stdout(&removed).contains("warning: optional Overlay service was not disabled"));
     let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
     assert!(calls.contains("--user disable --now voisu-overlay.service"));
     assert!(calls.contains("--user disable --now voisu.service"));

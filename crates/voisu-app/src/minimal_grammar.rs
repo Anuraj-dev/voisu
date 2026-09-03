@@ -8,10 +8,10 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use voisu_core::{
-    text_sha256_fingerprint, FormattingBaseline, MAX_GRAMMAR_EDITS,
-    MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES,
+    FormattingBaseline, MAX_GRAMMAR_EDITS, MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES,
+    text_sha256_fingerprint,
 };
 
 use crate::grammar_http::{GrammarHttpClient, GrammarHttpError, MAX_GRAMMAR_RESPONSE_BYTES};
@@ -109,10 +109,9 @@ impl MinimalGrammarAdapter {
         }
 
         let body = build_request(validated_transcript, baseline);
-        let response =
-            tokio::time::timeout(remaining, self.client.post_json(bearer_token, &body))
-                .await
-                .map_err(|_| MinimalGrammarError::ResultCutoff)??;
+        let response = tokio::time::timeout(remaining, self.client.post_json(bearer_token, &body))
+            .await
+            .map_err(|_| MinimalGrammarError::ResultCutoff)??;
 
         if Instant::now() >= cutoff {
             return Err(MinimalGrammarError::ResultCutoff);
@@ -185,8 +184,8 @@ fn extract_candidate(body: &[u8]) -> Result<Vec<u8>, MinimalGrammarError> {
     if body.len() > MAX_GRAMMAR_RESPONSE_BYTES {
         return Err(MinimalGrammarError::InvalidProviderEnvelope);
     }
-    let root: Value = serde_json::from_slice(body)
-        .map_err(|_| MinimalGrammarError::InvalidProviderEnvelope)?;
+    let root: Value =
+        serde_json::from_slice(body).map_err(|_| MinimalGrammarError::InvalidProviderEnvelope)?;
     let choices = root
         .get("choices")
         .and_then(Value::as_array)
@@ -217,15 +216,15 @@ fn extract_candidate(body: &[u8]) -> Result<Vec<u8>, MinimalGrammarError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use voisu_core::{
-        apply_grammar_candidate_json, format_validated_for_grammar, FormatOptions,
-        GrammarSafetyOptions,
+        FormatOptions, GrammarSafetyOptions, apply_grammar_candidate_json,
+        format_validated_for_grammar,
     };
 
     fn baseline(text: &str) -> FormattingBaseline {
@@ -334,7 +333,10 @@ mod tests {
             "../../../docs/research/smart-writing-spec-constants-2026-08-09.json"
         ))
         .expect("constants companion");
-        assert_eq!(companion["model"]["MINIMAL_GRAMMAR_MODEL"], MINIMAL_GRAMMAR_MODEL);
+        assert_eq!(
+            companion["model"]["MINIMAL_GRAMMAR_MODEL"],
+            MINIMAL_GRAMMAR_MODEL
+        );
         assert_eq!(
             companion["model"]["MINIMAL_GRAMMAR_REASONING_EFFORT"],
             MINIMAL_GRAMMAR_REASONING_EFFORT
@@ -409,9 +411,8 @@ mod tests {
         });
         let (endpoint, request_rx, count) =
             canned_server(200, provider_response(candidate.clone()), Duration::ZERO).await;
-        let adapter = MinimalGrammarAdapter::new(
-            GrammarHttpClient::with_endpoint(endpoint).expect("client"),
-        );
+        let adapter =
+            MinimalGrammarAdapter::new(GrammarHttpClient::with_endpoint(endpoint).expect("client"));
         let received = adapter
             .request_candidate("ready-token", text, &baseline, Instant::now())
             .await
@@ -438,7 +439,8 @@ mod tests {
     async fn empty_multiple_non_content_refusal_and_trailing_envelopes_fallback() {
         let cases = [
             json!({"choices": []}).to_string(),
-            json!({"choices": [{"message":{"content":"{}"}}, {"message":{"content":"{}"}}]}).to_string(),
+            json!({"choices": [{"message":{"content":"{}"}}, {"message":{"content":"{}"}}]})
+                .to_string(),
             json!({"choices": [{"message":{"content":null}}]}).to_string(),
             json!({"choices": [{"message":{"content":"   "}}]}).to_string(),
             json!({"choices": [{"message":{"content":"{}", "refusal":"no"}}]}).to_string(),
@@ -462,19 +464,16 @@ mod tests {
             let adapter = MinimalGrammarAdapter::new(
                 GrammarHttpClient::with_endpoint(endpoint).expect("client"),
             );
-            assert!(matches!(adapter.request_candidate("token", text, &baseline, Instant::now()).await, Err(MinimalGrammarError::Transport(GrammarHttpError::NonSuccessStatus { status: actual })) if actual == status));
+            assert!(
+                matches!(adapter.request_candidate("token", text, &baseline, Instant::now()).await, Err(MinimalGrammarError::Transport(GrammarHttpError::NonSuccessStatus { status: actual })) if actual == status)
+            );
             assert_eq!(count.load(Ordering::SeqCst), 1);
         }
 
-        let (endpoint, _request, count) = canned_server(
-            200,
-            provider_response(json!({"edits": []})),
-            Duration::ZERO,
-        )
-        .await;
-        let adapter = MinimalGrammarAdapter::new(
-            GrammarHttpClient::with_endpoint(endpoint).expect("client"),
-        );
+        let (endpoint, _request, count) =
+            canned_server(200, provider_response(json!({"edits": []})), Duration::ZERO).await;
+        let adapter =
+            MinimalGrammarAdapter::new(GrammarHttpClient::with_endpoint(endpoint).expect("client"));
         assert_eq!(
             adapter
                 .request_candidate(

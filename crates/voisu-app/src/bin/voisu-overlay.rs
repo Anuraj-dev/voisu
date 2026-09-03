@@ -13,21 +13,21 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gtk4 as gtk;
 use gtk::prelude::*;
+use gtk4 as gtk;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use voisu_app::feedback::{
-    after_surface_creation, select_feedback_backend, FeedbackBackend, FeedbackCapabilities,
-    FeedbackDegradation, FeedbackSelection, OverlayRestartPolicy, SessionKind,
+    FeedbackBackend, FeedbackCapabilities, FeedbackDegradation, FeedbackSelection,
+    OverlayRestartPolicy, SessionKind, after_surface_creation, select_feedback_backend,
 };
 use voisu_app::overlay::{
-    edge_falloff_alpha, interpolate_bands, limit_notification_body, limit_warning_class,
-    limit_warning_from_response, notification_rung_choice, phase_glyph, poll_tick,
-    recording_bar_height, recording_identity, recording_bar_rgb, recording_remaining,
-    resting_floor, sweep_brightness, BarSmoother, LevelPollAction,
-    LevelPollLatch, LimitWarning, LimitWarningLatch, NoSpeechNotifyLatch, VISUAL_BAR_COUNT,
-    ObservedSignal, OverlayPhase, OverlayView, PresentationController, PresentationTracker,
-    RecordingNotifyLatch, RungNotification, TickAction, TickObservation, LIMIT_WARNING_CLASS,
+    BarSmoother, LIMIT_WARNING_CLASS, LevelPollAction, LevelPollLatch, LimitWarning,
+    LimitWarningLatch, NoSpeechNotifyLatch, ObservedSignal, OverlayPhase, OverlayView,
+    PresentationController, PresentationTracker, RecordingNotifyLatch, RungNotification,
+    TickAction, TickObservation, VISUAL_BAR_COUNT, edge_falloff_alpha, interpolate_bands,
+    limit_notification_body, limit_warning_class, limit_warning_from_response,
+    notification_rung_choice, phase_glyph, poll_tick, recording_bar_height, recording_bar_rgb,
+    recording_identity, recording_remaining, resting_floor, sweep_brightness,
 };
 use voisu_core::{Command, Request, Response, socket_path};
 
@@ -63,7 +63,9 @@ fn supervise_overlay() -> i32 {
     let executable = match env::current_exe() {
         Ok(executable) => executable,
         Err(error) => {
-            eprintln!("overlay_feedback backend=none degradation=supervisor-current-exe-error error={error}");
+            eprintln!(
+                "overlay_feedback backend=none degradation=supervisor-current-exe-error error={error}"
+            );
             return 1;
         }
     };
@@ -73,7 +75,9 @@ fn supervise_overlay() -> i32 {
         let status = match ProcessCommand::new(&executable).status() {
             Ok(status) => status,
             Err(error) => {
-                eprintln!("overlay_feedback backend=none degradation=supervisor-spawn-failure error={error}");
+                eprintln!(
+                    "overlay_feedback backend=none degradation=supervisor-spawn-failure error={error}"
+                );
                 return 1;
             }
         };
@@ -86,7 +90,9 @@ fn supervise_overlay() -> i32 {
             // this process's bounded policy with an outer failure restart.
             return 0;
         }
-        eprintln!("overlay_feedback backend=none degradation=overlay-process-failure action=restart");
+        eprintln!(
+            "overlay_feedback backend=none degradation=overlay-process-failure action=restart"
+        );
         std::thread::sleep(Duration::from_secs(1));
     }
 }
@@ -107,7 +113,11 @@ fn run_overlay(arguments: &[String]) -> i32 {
     if !preflight.display_available {
         let selection = select_feedback_backend(preflight);
         report(selection);
-        return if report_only { 0 } else { run_journal_feedback(selection) };
+        return if report_only {
+            0
+        } else {
+            run_journal_feedback(selection)
+        };
     }
 
     // Only a Wayland session can use Layer Shell (rung 1), and probing that
@@ -118,7 +128,11 @@ fn run_overlay(arguments: &[String]) -> i32 {
     if preflight.session != SessionKind::Wayland {
         let selection = select_feedback_backend(preflight);
         report(selection);
-        return if report_only { 0 } else { run_notification_feedback(selection) };
+        return if report_only {
+            0
+        } else {
+            run_notification_feedback(selection)
+        };
     }
 
     // A Wayland session: initialize GTK to probe Layer Shell. If GTK/GDK cannot
@@ -130,7 +144,11 @@ fn run_overlay(arguments: &[String]) -> i32 {
             degradation: Some(FeedbackDegradation::LayerShellUnavailable),
         };
         report_with_error(selection, &error.to_string());
-        return if report_only { 0 } else { run_notification_feedback(selection) };
+        return if report_only {
+            0
+        } else {
+            run_notification_feedback(selection)
+        };
     }
 
     let capabilities = environment_capabilities(gtk4_layer_shell::is_supported());
@@ -167,8 +185,12 @@ fn environment_capabilities(layer_shell_supported: bool) -> FeedbackCapabilities
         x11_display.as_deref(),
         session_type.as_deref(),
     );
-    let has_wayland = wayland_display.as_deref().is_some_and(|value| !value.is_empty());
-    let has_x11 = x11_display.as_deref().is_some_and(|value| !value.is_empty());
+    let has_wayland = wayland_display
+        .as_deref()
+        .is_some_and(|value| !value.is_empty());
+    let has_x11 = x11_display
+        .as_deref()
+        .is_some_and(|value| !value.is_empty());
     let display_available = match resolution.session {
         SessionKind::Wayland => has_wayland,
         SessionKind::X11 => has_x11,
@@ -203,7 +225,11 @@ fn run_journal_feedback(selection: FeedbackSelection) -> i32 {
             None => controller.observe_unreachable(now),
         };
         if view != previous {
-            eprintln!("{} phase={}", selection.report_line(), overlay_phase_label(view.phase));
+            eprintln!(
+                "{} phase={}",
+                selection.report_line(),
+                overlay_phase_label(view.phase)
+            );
             previous = view;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -289,9 +315,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     label.add_css_class("state-label");
     label.set_hexpand(true);
     label.set_vexpand(true);
-    let meter = gtk::DrawingArea::builder()
-        .content_height(40)
-        .build();
+    let meter = gtk::DrawingArea::builder().content_height(40).build();
     // Graphics-first phases (Recording/Processing/NoSpeech) hide the label and
     // glyph widgets entirely (see render_surface), so the meter is the only
     // visible child and must be free to fill the whole capsule interior
@@ -447,8 +471,13 @@ fn install_surface_feedback(
             ),
         };
         render_surface(
-            CapsuleSurface { window: &window, label: &label, meter: &meter, glyph: &glyph,
-                container: &capsule },
+            CapsuleSurface {
+                window: &window,
+                label: &label,
+                meter: &meter,
+                glyph: &glyph,
+                container: &capsule,
+            },
             &rendered,
             view,
             warning,
@@ -489,7 +518,12 @@ fn install_surface_feedback(
         let action = poll_tick(
             switched.get(),
             is_fallback,
-            TickObservation { view, signal, identity: identity.as_deref(), warning },
+            TickObservation {
+                view,
+                signal,
+                identity: identity.as_deref(),
+                warning,
+            },
             &mut tracker.borrow_mut(),
             &mut notify_latch.borrow_mut(),
             &mut no_speech_latch.borrow_mut(),
@@ -503,7 +537,12 @@ fn install_surface_feedback(
                 }
                 gtk::glib::ControlFlow::Break
             }
-            TickAction::Continue { resurface, notify, notify_no_speech, notify_limit } => {
+            TickAction::Continue {
+                resurface,
+                notify,
+                notify_no_speech,
+                notify_limit,
+            } => {
                 // Wayland denies a plain toplevel keep-above; re-present it on
                 // each transition into a visible phase to resurface above
                 // occluders.
@@ -626,9 +665,13 @@ fn notification_tick(
                 recording_remaining(&response),
             )
         }
-        None => {
-            (controller.observe_unreachable(now), ObservedSignal::Unreachable, None, None, None)
-        }
+        None => (
+            controller.observe_unreachable(now),
+            ObservedSignal::Unreachable,
+            None,
+            None,
+            None,
+        ),
     };
     // Both latches observe every tick: they are state machines, not senders,
     // and skipping one would corrupt the next tick's decision.
@@ -693,8 +736,9 @@ impl Notifier {
         let spawned = std::thread::Builder::new()
             .name("voisu-overlay-notify".to_owned())
             .spawn(move || {
-                let Ok(runtime) =
-                    tokio::runtime::Builder::new_current_thread().enable_all().build()
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
                 else {
                     let _ = ready_sender.send(false);
                     return;
@@ -734,9 +778,15 @@ impl Notifier {
                 Ok(true)
             );
         if bus_ready {
-            Self { sender: Some(sender), selection }
+            Self {
+                sender: Some(sender),
+                selection,
+            }
         } else {
-            Self { sender: None, selection }
+            Self {
+                sender: None,
+                selection,
+            }
         }
     }
 
@@ -799,7 +849,16 @@ async fn notify_call(
     let hints: HashMap<&str, Value<'_>> = HashMap::new();
     // Notify(app_name, replaces_id, app_icon, summary, body, actions, hints,
     //        expire_timeout) -> u32
-    let arguments = ("Voisu", replaces_id, "", "Voisu", body, actions, hints, 3000_i32);
+    let arguments = (
+        "Voisu",
+        replaces_id,
+        "",
+        "Voisu",
+        body,
+        actions,
+        hints,
+        3000_i32,
+    );
     match connection
         .call_method(
             Some("org.freedesktop.Notifications"),
@@ -836,7 +895,10 @@ struct MeterState {
 }
 
 impl MeterState {
-    const HIDDEN: Self = Self { phase: OverlayPhase::Hidden, warning: None };
+    const HIDDEN: Self = Self {
+        phase: OverlayPhase::Hidden,
+        warning: None,
+    };
 }
 
 fn render_surface(
@@ -845,9 +907,21 @@ fn render_surface(
     view: OverlayView,
     warning: Option<LimitWarning>,
 ) {
-    let CapsuleSurface { window, label, meter, glyph, container: capsule } = surface;
-    for class in ["recording", "processing", "success", "failure", "nospeech", LIMIT_WARNING_CLASS]
-    {
+    let CapsuleSurface {
+        window,
+        label,
+        meter,
+        glyph,
+        container: capsule,
+    } = surface;
+    for class in [
+        "recording",
+        "processing",
+        "success",
+        "failure",
+        "nospeech",
+        LIMIT_WARNING_CLASS,
+    ] {
         capsule.remove_css_class(class);
     }
     let class = match view.phase {
@@ -863,11 +937,16 @@ fn render_surface(
     }
     // The warn border rides on top of the phase class, and only while the phase
     // it belongs to is still on screen.
-    let warning = (view.phase == OverlayPhase::Recording).then_some(warning).flatten();
+    let warning = (view.phase == OverlayPhase::Recording)
+        .then_some(warning)
+        .flatten();
     if let Some(warn_class) = limit_warning_class(warning) {
         capsule.add_css_class(warn_class);
     }
-    rendered.set(MeterState { phase: view.phase, warning });
+    rendered.set(MeterState {
+        phase: view.phase,
+        warning,
+    });
     if view.phase == OverlayPhase::Hidden {
         window.set_visible(false);
         return;
@@ -880,7 +959,9 @@ fn render_surface(
     // Success/NoSpeech), and a hidden widget is excluded from assistive
     // presentation. The capsule is visible in every non-Hidden phase, so it
     // is the one widget that can always carry the announcement.
-    capsule.update_property(&[gtk::accessible::Property::Description(view.accessible_label)]);
+    capsule.update_property(&[gtk::accessible::Property::Description(
+        view.accessible_label,
+    )]);
     meter.set_visible(matches!(
         view.phase,
         OverlayPhase::Recording | OverlayPhase::Processing | OverlayPhase::NoSpeech
@@ -1003,8 +1084,7 @@ fn draw_meter(
     // Only the Recording phase reads per-bar levels; the resting phases draw a
     // flat floor, so skip the interpolation allocation entirely for them.
     // Rounded to u8 to keep `recording_bar_height`'s signature — sub-pixel diff.
-    let levels =
-        matches!(phase, OverlayPhase::Recording).then(|| interpolate_bands(bands, count));
+    let levels = matches!(phase, OverlayPhase::Recording).then(|| interpolate_bands(bands, count));
     for index in 0..count {
         let (bar_height, alpha, colour) = match phase {
             OverlayPhase::Recording => (
@@ -1079,7 +1159,9 @@ fn read_status() -> Option<Response> {
     let request = serde_json::to_vec(&Request::new(Command::OverlayStatus)).ok()?;
     stream.write_all(&request).ok()?;
     stream.write_all(b"\n").ok()?;
-    stream.set_read_timeout(Some(Duration::from_millis(150))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(150)))
+        .ok()?;
     let mut response = Vec::new();
     stream.read_to_end(&mut response).ok()?;
     serde_json::from_slice(&response).ok()
@@ -1098,7 +1180,9 @@ fn read_levels(after_seq: u64, deadline: Instant) -> Option<Vec<voisu_core::Leve
     request.push(b'\n');
     write_within(&mut stream, &request, deadline)?;
     let response = read_until_eof_within(&mut stream, deadline)?;
-    serde_json::from_slice::<Response>(&response).ok()?.level_frames
+    serde_json::from_slice::<Response>(&response)
+        .ok()?
+        .level_frames
 }
 
 /// Nonblocking connect to the daemon socket, bounded by the shared deadline.
@@ -1163,7 +1247,11 @@ fn connect_within(path: &std::path::Path, deadline: Instant) -> Option<UnixStrea
 fn wait_within(fd: std::os::fd::RawFd, events: libc::c_short, deadline: Instant) -> Option<()> {
     loop {
         let remaining = deadline.checked_duration_since(Instant::now())?;
-        let mut descriptor = libc::pollfd { fd, events, revents: 0 };
+        let mut descriptor = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
         let millis = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
         // SAFETY: descriptor is a valid pollfd for the duration of the call.
         match unsafe { libc::poll(&mut descriptor, 1, millis) } {

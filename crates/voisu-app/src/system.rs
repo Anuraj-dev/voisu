@@ -13,22 +13,21 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use voisu_core::{
-    clipboard_candidates, install_instruction, resolve_session, scan_wav_pcm, socket_path,
-    ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture,
-    BoundaryKind, CancelRegistry, CaptureLimit, CapturedAudio, ClipboardTool,
-    Command as DaemonCommand, Credential, DeadlineClock, DeliveryAdapter, DeliveryOutcome,
-    IntentReconstructionAttempt, IntentReconstructionRequest, KeyDiagnosis,
-    KeyLocation, PackageManager, PreparedTranscriptDecision, Provider,
-    ProviderAuthenticator, ProviderKeyStatus, ProviderStream, ReadinessCapability, ReadinessFinding,
-    MergeResult, ReadinessInspector, ReadinessStatus, ReconciliationKind, ReconciliationModel,
-    Request, Response, SecretStore, SessionKind, SessionResolution, ShortcutPortal, ShortcutSession,
-    SourceTranscript, Transcript, TranscriptDecision, TranscriptDecisionPipeline, TranscriptProvider,
-    TranscriptValidator, TriggerKeyBinding, VersionEnvelope, WavScan, PACKAGE_MANAGERS,
-    PROTOCOL_VERSION,
+    ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
+    CancelRegistry, CaptureLimit, CapturedAudio, ClipboardTool, Command as DaemonCommand,
+    Credential, DeadlineClock, DeliveryAdapter, DeliveryOutcome, IntentReconstructionAttempt,
+    IntentReconstructionRequest, KeyDiagnosis, KeyLocation, MergeResult, PACKAGE_MANAGERS,
+    PROTOCOL_VERSION, PackageManager, PreparedTranscriptDecision, Provider, ProviderAuthenticator,
+    ProviderKeyStatus, ProviderStream, ReadinessCapability, ReadinessFinding, ReadinessInspector,
+    ReadinessStatus, ReconciliationKind, ReconciliationModel, Request, Response, SecretStore,
+    SessionKind, SessionResolution, ShortcutPortal, ShortcutSession, SourceTranscript, Transcript,
+    TranscriptDecision, TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator,
+    TriggerKeyBinding, VersionEnvelope, WavScan, clipboard_candidates, install_instruction,
+    resolve_session, scan_wav_pcm, socket_path,
 };
 
 use crate::audio_level::{
-    bands, BandState, LevelRegistry, PcmChunkAssembler, SampleDecoder, PCM_CHUNK_BYTES,
+    BandState, LevelRegistry, PCM_CHUNK_BYTES, PcmChunkAssembler, SampleDecoder, bands,
 };
 use crate::focus::SharedFocusProbe;
 use crate::hyprland_bindings::VerifiedPasteAction;
@@ -280,11 +279,18 @@ where
         .msg_type(zbus::message::Type::Signal)
         .interface(PORTAL_REQUEST_INTERFACE)
         .and_then(|builder| builder.member("Response"))
-        .map_err(|error| BoundaryError::new(kind, format!("portal response rule invalid: {error}")))?
+        .map_err(|error| {
+            BoundaryError::new(kind, format!("portal response rule invalid: {error}"))
+        })?
         .build();
     let mut responses = zbus::MessageStream::for_match_rule(rule, connection, Some(16))
         .await
-        .map_err(|error| BoundaryError::new(kind, format!("portal response subscription failed: {error}")))?;
+        .map_err(|error| {
+            BoundaryError::new(
+                kind,
+                format!("portal response subscription failed: {error}"),
+            )
+        })?;
 
     let reply = portal
         .call_method(method, body)
@@ -293,25 +299,32 @@ where
     // Since xdg-desktop-portal 0.9 the returned handle equals the predictable
     // path; on an older portal it differs — either way the broad subscription
     // above already buffers its Response, so only the filter changes.
-    let handle: zbus::zvariant::OwnedObjectPath = reply
-        .body()
-        .deserialize()
-        .map_err(|error| BoundaryError::new(kind, format!("portal {method} returned no handle: {error}")))?;
+    let handle: zbus::zvariant::OwnedObjectPath = reply.body().deserialize().map_err(|error| {
+        BoundaryError::new(kind, format!("portal {method} returned no handle: {error}"))
+    })?;
     let deadline_at = tokio::time::Instant::now() + deadline;
     loop {
         let message = tokio::time::timeout_at(deadline_at, responses.next())
             .await
-            .map_err(|_| BoundaryError::new(kind, format!("portal {method} response deadline elapsed")))?
-            .ok_or_else(|| BoundaryError::new(kind, format!("portal {method} response stream ended")))?
-            .map_err(|error| BoundaryError::new(kind, format!("portal {method} response failed: {error}")))?;
+            .map_err(|_| {
+                BoundaryError::new(kind, format!("portal {method} response deadline elapsed"))
+            })?
+            .ok_or_else(|| {
+                BoundaryError::new(kind, format!("portal {method} response stream ended"))
+            })?
+            .map_err(|error| {
+                BoundaryError::new(kind, format!("portal {method} response failed: {error}"))
+            })?;
         let header = message.header();
         if header.path().map(|path| path.as_str()) != Some(handle.as_str()) {
             continue;
         }
-        let (code, results): (u32, std::collections::HashMap<String, zbus::zvariant::OwnedValue>) =
-            message.body().deserialize().map_err(|error| {
-                BoundaryError::new(kind, format!("portal {method} response malformed: {error}"))
-            })?;
+        let (code, results): (
+            u32,
+            std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+        ) = message.body().deserialize().map_err(|error| {
+            BoundaryError::new(kind, format!("portal {method} response malformed: {error}"))
+        })?;
         if code != 0 {
             let error = BoundaryError::new(
                 kind,
@@ -411,10 +424,9 @@ impl ShortcutPortal for FedoraShortcutPortal {
                 zbus::zvariant::ObjectPath::try_from(session_path.as_str())
                     .map_err(|error| shortcut_error(format!("session handle malformed: {error}")))?
                     .into();
-            let activations = portal
-                .receive_signal("Activated")
-                .await
-                .map_err(|error| shortcut_error(format!("activation subscription failed: {error}")))?;
+            let activations = portal.receive_signal("Activated").await.map_err(|error| {
+                shortcut_error(format!("activation subscription failed: {error}"))
+            })?;
             let session_proxy = zbus::Proxy::new(
                 &connection,
                 PORTAL_BUS_NAME,
@@ -452,7 +464,10 @@ impl ShortcutPortal for FedoraShortcutPortal {
                 )]);
             let shortcuts = vec![(TRIGGER_KEY_ID, shortcut_properties)];
             let bind_options: std::collections::HashMap<&str, Value<'_>> =
-                std::collections::HashMap::from([("handle_token", Value::from(bind_token.as_str()))]);
+                std::collections::HashMap::from([(
+                    "handle_token",
+                    Value::from(bind_token.as_str()),
+                )]);
             let results = match portal_request(
                 &connection,
                 &portal,
@@ -684,7 +699,9 @@ impl FallbackReason {
             Self::Unavailable => {
                 "start a Secret Service (KWallet or GNOME Keyring) then re-run `voisu setup` to migrate"
             }
-            Self::Locked => "unlock your keyring (e.g. in KWallet) then re-run `voisu setup` to migrate",
+            Self::Locked => {
+                "unlock your keyring (e.g. in KWallet) then re-run `voisu setup` to migrate"
+            }
             Self::ToolMissing => {
                 "install secret-tool (libsecret-tools) then re-run `voisu setup` to migrate"
             }
@@ -694,14 +711,15 @@ impl FallbackReason {
     /// The reason-specific error surfaced when no credential can be produced —
     /// its public message steers the user at the real fix, not a generic hint.
     fn load_error(self) -> BoundaryError {
-        BoundaryError::new(BoundaryKind::SecretStorage, "keyring load failed")
-            .with_public_message(match self {
+        BoundaryError::new(BoundaryKind::SecretStorage, "keyring load failed").with_public_message(
+            match self {
                 Self::Unavailable => {
                     "no desktop Secret Service is available; run `voisu setup` to store a key"
                 }
                 Self::Locked => "the desktop keyring is locked; unlock it, or run `voisu setup`",
                 Self::ToolMissing => "the secret-tool helper is not installed",
-            })
+            },
+        )
     }
 }
 
@@ -1079,7 +1097,10 @@ fn load_primary(provider: Provider) -> LoadPrimary {
                 Provider::Groq => "VOISU_TEST_STORED_GROQ_CREDENTIAL",
                 Provider::Deepgram => "VOISU_TEST_STORED_DEEPGRAM_CREDENTIAL",
             };
-            return match std::env::var(name).ok().and_then(|value| Credential::new(value).ok()) {
+            return match std::env::var(name)
+                .ok()
+                .and_then(|value| Credential::new(value).ok())
+            {
                 Some(credential) => LoadPrimary::Found(credential),
                 None => LoadPrimary::Missing,
             };
@@ -1252,7 +1273,12 @@ impl ProviderHttpClient {
     ) -> Result<AuthProbe, BoundaryError> {
         tokio::task::spawn_blocking(move || authenticated_status(credential, request))
             .await
-            .map_err(|_| BoundaryError::new(BoundaryKind::ProviderAuthentication, "provider request task failed"))?
+            .map_err(|_| {
+                BoundaryError::new(
+                    BoundaryKind::ProviderAuthentication,
+                    "provider request task failed",
+                )
+            })?
     }
 
     /// The endpoint used for the cheapest authenticated round trip per provider.
@@ -1293,7 +1319,11 @@ impl ProviderHttpClient {
     /// Verifies a credential, mapping a non-valid classification onto a
     /// `BoundaryError` whose public message is the same actionable headline
     /// every other surface shows.
-    pub async fn verify(&self, provider: Provider, credential: Credential) -> Result<(), BoundaryError> {
+    pub async fn verify(
+        &self,
+        provider: Provider,
+        credential: Credential,
+    ) -> Result<(), BoundaryError> {
         match self.check(provider, credential).await {
             ProviderKeyStatus::Valid => Ok(()),
             status => Err(BoundaryError::new(
@@ -1374,12 +1404,17 @@ fn authenticated_status(
             "provider request did not complete",
         ));
     }
-    let rendered = std::str::from_utf8(&outcome.stdout)
-        .map_err(|_| {
-            BoundaryError::new(BoundaryKind::ProviderAuthentication, "provider returned no HTTP status")
-        })?;
+    let rendered = std::str::from_utf8(&outcome.stdout).map_err(|_| {
+        BoundaryError::new(
+            BoundaryKind::ProviderAuthentication,
+            "provider returned no HTTP status",
+        )
+    })?;
     parse_auth_probe(rendered).ok_or_else(|| {
-        BoundaryError::new(BoundaryKind::ProviderAuthentication, "provider returned no HTTP status")
+        BoundaryError::new(
+            BoundaryKind::ProviderAuthentication,
+            "provider returned no HTTP status",
+        )
     })
 }
 
@@ -1395,7 +1430,10 @@ fn parse_auth_probe(rendered: &str) -> Option<AuthProbe> {
         .next()
         .map(str::trim)
         .is_some_and(|value| !value.is_empty() && !value.starts_with('%'));
-    Some(AuthProbe { status, retry_after })
+    Some(AuthProbe {
+        status,
+        retry_after,
+    })
 }
 
 fn curl_config_escape(value: &str) -> String {
@@ -1591,9 +1629,13 @@ fn pipewire_finding() -> ReadinessFinding {
         .with_value("pw-record missing")
         .with_action(pw_record_install_command());
     }
-    let responds = run_restricted("pw-cli", &["info", "0"], None, false)
-        .is_ok_and(|outcome| outcome.success);
-    let path = if mode == PwRecordProbe::Raw { "raw" } else { "WAV fallback" };
+    let responds =
+        run_restricted("pw-cli", &["info", "0"], None, false).is_ok_and(|outcome| outcome.success);
+    let path = if mode == PwRecordProbe::Raw {
+        "raw"
+    } else {
+        "WAV fallback"
+    };
     let value = match version {
         Some(version) => format!("{version} ({path})"),
         None => format!("({path})"),
@@ -1621,23 +1663,53 @@ fn controlled_readiness(value: &str, daemon_status: Option<&Response>) -> Vec<Re
     // Host-independent findings so the doctor-output golden test is stable
     // everywhere: no real probes, no package-manager detection.
     let mut findings = vec![
-        readiness(ReadinessCapability::Session, ReadinessStatus::Pass, "display session detected")
-            .with_value("Wayland (KDE)"),
-        readiness(ReadinessCapability::PipeWire, ReadinessStatus::Pass, "PipeWire core responds")
-            .with_value("1.4.11 (raw)"),
-        readiness(ReadinessCapability::Microphone, ReadinessStatus::Pass, "default source available"),
-        readiness(ReadinessCapability::Portals, ReadinessStatus::Pass, "desktop portal responds"),
-        readiness(ReadinessCapability::Clipboard, ReadinessStatus::Pass, "clipboard roundtrip succeeds"),
-        readiness(ReadinessCapability::SecretStorage, ReadinessStatus::Pass, "Secret Service responds"),
+        readiness(
+            ReadinessCapability::Session,
+            ReadinessStatus::Pass,
+            "display session detected",
+        )
+        .with_value("Wayland (KDE)"),
+        readiness(
+            ReadinessCapability::PipeWire,
+            ReadinessStatus::Pass,
+            "PipeWire core responds",
+        )
+        .with_value("1.4.11 (raw)"),
+        readiness(
+            ReadinessCapability::Microphone,
+            ReadinessStatus::Pass,
+            "default source available",
+        ),
+        readiness(
+            ReadinessCapability::Portals,
+            ReadinessStatus::Pass,
+            "desktop portal responds",
+        ),
+        readiness(
+            ReadinessCapability::Clipboard,
+            ReadinessStatus::Pass,
+            "clipboard roundtrip succeeds",
+        ),
+        readiness(
+            ReadinessCapability::SecretStorage,
+            ReadinessStatus::Pass,
+            "Secret Service responds",
+        ),
         daemon_finding(daemon_status),
     ];
     if value == "pass" {
         return findings;
     }
     for override_value in value.split(',') {
-        let Some((capability, status)) = override_value.split_once('=') else { continue };
+        let Some((capability, status)) = override_value.split_once('=') else {
+            continue;
+        };
         let (status, detail, action) = match status {
-            "warn" => (ReadinessStatus::Warn, "needs attention; see remediation", None),
+            "warn" => (
+                ReadinessStatus::Warn,
+                "needs attention; see remediation",
+                None,
+            ),
             "fail" => (
                 ReadinessStatus::Fail,
                 "not available; see remediation",
@@ -1913,11 +1985,15 @@ fn clipboard_finding_for_candidates(candidates: &[ClipboardTool]) -> ReadinessFi
     } else {
         "no clipboard backend is installed for this session"
     };
-    ReadinessFinding::new(ReadinessCapability::Clipboard, ReadinessStatus::Fail, detail)
-        .with_action(install_instruction(
-            detect_package_manager(),
-            primary.install_package(),
-        ))
+    ReadinessFinding::new(
+        ReadinessCapability::Clipboard,
+        ReadinessStatus::Fail,
+        detail,
+    )
+    .with_action(install_instruction(
+        detect_package_manager(),
+        primary.install_package(),
+    ))
 }
 
 /// Read-only check that `tool` can reach the current display.
@@ -1994,7 +2070,12 @@ fn secret_service_finding() -> ReadinessFinding {
     // reports a no-match with a nonzero exit and empty stdout/stderr, while a
     // D-Bus/service failure or a locked keyring prints an error to stderr.
     let probe = std::process::id().to_string();
-    match run_restricted("secret-tool", &["lookup", "voisu-doctor-probe", &probe], None, false) {
+    match run_restricted(
+        "secret-tool",
+        &["lookup", "voisu-doctor-probe", &probe],
+        None,
+        false,
+    ) {
         Ok(outcome) if outcome.success || outcome.stderr.is_empty() => readiness(
             ReadinessCapability::SecretStorage,
             ReadinessStatus::Pass,
@@ -2182,7 +2263,11 @@ fn read_bounded_frame(stream: &mut UnixStream, started: Instant) -> Result<Strin
     }
 }
 
-fn readiness(capability: ReadinessCapability, status: ReadinessStatus, detail: &str) -> ReadinessFinding {
+fn readiness(
+    capability: ReadinessCapability,
+    status: ReadinessStatus,
+    detail: &str,
+) -> ReadinessFinding {
     ReadinessFinding::new(capability, status, detail)
 }
 
@@ -2236,7 +2321,14 @@ fn run_restricted(
     input: Option<&[u8]>,
     capture_stdout: bool,
 ) -> Result<ProcessOutcome, ProcessError> {
-    run_restricted_with_deadline(program, arguments, input, capture_stdout, PROCESS_DEADLINE, None)
+    run_restricted_with_deadline(
+        program,
+        arguments,
+        input,
+        capture_stdout,
+        PROCESS_DEADLINE,
+        None,
+    )
 }
 
 pub(crate) fn run_restricted_stdout(program: &str, arguments: &[&str]) -> Option<Vec<u8>> {
@@ -2271,9 +2363,9 @@ pub(crate) fn run_hyprctl_binds_json() -> Result<Vec<u8>, String> {
         None => CappedRead::Complete(Vec::new()),
     };
     match payload {
-        CappedRead::Truncated { .. } => Err(
-            "`hyprctl binds -j` response exceeded the 1 MiB inspection budget".to_owned(),
-        ),
+        CappedRead::Truncated { .. } => {
+            Err("`hyprctl binds -j` response exceeded the 1 MiB inspection budget".to_owned())
+        }
         CappedRead::Complete(bytes) if status.success() => Ok(bytes),
         CappedRead::Complete(_) => Err("`hyprctl binds -j` returned a failure".to_owned()),
     }
@@ -2304,7 +2396,11 @@ fn run_restricted_serving_within(
     let mut command = restricted_command(program);
     command
         .args(arguments)
-        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let mut child = command.spawn().map_err(|_| ProcessError::Unavailable)?;
@@ -2330,7 +2426,11 @@ fn run_restricted_serving_within(
             _ => return Err(ProcessError::Input),
         }
     }
-    Ok(ProcessOutcome { success: status.success(), stdout: Vec::new(), stderr: Vec::new() })
+    Ok(ProcessOutcome {
+        success: status.success(),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    })
 }
 
 fn run_restricted_with_deadline(
@@ -2349,8 +2449,16 @@ fn run_restricted_with_deadline(
     let mut command = restricted_command(program);
     command
         .args(arguments)
-        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(if capture_stdout { Stdio::piped() } else { Stdio::null() })
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(if capture_stdout {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|_| ProcessError::Unavailable)?;
     // The whole-operation deadline starts before spawn and covers startup, the
@@ -2384,8 +2492,10 @@ fn run_restricted_with_deadline(
     // may still be blocked on a descendant-held pipe.
     let status = wait_for_child(&mut child, started, deadline, cancel);
     let writer = writer.map(|handle| bounded_join(handle, started, &mut child, deadline));
-    let stdout_joined = stdout_reader.map(|handle| bounded_join(handle, started, &mut child, deadline));
-    let stderr_joined = stderr_reader.map(|handle| bounded_join(handle, started, &mut child, deadline));
+    let stdout_joined =
+        stdout_reader.map(|handle| bounded_join(handle, started, &mut child, deadline));
+    let stderr_joined =
+        stderr_reader.map(|handle| bounded_join(handle, started, &mut child, deadline));
     let stdout = pipe_bytes(stdout_joined)?;
     let stderr = pipe_bytes(stderr_joined)?;
     let status = status?;
@@ -2396,7 +2506,11 @@ fn run_restricted_with_deadline(
             _ => return Err(ProcessError::Input),
         }
     }
-    Ok(ProcessOutcome { success: status.success(), stdout, stderr })
+    Ok(ProcessOutcome {
+        success: status.success(),
+        stdout,
+        stderr,
+    })
 }
 
 /// Joins a helper thread under the remaining process budget. On budget
@@ -2509,9 +2623,7 @@ fn wait_for_child(
         // Cancellation is observed by the loop that owns the Child handle:
         // killing through the handle is pid-reuse-safe because this loop is
         // also the only reaper. Latency is at most one poll tick.
-        if cancel.is_some_and(CancelRegistry::is_cancelled)
-            || started.elapsed() >= deadline
-        {
+        if cancel.is_some_and(CancelRegistry::is_cancelled) || started.elapsed() >= deadline {
             let _ = child.kill();
             reap_briefly(child);
             return Err(ProcessError::TimedOut);
@@ -2705,7 +2817,13 @@ struct WavHeaderStripper<R: Read> {
 
 impl<R: Read> WavHeaderStripper<R> {
     fn new(inner: R) -> Self {
-        Self { inner, scan: Vec::new(), pending: Vec::new(), pending_pos: 0, header_done: false }
+        Self {
+            inner,
+            scan: Vec::new(),
+            pending: Vec::new(),
+            pending_pos: 0,
+            header_done: false,
+        }
     }
 }
 
@@ -2761,8 +2879,7 @@ impl<R: Read> Read for WavHeaderStripper<R> {
 
 impl AudioCapture for PipeWireCapture {
     fn begin(&mut self, _recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError> {
-        let maximum =
-            resolve_recording_maximum(std::env::var("VOISU_RECORDING_DEADLINE_MS").ok());
+        let maximum = resolve_recording_maximum(std::env::var("VOISU_RECORDING_DEADLINE_MS").ok());
         let pcm_byte_cap = maximum.pcm_byte_cap;
         // `--raw` yields headerless PCM directly (the Fedora path); without it
         // pw-record wraps the same PCM in a WAV container that WavHeaderStripper
@@ -2824,14 +2941,13 @@ impl AudioCapture for PipeWireCapture {
             } else {
                 Box::new(WavHeaderStripper::new(stdout))
             };
-            let stdout: Box<dyn Read + Send> =
-                match injected_capture_read_failure_after_bytes() {
-                    Some(bytes_before_failure) => Box::new(InjectedCaptureReadFailure {
-                        inner: stdout,
-                        bytes_before_failure,
-                    }),
-                    None => stdout,
-                };
+            let stdout: Box<dyn Read + Send> = match injected_capture_read_failure_after_bytes() {
+                Some(bytes_before_failure) => Box::new(InjectedCaptureReadFailure {
+                    inner: stdout,
+                    bytes_before_failure,
+                }),
+                None => stdout,
+            };
             if let Err(returned) = handoff_tx.send(Ok((child, stderr))) {
                 // begin() is blocked on recv, so this only happens if it
                 // panicked; reclaim the child rather than leaking it.
@@ -2946,7 +3062,10 @@ fn resolve_recording_maximum(raw: Option<String>) -> RecordingMaximum {
     // total loss, the exact defect this ticket exists to remove. The floor costs
     // nothing at any realistic deadline.
     let pcm_byte_cap = derived_cap.max(MIN_RECORDING_BYTES);
-    RecordingMaximum { deadline, pcm_byte_cap }
+    RecordingMaximum {
+        deadline,
+        pcm_byte_cap,
+    }
 }
 
 struct PipeWireActiveCapture {
@@ -2980,12 +3099,15 @@ impl PipeWireActiveCapture {
                 stop_child_blocking(child, reader, stderr_reader, graceful)
             }));
         }
-        let result = self.cleanup.as_mut().expect("capture cleanup is present").await;
+        let result = self
+            .cleanup
+            .as_mut()
+            .expect("capture cleanup is present")
+            .await;
         self.cleanup.take();
-        result
-            .map_err(|_| {
-                BoundaryError::new(BoundaryKind::Capture, "pw-record cleanup task failed")
-            })?
+        result.map_err(|_| {
+            BoundaryError::new(BoundaryKind::Capture, "pw-record cleanup task failed")
+        })?
     }
 
     fn validate_audio(&self) -> Result<(), BoundaryError> {
@@ -3001,9 +3123,10 @@ impl PipeWireActiveCapture {
                 format!("Recording contained {} PCM bytes", self.pcm.len()),
             ));
         }
-        let audible = self.pcm.chunks_exact(2).any(|sample| {
-            i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs() > 32
-        });
+        let audible = self
+            .pcm
+            .chunks_exact(2)
+            .any(|sample| i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs() > 32);
         if !audible {
             return Err(BoundaryError::new(
                 BoundaryKind::SilentRecording,
@@ -3035,8 +3158,8 @@ fn stop_child_blocking(
     let stopped = Instant::now();
     let status = wait_for_child(&mut child, stopped, PROCESS_DEADLINE, None);
     let reader = reader.map(|handle| bounded_join(handle, stopped, &mut child, PROCESS_DEADLINE));
-    let stderr = stderr_reader
-        .map(|handle| bounded_join(handle, stopped, &mut child, PROCESS_DEADLINE));
+    let stderr =
+        stderr_reader.map(|handle| bounded_join(handle, stopped, &mut child, PROCESS_DEADLINE));
     if !matches!(reader, None | Some(Ok(()))) {
         return Err(BoundaryError::new(
             BoundaryKind::Capture,
@@ -3054,16 +3177,17 @@ fn stop_child_blocking(
         }
     };
     let status = status.map_err(|error| capture_process_error(error, &stderr))?;
-    let expected_signal = if graceful { libc::SIGINT } else { libc::SIGKILL };
+    let expected_signal = if graceful {
+        libc::SIGINT
+    } else {
+        libc::SIGKILL
+    };
     // Real pw-record catches SIGINT and exits nonzero with no diagnostics
     // rather than dying by the signal; that silent nonzero exit is its
     // normal interrupted shape, not a failure. Anything with diagnostics,
     // or that had already died before the interrupt, stays rejected.
     let interrupted_cleanly = graceful && !exited_before_stop && stderr.is_empty();
-    if !status.success()
-        && status.signal() != Some(expected_signal)
-        && !interrupted_cleanly
-    {
+    if !status.success() && status.signal() != Some(expected_signal) && !interrupted_cleanly {
         return Err(BoundaryError::new(
             BoundaryKind::Capture,
             process_diagnostic("pw-record failed", &stderr),
@@ -3076,7 +3200,10 @@ impl ActiveCapture for PipeWireActiveCapture {
     fn deadline_clock(&self) -> DeadlineClock {
         // The same pair `next_chunk` enforces against, one field read apart —
         // there is no second resolution and no second clock to disagree.
-        DeadlineClock { started: self.started, deadline: self.deadline }
+        DeadlineClock {
+            started: self.started,
+            deadline: self.deadline,
+        }
     }
 
     fn next_chunk(&mut self) -> BoundaryFuture<'_, Option<AudioChunk>> {
@@ -3295,8 +3422,8 @@ impl GroqRequestParams {
     /// Resolves model configuration while retaining the exact language snapshot
     /// captured at the Recording boundary.
     fn from_config_with_language(prompt: String, language: String) -> Self {
-        let model = std::env::var("VOISU_GROQ_MODEL")
-            .unwrap_or_else(|_| "whisper-large-v3".to_owned());
+        let model =
+            std::env::var("VOISU_GROQ_MODEL").unwrap_or_else(|_| "whisper-large-v3".to_owned());
         Self {
             model,
             language,
@@ -3612,10 +3739,7 @@ impl CredentialCleanupEntry {
     }
 
     pub fn phase(&self) -> CredentialEntryPhase {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .phase
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).phase
     }
 
     pub fn has_launched_child(&self) -> bool {
@@ -3629,11 +3753,7 @@ impl CredentialCleanupEntry {
     /// needs kill/wait ownership. Survives take-for-reap so Drop can signal.
     pub fn retained_pgid(&self) -> Option<libc::pid_t> {
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        guard
-            .running
-            .as_ref()
-            .map(|r| r.pgid)
-            .or(guard.last_pgid)
+        guard.running.as_ref().map(|r| r.pgid).or(guard.last_pgid)
     }
 
     pub fn watchdog_overrun_logged(&self) -> bool {
@@ -3690,11 +3810,7 @@ impl CredentialCleanupEntry {
     fn kill_process_group_once(&self) {
         let pgid = {
             let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            guard
-                .running
-                .as_ref()
-                .map(|r| r.pgid)
-                .or(guard.last_pgid)
+            guard.running.as_ref().map(|r| r.pgid).or(guard.last_pgid)
         };
         let Some(pgid) = pgid else {
             // No child yet (or fully reaped). Do not stick kill_requested.
@@ -3804,11 +3920,7 @@ impl CredentialLane {
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let entry = Arc::new(CredentialCleanupEntry::new(id));
-        let mut guard = self
-            .inner
-            .entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.inner.entries.lock().unwrap_or_else(|p| p.into_inner());
         guard.insert(id, Arc::clone(&entry));
         entry
     }
@@ -3825,11 +3937,7 @@ impl CredentialLane {
         }
         guard.phase = CredentialEntryPhase::Deregistered;
         drop(guard);
-        let mut map = self
-            .inner
-            .entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut map = self.inner.entries.lock().unwrap_or_else(|p| p.into_inner());
         map.remove(&entry.id);
     }
 
@@ -3850,11 +3958,7 @@ impl CredentialLane {
             }
             guard.phase = CredentialEntryPhase::Deregistered;
         }
-        let mut map = self
-            .inner
-            .entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut map = self.inner.entries.lock().unwrap_or_else(|p| p.into_inner());
         map.remove(&entry.id);
     }
 
@@ -3929,7 +4033,11 @@ pub struct CredentialPreparationOwner {
 
 impl CredentialPreparationOwner {
     /// Bind a previously registered entry. First poll may launch work.
-    pub fn new(entry: Arc<CredentialCleanupEntry>, lane: CredentialLane, provider: Provider) -> Self {
+    pub fn new(
+        entry: Arc<CredentialCleanupEntry>,
+        lane: CredentialLane,
+        provider: Provider,
+    ) -> Self {
         Self {
             entry,
             lane,
@@ -4053,9 +4161,10 @@ impl CredentialPreparationOwner {
         }
 
         if self.entry.terminal_capability().is_none() {
-            self.entry.set_terminal(CredentialTerminalOutcome::Unavailable(
-                GrammarUnavailableReason::Cancelled,
-            ));
+            self.entry
+                .set_terminal(CredentialTerminalOutcome::Unavailable(
+                    GrammarUnavailableReason::Cancelled,
+                ));
         }
         self.lane.deregister(&self.entry);
         if self.lane.contains(self.entry.id()) {
@@ -4071,9 +4180,7 @@ impl CredentialPreparationOwner {
 
     /// After concurrent join: ensure Terminal + Deregistered, return capability.
     pub async fn finish_terminal(&mut self, outcome: GrammarCapability) -> GrammarCapability {
-        if self.finished
-            && self.entry.phase() == CredentialEntryPhase::Deregistered
-        {
+        if self.finished && self.entry.phase() == CredentialEntryPhase::Deregistered {
             return outcome;
         }
         if !matches!(
@@ -4095,9 +4202,7 @@ impl CredentialPreparationOwner {
 
 impl Drop for CredentialPreparationOwner {
     fn drop(&mut self) {
-        if self.finished
-            && self.entry.phase() == CredentialEntryPhase::Deregistered
-        {
+        if self.finished && self.entry.phase() == CredentialEntryPhase::Deregistered {
             return;
         }
         // Sync cancel + process-group kill backstop. Cannot declare Terminal or
@@ -4114,13 +4219,12 @@ async fn wait_for_terminal_capability(entry: &CredentialCleanupEntry) -> Grammar
         if let Some(cap) = entry.terminal_capability() {
             return cap;
         }
-        if matches!(
-            entry.phase(),
-            CredentialEntryPhase::Deregistered
-        ) {
-            return entry.terminal_capability().unwrap_or(
-                GrammarCapability::Unavailable(GrammarUnavailableReason::Cancelled),
-            );
+        if matches!(entry.phase(), CredentialEntryPhase::Deregistered) {
+            return entry
+                .terminal_capability()
+                .unwrap_or(GrammarCapability::Unavailable(
+                    GrammarUnavailableReason::Cancelled,
+                ));
         }
         // Try to claim as supervisor-style driver if free.
         if entry.try_claim(DriveClaim::Supervisor) {
@@ -4130,9 +4234,11 @@ async fn wait_for_terminal_capability(entry: &CredentialCleanupEntry) -> Grammar
             )
             .await;
             entry.release_claim();
-            return entry.terminal_capability().unwrap_or(
-                GrammarCapability::Unavailable(GrammarUnavailableReason::Cancelled),
-            );
+            return entry
+                .terminal_capability()
+                .unwrap_or(GrammarCapability::Unavailable(
+                    GrammarUnavailableReason::Cancelled,
+                ));
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -4213,9 +4319,9 @@ async fn drive_credential_work(
             }
             "denied" | "locked" => match file_fallback_credential(provider) {
                 Some(credential) => CredentialTerminalOutcome::Ready(credential),
-                None => CredentialTerminalOutcome::Unavailable(
-                    GrammarUnavailableReason::KeyringLocked,
-                ),
+                None => {
+                    CredentialTerminalOutcome::Unavailable(GrammarUnavailableReason::KeyringLocked)
+                }
             },
             _ => match file_fallback_credential(provider) {
                 Some(credential) => CredentialTerminalOutcome::Ready(credential),
@@ -4240,10 +4346,7 @@ async fn drive_credential_work(
         match run_secret_tool_lookup_attempt(entry, provider, work_deadline).await {
             AsyncLoadStep::Found(credential) => {
                 credential_cache().put(provider, credential.clone());
-                return finish_no_child(
-                    entry,
-                    CredentialTerminalOutcome::Ready(credential),
-                );
+                return finish_no_child(entry, CredentialTerminalOutcome::Ready(credential));
             }
             AsyncLoadStep::Missing => {
                 return finish_no_child(
@@ -4426,11 +4529,7 @@ async fn run_secret_tool_lookup_attempt(
 
     let mut command = tokio::process::Command::new("secret-tool");
     command
-        .args([
-            "lookup",
-            "voisu-provider",
-            provider.secret_service_value(),
-        ])
+        .args(["lookup", "voisu-provider", provider.secret_service_value()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -4692,8 +4791,7 @@ impl<'a> TakenRunningChild<'a> {
                             let room =
                                 MAX_RETAINED_STDOUT_BYTES.saturating_sub(self.stdout_buf.len());
                             let filled = read_buf.filled();
-                            self.stdout_buf
-                                .extend_from_slice(&filled[..n.min(room)]);
+                            self.stdout_buf.extend_from_slice(&filled[..n.min(room)]);
                         }
                     }
                     Poll::Ready(Err(_)) => {
@@ -4720,8 +4818,7 @@ impl<'a> TakenRunningChild<'a> {
                             let room =
                                 MAX_RETAINED_STDERR_BYTES.saturating_sub(self.stderr_buf.len());
                             let filled = read_buf.filled();
-                            self.stderr_buf
-                                .extend_from_slice(&filled[..n.min(room)]);
+                            self.stderr_buf.extend_from_slice(&filled[..n.min(room)]);
                         }
                     }
                     Poll::Ready(Err(_)) => {
@@ -4888,9 +4985,7 @@ impl<'a> std::future::Future for DrainBothPipes<'a> {
                                     let room = MAX_RETAINED_STDOUT_BYTES
                                         .saturating_sub(taken.stdout_buf.len());
                                     let filled = read_buf.filled();
-                                    taken
-                                        .stdout_buf
-                                        .extend_from_slice(&filled[..n.min(room)]);
+                                    taken.stdout_buf.extend_from_slice(&filled[..n.min(room)]);
                                 }
                             }
                             Poll::Ready(Err(_)) => {
@@ -4918,9 +5013,7 @@ impl<'a> std::future::Future for DrainBothPipes<'a> {
                                     let room = MAX_RETAINED_STDERR_BYTES
                                         .saturating_sub(taken.stderr_buf.len());
                                     let filled = read_buf.filled();
-                                    taken
-                                        .stderr_buf
-                                        .extend_from_slice(&filled[..n.min(room)]);
+                                    taken.stderr_buf.extend_from_slice(&filled[..n.min(room)]);
                                 }
                             }
                             Poll::Ready(Err(_)) => {
@@ -5201,10 +5294,7 @@ impl ProviderReaper {
         }));
     }
 
-    fn adopt_capture(
-        &self,
-        cleanup: tokio::task::JoinHandle<Result<Vec<u8>, BoundaryError>>,
-    ) {
+    fn adopt_capture(&self, cleanup: tokio::task::JoinHandle<Result<Vec<u8>, BoundaryError>>) {
         self.adopt(VecDeque::from([cleanup]));
     }
 
@@ -5284,8 +5374,7 @@ impl ProviderReaper {
             while let Some(mut task) = batch.pop() {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if tokio::time::timeout(remaining, &mut task).await.is_err() {
-                    let mut guard =
-                        self.tasks.lock().expect("provider reaper mutex poisoned");
+                    let mut guard = self.tasks.lock().expect("provider reaper mutex poisoned");
                     guard.push(task);
                     guard.append(&mut batch);
                     return false;
@@ -5323,9 +5412,8 @@ impl ProviderStream for GroqStream {
             if groq_prestream_active(self.streamed_bytes) {
                 while self.buffer.len() >= GROQ_CHUNK_BYTES {
                     let pcm = self.buffer[..GROQ_CHUNK_BYTES].to_vec();
-                    self.buffer = self.buffer
-                        [GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES..]
-                        .to_vec();
+                    self.buffer =
+                        self.buffer[GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES..].to_vec();
                     let credential = self.credential.clone();
                     let endpoint = self.endpoint.clone();
                     let params = self.params.clone();
@@ -5925,7 +6013,10 @@ async fn deepgram_ws_connect(
     request.headers_mut().insert(
         tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
         token.parse().map_err(|_| {
-            BoundaryError::new(BoundaryKind::Provider, "Deepgram credential is not header-safe")
+            BoundaryError::new(
+                BoundaryKind::Provider,
+                "Deepgram credential is not header-safe",
+            )
         })?,
     );
     let connect = tokio_tungstenite::connect_async(request);
@@ -6196,7 +6287,9 @@ impl MergeResultValidator {
     pub fn intent_reconstruction(reaper: ProviderReaper) -> Self {
         Self {
             pipeline: TranscriptDecisionPipeline::with_intent_reconstruction(
-                GroqReconciliationModel { reaper: Some(reaper) },
+                GroqReconciliationModel {
+                    reaper: Some(reaper),
+                },
                 INTENT_RECONSTRUCTION_DEADLINE,
                 Vec::new(),
             ),
@@ -6277,7 +6370,10 @@ impl ReconciliationModel for GroqReconciliationModel {
             })
             .await
             .map_err(|_| {
-                BoundaryError::new(BoundaryKind::Validation, "reconciliation request task failed")
+                BoundaryError::new(
+                    BoundaryKind::Validation,
+                    "reconciliation request task failed",
+                )
             })?
         })
     }
@@ -6313,10 +6409,12 @@ impl ReconciliationModel for GroqReconciliationModel {
                 request_groq_intent_reconstruction(credential, request, &cancel)
             })
             .await
-            .map_err(|_| BoundaryError::new(
-                BoundaryKind::Validation,
-                "Intent Reconstruction request task failed",
-            ))?
+            .map_err(|_| {
+                BoundaryError::new(
+                    BoundaryKind::Validation,
+                    "Intent Reconstruction request task failed",
+                )
+            })?
         })
     }
 }
@@ -6349,16 +6447,27 @@ fn request_groq_intent_reconstruction(
     );
     let outcome = run_restricted_with_deadline(
         "curl",
-        &["-q", "--config", "-", "--fail", "--silent", "--show-error", "--max-time", "5"],
+        &[
+            "-q",
+            "--config",
+            "-",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "5",
+        ],
         Some(config.as_bytes()),
         true,
         INTENT_RECONSTRUCTION_DEADLINE,
         Some(cancel),
     )
-    .map_err(|_| BoundaryError::new(
-        BoundaryKind::Validation,
-        "Groq Intent Reconstruction request unavailable or failed",
-    ))?;
+    .map_err(|_| {
+        BoundaryError::new(
+            BoundaryKind::Validation,
+            "Groq Intent Reconstruction request unavailable or failed",
+        )
+    })?;
     if !outcome.success {
         return Err(BoundaryError::new(
             BoundaryKind::Validation,
@@ -6371,22 +6480,31 @@ fn request_groq_intent_reconstruction(
             "Groq Intent Reconstruction returned malformed JSON",
         )
     })?;
-    let content = response.pointer("/choices/0/message/content")
+    let content = response
+        .pointer("/choices/0/message/content")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| BoundaryError::new(
-            BoundaryKind::Validation,
-            "Groq Intent Reconstruction omitted content",
-        ))?;
+        .ok_or_else(|| {
+            BoundaryError::new(
+                BoundaryKind::Validation,
+                "Groq Intent Reconstruction omitted content",
+            )
+        })?;
     voisu_core::parse_intent_reconstruction_response(content)
 }
 
 fn groq_intent_reconstruction_request_body(
     request: &IntentReconstructionRequest,
 ) -> serde_json::Value {
-    let sources: Vec<_> = request.sources.iter().map(|source| serde_json::json!({
-        "provider": source.provider.cli_label(),
-        "text": source.text,
-    })).collect();
+    let sources: Vec<_> = request
+        .sources
+        .iter()
+        .map(|source| {
+            serde_json::json!({
+                "provider": source.provider.cli_label(),
+                "text": source.text,
+            })
+        })
+        .collect();
     serde_json::json!({
         "model": DEFAULT_GROQ_RECONCILIATION_MODEL,
         "reasoning_effort": "none",
@@ -6470,9 +6588,10 @@ fn request_groq_reconciliation(
         Some(cancel),
     )
     .map_err(|error| match error {
-        ProcessError::TimedOut => {
-            BoundaryError::new(BoundaryKind::Validation, "reconciliation request deadline elapsed")
-        }
+        ProcessError::TimedOut => BoundaryError::new(
+            BoundaryKind::Validation,
+            "reconciliation request deadline elapsed",
+        ),
         _ => BoundaryError::new(
             BoundaryKind::Validation,
             "Groq reconciliation request unavailable or failed",
@@ -6485,7 +6604,10 @@ fn request_groq_reconciliation(
         ));
     }
     let response: serde_json::Value = serde_json::from_slice(&outcome.stdout).map_err(|_| {
-        BoundaryError::new(BoundaryKind::Validation, "Groq reconciliation returned malformed JSON")
+        BoundaryError::new(
+            BoundaryKind::Validation,
+            "Groq reconciliation returned malformed JSON",
+        )
     })?;
     response
         .pointer("/choices/0/message/content")
@@ -6587,23 +6709,11 @@ impl NotificationBoundary for DesktopNotifier {
                 proxy
                     .call::<_, _, u32>(
                         "Notify",
-                        &(
-                            "Voisu",
-                            0_u32,
-                            "",
-                            "Voisu",
-                            body,
-                            actions,
-                            hints,
-                            5_000_i32,
-                        ),
+                        &("Voisu", 0_u32, "", "Voisu", body, actions, hints, 5_000_i32),
                     )
                     .await
                     .map_err(|_| {
-                        BoundaryError::new(
-                            BoundaryKind::Delivery,
-                            "desktop notification failed",
-                        )
+                        BoundaryError::new(BoundaryKind::Delivery, "desktop notification failed")
                     })?;
                 Ok(())
             };
@@ -6620,8 +6730,7 @@ impl NotificationBoundary for DesktopNotifier {
 }
 
 pub const FOCUS_GUARD_FALLBACK_REASON: &str = "focus changed during Recording";
-pub const FOCUS_GUARD_NOTIFICATION: &str =
-    "focus changed — transcript preserved on the clipboard";
+pub const FOCUS_GUARD_NOTIFICATION: &str = "focus changed — transcript preserved on the clipboard";
 
 pub struct GuardedDelivery {
     focus: SharedFocusProbe,
@@ -6668,7 +6777,9 @@ impl DeliveryAdapter for GuardedDelivery {
             if unchanged {
                 self.direct.deliver(transcript).await
             } else {
-                eprintln!("focus guard: {FOCUS_GUARD_FALLBACK_REASON}; preserving Transcript on clipboard");
+                eprintln!(
+                    "focus guard: {FOCUS_GUARD_FALLBACK_REASON}; preserving Transcript on clipboard"
+                );
                 let mut outcome = self.clipboard.deliver(transcript).await?;
                 outcome.fallback_reason = Some(FOCUS_GUARD_FALLBACK_REASON.to_owned());
                 if let Err(error) = self.notifier.notify(FOCUS_GUARD_NOTIFICATION).await {
@@ -6880,8 +6991,7 @@ impl PortalClipboardDelivery {
             paste_action: None,
             direct_enabled: true,
             clipboard_fallback_reason:
-                "no verified Hyprland Paste Action; Transcript remains on the clipboard"
-                    .to_owned(),
+                "no verified Hyprland Paste Action; Transcript remains on the clipboard".to_owned(),
             session: None,
             setup: None,
             setup_failure: None,
@@ -6896,10 +7006,7 @@ impl PortalClipboardDelivery {
         action: VerifiedPasteAction,
         paste: Box<dyn PasteBoundary>,
     ) -> Self {
-        let mut delivery = Self::with_boundaries(
-            clipboard,
-            Box::new(DisabledRemoteDesktopPortal),
-        );
+        let mut delivery = Self::with_boundaries(clipboard, Box::new(DisabledRemoteDesktopPortal));
         delivery.paste = Some(paste);
         delivery.paste_action = Some(action);
         delivery.direct_enabled = false;
@@ -7100,9 +7207,7 @@ impl ClipboardBoundary for WlClipboard {
         Box::pin(async move {
             let result = tokio::task::spawn_blocking(move || clipboard_write(text.as_bytes()))
                 .await
-                .map_err(|_| {
-                    BoundaryError::new(BoundaryKind::Delivery, "clipboard task failed")
-                })?;
+                .map_err(|_| BoundaryError::new(BoundaryKind::Delivery, "clipboard task failed"))?;
             match result {
                 Ok(_tool) => Ok(()),
                 Err(ProcessError::TimedOut) => Err(BoundaryError::new(
@@ -7122,10 +7227,8 @@ const REMOTE_DESKTOP_INTERFACE: &str = "org.freedesktop.portal.RemoteDesktop";
 const KEYBOARD_DEVICE: u32 = 1;
 const PERSIST_UNTIL_REVOKED: u32 = 2;
 const MAX_RESTORE_TOKEN_BYTES: u64 = 4 * 1024;
-static REMOTE_DESKTOP_TOKEN: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
-static RESTORE_TOKEN_TEMP: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+static REMOTE_DESKTOP_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static RESTORE_TOKEN_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn restore_token_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("VOISU_REMOTE_DESKTOP_TOKEN_FILE") {
@@ -7245,163 +7348,161 @@ impl FedoraRemoteDesktopPortal {
     async fn connect_inner(
         force_keyboard: bool,
     ) -> Result<Box<dyn DirectDeliverySession>, BoundaryError> {
-            use std::sync::atomic::Ordering;
-            use zbus::zvariant::Value;
+        use std::sync::atomic::Ordering;
+        use zbus::zvariant::Value;
 
-            let connection = zbus::Connection::session().await.map_err(|_| {
-                BoundaryError::new(BoundaryKind::Delivery, "RemoteDesktop portal unavailable")
-            })?;
-            let portal = zbus::Proxy::new(
-                &connection,
-                PORTAL_BUS_NAME,
-                PORTAL_OBJECT_PATH,
-                REMOTE_DESKTOP_INTERFACE,
-            )
-            .await
-            .map_err(|_| {
-                BoundaryError::new(BoundaryKind::Delivery, "RemoteDesktop portal unavailable")
-            })?;
+        let connection = zbus::Connection::session().await.map_err(|_| {
+            BoundaryError::new(BoundaryKind::Delivery, "RemoteDesktop portal unavailable")
+        })?;
+        let portal = zbus::Proxy::new(
+            &connection,
+            PORTAL_BUS_NAME,
+            PORTAL_OBJECT_PATH,
+            REMOTE_DESKTOP_INTERFACE,
+        )
+        .await
+        .map_err(|_| {
+            BoundaryError::new(BoundaryKind::Delivery, "RemoteDesktop portal unavailable")
+        })?;
 
-            let unique = REMOTE_DESKTOP_TOKEN.fetch_add(1, Ordering::Relaxed);
-            let prefix = format!("voisu_delivery_{}_{}", std::process::id(), unique);
-            let session_token = format!("{prefix}_session");
-            let session_path = format!(
-                "/org/freedesktop/portal/desktop/session/{}/{session_token}",
-                escaped_sender(&connection).map_err(|_| BoundaryError::new(
-                    BoundaryKind::Delivery,
-                    "RemoteDesktop portal unavailable",
-                ))?
-            );
-            let create_options: std::collections::HashMap<&str, Value<'_>> =
-                std::collections::HashMap::from([
-                    ("handle_token", Value::from(format!("{prefix}_create"))),
-                    ("session_handle_token", Value::from(session_token.as_str())),
-                ]);
-            let create_results = portal_request(
-                &connection,
-                &portal,
+        let unique = REMOTE_DESKTOP_TOKEN.fetch_add(1, Ordering::Relaxed);
+        let prefix = format!("voisu_delivery_{}_{}", std::process::id(), unique);
+        let session_token = format!("{prefix}_session");
+        let session_path = format!(
+            "/org/freedesktop/portal/desktop/session/{}/{session_token}",
+            escaped_sender(&connection).map_err(|_| BoundaryError::new(
                 BoundaryKind::Delivery,
-                "CreateSession",
-                &(create_options,),
-                PORTAL_SESSION_DEADLINE,
-            )
-            .await
-            .map_err(classify_remote_desktop_failure)?;
-            let session_path = session_handle_from(&create_results).unwrap_or(session_path);
-            let session_object: zbus::zvariant::OwnedObjectPath =
-                zbus::zvariant::ObjectPath::try_from(session_path.as_str())
-                    .map_err(|_| BoundaryError::new(BoundaryKind::Delivery, "permission denied"))?
-                    .into();
-            let session_proxy = zbus::Proxy::new(
-                &connection,
-                PORTAL_BUS_NAME,
-                session_path.clone(),
-                PORTAL_SESSION_INTERFACE,
-            )
+                "RemoteDesktop portal unavailable",
+            ))?
+        );
+        let create_options: std::collections::HashMap<&str, Value<'_>> =
+            std::collections::HashMap::from([
+                ("handle_token", Value::from(format!("{prefix}_create"))),
+                ("session_handle_token", Value::from(session_token.as_str())),
+            ]);
+        let create_results = portal_request(
+            &connection,
+            &portal,
+            BoundaryKind::Delivery,
+            "CreateSession",
+            &(create_options,),
+            PORTAL_SESSION_DEADLINE,
+        )
+        .await
+        .map_err(classify_remote_desktop_failure)?;
+        let session_path = session_handle_from(&create_results).unwrap_or(session_path);
+        let session_object: zbus::zvariant::OwnedObjectPath =
+            zbus::zvariant::ObjectPath::try_from(session_path.as_str())
+                .map_err(|_| BoundaryError::new(BoundaryKind::Delivery, "permission denied"))?
+                .into();
+        let session_proxy = zbus::Proxy::new(
+            &connection,
+            PORTAL_BUS_NAME,
+            session_path.clone(),
+            PORTAL_SESSION_INTERFACE,
+        )
+        .await
+        .map_err(|_| BoundaryError::new(BoundaryKind::Delivery, "permission denied"))?;
+        let closures = session_proxy
+            .receive_signal("Closed")
             .await
             .map_err(|_| BoundaryError::new(BoundaryKind::Delivery, "permission denied"))?;
-            let closures = session_proxy.receive_signal("Closed").await.map_err(|_| {
-                BoundaryError::new(BoundaryKind::Delivery, "permission denied")
-            })?;
 
-            let restore_token = load_restore_token();
-            let mut select_options: std::collections::HashMap<&str, Value<'_>> =
-                std::collections::HashMap::from([
-                    ("handle_token", Value::from(format!("{prefix}_select"))),
-                    ("types", Value::from(KEYBOARD_DEVICE)),
-                    ("persist_mode", Value::from(PERSIST_UNTIL_REVOKED)),
-                ]);
-            if let Some(token) = restore_token.as_deref() {
-                select_options.insert("restore_token", Value::from(token));
-            }
-            if let Err(error) = portal_request(
-                &connection,
-                &portal,
-                BoundaryKind::Delivery,
-                "SelectDevices",
-                &(session_object.clone(), select_options),
-                PORTAL_BIND_DEADLINE,
-            )
-            .await
-            {
+        let restore_token = load_restore_token();
+        let mut select_options: std::collections::HashMap<&str, Value<'_>> =
+            std::collections::HashMap::from([
+                ("handle_token", Value::from(format!("{prefix}_select"))),
+                ("types", Value::from(KEYBOARD_DEVICE)),
+                ("persist_mode", Value::from(PERSIST_UNTIL_REVOKED)),
+            ]);
+        if let Some(token) = restore_token.as_deref() {
+            select_options.insert("restore_token", Value::from(token));
+        }
+        if let Err(error) = portal_request(
+            &connection,
+            &portal,
+            BoundaryKind::Delivery,
+            "SelectDevices",
+            &(session_object.clone(), select_options),
+            PORTAL_BIND_DEADLINE,
+        )
+        .await
+        {
+            return Err(fail_and_close(&connection, session_path.as_str(), error).await);
+        }
+
+        let start_options: std::collections::HashMap<&str, Value<'_>> =
+            std::collections::HashMap::from([(
+                "handle_token",
+                Value::from(format!("{prefix}_start")),
+            )]);
+        let started = match portal_request(
+            &connection,
+            &portal,
+            BoundaryKind::Delivery,
+            "Start",
+            &(session_object.clone(), "", start_options),
+            PORTAL_BIND_DEADLINE,
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err(error) => {
                 return Err(fail_and_close(&connection, session_path.as_str(), error).await);
             }
-
-            let start_options: std::collections::HashMap<&str, Value<'_>> =
-                std::collections::HashMap::from([(
-                    "handle_token",
-                    Value::from(format!("{prefix}_start")),
-                )]);
-            let started = match portal_request(
-                &connection,
-                &portal,
+        };
+        if let Some(token) = started
+            .get("restore_token")
+            .and_then(|value| value.downcast_ref::<zbus::zvariant::Str<'_>>().ok())
+        {
+            let _ = persist_restore_token(token.as_str());
+        } else if restore_token.is_some() {
+            // Restore tokens are single-use. If Start did not rotate the
+            // supplied token, retaining it would guarantee a stale retry.
+            clear_restore_token();
+        }
+        let devices = started
+            .get("devices")
+            .and_then(|value| value.downcast_ref::<u32>().ok())
+            .unwrap_or(0);
+        if devices & KEYBOARD_DEVICE == 0 {
+            close_portal_session(&connection, session_path.as_str()).await;
+            return Err(BoundaryError::new(
                 BoundaryKind::Delivery,
-                "Start",
-                &(session_object.clone(), "", start_options),
-                PORTAL_BIND_DEADLINE,
-            )
-            .await
-            {
-                Ok(results) => results,
-                Err(error) => {
-                    return Err(fail_and_close(&connection, session_path.as_str(), error).await);
-                }
-            };
-            if let Some(token) = started
-                .get("restore_token")
-                .and_then(|value| value.downcast_ref::<zbus::zvariant::Str<'_>>().ok())
-            {
-                let _ = persist_restore_token(token.as_str());
-            } else if restore_token.is_some() {
-                // Restore tokens are single-use. If Start did not rotate the
-                // supplied token, retaining it would guarantee a stale retry.
-                clear_restore_token();
-            }
-            let devices = started
-                .get("devices")
-                .and_then(|value| value.downcast_ref::<u32>().ok())
-                .unwrap_or(0);
-            if devices & KEYBOARD_DEVICE == 0 {
-                close_portal_session(&connection, session_path.as_str()).await;
-                return Err(BoundaryError::new(
-                    BoundaryKind::Delivery,
-                    "keyboard permission unavailable",
-                ));
-            }
+                "keyboard permission unavailable",
+            ));
+        }
 
-            let options: std::collections::HashMap<&str, Value<'_>> =
-                std::collections::HashMap::new();
-            let reply = portal
-                .call_method("ConnectToEIS", &(session_object.clone(), options))
-                .await
-                .map_err(|_| {
-                    BoundaryError::new(BoundaryKind::Delivery, "libei connection unavailable")
-                })?;
-            let fd: zbus::zvariant::OwnedFd = reply.body().deserialize().map_err(|_| {
-                BoundaryError::new(BoundaryKind::Delivery, "libei connection unavailable")
-            })?;
-            let fd: std::os::fd::OwnedFd = fd.into();
-            let sender_result = tokio::task::spawn_blocking(move || {
-                NativeEiSender::connect_with_keyboard(fd.into_raw_fd(), force_keyboard)
-            })
+        let options: std::collections::HashMap<&str, Value<'_>> = std::collections::HashMap::new();
+        let reply = portal
+            .call_method("ConnectToEIS", &(session_object.clone(), options))
             .await
             .map_err(|_| {
                 BoundaryError::new(BoundaryKind::Delivery, "libei connection unavailable")
             })?;
-            let sender = match sender_result {
-                Ok(sender) => sender,
-                Err(error) => {
-                    close_portal_session(&connection, session_path.as_str()).await;
-                    return Err(error);
-                }
-            };
+        let fd: zbus::zvariant::OwnedFd = reply.body().deserialize().map_err(|_| {
+            BoundaryError::new(BoundaryKind::Delivery, "libei connection unavailable")
+        })?;
+        let fd: std::os::fd::OwnedFd = fd.into();
+        let sender_result = tokio::task::spawn_blocking(move || {
+            NativeEiSender::connect_with_keyboard(fd.into_raw_fd(), force_keyboard)
+        })
+        .await
+        .map_err(|_| BoundaryError::new(BoundaryKind::Delivery, "libei connection unavailable"))?;
+        let sender = match sender_result {
+            Ok(sender) => sender,
+            Err(error) => {
+                close_portal_session(&connection, session_path.as_str()).await;
+                return Err(error);
+            }
+        };
 
-            Ok(Box::new(FedoraDirectDeliverySession {
-                connection,
-                session_path: session_object,
-                closures,
-                sender: Some(sender),
-            }) as Box<dyn DirectDeliverySession>)
+        Ok(Box::new(FedoraDirectDeliverySession {
+            connection,
+            session_path: session_object,
+            closures,
+            sender: Some(sender),
+        }) as Box<dyn DirectDeliverySession>)
     }
 }
 
@@ -7460,11 +7561,15 @@ impl DirectDeliverySession for FedoraDirectDeliverySession {
                 Ok(Some(_))
             ) {
                 clear_restore_token();
-                return Err(BoundaryError::new(BoundaryKind::Delivery, "permission revoked"));
+                return Err(BoundaryError::new(
+                    BoundaryKind::Delivery,
+                    "permission revoked",
+                ));
             }
-            let mut sender = self.sender.take().ok_or_else(|| {
-                BoundaryError::new(BoundaryKind::Delivery, "libei disconnected")
-            })?;
+            let mut sender = self
+                .sender
+                .take()
+                .ok_or_else(|| BoundaryError::new(BoundaryKind::Delivery, "libei disconnected"))?;
             let (returned, result) = tokio::task::spawn_blocking(move || {
                 let result = sender.deliver(&text);
                 (sender, result)
@@ -7485,11 +7590,15 @@ impl DirectDeliverySession for FedoraDirectDeliverySession {
                 Ok(Some(_))
             ) {
                 clear_restore_token();
-                return Err(BoundaryError::new(BoundaryKind::Delivery, "permission revoked"));
+                return Err(BoundaryError::new(
+                    BoundaryKind::Delivery,
+                    "permission revoked",
+                ));
             }
-            let mut sender = self.sender.take().ok_or_else(|| {
-                BoundaryError::new(BoundaryKind::Delivery, "libei disconnected")
-            })?;
+            let mut sender = self
+                .sender
+                .take()
+                .ok_or_else(|| BoundaryError::new(BoundaryKind::Delivery, "libei disconnected"))?;
             let (returned, result) = tokio::task::spawn_blocking(move || {
                 let result = sender.deliver_shortcut(&shortcut);
                 (sender, result)
@@ -7572,9 +7681,7 @@ fn bind_capability(api: &EiApi, seat: *mut EiSeat, capability: libc::c_int) {
     // SAFETY: `seat` is a live pointer obtained from the event currently being
     // processed; the variadic call passes one capability (promoted to int, as
     // C callers do) followed by the documented NULL terminator.
-    unsafe {
-        (api.seat_bind_capabilities)(seat, capability, std::ptr::null_mut::<libc::c_void>())
-    };
+    unsafe { (api.seat_bind_capabilities)(seat, capability, std::ptr::null_mut::<libc::c_void>()) };
 }
 
 /// What the connect loop should do in response to one libei event, decided by
@@ -7729,7 +7836,9 @@ fn resolve_shortcut_keycodes(
         xkb::KEYMAP_FORMAT_TEXT_V1,
         xkb::KEYMAP_COMPILE_NO_FLAGS,
     )
-    .ok_or_else(|| BoundaryError::new(BoundaryKind::Delivery, "active keyboard layout unavailable"))?;
+    .ok_or_else(|| {
+        BoundaryError::new(BoundaryKind::Delivery, "active keyboard layout unavailable")
+    })?;
     let find = |keysym: xkb::Keysym| -> Option<u32> {
         (keymap.min_keycode().raw()..=keymap.max_keycode().raw()).find_map(|raw| {
             let key = xkb::Keycode::new(raw);
@@ -7744,7 +7853,10 @@ fn resolve_shortcut_keycodes(
         .filter(|token| !token.is_empty())
         .collect::<Vec<_>>();
     let key = tokens.last().ok_or_else(|| {
-        BoundaryError::new(BoundaryKind::Delivery, "verified Paste Action shortcut is empty")
+        BoundaryError::new(
+            BoundaryKind::Delivery,
+            "verified Paste Action shortcut is empty",
+        )
     })?;
     let mut codes = Vec::with_capacity(tokens.len());
     for modifier in &tokens[..tokens.len().saturating_sub(1)] {
@@ -7752,14 +7864,12 @@ fn resolve_shortcut_keycodes(
             "CTRL" | "CONTROL" => xkb::Keysym::from(xkb::keysyms::KEY_Control_L),
             "SHIFT" => xkb::Keysym::from(xkb::keysyms::KEY_Shift_L),
             "ALT" => xkb::Keysym::from(xkb::keysyms::KEY_Alt_L),
-            "SUPER" | "META" | "WIN" | "MOD4" => {
-                xkb::Keysym::from(xkb::keysyms::KEY_Super_L)
-            }
+            "SUPER" | "META" | "WIN" | "MOD4" => xkb::Keysym::from(xkb::keysyms::KEY_Super_L),
             _ => {
                 return Err(BoundaryError::new(
                     BoundaryKind::Delivery,
                     "verified Paste Action contains an unknown modifier",
-                ))
+                ));
             }
         };
         codes.push(find(keysym).ok_or_else(|| {
@@ -7775,7 +7885,9 @@ fn resolve_shortcut_keycodes(
             (*key).to_owned()
         };
         let keysym = xkb::keysym_from_name(&name, xkb::KEYSYM_CASE_INSENSITIVE);
-        (keysym != xkb::Keysym::from(xkb::keysyms::KEY_NoSymbol)).then(|| find(keysym)).flatten()
+        (keysym != xkb::Keysym::from(xkb::keysyms::KEY_NoSymbol))
+            .then(|| find(keysym))
+            .flatten()
     };
     codes.push(keycode.ok_or_else(|| {
         BoundaryError::new(BoundaryKind::Delivery, "active keyboard layout unavailable")
@@ -7817,8 +7929,7 @@ impl EiDeliveryConfirmation {
             EiLinkEvent::Disconnect => {
                 self.failure = Some("libei disconnected during compositor submission");
             }
-            EiLinkEvent::DeviceRemoved { ours: true }
-            | EiLinkEvent::SeatRemoved { ours: true } => {
+            EiLinkEvent::DeviceRemoved { ours: true } | EiLinkEvent::SeatRemoved { ours: true } => {
                 self.failure = Some("libei disconnected");
             }
             EiLinkEvent::DevicePaused { ours: true } if !self.pong_matched => {
@@ -7904,7 +8015,10 @@ impl EiApi {
             Ok(unsafe { std::mem::transmute_copy(&pointer) })
         }
 
-        unsafe fn optional_symbol<T: Copy>(library: *mut libc::c_void, name: &'static [u8]) -> Option<T> {
+        unsafe fn optional_symbol<T: Copy>(
+            library: *mut libc::c_void,
+            name: &'static [u8],
+        ) -> Option<T> {
             let pointer = unsafe { libc::dlsym(library, name.as_ptr().cast()) };
             (!pointer.is_null()).then(|| unsafe { std::mem::transmute_copy(&pointer) })
         }
@@ -7945,10 +8059,7 @@ impl EiApi {
                     device_unref: symbol(library, b"ei_device_unref\0")?,
                     start_emulating: symbol(library, b"ei_device_start_emulating\0")?,
                     keyboard_key: symbol(library, b"ei_device_keyboard_key\0")?,
-                    text_utf8: optional_symbol(
-                        library,
-                        b"ei_device_text_utf8_with_length\0",
-                    ),
+                    text_utf8: optional_symbol(library, b"ei_device_text_utf8_with_length\0"),
                     frame: symbol(library, b"ei_device_frame\0")?,
                     stop_emulating: symbol(library, b"ei_device_stop_emulating\0")?,
                     now: symbol(library, b"ei_now\0")?,
@@ -8096,10 +8207,7 @@ impl Drop for EiConnectGuard<'_> {
 }
 
 impl NativeEiSender {
-    fn connect_with_keyboard(
-        fd: libc::c_int,
-        force_keyboard: bool,
-    ) -> Result<Self, BoundaryError> {
+    fn connect_with_keyboard(fd: libc::c_int, force_keyboard: bool) -> Result<Self, BoundaryError> {
         let api = match EiApi::load() {
             Ok(api) => api,
             Err(error) => {
@@ -8395,7 +8503,10 @@ impl NativeEiSender {
     fn deliver(&mut self, text: &str) -> Result<(), BoundaryError> {
         self.absorb_pending_state()?;
         if !self.link.ready() {
-            return Err(BoundaryError::new(BoundaryKind::Delivery, "libei disconnected"));
+            return Err(BoundaryError::new(
+                BoundaryKind::Delivery,
+                "libei disconnected",
+            ));
         }
         let text = match self.mode {
             EiDeliveryMode::Text => Some(libei_text_buffer(text)?),
@@ -8413,7 +8524,10 @@ impl NativeEiSender {
             (self.api.start_emulating)(self.device, self.sequence);
             match (self.mode, text.as_ref(), paste_keys) {
                 (EiDeliveryMode::Text, Some(text), _) => {
-                    let text_utf8 = self.api.text_utf8.expect("TEXT mode requires the TEXT symbol");
+                    let text_utf8 = self
+                        .api
+                        .text_utf8
+                        .expect("TEXT mode requires the TEXT symbol");
                     text_utf8(self.device, text.as_ptr(), text.as_bytes().len());
                     (self.api.frame)(self.device, (self.api.now)(self.context));
                 }
@@ -8522,8 +8636,7 @@ impl Default for PortalClipboardDelivery {
             paste_action: None,
             direct_enabled: true,
             clipboard_fallback_reason:
-                "no verified Hyprland Paste Action; Transcript remains on the clipboard"
-                    .to_owned(),
+                "no verified Hyprland Paste Action; Transcript remains on the clipboard".to_owned(),
             session: None,
             setup: Some(spawn_remote_desktop_setup()),
             setup_failure: None,
@@ -8534,8 +8647,8 @@ impl Default for PortalClipboardDelivery {
     }
 }
 
-fn spawn_remote_desktop_setup(
-) -> tokio::task::JoinHandle<Result<Box<dyn DirectDeliverySession>, BoundaryError>> {
+fn spawn_remote_desktop_setup()
+-> tokio::task::JoinHandle<Result<Box<dyn DirectDeliverySession>, BoundaryError>> {
     tokio::spawn(async {
         let mut portal = FedoraRemoteDesktopPortal;
         portal.connect().await
@@ -8572,10 +8685,16 @@ fn build_groq_curl_config(
     params: &GroqRequestParams,
 ) -> Result<String, BoundaryError> {
     if params.model.is_empty() || params.model.contains(['\n', '\r']) {
-        return Err(BoundaryError::new(BoundaryKind::Provider, "invalid Groq model"));
+        return Err(BoundaryError::new(
+            BoundaryKind::Provider,
+            "invalid Groq model",
+        ));
     }
     if params.language.contains(['\n', '\r']) {
-        return Err(BoundaryError::new(BoundaryKind::Provider, "invalid Groq language"));
+        return Err(BoundaryError::new(
+            BoundaryKind::Provider,
+            "invalid Groq language",
+        ));
     }
     let endpoint = curl_config_escape(endpoint);
     let credential = curl_config_escape(credential.expose_to_boundary());
@@ -8588,7 +8707,11 @@ fn build_groq_curl_config(
         let language = curl_config_escape(&params.language);
         config.push_str(&format!("form = \"language={language}\"\n"));
     }
-    let prompt: String = params.prompt.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+    let prompt: String = params
+        .prompt
+        .chars()
+        .filter(|c| *c != '\n' && *c != '\r')
+        .collect();
     if !prompt.is_empty() {
         let prompt = curl_config_escape(&prompt);
         config.push_str(&format!("form = \"prompt={prompt}\"\n"));
@@ -8607,12 +8730,19 @@ fn request_groq_chunk(
         .prefix("voisu-recording-")
         .suffix(".flac")
         .tempfile()
-        .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "temporary audio file unavailable"))?;
+        .map_err(|_| {
+            BoundaryError::new(BoundaryKind::Provider, "temporary audio file unavailable")
+        })?;
     let flac = flac_from_pcm(&pcm)?;
     file.write_all(&flac)
         .and_then(|()| file.flush())
         .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "temporary audio write failed"))?;
-    let config = build_groq_curl_config(&endpoint, &credential, &file.path().to_string_lossy(), params)?;
+    let config = build_groq_curl_config(
+        &endpoint,
+        &credential,
+        &file.path().to_string_lossy(),
+        params,
+    )?;
     let outcome = run_restricted_with_deadline(
         "curl",
         &[
@@ -8642,9 +8772,8 @@ fn request_groq_chunk(
             "Groq rejected the audio request",
         ));
     }
-    let response: serde_json::Value = serde_json::from_slice(&outcome.stdout).map_err(|_| {
-        BoundaryError::new(BoundaryKind::Provider, "Groq returned malformed JSON")
-    })?;
+    let response: serde_json::Value = serde_json::from_slice(&outcome.stdout)
+        .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "Groq returned malformed JSON"))?;
     response
         .get("text")
         .and_then(|text| text.as_str())
@@ -8655,10 +8784,7 @@ fn request_groq_chunk(
 fn merge_chunk_transcripts(transcripts: Vec<String>) -> String {
     let mut merged: Vec<String> = Vec::new();
     for transcript in transcripts {
-        let words: Vec<String> = transcript
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect();
+        let words: Vec<String> = transcript.split_whitespace().map(str::to_owned).collect();
         let overlap = (1..=merged.len().min(words.len()).min(GROQ_MERGE_OVERLAP_WORDS))
             .rev()
             .find(|count| merged[merged.len() - count..] == words[..*count])
@@ -8687,16 +8813,18 @@ fn flac_from_pcm(pcm: &[u8]) -> Result<Vec<u8>, BoundaryError> {
         ));
     }
     let config = Encoder::default().into_verified().map_err(|_| {
-        BoundaryError::new(BoundaryKind::Provider, "FLAC encoder configuration is invalid")
+        BoundaryError::new(
+            BoundaryKind::Provider,
+            "FLAC encoder configuration is invalid",
+        )
     })?;
     let source = MemSource::from_samples(&samples, 1, 16, 16_000);
-    let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size).map_err(
-        |_| BoundaryError::new(BoundaryKind::Provider, "Recording FLAC encode failed"),
-    )?;
+    let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+        .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "Recording FLAC encode failed"))?;
     let mut sink = ByteSink::new();
-    stream.write(&mut sink).map_err(|_| {
-        BoundaryError::new(BoundaryKind::Provider, "Recording FLAC output failed")
-    })?;
+    stream
+        .write(&mut sink)
+        .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "Recording FLAC output failed"))?;
     Ok(sink.into_inner())
 }
 
@@ -8753,7 +8881,9 @@ mod tests {
     fn pw_help_rejects_raw_near_matches() {
         // A different option that merely starts with the same letters must not
         // be mistaken for --raw support.
-        assert!(!help_advertises_raw(b"      --raw-file FILE   write raw to FILE\n"));
+        assert!(!help_advertises_raw(
+            b"      --raw-file FILE   write raw to FILE\n"
+        ));
         assert!(!help_advertises_raw(b"      --rawmode        legacy\n"));
         // Substring inside another word must not match either.
         assert!(!help_advertises_raw(b"  see the xyz--rawabc note\n"));
@@ -8803,8 +8933,7 @@ mod tests {
         }
         let payload = b"the-pcm-body".to_vec();
         let stream = canonical_wav_with_payload(&payload);
-        let mut stripper =
-            WavHeaderStripper::new(OneByteAtATime(std::io::Cursor::new(stream)));
+        let mut stripper = WavHeaderStripper::new(OneByteAtATime(std::io::Cursor::new(stream)));
         let mut recovered = Vec::new();
         std::io::Read::read_to_end(&mut stripper, &mut recovered).unwrap();
         assert_eq!(recovered, payload);
@@ -8930,10 +9059,7 @@ mod tests {
     #[test]
     fn clipboard_read_probe_treats_empty_selection_as_usable() {
         assert!(clipboard_read_proves_display(true, b""));
-        assert!(clipboard_read_proves_display(
-            false,
-            b"Nothing is copied\n"
-        ));
+        assert!(clipboard_read_proves_display(false, b"Nothing is copied\n"));
         assert!(clipboard_read_proves_display(
             false,
             b"Error: target STRING not available\n"
@@ -9012,7 +9138,11 @@ mod tests {
         .unwrap();
         assert_eq!(first.expose_to_boundary(), "cached-secret");
         assert_eq!(second.expose_to_boundary(), "cached-secret");
-        assert_eq!(calls.get(), 1, "the second load must be served from the cache");
+        assert_eq!(
+            calls.get(),
+            1,
+            "the second load must be served from the cache"
+        );
     }
 
     #[test]
@@ -9029,7 +9159,11 @@ mod tests {
             })
             .unwrap();
         }
-        assert_eq!(calls.get(), 2, "an expired entry must be re-read, never served stale");
+        assert_eq!(
+            calls.get(),
+            2,
+            "an expired entry must be re-read, never served stale"
+        );
     }
 
     #[test]
@@ -9055,11 +9189,18 @@ mod tests {
     fn session_cache_keys_each_provider_independently() {
         let cache = CredentialCache::new();
         let ttl = Duration::from_secs(300);
-        let groq = resolve_with_cache(Provider::Groq, &cache, ttl, || Ok(credential("groq-key"))).unwrap();
-        let deepgram =
-            resolve_with_cache(Provider::Deepgram, &cache, ttl, || Ok(credential("deepgram-key"))).unwrap();
+        let groq =
+            resolve_with_cache(Provider::Groq, &cache, ttl, || Ok(credential("groq-key"))).unwrap();
+        let deepgram = resolve_with_cache(Provider::Deepgram, &cache, ttl, || {
+            Ok(credential("deepgram-key"))
+        })
+        .unwrap();
         assert_eq!(groq.expose_to_boundary(), "groq-key");
-        assert_eq!(deepgram.expose_to_boundary(), "deepgram-key", "one provider must not read another's slot");
+        assert_eq!(
+            deepgram.expose_to_boundary(),
+            "deepgram-key",
+            "one provider must not read another's slot"
+        );
     }
 
     #[test]
@@ -9072,8 +9213,14 @@ mod tests {
             Err(BoundaryError::new(BoundaryKind::SecretStorage, "transient"))
         });
         assert!(first.is_err());
-        let second = resolve_with_cache(Provider::Groq, &cache, ttl, || Ok(credential("recovered"))).unwrap();
-        assert_eq!(second.expose_to_boundary(), "recovered", "a failure must not be cached");
+        let second =
+            resolve_with_cache(Provider::Groq, &cache, ttl, || Ok(credential("recovered")))
+                .unwrap();
+        assert_eq!(
+            second.expose_to_boundary(),
+            "recovered",
+            "a failure must not be cached"
+        );
     }
 
     /// Fixed Groq request tuning for stream constructor tests: deterministic and
@@ -9111,12 +9258,23 @@ mod tests {
         // into 60 s windows with a 4 s overlap, not one oversized request.
         let len = GROQ_FULL_AUDIO_MAX_BYTES + 16_000 * 2 * 10;
         let ranges = plan_finalize_chunks(len);
-        assert!(ranges.len() >= 2, "past the limit finalize is chunked, not one request");
+        assert!(
+            ranges.len() >= 2,
+            "past the limit finalize is chunked, not one request"
+        );
         assert_eq!(ranges[0], 0..GROQ_CHUNK_BYTES);
         assert_eq!(ranges[1].start, GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES);
-        assert_eq!(ranges.last().unwrap().end, len, "the last window ends at the recording end");
+        assert_eq!(
+            ranges.last().unwrap().end,
+            len,
+            "the last window ends at the recording end"
+        );
         for range in &ranges[..ranges.len() - 1] {
-            assert_eq!(range.end - range.start, GROQ_CHUNK_BYTES, "non-final windows are full chunks");
+            assert_eq!(
+                range.end - range.start,
+                GROQ_CHUNK_BYTES,
+                "non-final windows are full chunks"
+            );
         }
     }
 
@@ -9135,9 +9293,13 @@ mod tests {
             language: "en".to_owned(),
             prompt: "Tokio, serde, SELinux".to_owned(),
         };
-        let config =
-            build_groq_curl_config("https://api.groq.com/v1", &credential, "/tmp/rec.wav", &params)
-                .expect("valid config");
+        let config = build_groq_curl_config(
+            "https://api.groq.com/v1",
+            &credential,
+            "/tmp/rec.wav",
+            &params,
+        )
+        .expect("valid config");
         assert!(config.contains("form = \"model=whisper-large-v3\""));
         assert!(config.contains("form = \"language=en\""));
         assert!(config.contains("form = \"temperature=0\""));
@@ -9166,9 +9328,10 @@ mod tests {
         )
         .expect("valid config");
 
-        assert!(config.contains(
-            "form = \"file=@/tmp/rec.flac;filename=recording.flac;type=audio/flac\""
-        ));
+        assert!(
+            config
+                .contains("form = \"file=@/tmp/rec.flac;filename=recording.flac;type=audio/flac\"")
+        );
         assert!(!config.contains("recording.wav"));
         assert!(!config.contains("audio/wav"));
     }
@@ -9181,9 +9344,13 @@ mod tests {
             language: String::new(),
             prompt: String::new(),
         };
-        let config =
-            build_groq_curl_config("https://api.groq.com/v1", &credential, "/tmp/rec.wav", &params)
-                .expect("valid config");
+        let config = build_groq_curl_config(
+            "https://api.groq.com/v1",
+            &credential,
+            "/tmp/rec.wav",
+            &params,
+        )
+        .expect("valid config");
         assert!(!config.contains("prompt="));
         assert!(!config.contains("language="));
         // temperature is unconditional.
@@ -9198,9 +9365,13 @@ mod tests {
             language: "en".to_owned(),
             prompt: String::new(),
         };
-        let error =
-            build_groq_curl_config("https://api.groq.com/v1", &credential, "/tmp/rec.wav", &params)
-                .unwrap_err();
+        let error = build_groq_curl_config(
+            "https://api.groq.com/v1",
+            &credential,
+            "/tmp/rec.wav",
+            &params,
+        )
+        .unwrap_err();
         assert_eq!(error.diagnostic(), "invalid Groq model");
     }
 
@@ -9210,8 +9381,7 @@ mod tests {
         // must be collapsed, not duplicated, at the 4 s chunk boundary.
         let first: Vec<String> = (0..40).map(|i| format!("w{i}")).collect();
         let second: Vec<String> = (10..60).map(|i| format!("w{i}")).collect();
-        let merged =
-            merge_chunk_transcripts(vec![first.join(" "), second.join(" ")]);
+        let merged = merge_chunk_transcripts(vec![first.join(" "), second.join(" ")]);
         let expected: Vec<String> = (0..60).map(|i| format!("w{i}")).collect();
         assert_eq!(merged, expected.join(" "), "the 30-word overlap is deduped");
     }
@@ -9394,7 +9564,11 @@ mod tests {
         let tail_state = Arc::clone(&capture.state);
         capture.cleanup = Some(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(25)).await;
-            tail_state.lock().unwrap().chunks.push_back(AudioChunk(tail));
+            tail_state
+                .lock()
+                .unwrap()
+                .chunks
+                .push_back(AudioChunk(tail));
             Ok(Vec::new())
         }));
 
@@ -9558,7 +9732,10 @@ mod tests {
                 // the blocking work is still live.
                 let _ = release_rx.recv();
                 reap_done_task.store(true, Ordering::SeqCst);
-                Err(BoundaryError::new(BoundaryKind::Provider, "request cancelled"))
+                Err(BoundaryError::new(
+                    BoundaryKind::Provider,
+                    "request cancelled",
+                ))
             })
             .await
             .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "request task failed"))?
@@ -9620,11 +9797,14 @@ mod tests {
         wait_for(&deepgram_probe.entered).await;
         wait_for(&groq_probe.entered).await;
 
-        let error =
-            ProviderCoordinator::start(Duration::from_millis(10), Duration::from_millis(10), streams)
-                .complete(CapturedAudio::empty())
-                .await
-                .unwrap_err();
+        let error = ProviderCoordinator::start(
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            streams,
+        )
+        .complete(CapturedAudio::empty())
+        .await
+        .unwrap_err();
         assert_eq!(error.diagnostic(), "provider deadline cleanup timed out");
 
         // The moment the coordinator's cleanup-timeout error surfaces, the
@@ -9663,7 +9843,11 @@ mod tests {
             groq_probe.reap_done.load(Ordering::SeqCst),
             "draining must not return until the Groq blocking reap completed"
         );
-        assert_eq!(reaper.pending(), 0, "a full drain must leave nothing retained");
+        assert_eq!(
+            reaper.pending(),
+            0,
+            "a full drain must leave nothing retained"
+        );
     }
 
     #[tokio::test]
@@ -9824,10 +10008,17 @@ mod tests {
     fn deepgram_streaming_url_carries_nova3_params_and_repeated_encoded_keyterms() {
         let url = deepgram_streaming_url(
             "wss://api.deepgram.com/v1/listen",
-            &["Voisu".to_owned(), "smart format".to_owned(), "  ".to_owned()],
+            &[
+                "Voisu".to_owned(),
+                "smart format".to_owned(),
+                "  ".to_owned(),
+            ],
         )
         .unwrap();
-        assert!(url.starts_with("wss://api.deepgram.com/v1/listen?"), "{url}");
+        assert!(
+            url.starts_with("wss://api.deepgram.com/v1/listen?"),
+            "{url}"
+        );
         for expected in [
             "model=nova-3",
             "encoding=linear16",
@@ -9843,17 +10034,25 @@ mod tests {
         }
         assert!(url.contains("keyterm=Voisu"), "{url}");
         assert!(url.contains("keyterm=smart%20format"), "{url}");
-        assert_eq!(url.matches("keyterm=").count(), 2, "blank keyterms must be dropped: {url}");
+        assert_eq!(
+            url.matches("keyterm=").count(),
+            2,
+            "blank keyterms must be dropped: {url}"
+        );
     }
 
     #[test]
     fn deepgram_streaming_url_rewrites_http_schemes_and_requires_wss_off_loopback() {
-        assert!(deepgram_streaming_url("https://api.deepgram.com/v1/listen", &[])
-            .unwrap()
-            .starts_with("wss://api.deepgram.com/v1/listen?"));
-        assert!(deepgram_streaming_url("http://127.0.0.1:9999/v1/listen", &[])
-            .unwrap()
-            .starts_with("ws://127.0.0.1:9999/v1/listen?"));
+        assert!(
+            deepgram_streaming_url("https://api.deepgram.com/v1/listen", &[])
+                .unwrap()
+                .starts_with("wss://api.deepgram.com/v1/listen?")
+        );
+        assert!(
+            deepgram_streaming_url("http://127.0.0.1:9999/v1/listen", &[])
+                .unwrap()
+                .starts_with("ws://127.0.0.1:9999/v1/listen?")
+        );
         assert!(deepgram_streaming_url("ws://deepgram.test/v1/listen", &[]).is_err());
         assert!(deepgram_streaming_url("http://deepgram.test/v1/listen", &[]).is_err());
         // A base that already carries a query keeps it and appends with '&'.
@@ -9912,10 +10111,10 @@ mod tests {
     #[allow(clippy::result_large_err)]
     async fn deepgram_streams_binary_audio_and_returns_only_finalized_segments() {
         use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
         use tokio_tungstenite::tungstenite::handshake::server::{
             Request as WsRequest, Response as WsResponse,
         };
-        use tokio_tungstenite::tungstenite::Message;
 
         let (listener, base) = mock_deepgram_listener().await;
         let server = tokio::spawn(async move {
@@ -9931,8 +10130,7 @@ mod tests {
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or_default()
                         .to_owned();
-                    *capture.lock().unwrap() =
-                        Some((request.uri().to_string(), authorization));
+                    *capture.lock().unwrap() = Some((request.uri().to_string(), authorization));
                     Ok(response)
                 },
             )
@@ -10284,12 +10482,8 @@ mod tests {
         // a loopback-looking userinfo but the HOST is attacker.example; the
         // Token header must never travel over that connection (let alone in
         // plaintext).
-        assert!(
-            deepgram_streaming_url("ws://127.0.0.1:80@attacker.example/listen", &[]).is_err()
-        );
-        assert!(
-            deepgram_streaming_url("http://localhost@attacker.example/listen", &[]).is_err()
-        );
+        assert!(deepgram_streaming_url("ws://127.0.0.1:80@attacker.example/listen", &[]).is_err());
+        assert!(deepgram_streaming_url("http://localhost@attacker.example/listen", &[]).is_err());
         assert!(deepgram_streaming_url("wss://user@api.deepgram.com/v1/listen", &[]).is_err());
         assert!(deepgram_streaming_url("ws:///listen", &[]).is_err());
     }
@@ -10348,17 +10542,18 @@ mod tests {
         assert!(ingest_deepgram_message(&transcript, r#"{"type":"Results"}"#).is_err());
         // A finalized Results frame whose transcript text is missing: skipping
         // it would silently truncate the Transcript.
-        assert!(ingest_deepgram_message(
-            &transcript,
-            r#"{"type":"Results","is_final":true,"speech_final":true}"#
-        )
-        .is_err());
+        assert!(
+            ingest_deepgram_message(
+                &transcript,
+                r#"{"type":"Results","is_final":true,"speech_final":true}"#
+            )
+            .is_err()
+        );
         // Unknown message types stay tolerated (server-side schema additions),
         // and interim shape drift is UI-only.
         assert!(ingest_deepgram_message(&transcript, r#"{"type":"SpeechStarted"}"#).is_ok());
         assert!(
-            ingest_deepgram_message(&transcript, r#"{"type":"Results","is_final":false}"#)
-                .is_ok()
+            ingest_deepgram_message(&transcript, r#"{"type":"Results","is_final":false}"#).is_ok()
         );
         assert_eq!(
             transcript.lock().unwrap().text(),
@@ -10715,7 +10910,10 @@ mod tests {
             .await
             .expect("live verification should complete")
             .expect_err("a stale cached action must fail closed");
-        assert_eq!(error.diagnostic(), "verified Paste Action is no longer active");
+        assert_eq!(
+            error.diagnostic(),
+            "verified Paste Action is no longer active"
+        );
     }
 
     #[tokio::test]
@@ -10757,7 +10955,9 @@ mod tests {
             .expect("live verification must complete on the first invoke")
             .expect("invoke task should finish")
             .expect("the first invocation must paste once live verification matches");
-        releaser.join().expect("verifier release thread should finish");
+        releaser
+            .join()
+            .expect("verifier release thread should finish");
         assert_eq!(events.lock().unwrap().as_slice(), ["shortcut:SUPER + V"]);
     }
 
@@ -10838,7 +11038,10 @@ mod tests {
             resolve_recording_maximum(Some("5000".to_owned())).deadline,
             Duration::from_millis(5000)
         );
-        assert_eq!(resolve_recording_maximum(Some("0".to_owned())).deadline, default);
+        assert_eq!(
+            resolve_recording_maximum(Some("0".to_owned())).deadline,
+            default
+        );
         assert_eq!(
             resolve_recording_maximum(Some("nonsense".to_owned())).deadline,
             default
@@ -10854,7 +11057,8 @@ mod tests {
             "the configured maximum must set the per-Recording Deadline"
         );
         assert_eq!(
-            configured.pcm_byte_cap, 16_000 * 2 * 5,
+            configured.pcm_byte_cap,
+            16_000 * 2 * 5,
             "the same configured maximum must set the per-Recording PCM byte cap"
         );
     }
@@ -10894,11 +11098,23 @@ mod tests {
         );
         // Nothing is said when nothing was ignored — including at exactly the
         // ceiling, which is honoured in full.
-        assert_eq!(recording_deadline_override_notice(Some("600000".to_owned())), None);
-        assert_eq!(recording_deadline_override_notice(Some("5000".to_owned())), None);
+        assert_eq!(
+            recording_deadline_override_notice(Some("600000".to_owned())),
+            None
+        );
+        assert_eq!(
+            recording_deadline_override_notice(Some("5000".to_owned())),
+            None
+        );
         assert_eq!(recording_deadline_override_notice(None), None);
-        assert_eq!(recording_deadline_override_notice(Some("not-a-number".to_owned())), None);
-        assert_eq!(recording_deadline_override_notice(Some("0".to_owned())), None);
+        assert_eq!(
+            recording_deadline_override_notice(Some("not-a-number".to_owned())),
+            None
+        );
+        assert_eq!(
+            recording_deadline_override_notice(Some("0".to_owned())),
+            None
+        );
     }
 
     #[test]
@@ -10944,7 +11160,8 @@ mod tests {
             Some("qwen/qwen3.6-27b")
         );
         assert_eq!(
-            body.get("reasoning_effort").and_then(|value| value.as_str()),
+            body.get("reasoning_effort")
+                .and_then(|value| value.as_str()),
             Some("none")
         );
         assert_eq!(
@@ -10957,8 +11174,14 @@ mod tests {
     fn intent_reconstruction_body_uses_json_object_mode_with_both_sources_and_dictionary() {
         let body = groq_intent_reconstruction_request_body(&IntentReconstructionRequest {
             sources: vec![
-                SourceTranscript { provider: Provider::Deepgram, text: "sanitized one".to_owned() },
-                SourceTranscript { provider: Provider::Groq, text: "sanitized two".to_owned() },
+                SourceTranscript {
+                    provider: Provider::Deepgram,
+                    text: "sanitized one".to_owned(),
+                },
+                SourceTranscript {
+                    provider: Provider::Groq,
+                    text: "sanitized two".to_owned(),
+                },
             ],
             dictionary_terms: vec!["Voisu".to_owned()],
         });
@@ -10968,13 +11191,14 @@ mod tests {
             body["response_format"],
             serde_json::json!({"type": "json_object"})
         );
-        assert!(body["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("exactly this shape: {\"wording\":\"...\"}"));
-        let user: serde_json::Value = serde_json::from_str(
-            body["messages"][1]["content"].as_str().unwrap(),
-        ).unwrap();
+        assert!(
+            body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("exactly this shape: {\"wording\":\"...\"}")
+        );
+        let user: serde_json::Value =
+            serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
         assert_eq!(user["sources"].as_array().unwrap().len(), 2);
         assert_eq!(user["dictionary"], serde_json::json!(["Voisu"]));
     }
@@ -10990,7 +11214,8 @@ mod tests {
             "configured-model",
         ];
         for model in overrides {
-            let body = groq_reconciliation_request_body(model, "Reconcile these Source Transcripts.");
+            let body =
+                groq_reconciliation_request_body(model, "Reconcile these Source Transcripts.");
             assert_eq!(
                 body.get("model").and_then(|value| value.as_str()),
                 Some(model),
@@ -11022,10 +11247,7 @@ mod tests {
 
     impl CredentialEnvGuard {
         fn capture(keys: &[&'static str]) -> Self {
-            let keys = keys
-                .iter()
-                .map(|k| (*k, std::env::var_os(k)))
-                .collect();
+            let keys = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
             Self { keys }
         }
 
@@ -11136,14 +11358,25 @@ mod tests {
         install_fake_secret_tool(tools.path(), "#!/bin/sh\nsleep 30\n");
         let reaper = ProviderReaper::new();
         let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
-            GroqReconciliationModel { reaper: Some(reaper.clone()) },
+            GroqReconciliationModel {
+                reaper: Some(reaper.clone()),
+            },
             Duration::from_millis(30),
             Vec::new(),
         );
-        let prepared = pipeline.prepare(vec![
-            SourceTranscript { provider: Provider::Deepgram, text: "Book the room Tuesday afternoon.".to_owned() },
-            SourceTranscript { provider: Provider::Groq, text: "Schedule the review Wednesday morning.".to_owned() },
-        ]).await.unwrap();
+        let prepared = pipeline
+            .prepare(vec![
+                SourceTranscript {
+                    provider: Provider::Deepgram,
+                    text: "Book the room Tuesday afternoon.".to_owned(),
+                },
+                SourceTranscript {
+                    provider: Provider::Groq,
+                    text: "Schedule the review Wednesday morning.".to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
         let PreparedTranscriptDecision::Reconstruct(attempt) = prepared else {
             panic!("material disagreement must reconstruct");
         };
@@ -11334,10 +11567,7 @@ mod tests {
         CredentialEnvGuard::set("VOISU_TEST_KEYRING_RETRY_MS", "0");
 
         let tool_dir = tempfile::tempdir().unwrap();
-        install_fake_secret_tool(
-            tool_dir.path(),
-            "#!/bin/sh\nsleep 30\n",
-        );
+        install_fake_secret_tool(tool_dir.path(), "#!/bin/sh\nsleep 30\n");
 
         let reaper = ProviderReaper::new();
         let lane = reaper.credential_lane().clone();
@@ -11576,11 +11806,8 @@ mod tests {
         // Drive first poll past the secret write + launch, then drop the owner
         // without awaiting terminal — Drop kill-signals but must not deregister.
         let pgid = {
-            let mut owner = CredentialPreparationOwner::new(
-                Arc::clone(&entry),
-                lane.clone(),
-                Provider::Groq,
-            );
+            let mut owner =
+                CredentialPreparationOwner::new(Arc::clone(&entry), lane.clone(), Provider::Groq);
             let pgid = {
                 let poll = owner.poll_outcome();
                 tokio::pin!(poll);
@@ -11627,7 +11854,8 @@ mod tests {
         // After Drop: durable kill must have signalled. Process may be zombie
         // until supervisor wait; must not still be a running sleep.
         assert!(
-            entry.retained_pgid().is_some() || !std::path::Path::new(&format!("/proc/{pgid}")).exists(),
+            entry.retained_pgid().is_some()
+                || !std::path::Path::new(&format!("/proc/{pgid}")).exists(),
             "after Drop, either wait ownership (pgid) remains or OS process is already gone"
         );
         // Drop alone must not claim both-EOF terminal (supervisor finishes EOFs).
@@ -11678,9 +11906,7 @@ mod tests {
         let ready_path = ready.to_string_lossy().into_owned();
         install_fake_secret_tool(
             tool_dir.path(),
-            &format!(
-                "#!/bin/sh\nprintf 'cancel-secret-token\\n'\n: > '{ready_path}'\nsleep 30\n"
-            ),
+            &format!("#!/bin/sh\nprintf 'cancel-secret-token\\n'\n: > '{ready_path}'\nsleep 30\n"),
         );
 
         let reaper = ProviderReaper::new();

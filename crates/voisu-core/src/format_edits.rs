@@ -14,7 +14,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::prompt_rendering::{RenderingPolicy, CLOSED_STRUCTURED_LABELS};
+use crate::prompt_rendering::{CLOSED_STRUCTURED_LABELS, RenderingPolicy};
 use crate::{is_command_shaped, is_text_sha256_fingerprint, text_sha256_fingerprint};
 
 /// Contract id for diagnostics and later pipeline wiring.
@@ -195,7 +195,9 @@ impl FormatEditOutcome {
 
 /// Parse untrusted formatting JSON. Does not apply edits and does not take
 /// Delivery ownership of any model string.
-pub fn parse_format_edit_candidate_json(raw: &[u8]) -> Result<FormatEditCandidate, FormatEditErrorCode> {
+pub fn parse_format_edit_candidate_json(
+    raw: &[u8],
+) -> Result<FormatEditCandidate, FormatEditErrorCode> {
     if raw.len() > MAX_FORMAT_EDIT_RESPONSE_BYTES {
         return Err(FormatEditErrorCode::Oversize);
     }
@@ -392,7 +394,9 @@ fn has_exact_keys(object: &Map<String, Value>, expected: &[&str]) -> bool {
 }
 
 fn as_usize(value: &Value) -> Option<usize> {
-    value.as_u64().and_then(|number| usize::try_from(number).ok())
+    value
+        .as_u64()
+        .and_then(|number| usize::try_from(number).ok())
 }
 
 fn json_shape(value: &Value) -> (usize, usize) {
@@ -427,12 +431,28 @@ const NEGATIONS: &[&str] = &[
 ];
 
 const WEEKDAYS: &[&str] = &[
-    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
 ];
 
 const MONTHS: &[&str] = &[
-    "january", "february", "march", "april", "may", "june", "july", "august", "september",
-    "october", "november", "december",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
 ];
 
 const SECTION_CUES: &[(&[&str], &str)] = &[
@@ -620,7 +640,10 @@ fn structural_headings(text: &str) -> Vec<String> {
 }
 
 fn markdown_atx_heading(line: &str) -> Option<&str> {
-    let hash_count = line.chars().take_while(|&character| character == '#').count();
+    let hash_count = line
+        .chars()
+        .take_while(|&character| character == '#')
+        .count();
     if !(1..=6).contains(&hash_count) {
         return None;
     }
@@ -628,10 +651,7 @@ fn markdown_atx_heading(line: &str) -> Option<&str> {
     if !after_hashes.chars().next().is_some_and(char::is_whitespace) {
         return None;
     }
-    let label = after_hashes
-        .trim()
-        .trim_end_matches('#')
-        .trim_end();
+    let label = after_hashes.trim().trim_end_matches('#').trim_end();
     (!label.is_empty()).then_some(label)
 }
 
@@ -660,12 +680,10 @@ fn is_title_case(value: &str) -> bool {
 }
 
 fn mutates_protected_fact(base: &str, rendered: &str, extra: &[&str]) -> bool {
-    host_protected_facts(base, extra)
-        .into_iter()
-        .any(|fact| {
-            !fact.is_empty()
-                && protected_fact_count(rendered, &fact) < protected_fact_count(base, &fact)
-        })
+    host_protected_facts(base, extra).into_iter().any(|fact| {
+        !fact.is_empty()
+            && protected_fact_count(rendered, &fact) < protected_fact_count(base, &fact)
+    })
 }
 
 fn protected_fact_count(text: &str, fact: &str) -> usize {
@@ -945,10 +963,7 @@ mod tests {
     #[test]
     fn host_applies_structure_edit_and_never_takes_model_prose() {
         let base = "goal ship the rust parser";
-        let raw = candidate_json(
-            base,
-            json!([edit(0, 4, "goal", "Goal:\n", "structure")]),
-        );
+        let raw = candidate_json(base, json!([edit(0, 4, "goal", "Goal:\n", "structure")]));
         let parsed = parse_format_edit_candidate_json(&raw).expect("parse");
         assert_eq!(parsed.version, "1");
         assert_eq!(parsed.edits.len(), 1);
@@ -1091,7 +1106,10 @@ mod tests {
             base,
             &candidate_json(base, json!([edit(0, 99, "goal", "Goal", "casing")])),
         );
-        assert_eq!(out_of_bounds.error, Some(FormatEditErrorCode::SpanOutOfBounds));
+        assert_eq!(
+            out_of_bounds.error,
+            Some(FormatEditErrorCode::SpanOutOfBounds)
+        );
 
         let mid_char = "gøal";
         let cut = apply_format_edit_candidate_json(
@@ -1190,7 +1208,10 @@ mod tests {
         let base = "pls ship the rust parser";
         let outcome = apply_format_edit_candidate_json(
             base,
-            &candidate_json(base, json!([edit(0, 3, "pls", "Please", "bounded_wording")])),
+            &candidate_json(
+                base,
+                json!([edit(0, 3, "pls", "Please", "bounded_wording")]),
+            ),
         );
         assert!(outcome.accepted, "{outcome:?}");
         assert_eq!(outcome.rendered, "Please ship the rust parser");
@@ -1211,14 +1232,7 @@ mod tests {
                 "Alicia",
                 "bounded_wording",
             ),
-            (
-                "do not deploy tonight",
-                3,
-                6,
-                "not",
-                "",
-                "bounded_wording",
-            ),
+            ("do not deploy tonight", 3, 6, "not", "", "bounded_wording"),
             (
                 "open https://example.test/a now",
                 5,
@@ -1455,13 +1469,7 @@ mod tests {
                 base,
                 &candidate_json(
                     base,
-                    json!([edit(
-                        base.len(),
-                        base.len(),
-                        "",
-                        heading,
-                        "structure"
-                    )]),
+                    json!([edit(base.len(), base.len(), "", heading, "structure")]),
                 ),
             );
             assert_eq!(

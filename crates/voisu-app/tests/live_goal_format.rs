@@ -8,16 +8,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use voisu_app::dpr_cloud::{load_groq_credential, DprCloudClient, DprCloudErrorClass};
+use voisu_app::dpr_cloud::{DprCloudClient, DprCloudErrorClass, load_groq_credential};
 use voisu_app::dpr_pipeline::{
-    dpr_protected_tokens, dpr_source_context, dpr_transform_and_deliver, DprCloudCapability,
-    DprTransformInput, SystemDprPipelineClock,
+    DprCloudCapability, DprTransformInput, SystemDprPipelineClock, dpr_protected_tokens,
+    dpr_source_context, dpr_transform_and_deliver,
 };
 use voisu_app::system::SecretToolStore;
 use voisu_core::{
-    leftover_admits_format_cloud, organize_local_baseline, route_intent, BoundaryFuture,
-    CompositionDecision, DeliveryAdapter, DeliveryOutcome, IntentObservation, LocalBaselineOptions,
-    Provider, ProviderState, RenderingPolicy, SourceTranscript, Transcript,
+    BoundaryFuture, CompositionDecision, DeliveryAdapter, DeliveryOutcome, IntentObservation,
+    LocalBaselineOptions, Provider, ProviderState, RenderingPolicy, SourceTranscript, Transcript,
+    leftover_admits_format_cloud, organize_local_baseline, route_intent,
 };
 
 const LIVE_GOAL_FORMAT_ENV: &str = "VOISU_LIVE_GOAL_FORMAT";
@@ -262,10 +262,7 @@ async fn live_goal_format_sends_leftover_notes_through_production_path() {
         );
         assert!(!has_hallucinated_outro(transcript), "hallucinated outro");
         assert!(!has_prompt_junk(transcript), "prompt junk at line start");
-        assert!(
-            completion.delivery.is_ok(),
-            "Delivery adapter must succeed"
-        );
+        assert!(completion.delivery.is_ok(), "Delivery adapter must succeed");
 
         eprintln!(
             "live_goal_format cloud_attempted={} compose_decision={:?} cloud_error={}",

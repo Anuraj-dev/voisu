@@ -291,15 +291,15 @@ mod tests {
             .max_by_key(|(_, level)| *level)
             .unwrap()
             .0;
-        assert!((9..=12).contains(&peak), "unexpected peak band {peak}: {frame:?}");
+        assert!(
+            (9..=12).contains(&peak),
+            "unexpected peak band {peak}: {frame:?}"
+        );
     }
 
     #[test]
     fn red_silence_is_floor_and_sustained_saturation_reads_near_ceiling() {
-        assert_eq!(
-            bands(&[0; 320], &mut BandState::default()),
-            [0; BAND_COUNT]
-        );
+        assert_eq!(bands(&[0; 320], &mut BandState::default()), [0; BAND_COUNT]);
         // Band-limited saturation: a sustained full-scale tone drives ITS
         // band close to the ceiling while distant bands stay far below it.
         let mut state = BandState::default();
@@ -311,7 +311,10 @@ mod tests {
             .collect::<Vec<_>>();
         let frame = bands(&full_scale_tone, &mut state);
         let peak = *frame.iter().max().unwrap();
-        assert!(peak >= 220, "full-scale tone should read near ceiling: {frame:?}");
+        assert!(
+            peak >= 220,
+            "full-scale tone should read near ceiling: {frame:?}"
+        );
         // The u8 scale is dB-mapped (60 dB over 255 steps), so "band-limited"
         // means the far skirt sits at least ~19 dB (80 steps) below the
         // driven band, not half its raw value.
@@ -327,7 +330,11 @@ mod tests {
                 lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 // High LCG bits are the well-mixed ones; the low bit merely
                 // alternates, which would be a pure Nyquist tone, not noise.
-                if (lcg >> 16) & 1 == 0 { i16::MAX } else { i16::MIN }
+                if (lcg >> 16) & 1 == 0 {
+                    i16::MAX
+                } else {
+                    i16::MIN
+                }
             })
             .collect::<Vec<_>>();
         let broadband = bands(&clipped_noise, &mut BandState::default());
@@ -357,7 +364,10 @@ mod tests {
         );
         let cursor = retained[4].seq;
         assert_eq!(
-            ring.after(cursor).iter().map(|frame| frame.seq).collect::<Vec<_>>(),
+            ring.after(cursor)
+                .iter()
+                .map(|frame| frame.seq)
+                .collect::<Vec<_>>(),
             vec![8, 9, 10]
         );
         assert!(ring.after(10).is_empty());
@@ -374,14 +384,21 @@ mod tests {
         let mut pcm = vec![0_i16; 320];
         pcm[160] = i16::MAX;
         let frame = bands(&pcm, &mut state);
-        assert_ne!(frame, [u8::MAX; BAND_COUNT], "clipping short-circuited the bank");
+        assert_ne!(
+            frame,
+            [u8::MAX; BAND_COUNT],
+            "clipping short-circuited the bank"
+        );
         assert!(
             frame.iter().all(|level| *level < 200),
             "an impulse carries almost no energy per band: {frame:?}"
         );
         let decayed = bands(&vec![0_i16; 320], &mut state);
         assert!(
-            decayed.iter().zip(&frame).all(|(after, before)| after <= before),
+            decayed
+                .iter()
+                .zip(&frame)
+                .all(|(after, before)| after <= before),
             "the bank state did not advance through the clipped frame: {frame:?} -> {decayed:?}"
         );
     }
@@ -420,7 +437,10 @@ mod tests {
         for filter in &state.filters {
             assert!(filter.z1.is_finite() && filter.z2.is_finite() && filter.envelope.is_finite());
         }
-        assert!(frame[7] > 0, "the poisoned filter never recovered: {frame:?}");
+        assert!(
+            frame[7] > 0,
+            "the poisoned filter never recovered: {frame:?}"
+        );
     }
 
     #[test]
@@ -459,13 +479,19 @@ mod tests {
         let mut empty_returns = 0;
         for byte in &bytes {
             let decoded = trickled.decode(std::slice::from_ref(byte));
-            assert!(decoded.len() <= 1, "one byte can complete at most one sample");
+            assert!(
+                decoded.len() <= 1,
+                "one byte can complete at most one sample"
+            );
             if decoded.is_empty() {
                 empty_returns += 1;
             }
             samples.extend(decoded);
         }
-        assert_eq!(samples, expected, "byte-at-a-time decode must match whole-buffer decode");
+        assert_eq!(
+            samples, expected,
+            "byte-at-a-time decode must match whole-buffer decode"
+        );
         // Half a sample decodes nothing: the caller must therefore have
         // nothing to push, so no all-zero frame can advance the ring's
         // sequence and evict real peaks under repeated tiny reads.

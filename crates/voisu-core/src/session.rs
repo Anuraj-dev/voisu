@@ -73,7 +73,10 @@ pub fn resolve_session(
     } else {
         SessionKind::Unknown
     };
-    SessionResolution { session, xwayland_fallback }
+    SessionResolution {
+        session,
+        xwayland_fallback,
+    }
 }
 
 /// A variable counts as present only when it is set to a non-empty value.
@@ -269,7 +272,10 @@ mod tests {
 
     #[test]
     fn clipboard_argv_is_stable_per_tool() {
-        assert_eq!(ClipboardTool::WlClipboard.write_command(), ("wl-copy", &["--"][..]));
+        assert_eq!(
+            ClipboardTool::WlClipboard.write_command(),
+            ("wl-copy", &["--"][..])
+        );
         assert_eq!(
             ClipboardTool::WlClipboard.read_command(),
             ("wl-paste", &["--no-newline"][..])

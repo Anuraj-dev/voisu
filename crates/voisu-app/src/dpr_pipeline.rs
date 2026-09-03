@@ -9,18 +9,17 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use voisu_core::{
-    apply_format_edits_with, compose_structured_candidate, leftover_admits_format_cloud,
-    organize_local_baseline, route_intent, sanitize_source_transcripts, text_sha256_fingerprint,
     CloudOutcome, CloudRequest, ComposeInput, ComposeSource, CompositionDecision, Credential,
     DeliveryAdapter, DeliveryFlags, DeliveryOutcome, DprDiagnostic, FormatEditSafety,
-    IntentObservation, LocalBaselineOptions, ProcessHint, ProviderState, RenderingPolicy,
-    RoutingDecision, SourceSelection, SourceTranscript, SttProvider, SurfaceHint, TimingHint,
-    Transcript, TranscriptSelection, Provider, MAX_COMPOSE_FIELD_UTF8_BYTES,
+    IntentObservation, LocalBaselineOptions, MAX_COMPOSE_FIELD_UTF8_BYTES, ProcessHint, Provider,
+    ProviderState, RenderingPolicy, RoutingDecision, SourceSelection, SourceTranscript,
+    SttProvider, SurfaceHint, TimingHint, Transcript, TranscriptSelection, apply_format_edits_with,
+    compose_structured_candidate, leftover_admits_format_cloud, organize_local_baseline,
+    route_intent, sanitize_source_transcripts, text_sha256_fingerprint,
 };
 
 use crate::dpr_cloud::{
-    DprCloudAttempt, DprCloudClient, DprCloudErrorClass, DprCloudRequest,
-    MAX_DPR_PROTECTED_TOKENS,
+    DprCloudAttempt, DprCloudClient, DprCloudErrorClass, DprCloudRequest, MAX_DPR_PROTECTED_TOKENS,
 };
 
 /// Maximum elapsed time from utterance end to initiating Delivery.
@@ -32,8 +31,7 @@ pub const DPR_FORMAT_PROVIDER_BUDGET: Duration = Duration::from_millis(4_750);
 /// Time reserved for host parsing, validation, composition, and Delivery initiation.
 pub const DPR_FORMAT_HOST_RESERVE: Duration = Duration::from_millis(250);
 
-pub type DprCloudFuture<'a> =
-    Pin<Box<dyn Future<Output = DprCloudAttempt> + Send + 'a>>;
+pub type DprCloudFuture<'a> = Pin<Box<dyn Future<Output = DprCloudAttempt> + Send + 'a>>;
 
 /// One-attempt cloud seam. Production uses [`DprCloudClient`]; tests inject a
 /// counting boundary without networking or wall-clock sleeps.
@@ -179,21 +177,19 @@ pub fn dpr_source_context(
             .all(|source| source.text == available[0].text);
     let punctuation_only_agreement = available.len() > 1
         && !exact_agreement
-        && available
-            .iter()
-            .all(|source| normalized_source_words(&source.text) == normalized_source_words(&available[0].text));
+        && available.iter().all(|source| {
+            normalized_source_words(&source.text) == normalized_source_words(&available[0].text)
+        });
     let other = available
         .iter()
         .find(|source| source.provider != selected_provider)
         .copied();
-    let safe_complementary = if available.len() == 2
-        && !exact_agreement
-        && !punctuation_only_agreement
-    {
-        other.and_then(|other| merge_insertion_only_sources(&selected.text, &other.text))
-    } else {
-        None
-    };
+    let safe_complementary =
+        if available.len() == 2 && !exact_agreement && !punctuation_only_agreement {
+            other.and_then(|other| merge_insertion_only_sources(&selected.text, &other.text))
+        } else {
+            None
+        };
     let protected_disagreement = safe_complementary.is_none()
         && other.is_some_and(|other| {
             protected_atoms_disagree(&selected.text, &other.text, dictionary_terms)
@@ -270,17 +266,14 @@ fn protected_atoms_disagree(left: &str, right: &str, dictionary_terms: &[String]
         .into_iter()
         .filter(|token| !is_closed_negation(token))
         .collect();
-    left_protected
-        .iter()
-        .any(|token| !right.contains(token))
+    left_protected.iter().any(|token| !right.contains(token))
         || right_protected.iter().any(|token| !left.contains(token))
 }
 
 fn is_closed_negation(token: &str) -> bool {
     matches!(
         token.to_ascii_lowercase().as_str(),
-        "no"
-            | "not"
+        "no" | "not"
             | "never"
             | "cannot"
             | "can't"
@@ -328,8 +321,8 @@ fn merge_insertion_only_sources(left: &str, right: &str) -> Option<String> {
         for (left_index, left_token) in left_tokens.iter().enumerate().skip(left_at) {
             for (right_index, right_token) in right_tokens.iter().enumerate().skip(right_at) {
                 if token_anchor_eq(left_token, right_token) {
-                    let distance = left_index.saturating_sub(left_at)
-                        + right_index.saturating_sub(right_at);
+                    let distance =
+                        left_index.saturating_sub(left_at) + right_index.saturating_sub(right_at);
                     if distance < nearest_distance {
                         nearest_distance = distance;
                         next_anchor = Some((left_index, right_index));
@@ -344,7 +337,11 @@ fn merge_insertion_only_sources(left: &str, right: &str) -> Option<String> {
             if !left_gap.is_empty() && !right_gap.is_empty() {
                 return None;
             }
-            if !left_gap.iter().chain(right_gap).all(|token| safe_complement_token(token)) {
+            if !left_gap
+                .iter()
+                .chain(right_gap)
+                .all(|token| safe_complement_token(token))
+            {
                 return None;
             }
             left_contributed |= !left_gap.is_empty();
@@ -359,7 +356,11 @@ fn merge_insertion_only_sources(left: &str, right: &str) -> Option<String> {
         if !left_gap.is_empty() && !right_gap.is_empty() {
             return None;
         }
-        if !left_gap.iter().chain(right_gap).all(|token| safe_complement_token(token)) {
+        if !left_gap
+            .iter()
+            .chain(right_gap)
+            .all(|token| safe_complement_token(token))
+        {
             return None;
         }
         left_contributed |= !left_gap.is_empty();
@@ -417,8 +418,7 @@ pub fn dpr_protected_tokens(selected_source: &str, dictionary_terms: &[String]) 
         let lower = token.to_ascii_lowercase();
         let negation = matches!(
             lower.as_str(),
-            "no"
-                | "not"
+            "no" | "not"
                 | "never"
                 | "cannot"
                 | "can't"
@@ -559,8 +559,8 @@ pub async fn dpr_transform_and_deliver(
     let mut cloud_error = None;
     let mut candidate = None;
     let mut format_rendered = None;
-    let skip_format_cloud = input.small_edit_contract
-        && !leftover_admits_format_cloud(baseline.rendered());
+    let skip_format_cloud =
+        input.small_edit_contract && !leftover_admits_format_cloud(baseline.rendered());
     let cloud_outcome = if !input.english_eligible
         || routing.cloud_request == CloudRequest::NotAllowed
         || skip_format_cloud
@@ -659,11 +659,8 @@ pub async fn dpr_transform_and_deliver(
                                             },
                                         );
                                         if organized_protected.iter().any(|token| {
-                                            let core = token.trim_end_matches([
-                                                '.', '!', '?', ',',
-                                            ]);
-                                            !core.is_empty()
-                                                && !reapplied.rendered().contains(core)
+                                            let core = token.trim_end_matches(['.', '!', '?', ',']);
+                                            !core.is_empty() && !reapplied.rendered().contains(core)
                                         }) {
                                             cloud_error = Some(DprCloudErrorClass::CandidateSchema);
                                             CloudOutcome::SchemaFailure
@@ -740,8 +737,7 @@ pub async fn dpr_transform_and_deliver(
                 cloud_outcome,
                 candidate: candidate.as_ref(),
             });
-            if cloud_outcome == CloudOutcome::Succeeded
-                && compose_finished_at >= delivery_deadline
+            if cloud_outcome == CloudOutcome::Succeeded && compose_finished_at >= delivery_deadline
             {
                 cloud_error = Some(DprCloudErrorClass::DeadlineExceeded);
                 composed = compose_structured_candidate(&ComposeInput {
@@ -814,9 +810,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use voisu_core::{
-        parse_format_edit_candidate_json, parse_structured_candidate_json,
-        text_sha256_fingerprint, BoundaryFuture, DprDiagnosticEventName, DprFeedbackKind,
-        FormatEditCandidate, SttProvider, StructuredCandidate, Transcript,
+        BoundaryFuture, DprDiagnosticEventName, DprFeedbackKind, FormatEditCandidate,
+        StructuredCandidate, SttProvider, Transcript, parse_format_edit_candidate_json,
+        parse_structured_candidate_json, text_sha256_fingerprint,
     };
 
     use super::*;
@@ -957,9 +953,8 @@ mod tests {
                 Ordering::SeqCst,
             );
             let current_ms = self.clock.0.load(Ordering::SeqCst);
-            let deadline_ms = current_ms.saturating_add(
-                u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
-            );
+            let deadline_ms =
+                current_ms.saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX));
             let result = if self.completes_at_ms > deadline_ms {
                 self.clock.0.store(deadline_ms, Ordering::SeqCst);
                 DprCloudAttempt::failure(DprCloudErrorClass::DeadlineExceeded)
@@ -990,23 +985,18 @@ mod tests {
                 Ordering::SeqCst,
             );
             let current_ms = self.clock.0.load(Ordering::SeqCst);
-            let deadline_ms = current_ms.saturating_add(
-                u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
-            );
+            let deadline_ms =
+                current_ms.saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX));
             let result = if self.honor_budget && self.completes_at_ms > deadline_ms {
                 self.clock.0.store(deadline_ms, Ordering::SeqCst);
                 DprCloudAttempt::failure(DprCloudErrorClass::DeadlineExceeded)
             } else {
-                self.clock
-                    .0
-                    .store(self.completes_at_ms, Ordering::SeqCst);
+                self.clock.0.store(self.completes_at_ms, Ordering::SeqCst);
                 match &self.outcome {
                     CannedFormatCloudOutcome::Success(candidate) => {
                         DprCloudAttempt::format_edits(candidate.clone())
                     }
-                    CannedFormatCloudOutcome::Failure(error) => {
-                        DprCloudAttempt::failure(*error)
-                    }
+                    CannedFormatCloudOutcome::Failure(error) => DprCloudAttempt::failure(*error),
                 }
             };
             Box::pin(async move { result })
@@ -1079,7 +1069,10 @@ mod tests {
         assert_eq!(context.sources[1].provider, SttProvider::ProviderB);
         assert_eq!(context.provider_state, ProviderState::SemanticDisagreement);
         assert_eq!(context.source_selection.reason, "configured_primary_rank");
-        assert_eq!(context.transcript_selection, TranscriptSelection::SourceGroq);
+        assert_eq!(
+            context.transcript_selection,
+            TranscriptSelection::SourceGroq
+        );
         assert!(dpr_source_context(&[], &[]).is_none());
     }
 
@@ -1159,8 +1152,7 @@ mod tests {
             },
             SourceTranscript {
                 provider: Provider::Deepgram,
-                text: "Schedule the review for Wednesday morning. Thanks for watching!"
-                    .to_owned(),
+                text: "Schedule the review for Wednesday morning. Thanks for watching!".to_owned(),
             },
         ];
         let context = dpr_source_context(&sources, &[]).expect("stripped context");
@@ -1279,7 +1271,10 @@ mod tests {
 
         assert!(!completion.cloud_attempted);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(rendered.lock().expect("delivery lock").as_slice(), ["Hello from voisu."]);
+        assert_eq!(
+            rendered.lock().expect("delivery lock").as_slice(),
+            ["Hello from voisu."]
+        );
         assert_eq!(completion.rendered, "Hello from voisu.");
         assert_eq!(completion.delivery_flags.state, "unsent");
         assert!(!completion.delivery_flags.auto_send);
@@ -1291,7 +1286,10 @@ mod tests {
             completion.compose_decision,
             CompositionDecision::FallbackBaseline
         );
-        assert_eq!(completion.diagnostic.feedback_kind(), DprFeedbackKind::Silent);
+        assert_eq!(
+            completion.diagnostic.feedback_kind(),
+            DprFeedbackKind::Silent
+        );
         assert_eq!(
             diagnostic_event_names(&completion),
             vec![
@@ -1374,12 +1372,18 @@ mod tests {
         assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
         assert_eq!(remaining_ms.load(Ordering::SeqCst), 1_400);
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(delivered.lock().expect("delivery lock").as_slice(), ["Hello from voisu!"]);
+        assert_eq!(
+            delivered.lock().expect("delivery lock").as_slice(),
+            ["Hello from voisu!"]
+        );
         assert_eq!(completion.rendered, "Hello from voisu!");
         assert_eq!(completion.compose_decision, CompositionDecision::Accept);
         assert_eq!(completion.delivery_flags, DeliveryFlags::dpr_default());
         assert_eq!(completion.cloud_error, None);
-        assert_eq!(completion.diagnostic.feedback_kind(), DprFeedbackKind::Silent);
+        assert_eq!(
+            completion.diagnostic.feedback_kind(),
+            DprFeedbackKind::Silent
+        );
         assert_eq!(
             diagnostic_event_names(&completion),
             vec![
@@ -1465,7 +1469,10 @@ mod tests {
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
         assert_eq!(delivery_at_ms.load(Ordering::SeqCst), 1_500);
         assert_eq!(completion.rendered, "Hello from voisu.");
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
         assert_eq!(
             completion.cloud_error,
             Some(DprCloudErrorClass::DeadlineExceeded)
@@ -1515,11 +1522,7 @@ mod tests {
             selected_provider: SttProvider::ProviderA,
             reason: "configured_primary_rank".to_owned(),
         };
-        let mut stale = accepted_candidate(
-            source,
-            "Hello from voisu!",
-            "configured_primary_rank",
-        );
+        let mut stale = accepted_candidate(source, "Hello from voisu!", "configured_primary_rank");
         stale.base_fingerprint = format!("sha256:{}", "0".repeat(64));
         let clock = ControlledClock::new(0);
         let cloud_calls = Arc::new(AtomicUsize::new(0));
@@ -1558,7 +1561,10 @@ mod tests {
         assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
         assert_eq!(completion.rendered, "Hello from voisu.");
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
         assert_eq!(completion.cloud_error, None);
         assert_eq!(completion.delivery_flags, DeliveryFlags::dpr_default());
         assert_eq!(
@@ -1606,11 +1612,7 @@ mod tests {
         let cloud_calls = Arc::new(AtomicUsize::new(0));
         let cloud = ImmediateCandidateCloud {
             calls: Arc::clone(&cloud_calls),
-            candidate: accepted_candidate(
-                source,
-                "Hello from voisu!",
-                "configured_primary_rank",
-            ),
+            candidate: accepted_candidate(source, "Hello from voisu!", "configured_primary_rank"),
         };
         let credential = Credential::new("controlled-secret".to_owned()).expect("credential");
         let delivery_calls = Arc::new(AtomicUsize::new(0));
@@ -1646,9 +1648,15 @@ mod tests {
 
         assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(delivered.lock().expect("delivery lock").as_slice(), ["Hello from voisu."]);
+        assert_eq!(
+            delivered.lock().expect("delivery lock").as_slice(),
+            ["Hello from voisu."]
+        );
         assert_eq!(completion.rendered, "Hello from voisu.");
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
         assert_eq!(
             completion.cloud_error,
             Some(DprCloudErrorClass::DeadlineExceeded)
@@ -1912,7 +1920,10 @@ mod tests {
         assert_eq!(completion.routing.cloud_request, CloudRequest::Required);
         assert!(!completion.cloud_attempted);
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
         assert_eq!(
             completion.cloud_error,
             Some(DprCloudErrorClass::CredentialUnavailable)
@@ -1939,16 +1950,21 @@ mod tests {
                 u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
                 Ordering::SeqCst,
             );
-            *self
-                .saw_small_edit_contract
-                .lock()
-                .expect("flag lock") = Some(request.small_edit_contract);
+            *self.saw_small_edit_contract.lock().expect("flag lock") =
+                Some(request.small_edit_contract);
             let candidate = self.candidate.clone();
             Box::pin(async move { DprCloudAttempt::format_edits(candidate) })
         }
     }
 
-    fn format_edit_candidate(source: &str, start: usize, end: usize, before: &str, after: &str, kind: &str) -> FormatEditCandidate {
+    fn format_edit_candidate(
+        source: &str,
+        start: usize,
+        end: usize,
+        before: &str,
+        after: &str,
+        kind: &str,
+    ) -> FormatEditCandidate {
         let raw = serde_json::json!({
             "version": "1",
             "base_fingerprint": text_sha256_fingerprint(source),
@@ -2191,7 +2207,10 @@ mod tests {
         assert_eq!(cloud_calls.load(Ordering::SeqCst), 0);
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
         assert_eq!(completion.rendered, baseline.rendered());
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
         assert_eq!(
             completion.cloud_error,
             Some(DprCloudErrorClass::DeadlineExceeded)
@@ -2211,7 +2230,12 @@ mod tests {
             completes_at_ms: 4_751,
             honor_budget: true,
             outcome: CannedFormatCloudOutcome::Success(format_edit_candidate(
-                source, 0, 4, "goal", "Goal:\n", "structure",
+                source,
+                0,
+                4,
+                "goal",
+                "Goal:\n",
+                "structure",
             )),
         };
         let delivery_calls = Arc::new(AtomicUsize::new(0));
@@ -2249,7 +2273,12 @@ mod tests {
             completes_at_ms: 5_001,
             honor_budget: false,
             outcome: CannedFormatCloudOutcome::Success(format_edit_candidate(
-                source, 0, 4, "goal", "Goal:\n", "structure",
+                source,
+                0,
+                4,
+                "goal",
+                "Goal:\n",
+                "structure",
             )),
         };
         let delivery_calls = Arc::new(AtomicUsize::new(0));
@@ -2268,7 +2297,10 @@ mod tests {
             ["Goal ship the rust parser."]
         );
         assert_eq!(completion.rendered, "Goal ship the rust parser.");
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
         assert_eq!(
             completion.cloud_error,
             Some(DprCloudErrorClass::DeadlineExceeded)
@@ -2287,7 +2319,12 @@ mod tests {
             completes_at_ms: 2_000,
             honor_budget: true,
             outcome: CannedFormatCloudOutcome::Success(format_edit_candidate(
-                source, 5, 8, "pls", "Please", "bounded_wording",
+                source,
+                5,
+                8,
+                "pls",
+                "Please",
+                "bounded_wording",
             )),
         };
         let delivery_calls = Arc::new(AtomicUsize::new(0));
@@ -2374,7 +2411,10 @@ mod tests {
 
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
         assert_eq!(completion.rendered, "Goal ship the rust parser.");
-        assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::RateLimited));
+        assert_eq!(
+            completion.cloud_error,
+            Some(DprCloudErrorClass::RateLimited)
+        );
     }
 
     #[tokio::test]
@@ -2440,8 +2480,14 @@ mod tests {
 
         assert_eq!(completion.rendered, baseline.rendered());
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
-        assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::CandidateSchema));
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
+        assert_eq!(
+            completion.cloud_error,
+            Some(DprCloudErrorClass::CandidateSchema)
+        );
         assert_eq!(completion.delivery_flags, DeliveryFlags::dpr_default());
     }
 
@@ -2499,7 +2545,10 @@ mod tests {
 
         assert_eq!(completion.rendered, baseline.rendered());
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
         assert_eq!(
             *cloud.saw_small_edit_contract.lock().expect("flag"),
             Some(false)
@@ -2630,8 +2679,14 @@ mod tests {
 
         assert_eq!(completion.rendered, baseline.rendered());
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
-        assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::CandidateSchema));
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
+        assert_eq!(
+            completion.cloud_error,
+            Some(DprCloudErrorClass::CandidateSchema)
+        );
     }
 
     async fn deliver_local_spoken_marks(source: &str) -> DprTransformCompletion {
@@ -2678,7 +2733,10 @@ mod tests {
         assert_eq!(completion.rendered, "cargo test --workspace");
         assert!(!completion.cloud_attempted);
         assert_eq!(completion.routing.cloud_request, CloudRequest::NotAllowed);
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
     }
 
     #[tokio::test]
@@ -2716,7 +2774,10 @@ mod tests {
         );
         assert!(!completion.rendered.contains("Goal:"));
         assert!(!completion.cloud_attempted);
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
     }
 
     #[tokio::test]
@@ -2730,7 +2791,10 @@ mod tests {
             "1. Do the deployment\n2. Figure out the env variable\n3. Report to me"
         );
         assert!(!completion.cloud_attempted);
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
     }
 
     struct ReadyFormatPath {
@@ -2823,8 +2887,9 @@ mod tests {
             run.completion.compose_decision,
             CompositionDecision::FallbackBaseline
         );
-        assert!(diagnostic_event_names(&run.completion)
-            .contains(&DprDiagnosticEventName::CloudSkipped));
+        assert!(
+            diagnostic_event_names(&run.completion).contains(&DprDiagnosticEventName::CloudSkipped)
+        );
         assert!(
             !diagnostic_event_names(&run.completion)
                 .contains(&DprDiagnosticEventName::CloudRequestStarted)
@@ -2964,8 +3029,14 @@ mod tests {
         assert_eq!(completion.rendered, "Goal https://example.test/a.");
         assert!(!completion.rendered.contains("evil"));
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
-        assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::CandidateSchema));
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
+        assert_eq!(
+            completion.cloud_error,
+            Some(DprCloudErrorClass::CandidateSchema)
+        );
     }
 
     #[tokio::test]
@@ -3029,8 +3100,14 @@ mod tests {
 
         assert_eq!(completion.rendered, "goal cargo test --workspace");
         assert!(!completion.rendered.contains("evil"));
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
-        assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::CandidateSchema));
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
+        assert_eq!(
+            completion.cloud_error,
+            Some(DprCloudErrorClass::CandidateSchema)
+        );
     }
 
     #[tokio::test]
@@ -3052,7 +3129,14 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
             saw_small_edit_contract: Arc::new(Mutex::new(None)),
             remaining_ms: Arc::new(AtomicU64::new(u64::MAX)),
-            candidate: format_edit_candidate(source, look_start, look_start + 4, "look", "Look", "casing"),
+            candidate: format_edit_candidate(
+                source,
+                look_start,
+                look_start + 4,
+                "look",
+                "Look",
+                "casing",
+            ),
         };
         let mut delivery = RecordingDelivery {
             calls: Arc::new(AtomicUsize::new(0)),
@@ -3157,7 +3241,13 @@ mod tests {
 
         assert_eq!(completion.rendered, "goal cargo test --workspace");
         assert!(!completion.rendered.contains("evil"));
-        assert_eq!(completion.compose_decision, CompositionDecision::FallbackBaseline);
-        assert_eq!(completion.cloud_error, Some(DprCloudErrorClass::CandidateSchema));
+        assert_eq!(
+            completion.compose_decision,
+            CompositionDecision::FallbackBaseline
+        );
+        assert_eq!(
+            completion.cloud_error,
+            Some(DprCloudErrorClass::CandidateSchema)
+        );
     }
 }

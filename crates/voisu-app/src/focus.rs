@@ -98,13 +98,7 @@ struct KwinFocusUpdates {
 }
 
 impl KwinFocusUpdates {
-    fn apply_update(
-        &self,
-        sender: Option<&str>,
-        stable_id: &str,
-        process_id: &str,
-        app_id: &str,
-    ) {
+    fn apply_update(&self, sender: Option<&str>, stable_id: &str, process_id: &str, app_id: &str) {
         if sender != Some(self.expected_owner.as_str()) {
             return;
         }
@@ -300,13 +294,10 @@ async fn initialize_kwin_probe(runtime_dir: &Path) -> Option<KwinFocusProbe> {
         if script_id < 0 {
             return None;
         }
-        timeout(
-            FOCUS_DBUS_DEADLINE,
-            scripting.call_method("start", &()),
-        )
-        .await
-        .ok()?
-        .ok()?;
+        timeout(FOCUS_DBUS_DEADLINE, scripting.call_method("start", &()))
+            .await
+            .ok()?
+            .ok()?;
 
         Some(KwinFocusProbe {
             connection,

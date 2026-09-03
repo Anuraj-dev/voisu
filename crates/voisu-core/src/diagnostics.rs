@@ -167,8 +167,7 @@ pub fn is_text_sha256_fingerprint(value: &str) -> bool {
     let Some(hex) = value.strip_prefix("sha256:") else {
         return false;
     };
-    hex.bytes()
-        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// When `value` is not exact `sha256:` + 64 lowercase hex, replaces it with a
@@ -533,7 +532,10 @@ impl SmartWritingDiagnostic {
                 MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES,
             ),
             validated_before_sha256: text_sha256_fingerprint(validated),
-            rendered_after: clamp_utf8_bytes(rendered, MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES),
+            rendered_after: clamp_utf8_bytes(
+                rendered,
+                MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES,
+            ),
             rendered_after_sha256: text_sha256_fingerprint(rendered),
             outcome,
             edits: Vec::new(),
@@ -609,14 +611,8 @@ impl SmartWritingDiagnostic {
         );
         // Validate fingerprints after text clamps so invalid values regenerate
         // from the bounded stored text (unclamped source is unavailable here).
-        sanitize_text_sha256_fingerprint(
-            &mut self.validated_before_sha256,
-            &self.validated_before,
-        );
-        sanitize_text_sha256_fingerprint(
-            &mut self.rendered_after_sha256,
-            &self.rendered_after,
-        );
+        sanitize_text_sha256_fingerprint(&mut self.validated_before_sha256, &self.validated_before);
+        sanitize_text_sha256_fingerprint(&mut self.rendered_after_sha256, &self.rendered_after);
         if let Some(model_id) = self.model_id.take() {
             let clamped = clamp_utf8_bytes(&model_id, MAX_MODEL_ID_UTF8_BYTES);
             self.model_id = if clamped.is_empty() {
@@ -849,14 +845,22 @@ pub struct PruneOutcome {
 }
 
 fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
-    std::env::var(name).ok().and_then(|value| value.parse().ok())
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
 }
 
 /// True when an environment variable name denotes a secret whose value must
 /// never appear in a diagnostic export, under any key.
 pub fn is_secret_env_key(key: &str) -> bool {
     const MARKERS: [&str; 7] = [
-        "API_KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "AUTHORIZATION", "CREDENTIAL",
+        "API_KEY",
+        "APIKEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "AUTHORIZATION",
+        "CREDENTIAL",
     ];
     let upper = key.to_ascii_uppercase();
     MARKERS.iter().any(|marker| upper.contains(marker))
@@ -938,9 +942,9 @@ fn is_valid_authority_host(host: &str) -> bool {
 
 fn is_dns_safe_name(name: &str) -> bool {
     !name.is_empty()
-        && name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '.')
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '.'
+        })
 }
 
 fn is_valid_port(port: &str) -> bool {
@@ -1111,15 +1115,15 @@ pub fn export_record(
     if let Some(dpr) = record.dpr.as_mut() {
         #[cfg(feature = "dpr-eval-late-retain")]
         if let Some(late) = dpr.late_evaluation.as_mut() {
-            late.candidate_text_clamped =
-                scrub_free_text(&late.candidate_text_clamped, &secrets);
+            late.candidate_text_clamped = scrub_free_text(&late.candidate_text_clamped, &secrets);
         }
         dpr.normalize();
     }
     if let Some(intent) = record.intent_reconstruction.as_mut() {
-        intent.candidate = intent.candidate.take().map(|candidate| {
-            scrub_free_text(&candidate, &secrets)
-        });
+        intent.candidate = intent
+            .candidate
+            .take()
+            .map(|candidate| scrub_free_text(&candidate, &secrets));
         intent.normalize();
     }
     DiagnosticExport {
@@ -1210,7 +1214,9 @@ impl DiagnosticStore {
     }
 
     fn lock_store(&self) -> MutexGuard<'_, ()> {
-        self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn load_raw(&self) -> io::Result<Vec<DiagnosticRecord>> {
@@ -1726,7 +1732,10 @@ mod tests {
 
         let error = store.history().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "diagnostics history is not a regular file");
+        assert_eq!(
+            error.to_string(),
+            "diagnostics history is not a regular file"
+        );
     }
 
     #[test]
@@ -1757,7 +1766,10 @@ mod tests {
             .record(DiagnosticRecord::new("must-not-rewrite".to_owned(), 2))
             .unwrap_err();
         assert_eq!(record_error.kind(), io::ErrorKind::InvalidData);
-        assert!(history.is_dir(), "failed cleanup must not rename over history");
+        assert!(
+            history.is_dir(),
+            "failed cleanup must not rename over history"
+        );
         assert_eq!(
             fs::read(history.join("retained-marker")).unwrap(),
             b"must survive"
@@ -1816,18 +1828,18 @@ mod tests {
 
         store.sync_directory_best_effort("test");
         assert_eq!(store.directory_sync_attempts.load(Ordering::Relaxed), 1);
-        assert!(moved.is_dir(), "a failed best-effort sync changes no durable data");
+        assert!(
+            moved.is_dir(),
+            "a failed best-effort sync changes no durable data"
+        );
     }
 
     #[test]
     fn diagnostic_store_recovers_a_poisoned_serialization_lock() {
         let dir = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(
-            DiagnosticStore::open(
-                dir.path().join("diagnostics"),
-                RetentionPolicy::default(),
-            )
-            .unwrap(),
+            DiagnosticStore::open(dir.path().join("diagnostics"), RetentionPolicy::default())
+                .unwrap(),
         );
         let poisoning_store = std::sync::Arc::clone(&store);
         let poisoned = std::thread::spawn(move || {

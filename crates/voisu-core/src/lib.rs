@@ -6,113 +6,112 @@ use std::future::Future;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 mod session;
 pub use session::{
-    clipboard_candidates, install_instruction, resolve_session, ClipboardTool, PackageManager,
-    SessionKind, SessionResolution, PACKAGE_MANAGERS,
+    ClipboardTool, PACKAGE_MANAGERS, PackageManager, SessionKind, SessionResolution,
+    clipboard_candidates, install_instruction, resolve_session,
 };
 
 mod wav;
-pub use wav::{scan_wav_pcm, WavScan};
+pub use wav::{WavScan, scan_wav_pcm};
 
 mod diagnostics;
 pub use diagnostics::{
-    clamp_utf8_bytes, correlation_id, export_record, is_secret_env_key,
-    is_text_sha256_fingerprint, redacted_environment, replay_capture, sanitize_url,
-    scrub_embedded_urls, scrub_secret_values, text_sha256_fingerprint, unix_millis_now,
-    DebugAudioRecord, DiagnosticExport, DiagnosticRecord, DiagnosticStore,
-    EnglishEligibilityOutcome, IntentReconstructionDiagnostic,
-    IntentReconstructionEligibility, IntentReconstructionOutcome, PruneOutcome, ReplayOutcome, RetentionPolicy,
-    SmartWritingDiagnostic, SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome,
-    SmartWritingReasonCode, SourceCoverageRecord, SourceSelectionConfidence,
-    SourceSelectionDiagnostic, SourceTranscriptRecord, DEFAULT_DEBUG_AUDIO_TTL, DEFAULT_MAX_AGE,
-    DEFAULT_MAX_RECORDS, EXPORT_ENV_ALLOWLIST, MAX_MODEL_ID_UTF8_BYTES,
-    MAX_SMART_WRITING_DIAGNOSTIC_EDITS, MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES,
-    MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES, MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES,
-    MAX_STORED_TEXT, REDACTED, SMART_WRITING_DIAGNOSTIC_VERSION, TEXT_SHA256_FINGERPRINT_LEN,
+    DEFAULT_DEBUG_AUDIO_TTL, DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS, DebugAudioRecord,
+    DiagnosticExport, DiagnosticRecord, DiagnosticStore, EXPORT_ENV_ALLOWLIST,
+    EnglishEligibilityOutcome, IntentReconstructionDiagnostic, IntentReconstructionEligibility,
+    IntentReconstructionOutcome, MAX_MODEL_ID_UTF8_BYTES, MAX_SMART_WRITING_DIAGNOSTIC_EDITS,
+    MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES, MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES,
+    MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES, MAX_STORED_TEXT, PruneOutcome, REDACTED, ReplayOutcome,
+    RetentionPolicy, SMART_WRITING_DIAGNOSTIC_VERSION, SmartWritingDiagnostic,
+    SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode,
+    SourceCoverageRecord, SourceSelectionConfidence, SourceSelectionDiagnostic,
+    SourceTranscriptRecord, TEXT_SHA256_FINGERPRINT_LEN, clamp_utf8_bytes, correlation_id,
+    export_record, is_secret_env_key, is_text_sha256_fingerprint, redacted_environment,
+    replay_capture, sanitize_url, scrub_embedded_urls, scrub_secret_values,
+    text_sha256_fingerprint, unix_millis_now,
 };
 
 mod dpr_diagnostics;
+#[cfg(not(feature = "dpr-eval-late-retain"))]
+pub use dpr_diagnostics::DPR_EVALUATION_LANE_COMPILE_GATED;
 pub use dpr_diagnostics::{
-    DprDeliveryEvidence, DprDiagnostic, DprDiagnosticEvent, DprDiagnosticEventName,
-    DprDiagnosticMode, DprFeedbackKind, DPR_DIAGNOSTIC_VERSION,
-    DPR_LOCAL_FALLBACK_MESSAGE, MAX_DPR_DIAGNOSTIC_EVENTS,
+    DPR_DIAGNOSTIC_VERSION, DPR_LOCAL_FALLBACK_MESSAGE, DprDeliveryEvidence, DprDiagnostic,
+    DprDiagnosticEvent, DprDiagnosticEventName, DprDiagnosticMode, DprFeedbackKind,
+    MAX_DPR_DIAGNOSTIC_EVENTS,
 };
 #[cfg(feature = "dpr-eval-late-retain")]
 pub use dpr_diagnostics::{
-    DprAcceptedLateCandidate, DprLateEvaluationRecord,
-    MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES,
+    DprAcceptedLateCandidate, DprLateEvaluationRecord, MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES,
 };
-#[cfg(not(feature = "dpr-eval-late-retain"))]
-pub use dpr_diagnostics::DPR_EVALUATION_LANE_COMPILE_GATED;
 
 mod formatting_commands;
 pub use formatting_commands::{
-    parse_formatting_commands, CommandEvent, CommandKind, NumberedListItem, ParsedCommands,
-    SourceSpan,
+    CommandEvent, CommandKind, NumberedListItem, ParsedCommands, SourceSpan,
+    parse_formatting_commands,
 };
 
 mod formatting;
 pub use formatting::{
-    format_validated, format_validated_for_grammar, format_validated_with, FormatOptions,
-    FormattingBaseline, SourceAnchor, WritingMode, FORMATTER_CONTRACT_ID,
-    LOCAL_FORMATTER_WORK_DEADLINE,
-    MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES, VALIDATED_TRANSCRIPT_VERSION,
+    FORMATTER_CONTRACT_ID, FormatOptions, FormattingBaseline, LOCAL_FORMATTER_WORK_DEADLINE,
+    MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES, SourceAnchor, VALIDATED_TRANSCRIPT_VERSION, WritingMode,
+    format_validated, format_validated_for_grammar, format_validated_with,
 };
 
 mod grammar_safety;
 pub use grammar_safety::{
-    apply_grammar_candidate_json, GrammarDiagnostic, GrammarErrorCode, GrammarOutcome,
-    GrammarSafetyOptions, GrammarSafetyResult, MAX_GRAMMAR_DIAGNOSTIC_UTF8_BYTES,
-    MAX_GRAMMAR_EDITS, MAX_GRAMMAR_EDIT_FIELD_UTF8_BYTES, MAX_GRAMMAR_JSON_DEPTH,
-    MAX_GRAMMAR_JSON_NODES, MAX_GRAMMAR_RESPONSE_BYTES,
+    GrammarDiagnostic, GrammarErrorCode, GrammarOutcome, GrammarSafetyOptions, GrammarSafetyResult,
+    MAX_GRAMMAR_DIAGNOSTIC_UTF8_BYTES, MAX_GRAMMAR_EDIT_FIELD_UTF8_BYTES, MAX_GRAMMAR_EDITS,
+    MAX_GRAMMAR_JSON_DEPTH, MAX_GRAMMAR_JSON_NODES, MAX_GRAMMAR_RESPONSE_BYTES,
+    apply_grammar_candidate_json,
 };
 
 mod prompt_rendering;
 pub use prompt_rendering::{
-    CloudRequest, RenderingPolicy, RenderingRoute, TimingCertainty, CLOSED_STRUCTURED_LABELS,
-    DEFAULT_RENDERING_POLICY, DELIVERY_AUTO_SEND, DELIVERY_DEADLINE, DELIVERY_DEADLINE_MS,
-    DELIVERY_LIVE_TYPE, DELIVERY_REPLACE_DELIVERED, DELIVERY_STATE_UNSENT,
+    CLOSED_STRUCTURED_LABELS, CloudRequest, DEFAULT_RENDERING_POLICY, DELIVERY_AUTO_SEND,
+    DELIVERY_DEADLINE, DELIVERY_DEADLINE_MS, DELIVERY_LIVE_TYPE, DELIVERY_REPLACE_DELIVERED,
+    DELIVERY_STATE_UNSENT, RenderingPolicy, RenderingRoute, TimingCertainty,
 };
 
 mod local_baseline;
 pub use local_baseline::{
-    leftover_admits_format_cloud, organize_local_baseline, LocalBaseline, LocalBaselineOptions,
-    LocalTiming, PauseBoundary, LOCAL_BASELINE_CONTRACT_ID,
+    LOCAL_BASELINE_CONTRACT_ID, LocalBaseline, LocalBaselineOptions, LocalTiming, PauseBoundary,
+    leftover_admits_format_cloud, organize_local_baseline,
 };
 
 mod intent_routing;
 pub use intent_routing::{
-    is_command_shaped, route_intent, IntentObservation, ProcessClass, ProcessHint, ProviderState,
-    RuleId, RoutingDecision, ScoreContribution, SurfaceHint, TimingHint, BROWSER_SHORT_WORDS,
-    COMPLEXITY_CLOUD_THRESHOLD, MESSAGING_SHORT_WORDS, SECTION_CUES_FOR_LENGTH_ASSIST,
+    BROWSER_SHORT_WORDS, COMPLEXITY_CLOUD_THRESHOLD, IntentObservation, MESSAGING_SHORT_WORDS,
+    ProcessClass, ProcessHint, ProviderState, RoutingDecision, RuleId,
+    SECTION_CUES_FOR_LENGTH_ASSIST, ScoreContribution, SurfaceHint, TimingHint, is_command_shaped,
+    route_intent,
 };
 
 mod compose_gate;
 pub use compose_gate::{
-    compose_structured_candidate, parse_structured_candidate_json, CloudOutcome, ComposeCertainty,
-    ComposeErrorCode, ComposeInput, ComposeOutcome, ComposeSource, CompositionDecision,
-    ConversionClaim, DeliveryFlags, DerivationSpan, FallbackTrigger, LabelClaim, LayoutClaim,
-    LayoutDecision, Reconciliation, RemovalClaim, RemovalKind, SourceSelection, SpanKind,
-    StructuredCandidate, SttProvider, CLOSED_CONVERSIONS, CLOSED_SOURCE_SELECTION_REASONS,
-    COMPOSE_GATE_CONTRACT_ID, MAX_COMPOSE_CONVERSIONS, MAX_COMPOSE_DERIVATION_SPANS,
-    MAX_COMPOSE_FIELD_UTF8_BYTES, MAX_COMPOSE_LABELS, MAX_COMPOSE_REMOVALS,
+    CLOSED_CONVERSIONS, CLOSED_SOURCE_SELECTION_REASONS, COMPOSE_GATE_CONTRACT_ID, CloudOutcome,
+    ComposeCertainty, ComposeErrorCode, ComposeInput, ComposeOutcome, ComposeSource,
+    CompositionDecision, ConversionClaim, DeliveryFlags, DerivationSpan, FallbackTrigger,
+    LabelClaim, LayoutClaim, LayoutDecision, MAX_COMPOSE_CONVERSIONS, MAX_COMPOSE_DERIVATION_SPANS,
+    MAX_COMPOSE_FIELD_UTF8_BYTES, MAX_COMPOSE_LABELS, MAX_COMPOSE_REMOVALS, Reconciliation,
+    RemovalClaim, RemovalKind, SourceSelection, SpanKind, StructuredCandidate, SttProvider,
+    compose_structured_candidate, parse_structured_candidate_json,
 };
 
 mod format_edits;
 pub use format_edits::{
-    apply_format_edit_candidate_json, apply_format_edit_candidate_json_with, apply_format_edits,
-    apply_format_edits_with, parse_format_edit_candidate_json, FormatEdit, FormatEditCandidate,
-    FormatEditErrorCode, FormatEditKind, FormatEditOutcome, FormatEditSafety,
-    CLOSED_FORMAT_EDIT_KINDS, FORMAT_EDIT_CONTRACT_ID, FORMAT_EDIT_CONTRACT_VERSION,
-    MAX_FORMAT_EDITS, MAX_FORMAT_EDIT_FIELD_UTF8_BYTES, MAX_FORMAT_EDIT_JSON_DEPTH,
-    MAX_FORMAT_EDIT_JSON_NODES, MAX_FORMAT_EDIT_RESPONSE_BYTES,
+    CLOSED_FORMAT_EDIT_KINDS, FORMAT_EDIT_CONTRACT_ID, FORMAT_EDIT_CONTRACT_VERSION, FormatEdit,
+    FormatEditCandidate, FormatEditErrorCode, FormatEditKind, FormatEditOutcome, FormatEditSafety,
+    MAX_FORMAT_EDIT_FIELD_UTF8_BYTES, MAX_FORMAT_EDIT_JSON_DEPTH, MAX_FORMAT_EDIT_JSON_NODES,
+    MAX_FORMAT_EDIT_RESPONSE_BYTES, MAX_FORMAT_EDITS, apply_format_edit_candidate_json,
+    apply_format_edit_candidate_json_with, apply_format_edits, apply_format_edits_with,
+    parse_format_edit_candidate_json,
 };
 
 // Paged diagnostic responses are negotiated per REQUEST (see `Request::paged`),
@@ -194,7 +193,9 @@ pub enum Command {
     OverlayStatus,
     /// Observes audio levels newer than the caller's stateless sequence cursor.
     /// The daemon answers this directly without entering the lifecycle actor.
-    Level { after_seq: u64 },
+    Level {
+        after_seq: u64,
+    },
     /// Returns the desktop-approved Trigger Key binding for display, or a
     /// notice that no Trigger Key is bound. Never blocks CLI start/stop/toggle.
     Shortcut,
@@ -1202,10 +1203,12 @@ struct IntentReconstructionResponse {
 pub fn parse_intent_reconstruction_response(content: &str) -> Result<MergeResult, BoundaryError> {
     serde_json::from_str::<IntentReconstructionResponse>(content)
         .map(|response| MergeResult(response.wording))
-        .map_err(|_| BoundaryError::new(
-            BoundaryKind::Validation,
-            "Intent Reconstruction returned invalid shape",
-        ))
+        .map_err(|_| {
+            BoundaryError::new(
+                BoundaryKind::Validation,
+                "Intent Reconstruction returned invalid shape",
+            )
+        })
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1315,15 +1318,22 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         mut sources: Vec<SourceTranscript>,
     ) -> Result<PreparedTranscriptDecision, BoundaryError> {
         if !self.intent_reconstruction {
-            return self.decide(sources).await.map(PreparedTranscriptDecision::Ready);
+            return self
+                .decide(sources)
+                .await
+                .map(PreparedTranscriptDecision::Ready);
         }
 
         sources = sanitize_source_transcripts(sources);
         sources.retain(|source| !source.text.is_empty());
         sources.sort_by_key(|source| source.provider);
         if let (Some(deepgram), Some(groq)) = (
-            sources.iter().find(|source| source.provider == Provider::Deepgram),
-            sources.iter().find(|source| source.provider == Provider::Groq),
+            sources
+                .iter()
+                .find(|source| source.provider == Provider::Deepgram),
+            sources
+                .iter()
+                .find(|source| source.provider == Provider::Groq),
         ) {
             let classification = source_pair_classification(&deepgram.text, &groq.text);
             if let Some(eligibility) = classification.intent_eligibility() {
@@ -1338,15 +1348,17 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                         decision.source_selection_diagnostic.confidence = Some(confidence);
                     }
                 }
-                return Ok(PreparedTranscriptDecision::Reconstruct(IntentReconstructionAttempt {
-                    request: IntentReconstructionRequest {
-                        sources,
-                        dictionary_terms: self.dictionary_terms.clone(),
+                return Ok(PreparedTranscriptDecision::Reconstruct(
+                    IntentReconstructionAttempt {
+                        request: IntentReconstructionRequest {
+                            sources,
+                            dictionary_terms: self.dictionary_terms.clone(),
+                        },
+                        eligibility,
+                        classification,
+                        fallback,
                     },
-                    eligibility,
-                    classification,
-                    fallback,
-                }));
+                ));
             }
         }
 
@@ -1377,20 +1389,24 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         let model_request = self.model.reconstruct_intent(request, Arc::clone(&cancel));
         let candidate = match bounded_model_call(model_request, cancel, self.deadline).await {
             Ok(candidate) => candidate,
-            Err(ModelCallFailure::Failed(error)) => return intent_fallback(
-                fallback,
-                eligibility,
-                IntentReconstructionOutcome::Failed,
-                format!("Intent Reconstruction failed: {}", error.diagnostic()),
-                None,
-            ),
-            Err(ModelCallFailure::DeadlineElapsed) => return intent_fallback(
-                fallback,
-                eligibility,
-                IntentReconstructionOutcome::Deadline,
-                "Intent Reconstruction deadline elapsed".to_owned(),
-                None,
-            ),
+            Err(ModelCallFailure::Failed(error)) => {
+                return intent_fallback(
+                    fallback,
+                    eligibility,
+                    IntentReconstructionOutcome::Failed,
+                    format!("Intent Reconstruction failed: {}", error.diagnostic()),
+                    None,
+                );
+            }
+            Err(ModelCallFailure::DeadlineElapsed) => {
+                return intent_fallback(
+                    fallback,
+                    eligibility,
+                    IntentReconstructionOutcome::Deadline,
+                    "Intent Reconstruction deadline elapsed".to_owned(),
+                    None,
+                );
+            }
         };
         let wording = candidate.0.trim();
         let bounded_candidate = Some(clamp_utf8_bytes(wording, MAX_STORED_TEXT));
@@ -1437,7 +1453,9 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         let sanitized_sources = sources.clone();
         sources.retain(|source| !source.text.is_empty());
         if sources.is_empty() {
-            let validation_reason = "hallucinated suffix; no Source Transcript remains after stripping ASR outros".to_owned();
+            let validation_reason =
+                "hallucinated suffix; no Source Transcript remains after stripping ASR outros"
+                    .to_owned();
             return Err(
                 BoundaryError::new(BoundaryKind::Validation, validation_reason.clone())
                     .with_transcript_failure(TranscriptFailureEvidence {
@@ -1455,8 +1473,12 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         }
         sources.sort_by_key(|source| source.provider);
         if let (Some(deepgram), Some(groq)) = (
-            sources.iter().find(|source| source.provider == Provider::Deepgram),
-            sources.iter().find(|source| source.provider == Provider::Groq),
+            sources
+                .iter()
+                .find(|source| source.provider == Provider::Deepgram),
+            sources
+                .iter()
+                .find(|source| source.provider == Provider::Groq),
         ) {
             let classification = source_pair_classification(&deepgram.text, &groq.text);
             if classification.is_near_identical() {
@@ -1614,8 +1636,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             if !is_source_derived(&merge_result.0, &sources) {
                 return safe_source_fallback(
                     &sources,
-                    "reconciliation produced words absent from every Source Transcript"
-                        .to_owned(),
+                    "reconciliation produced words absent from every Source Transcript".to_owned(),
                     true,
                     false,
                 );
@@ -1632,9 +1653,9 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             });
         }
 
-        let source = sources.first().ok_or_else(|| {
-            BoundaryError::new(BoundaryKind::Validation, "no Source Transcript")
-        })?;
+        let source = sources
+            .first()
+            .ok_or_else(|| BoundaryError::new(BoundaryKind::Validation, "no Source Transcript"))?;
         if let Some(reason) = non_contraction_quality_failure_reason(&source.text, &sources) {
             return self
                 .repair_candidate(
@@ -1696,8 +1717,8 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                     // and await it under the bounded grace — its subprocess must
                     // be killed and reaped before the fallback is observable.
                     cancel.cancel();
-                    let _ = tokio::time::timeout(RECONCILIATION_CLEANUP_GRACE, request.as_mut())
-                        .await;
+                    let _ =
+                        tokio::time::timeout(RECONCILIATION_CLEANUP_GRACE, request.as_mut()).await;
                     return safe_source_fallback(
                         sources,
                         "recovery deadline elapsed".to_owned(),
@@ -2008,16 +2029,39 @@ fn complete_source_preference<'a>(
     } else {
         (right, right_coverage, left_coverage)
     };
-    let material = fuller > 0
-        && (shorter as f64 / fuller as f64) < MATERIAL_COMPLETENESS_RATIO;
+    let material = fuller > 0 && (shorter as f64 / fuller as f64) < MATERIAL_COMPLETENESS_RATIO;
     let diagnostic = format!(
         "materially fuller safe Source Transcript selected; raw words Deepgram={} Groq={}; adjusted coverage Deepgram={} Groq={}; repetition discount Deepgram={} Groq={}; selected provider={}; confidence high; safety passed",
-        if left.provider == Provider::Deepgram { left_words.len() } else { right_words.len() },
-        if left.provider == Provider::Groq { left_words.len() } else { right_words.len() },
-        if left.provider == Provider::Deepgram { left_coverage } else { right_coverage },
-        if left.provider == Provider::Groq { left_coverage } else { right_coverage },
-        if left.provider == Provider::Deepgram { left_discount } else { right_discount },
-        if left.provider == Provider::Groq { left_discount } else { right_discount },
+        if left.provider == Provider::Deepgram {
+            left_words.len()
+        } else {
+            right_words.len()
+        },
+        if left.provider == Provider::Groq {
+            left_words.len()
+        } else {
+            right_words.len()
+        },
+        if left.provider == Provider::Deepgram {
+            left_coverage
+        } else {
+            right_coverage
+        },
+        if left.provider == Provider::Groq {
+            left_coverage
+        } else {
+            right_coverage
+        },
+        if left.provider == Provider::Deepgram {
+            left_discount
+        } else {
+            right_discount
+        },
+        if left.provider == Provider::Groq {
+            left_discount
+        } else {
+            right_discount
+        },
         source.provider.cli_label(),
     );
     CompleteSourcePreference {
@@ -2037,7 +2081,10 @@ fn repetition_discount(candidate: &[String], other: &[String]) -> usize {
     for word in candidate.iter().filter(|word| is_known_filler(word)) {
         *filler_counts.entry(word.as_str()).or_default() += 1;
     }
-    let filler_discount: usize = filler_counts.values().map(|count| count.saturating_sub(2)).sum();
+    let filler_discount: usize = filler_counts
+        .values()
+        .map(|count| count.saturating_sub(2))
+        .sum();
 
     if surplus_is_self_repetition(candidate, other) {
         let mut budget: HashMap<&str, usize> = HashMap::new();
@@ -2065,32 +2112,34 @@ fn is_known_filler(word: &str) -> bool {
 }
 
 fn source_coverage(sources: &[SourceTranscript]) -> Vec<SourceCoverageRecord> {
-    (0..sources.len()).map(|index| {
-        let words = normalized_words(&sources[index].text);
-        let other_words = sources
-            .iter()
-            .enumerate()
-            .find(|(other_index, _)| *other_index != index)
-            .map(|(_, source)| normalized_words(&source.text))
-            .unwrap_or_default();
-        let discount = repetition_discount(&words, &other_words);
-        let safety_passed = !words.is_empty()
-            && non_contraction_quality_failure_reason(
-                &sources[index].text,
-                &[SourceTranscript {
-                    provider: sources[index].provider,
-                    text: sources[index].text.clone(),
-                }],
-            )
-            .is_none();
-        SourceCoverageRecord {
-            provider: sources[index].provider,
-            raw_words: words.len(),
-            adjusted_coverage: words.len().saturating_sub(discount),
-            repetition_discount: discount,
-            safety_passed,
-        }
-    }).collect()
+    (0..sources.len())
+        .map(|index| {
+            let words = normalized_words(&sources[index].text);
+            let other_words = sources
+                .iter()
+                .enumerate()
+                .find(|(other_index, _)| *other_index != index)
+                .map(|(_, source)| normalized_words(&source.text))
+                .unwrap_or_default();
+            let discount = repetition_discount(&words, &other_words);
+            let safety_passed = !words.is_empty()
+                && non_contraction_quality_failure_reason(
+                    &sources[index].text,
+                    &[SourceTranscript {
+                        provider: sources[index].provider,
+                        text: sources[index].text.clone(),
+                    }],
+                )
+                .is_none();
+            SourceCoverageRecord {
+                provider: sources[index].provider,
+                raw_words: words.len(),
+                adjusted_coverage: words.len().saturating_sub(discount),
+                repetition_discount: discount,
+                safety_passed,
+            }
+        })
+        .collect()
 }
 
 fn source_selection_diagnostic(
@@ -2140,14 +2189,15 @@ fn source_fallback_refusal(
     recovery_attempted: bool,
 ) -> BoundaryError {
     let validation_reason = format!("{reason}; neither Source Transcript is safe");
-    BoundaryError::new(BoundaryKind::Validation, validation_reason.clone())
-        .with_transcript_failure(TranscriptFailureEvidence {
+    BoundaryError::new(BoundaryKind::Validation, validation_reason.clone()).with_transcript_failure(
+        TranscriptFailureEvidence {
             validation_reason,
             fallback_reason: Some(reason.to_owned()),
             reconciliation_requested,
             recovery_attempted,
             source_selection_diagnostic: source_selection_diagnostic(sources, None, None),
-        })
+        },
+    )
 }
 
 /// A Source Transcript shorter than roughly a third of the other's length is a
@@ -2173,13 +2223,13 @@ struct QualityGate {
 /// is dominated by these; a real technical dictation is not.
 const STOPWORDS: [&str; 94] = [
     "a", "an", "and", "or", "but", "of", "to", "in", "on", "at", "for", "with", "is", "are", "was",
-    "were", "be", "been", "being", "am", "the", "this", "that", "these", "those", "it", "its", "as",
-    "by", "from", "into", "onto", "over", "under", "out", "up", "down", "off", "so", "then", "than",
-    "we", "you", "i", "he", "she", "they", "them", "our", "your", "my", "me", "his", "her", "their",
-    "do", "does", "did", "not", "no", "yes", "if", "when", "while", "about", "before", "after",
-    "near", "would", "could", "should", "will", "can", "um", "uh", "uhh", "yeah", "like", "just",
-    "kind", "sort", "mean", "know", "well", "okay", "ok", "there", "here", "gonna", "wanna", "sorta",
-    "kinda", "really", "actually",
+    "were", "be", "been", "being", "am", "the", "this", "that", "these", "those", "it", "its",
+    "as", "by", "from", "into", "onto", "over", "under", "out", "up", "down", "off", "so", "then",
+    "than", "we", "you", "i", "he", "she", "they", "them", "our", "your", "my", "me", "his", "her",
+    "their", "do", "does", "did", "not", "no", "yes", "if", "when", "while", "about", "before",
+    "after", "near", "would", "could", "should", "will", "can", "um", "uh", "uhh", "yeah", "like",
+    "just", "kind", "sort", "mean", "know", "well", "okay", "ok", "there", "here", "gonna",
+    "wanna", "sorta", "kinda", "really", "actually",
 ];
 
 fn is_stopword(word: &str) -> bool {
@@ -2210,11 +2260,8 @@ fn source_quality(words: &[String]) -> f64 {
     let distinct_content = distinct_content_words(words).len();
     let content_fraction = content_count as f64 / total as f64;
     let richness = (distinct_content as f64 / 8.0).min(1.0);
-    let duplication = words
-        .windows(2)
-        .filter(|pair| pair[0] == pair[1])
-        .count() as f64
-        / total as f64;
+    let duplication =
+        words.windows(2).filter(|pair| pair[0] == pair[1]).count() as f64 / total as f64;
     (0.6 * content_fraction + 0.4 * richness) * (1.0 - duplication)
 }
 
@@ -2493,11 +2540,7 @@ fn topical_cohesion(words: &[String]) -> usize {
     }
     positions
         .values()
-        .filter(|occurrences| {
-            occurrences
-                .windows(2)
-                .any(|pair| pair[1] - pair[0] > 1)
-        })
+        .filter(|occurrences| occurrences.windows(2).any(|pair| pair[1] - pair[0] > 1))
         .count()
 }
 
@@ -2875,10 +2918,18 @@ fn compare_formatting(
         "capitalised sentence starts {}/{}{} vs {}/{}{}, sentence punctuation boundaries {} vs {}, dictionary matches {} vs {}",
         left_evidence.capitalised_sentence_starts,
         left_evidence.sentence_starts,
-        if left_evidence.all_caps { " (all-caps)" } else { "" },
+        if left_evidence.all_caps {
+            " (all-caps)"
+        } else {
+            ""
+        },
         right_evidence.capitalised_sentence_starts,
         right_evidence.sentence_starts,
-        if right_evidence.all_caps { " (all-caps)" } else { "" },
+        if right_evidence.all_caps {
+            " (all-caps)"
+        } else {
+            ""
+        },
         left_evidence.sentence_punctuation_boundaries,
         right_evidence.sentence_punctuation_boundaries,
         left_evidence.dictionary_matches,
@@ -2893,8 +2944,14 @@ fn compare_formatting(
 
 fn formatting_evidence(text: &str, dictionary_terms: &[String]) -> FormattingEvidence {
     let (capitalised_sentence_starts, sentence_starts) = sentence_start_capitalisation(text);
-    let alphabetic = text.chars().filter(|character| character.is_alphabetic()).count();
-    let lowercase = text.chars().filter(|character| character.is_lowercase()).count();
+    let alphabetic = text
+        .chars()
+        .filter(|character| character.is_alphabetic())
+        .count();
+    let lowercase = text
+        .chars()
+        .filter(|character| character.is_lowercase())
+        .count();
     FormattingEvidence {
         capitalised_sentence_starts,
         sentence_starts,
@@ -3064,9 +3121,9 @@ fn remainder_is_substantial_speech(text: &str) -> bool {
     if words.is_empty() {
         return false;
     }
-    let has_real_content = words.iter().any(|word| {
-        !is_stopword(word) && !TRIVIAL_OUTRO_PREFIXES.contains(&word.as_str())
-    });
+    let has_real_content = words
+        .iter()
+        .any(|word| !is_stopword(word) && !TRIVIAL_OUTRO_PREFIXES.contains(&word.as_str()));
     if has_real_content {
         return true;
     }
@@ -3102,18 +3159,19 @@ fn distinct_nonoverlapping_dictionary_matches(text: &str, terms: &[String]) -> u
         .collect::<HashSet<_>>()
         .into_iter()
         .flat_map(|term| {
-            text.match_indices(term).filter_map(move |(start, matched)| {
-                let before_is_boundary = text[..start]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|character| !character.is_alphanumeric());
-                let end = start + matched.len();
-                let after_is_boundary = text[end..]
-                    .chars()
-                    .next()
-                    .is_none_or(|character| !character.is_alphanumeric());
-                (before_is_boundary && after_is_boundary).then_some((term, start, end))
-            })
+            text.match_indices(term)
+                .filter_map(move |(start, matched)| {
+                    let before_is_boundary = text[..start]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|character| !character.is_alphanumeric());
+                    let end = start + matched.len();
+                    let after_is_boundary = text[end..]
+                        .chars()
+                        .next()
+                        .is_none_or(|character| !character.is_alphanumeric());
+                    (before_is_boundary && after_is_boundary).then_some((term, start, end))
+                })
         })
         .collect();
     candidates.sort_by_key(|(term, start, _)| (std::cmp::Reverse(term.len()), *start));
@@ -3122,9 +3180,9 @@ fn distinct_nonoverlapping_dictionary_matches(text: &str, terms: &[String]) -> u
     let mut selected_spans: Vec<(usize, usize)> = Vec::new();
     for (term, start, end) in candidates {
         if selected_terms.contains(term)
-            || selected_spans
-                .iter()
-                .any(|(selected_start, selected_end)| start < *selected_end && *selected_start < end)
+            || selected_spans.iter().any(|(selected_start, selected_end)| {
+                start < *selected_end && *selected_start < end
+            })
         {
             continue;
         }
@@ -3235,7 +3293,9 @@ fn is_source_derived(candidate: &str, sources: &[SourceTranscript]) -> bool {
     if content_words.is_empty() {
         let heard: HashSet<&str> = source_words.iter().map(String::as_str).collect();
         return !candidate_words.is_empty()
-            && candidate_words.iter().all(|word| heard.contains(word.as_str()));
+            && candidate_words
+                .iter()
+                .all(|word| heard.contains(word.as_str()));
     }
     let vocabulary = distinct_content_words(&source_words);
     content_words
@@ -3243,10 +3303,7 @@ fn is_source_derived(candidate: &str, sources: &[SourceTranscript]) -> bool {
         .all(|word| vocabulary.contains(word.as_str()))
 }
 
-fn quality_failure_reason(
-    candidate: &str,
-    sources: &[SourceTranscript],
-) -> Option<QualityFailure> {
+fn quality_failure_reason(candidate: &str, sources: &[SourceTranscript]) -> Option<QualityFailure> {
     let trimmed = candidate.trim();
     if trimmed.is_empty() || trimmed.contains('\0') || trimmed.len() > 100_000 {
         return Some(QualityFailure::Other("invalid candidate text"));
@@ -3416,8 +3473,8 @@ fn script_count(text: &str) -> usize {
             Some(ConfusableScript::Greek) => 1,
             Some(ConfusableScript::Cyrillic) => 2,
             None => match character as u32 {
-                0x0600..=0x06ff => 3, // Arabic
-                0x0900..=0x097f => 4, // Devanagari
+                0x0600..=0x06ff => 3,                   // Arabic
+                0x0900..=0x097f => 4,                   // Devanagari
                 0x3040..=0x30ff | 0x3400..=0x9fff => 5, // Japanese/CJK
                 _ => 6,
             },
@@ -3538,7 +3595,8 @@ impl DeadlineClock {
     /// Headroom left at `now`, saturating: a Recording already past its
     /// Deadline (the stop is in flight) has none rather than wrapping.
     pub fn remaining(&self, now: Instant) -> Duration {
-        self.deadline.saturating_sub(now.saturating_duration_since(self.started))
+        self.deadline
+            .saturating_sub(now.saturating_duration_since(self.started))
     }
 }
 
@@ -3830,7 +3888,11 @@ pub trait TranscriptValidator: Send {
         &mut self,
         sources: Vec<SourceTranscript>,
     ) -> BoundaryFuture<'_, PreparedTranscriptDecision> {
-        Box::pin(async move { self.validate(sources).await.map(PreparedTranscriptDecision::Ready) })
+        Box::pin(async move {
+            self.validate(sources)
+                .await
+                .map(PreparedTranscriptDecision::Ready)
+        })
     }
 
     fn reconstruct(

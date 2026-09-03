@@ -9,15 +9,15 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CloudRequest, ComposeErrorCode, CompositionDecision, DeliveryFlags, FallbackTrigger,
-    RenderingRoute, RoutingDecision, RuleId, DELIVERY_AUTO_SEND, DELIVERY_LIVE_TYPE,
-    DELIVERY_REPLACE_DELIVERED, DELIVERY_STATE_UNSENT,
+    CloudRequest, ComposeErrorCode, CompositionDecision, DELIVERY_AUTO_SEND, DELIVERY_LIVE_TYPE,
+    DELIVERY_REPLACE_DELIVERED, DELIVERY_STATE_UNSENT, DeliveryFlags, FallbackTrigger,
+    RenderingRoute, RoutingDecision, RuleId,
 };
 
 #[cfg(feature = "dpr-eval-late-retain")]
 use crate::{
-    clamp_utf8_bytes, is_text_sha256_fingerprint, scrub_embedded_urls, scrub_secret_values,
-    text_sha256_fingerprint, ComposeOutcome,
+    ComposeOutcome, clamp_utf8_bytes, is_text_sha256_fingerprint, scrub_embedded_urls,
+    scrub_secret_values, text_sha256_fingerprint,
 };
 
 /// Schema version for the persisted DPR diagnostic surface.
@@ -297,12 +297,8 @@ impl DprDiagnostic {
         self.compose_decision = Some(decision);
         self.fallback_trigger = fallback_trigger;
         self.reason_codes.clear();
-        self.reason_codes.extend(
-            reason_codes
-                .iter()
-                .copied()
-                .take(MAX_DPR_DIAGNOSTIC_EVENTS),
-        );
+        self.reason_codes
+            .extend(reason_codes.iter().copied().take(MAX_DPR_DIAGNOSTIC_EVENTS));
 
         if self.cloud_attempted {
             match fallback_trigger {
@@ -392,10 +388,8 @@ impl DprDiagnostic {
             return false;
         }
         let arrived_t_ms = duration_ms(at);
-        let redacted = scrub_embedded_urls(&scrub_secret_values(
-            &candidate.rendered,
-            sensitive_values,
-        ));
+        let redacted =
+            scrub_embedded_urls(&scrub_secret_values(&candidate.rendered, sensitive_values));
         self.late_evaluation = Some(DprLateEvaluationRecord {
             arrived_t_ms,
             candidate_fingerprint: text_sha256_fingerprint(&candidate.rendered),
@@ -485,8 +479,7 @@ impl DprDiagnostic {
                 MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES,
             );
             if !is_text_sha256_fingerprint(&late.candidate_fingerprint) {
-                late.candidate_fingerprint =
-                    text_sha256_fingerprint(&late.candidate_text_clamped);
+                late.candidate_fingerprint = text_sha256_fingerprint(&late.candidate_text_clamped);
             }
             late.compare_to_delivered = true;
         }

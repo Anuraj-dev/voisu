@@ -431,9 +431,9 @@ fn install() -> Result<UserServiceReport, String> {
 
 fn install_message(paths: &ServicePaths, message: &str) -> String {
     match &paths.packaged_fallback {
-        Some(reason) => format!(
-            "{message} via Ticket 09 user-data path; packaged unit was ignored: {reason}"
-        ),
+        Some(reason) => {
+            format!("{message} via Ticket 09 user-data path; packaged unit was ignored: {reason}")
+        }
         None => message.to_owned(),
     }
 }
@@ -515,9 +515,7 @@ fn import_session_environment() -> Result<(), String> {
 fn require_hyprland_session_environment() -> Result<(), String> {
     let missing: Vec<&str> = ["WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE"]
         .into_iter()
-        .filter(|name| {
-            std::env::var_os(name).is_none_or(|value| value.is_empty())
-        })
+        .filter(|name| std::env::var_os(name).is_none_or(|value| value.is_empty()))
         .collect();
     if !missing.is_empty() {
         return Err(format!(
@@ -611,9 +609,9 @@ fn status() -> Result<UserServiceReport, String> {
     let systemd_state = systemd_state()?;
     let active = systemd_state == "active";
     let report = match (active, probe_daemon()) {
-        (true, DaemonIpc::Available(state)) => UserServiceReport::success(format!(
-            "systemd user service active; daemon IPC {state}"
-        )),
+        (true, DaemonIpc::Available(state)) => {
+            UserServiceReport::success(format!("systemd user service active; daemon IPC {state}"))
+        }
         (false, DaemonIpc::Available(state)) => {
             let ownership = if systemd_state == "inactive" {
                 "daemon running outside systemd".to_owned()
@@ -717,8 +715,8 @@ fn uninstall_packaged(paths: &ServicePaths) -> Result<UserServiceReport, String>
 }
 
 fn service_paths() -> Result<ServicePaths, String> {
-    let current = std::env::current_exe()
-        .map_err(|_| "cannot locate the Voisu executable".to_owned())?;
+    let current =
+        std::env::current_exe().map_err(|_| "cannot locate the Voisu executable".to_owned())?;
     let source_daemon = current
         .parent()
         .ok_or_else(|| "cannot locate voisu-daemon beside the Voisu CLI".to_owned())?
@@ -824,7 +822,9 @@ fn effective_packaged_unit() -> EffectiveLookup {
             }
         }
 
-        let fragment = fragment.filter(|value| !value.is_empty()).map(PathBuf::from);
+        let fragment = fragment
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
         // Case A: systemd's effective unit is itself a packaged unit (possibly
         // via an /etc override or drop-in). Trust exactly what systemd will run.
         if let Some(fragment) = fragment.filter(|fragment| is_packaged_fragment(fragment)) {
@@ -1058,7 +1058,10 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
         || parent_metadata.file_type().is_symlink()
         || parent_metadata.uid() != unsafe { libc::geteuid() }
     {
-        return Err(format!("unsafe installation directory {}", parent.display()));
+        return Err(format!(
+            "unsafe installation directory {}",
+            parent.display()
+        ));
     }
 
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1090,30 +1093,33 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
 
 fn service_unit(executable: &Path) -> Result<String, String> {
     let executable = quote_systemd_path(executable)?;
-    Ok(format!(concat!(
-        "[Unit]\n",
-        "Description=Voisu dictation daemon\n",
-        "After=wayland-session-waitenv.service dbus.socket pipewire.service\n",
-        "Wants=dbus.socket pipewire.service\n",
-        "PartOf=graphical-session.target\n",
-        "ConditionEnvironment=|WAYLAND_DISPLAY\n",
-        "ConditionEnvironment=|DISPLAY\n",
-        "StartLimitIntervalSec=30s\n",
-        "StartLimitBurst=3\n\n",
-        "[Service]\n",
-        "Type=simple\n",
-        "ExecStart={} --systemd\n",
-        "Restart=on-failure\n",
-        "RestartSec=2s\n",
-        // Graceful shutdown stops an active Recording, processes it to
-        // completion, joins the actor, and drains retained provider cleanup;
-        // that internal budget peaks near 37 seconds, so the stop bound is set
-        // explicitly and comfortably above it instead of relying on the
-        // distribution's default.
-        "TimeoutStopSec=60s\n\n",
-        "[Install]\n",
-        "WantedBy=graphical-session.target\n",
-    ), executable))
+    Ok(format!(
+        concat!(
+            "[Unit]\n",
+            "Description=Voisu dictation daemon\n",
+            "After=wayland-session-waitenv.service dbus.socket pipewire.service\n",
+            "Wants=dbus.socket pipewire.service\n",
+            "PartOf=graphical-session.target\n",
+            "ConditionEnvironment=|WAYLAND_DISPLAY\n",
+            "ConditionEnvironment=|DISPLAY\n",
+            "StartLimitIntervalSec=30s\n",
+            "StartLimitBurst=3\n\n",
+            "[Service]\n",
+            "Type=simple\n",
+            "ExecStart={} --systemd\n",
+            "Restart=on-failure\n",
+            "RestartSec=2s\n",
+            // Graceful shutdown stops an active Recording, processes it to
+            // completion, joins the actor, and drains retained provider cleanup;
+            // that internal budget peaks near 37 seconds, so the stop bound is set
+            // explicitly and comfortably above it instead of relying on the
+            // distribution's default.
+            "TimeoutStopSec=60s\n\n",
+            "[Install]\n",
+            "WantedBy=graphical-session.target\n",
+        ),
+        executable
+    ))
 }
 
 fn quote_systemd_path(path: &Path) -> Result<String, String> {
@@ -1140,10 +1146,7 @@ fn systemctl_required(arguments: &[&str]) -> Result<(), String> {
     if output.success {
         Ok(())
     } else {
-        Err(format!(
-            "systemctl --user {} failed",
-            arguments.join(" ")
-        ))
+        Err(format!("systemctl --user {} failed", arguments.join(" ")))
     }
 }
 
@@ -1245,12 +1248,7 @@ fn probe_daemon() -> DaemonIpc {
         return DaemonIpc::Unavailable;
     }
     let mut response = Vec::new();
-    if stream
-        .take(64 * 1024)
-        .read_to_end(&mut response)
-        .is_err()
-        || !response.ends_with(b"\n")
-    {
+    if stream.take(64 * 1024).read_to_end(&mut response).is_err() || !response.ends_with(b"\n") {
         return DaemonIpc::Unavailable;
     }
     let Ok(envelope) = serde_json::from_slice::<VersionEnvelope>(&response) else {

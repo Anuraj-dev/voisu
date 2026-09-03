@@ -98,8 +98,7 @@ pub fn scan_wav_pcm(prefix: &[u8]) -> WavScan {
             let body = &prefix[header_end..header_end + 16];
             let audio_format = u16::from_le_bytes([body[0], body[1]]);
             let channels = u16::from_le_bytes([body[2], body[3]]);
-            let sample_rate =
-                u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+            let sample_rate = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
             let byte_rate = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
             let block_align = u16::from_le_bytes([body[12], body[13]]);
             let bits_per_sample = u16::from_le_bytes([body[14], body[15]]);
@@ -113,9 +112,7 @@ pub fn scan_wav_pcm(prefix: &[u8]) -> WavScan {
                 || block_align != EXPECTED_BLOCK_ALIGN
                 || byte_rate != EXPECTED_BYTE_RATE
             {
-                return WavScan::Invalid(
-                    "WAV fmt chunk is not s16 / 16 kHz / mono PCM",
-                );
+                return WavScan::Invalid("WAV fmt chunk is not s16 / 16 kHz / mono PCM");
             }
             fmt_validated = true;
             offset = advance_past_chunk(body_end, size);

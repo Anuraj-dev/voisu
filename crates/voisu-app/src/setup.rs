@@ -10,8 +10,8 @@
 use std::path::Path;
 
 use voisu_core::{
-    provider_free_tier_hint, Credential, KeyDiagnosis, KeyLocation, Provider, ProviderKeyStatus,
-    SecretStore,
+    Credential, KeyDiagnosis, KeyLocation, Provider, ProviderKeyStatus, SecretStore,
+    provider_free_tier_hint,
 };
 
 use crate::config::{self, DeliveryMode};

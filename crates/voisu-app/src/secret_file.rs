@@ -44,7 +44,9 @@ pub struct FileSecretStore {
 impl FileSecretStore {
     /// The default fallback file beside `config.toml`.
     pub fn at_default() -> Self {
-        Self { path: default_path() }
+        Self {
+            path: default_path(),
+        }
     }
 
     /// A fallback file at an explicit path (tests point this at a tempdir).
@@ -60,10 +62,16 @@ impl FileSecretStore {
     /// `0600` file if needed and preserving any other provider's line.
     pub fn store(&self, provider: Provider, credential: &Credential) -> Result<(), BoundaryError> {
         let parent = self.path.parent().ok_or_else(|| {
-            BoundaryError::new(BoundaryKind::SecretStorage, "credential fallback path has no parent")
+            BoundaryError::new(
+                BoundaryKind::SecretStorage,
+                "credential fallback path has no parent",
+            )
         })?;
         std::fs::create_dir_all(parent).map_err(|_| {
-            BoundaryError::new(BoundaryKind::SecretStorage, "cannot create credential directory")
+            BoundaryError::new(
+                BoundaryKind::SecretStorage,
+                "cannot create credential directory",
+            )
         })?;
         // Tighten the directory to owner-only; ignore failures on filesystems
         // that do not honour Unix modes rather than refusing to store.
@@ -185,7 +193,8 @@ impl FileSecretStore {
             body.push_str(line);
             body.push('\n');
         }
-        self.write_atomic(parent, &body).map_err(RemoveError::TargetPresent)?;
+        self.write_atomic(parent, &body)
+            .map_err(RemoveError::TargetPresent)?;
         Ok(true)
     }
 
@@ -221,10 +230,16 @@ impl FileSecretStore {
             .write_all(contents.as_bytes())
             .and_then(|()| file.as_file().sync_all())
             .map_err(|_| {
-                BoundaryError::new(BoundaryKind::SecretStorage, "cannot write the credential fallback file")
+                BoundaryError::new(
+                    BoundaryKind::SecretStorage,
+                    "cannot write the credential fallback file",
+                )
             })?;
         file.persist(&self.path).map_err(|_| {
-            BoundaryError::new(BoundaryKind::SecretStorage, "cannot persist the credential fallback file")
+            BoundaryError::new(
+                BoundaryKind::SecretStorage,
+                "cannot persist the credential fallback file",
+            )
         })?;
         // Reassert 0600 in case an inherited umask or prior file loosened it.
         let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
@@ -377,7 +392,11 @@ mod tests {
         let (_dir, store) = temp_store();
         let cred = Credential::new("secret".to_owned()).unwrap();
         store.store(Provider::Deepgram, &cred).unwrap();
-        let file_mode = std::fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(file_mode, 0o600, "credential file must be owner-only");
         let dir_mode = std::fs::metadata(store.path().parent().unwrap())
             .unwrap()
@@ -391,34 +410,61 @@ mod tests {
     fn writing_one_provider_preserves_the_other() {
         let (_dir, store) = temp_store();
         store
-            .store(Provider::Groq, &Credential::new("groq-key".to_owned()).unwrap())
+            .store(
+                Provider::Groq,
+                &Credential::new("groq-key".to_owned()).unwrap(),
+            )
             .unwrap();
         store
-            .store(Provider::Deepgram, &Credential::new("deepgram-key".to_owned()).unwrap())
+            .store(
+                Provider::Deepgram,
+                &Credential::new("deepgram-key".to_owned()).unwrap(),
+            )
             .unwrap();
         assert_eq!(
-            store.read(Provider::Groq).unwrap().unwrap().expose_to_boundary(),
+            store
+                .read(Provider::Groq)
+                .unwrap()
+                .unwrap()
+                .expose_to_boundary(),
             "groq-key"
         );
         assert_eq!(
-            store.read(Provider::Deepgram).unwrap().unwrap().expose_to_boundary(),
+            store
+                .read(Provider::Deepgram)
+                .unwrap()
+                .unwrap()
+                .expose_to_boundary(),
             "deepgram-key"
         );
         // Exactly one line per provider, header emitted once.
         let body = std::fs::read_to_string(store.path()).unwrap();
         assert_eq!(body.matches("groq=").count(), 1, "{body}");
         assert_eq!(body.matches("deepgram=").count(), 1, "{body}");
-        assert_eq!(body.matches("# Voisu credential fallback").count(), 1, "{body}");
+        assert_eq!(
+            body.matches("# Voisu credential fallback").count(),
+            1,
+            "{body}"
+        );
     }
 
     #[test]
     fn removing_the_last_provider_deletes_the_file() {
         let (_dir, store) = temp_store();
         store
-            .store(Provider::Groq, &Credential::new("groq-key".to_owned()).unwrap())
+            .store(
+                Provider::Groq,
+                &Credential::new("groq-key".to_owned()).unwrap(),
+            )
             .unwrap();
-        assert!(store.remove(Provider::Groq).unwrap(), "a stored key is removed");
-        assert!(!store.path().exists(), "an emptied fallback file is deleted");
+        assert!(
+            store.remove(Provider::Groq).unwrap(),
+            "a stored key is removed"
+        );
+        assert!(
+            !store.path().exists(),
+            "an emptied fallback file is deleted"
+        );
         // Removing an absent provider is a no-op, not an error.
         assert!(!store.remove(Provider::Groq).unwrap());
     }
@@ -427,18 +473,31 @@ mod tests {
     fn removing_one_provider_preserves_the_other() {
         let (_dir, store) = temp_store();
         store
-            .store(Provider::Groq, &Credential::new("groq-key".to_owned()).unwrap())
+            .store(
+                Provider::Groq,
+                &Credential::new("groq-key".to_owned()).unwrap(),
+            )
             .unwrap();
         store
-            .store(Provider::Deepgram, &Credential::new("deepgram-key".to_owned()).unwrap())
+            .store(
+                Provider::Deepgram,
+                &Credential::new("deepgram-key".to_owned()).unwrap(),
+            )
             .unwrap();
         assert!(store.remove(Provider::Groq).unwrap());
         assert!(store.read(Provider::Groq).unwrap().is_none());
         assert_eq!(
-            store.read(Provider::Deepgram).unwrap().unwrap().expose_to_boundary(),
+            store
+                .read(Provider::Deepgram)
+                .unwrap()
+                .unwrap()
+                .expose_to_boundary(),
             "deepgram-key"
         );
-        assert!(store.path().exists(), "the file survives while a key remains");
+        assert!(
+            store.path().exists(),
+            "the file survives while a key remains"
+        );
     }
 
     #[test]
@@ -482,7 +541,11 @@ mod tests {
         );
         // The other provider's line is untouched.
         assert_eq!(
-            store.read(Provider::Deepgram).unwrap().unwrap().expose_to_boundary(),
+            store
+                .read(Provider::Deepgram)
+                .unwrap()
+                .unwrap()
+                .expose_to_boundary(),
             "other-provider-key"
         );
     }
@@ -500,7 +563,10 @@ mod tests {
 
         let (_dir, store) = temp_store();
         store
-            .store(Provider::Groq, &Credential::new("groq-key".to_owned()).unwrap())
+            .store(
+                Provider::Groq,
+                &Credential::new("groq-key".to_owned()).unwrap(),
+            )
             .unwrap();
 
         let lock_path = store.path().with_file_name("credentials.lock");
@@ -519,7 +585,10 @@ mod tests {
         let writer = std::thread::spawn(move || {
             let other = FileSecretStore::at(path);
             other
-                .store(Provider::Deepgram, &Credential::new("deepgram-key".to_owned()).unwrap())
+                .store(
+                    Provider::Deepgram,
+                    &Credential::new("deepgram-key".to_owned()).unwrap(),
+                )
                 .unwrap();
             let _ = stored_tx.send(());
         });
@@ -556,7 +625,11 @@ mod tests {
         // the remove that ran from a different handle's snapshot.
         assert!(store.read(Provider::Groq).unwrap().is_none());
         assert_eq!(
-            store.read(Provider::Deepgram).unwrap().unwrap().expose_to_boundary(),
+            store
+                .read(Provider::Deepgram)
+                .unwrap()
+                .unwrap()
+                .expose_to_boundary(),
             "deepgram-key"
         );
     }
@@ -571,7 +644,11 @@ mod tests {
             .store(Provider::Groq, &Credential::new("new".to_owned()).unwrap())
             .unwrap();
         assert_eq!(
-            store.read(Provider::Groq).unwrap().unwrap().expose_to_boundary(),
+            store
+                .read(Provider::Groq)
+                .unwrap()
+                .unwrap()
+                .expose_to_boundary(),
             "new"
         );
         let body = std::fs::read_to_string(store.path()).unwrap();

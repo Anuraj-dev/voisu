@@ -232,7 +232,9 @@ pub fn qwen_format_enabled() -> bool {
 
 pub fn intent_reconstruction_enabled() -> bool {
     parse_optional_dpr_enablement(
-        std::env::var(ENABLE_INTENT_RECONSTRUCTION_ENV).ok().as_deref(),
+        std::env::var(ENABLE_INTENT_RECONSTRUCTION_ENV)
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -576,7 +578,10 @@ fn write_config(
         .parent()
         .ok_or_else(|| format!("config path has no parent: {}", path.display()))?;
     std::fs::create_dir_all(parent).map_err(|error| {
-        format!("cannot create config directory {}: {error}", parent.display())
+        format!(
+            "cannot create config directory {}: {error}",
+            parent.display()
+        )
     })?;
     // Only a genuinely absent file starts from empty. A permission error or
     // invalid UTF-8 must abort the write untouched — treating it as empty would
@@ -638,8 +643,8 @@ fn merge_content(
         if trimmed.starts_with('[') {
             in_root = false;
         }
-        let is_managed_comment = MANAGED_LINES.contains(&line.trim())
-            || LEGACY_MANAGED_LINES.contains(&line.trim());
+        let is_managed_comment =
+            MANAGED_LINES.contains(&line.trim()) || LEGACY_MANAGED_LINES.contains(&line.trim());
         let is_root_deepgram_enabled = deepgram_enabled.is_some()
             && in_root
             && trimmed
@@ -739,7 +744,10 @@ mod tests {
 
     #[test]
     fn a_missing_config_file_reads_as_none() {
-        assert_eq!(read_setting(Path::new("/nonexistent/voisu/config.toml")), None);
+        assert_eq!(
+            read_setting(Path::new("/nonexistent/voisu/config.toml")),
+            None
+        );
     }
 
     #[test]
@@ -764,7 +772,11 @@ mod tests {
         assert_eq!(read_setting(&path), Some(false));
         assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Clipboard));
         let contents = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(contents.matches(DEEPGRAM_ENABLED_KEY).count(), 1, "{contents}");
+        assert_eq!(
+            contents.matches(DEEPGRAM_ENABLED_KEY).count(),
+            1,
+            "{contents}"
+        );
         assert_eq!(contents.matches(DELIVERY_MODE_KEY).count(), 1, "{contents}");
     }
 
@@ -803,7 +815,11 @@ mod tests {
         );
 
         let contents = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(contents.matches(DEEPGRAM_ENABLED_KEY).count(), 1, "{contents}");
+        assert_eq!(
+            contents.matches(DEEPGRAM_ENABLED_KEY).count(),
+            1,
+            "{contents}"
+        );
         assert_eq!(contents.matches(DELIVERY_MODE_KEY).count(), 1, "{contents}");
         assert_eq!(contents.matches(WRITING_MODE_KEY).count(), 1, "{contents}");
     }
@@ -912,21 +928,11 @@ other_key = 5
             WritingModeLoad::Known(WritingMode::Smart)
         );
         assert_eq!(
-            parse_rendering_policy(&render(
-                None,
-                None,
-                None,
-                Some(RenderingPolicy::Structured)
-            )),
+            parse_rendering_policy(&render(None, None, None, Some(RenderingPolicy::Structured))),
             RenderingPolicyLoad::Known(RenderingPolicy::Structured)
         );
         assert_eq!(
-            parse_rendering_policy(&render(
-                None,
-                None,
-                None,
-                Some(RenderingPolicy::Adaptive)
-            )),
+            parse_rendering_policy(&render(None, None, None, Some(RenderingPolicy::Adaptive))),
             RenderingPolicyLoad::Known(RenderingPolicy::Adaptive)
         );
     }
@@ -935,7 +941,10 @@ other_key = 5
     fn writing_mode_defaults_to_smart_when_nothing_is_persisted() {
         assert_eq!(DEFAULT_WRITING_MODE, WritingMode::Smart);
         assert_eq!(WritingMode::default(), WritingMode::Smart);
-        assert_eq!(resolve_writing_mode(WritingModeLoad::Missing), WritingMode::Smart);
+        assert_eq!(
+            resolve_writing_mode(WritingModeLoad::Missing),
+            WritingMode::Smart
+        );
         assert_eq!(
             resolve_writing_mode(parse_writing_mode("other_key = true\n")),
             WritingMode::Smart
@@ -1027,9 +1036,7 @@ other_key = 5
             WritingModeLoad::Missing
         );
         assert_eq!(
-            resolve_writing_mode(parse_writing_mode(
-                "[other]\nwriting_mode = \"literal\"\n"
-            )),
+            resolve_writing_mode(parse_writing_mode("[other]\nwriting_mode = \"literal\"\n")),
             WritingMode::Smart
         );
     }
@@ -1076,7 +1083,10 @@ other_key = 5
     #[test]
     fn dpr_rollout_gate_defaults_off_and_requires_an_explicit_true_value() {
         for value in ["", "0", "false", "yes", "adaptive", "garbage"] {
-            assert!(!parse_dpr_enablement(value), "unexpected enablement: {value}");
+            assert!(
+                !parse_dpr_enablement(value),
+                "unexpected enablement: {value}"
+            );
         }
         for value in ["1", "true", " TRUE "] {
             assert!(parse_dpr_enablement(value), "expected enablement: {value}");
@@ -1165,9 +1175,7 @@ other_key = 5
             RenderingPolicyLoad::FailClosed
         );
         assert_eq!(
-            resolve_rendering_policy(parse_rendering_policy(
-                "rendering_policy = \"future\"\n"
-            )),
+            resolve_rendering_policy(parse_rendering_policy("rendering_policy = \"future\"\n")),
             RenderingPolicy::Natural
         );
         assert_eq!(
@@ -1284,8 +1292,7 @@ other_key = 5
         let path = dir.path().join("voisu").join("config.toml");
         write_rendering_policy(&path, RenderingPolicy::Natural).unwrap();
 
-        let snapshot =
-            resolve_rendering_policy(read_rendering_policy(&path));
+        let snapshot = resolve_rendering_policy(read_rendering_policy(&path));
         assert_eq!(snapshot, RenderingPolicy::Natural);
 
         write_rendering_policy(&path, RenderingPolicy::Structured).unwrap();
@@ -1332,7 +1339,11 @@ other_key = 5
         );
 
         let contents = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(contents.matches(DEEPGRAM_ENABLED_KEY).count(), 1, "{contents}");
+        assert_eq!(
+            contents.matches(DEEPGRAM_ENABLED_KEY).count(),
+            1,
+            "{contents}"
+        );
         assert_eq!(contents.matches(DELIVERY_MODE_KEY).count(), 1, "{contents}");
         assert_eq!(contents.matches(WRITING_MODE_KEY).count(), 1, "{contents}");
         assert_eq!(
@@ -1381,7 +1392,11 @@ other_key = 5
         let contents = std::fs::read_to_string(&path).unwrap();
         // The toggle now reads false, exactly once, at the root.
         assert_eq!(read_setting(&path), Some(false));
-        assert_eq!(contents.matches("deepgram_enabled").count(), 1, "{contents}");
+        assert_eq!(
+            contents.matches("deepgram_enabled").count(),
+            1,
+            "{contents}"
+        );
         // Unrelated content survives untouched.
         assert!(contents.contains("# a user's own note"), "{contents}");
         assert!(contents.contains("[keyterms]"), "{contents}");

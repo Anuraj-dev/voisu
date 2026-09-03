@@ -35,10 +35,7 @@ pub enum CompletenessChoice {
 /// Discounts repeated filler, consecutive duplicate tokens, duplicated loops,
 /// and known outro garbage. A short coherent fragment must not beat a longer
 /// non-repetitive sibling. This is not product source selection (ticket 02).
-pub fn select_completeness_aware(
-    groq: Option<&str>,
-    deepgram: Option<&str>,
-) -> CompletenessChoice {
+pub fn select_completeness_aware(groq: Option<&str>, deepgram: Option<&str>) -> CompletenessChoice {
     let groq = usable(groq);
     let deepgram = usable(deepgram);
     match (groq, deepgram) {
@@ -124,8 +121,7 @@ impl ContentScore {
         if other.unique_content_words == 0 {
             return self.unique_content_words > 0;
         }
-        let ratio =
-            self.unique_content_words as f64 / other.unique_content_words.max(1) as f64;
+        let ratio = self.unique_content_words as f64 / other.unique_content_words.max(1) as f64;
         ratio >= 1.25 && self.unique_content_words > other.unique_content_words
     }
 }

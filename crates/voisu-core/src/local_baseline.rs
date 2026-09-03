@@ -25,7 +25,7 @@
 
 use crate::is_command_shaped;
 use crate::prompt_rendering::{
-    RenderingPolicy, RenderingRoute, TimingCertainty, CLOSED_STRUCTURED_LABELS,
+    CLOSED_STRUCTURED_LABELS, RenderingPolicy, RenderingRoute, TimingCertainty,
 };
 
 /// Contract id bound into baseline metadata for diagnostics / later compose.
@@ -526,7 +526,9 @@ fn try_section_organize(text: &str, policy: RenderingPolicy) -> Option<String> {
             } else {
                 format!("Goal {body_text}")
             };
-            parts.push(ensure_terminal_period(&capitalize_sentence_start(&combined)));
+            parts.push(ensure_terminal_period(&capitalize_sentence_start(
+                &combined,
+            )));
             continue;
         }
 
@@ -578,11 +580,7 @@ fn try_section_organize(text: &str, policy: RenderingPolicy) -> Option<String> {
                     out.push('\n');
                 }
                 out.push_str(part);
-            } else if out
-                .lines()
-                .last()
-                .is_some_and(starts_with_numbered_marker)
-            {
+            } else if out.lines().last().is_some_and(starts_with_numbered_marker) {
                 out.push('\n');
                 out.push_str(part);
             } else {
@@ -635,10 +633,7 @@ fn preserves_surviving_content_tokens(
     is_key_subsequence(&source_keys, &rendered_keys)
 }
 
-fn surviving_source_keys(
-    tokens: &[(usize, usize, &str)],
-    sections: &[SectionSpan],
-) -> Vec<String> {
+fn surviving_source_keys(tokens: &[(usize, usize, &str)], sections: &[SectionSpan]) -> Vec<String> {
     let mut skip = vec![false; tokens.len()];
     for (idx, sec) in sections.iter().enumerate() {
         for flag in skip
@@ -1031,10 +1026,7 @@ fn spoken_list_open_boundary(
 fn spoken_list_step_number(tokens: &[(usize, usize, &str)], i: usize) -> Option<u8> {
     let cue = spoken_cue_token(tokens[i].2);
     let &(_, num) = SPOKEN_STEP_ORDINALS.iter().find(|(w, _)| *w == cue)?;
-    if i > 0
-        && !token_ends_speech_boundary(tokens[i - 1].2)
-        && preceded_by_determiner(tokens, i)
-    {
+    if i > 0 && !token_ends_speech_boundary(tokens[i - 1].2) && preceded_by_determiner(tokens, i) {
         return None;
     }
     if ordinal_followed_by_ranking_copula(tokens, i) {
@@ -1164,8 +1156,8 @@ fn apply_bare_spoken_cues_pass(text: &str) -> (String, bool) {
         let mut i = 0usize;
         while i < tokens.len() {
             if spoken_cue_token(tokens[i].2) == "quote" {
-                if let Some(j) = (i + 1..tokens.len())
-                    .find(|&j| spoken_cue_token(tokens[j].2) == "unquote")
+                if let Some(j) =
+                    (i + 1..tokens.len()).find(|&j| spoken_cue_token(tokens[j].2) == "unquote")
                 {
                     quote_pairs.push((i, j));
                     skip[i..=j].fill(true);
@@ -1308,12 +1300,8 @@ fn apply_bare_spoken_cues_pass(text: &str) -> (String, bool) {
 
 /// Lone `dash` is a cue unless it is the English noun (`a dash of salt`).
 fn dash_is_cue(tokens: &[(usize, usize, &str)], i: usize) -> bool {
-    let prev = i
-        .checked_sub(1)
-        .map(|j| spoken_cue_token(tokens[j].2));
-    let next = tokens
-        .get(i + 1)
-        .map(|token| spoken_cue_token(token.2));
+    let prev = i.checked_sub(1).map(|j| spoken_cue_token(tokens[j].2));
+    let next = tokens.get(i + 1).map(|token| spoken_cue_token(token.2));
     !matches!(
         (prev.as_deref(), next.as_deref()),
         (Some("a") | Some("the"), Some("of"))
@@ -1374,7 +1362,11 @@ fn ensure_clause_period(out: &mut String) {
         return;
     }
     // Only when there is a word to punctuate.
-    if trimmed.chars().last().is_some_and(|c| c.is_alphanumeric() || c == ')') {
+    if trimmed
+        .chars()
+        .last()
+        .is_some_and(|c| c.is_alphanumeric() || c == ')')
+    {
         let trail_ws = out.len() - trimmed.len();
         out.truncate(trimmed.len());
         out.push('.');
@@ -1410,14 +1402,8 @@ fn apply_clear_pause_breaks(text: &str, timing: &LocalTiming) -> String {
 
 fn split_on_phrases(text: &str, left: &str, right: &str) -> Option<String> {
     let tokens = word_tokens(text);
-    let left_toks: Vec<String> = left
-        .split_whitespace()
-        .map(ascii_lower)
-        .collect();
-    let right_toks: Vec<String> = right
-        .split_whitespace()
-        .map(ascii_lower)
-        .collect();
+    let left_toks: Vec<String> = left.split_whitespace().map(ascii_lower).collect();
+    let right_toks: Vec<String> = right.split_whitespace().map(ascii_lower).collect();
     if left_toks.is_empty() || right_toks.is_empty() {
         return None;
     }
@@ -1499,7 +1485,13 @@ fn apply_discourse_ok(text: &str) -> String {
 }
 
 const WEEKDAYS: &[&str] = &[
-    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
 ];
 
 fn apply_sentence_and_weekday_casing(text: &str, capitalize_weekdays: bool) -> String {
@@ -1543,11 +1535,7 @@ fn apply_sentence_and_weekday_casing(text: &str, capitalize_weekdays: bool) -> S
                     *c = 'I';
                 }
             }
-        } else if capitalize_weekdays
-            && WEEKDAYS
-                .iter()
-                .any(|w| eq_ascii_ignore_case(core, w))
-        {
+        } else if capitalize_weekdays && WEEKDAYS.iter().any(|w| eq_ascii_ignore_case(core, w)) {
             if let Some(c) = chars.get_mut(cs) {
                 *c = c.to_ascii_uppercase();
             }
@@ -1654,10 +1642,10 @@ fn line_needs_terminal(line: &str) -> bool {
         && words.iter().any(|(_, _, w)| {
             const VERBS: &[&str] = &[
                 "is", "are", "was", "were", "be", "have", "has", "had", "do", "does", "did",
-                "will", "would", "can", "could", "should", "may", "might", "must", "think",
-                "send", "ship", "meet", "file", "ignore", "enable", "returns", "works",
-                "ping", "let", "aint", "missing", "open", "clone", "use", "keep", "type",
-                "replace", "gonna", "please", "there",
+                "will", "would", "can", "could", "should", "may", "might", "must", "think", "send",
+                "ship", "meet", "file", "ignore", "enable", "returns", "works", "ping", "let",
+                "aint", "missing", "open", "clone", "use", "keep", "type", "replace", "gonna",
+                "please", "there",
             ];
             VERBS.iter().any(|v| eq_ascii_ignore_case(w, v))
         })
@@ -2068,12 +2056,7 @@ mod tests {
         for (src, expect) in cases {
             for opts in [adaptive_opts(), natural_opts(), structured_opts()] {
                 let b = organize_local_baseline(src, &opts);
-                assert_eq!(
-                    b.rendered(),
-                    expect,
-                    "src={src:?} policy={:?}",
-                    opts.policy
-                );
+                assert_eq!(b.rendered(), expect, "src={src:?} policy={:?}", opts.policy);
                 assert_opening_survives(src, b.rendered(), "here is the plan");
             }
         }
@@ -2114,7 +2097,10 @@ mod tests {
                 "I need you to take this in order. First do the deployment third report to me",
                 "take this in order",
             ),
-            ("here is the plan. first do the deployment", "here is the plan"),
+            (
+                "here is the plan. first do the deployment",
+                "here is the plan",
+            ),
         ];
         for (src, opening) in cases {
             let b = organize_local_baseline(src, &adaptive_opts());
@@ -2125,7 +2111,8 @@ mod tests {
 
     #[test]
     fn ordinal_words_without_boundary_do_not_authorize_a_list() {
-        let src = "okay first do the deployment second figure out the env variable third report to me";
+        let src =
+            "okay first do the deployment second figure out the env variable third report to me";
         let b = organize_local_baseline(src, &adaptive_opts());
         assert_eq!(
             b.rendered(),
@@ -2171,10 +2158,7 @@ mod tests {
     fn punctuated_spoken_items_become_numbered_lines() {
         let src = "Take this. First do X. Second do Y. Third do Z.";
         let b = organize_local_baseline(src, &adaptive_opts());
-        assert_eq!(
-            b.rendered(),
-            "Take this.\n1. Do X.\n2. Do Y.\n3. Do Z."
-        );
+        assert_eq!(b.rendered(), "Take this.\n1. Do X.\n2. Do Y.\n3. Do Z.");
         assert_opening_survives(src, b.rendered(), "Take this");
     }
 
@@ -2211,7 +2195,11 @@ mod tests {
             with_pause.rendered(),
             "I need you to take this in order.\n1. Do the deployment\n2. Figure out the env variable\n3. Report to me"
         );
-        assert_opening_survives(src, with_pause.rendered(), "I need you to take this in order");
+        assert_opening_survives(
+            src,
+            with_pause.rendered(),
+            "I need you to take this in order",
+        );
 
         let uncertain = organize_local_baseline(
             src,
@@ -2233,7 +2221,8 @@ mod tests {
 
     #[test]
     fn new_line_and_new_paragraph_still_convert_in_literal_identity() {
-        let line = organize_local_baseline("first thought new line second thought", &literal_opts());
+        let line =
+            organize_local_baseline("first thought new line second thought", &literal_opts());
         assert_eq!(line.rendered(), "first thought.\nsecond thought");
         let para = organize_local_baseline("intro new paragraph body text", &literal_opts());
         assert_eq!(para.rendered(), "intro.\n\nbody text");
@@ -2269,7 +2258,12 @@ mod tests {
             ("quote, leave this, unquote", "\"leave this\""),
         ];
         for (src, expect) in cases {
-            for opts in [literal_opts(), adaptive_opts(), natural_opts(), structured_opts()] {
+            for opts in [
+                literal_opts(),
+                adaptive_opts(),
+                natural_opts(),
+                structured_opts(),
+            ] {
                 let got = organize_local_baseline(src, &opts);
                 assert_eq!(
                     got.rendered(),
@@ -2291,10 +2285,7 @@ mod tests {
 
     #[test]
     fn empty_source_empty_baseline() {
-        assert_eq!(
-            organize_local_baseline("", &adaptive_opts()).rendered(),
-            ""
-        );
+        assert_eq!(organize_local_baseline("", &adaptive_opts()).rendered(), "");
     }
 
     #[test]
@@ -2359,8 +2350,7 @@ mod tests {
     fn rec_372011_groq_source() -> String {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/rec-372011-9-1787154075295-groq.txt");
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
     fn lexical_key(tok: &str) -> Option<String> {
@@ -2482,7 +2472,14 @@ mod tests {
     }
 
     fn assert_no_false_section_headers(policy: RenderingPolicy, rendered: &str) {
-        for header in ["Context:", "Notes:", "Steps:", "Files:", "Requirements:", "Constraints:"] {
+        for header in [
+            "Context:",
+            "Notes:",
+            "Steps:",
+            "Files:",
+            "Requirements:",
+            "Constraints:",
+        ] {
             assert!(
                 !rendered.contains(header),
                 "policy={policy:?}: false section header {header:?} → {rendered:?}"
@@ -2580,12 +2577,7 @@ mod tests {
         let expect = "Goal fix the flaky auth test. Context it fails on CI only. Requirements keep public API stable. Constraints no new dependencies.\n1. Reproduce\n2. Isolate\n3. Fix\n4. Verify\nAcceptance criteria CI is green on main. Files crates/voisu-core/src/auth.rs. Notes keep the change small.";
         for opts in [adaptive_opts(), natural_opts()] {
             let b = organize_local_baseline(src, &opts);
-            assert_eq!(
-                b.rendered(),
-                expect,
-                "policy={:?}",
-                opts.policy
-            );
+            assert_eq!(b.rendered(), expect, "policy={:?}", opts.policy);
         }
         let structured = organize_local_baseline(src, &structured_opts());
         let structured_lower = ascii_lower(structured.rendered());
@@ -2758,10 +2750,7 @@ mod tests {
             "say the words period and new line out loud",
             &adaptive_opts(),
         );
-        assert_eq!(
-            b.rendered(),
-            "Say the words period and new line out loud."
-        );
+        assert_eq!(b.rendered(), "Say the words period and new line out loud.");
         assert!(!b.rendered().contains('\n'));
     }
 
@@ -2771,10 +2760,7 @@ mod tests {
             "the period of the moon is twenty seven days",
             &adaptive_opts(),
         );
-        assert_eq!(
-            b.rendered(),
-            "The period of the moon is twenty seven days."
-        );
+        assert_eq!(b.rendered(), "The period of the moon is twenty seven days.");
     }
 
     #[test]
@@ -2870,9 +2856,7 @@ mod tests {
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let root: Value = serde_json::from_str(&raw).expect("corpus JSON");
-        let fixtures = root["fixtures"]
-            .as_array()
-            .expect("fixtures array");
+        let fixtures = root["fixtures"].as_array().expect("fixtures array");
 
         let mut checked = 0usize;
         for fix in fixtures {
@@ -2903,7 +2887,8 @@ mod tests {
             let source = if fix["source_selection"]["reason"] == "safe_complementary_merge" {
                 // Source selection owns the conservative merge; this harness
                 // promotes the organizer half of DPR-33 without a deferral.
-                merged_source = "open crates/voisu-core/src/lib.rs and check correlation_id".to_owned();
+                merged_source =
+                    "open crates/voisu-core/src/lib.rs and check correlation_id".to_owned();
                 merged_source.as_str()
             } else {
                 selected_source

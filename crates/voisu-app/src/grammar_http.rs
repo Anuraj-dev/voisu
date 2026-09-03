@@ -156,7 +156,10 @@ impl GrammarHttpClient {
             .client
             .post(&self.endpoint)
             .timeout(self.request_timeout)
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {bearer_token}"))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {bearer_token}"),
+            )
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "application/json")
             .json(body)
@@ -180,7 +183,10 @@ impl GrammarHttpClient {
             .client
             .post(&self.endpoint)
             .timeout(self.request_timeout)
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {bearer_token}"))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {bearer_token}"),
+            )
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "application/json")
             .body(body)
@@ -316,8 +322,8 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use std::time::Instant;
 
@@ -394,9 +400,14 @@ mod tests {
     }
 
     async fn bind_loopback() -> (TcpListener, String) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
-        (listener, format!("http://{addr}/openai/v1/chat/completions"))
+        (
+            listener,
+            format!("http://{addr}/openai/v1/chat/completions"),
+        )
     }
 
     /// Controllable HTTP/1.1 loopback using the **real** TCP path (not a reqwest
@@ -452,11 +463,8 @@ mod tests {
                 // in the mid-upload test (explicit remaining bytes under test
                 // control). No SO_RCVBUF zero-window: that blocks client
                 // teardown so the server never observes EOF/reset.
-                let partial = read_verified_partial_body(
-                    &mut socket,
-                    UPLOAD_HANG_MAX_BODY_OBSERVE,
-                )
-                .await;
+                let partial =
+                    read_verified_partial_body(&mut socket, UPLOAD_HANG_MAX_BODY_OBSERVE).await;
                 probe
                     .upload_body_bytes
                     .store(partial.body_bytes as u64, Ordering::SeqCst);
@@ -603,16 +611,12 @@ mod tests {
         loop {
             match socket.read(&mut buf).await {
                 Ok(0) | Err(_) => {
-                    probe
-                        .client_eof_observed
-                        .fetch_add(1, Ordering::SeqCst);
+                    probe.client_eof_observed.fetch_add(1, Ordering::SeqCst);
                     break;
                 }
                 Ok(n) => {
                     // Kernel-buffered remainder that arrived with/before the close.
-                    probe
-                        .bytes_after_drop
-                        .fetch_add(n as u64, Ordering::SeqCst);
+                    probe.bytes_after_drop.fetch_add(n as u64, Ordering::SeqCst);
                 }
             }
         }
@@ -700,9 +704,7 @@ mod tests {
     }
 
     fn find_header_end(buf: &[u8]) -> Option<usize> {
-        buf.windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .map(|i| i + 4)
+        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
     }
 
     fn parse_content_length(headers: &[u8]) -> Option<usize> {
@@ -836,9 +838,7 @@ mod tests {
         let server = spawn_http_server(
             listener,
             Arc::clone(&probe),
-            ReplyMode::OkJson(
-                r#"{"choices":[{"message":{"content":"{\"edits\":[]}"}}]}"#,
-            ),
+            ReplyMode::OkJson(r#"{"choices":[{"message":{"content":"{\"edits\":[]}"}}]}"#),
             None,
         )
         .await;
@@ -961,8 +961,7 @@ mod tests {
             _cx: &mut Context<'_>,
         ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
             if let Some(chunk) = self.first.take() {
-                self.yielded
-                    .fetch_add(chunk.len() as u64, Ordering::SeqCst);
+                self.yielded.fetch_add(chunk.len() as u64, Ordering::SeqCst);
                 return Poll::Ready(Some(Ok(http_body::Frame::data(chunk))));
             }
             // Remainder never yields — cancel must happen with unsent payload.

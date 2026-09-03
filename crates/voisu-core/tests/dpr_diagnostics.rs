@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use voisu_core::{
-    CloudRequest, ComposeErrorCode, CompositionDecision, DeliveryFlags, DprDiagnostic,
-    DprDiagnosticEventName, DprDiagnosticMode, DprFeedbackKind, FallbackTrigger, RenderingRoute,
-    RoutingDecision, RuleId, DPR_LOCAL_FALLBACK_MESSAGE, MAX_DPR_DIAGNOSTIC_EVENTS,
+    CloudRequest, ComposeErrorCode, CompositionDecision, DPR_LOCAL_FALLBACK_MESSAGE, DeliveryFlags,
+    DprDiagnostic, DprDiagnosticEventName, DprDiagnosticMode, DprFeedbackKind, FallbackTrigger,
+    MAX_DPR_DIAGNOSTIC_EVENTS, RenderingRoute, RoutingDecision, RuleId,
 };
 
 fn cloud_route() -> RoutingDecision {
@@ -52,10 +52,12 @@ fn production_diagnostic_records_a_bounded_utterance_end_timeline_and_hard_fallb
             DprDiagnosticEventName::DeliveryEmitted,
         ]
     );
-    assert!(diagnostic
-        .events()
-        .windows(2)
-        .all(|events| events[0].t_ms() <= events[1].t_ms()));
+    assert!(
+        diagnostic
+            .events()
+            .windows(2)
+            .all(|events| events[0].t_ms() <= events[1].t_ms())
+    );
     assert!(diagnostic.events().len() <= MAX_DPR_DIAGNOSTIC_EVENTS);
     assert_eq!(diagnostic.reason_codes(), &[ComposeErrorCode::Unverifiable]);
     assert!(!diagnostic.delivery_flags().replace_delivered());
@@ -71,10 +73,7 @@ fn production_late_evidence_is_timing_only_and_cannot_replace_delivery() {
         &[ComposeErrorCode::Deadline],
         Duration::from_millis(1_500),
     );
-    diagnostic.delivery_emitted(
-        Duration::from_millis(1_500),
-        DeliveryFlags::dpr_default(),
-    );
+    diagnostic.delivery_emitted(Duration::from_millis(1_500), DeliveryFlags::dpr_default());
     diagnostic.late_result_discarded(Duration::from_millis(1_675));
 
     let encoded = serde_json::to_string(&diagnostic).expect("serialize production diagnostic");
@@ -83,7 +82,10 @@ fn production_late_evidence_is_timing_only_and_cannot_replace_delivery() {
     assert!(!encoded.contains("candidate_text"));
     assert!(!encoded.contains("apply_late"));
     assert!(!encoded.contains("replace_delivered\":true"));
-    assert_eq!(diagnostic.events().last().expect("late event").t_ms(), 1_675);
+    assert_eq!(
+        diagnostic.events().last().expect("late event").t_ms(),
+        1_675
+    );
 }
 
 #[test]
@@ -118,10 +120,10 @@ fn feedback_is_silent_without_an_attempt_or_when_composition_accepts() {
 #[test]
 fn evaluation_feature_retains_one_clamped_candidate_for_compare_without_delivery_mutation() {
     use voisu_core::{
-        compose_structured_candidate, organize_local_baseline, parse_structured_candidate_json,
-        text_sha256_fingerprint, CloudOutcome, ComposeInput, ComposeSource, DiagnosticRecord,
-        DiagnosticStore, DprAcceptedLateCandidate, LocalBaselineOptions, RetentionPolicy,
-        SourceSelection, SttProvider, MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES, REDACTED,
+        CloudOutcome, ComposeInput, ComposeSource, DiagnosticRecord, DiagnosticStore,
+        DprAcceptedLateCandidate, LocalBaselineOptions, MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES,
+        REDACTED, RetentionPolicy, SourceSelection, SttProvider, compose_structured_candidate,
+        organize_local_baseline, parse_structured_candidate_json, text_sha256_fingerprint,
     };
 
     let secret = "eval-secret";
@@ -186,10 +188,7 @@ fn evaluation_feature_retains_one_clamped_candidate_for_compare_without_delivery
         &[ComposeErrorCode::Deadline],
         Duration::from_millis(1_500),
     );
-    evaluation.delivery_emitted(
-        Duration::from_millis(1_500),
-        DeliveryFlags::dpr_default(),
-    );
+    evaluation.delivery_emitted(Duration::from_millis(1_500), DeliveryFlags::dpr_default());
 
     assert!(evaluation.retain_late_candidate_for_compare(
         Duration::from_millis(1_675),
@@ -205,7 +204,10 @@ fn evaluation_feature_retains_one_clamped_candidate_for_compare_without_delivery
     let late = evaluation.late_evaluation().expect("evaluation record");
     assert_eq!(late.arrived_t_ms(), 1_675);
     assert!(late.candidate_text_clamped().len() <= MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES);
-    assert_eq!(late.candidate_fingerprint(), text_sha256_fingerprint(&rendered));
+    assert_eq!(
+        late.candidate_fingerprint(),
+        text_sha256_fingerprint(&rendered)
+    );
     assert!(!late.candidate_text_clamped().contains(secret));
     assert!(late.candidate_text_clamped().contains(REDACTED));
     assert!(late.compare_to_delivered());
@@ -217,8 +219,8 @@ fn evaluation_feature_retains_one_clamped_candidate_for_compare_without_delivery
     let mut record = DiagnosticRecord::new("rec-eval-redaction".to_owned(), 7);
     record.dpr = Some(evaluation);
     store.record(record).expect("persist evaluation diagnostic");
-    let on_disk = std::fs::read_to_string(dir.path().join("history.jsonl"))
-        .expect("read persisted history");
+    let on_disk =
+        std::fs::read_to_string(dir.path().join("history.jsonl")).expect("read persisted history");
     assert!(!on_disk.contains(secret), "secret persisted: {on_disk}");
     assert!(on_disk.contains(REDACTED), "redaction absent: {on_disk}");
 

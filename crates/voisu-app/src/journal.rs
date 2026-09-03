@@ -190,11 +190,9 @@ mod tests {
 
     #[test]
     fn a_failed_recording_keeps_the_historical_line_and_gains_the_timings() {
-        let lines =
-            recording_journal_lines(7, &evidence(), Some("Provider Deadline elapsed"));
+        let lines = recording_journal_lines(7, &evidence(), Some("Provider Deadline elapsed"));
         assert_eq!(
-            lines.human,
-            "Recording 7: Provider Deadline elapsed",
+            lines.human, "Recording 7: Provider Deadline elapsed",
             "the historical failure line must survive verbatim"
         );
         assert_eq!(
@@ -314,8 +312,7 @@ mod tests {
     fn a_diagnostic_without_control_characters_is_passed_through_untouched() {
         let lines = recording_journal_lines(4, &evidence(), Some(r"C:\path\not\escaped"));
         assert_eq!(
-            lines.human,
-            r"Recording 4: C:\path\not\escaped",
+            lines.human, r"Recording 4: C:\path\not\escaped",
             "escaping must not rewrite backslashes that are already literal text"
         );
     }

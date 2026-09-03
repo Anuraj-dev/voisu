@@ -9,14 +9,15 @@ use std::time::Duration;
 
 use voisu_app::dpr_cloud::{DprCloudAttempt, DprCloudErrorClass, DprCloudRequest};
 use voisu_app::dpr_pipeline::{
-    dpr_protected_tokens, dpr_source_context, dpr_transform_and_deliver, DprCloudBoundary,
-    DprCloudCapability, DprCloudFuture, DprPipelineClock, DprTransformInput, DPR_FORMAT_GATE,
+    DPR_FORMAT_GATE, DprCloudBoundary, DprCloudCapability, DprCloudFuture, DprPipelineClock,
+    DprTransformInput, dpr_protected_tokens, dpr_source_context, dpr_transform_and_deliver,
 };
 use voisu_core::{
-    organize_local_baseline, parse_format_edit_candidate_json, route_intent, sanitize_source_transcripts,
-    text_sha256_fingerprint, BoundaryFuture, CompositionDecision, Credential, DeliveryAdapter,
-    DeliveryOutcome, FormatEditCandidate, IntentObservation, LocalBaselineOptions, Provider,
-    ProviderState, RenderingPolicy, SourceTranscript, SurfaceHint, Transcript,
+    BoundaryFuture, CompositionDecision, Credential, DeliveryAdapter, DeliveryOutcome,
+    FormatEditCandidate, IntentObservation, LocalBaselineOptions, Provider, ProviderState,
+    RenderingPolicy, SourceTranscript, SurfaceHint, Transcript, organize_local_baseline,
+    parse_format_edit_candidate_json, route_intent, sanitize_source_transcripts,
+    text_sha256_fingerprint,
 };
 
 const TRIALS: usize = 3;
@@ -258,7 +259,10 @@ const CORPUS: &[Fixture] = &[
     Fixture {
         id: "paragraphs_break",
         category: "paragraphs_lists",
-        sources: &[src(Provider::Groq, "goal first thought then second thought")],
+        sources: &[src(
+            Provider::Groq,
+            "goal first thought then second thought",
+        )],
         policy: RenderingPolicy::Adaptive,
         surface_hint: None,
         open_cloud: true,
@@ -685,7 +689,8 @@ impl DprCloudBoundary for CannedCloud {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.saw_small_edit.lock().expect("flag lock") = Some(request.small_edit_contract);
         let current = self.clock.millis.load(Ordering::SeqCst);
-        let deadline = current.saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX));
+        let deadline =
+            current.saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX));
         let result = if self.honor_budget && self.complete_at > deadline {
             self.clock.millis.store(deadline, Ordering::SeqCst);
             DprCloudAttempt::failure(DprCloudErrorClass::DeadlineExceeded)
@@ -743,9 +748,9 @@ fn format_edits_for(base: &str, specs: &[EditSpec]) -> FormatEditCandidate {
         }
         let mut search = 0usize;
         let start = loop {
-            let offset = base[search..].find(spec.before).unwrap_or_else(|| {
-                panic!("edit anchor {:?} missing from {base:?}", spec.before)
-            });
+            let offset = base[search..]
+                .find(spec.before)
+                .unwrap_or_else(|| panic!("edit anchor {:?} missing from {base:?}", spec.before));
             let start = search + offset;
             let end = start + spec.before.len();
             if !claimed[start..end].iter().any(|taken| *taken) {
@@ -840,7 +845,8 @@ async fn run_trial(fixture: &Fixture) -> Trial {
         };
     }
 
-    let context = context.unwrap_or_else(|| panic!("{}: expected sanitized source context", fixture.id));
+    let context =
+        context.unwrap_or_else(|| panic!("{}: expected sanitized source context", fixture.id));
     let selected = context.selected_source.clone();
     assert!(
         !selected.is_empty(),
@@ -849,7 +855,9 @@ async fn run_trial(fixture: &Fixture) -> Trial {
     );
     if fixture.id == "mixed_outro_remaining_formats" {
         assert!(
-            !selected.to_ascii_lowercase().contains("thank you for watching"),
+            !selected
+                .to_ascii_lowercase()
+                .contains("thank you for watching"),
             "{}: anchored final outro must be stripped before format",
             fixture.id
         );
@@ -986,7 +994,12 @@ async fn run_trial(fixture: &Fixture) -> Trial {
         fixture.id
     );
     let initiated = initiated_ms.load(Ordering::SeqCst);
-    assert_ne!(initiated, u64::MAX, "{}: Delivery must record initiated time", fixture.id);
+    assert_ne!(
+        initiated,
+        u64::MAX,
+        "{}: Delivery must record initiated time",
+        fixture.id
+    );
 
     match fixture.expect {
         Expect::NoDelivery => unreachable!("NoDelivery handled before transform"),
@@ -999,7 +1012,11 @@ async fn run_trial(fixture: &Fixture) -> Trial {
                 completion.compose_decision,
                 completion.rendered
             );
-            assert_eq!(completion.rendered, expected, "{}: accepted render", fixture.id);
+            assert_eq!(
+                completion.rendered, expected,
+                "{}: accepted render",
+                fixture.id
+            );
             assert_ne!(
                 completion.rendered, baseline_text,
                 "{}: accepted text must differ from the local baseline so Accept is uniquely proven",
@@ -1033,7 +1050,11 @@ async fn run_trial(fixture: &Fixture) -> Trial {
                 );
             }
             if fixture.id == "late_after_gate_discarded" {
-                assert_eq!(calls, 1, "{}: late candidate must not replace Delivery", fixture.id);
+                assert_eq!(
+                    calls, 1,
+                    "{}: late candidate must not replace Delivery",
+                    fixture.id
+                );
                 assert_ne!(
                     completion.rendered, "Please ship the rust parser",
                     "{}: late Accept candidate must be discarded",
@@ -1042,13 +1063,22 @@ async fn run_trial(fixture: &Fixture) -> Trial {
             }
         }
         Expect::Identity => {
-            assert_eq!(completion.rendered, selected, "{}: identity render", fixture.id);
+            assert_eq!(
+                completion.rendered, selected,
+                "{}: identity render",
+                fixture.id
+            );
             assert_eq!(
                 completion.rendered, baseline_text,
                 "{}: identity baseline",
                 fixture.id
             );
-            assert_eq!(cloud_calls.load(Ordering::SeqCst), 0, "{}: identity cloud", fixture.id);
+            assert_eq!(
+                cloud_calls.load(Ordering::SeqCst),
+                0,
+                "{}: identity cloud",
+                fixture.id
+            );
         }
     }
 
@@ -1136,8 +1166,14 @@ async fn format_regression_corpus_meets_ship_gates() {
     }
 
     let format_required = trials.iter().filter(|trial| trial.format_required).count();
-    let useful = trials.iter().filter(|trial| trial.useful_formatting).count();
-    let intent_equivalent = trials.iter().filter(|trial| trial.intent_equivalent).count();
+    let useful = trials
+        .iter()
+        .filter(|trial| trial.useful_formatting)
+        .count();
+    let intent_equivalent = trials
+        .iter()
+        .filter(|trial| trial.intent_equivalent)
+        .count();
     assert!(
         format_required > 0,
         "corpus must include format-required fixtures"

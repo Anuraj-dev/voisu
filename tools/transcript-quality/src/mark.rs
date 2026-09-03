@@ -13,9 +13,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use voisu_core::{
-    is_secret_env_key, scrub_embedded_urls, scrub_secret_values, socket_path, unix_millis_now,
     Command, DaemonState, DebugAudioRecord, DiagnosticRecord, LifecycleStage, Provider,
-    ProviderTiming, Request, Response, TranscriptSelection,
+    ProviderTiming, Request, Response, TranscriptSelection, is_secret_env_key, scrub_embedded_urls,
+    scrub_secret_values, socket_path, unix_millis_now,
 };
 
 const USAGE: &str = "\
@@ -226,9 +226,8 @@ pub fn run_mark_last(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<
             correlation_id,
             file,
         }) => {
-            let text = fs::read_to_string(&file).map_err(|err| {
-                format!("cannot read reference {}: {err}", file.display())
-            })?;
+            let text = fs::read_to_string(&file)
+                .map_err(|err| format!("cannot read reference {}: {err}", file.display()))?;
             attach_reference(&corpus_dir, &correlation_id, &text, unix_millis_now())?;
             println!(
                 "attached adjudicated reference for {correlation_id} under {}",
@@ -252,15 +251,12 @@ pub fn mark_last(
     let records = load_history(config.diagnostics_dir)?;
     let record = newest_completed(&records)
         .ok_or_else(|| "no completed Recording in diagnostic history".to_owned())?;
-    let debug_audio = record
-        .debug_audio
-        .as_ref()
-        .ok_or_else(|| {
-            format!(
-                "audio already missing for {}; enable debug capture before the Recording",
-                record.correlation_id
-            )
-        })?;
+    let debug_audio = record.debug_audio.as_ref().ok_or_else(|| {
+        format!(
+            "audio already missing for {}; enable debug capture before the Recording",
+            record.correlation_id
+        )
+    })?;
     let source_audio = audio_path(config.diagnostics_dir, debug_audio)?;
     if !source_audio.is_file() {
         return Err(format!(
@@ -312,7 +308,14 @@ pub fn mark_last(
         write_private_new(&checksum_path, line.as_bytes())?;
     }
 
-    write_label(&entry_dir, record, label, note, config.now_ms, already_present)?;
+    write_label(
+        &entry_dir,
+        record,
+        label,
+        note,
+        config.now_ms,
+        already_present,
+    )?;
 
     let (disk_bytes, recording_count) = corpus_usage(config.corpus_dir)?;
     Ok(Promotion {
@@ -379,7 +382,11 @@ pub fn render_promotion(promotion: &Promotion) -> String {
         promotion.corpus_dir.display(),
         format_bytes(promotion.disk_bytes),
         promotion.recording_count,
-        if promotion.recording_count == 1 { "" } else { "s" },
+        if promotion.recording_count == 1 {
+            ""
+        } else {
+            "s"
+        },
     )
 }
 
@@ -571,8 +578,8 @@ fn build_snapshot(
         .final_transcript
         .as_ref()
         .map(|text| scrub_text(text, &secrets));
-    let reconstruction_candidate = reconstruction_candidate(record)
-        .map(|text| scrub_text(&text, &secrets));
+    let reconstruction_candidate =
+        reconstruction_candidate(record).map(|text| scrub_text(&text, &secrets));
     let model_id = record
         .smart_writing
         .as_ref()
@@ -725,9 +732,7 @@ fn daemon_state() -> Option<DaemonState> {
     stream
         .set_write_timeout(Some(Duration::from_secs(1)))
         .ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
     serde_json::to_writer(&mut stream, &Request::new(Command::Status)).ok()?;
     stream.write_all(b"\n").ok()?;
     let mut line = String::new();
@@ -857,9 +862,8 @@ fn create_private_dir(path: &Path) -> Result<(), String> {
                     path.display()
                 ));
             }
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|err| {
-                format!("cannot set permissions on {}: {err}", path.display())
-            })
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .map_err(|err| format!("cannot set permissions on {}: {err}", path.display()))
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             if let Some(parent) = path.parent() {
@@ -886,9 +890,8 @@ fn read_regular_file(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn ensure_private_file(path: &Path) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path).map_err(|err| {
-        format!("cannot set permissions on {}: {err}", path.display())
-    })?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("cannot set permissions on {}: {err}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(format!("not a regular file: {}", path.display()));
     }

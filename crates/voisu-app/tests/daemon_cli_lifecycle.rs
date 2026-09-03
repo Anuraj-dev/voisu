@@ -7,21 +7,21 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tempfile::TempDir;
 use voisu_app::system::{
-    CAPTURE_FINALIZE_DEADLINE, CLIPBOARD_DELIVERY_DEADLINE,
-    INTENT_RECONSTRUCTION_DEADLINE, LIBEI_DELIVERY_DEADLINE, PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE,
+    CAPTURE_FINALIZE_DEADLINE, CLIPBOARD_DELIVERY_DEADLINE, INTENT_RECONSTRUCTION_DEADLINE,
+    LIBEI_DELIVERY_DEADLINE, PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE,
     RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
 };
 
@@ -76,9 +76,7 @@ fn disable_shortcuts_unless_bus_injected(command: &mut Command, environment: &[(
         .any(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
     {
         command.env("VOISU_DISABLE_SHORTCUTS", "1");
-        if std::env::var_os("VOISU_LIVE_SMOKE").as_deref()
-            != Some(std::ffi::OsStr::new("1"))
-        {
+        if std::env::var_os("VOISU_LIVE_SMOKE").as_deref() != Some(std::ffi::OsStr::new("1")) {
             command.env("VOISU_DISABLE_DIRECT_DELIVERY", "1");
         }
     }
@@ -92,10 +90,7 @@ fn disable_shortcuts_unless_bus_injected(command: &mut Command, environment: &[(
 /// test that sets its own `XDG_CONFIG_HOME` opts out and drives the config
 /// itself. An explicit `VOISU_DISABLE_DEEPGRAM` still wins inside the isolated
 /// config, so it must not expose unrelated host settings such as Writing Mode.
-fn isolate_deepgram_config(
-    command: &mut Command,
-    environment: &[(&str, &str)],
-) -> Option<TempDir> {
+fn isolate_deepgram_config(command: &mut Command, environment: &[(&str, &str)]) -> Option<TempDir> {
     // Strip any inherited override from the parent shell/CI. An explicit test
     // override is restored from `environment` after this helper returns.
     command.env_remove("VOISU_DISABLE_DEEPGRAM");
@@ -255,8 +250,8 @@ impl Daemon {
         let deepgram_disabled = environment
             .iter()
             .any(|(name, _)| *name == "VOISU_DISABLE_DEEPGRAM");
-        let live_smoke = std::env::var_os("VOISU_LIVE_SMOKE").as_deref()
-            == Some(std::ffi::OsStr::new("1"));
+        let live_smoke =
+            std::env::var_os("VOISU_LIVE_SMOKE").as_deref() == Some(std::ffi::OsStr::new("1"));
         let original_path = environment
             .iter()
             .find_map(|(name, value)| (*name == "PATH").then_some((*value).to_owned()))
@@ -439,8 +434,7 @@ cat > "$dir/clipboard"
     assert!(pipewire_args.contains(
         "--raw\n--rate\n16000\n--channels\n1\n--format\ns16\n--target\ntest-microphone\n-\n"
     ));
-    let clipboard_environment =
-        fs::read_to_string(commands.path().join("wl-copy.env")).unwrap();
+    let clipboard_environment = fs::read_to_string(commands.path().join("wl-copy.env")).unwrap();
     assert!(!clipboard_environment.contains("VOISU_GROQ_API_KEY="));
     assert!(!clipboard_environment.contains("VOISU_TEST_"));
 }
@@ -684,7 +678,11 @@ cat > "$dir/clipboard"
         commands.path(),
         MockDeepgramBehavior::Finalize("hello from Deepgram"),
     );
-    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let _daemon = Daemon::start_production_with_env(
         runtime.path(),
         &[
@@ -695,7 +693,10 @@ cat > "$dir/clipboard"
             ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
             ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
             ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
-            ("VOISU_GROQ_TRANSCRIPTION_URL", "https://groq.test/audio/transcriptions"),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
             ("VOISU_RECORDING_DEADLINE_MS", "5000"),
         ],
     );
@@ -709,7 +710,10 @@ cat > "$dir/clipboard"
 
     // No --raw was passed (that is the whole point of the WAV path).
     let pw_args = fs::read_to_string(commands.path().join("pw-record.args")).unwrap();
-    assert!(!pw_args.contains("--raw"), "pw-record must be invoked without --raw: {pw_args}");
+    assert!(
+        !pw_args.contains("--raw"),
+        "pw-record must be invoked without --raw: {pw_args}"
+    );
 
     // The provider received exactly the PCM payload — the 44-byte RIFF/WAVE
     // header was stripped. A byte-for-byte match rules out both a leaked header
@@ -719,7 +723,10 @@ cat > "$dir/clipboard"
         !received.starts_with(b"RIFF"),
         "the WAV header must not reach the provider"
     );
-    assert_eq!(received, pcm, "the provider must receive the stripped PCM byte for byte");
+    assert_eq!(
+        received, pcm,
+        "the provider must receive the stripped PCM byte for byte"
+    );
 }
 
 #[test]
@@ -776,7 +783,11 @@ dir=$(dirname "$0")
 cat > /dev/null
 "#,
     );
-    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let _daemon = Daemon::start_production_with_env(
         runtime.path(),
         &[
@@ -786,7 +797,10 @@ cat > /dev/null
             ("DISPLAY", ":0"),
             ("XAUTHORITY", xauthority.to_str().unwrap()),
             ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
-            ("VOISU_GROQ_TRANSCRIPTION_URL", "https://groq.test/audio/transcriptions"),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
             ("VOISU_RECORDING_DEADLINE_MS", "5000"),
         ],
     );
@@ -908,7 +922,11 @@ dir=$(dirname "$0")
 cat > "$dir/xclip.stdin"
 "#,
     );
-    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let _daemon = Daemon::start_production_with_env(
         runtime.path(),
         &[
@@ -919,7 +937,10 @@ cat > "$dir/xclip.stdin"
             ("DISPLAY", ""),
             ("XDG_SESSION_TYPE", ""),
             ("VOISU_GROQ_API_KEY", "groq-controlled-secret"),
-            ("VOISU_GROQ_TRANSCRIPTION_URL", "https://groq.test/audio/transcriptions"),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/audio/transcriptions",
+            ),
             ("VOISU_RECORDING_DEADLINE_MS", "5000"),
         ],
     );
@@ -958,11 +979,7 @@ fn dictionary_edits_between_recordings_reach_providers_and_the_comparator() {
         "pw-record",
         "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do /usr/bin/sleep 1; i=$((i + 1)); done\n",
     );
-    write_fake_command(
-        commands.path(),
-        "wl-copy",
-        "#!/bin/sh\ncat > /dev/null\n",
-    );
+    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
     let deepgram_endpoint = spawn_mock_deepgram(
         commands.path(),
         MockDeepgramBehavior::Finalize("The FriendName account is ready."),
@@ -1002,8 +1019,7 @@ fn dictionary_edits_between_recordings_reach_providers_and_the_comparator() {
     );
     let first_history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     assert_eq!(
-        first_history["history"][0]["final_transcript"],
-        "The friendname account is ready.",
+        first_history["history"][0]["final_transcript"], "The friendname account is ready.",
         "without the user term the comparator keeps the Groq default: {first_history}"
     );
     assert_eq!(
@@ -1055,14 +1071,10 @@ fn dictionary_edits_between_recordings_reach_providers_and_the_comparator() {
     );
     let second_history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     assert_eq!(
-        second_history["history"][0]["final_transcript"],
-        "The FriendName account is ready.",
+        second_history["history"][0]["final_transcript"], "The FriendName account is ready.",
         "the second Recording's comparator must use the edited snapshot: {second_history}"
     );
-    assert_eq!(
-        second_history["history"][0]["selection"],
-        "source_deepgram"
-    );
+    assert_eq!(second_history["history"][0]["selection"], "source_deepgram");
 
     let requests = groq_requests.recv_timeout(Duration::from_secs(3)).unwrap();
     groq_server.join().unwrap();
@@ -1218,7 +1230,10 @@ printf '%s' "$((count + 1))" > "$dir/delivery.count"
             wait_for_marker(commands.path(), "pw-record.ready");
             let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
             assert_eq!(stopped["ok"], true, "{failure}: {stopped}");
-            assert_eq!(stopped["evidence"]["delivery_count"], 1, "{failure}: {stopped}");
+            assert_eq!(
+                stopped["evidence"]["delivery_count"], 1,
+                "{failure}: {stopped}"
+            );
             assert_eq!(
                 stopped["evidence"]["source_transcript_providers"],
                 serde_json::json!(["deepgram"]),
@@ -1235,7 +1250,11 @@ printf '%s' "$((count + 1))" > "$dir/delivery.count"
             "Provider fallback.",
             "{failure}"
         );
-        assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n", "{failure}");
+        assert_eq!(
+            stdout(&voisu(runtime.path(), "status")),
+            "idle\n",
+            "{failure}"
+        );
         daemon.terminate();
     }
 }
@@ -1607,7 +1626,11 @@ fn production_groq_quality_failure_is_classified_through_the_public_cli() {
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
     let (endpoint, request_rx, server) = local_groq_server("   ");
-    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let _daemon = Daemon::start_production_with_env(
         runtime.path(),
         &[
@@ -1637,9 +1660,16 @@ fn production_groq_5xx_is_recoverable_through_the_public_cli() {
         "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
-    let (endpoint, request_rx, server) =
-        local_groq_response_server("503 Service Unavailable", "unavailable".to_owned(), Duration::ZERO);
-    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let (endpoint, request_rx, server) = local_groq_response_server(
+        "503 Service Unavailable",
+        "unavailable".to_owned(),
+        Duration::ZERO,
+    );
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let _daemon = Daemon::start_production_with_env(
         runtime.path(),
         &[
@@ -1674,7 +1704,11 @@ fn production_slow_groq_endpoint_is_bounded_and_recoverable() {
         serde_json::json!({ "text": "late Transcript" }).to_string(),
         Duration::from_secs(16),
     );
-    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let daemon = Daemon::start_production_with_env(
         runtime.path(),
         &[
@@ -1710,7 +1744,11 @@ fn production_capture_death_mid_recording_self_recovers_without_stop() {
         "pw-record",
         "#!/bin/sh\nprintf '\\100\\000'\ntrap - EXIT\nexit 7\n",
     );
-    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let daemon = Daemon::start_production_with_env(
         runtime.path(),
         &[("PATH", &path), ("VOISU_GROQ_API_KEY", "controlled-secret")],
@@ -1751,7 +1789,11 @@ fn an_over_long_recording_maximum_override_is_reported_at_startup() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
     write_fake_command(commands.path(), "pw-record", "#!/bin/sh\nsleep 0\n");
-    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let daemon = Daemon::start_production_with_env(
         runtime.path(),
         &[
@@ -1920,7 +1962,10 @@ fn local_minimal_grammar_server(
                 authorized = true;
             }
         }
-        assert!(authorized, "Minimal Grammar credential must be ready before the gate");
+        assert!(
+            authorized,
+            "Minimal Grammar credential must be ready before the gate"
+        );
         let mut request_body = vec![0_u8; content_length];
         reader.read_exact(&mut request_body).unwrap();
         let request: Value = serde_json::from_slice(&request_body).unwrap();
@@ -2087,7 +2132,9 @@ fn local_groq_response_server(
     let (request_tx, request_rx) = mpsc::channel();
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
         let mut reader = BufReader::new(stream);
         let mut content_length = 0_usize;
         let mut authorized = false;
@@ -2105,7 +2152,10 @@ fn local_groq_response_server(
                 authorized = true;
             }
         }
-        assert!(authorized, "Groq credential must be sent in the HTTP header");
+        assert!(
+            authorized,
+            "Groq credential must be sent in the HTTP header"
+        );
         let mut request_body = vec![0_u8; content_length];
         reader.read_exact(&mut request_body).unwrap();
         request_tx.send(request_body).unwrap();
@@ -2119,7 +2169,11 @@ fn local_groq_response_server(
             response_body
         );
     });
-    (format!("http://{address}/audio/transcriptions"), request_rx, server)
+    (
+        format!("http://{address}/audio/transcriptions"),
+        request_rx,
+        server,
+    )
 }
 
 fn local_groq_chunk_server(
@@ -2139,7 +2193,9 @@ fn local_groq_chunk_server(
         let mut requests = Vec::new();
         for transcript in transcripts {
             let (stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
             let mut reader = BufReader::new(stream);
             let mut content_length = 0_usize;
             loop {
@@ -2179,9 +2235,8 @@ fn local_groq_chunk_server(
 #[ignore = "requires Fedora PipeWire, a microphone, Groq credentials, wl-copy, and VOISU_LIVE_SMOKE=1"]
 fn live_fedora_microphone_groq_and_clipboard_smoke() {
     assert_eq!(std::env::var("VOISU_LIVE_SMOKE").as_deref(), Ok("1"));
-    let runtime = PathBuf::from(
-        std::env::var_os("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR is required"),
-    );
+    let runtime =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR is required"));
     let _daemon = Daemon::start_production_with_env(&runtime, &[]);
     assert!(voisu(&runtime, "start").status.success());
     eprintln!("Speak now; the live smoke Recording lasts three seconds");
@@ -2190,7 +2245,10 @@ fn live_fedora_microphone_groq_and_clipboard_smoke() {
     assert!(stopped.status.success(), "{}", stderr(&stopped));
     let clipboard = Command::new("wl-paste").output().unwrap();
     assert!(clipboard.status.success());
-    assert!(!clipboard.stdout.is_empty(), "Transcript must remain on the clipboard");
+    assert!(
+        !clipboard.stdout.is_empty(),
+        "Transcript must remain on the clipboard"
+    );
 }
 
 #[test]
@@ -2202,9 +2260,8 @@ fn live_fedora_full_workflow_recovers_the_next_recording_after_daemon_interrupti
         std::env::var("VOISU_LIVE_RECOVERY_SMOKE").as_deref(),
         Ok("1")
     );
-    let runtime = PathBuf::from(
-        std::env::var_os("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR is required"),
-    );
+    let runtime =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR is required"));
     let run = |arguments: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_voisu"))
             .args(arguments)
@@ -2276,7 +2333,10 @@ fn live_fedora_full_workflow_recovers_the_next_recording_after_daemon_interrupti
     assert_ne!(original_main_pid, restarted_main_pid);
     let clipboard = Command::new("wl-paste").output().unwrap();
     assert!(clipboard.status.success());
-    assert!(!clipboard.stdout.is_empty(), "Transcript must remain on the clipboard");
+    assert!(
+        !clipboard.stdout.is_empty(),
+        "Transcript must remain on the clipboard"
+    );
     cleanup.finish();
 }
 
@@ -2300,11 +2360,15 @@ impl LiveServiceCleanup {
             "live recovery smoke requires Voisu to be uninstalled so it cannot overwrite a real installation"
         );
         assert!(
-            !live_systemctl(&["is-active", "voisu.service"]).status.success(),
+            !live_systemctl(&["is-active", "voisu.service"])
+                .status
+                .success(),
             "live recovery smoke requires an inactive voisu.service"
         );
         assert!(
-            !live_systemctl(&["is-enabled", "voisu.service"]).status.success(),
+            !live_systemctl(&["is-enabled", "voisu.service"])
+                .status
+                .success(),
             "live recovery smoke requires a disabled voisu.service"
         );
         cleanup
@@ -2333,8 +2397,16 @@ impl LiveServiceCleanup {
             assert!(reloaded.status.success(), "{}", stderr(&reloaded));
             assert!(!self.unit.exists());
             assert!(!self.daemon.exists());
-            assert!(!live_systemctl(&["is-active", "voisu.service"]).status.success());
-            assert!(!live_systemctl(&["is-enabled", "voisu.service"]).status.success());
+            assert!(
+                !live_systemctl(&["is-active", "voisu.service"])
+                    .status
+                    .success()
+            );
+            assert!(
+                !live_systemctl(&["is-enabled", "voisu.service"])
+                    .status
+                    .success()
+            );
         }
         let _ = live_systemctl(&["reset-failed", "voisu.service"]);
     }
@@ -2366,12 +2438,7 @@ fn live_systemctl(arguments: &[&str]) -> Output {
 }
 
 fn live_service_main_pid() -> u32 {
-    let output = live_systemctl(&[
-        "show",
-        "--property=MainPID",
-        "--value",
-        "voisu.service",
-    ]);
+    let output = live_systemctl(&["show", "--property=MainPID", "--value", "voisu.service"]);
     assert!(output.status.success(), "{}", stderr(&output));
     stdout(&output).trim().parse().unwrap()
 }
@@ -2503,10 +2570,8 @@ fn silent_recording_is_distinct_and_recoverable_through_the_public_cli() {
 #[test]
 fn status_is_responsive_and_processing_is_observable_during_provider_work() {
     let runtime = TempDir::new().unwrap();
-    let _daemon = Daemon::start_with_env(
-        runtime.path(),
-        &[("VOISU_TEST_PROVIDER_DELAY_MS", "400")],
-    );
+    let _daemon =
+        Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_PROVIDER_DELAY_MS", "400")]);
     assert!(voisu(runtime.path(), "start").status.success());
 
     let runtime_dir = runtime.path().to_owned();
@@ -2556,10 +2621,7 @@ fn capture_finalization_failure_is_redacted_and_the_next_recording_succeeds() {
 #[test]
 fn capture_pump_panic_fails_the_recording_and_the_next_recording_succeeds() {
     let runtime = TempDir::new().unwrap();
-    let _daemon = Daemon::start_with_env(
-        runtime.path(),
-        &[("VOISU_TEST_CAPTURE_PUMP_PANIC", "1")],
-    );
+    let _daemon = Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_CAPTURE_PUMP_PANIC", "1")]);
     assert!(voisu(runtime.path(), "start").status.success());
     thread::sleep(Duration::from_millis(50));
 
@@ -2590,10 +2652,7 @@ fn capture_pump_panic_fails_the_recording_and_the_next_recording_succeeds() {
 #[test]
 fn processing_task_panic_records_aborted_unknown_outcomes_and_rebuilds_adapters() {
     let runtime = TempDir::new().unwrap();
-    let _daemon = Daemon::start_with_env(
-        runtime.path(),
-        &[("VOISU_TEST_DELIVERY_PANIC", "1")],
-    );
+    let _daemon = Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_DELIVERY_PANIC", "1")]);
     assert!(voisu(runtime.path(), "start").status.success());
 
     let failed = voisu(runtime.path(), "stop");
@@ -2974,13 +3033,12 @@ fn serve_mock_deepgram_connection(
     markers: &Path,
     behavior: MockDeepgramBehavior,
 ) {
-    use tungstenite::handshake::server::{Request as WsRequest, Response as WsResponse};
     use tungstenite::Message;
+    use tungstenite::handshake::server::{Request as WsRequest, Response as WsResponse};
 
     let mut handshake = String::new();
-    let accepted = tungstenite::accept_hdr(
-        connection,
-        |request: &WsRequest, response: WsResponse| {
+    let accepted =
+        tungstenite::accept_hdr(connection, |request: &WsRequest, response: WsResponse| {
             handshake = format!(
                 "{}\n{}",
                 request.uri(),
@@ -2991,8 +3049,7 @@ fn serve_mock_deepgram_connection(
                     .unwrap_or_default()
             );
             Ok(response)
-        },
-    );
+        });
     let Ok(mut socket) = accepted else { return };
     fs::write(markers.join("deepgram.handshake"), handshake).unwrap();
     let mut audio_bytes = 0_usize;
@@ -3003,7 +3060,11 @@ fn serve_mock_deepgram_connection(
             Ok(Message::Binary(bytes)) => {
                 audio_bytes += bytes.len();
                 audio.extend_from_slice(&bytes);
-                fs::write(markers.join("deepgram.audio-bytes"), audio_bytes.to_string()).unwrap();
+                fs::write(
+                    markers.join("deepgram.audio-bytes"),
+                    audio_bytes.to_string(),
+                )
+                .unwrap();
                 fs::write(markers.join("deepgram.audio"), &audio).unwrap();
                 fs::write(markers.join("deepgram.ready"), "").unwrap();
                 if matches!(behavior, MockDeepgramBehavior::StreamingError) && !error_sent {
@@ -3038,11 +3099,7 @@ fn serve_mock_deepgram_connection(
     fs::write(markers.join("deepgram.closed"), "").unwrap();
 }
 
-fn start_portal_clipboard_daemon(
-    runtime: &Path,
-    commands: &Path,
-    portal_address: &str,
-) -> Daemon {
+fn start_portal_clipboard_daemon(runtime: &Path, commands: &Path, portal_address: &str) -> Daemon {
     write_fake_command(
         commands,
         "pw-record",
@@ -3076,11 +3133,7 @@ count=$(cat "$dir/delivery.count" 2>/dev/null || printf '0')
 printf '%s' "$((count + 1))" > "$dir/delivery.count"
 "#,
     );
-    let path = format!(
-        "{}:{}",
-        commands.display(),
-        std::env::var("PATH").unwrap()
-    );
+    let path = format!("{}:{}", commands.display(), std::env::var("PATH").unwrap());
     Daemon::start_production_with_env(
         runtime,
         &[
@@ -3146,10 +3199,7 @@ fn ipc_request_with_page_count(runtime_dir: &Path, request: &str) -> (Value, usi
         if page["last"] != true {
             continue;
         }
-        response
-            .as_object_mut()
-            .unwrap()
-            .remove("diagnostic_page");
+        response.as_object_mut().unwrap().remove("diagnostic_page");
         let field = if request.contains(r#""command":"history""#) {
             "history"
         } else {
@@ -3227,9 +3277,7 @@ fn doctor_rejects_a_daemon_started_without_wayland_display() {
     );
     let status = ipc_request(
         runtime.path(),
-        &format!(
-            r#"{{"version":{PROTOCOL_VERSION},"command":"status"}}"#
-        ),
+        &format!(r#"{{"version":{PROTOCOL_VERSION},"command":"status"}}"#),
     );
     assert_eq!(status["readiness"]["session_type"], "wayland");
     assert_eq!(status["readiness"]["wayland_display"], "");
@@ -3251,8 +3299,14 @@ fn doctor_rejects_a_daemon_started_without_wayland_display() {
     );
     let output = stdout(&doctor);
     assert_eq!(doctor.status.code(), Some(4), "{output}");
-    assert!(output.contains(&doctor_line("Daemon session", "Wayland / missing", "FAIL")), "{output}");
-    assert!(output.contains(&doctor_line("Daemon clipboard", "not installed", "FAIL")), "{output}");
+    assert!(
+        output.contains(&doctor_line("Daemon session", "Wayland / missing", "FAIL")),
+        "{output}"
+    );
+    assert!(
+        output.contains(&doctor_line("Daemon clipboard", "not installed", "FAIL")),
+        "{output}"
+    );
 }
 
 #[test]
@@ -3283,7 +3337,14 @@ fn doctor_rejects_a_daemon_with_a_stale_wayland_display() {
     );
     let output = stdout(&doctor);
     assert_eq!(doctor.status.code(), Some(4), "{output}");
-    assert!(output.contains(&doctor_line("Daemon session", "Wayland / wayland-1", "FAIL")), "{output}");
+    assert!(
+        output.contains(&doctor_line(
+            "Daemon session",
+            "Wayland / wayland-1",
+            "FAIL"
+        )),
+        "{output}"
+    );
     assert!(output.contains("voisu service restart"), "{output}");
 }
 
@@ -3317,7 +3378,11 @@ fn doctor_rejects_a_daemon_from_a_different_hyprland_instance() {
     let output = stdout(&doctor);
     assert_eq!(doctor.status.code(), Some(4), "{output}");
     assert!(
-        output.contains(&doctor_line("Daemon session", "Wayland / wayland-1", "FAIL")),
+        output.contains(&doctor_line(
+            "Daemon session",
+            "Wayland / wayland-1",
+            "FAIL"
+        )),
         "{output}"
     );
 }
@@ -3342,7 +3407,10 @@ fn doctor_rejects_x11_clipboard_readiness_with_stale_xauthority() {
         runtime.path(),
         &format!(r#"{{"version":{PROTOCOL_VERSION},"command":"status"}}"#),
     );
-    assert_eq!(status["readiness"]["x_authority"], "/run/user/1000/old-xauth");
+    assert_eq!(
+        status["readiness"]["x_authority"],
+        "/run/user/1000/old-xauth"
+    );
 
     let config_home = TempDir::new().unwrap();
     let doctor = voisu_isolated(
@@ -3376,11 +3444,19 @@ fn doctor_reports_clipboard_only_when_hyprland_paste_is_unverified() {
     let config_home = TempDir::new().unwrap();
     let voisu_config = config_home.path().join("voisu");
     fs::create_dir_all(&voisu_config).unwrap();
-    fs::write(voisu_config.join("config.toml"), "delivery_mode = \"clipboard\"\n").unwrap();
+    fs::write(
+        voisu_config.join("config.toml"),
+        "delivery_mode = \"clipboard\"\n",
+    )
+    .unwrap();
     let commands = TempDir::new().unwrap();
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat >/dev/null\n");
     write_fake_command(commands.path(), "wl-paste", "exit 0\n");
-    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let runtime = TempDir::new().unwrap();
     let config_home_value = config_home.path().to_str().unwrap();
     let _daemon = Daemon::start_with_env(
@@ -3441,7 +3517,11 @@ printf '[{"key":"P","modmask":5,"description":"Paste transcript","dispatcher":"e
 "#,
     );
     write_fake_command(commands.path(), "wl-copy", "cat >/dev/null\n");
-    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start_production_with_env(
         runtime.path(),
@@ -3473,7 +3553,11 @@ fn doctor_reports_hyprland_overlay_readiness() {
     let commands = TempDir::new().unwrap();
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat >/dev/null\n");
     write_fake_command(commands.path(), "wl-paste", "exit 0\n");
-    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start_with_env(
         runtime.path(),
@@ -3502,7 +3586,10 @@ fn doctor_reports_hyprland_overlay_readiness() {
     );
     let output = stdout(&doctor);
     assert!(doctor.status.success(), "{output}");
-    assert!(output.contains(&doctor_line("Overlay", "active", "PASS")), "{output}");
+    assert!(
+        output.contains(&doctor_line("Overlay", "active", "PASS")),
+        "{output}"
+    );
 }
 
 #[test]
@@ -3554,7 +3641,11 @@ fn doctor_accepts_a_recovered_daemon_session_and_reports_backend_state() {
         "wl-paste",
         "echo 'failed to connect to a Wayland server: No such file or directory' >&2\nexit 1\n",
     );
-    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start_with_env(
         runtime.path(),
@@ -3582,7 +3673,14 @@ fn doctor_accepts_a_recovered_daemon_session_and_reports_backend_state() {
     );
     let output = stdout(&doctor);
     assert_eq!(doctor.status.code(), Some(4), "{output}");
-    assert!(output.contains(&doctor_line("Daemon session", "Wayland / wayland-3", "PASS")), "{output}");
+    assert!(
+        output.contains(&doctor_line(
+            "Daemon session",
+            "Wayland / wayland-3",
+            "PASS"
+        )),
+        "{output}"
+    );
     assert!(
         output.contains(&doctor_line("Daemon clipboard", "wl-copy", "FAIL")),
         "session recovery must not false-green Daemon clipboard from PATH plus display env: {output}"
@@ -3598,7 +3696,11 @@ fn doctor_rejects_daemon_clipboard_when_wl_copy_cannot_reach_the_display() {
         "wl-paste",
         "echo 'failed to connect to a Wayland server: No such file or directory' >&2\nexit 1\n",
     );
-    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start_with_env(
         runtime.path(),
@@ -3670,7 +3772,11 @@ fn doctor_renders_the_service_env_warning_as_a_terse_row() {
         stdout(&doctor)
     );
     // No action line on a WARN.
-    assert!(!stdout(&doctor).contains("\n    voisu service restart"), "{}", stdout(&doctor));
+    assert!(
+        !stdout(&doctor).contains("\n    voisu service restart"),
+        "{}",
+        stdout(&doctor)
+    );
     let verbose = voisu_with_env(runtime.path(), &["doctor", "--verbose"], &environment);
     assert!(
         stdout(&verbose).contains("voisu service restart"),
@@ -3774,11 +3880,23 @@ fn doctor_exposes_actionable_warn_and_fail_outcomes() {
     assert_eq!(doctor.status.code(), Some(4));
     let output = stdout(&doctor);
     // A FAIL check prints its status line and an indented action line.
-    assert!(output.contains(&doctor_line("PipeWire", "1.4.11 (raw)", "FAIL")), "{output}");
-    assert!(output.contains("\n    run the printed remediation command\n"), "{output}");
+    assert!(
+        output.contains(&doctor_line("PipeWire", "1.4.11 (raw)", "FAIL")),
+        "{output}"
+    );
+    assert!(
+        output.contains("\n    run the printed remediation command\n"),
+        "{output}"
+    );
     // A WARN prints just the one line — no action, even though it has one.
-    assert!(output.contains(&doctor_line("Clipboard", "", "WARN")), "{output}");
-    assert!(output.contains(&doctor_line("Daemon", "", "FAIL")), "{output}");
+    assert!(
+        output.contains(&doctor_line("Clipboard", "", "WARN")),
+        "{output}"
+    );
+    assert!(
+        output.contains(&doctor_line("Daemon", "", "FAIL")),
+        "{output}"
+    );
     assert!(
         output.contains("\n    start voisu-daemon and run voisu doctor again\n"),
         "{output}"
@@ -3805,7 +3923,10 @@ fn doctor_points_at_the_journal_when_the_service_unit_is_failed() {
     assert_eq!(doctor.status.code(), Some(4));
     let output = stdout(&doctor);
     // The terse Daemon FAIL line plus the journal action on its own indented line.
-    assert!(output.contains(&doctor_line("Daemon", "", "FAIL")), "{output}");
+    assert!(
+        output.contains(&doctor_line("Daemon", "", "FAIL")),
+        "{output}"
+    );
     assert!(
         output.contains("\n    journalctl --user -u voisu.service\n"),
         "{output}"
@@ -3824,24 +3945,43 @@ fn doctor_warns_when_the_portal_exposes_no_global_shortcuts() {
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[
+            ("PATH", &commands.path()),
+            ("WAYLAND_DISPLAY", "wayland-fake"),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
     );
 
     // Terse: the WARN line carries no reasoning and no action line (actions are
     // reserved for FAIL).
     let out = stdout(&doctor);
     assert!(out.contains(&doctor_line("Portals", "", "WARN")), "{out}");
-    assert!(!out.contains("voisu toggle"), "no action/reasoning on a terse WARN: {out}");
+    assert!(
+        !out.contains("voisu toggle"),
+        "no action/reasoning on a terse WARN: {out}"
+    );
     // The reasoning (GlobalShortcuts / Hyprland / the toggle recipe) moves behind
     // --verbose.
     let verbose = voisu_with_env(
         runtime.path(),
         &["doctor", "--verbose"],
-        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[
+            ("PATH", &commands.path()),
+            ("WAYLAND_DISPLAY", "wayland-fake"),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
     );
     let verbose_out = stdout(&verbose);
-    assert!(verbose_out.contains("no GlobalShortcuts interface"), "{verbose_out}");
-    assert!(verbose_out.contains("xdg-desktop-portal-hyprland"), "{verbose_out}");
+    assert!(
+        verbose_out.contains("no GlobalShortcuts interface"),
+        "{verbose_out}"
+    );
+    assert!(
+        verbose_out.contains("xdg-desktop-portal-hyprland"),
+        "{verbose_out}"
+    );
     assert!(verbose_out.contains("voisu toggle"), "{verbose_out}");
 }
 
@@ -3855,7 +3995,12 @@ fn doctor_passes_portals_when_global_shortcuts_are_available() {
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[
+            ("PATH", &commands.path()),
+            ("WAYLAND_DISPLAY", "wayland-fake"),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
     );
 
     assert!(
@@ -3873,12 +4018,20 @@ fn doctor_exercises_real_capabilities_instead_of_command_headings_or_socket_conn
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[
+            ("PATH", &commands.path()),
+            ("WAYLAND_DISPLAY", "wayland-fake"),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
     );
 
     assert!(doctor.status.success(), "{}", stderr(&doctor));
     assert_eq!(commands.read("pw-cli.args"), "info\n0\n");
-    assert_eq!(commands.read("wpctl.args"), "inspect\n@DEFAULT_AUDIO_SOURCE@\n");
+    assert_eq!(
+        commands.read("wpctl.args"),
+        "inspect\n@DEFAULT_AUDIO_SOURCE@\n"
+    );
     assert_eq!(
         commands.read("busctl.status.args"),
         "--user\n--no-pager\nstatus\norg.freedesktop.portal.Desktop\n"
@@ -3913,7 +4066,12 @@ fn doctor_clipboard_passes_while_wl_copy_serves_the_clipboard_past_exit() {
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[
+            ("PATH", &commands.path()),
+            ("WAYLAND_DISPLAY", "wayland-fake"),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
     );
 
     assert!(doctor.status.success(), "{}", stdout(&doctor));
@@ -3944,7 +4102,12 @@ fn doctor_reports_a_reachable_secret_service_without_a_match_as_pass() {
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[
+            ("PATH", &commands.path()),
+            ("WAYLAND_DISPLAY", "wayland-fake"),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
     );
 
     assert!(doctor.status.success(), "{}", stderr(&doctor));
@@ -3971,7 +4134,12 @@ fn doctor_warns_when_the_secret_service_reports_an_error() {
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[
+            ("PATH", &commands.path()),
+            ("WAYLAND_DISPLAY", "wayland-fake"),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
     );
 
     assert!(
@@ -3988,7 +4156,12 @@ fn doctor_warns_when_the_secret_service_reports_an_error() {
     let verbose = voisu_with_env(
         runtime.path(),
         &["doctor", "--verbose"],
-        &[("PATH", &commands.path()), ("WAYLAND_DISPLAY", "wayland-fake"), ("XDG_SESSION_TYPE", "wayland"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[
+            ("PATH", &commands.path()),
+            ("WAYLAND_DISPLAY", "wayland-fake"),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
     );
     assert!(
         stdout(&verbose).contains("unlock the keyring or log in to the desktop session"),
@@ -4018,8 +4191,16 @@ fn doctor_reports_valid_provider_keys_as_pass() {
     );
 
     assert!(doctor.status.success(), "{}", stderr(&doctor));
-    assert!(stdout(&doctor).contains(&doctor_line("Deepgram key", "valid", "PASS")), "{}", stdout(&doctor));
-    assert!(stdout(&doctor).contains(&doctor_line("Groq key", "valid", "PASS")), "{}", stdout(&doctor));
+    assert!(
+        stdout(&doctor).contains(&doctor_line("Deepgram key", "valid", "PASS")),
+        "{}",
+        stdout(&doctor)
+    );
+    assert!(
+        stdout(&doctor).contains(&doctor_line("Groq key", "valid", "PASS")),
+        "{}",
+        stdout(&doctor)
+    );
 }
 
 #[test]
@@ -4041,7 +4222,11 @@ fn doctor_flags_an_invalid_key_as_a_failure_naming_the_fix() {
         ],
     );
 
-    assert_eq!(doctor.status.code(), Some(4), "an invalid key is a hard failure");
+    assert_eq!(
+        doctor.status.code(),
+        Some(4),
+        "an invalid key is a hard failure"
+    );
     assert!(
         stdout(&doctor).contains(&doctor_line("Groq key", "invalid", "FAIL")),
         "{}",
@@ -4053,7 +4238,11 @@ fn doctor_flags_an_invalid_key_as_a_failure_naming_the_fix() {
         "{}",
         stdout(&doctor)
     );
-    assert!(stdout(&doctor).contains(&doctor_line("Deepgram key", "off", "SKIP")), "{}", stdout(&doctor));
+    assert!(
+        stdout(&doctor).contains(&doctor_line("Deepgram key", "off", "SKIP")),
+        "{}",
+        stdout(&doctor)
+    );
 }
 
 #[test]
@@ -4075,7 +4264,11 @@ fn doctor_tells_a_locked_keyring_to_unlock_not_to_run_setup() {
         ],
     );
 
-    assert!(doctor.status.success(), "a locked keyring is a warning: {}", stderr(&doctor));
+    assert!(
+        doctor.status.success(),
+        "a locked keyring is a warning: {}",
+        stderr(&doctor)
+    );
     assert!(
         stdout(&doctor).contains(&doctor_line("Groq key", "keyring locked", "WARN")),
         "{}",
@@ -4108,7 +4301,11 @@ fn doctor_reports_a_bare_429_as_quota_and_a_missing_key_as_a_warning() {
         ],
     );
 
-    assert!(doctor.status.success(), "transient states are warnings: {}", stderr(&doctor));
+    assert!(
+        doctor.status.success(),
+        "transient states are warnings: {}",
+        stderr(&doctor)
+    );
     assert!(
         stdout(&doctor).contains(&doctor_line("Deepgram key", "quota exhausted", "WARN")),
         "{}",
@@ -4145,7 +4342,12 @@ fn doctor_fails_a_present_but_invalid_env_override_naming_the_variable() {
         ],
     );
 
-    assert_eq!(doctor.status.code(), Some(4), "a broken override is a hard failure: {}", stdout(&doctor));
+    assert_eq!(
+        doctor.status.code(),
+        Some(4),
+        "a broken override is a hard failure: {}",
+        stdout(&doctor)
+    );
     assert!(
         stdout(&doctor).contains("unset or fix VOISU_GROQ_API_KEY"),
         "the remedy must name the variable: {}",
@@ -4178,7 +4380,13 @@ fn auth_set_replaces_a_credential_without_echoing_it() {
     assert_eq!(stdout(&first), "Groq credential stored\n");
     assert!(replacement.status.success(), "{}", stderr(&replacement));
     assert_eq!(stdout(&replacement), "Groq credential stored\n");
-    let combined = format!("{}{}{}{}", stdout(&first), stderr(&first), stdout(&replacement), stderr(&replacement));
+    let combined = format!(
+        "{}{}{}{}",
+        stdout(&first),
+        stderr(&first),
+        stdout(&replacement),
+        stderr(&replacement)
+    );
     assert!(!combined.contains("controlled-secret-one"));
     assert!(!combined.contains("controlled-secret-two"));
 }
@@ -4203,15 +4411,31 @@ fn a_locked_keyring_falls_back_to_a_0600_file_with_a_loud_warning() {
     assert!(denied.status.success(), "{}", stderr(&denied));
     assert_eq!(stdout(&denied), "Deepgram credential stored\n");
     let warning = stderr(&denied);
-    assert!(warning.contains("WARNING"), "fallback must be loud: {warning}");
-    assert!(warning.contains("locked"), "locked keyring must be named: {warning}");
-    assert!(warning.contains("0600"), "the file mode must be named: {warning}");
-    assert!(!warning.contains("controlled-secret"), "credential must never leak");
+    assert!(
+        warning.contains("WARNING"),
+        "fallback must be loud: {warning}"
+    );
+    assert!(
+        warning.contains("locked"),
+        "locked keyring must be named: {warning}"
+    );
+    assert!(
+        warning.contains("0600"),
+        "the file mode must be named: {warning}"
+    );
+    assert!(
+        !warning.contains("controlled-secret"),
+        "credential must never leak"
+    );
     // The credential landed in the 0600 fallback file.
     let file = config_home.path().join("voisu").join("credentials");
     let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "fallback file must be owner-only");
-    assert!(fs::read_to_string(&file).unwrap().contains("deepgram=controlled-secret"));
+    assert!(
+        fs::read_to_string(&file)
+            .unwrap()
+            .contains("deepgram=controlled-secret")
+    );
 }
 
 #[test]
@@ -4250,16 +4474,27 @@ fn auth_set_reports_a_surviving_plaintext_copy_instead_of_claiming_migration() {
         stderr(&stored)
     );
     let warning = stderr(&stored);
-    assert!(warning.contains("WARNING"), "the leftover must be loud: {warning}");
+    assert!(
+        warning.contains("WARNING"),
+        "the leftover must be loud: {warning}"
+    );
     assert!(
         warning.contains("plaintext copy"),
         "the leftover plaintext copy must be named: {warning}"
     );
-    assert!(!warning.contains("stale-plaintext-secret"), "no credential may leak: {warning}");
-    assert!(!warning.contains("fresh-secret"), "no credential may leak: {warning}");
+    assert!(
+        !warning.contains("stale-plaintext-secret"),
+        "no credential may leak: {warning}"
+    );
+    assert!(
+        !warning.contains("fresh-secret"),
+        "no credential may leak: {warning}"
+    );
     // The stale copy is in fact still on disk — the truth being reported.
     assert!(
-        fs::read_to_string(&file).unwrap().contains("stale-plaintext-secret"),
+        fs::read_to_string(&file)
+            .unwrap()
+            .contains("stale-plaintext-secret"),
         "the scenario requires the plaintext copy to survive"
     );
 }
@@ -4367,7 +4602,11 @@ fn a_credential_stored_in_the_fallback_file_is_loaded_back() {
         "fallback-groq-key",
     );
     assert!(stored.status.success(), "{}", stderr(&stored));
-    assert!(stderr(&stored).contains("no desktop Secret Service is available"), "{}", stderr(&stored));
+    assert!(
+        stderr(&stored).contains("no desktop Secret Service is available"),
+        "{}",
+        stderr(&stored)
+    );
 
     let verified = voisu_with_env(
         runtime.path(),
@@ -4431,7 +4670,10 @@ fn setup_wizard_validates_each_key_then_persists_both() {
     assert!(out.contains("Groq key validated and stored."), "{out}");
     assert!(out.contains("Run `voisu doctor`"), "{out}");
     // The keys landed in the 0600 fallback file, never echoed to stdout.
-    assert!(!out.contains("deepgram-secret") && !out.contains("groq-secret"), "{out}");
+    assert!(
+        !out.contains("deepgram-secret") && !out.contains("groq-secret"),
+        "{out}"
+    );
     let file = config_home.path().join("voisu").join("credentials");
     let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
@@ -4465,7 +4707,11 @@ fn setup_rejects_legacy_hyprland_without_writing_files() {
         .output()
         .expect("setup should run");
 
-    assert_eq!(output.status.code(), Some(4), "setup must stop before the wizard");
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "setup must stop before the wizard"
+    );
     let error = stderr(&output);
     assert!(
         error.contains("legacy configuration")
@@ -4498,7 +4744,10 @@ fn auth_set_writes_exact_credential_bytes_and_isolates_secret_tool_environment()
     );
 
     assert!(stored.status.success(), "{}", stderr(&stored));
-    assert_eq!(commands.read("secret-tool.args"), "store\n--label=Voisu cloud credential\nvoisu-provider\ngroq\n");
+    assert_eq!(
+        commands.read("secret-tool.args"),
+        "store\n--label=Voisu cloud credential\nvoisu-provider\ngroq\n"
+    );
     assert_eq!(commands.read("secret-tool.stdin"), credential);
     let environment = commands.read("secret-tool.env");
     assert!(!environment.contains("VOISU_GROQ_API_KEY="));
@@ -4517,12 +4766,22 @@ fn auth_set_bounds_a_stalled_or_missing_secret_tool_then_falls_back_without_leak
     let stalled = voisu_with_secret(
         runtime.path(),
         &["auth", "set", "groq"],
-        &[("PATH", &commands.path()), ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())],
+        &[
+            ("PATH", &commands.path()),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+        ],
         "controlled-secret",
     );
     assert!(stalled.status.success(), "{}", stderr(&stalled));
-    assert!(started.elapsed() < Duration::from_secs(4), "secret-tool must have a bounded wait");
-    assert!(stderr(&stalled).contains("WARNING"), "fallback must be loud: {}", stderr(&stalled));
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "secret-tool must have a bounded wait"
+    );
+    assert!(
+        stderr(&stalled).contains("WARNING"),
+        "fallback must be loud: {}",
+        stderr(&stalled)
+    );
     assert!(!stderr(&stalled).contains("controlled-secret"));
 
     // With no secret-tool on PATH at all, the store still succeeds via the file,
@@ -4538,7 +4797,11 @@ fn auth_set_bounds_a_stalled_or_missing_secret_tool_then_falls_back_without_leak
         "controlled-secret",
     );
     assert!(missing.status.success(), "{}", stderr(&missing));
-    assert!(stderr(&missing).contains("secret-tool helper is not installed"), "{}", stderr(&missing));
+    assert!(
+        stderr(&missing).contains("secret-tool helper is not installed"),
+        "{}",
+        stderr(&missing)
+    );
     assert!(!stderr(&missing).contains("controlled-secret"));
 }
 
@@ -4562,7 +4825,11 @@ fn auth_set_retries_an_activating_keyring_within_budget_then_falls_back() {
     )
     .unwrap();
     fs::set_permissions(&stub_path, fs::Permissions::from_mode(0o700)).unwrap();
-    let path = format!("{}:{}", stub.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        stub.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let started = Instant::now();
     let stored = voisu_with_secret(
         runtime.path(),
@@ -4575,12 +4842,24 @@ fn auth_set_retries_an_activating_keyring_within_budget_then_falls_back() {
         "controlled-secret",
     );
     assert!(stored.status.success(), "{}", stderr(&stored));
-    assert!(started.elapsed() < Duration::from_secs(4), "the retry budget must stay bounded");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the retry budget must stay bounded"
+    );
     // One immediate attempt plus three bounded retries.
     let calls = fs::read_to_string(stub.path().join("secret-tool.calls")).unwrap();
-    assert_eq!(calls.len(), 4, "expected 1 immediate + 3 retried attempts, got {}", calls.len());
+    assert_eq!(
+        calls.len(),
+        4,
+        "expected 1 immediate + 3 retried attempts, got {}",
+        calls.len()
+    );
     assert!(
-        config_home.path().join("voisu").join("credentials").exists(),
+        config_home
+            .path()
+            .join("voisu")
+            .join("credentials")
+            .exists(),
         "the exhausted budget must fall back to the file"
     );
 }
@@ -4615,7 +4894,11 @@ fn auth_verify_recovers_from_a_transient_secret_service_lookup_denial() {
     )
     .unwrap();
     fs::set_permissions(&stub_path, fs::Permissions::from_mode(0o700)).unwrap();
-    let path = format!("{}:{}", stub.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        stub.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let started = Instant::now();
     let verified = voisu_isolated(
         runtime.path(),
@@ -4636,10 +4919,18 @@ fn auth_verify_recovers_from_a_transient_secret_service_lookup_denial() {
         stderr(&verified)
     );
     assert_eq!(stdout(&verified), "Groq authentication verified\n");
-    assert!(started.elapsed() < Duration::from_secs(4), "the load retry must stay bounded");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the load retry must stay bounded"
+    );
     // One denied attempt plus one recovered attempt: exactly two lookups.
     let calls = fs::read_to_string(stub.path().join("secret-tool.calls")).unwrap();
-    assert_eq!(calls.len(), 2, "expected 1 denied + 1 recovered lookup, got {}", calls.len());
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected 1 denied + 1 recovered lookup, got {}",
+        calls.len()
+    );
     assert!(
         !format!("{}{}", stdout(&verified), stderr(&verified)).contains("recovered-secret"),
         "the credential value must never be echoed"
@@ -4665,7 +4956,11 @@ fn auth_verify_surfaces_the_loud_failure_when_a_lookup_denial_persists() {
     )
     .unwrap();
     fs::set_permissions(&stub_path, fs::Permissions::from_mode(0o700)).unwrap();
-    let path = format!("{}:{}", stub.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        stub.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let started = Instant::now();
     let denied = voisu_isolated(
         runtime.path(),
@@ -4674,17 +4969,30 @@ fn auth_verify_surfaces_the_loud_failure_when_a_lookup_denial_persists() {
         &[("PATH", &path), ("VOISU_TEST_KEYRING_RETRY_MS", "0")],
     );
 
-    assert_eq!(denied.status.code(), Some(4), "a persistent denial is a hard failure: {}", stderr(&denied));
+    assert_eq!(
+        denied.status.code(),
+        Some(4),
+        "a persistent denial is a hard failure: {}",
+        stderr(&denied)
+    );
     assert!(
         stderr(&denied).contains("keyring is locked"),
         "the persistent-denial failure must stay loud: {}",
         stderr(&denied)
     );
-    assert!(started.elapsed() < Duration::from_secs(4), "the exhausted retry budget must stay bounded");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the exhausted retry budget must stay bounded"
+    );
     // One immediate attempt plus two bounded retries: the lookup budget is smaller
     // than the store budget because it runs on the per-Recording hot path.
     let calls = fs::read_to_string(stub.path().join("secret-tool.calls")).unwrap();
-    assert_eq!(calls.len(), 3, "expected 1 immediate + 2 retried lookups, got {}", calls.len());
+    assert_eq!(
+        calls.len(),
+        3,
+        "expected 1 immediate + 2 retried lookups, got {}",
+        calls.len()
+    );
 }
 
 #[test]
@@ -4706,7 +5014,11 @@ fn auth_verify_does_not_retry_a_clean_no_match_lookup() {
     )
     .unwrap();
     fs::set_permissions(&stub_path, fs::Permissions::from_mode(0o700)).unwrap();
-    let path = format!("{}:{}", stub.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        stub.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let absent = voisu_isolated(
         runtime.path(),
         config_home.path(),
@@ -4724,7 +5036,12 @@ fn auth_verify_does_not_retry_a_clean_no_match_lookup() {
     );
     // Exactly one lookup: a definitive no-match is never retried.
     let calls = fs::read_to_string(stub.path().join("secret-tool.calls")).unwrap();
-    assert_eq!(calls.len(), 1, "a clean no-match must not be retried, got {} lookups", calls.len());
+    assert_eq!(
+        calls.len(),
+        1,
+        "a clean no-match must not be retried, got {} lookups",
+        calls.len()
+    );
 }
 
 #[test]
@@ -4741,7 +5058,10 @@ fn auth_set_bounds_a_child_that_never_drains_a_large_stdin() {
     let stalled = voisu_with_secret(
         runtime.path(),
         &["auth", "set", "groq"],
-        &[("PATH", &commands.path()), ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())],
+        &[
+            ("PATH", &commands.path()),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+        ],
         &large_credential,
     );
     assert!(stalled.status.success(), "{}", stderr(&stalled));
@@ -4766,7 +5086,10 @@ fn auth_set_is_bounded_when_a_descendant_holds_the_pipes_past_child_exit() {
     let held = voisu_with_secret(
         runtime.path(),
         &["auth", "set", "groq"],
-        &[("PATH", &commands.path()), ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())],
+        &[
+            ("PATH", &commands.path()),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+        ],
         "controlled-secret",
     );
     // Bounded, non-leaking, AND a real outcome: the descendant-held pipes read
@@ -4779,9 +5102,17 @@ fn auth_set_is_bounded_when_a_descendant_holds_the_pipes_past_child_exit() {
         "pipe-reader joins must be bounded when a descendant holds the pipes, elapsed {:?}",
         started.elapsed()
     );
-    assert!(stderr(&held).contains("WARNING"), "the fallback must be loud: {}", stderr(&held));
     assert!(
-        config_home.path().join("voisu").join("credentials").exists(),
+        stderr(&held).contains("WARNING"),
+        "the fallback must be loud: {}",
+        stderr(&held)
+    );
+    assert!(
+        config_home
+            .path()
+            .join("voisu")
+            .join("credentials")
+            .exists(),
         "the bounded failure must still land the credential in the fallback file"
     );
     assert!(!stderr(&held).contains("controlled-secret"));
@@ -4800,7 +5131,10 @@ fn auth_set_is_bounded_when_the_child_crashes_while_a_descendant_holds_the_pipes
     let crashed = voisu_with_secret(
         runtime.path(),
         &["auth", "set", "groq"],
-        &[("PATH", &commands.path()), ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())],
+        &[
+            ("PATH", &commands.path()),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+        ],
         "controlled-secret",
     );
     assert!(crashed.status.success(), "{}", stderr(&crashed));
@@ -4833,7 +5167,10 @@ fn auth_set_caps_retained_diagnostics_from_a_noisy_child_without_leaking_them() 
         "noisy stderr must be drained within the budget, elapsed {:?}",
         started.elapsed()
     );
-    assert!(!stderr(&stored).contains("eeee"), "child noise must not be echoed");
+    assert!(
+        !stderr(&stored).contains("eeee"),
+        "child noise must not be echoed"
+    );
     assert_eq!(commands.read("secret-tool.stdin"), "controlled-secret");
 }
 
@@ -4863,7 +5200,13 @@ fn auth_verify_checks_each_provider_without_retaining_or_printing_response_conte
     assert_eq!(stdout(&groq), "Groq authentication verified\n");
     assert_eq!(deepgram.status.code(), Some(4));
     assert_eq!(stderr(&deepgram), "key invalid — run `voisu setup`\n");
-    let combined = format!("{}{}{}{}", stdout(&groq), stderr(&groq), stdout(&deepgram), stderr(&deepgram));
+    let combined = format!(
+        "{}{}{}{}",
+        stdout(&groq),
+        stderr(&groq),
+        stdout(&deepgram),
+        stderr(&deepgram)
+    );
     assert!(!combined.contains("controlled-secret"));
     assert!(!combined.contains("response content"));
 }
@@ -4884,7 +5227,11 @@ fn auth_verify_requires_2xx_discards_response_and_isolates_curl_environment() {
         ],
     );
 
-    assert_eq!(verified.status.code(), Some(4), "a redirect is not an authenticated API response");
+    assert_eq!(
+        verified.status.code(),
+        Some(4),
+        "a redirect is not an authenticated API response"
+    );
     assert_eq!(stderr(&verified), "provider unreachable (transient)\n");
     assert!(!format!("{}{}", stdout(&verified), stderr(&verified)).contains("stored-credential"));
     let arguments = commands.read("curl.args");
@@ -4907,7 +5254,10 @@ fn auth_verify_escapes_credential_before_writing_curl_configuration() {
     let verified = voisu_with_env(
         runtime.path(),
         &["auth", "verify", "groq"],
-        &[("PATH", &commands.path()), ("VOISU_GROQ_API_KEY", credential)],
+        &[
+            ("PATH", &commands.path()),
+            ("VOISU_GROQ_API_KEY", credential),
+        ],
     );
 
     assert!(verified.status.success(), "{}", stderr(&verified));
@@ -4934,7 +5284,10 @@ fn auth_verify_bounds_stalled_curl_without_leaking_the_credential() {
         ],
     );
     assert_eq!(stalled.status.code(), Some(4));
-    assert!(started.elapsed() < Duration::from_secs(4), "curl must have a bounded wait");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "curl must have a bounded wait"
+    );
     assert!(!stderr(&stalled).contains("controlled-secret"));
 }
 
@@ -4984,15 +5337,20 @@ fn overlay_status_carries_the_delivered_event_while_lifecycle_responses_do_not()
     // The retained event is stable across repeated observation (the daemon keeps
     // returning it; showing it once is the client's concern).
     let again = ipc_request(runtime.path(), OVERLAY_STATUS);
-    assert_eq!(again["overlay_event"]["id"], observed["overlay_event"]["id"]);
+    assert_eq!(
+        again["overlay_event"]["id"],
+        observed["overlay_event"]["id"]
+    );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 }
 
 #[test]
 fn overlay_status_reports_a_startup_failure_without_touching_lifecycle_responses() {
     let runtime = TempDir::new().unwrap();
-    let _daemon =
-        Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_PROVIDER_START_FAILURE", "1")]);
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_PROVIDER_START_FAILURE", "1")],
+    );
 
     let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
     assert_eq!(started["ok"], false, "{started}");
@@ -5004,7 +5362,10 @@ fn overlay_status_reports_a_startup_failure_without_touching_lifecycle_responses
     // The startup failure is a non-guardrail provider failure, visible only
     // through the observer path.
     let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
-    assert_eq!(observed["overlay_event"]["outcome"], "provider_failure", "{observed}");
+    assert_eq!(
+        observed["overlay_event"]["outcome"], "provider_failure",
+        "{observed}"
+    );
 }
 
 #[test]
@@ -5034,14 +5395,19 @@ fn overlay_status_classifies_a_guardrail_quality_failure() {
     assert!(stopped.get("overlay_event").is_none(), "{stopped}");
 
     let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
-    assert_eq!(observed["overlay_event"]["outcome"], "quality_failure", "{observed}");
+    assert_eq!(
+        observed["overlay_event"]["outcome"], "quality_failure",
+        "{observed}"
+    );
 }
 
 #[test]
 fn overlay_status_classifies_a_non_guardrail_capture_failure() {
     let runtime = TempDir::new().unwrap();
-    let _daemon =
-        Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_CAPTURE_FINISH_FAILURE", "1")]);
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_CAPTURE_FINISH_FAILURE", "1")],
+    );
 
     assert!(voisu(runtime.path(), "start").status.success());
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
@@ -5051,7 +5417,10 @@ fn overlay_status_classifies_a_non_guardrail_capture_failure() {
 
     let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
     // A capture failure is not a guardrail Quality Failure.
-    assert_eq!(observed["overlay_event"]["outcome"], "capture_failure", "{observed}");
+    assert_eq!(
+        observed["overlay_event"]["outcome"], "capture_failure",
+        "{observed}"
+    );
 }
 
 // Matches the daemon's MAX_CONNECTIONS. Holding one fewer connection genuinely
@@ -5064,7 +5433,10 @@ fn saturating_observers_stuck_mid_frame_never_perturb_recording_delivery_or_the_
     let _daemon = Daemon::start(runtime.path());
     let path = socket_path(runtime.path());
 
-    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "start")),
+        "Recording started\n"
+    );
 
     // Occupy the connection permits with observers whose request never
     // completes: each trickles a partial frame with no terminating newline, so
@@ -5076,7 +5448,9 @@ fn saturating_observers_stuck_mid_frame_never_perturb_recording_delivery_or_the_
     for _ in 0..(MAX_DAEMON_CONNECTIONS - 2) {
         let mut trickle = UnixStream::connect(&path).unwrap();
         // A valid prefix of an OverlayStatus request, deliberately unterminated.
-        trickle.write_all(br#"{"version":1,"command":"overlay"#).unwrap();
+        trickle
+            .write_all(br#"{"version":1,"command":"overlay"#)
+            .unwrap();
         trickle.flush().unwrap();
         stuck.push(trickle);
     }
@@ -5086,7 +5460,10 @@ fn saturating_observers_stuck_mid_frame_never_perturb_recording_delivery_or_the_
     // instead stall this Status until the readers' deadline elapsed.
     let responsive = Instant::now();
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
-    assert!(responsive.elapsed() < Duration::from_secs(1), "status stalled under saturation");
+    assert!(
+        responsive.elapsed() < Duration::from_secs(1),
+        "status stalled under saturation"
+    );
 
     // Delivery completes exactly once despite the stuck observers.
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
@@ -5094,10 +5471,16 @@ fn saturating_observers_stuck_mid_frame_never_perturb_recording_delivery_or_the_
     assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
 
     let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
-    assert_eq!(observed["overlay_event"]["outcome"], "delivered", "{observed}");
+    assert_eq!(
+        observed["overlay_event"]["outcome"], "delivered",
+        "{observed}"
+    );
 
     // The next Recording is fully usable while the observers are still stuck.
-    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "start")),
+        "Recording started\n"
+    );
     let next = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(next["ok"], true, "{next}");
     assert_eq!(next["evidence"]["delivery_count"], 1, "{next}");
@@ -5119,10 +5502,15 @@ fn an_unknown_observer_command_is_rejected_without_disturbing_the_daemon() {
         .write_all(br#"{"version":1,"command":"observerpush"}"#)
         .unwrap();
     stream.write_all(b"\n").unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
     let mut response = String::new();
     let _ = BufReader::new(stream).read_line(&mut response);
-    assert!(response.is_empty(), "unknown command was not rejected: {response}");
+    assert!(
+        response.is_empty(),
+        "unknown command was not rejected: {response}"
+    );
 
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 }
@@ -5142,9 +5530,15 @@ fn level_poll_filters_by_cursor_over_deterministic_paused_frames() {
     assert_eq!(idle["version"], PROTOCOL_VERSION, "{idle}");
     assert_eq!(idle["ok"], true, "{idle}");
     assert_eq!(idle["level_frames"], serde_json::json!([]), "{idle}");
-    assert!(idle.get("state").is_none() || idle["state"].is_null(), "{idle}");
+    assert!(
+        idle.get("state").is_none() || idle["state"].is_null(),
+        "{idle}"
+    );
 
-    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "start")),
+        "Recording started\n"
+    );
     let first = ipc_request(
         runtime.path(),
         r#"{"version":1,"command":{"level":{"after_seq":0}}}"#,
@@ -5261,9 +5655,18 @@ fn concurrent_start_begins_exactly_one_recording() {
         })
         .collect();
     barrier.wait();
-    let outputs: Vec<_> = attempts.into_iter().map(|attempt| attempt.join().unwrap()).collect();
+    let outputs: Vec<_> = attempts
+        .into_iter()
+        .map(|attempt| attempt.join().unwrap())
+        .collect();
 
-    assert_eq!(outputs.iter().filter(|output| output.status.success()).count(), 1);
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|output| output.status.success())
+            .count(),
+        1
+    );
     assert_eq!(
         outputs
             .iter()
@@ -5298,10 +5701,7 @@ fn stop_completes_recording_and_delivery_then_returns_to_idle() {
     assert!(start.status.success(), "{}", stderr(&start));
     assert_eq!(stdout(&start), "Recording started\n");
 
-    let stop = ipc_request(
-        runtime.path(),
-        r#"{"version":1,"command":"stop"}"#,
-    );
+    let stop = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stop["ok"], true);
     assert_eq!(
         stop["message"],
@@ -5344,7 +5744,10 @@ fn unavailable_direct_delivery_reports_that_the_transcript_is_on_the_clipboard()
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
     assert_eq!(record["delivery_method"], "clipboard_fallback", "{history}");
-    assert_eq!(record["delivery_fallback_reason"], "permission denied", "{history}");
+    assert_eq!(
+        record["delivery_fallback_reason"], "permission denied",
+        "{history}"
+    );
     assert_eq!(record["delivery_count"], 1, "{history}");
 }
 
@@ -5411,7 +5814,10 @@ fn material_disagreement_reconciles_with_recorded_selection_and_validation() {
     let _daemon = Daemon::start_with_env(
         runtime.path(),
         &[
-            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Book the room Tuesday afternoon."),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Book the room Tuesday afternoon.",
+            ),
             (
                 "VOISU_TEST_GROQ_TRANSCRIPT",
                 "Schedule the review Wednesday morning.",
@@ -5443,9 +5849,18 @@ fn enabled_intent_reconstruction_records_lifecycle_and_delivers_once() {
         runtime.path(),
         &[
             ("VOISU_ENABLE_INTENT_RECONSTRUCTION", "1"),
-            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Book the room Tuesday afternoon."),
-            ("VOISU_TEST_GROQ_TRANSCRIPT", "Schedule the review Wednesday morning."),
-            ("VOISU_TEST_RECONCILIATION_RESULT", "Book the review on Wednesday morning."),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Book the room Tuesday afternoon.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "Schedule the review Wednesday morning.",
+            ),
+            (
+                "VOISU_TEST_RECONCILIATION_RESULT",
+                "Book the review on Wednesday morning.",
+            ),
         ],
     );
 
@@ -5454,12 +5869,19 @@ fn enabled_intent_reconstruction_records_lifecycle_and_delivers_once() {
 
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
-    assert_eq!(stopped["evidence"]["transcript_selection"], "intent_reconstructed");
+    assert_eq!(
+        stopped["evidence"]["transcript_selection"],
+        "intent_reconstructed"
+    );
     assert_eq!(
         stopped["evidence"]["stages"],
         serde_json::json!([
-            "capture_started", "providers_started", "capture_finalized",
-            "providers_completed", "validation_completed", "delivery_completed"
+            "capture_started",
+            "providers_started",
+            "capture_finalized",
+            "providers_completed",
+            "validation_completed",
+            "delivery_completed"
         ])
     );
     let intent = &stopped["evidence"]["intent_reconstruction"];
@@ -5468,15 +5890,20 @@ fn enabled_intent_reconstruction_records_lifecycle_and_delivers_once() {
     assert_eq!(intent["model"], "qwen/qwen3.6-27b", "{stopped}");
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
-    assert_eq!(history["history"][0]["intent_reconstruction"], *intent, "{history}");
     assert_eq!(
-        history["history"][0]["source_coverage"].as_array().unwrap().len(),
+        history["history"][0]["intent_reconstruction"], *intent,
+        "{history}"
+    );
+    assert_eq!(
+        history["history"][0]["source_coverage"]
+            .as_array()
+            .unwrap()
+            .len(),
         2,
         "{history}"
     );
     assert_eq!(
-        history["history"][0]["final_transcript"],
-        "Book the review on Wednesday morning.",
+        history["history"][0]["final_transcript"], "Book the review on Wednesday morning.",
         "{history}"
     );
 }
@@ -5488,9 +5915,18 @@ fn intent_reconstruction_deadline_falls_back_without_late_replacement() {
         runtime.path(),
         &[
             ("VOISU_ENABLE_INTENT_RECONSTRUCTION", "1"),
-            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Book the room Tuesday afternoon."),
-            ("VOISU_TEST_GROQ_TRANSCRIPT", "Schedule the review Wednesday morning."),
-            ("VOISU_TEST_RECONCILIATION_RESULT", "This late wording must never appear."),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Book the room Tuesday afternoon.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "Schedule the review Wednesday morning.",
+            ),
+            (
+                "VOISU_TEST_RECONCILIATION_RESULT",
+                "This late wording must never appear.",
+            ),
             ("VOISU_TEST_RECONCILIATION_DELAY_MS", "200"),
             ("VOISU_TEST_RECONCILIATION_DEADLINE_MS", "20"),
         ],
@@ -5501,16 +5937,21 @@ fn intent_reconstruction_deadline_falls_back_without_late_replacement() {
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
     assert_eq!(
-        stopped["evidence"]["intent_reconstruction"]["outcome"],
-        "deadline",
+        stopped["evidence"]["intent_reconstruction"]["outcome"], "deadline",
         "{stopped}"
     );
-    assert_ne!(stopped["evidence"]["transcript_selection"], "intent_reconstructed");
+    assert_ne!(
+        stopped["evidence"]["transcript_selection"],
+        "intent_reconstructed"
+    );
     thread::sleep(Duration::from_millis(250));
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     assert_eq!(history["history"].as_array().unwrap().len(), 1, "{history}");
     assert_eq!(history["history"][0]["delivery_count"], 1, "{history}");
-    assert_ne!(history["history"][0]["final_transcript"], "This late wording must never appear.");
+    assert_ne!(
+        history["history"][0]["final_transcript"],
+        "This late wording must never appear."
+    );
 }
 
 #[test]
@@ -5522,9 +5963,18 @@ fn stale_correlation_after_formatting_is_refused_at_delivery() {
             ("VOISU_ENABLE_INTENT_RECONSTRUCTION", "1"),
             ("VOISU_ENABLE_DPR", "1"),
             ("VOISU_TEST_STALE_DELIVERY_CORRELATION", "1"),
-            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Book the room Tuesday afternoon."),
-            ("VOISU_TEST_GROQ_TRANSCRIPT", "Schedule the review Wednesday morning."),
-            ("VOISU_TEST_RECONCILIATION_RESULT", "Book the review on Wednesday morning."),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Book the room Tuesday afternoon.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "Schedule the review Wednesday morning.",
+            ),
+            (
+                "VOISU_TEST_RECONCILIATION_RESULT",
+                "Book the review on Wednesday morning.",
+            ),
         ],
     );
 
@@ -5532,15 +5982,20 @@ fn stale_correlation_after_formatting_is_refused_at_delivery() {
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], false, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 0, "{stopped}");
-    assert_eq!(stopped["evidence"]["intent_reconstruction"]["outcome"], "accepted");
+    assert_eq!(
+        stopped["evidence"]["intent_reconstruction"]["outcome"],
+        "accepted"
+    );
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     assert_eq!(
-        history["history"][0]["dpr"]["events"][0]["name"],
-        "route_selected",
+        history["history"][0]["dpr"]["events"][0]["name"], "route_selected",
         "formatting must start before correlation becomes stale: {history}"
     );
     assert!(
-        stopped["message"].as_str().unwrap().contains("Delivery failed"),
+        stopped["message"]
+            .as_str()
+            .unwrap()
+            .contains("Delivery failed"),
         "{stopped}"
     );
 }
@@ -5589,7 +6044,10 @@ fn unsafe_merge_result_is_repaired_once_before_delivery() {
     let _daemon = Daemon::start_with_env(
         runtime.path(),
         &[
-            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Book the room Tuesday afternoon."),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Book the room Tuesday afternoon.",
+            ),
             (
                 "VOISU_TEST_GROQ_TRANSCRIPT",
                 "Schedule the review Wednesday morning.",
@@ -5612,7 +6070,10 @@ fn unsafe_merge_result_is_repaired_once_before_delivery() {
     assert_eq!(stopped["evidence"]["delivery_count"], 1);
     assert_eq!(stopped["evidence"]["transcript_selection"], "repaired");
     assert_eq!(stopped["evidence"]["recovery_attempted"], true);
-    assert_eq!(stopped["evidence"]["validation_reason"], "repaired prompt artifact");
+    assert_eq!(
+        stopped["evidence"]["validation_reason"],
+        "repaired prompt artifact"
+    );
 }
 
 #[test]
@@ -5624,7 +6085,10 @@ fn unsafe_source_safety_serializes_false_through_history() {
         &[
             ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", source),
             ("VOISU_TEST_GROQ_TRANSCRIPT", source),
-            ("VOISU_TEST_REPAIR_RESULT", "Book the room Tuesday afternoon."),
+            (
+                "VOISU_TEST_REPAIR_RESULT",
+                "Book the room Tuesday afternoon.",
+            ),
         ],
     );
 
@@ -5632,8 +6096,14 @@ fn unsafe_source_safety_serializes_false_through_history() {
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
-    assert_eq!(history["history"][0]["source_coverage"][0]["safety_passed"], false);
-    assert_eq!(history["history"][0]["source_coverage"][1]["safety_passed"], false);
+    assert_eq!(
+        history["history"][0]["source_coverage"][0]["safety_passed"],
+        false
+    );
+    assert_eq!(
+        history["history"][0]["source_coverage"][1]["safety_passed"],
+        false
+    );
 }
 
 #[test]
@@ -5643,7 +6113,10 @@ fn failed_recovery_falls_back_to_safe_source_and_delivers_once() {
     let _daemon = Daemon::start_with_env(
         runtime.path(),
         &[
-            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Book the room Tuesday afternoon."),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Book the room Tuesday afternoon.",
+            ),
             (
                 "VOISU_TEST_GROQ_TRANSCRIPT",
                 "Schedule the review Wednesday morning.",
@@ -5664,8 +6137,14 @@ fn failed_recovery_falls_back_to_safe_source_and_delivers_once() {
         "recovery produced prompt artifact"
     );
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
-    assert_eq!(history["history"][0]["selected_provider"], "groq", "{history}");
-    assert_eq!(history["history"][0]["selection_confidence"], "low", "{history}");
+    assert_eq!(
+        history["history"][0]["selected_provider"], "groq",
+        "{history}"
+    );
+    assert_eq!(
+        history["history"][0]["selection_confidence"], "low",
+        "{history}"
+    );
 }
 
 #[test]
@@ -5713,16 +6192,40 @@ fn failed_recovery_reports_quality_failure_when_neither_source_is_safe() {
     );
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
-    assert_eq!(record["source_coverage"][0]["provider"], "deepgram", "{history}");
+    assert_eq!(
+        record["source_coverage"][0]["provider"], "deepgram",
+        "{history}"
+    );
     assert_eq!(record["source_coverage"][0]["raw_words"], 4, "{history}");
-    assert_eq!(record["source_coverage"][0]["adjusted_coverage"], 4, "{history}");
-    assert_eq!(record["source_coverage"][0]["repetition_discount"], 0, "{history}");
-    assert_eq!(record["source_coverage"][0]["safety_passed"], false, "{history}");
-    assert_eq!(record["source_coverage"][1]["provider"], "groq", "{history}");
+    assert_eq!(
+        record["source_coverage"][0]["adjusted_coverage"], 4,
+        "{history}"
+    );
+    assert_eq!(
+        record["source_coverage"][0]["repetition_discount"], 0,
+        "{history}"
+    );
+    assert_eq!(
+        record["source_coverage"][0]["safety_passed"], false,
+        "{history}"
+    );
+    assert_eq!(
+        record["source_coverage"][1]["provider"], "groq",
+        "{history}"
+    );
     assert_eq!(record["source_coverage"][1]["raw_words"], 8, "{history}");
-    assert_eq!(record["source_coverage"][1]["adjusted_coverage"], 8, "{history}");
-    assert_eq!(record["source_coverage"][1]["repetition_discount"], 0, "{history}");
-    assert_eq!(record["source_coverage"][1]["safety_passed"], false, "{history}");
+    assert_eq!(
+        record["source_coverage"][1]["adjusted_coverage"], 8,
+        "{history}"
+    );
+    assert_eq!(
+        record["source_coverage"][1]["repetition_discount"], 0,
+        "{history}"
+    );
+    assert_eq!(
+        record["source_coverage"][1]["safety_passed"], false,
+        "{history}"
+    );
     assert!(record.get("selected_provider").is_none(), "{history}");
     assert!(record.get("selection_confidence").is_none(), "{history}");
 }
@@ -6108,7 +6611,11 @@ printf '{"text":"Groq wins"}'
     // Idle becomes observable, so at this point the close is already on the
     // wire: only the mock's cross-thread observation lag is granted, not an
     // open-ended wait that would also pass over a still-live connection.
-    assert_marker_appears_within(commands.path(), "deepgram.closed", Duration::from_millis(250));
+    assert_marker_appears_within(
+        commands.path(),
+        "deepgram.closed",
+        Duration::from_millis(250),
+    );
 }
 
 #[test]
@@ -6172,7 +6679,11 @@ printf '{"text":"Groq wins"}'
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
     // The failed stream's websocket is torn down before Idle is observable,
     // not left dangling; only observation lag is granted.
-    assert_marker_appears_within(commands.path(), "deepgram.closed", Duration::from_millis(250));
+    assert_marker_appears_within(
+        commands.path(),
+        "deepgram.closed",
+        Duration::from_millis(250),
+    );
 }
 
 #[test]
@@ -6493,7 +7004,11 @@ impl GlobalShortcutsService {
         // A divergent portal (like pre-0.9 xdg-desktop-portal) answers on
         // request/session handles that do NOT match the client's predictable
         // paths; the client must honor the returned handles, not its guesses.
-        let suffix = if self.behavior.divergent { "_actual" } else { "" };
+        let suffix = if self.behavior.divergent {
+            "_actual"
+        } else {
+            ""
+        };
         let request_path = format!(
             "/org/freedesktop/portal/desktop/request/{sender}/{}{suffix}",
             portal_token(&options, "handle_token")
@@ -6537,7 +7052,11 @@ impl GlobalShortcutsService {
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> zbus::zvariant::OwnedObjectPath {
         let sender = escaped_portal_sender(&header);
-        let suffix = if self.behavior.divergent { "_actual" } else { "" };
+        let suffix = if self.behavior.divergent {
+            "_actual"
+        } else {
+            ""
+        };
         let request_path = format!(
             "/org/freedesktop/portal/desktop/request/{sender}/{}{suffix}",
             portal_token(&options, "handle_token")
@@ -6549,13 +7068,23 @@ impl GlobalShortcutsService {
             .is_some_and(|after| attempt >= after);
         if refuses {
             // Response 1: an explicit user cancellation — permanent.
-            emit_portal_response(connection, &request_path, 1, std::collections::HashMap::new())
-                .await;
+            emit_portal_response(
+                connection,
+                &request_path,
+                1,
+                std::collections::HashMap::new(),
+            )
+            .await;
         } else if attempt < self.behavior.transient_bind_failures {
             // Response 2: "interaction ended some other way" — a transient
             // backend hiccup the daemon must retry, not treat as permanent.
-            emit_portal_response(connection, &request_path, 2, std::collections::HashMap::new())
-                .await;
+            emit_portal_response(
+                connection,
+                &request_path,
+                2,
+                std::collections::HashMap::new(),
+            )
+            .await;
         } else {
             // The response's `shortcuts` must be a typed a(sa{sv}) array — the
             // wire format the real portal produces — not an array of variants.
@@ -6568,10 +7097,9 @@ impl GlobalShortcutsService {
                     zbus::zvariant::Value::from(self.behavior.trigger_description.as_str()),
                 )]);
                 approved
-                    .append(zbus::zvariant::Value::from(zbus::zvariant::Structure::from((
-                        id.as_str(),
-                        properties,
-                    ))))
+                    .append(zbus::zvariant::Value::from(
+                        zbus::zvariant::Structure::from((id.as_str(), properties)),
+                    ))
                     .expect("approved shortcut should append");
             }
             let results = std::collections::HashMap::from([(
@@ -6689,14 +7217,14 @@ impl MockPortal {
                     .build()
                     .await
                     .expect("mock portal should join the private bus");
-                ready_tx.send(()).expect("mock portal readiness should be reported");
+                ready_tx
+                    .send(())
+                    .expect("mock portal readiness should be reported");
                 while let Some(command) = commands.recv().await {
                     let session = {
                         let deadline = Instant::now() + Duration::from_secs(3);
                         loop {
-                            if let Some(session) =
-                                service_shared.session.lock().unwrap().clone()
-                            {
+                            if let Some(session) = service_shared.session.lock().unwrap().clone() {
                                 break session;
                             }
                             assert!(
@@ -7027,12 +7555,11 @@ fn sigterm_while_a_recording_is_starting_persists_a_correlated_record() {
         .expect("the interrupted start keeps its correlation ID");
     assert!(
         journal.lines().any(|line| {
-            line
-                == format!(
-                    "Recording 1: outcome=error correlation_id={correlation_id} \
+            line == format!(
+                "Recording 1: outcome=error correlation_id={correlation_id} \
                      first_chunk_ms=- capture_finalized_ms=- provider_timings_ms=- \
                      release_to_text_ms=-"
-                )
+            )
         }),
         "shutdown during startup must emit structured timings: {journal}"
     );
@@ -7109,7 +7636,10 @@ fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
             );
             break;
         }
-        assert!(records.len() <= 1, "the forgotten toggle produced extra Recordings: {history}");
+        assert!(
+            records.len() <= 1,
+            "the forgotten toggle produced extra Recordings: {history}"
+        );
         assert!(
             Instant::now() < deadline,
             "the Recording Deadline never stopped the forgotten Recording: {history}"
@@ -7146,24 +7676,26 @@ fn deadline_at_the_buffer_ceiling_delivers_retained_audio_as_truncated() {
         ],
     );
 
-    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "start")),
+        "Recording started\n"
+    );
     wait_for_status(runtime.path(), "idle\n");
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
     assert_eq!(
-        record["final_transcript"],
-        "Keep the deadline-limited dictation.",
+        record["final_transcript"], "Keep the deadline-limited dictation.",
         "{history}"
     );
     assert_eq!(record["delivery_count"], 1, "{history}");
-    assert_eq!(
-        record["truncated_by"], "recording_deadline",
-        "{history}"
-    );
+    assert_eq!(record["truncated_by"], "recording_deadline", "{history}");
 
     let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
-    assert_eq!(observed["overlay_event"]["outcome"], "delivered", "{observed}");
+    assert_eq!(
+        observed["overlay_event"]["outcome"], "delivered",
+        "{observed}"
+    );
     assert_eq!(
         observed["overlay_event"]["message"],
         "Delivered, but the Recording was truncated; check the end",
@@ -7204,14 +7736,16 @@ fn synthetic_pcm_past_the_buffer_cap_delivers_a_non_empty_transcript() {
         ],
     );
 
-    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "start")),
+        "Recording started\n"
+    );
     wait_for_status(runtime.path(), "idle\n");
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
     assert_eq!(
-        record["final_transcript"],
-        "Retain the captured dictation.",
+        record["final_transcript"], "Retain the captured dictation.",
         "{history}"
     );
     assert_eq!(record["delivery_count"], 1, "{history}");
@@ -7230,14 +7764,20 @@ fn buffer_truncation_is_diagnosed_and_warns_through_the_delivered_outcome() {
         ],
     );
 
-    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "start")),
+        "Recording started\n"
+    );
     wait_for_status(runtime.path(), "idle\n");
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     assert_eq!(history["history"][0]["truncated_by"], "buffer", "{history}");
 
     let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
-    assert_eq!(observed["overlay_event"]["outcome"], "delivered", "{observed}");
+    assert_eq!(
+        observed["overlay_event"]["outcome"], "delivered",
+        "{observed}"
+    );
     assert_eq!(
         observed["overlay_event"]["message"],
         "Delivered, but the Recording was truncated; check the end",
@@ -7276,7 +7816,11 @@ dir=$(dirname "$0")
 exit 1
 "#,
     );
-    let path = format!("{}:{}", commands.path().display(), std::env::var("PATH").unwrap());
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
     let _daemon = Daemon::start_production_with_env(
         runtime.path(),
         &[
@@ -7293,11 +7837,17 @@ exit 1
         ],
     );
 
-    assert_eq!(stdout(&voisu(runtime.path(), "start")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "start")),
+        "Recording started\n"
+    );
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
-        if history["history"].as_array().is_some_and(|records| records.len() == 1) {
+        if history["history"]
+            .as_array()
+            .is_some_and(|records| records.len() == 1)
+        {
             break;
         }
         assert!(
@@ -7357,7 +7907,10 @@ fn self_terminating_recording_publishes_a_terminal_outcome_and_operator_line() {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
-        if history["history"].as_array().is_some_and(|records| records.len() == 1) {
+        if history["history"]
+            .as_array()
+            .is_some_and(|records| records.len() == 1)
+        {
             break;
         }
         assert!(
@@ -7403,7 +7956,10 @@ fn clipboard_fallback_preserves_delivery_info_and_warns_of_truncation() {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
-        if history["history"].as_array().is_some_and(|records| records.len() == 1) {
+        if history["history"]
+            .as_array()
+            .is_some_and(|records| records.len() == 1)
+        {
             break;
         }
         assert!(
@@ -7440,7 +7996,10 @@ fn trigger_key_permission_denial_leaves_cli_control_usable() {
     );
 
     // CLI Recording control is fully usable despite the denied portal.
-    assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "toggle")),
+        "Recording started\n"
+    );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
     assert_eq!(
         stdout(&voisu(runtime.path(), "toggle")),
@@ -7481,11 +8040,7 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
     // Approves the first bind, then refuses every later one with response 1 —
     // the shape of a user who has genuinely revoked the Trigger Key.
     let portal = MockPortal::start_refusing_after_first_bind();
-    let daemon = start_portal_clipboard_daemon(
-        runtime.path(),
-        commands.path(),
-        portal.address(),
-    );
+    let daemon = start_portal_clipboard_daemon(runtime.path(), commands.path(), portal.address());
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
     // The desktop closes the session. The listener clears the binding and
@@ -7497,7 +8052,10 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
         "No Trigger Key is bound; start, stop, and toggle remain available\n",
     );
 
-    assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "toggle")),
+        "Recording started\n"
+    );
     wait_for_status(runtime.path(), "Recording\n");
     wait_for_portal_capture(commands.path());
     let stopped = voisu(runtime.path(), "toggle");
@@ -7546,11 +8104,7 @@ fn portal_restart_clears_the_stale_binding_and_rebinds_the_trigger_key() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
     let mut portal = MockPortal::start();
-    let daemon = start_portal_clipboard_daemon(
-        runtime.path(),
-        commands.path(),
-        portal.address(),
-    );
+    let daemon = start_portal_clipboard_daemon(runtime.path(), commands.path(), portal.address());
     wait_for_shortcut(runtime.path(), "Trigger Key: Super+Alt+V\n");
 
     // The portal process crashes: no Session.Closed is emitted, only the bus
@@ -7577,7 +8131,10 @@ fn portal_restart_clears_the_stale_binding_and_rebinds_the_trigger_key() {
     );
 
     fs::remove_file(commands.path().join("pw-record.ready")).unwrap();
-    assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "toggle")),
+        "Recording started\n"
+    );
     wait_for_portal_capture(commands.path());
     let stopped = voisu(runtime.path(), "toggle");
     assert!(stopped.status.success(), "{}", stderr(&stopped));
@@ -7638,7 +8195,10 @@ fn unavailable_portal_leaves_cli_control_usable() {
         stdout(&voisu(runtime.path(), "shortcut")),
         "No Trigger Key is bound; start, stop, and toggle remain available\n"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "toggle")),
+        "Recording started\n"
+    );
     assert_eq!(
         stdout(&voisu(runtime.path(), "toggle")),
         "Transcript submitted through the compositor; preserved on the clipboard\n"
@@ -7673,7 +8233,10 @@ fn trigger_key_binds_without_restart_once_the_portal_becomes_available() {
         stdout(&voisu(runtime.path(), "shortcut")),
         "No Trigger Key is bound; start, stop, and toggle remain available\n"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "toggle")), "Recording started\n");
+    assert_eq!(
+        stdout(&voisu(runtime.path(), "toggle")),
+        "Recording started\n"
+    );
     assert_eq!(
         stdout(&voisu(runtime.path(), "toggle")),
         "Transcript submitted through the compositor; preserved on the clipboard\n"
@@ -7834,9 +8397,7 @@ fn protocol_version_mismatches_are_rejected_by_daemon_and_cli() {
             .unwrap();
         assert!(!request.is_empty());
         stream
-            .write_all(
-                b"{\"version\":999,\"ok\":true,\"state\":\"idle\",\"message\":\"idle\"}\n",
-            )
+            .write_all(b"{\"version\":999,\"ok\":true,\"state\":\"idle\",\"message\":\"idle\"}\n")
             .unwrap();
     });
 
@@ -7934,7 +8495,10 @@ fn an_oversized_single_frame_is_refused_while_it_streams() {
     let runtime = TempDir::new().unwrap();
     let chunk = "b".repeat(64 * 1024);
     let daemon = fake_daemon(runtime.path(), move |stream| {
-        if stream.write_all(b"{\"version\":1,\"ok\":true,\"message\":\"").is_err() {
+        if stream
+            .write_all(b"{\"version\":1,\"ok\":true,\"message\":\"")
+            .is_err()
+        {
             return;
         }
         for _ in 0..(MAX_RESPONSE_BYTES / chunk.len() + 8) {
@@ -8107,10 +8671,16 @@ done
     thread::sleep(Duration::from_millis(1500));
     // A bare /proc existence check would also pass for an unreaped zombie or a
     // reused pid; require the SAME process (starttime) still running.
-    let (state, start_time) = proc_state_and_start(pid)
-        .expect("pw-record was killed by the blocking-pool thread reap");
-    assert_eq!(start_time, started.1, "pw-record pid was reused by another process");
-    assert_ne!(state, 'Z', "pw-record is a zombie: it was killed by the thread reap");
+    let (state, start_time) =
+        proc_state_and_start(pid).expect("pw-record was killed by the blocking-pool thread reap");
+    assert_eq!(
+        start_time, started.1,
+        "pw-record pid was reused by another process"
+    );
+    assert_ne!(
+        state, 'Z',
+        "pw-record is a zombie: it was killed by the thread reap"
+    );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
     daemon.terminate();
 }
@@ -8171,7 +8741,10 @@ fn single_instance_rejection_preserves_the_live_daemon_and_cleanup_owns_one_inod
     let replacement_inode = fs::symlink_metadata(&path).unwrap().ino();
     assert_ne!(original_inode, replacement_inode);
     daemon.terminate();
-    assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), replacement_inode);
+    assert_eq!(
+        fs::symlink_metadata(&path).unwrap().ino(),
+        replacement_inode
+    );
     drop(replacement);
 }
 
@@ -8180,8 +8753,18 @@ fn runtime_paths_are_private_and_unsafe_runtime_roots_are_rejected() {
     let runtime = TempDir::new().unwrap();
     let daemon = Daemon::start(runtime.path());
     let path = socket_path(runtime.path());
-    assert_eq!(fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
-    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     drop(daemon);
 
     let unsafe_runtime = TempDir::new().unwrap();
@@ -8192,10 +8775,7 @@ fn runtime_paths_are_private_and_unsafe_runtime_roots_are_rejected() {
         .output()
         .unwrap();
     assert!(!rejected.status.success());
-    assert_eq!(
-        stderr(&rejected),
-        "XDG_RUNTIME_DIR must have mode 0700\n"
-    );
+    assert_eq!(stderr(&rejected), "XDG_RUNTIME_DIR must have mode 0700\n");
 
     let link_parent = TempDir::new().unwrap();
     let real_runtime = TempDir::new().unwrap();
@@ -8234,7 +8814,9 @@ fn live_chunks_flow_to_providers_during_the_recording_not_only_after_stop() {
     while Instant::now() < deadline {
         let status = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
         if status["state"] == "recording" {
-            let count = status["evidence"]["streamed_chunk_count"].as_u64().unwrap_or(0);
+            let count = status["evidence"]["streamed_chunk_count"]
+                .as_u64()
+                .unwrap_or(0);
             if count > 0 {
                 streamed_during = count;
                 break;
@@ -8398,7 +8980,10 @@ while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
     // running for up to 14s, overlapping the next Recording).
     let idle_deadline = Instant::now() + Duration::from_secs(8);
     while stdout(&voisu(runtime.path(), "status")) != "idle\n" {
-        assert!(Instant::now() < idle_deadline, "failed Recording must recover to idle");
+        assert!(
+            Instant::now() < idle_deadline,
+            "failed Recording must recover to idle"
+        );
         thread::sleep(Duration::from_millis(20));
     }
     let curl_pid: u32 = fs::read_to_string(commands.path().join("curl.pids"))
@@ -8508,7 +9093,10 @@ while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
     // return to idle and accept the next Recording.
     let idle_deadline = Instant::now() + Duration::from_secs(8);
     while stdout(&voisu(runtime.path(), "status")) != "idle\n" {
-        assert!(Instant::now() < idle_deadline, "failed Recording must recover to idle");
+        assert!(
+            Instant::now() < idle_deadline,
+            "failed Recording must recover to idle"
+        );
         thread::sleep(Duration::from_millis(20));
     }
     assert!(voisu(runtime.path(), "start").status.success());
@@ -8681,8 +9269,14 @@ fn repeated_failures_never_deliver_and_the_next_recording_delivers_once() {
         .iter()
         .map(|record| record["delivery_count"].as_u64().unwrap())
         .collect();
-    assert_eq!(delivery_counts.iter().filter(|count| **count == 0).count(), 3);
-    assert_eq!(delivery_counts.iter().filter(|count| **count == 1).count(), 1);
+    assert_eq!(
+        delivery_counts.iter().filter(|count| **count == 0).count(),
+        3
+    );
+    assert_eq!(
+        delivery_counts.iter().filter(|count| **count == 1).count(),
+        1
+    );
     assert!(delivery_counts.iter().all(|count| *count <= 1));
 }
 
@@ -8691,10 +9285,8 @@ fn repeated_failures_never_deliver_and_the_next_recording_delivers_once() {
 // Ticket 10 production algorithm is claimed by this test.
 fn cli_termination_during_stop_cannot_abandon_the_daemon_or_duplicate_delivery() {
     let runtime = TempDir::new().unwrap();
-    let _daemon = Daemon::start_with_env(
-        runtime.path(),
-        &[("VOISU_TEST_PROVIDER_DELAY_MS", "750")],
-    );
+    let _daemon =
+        Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_PROVIDER_DELAY_MS", "750")]);
     assert!(voisu(runtime.path(), "start").status.success());
 
     let mut stop = Command::new(env!("CARGO_BIN_EXE_voisu"));
@@ -8817,7 +9409,10 @@ fn doctor_daemon_probe_is_bounded_under_a_trickling_peer() {
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("VOISU_TEST_READINESS", "pass"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
     );
     let elapsed = started.elapsed();
     assert!(
@@ -8860,7 +9455,10 @@ fn doctor_daemon_probe_rejects_a_flooding_peer_at_the_response_cap() {
     let doctor = voisu_with_env(
         runtime.path(),
         &["doctor"],
-        &[("VOISU_TEST_READINESS", "pass"), ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")],
+        &[
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
     );
     let elapsed = started.elapsed();
     assert!(
@@ -9023,7 +9621,9 @@ fn pcm_file_count(dir: &Path) -> usize {
         .map(|entries| {
             entries
                 .filter_map(Result::ok)
-                .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("pcm"))
+                .filter(|entry| {
+                    entry.path().extension().and_then(|ext| ext.to_str()) == Some("pcm")
+                })
                 .count()
         })
         .unwrap_or(0)
@@ -9036,8 +9636,14 @@ fn completed_recording_is_correlated_in_local_history_and_export_redacts_secrets
         runtime.path(),
         &[
             ("VOISU_GROQ_API_KEY", "super-secret-groq-key"),
-            ("VOISU_GROQ_TRANSCRIPTION_URL", "https://groq.test/transcribe"),
-            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Ship the release on Friday."),
+            (
+                "VOISU_GROQ_TRANSCRIPTION_URL",
+                "https://groq.test/transcribe",
+            ),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Ship the release on Friday.",
+            ),
             ("VOISU_TEST_GROQ_TRANSCRIPT", "Ship the release on Friday"),
         ],
     );
@@ -9049,13 +9655,20 @@ fn completed_recording_is_correlated_in_local_history_and_export_redacts_secrets
         .as_str()
         .expect("stop evidence carries the correlation id")
         .to_owned();
-    assert!(correlation_id.starts_with("rec-"), "correlation id: {correlation_id}");
+    assert!(
+        correlation_id.starts_with("rec-"),
+        "correlation id: {correlation_id}"
+    );
 
     // History exposes the Recording, its Source Transcripts, final Transcript,
     // timing, and decision reasons, joined by the same correlation id.
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let records = history["history"].as_array().expect("history is a list");
-    assert_eq!(records.len(), 1, "one completed Recording is retained: {history}");
+    assert_eq!(
+        records.len(),
+        1,
+        "one completed Recording is retained: {history}"
+    );
     let record = &records[0];
     assert_eq!(record["correlation_id"], correlation_id);
     assert_eq!(record["final_transcript"], "Ship the release on Friday.");
@@ -9064,9 +9677,7 @@ fn completed_recording_is_correlated_in_local_history_and_export_redacts_secrets
     assert!(record["provider_timings_ms"].is_array());
 
     // Export redacts the credential, keeps relevant config, and drops unrelated env.
-    let export_request = format!(
-        r#"{{"version":1,"command":{{"export":"{correlation_id}"}}}}"#
-    );
+    let export_request = format!(r#"{{"version":1,"command":{{"export":"{correlation_id}"}}}}"#);
     let export = ipc_request(runtime.path(), &export_request);
     assert_eq!(export["ok"], true, "{export}");
     let environment = &export["export"]["environment"];
@@ -9074,8 +9685,14 @@ fn completed_recording_is_correlated_in_local_history_and_export_redacts_secrets
         environment.get("VOISU_GROQ_API_KEY").is_none(),
         "secret keys never appear in an export, even masked: {environment}"
     );
-    assert_eq!(environment["VOISU_GROQ_TRANSCRIPTION_URL"], "https://groq.test/transcribe");
-    assert!(environment.get("HOME").is_none(), "unrelated env is dropped: {environment}");
+    assert_eq!(
+        environment["VOISU_GROQ_TRANSCRIPTION_URL"],
+        "https://groq.test/transcribe"
+    );
+    assert!(
+        environment.get("HOME").is_none(),
+        "unrelated env is dropped: {environment}"
+    );
     assert!(
         !export.to_string().contains("super-secret-groq-key"),
         "no credential value survives export"
@@ -9095,7 +9712,10 @@ fn raw_audio_is_absent_from_diagnostics_without_debug_capture() {
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
-    assert!(record["debug_audio"].is_null(), "no debug audio without opt-in: {record}");
+    assert!(
+        record["debug_audio"].is_null(),
+        "no debug audio without opt-in: {record}"
+    );
     assert_eq!(
         pcm_file_count(&diagnostics_audio_dir(runtime.path())),
         0,
@@ -9114,7 +9734,10 @@ fn debug_capture_persists_audio_with_recorded_expiry() {
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let debug_audio = &history["history"][0]["debug_audio"];
-    assert!(debug_audio.is_object(), "debug capture records audio: {history}");
+    assert!(
+        debug_audio.is_object(),
+        "debug capture records audio: {history}"
+    );
     let expires = debug_audio["expires_at_unix_ms"].as_u64().unwrap();
     let captured = debug_audio["captured_at_unix_ms"].as_u64().unwrap();
     assert!(expires > captured, "debug audio records a future expiry");
@@ -9130,7 +9753,10 @@ fn expired_debug_audio_is_cleaned_up_safely() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start_with_env(
         runtime.path(),
-        &[("VOISU_DEBUG_CAPTURE", "1"), ("VOISU_DEBUG_AUDIO_TTL_SECS", "0")],
+        &[
+            ("VOISU_DEBUG_CAPTURE", "1"),
+            ("VOISU_DEBUG_AUDIO_TTL_SECS", "0"),
+        ],
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
@@ -9140,7 +9766,10 @@ fn expired_debug_audio_is_cleaned_up_safely() {
     // A zero TTL expires immediately; the next history read must remove the file
     // and detach it from the record without failing.
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
-    assert!(history["history"][0]["debug_audio"].is_null(), "expired audio is detached: {history}");
+    assert!(
+        history["history"][0]["debug_audio"].is_null(),
+        "expired audio is detached: {history}"
+    );
     assert_eq!(
         pcm_file_count(&diagnostics_audio_dir(runtime.path())),
         0,
@@ -9163,7 +9792,11 @@ fn fixed_fixture_replays_through_provider_and_validation_boundaries() {
         ],
     );
     // Replay reads only from the daemon's private fixture directory, by name.
-    fs::write(fixture_dir(runtime.path()).join("dictation.pcm"), vec![1_u8; 3_200]).unwrap();
+    fs::write(
+        fixture_dir(runtime.path()).join("dictation.pcm"),
+        vec![1_u8; 3_200],
+    )
+    .unwrap();
 
     let replayed = ipc_request(
         runtime.path(),
@@ -9174,7 +9807,10 @@ fn fixed_fixture_replays_through_provider_and_validation_boundaries() {
         replayed["evidence"]["source_transcript_providers"],
         serde_json::json!(["deepgram", "groq"])
     );
-    assert_eq!(replayed["evidence"]["transcript_selection"], "source_deepgram");
+    assert_eq!(
+        replayed["evidence"]["transcript_selection"],
+        "source_deepgram"
+    );
     // The daemon stays reusable after a replay: a real Recording still works.
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
@@ -9187,22 +9823,44 @@ fn replay_exposes_intent_reconstruction_evidence() {
         runtime.path(),
         &[
             ("VOISU_ENABLE_INTENT_RECONSTRUCTION", "1"),
-            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Book the room Tuesday afternoon."),
-            ("VOISU_TEST_GROQ_TRANSCRIPT", "Schedule the review Wednesday morning."),
-            ("VOISU_TEST_RECONCILIATION_RESULT", "Book the review on Wednesday morning."),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Book the room Tuesday afternoon.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "Schedule the review Wednesday morning.",
+            ),
+            (
+                "VOISU_TEST_RECONCILIATION_RESULT",
+                "Book the review on Wednesday morning.",
+            ),
         ],
     );
-    fs::write(fixture_dir(runtime.path()).join("intent.pcm"), vec![1_u8; 3_200]).unwrap();
+    fs::write(
+        fixture_dir(runtime.path()).join("intent.pcm"),
+        vec![1_u8; 3_200],
+    )
+    .unwrap();
 
     let replayed = ipc_request(
         runtime.path(),
         r#"{"version":1,"command":{"replay":"intent.pcm"}}"#,
     );
     assert_eq!(replayed["ok"], true, "{replayed}");
-    assert_eq!(replayed["evidence"]["transcript_selection"], "intent_reconstructed");
+    assert_eq!(
+        replayed["evidence"]["transcript_selection"],
+        "intent_reconstructed"
+    );
     assert_eq!(replayed["evidence"]["reconciliation_requested"], true);
-    assert_eq!(replayed["evidence"]["intent_reconstruction"]["outcome"], "accepted");
-    assert_eq!(replayed["evidence"]["intent_reconstruction"]["model"], "qwen/qwen3.6-27b");
+    assert_eq!(
+        replayed["evidence"]["intent_reconstruction"]["outcome"],
+        "accepted"
+    );
+    assert_eq!(
+        replayed["evidence"]["intent_reconstruction"]["model"],
+        "qwen/qwen3.6-27b"
+    );
 }
 
 #[test]
@@ -9216,7 +9874,11 @@ fn replay_normalizes_disabled_deepgram_failure_evidence() {
             ("VOISU_TEST_GROQ_TRANSCRIPT", "Replay with Groq only."),
         ],
     );
-    fs::write(fixture_dir(runtime.path()).join("groq-only.pcm"), vec![1_u8; 3_200]).unwrap();
+    fs::write(
+        fixture_dir(runtime.path()).join("groq-only.pcm"),
+        vec![1_u8; 3_200],
+    )
+    .unwrap();
 
     let replayed = ipc_request(
         runtime.path(),
@@ -9236,8 +9898,7 @@ fn replay_normalizes_disabled_deepgram_failure_evidence() {
         .expect("disabled Deepgram is represented in replay evidence");
     assert_eq!(deepgram["stage"], "not_started", "{replayed}");
     assert_eq!(
-        deepgram["diagnostic"],
-        "Deepgram disabled for this Recording",
+        deepgram["diagnostic"], "Deepgram disabled for this Recording",
         "{replayed}"
     );
 }
@@ -9268,7 +9929,10 @@ fn replay_rejects_a_symlink_planted_inside_the_fixture_directory() {
         runtime.path(),
         r#"{"version":1,"command":{"replay":"innocent.pcm"}}"#,
     );
-    assert_eq!(replayed["ok"], false, "O_NOFOLLOW must refuse the symlink: {replayed}");
+    assert_eq!(
+        replayed["ok"], false,
+        "O_NOFOLLOW must refuse the symlink: {replayed}"
+    );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
 }
 
@@ -9286,7 +9950,10 @@ fn replay_rejects_a_fifo_without_wedging_the_daemon() {
         runtime.path(),
         r#"{"version":1,"command":{"replay":"pipe.pcm"}}"#,
     );
-    assert_eq!(replayed["ok"], false, "a FIFO is not a regular file: {replayed}");
+    assert_eq!(
+        replayed["ok"], false,
+        "a FIFO is not a regular file: {replayed}"
+    );
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
 }
@@ -9300,7 +9967,11 @@ fn replay_partial_provider_start_failure_aborts_the_started_stream_and_recovers(
         runtime.path(),
         &[("VOISU_TEST_PROVIDER_START_FAILURE", "1")],
     );
-    fs::write(fixture_dir(runtime.path()).join("dictation.pcm"), vec![1_u8; 3_200]).unwrap();
+    fs::write(
+        fixture_dir(runtime.path()).join("dictation.pcm"),
+        vec![1_u8; 3_200],
+    )
+    .unwrap();
 
     let replayed = ipc_request(
         runtime.path(),
@@ -9338,7 +10009,12 @@ fn cli_history_renders_the_complete_bounded_records() {
     let records: Value = serde_json::from_str(&stdout(&output))
         .expect("voisu history --json prints structured JSON");
     let record = &records[0];
-    assert!(record["correlation_id"].as_str().unwrap().starts_with("rec-"));
+    assert!(
+        record["correlation_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("rec-")
+    );
     assert_eq!(record["final_transcript"], "Render the full record.");
     assert_eq!(record["source_transcripts"].as_array().unwrap().len(), 2);
     assert!(record["validation_reason"].is_string());
@@ -9383,8 +10059,7 @@ fn seed_full_diagnostic_ring(runtime_dir: &Path) -> usize {
     let records: Vec<voisu_core::DiagnosticRecord> = (0..voisu_core::DEFAULT_MAX_RECORDS)
         .map(|index| {
             let index = u64::try_from(index).unwrap();
-            let mut record =
-                voisu_core::DiagnosticRecord::new(format!("seed-{index}"), index);
+            let mut record = voisu_core::DiagnosticRecord::new(format!("seed-{index}"), index);
             // One millisecond apart, and so far inside the age bound that the
             // ring is full by COUNT alone and pruning cannot drop any of it.
             record.recorded_at_unix_ms = now - (voisu_core::DEFAULT_MAX_RECORDS as u64 - index);
@@ -9436,7 +10111,8 @@ fn seed_diagnostic_beyond_one_page(runtime_dir: &Path) -> (usize, usize, usize, 
 
     // Long enough that boundaries 1, 2 and 3 all fall inside a single run of the
     // filler, which is what makes the split-character case certain.
-    let diagnostic = MULTIBYTE_FILLER.repeat(3 * DIAGNOSTIC_PAGE_BYTES / MULTIBYTE_FILLER.len() + 1);
+    let diagnostic =
+        MULTIBYTE_FILLER.repeat(3 * DIAGNOSTIC_PAGE_BYTES / MULTIBYTE_FILLER.len() + 1);
     let diagnostic_bytes = diagnostic.len();
     let record_count = 2;
     let now = voisu_core::unix_millis_now();
@@ -9445,11 +10121,13 @@ fn seed_diagnostic_beyond_one_page(runtime_dir: &Path) -> (usize, usize, usize, 
             let correlation_id = format!("seed-beyond-one-page-{index}");
             let mut record = voisu_core::DiagnosticRecord::new(correlation_id, index as u64 + 1);
             record.recorded_at_unix_ms = now - (record_count - index) as u64;
-            record.provider_failures.push(voisu_core::ProviderFailure::new(
-                voisu_core::Provider::Groq,
-                voisu_core::ProviderFailureStage::Completion,
-                diagnostic.clone(),
-            ));
+            record
+                .provider_failures
+                .push(voisu_core::ProviderFailure::new(
+                    voisu_core::Provider::Groq,
+                    voisu_core::ProviderFailureStage::Completion,
+                    diagnostic.clone(),
+                ));
             record
         })
         .collect();
@@ -9484,7 +10162,10 @@ fn a_delivered_recording_reports_its_per_stage_timings_to_the_journal() {
     let daemon = Daemon::start_with_env(
         runtime.path(),
         &[
-            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Measure the healthy path."),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Measure the healthy path.",
+            ),
             ("VOISU_TEST_GROQ_TRANSCRIPT", "Measure the healthy path"),
             ("VOISU_TEST_WAIT_FOR_FIRST_CHUNK_BEFORE_START", "1"),
         ],
@@ -9494,11 +10175,17 @@ fn a_delivered_recording_reports_its_per_stage_timings_to_the_journal() {
     // withholds it until the pump has streamed a chunk to both providers.
     let status = ipc_request(runtime.path(), r#"{"version":1,"command":"status"}"#);
     let streamed = status["evidence"]["streamed_chunk_count"].as_u64().unwrap();
-    assert!(streamed > 0, "the start marker must establish a streamed chunk: {status}");
+    assert!(
+        streamed > 0,
+        "the start marker must establish a streamed chunk: {status}"
+    );
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert!(
-        stopped["evidence"]["streamed_chunk_count"].as_u64().unwrap() >= streamed,
+        stopped["evidence"]["streamed_chunk_count"]
+            .as_u64()
+            .unwrap()
+            >= streamed,
         "stop evidence must retain the chunk observed before stop: {stopped}"
     );
 
@@ -9519,7 +10206,10 @@ fn a_delivered_recording_reports_its_per_stage_timings_to_the_journal() {
         "provider_timings_ms=",
         "release_to_text_ms=",
     ] {
-        assert!(line.contains(key), "the journal line must carry {key}: {line}");
+        assert!(
+            line.contains(key),
+            "the journal line must carry {key}: {line}"
+        );
         assert!(
             !line.contains(&format!("{key}-")),
             "the delivered path must log the measurement, not an absent marker: {line}"
@@ -9592,7 +10282,10 @@ fn a_failed_recording_keeps_its_journal_message_and_gains_the_timings() {
         "provider_timings_ms=",
         "release_to_text_ms=",
     ] {
-        assert!(line.contains(key), "the journal line must carry {key}: {line}");
+        assert!(
+            line.contains(key),
+            "the journal line must carry {key}: {line}"
+        );
     }
 }
 
@@ -9706,17 +10399,25 @@ fn a_fifo_history_disables_diagnostics_without_blocking_dictation() {
     let runtime = TempDir::new().unwrap();
     let diagnostics = seeded_diagnostics_dir(runtime.path());
     let history = diagnostics.join("history.jsonl");
-    assert!(Command::new("mkfifo").arg(&history).status().unwrap().success());
+    assert!(
+        Command::new("mkfifo")
+            .arg(&history)
+            .status()
+            .unwrap()
+            .success()
+    );
 
     let daemon = Daemon::start(runtime.path());
     assert!(voisu(runtime.path(), "start").status.success());
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
-    let history_response =
-        ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history_response = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     assert_eq!(history_response["history"], serde_json::json!([]));
     assert!(
-        fs::symlink_metadata(&history).unwrap().file_type().is_fifo(),
+        fs::symlink_metadata(&history)
+            .unwrap()
+            .file_type()
+            .is_fifo(),
         "degraded diagnostics must leave the rejected history path untouched"
     );
 
@@ -9751,8 +10452,7 @@ fn an_unreadable_history_disables_diagnostics_without_rewriting_retained_bytes()
         original,
         "a failed startup read must not compact an invented empty history"
     );
-    let history_response =
-        ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+    let history_response = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     assert_eq!(
         history_response["history"],
         serde_json::json!([]),
@@ -9792,7 +10492,13 @@ fn a_history_read_failure_after_startup_is_not_presented_as_an_empty_history() {
     // reached only AFTER startup, so the store is not in degraded mode.
     let history = diagnostics.join("history.jsonl");
     fs::remove_file(&history).unwrap();
-    assert!(Command::new("mkfifo").arg(&history).status().unwrap().success());
+    assert!(
+        Command::new("mkfifo")
+            .arg(&history)
+            .status()
+            .unwrap()
+            .success()
+    );
 
     let response = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     assert_eq!(
@@ -9860,7 +10566,10 @@ fn a_full_diagnostic_ring_round_trips_through_cli_history_json() {
         "a clamped final Transcript must round-trip without truncation"
     );
     assert_eq!(
-        records[0]["source_transcripts"][1]["text"].as_str().unwrap().len(),
+        records[0]["source_transcripts"][1]["text"]
+            .as_str()
+            .unwrap()
+            .len(),
         voisu_core::MAX_STORED_TEXT,
         "a clamped Source Transcript must round-trip without truncation"
     );
@@ -9884,13 +10593,19 @@ fn legacy_unpaged_history_frame_stays_within_one_mebibyte_and_keeps_newest_recor
         .write_all(b"{\"version\":1,\"command\":\"history\"}\n")
         .unwrap();
     let mut frame = Vec::new();
-    BufReader::new(stream).read_until(b'\n', &mut frame).unwrap();
+    BufReader::new(stream)
+        .read_until(b'\n', &mut frame)
+        .unwrap();
     assert!(
         frame.len() <= LEGACY_MAX_RESPONSE_BYTES,
         "legacy CLI rejects frames larger than one mebibyte: {} bytes",
         frame.len()
     );
-    assert_eq!(frame.last(), Some(&b'\n'), "the response must be one complete frame");
+    assert_eq!(
+        frame.last(),
+        Some(&b'\n'),
+        "the response must be one complete frame"
+    );
 
     let response: Value = serde_json::from_slice(&frame).unwrap();
     let records = response["history"].as_array().unwrap();
@@ -9927,14 +10642,16 @@ fn diagnostic_paging_serves_history_and_export_across_multiple_pages() {
         runtime.path(),
         r#"{"version":1,"command":"history","paged":true}"#,
     );
-    assert!(page_count > 1, "the oversized snapshot must use multiple pages");
+    assert!(
+        page_count > 1,
+        "the oversized snapshot must use multiple pages"
+    );
     assert_eq!(
         protocol_history["history"].as_array().unwrap().len(),
         record_count
     );
-    let export_request = format!(
-        r#"{{"version":1,"command":{{"export":"{correlation_id}"}},"paged":true}}"#
-    );
+    let export_request =
+        format!(r#"{{"version":1,"command":{{"export":"{correlation_id}"}},"paged":true}}"#);
     let (protocol_export, export_page_count) =
         ipc_request_with_page_count(runtime.path(), &export_request);
     assert!(
@@ -9976,7 +10693,9 @@ fn diagnostic_paging_serves_history_and_export_across_multiple_pages() {
         "each unbounded diagnostic must arrive intact"
     );
     assert!(
-        diagnostic.chars().all(|character| MULTIBYTE_FILLER.starts_with(character)),
+        diagnostic
+            .chars()
+            .all(|character| MULTIBYTE_FILLER.starts_with(character)),
         "UTF-8 text must survive page boundaries intact"
     );
 }
@@ -10058,14 +10777,9 @@ fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     assert!(
-        history["history"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|record| {
-                record["correlation_id"] == correlation_id.as_str()
-                    && record["error"].is_string()
-            }),
+        history["history"].as_array().unwrap().iter().any(|record| {
+            record["correlation_id"] == correlation_id.as_str() && record["error"].is_string()
+        }),
         "the startup failure is retained before its response is sent: {history}"
     );
 
@@ -10083,10 +10797,7 @@ fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
     );
     assert!(
         journal.lines().any(|line| {
-            line
-                == format!(
-                    "Recording 1 [{correlation_id}]: controlled-provider-start-detail"
-                )
+            line == format!("Recording 1 [{correlation_id}]: controlled-provider-start-detail")
         }),
         "the startup failure keeps its exact historical diagnostic line: {journal}"
     );
@@ -10111,9 +10822,8 @@ fn multiline_startup_failure_cannot_forge_a_journal_entry() {
     assert_eq!(started["ok"], false, "{started}");
     let correlation_id = started["evidence"]["correlation_id"].as_str().unwrap();
     let journal = daemon.terminate_and_stderr();
-    let escaped = format!(
-        "Recording 1 [{correlation_id}]: provider failed\\n{forged}\\rwith\\ttabs"
-    );
+    let escaped =
+        format!("Recording 1 [{correlation_id}]: provider failed\\n{forged}\\rwith\\ttabs");
     assert!(
         journal.lines().any(|line| line == escaped),
         "the correlated human line must preserve escaped diagnostic text: {journal}"
@@ -10139,23 +10849,36 @@ fn partial_provider_completion_failure_is_recorded_in_history() {
         runtime.path(),
         &[
             ("VOISU_TEST_PROVIDER_COMPLETE_FAILURE", "groq"),
-            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Ship the release on Friday."),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Ship the release on Friday.",
+            ),
         ],
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
-    assert_eq!(stopped["ok"], true, "the surviving provider still delivers: {stopped}");
+    assert_eq!(
+        stopped["ok"], true,
+        "the surviving provider still delivers: {stopped}"
+    );
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"].as_array().expect("history is a list")[0];
     let failures = record["provider_failures"]
         .as_array()
         .expect("a failed provider must be recorded even when the other succeeds");
-    assert_eq!(failures.len(), 1, "exactly the failed provider is recorded: {record}");
+    assert_eq!(
+        failures.len(),
+        1,
+        "exactly the failed provider is recorded: {record}"
+    );
     assert_eq!(failures[0]["provider"], "groq");
     assert_eq!(failures[0]["stage"], "completion");
-    assert!(failures[0]["diagnostic"].is_string(), "the boundary diagnostic is retained");
+    assert!(
+        failures[0]["diagnostic"].is_string(),
+        "the boundary diagnostic is retained"
+    );
 
     let _ = daemon.terminate_and_stderr();
 }
@@ -10173,7 +10896,10 @@ fn all_providers_failing_records_every_failure_in_history() {
 
     assert!(voisu(runtime.path(), "start").status.success());
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
-    assert_eq!(stopped["ok"], false, "no Source Transcript was produced: {stopped}");
+    assert_eq!(
+        stopped["ok"], false,
+        "no Source Transcript was produced: {stopped}"
+    );
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"].as_array().expect("history is a list")[0];
@@ -10185,8 +10911,16 @@ fn all_providers_failing_records_every_failure_in_history() {
         .iter()
         .map(|failure| failure["provider"].as_str().unwrap())
         .collect();
-    assert!(providers.contains(&"deepgram") && providers.contains(&"groq"), "{record}");
-    assert!(failures.iter().all(|failure| failure["stage"] == "completion"), "{record}");
+    assert!(
+        providers.contains(&"deepgram") && providers.contains(&"groq"),
+        "{record}"
+    );
+    assert!(
+        failures
+            .iter()
+            .all(|failure| failure["stage"] == "completion"),
+        "{record}"
+    );
 
     let _ = daemon.terminate_and_stderr();
 }
@@ -10239,10 +10973,8 @@ fn capture_begin_failure_records_every_provider_as_not_started() {
     // both not_started — never a bare capture error with silent provider
     // absence.
     let runtime = TempDir::new().unwrap();
-    let _daemon = Daemon::start_with_env(
-        runtime.path(),
-        &[("VOISU_TEST_CAPTURE_BEGIN_FAILURE", "1")],
-    );
+    let _daemon =
+        Daemon::start_with_env(runtime.path(), &[("VOISU_TEST_CAPTURE_BEGIN_FAILURE", "1")]);
 
     let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
     assert_eq!(started["ok"], false, "{started}");
@@ -10327,7 +11059,10 @@ fn capture_finalization_failure_records_all_providers_in_history() {
     );
     assert!(voisu(runtime.path(), "start").status.success());
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
-    assert_eq!(stopped["ok"], false, "capture finalization failed: {stopped}");
+    assert_eq!(
+        stopped["ok"], false,
+        "capture finalization failed: {stopped}"
+    );
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"].as_array().expect("history is a list")[0];
@@ -10338,8 +11073,14 @@ fn capture_finalization_failure_records_all_providers_in_history() {
         .iter()
         .map(|failure| failure["provider"].as_str().unwrap())
         .collect();
-    assert!(providers.contains(&"deepgram") && providers.contains(&"groq"), "{record}");
-    assert!(failures.iter().all(|failure| failure["stage"] == "aborted"), "{record}");
+    assert!(
+        providers.contains(&"deepgram") && providers.contains(&"groq"),
+        "{record}"
+    );
+    assert!(
+        failures.iter().all(|failure| failure["stage"] == "aborted"),
+        "{record}"
+    );
 
     let _ = daemon.terminate_and_stderr();
 }
@@ -10349,7 +11090,10 @@ fn export_of_an_unknown_correlation_id_is_rejected() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start(runtime.path());
 
-    let export = ipc_request(runtime.path(), r#"{"version":1,"command":{"export":"rec-does-not-exist"}}"#);
+    let export = ipc_request(
+        runtime.path(),
+        r#"{"version":1,"command":{"export":"rec-does-not-exist"}}"#,
+    );
     assert_eq!(export["ok"], false, "{export}");
 }
 
@@ -10382,14 +11126,23 @@ fn export_scrubs_a_secret_spoken_into_the_transcript_itself() {
         runtime.path(),
         &[
             ("VOISU_GROQ_API_KEY", "sk-live-spoken-9x7"),
-            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "my key is sk-live-spoken-9x7 okay."),
-            ("VOISU_TEST_GROQ_TRANSCRIPT", "my key is sk-live-spoken-9x7 okay"),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "my key is sk-live-spoken-9x7 okay.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "my key is sk-live-spoken-9x7 okay",
+            ),
         ],
     );
     assert!(voisu(runtime.path(), "start").status.success());
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
-    let correlation_id = stopped["evidence"]["correlation_id"].as_str().unwrap().to_owned();
+    let correlation_id = stopped["evidence"]["correlation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     let export = ipc_request(
         runtime.path(),
@@ -10418,9 +11171,16 @@ fn recovery_diagnostics_carry_the_recordings_correlation_id() {
 
     let started = ipc_request(runtime.path(), r#"{"version":1,"command":"start"}"#);
     assert_eq!(started["ok"], false, "{started}");
-    let correlation_id = started["evidence"]["correlation_id"].as_str().unwrap().to_owned();
+    let correlation_id = started["evidence"]["correlation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     // Let the recovery aborts run and log before draining stderr.
-    assert!(start_recording_when_recovered(runtime.path()).status.success());
+    assert!(
+        start_recording_when_recovered(runtime.path())
+            .status
+            .success()
+    );
 
     let diagnostics = daemon.terminate_and_stderr();
     let tag = format!("[{correlation_id}]");
@@ -10462,9 +11222,16 @@ fn a_disabled_deepgram_runs_groq_only_and_records_the_disabled_diagnostic() {
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
     let sources = record["source_transcripts"].as_array().unwrap();
-    assert_eq!(sources.len(), 1, "only Groq contributes a Source Transcript: {history}");
+    assert_eq!(
+        sources.len(),
+        1,
+        "only Groq contributes a Source Transcript: {history}"
+    );
     assert_eq!(sources[0]["provider"], "groq", "{history}");
-    assert_eq!(record["final_transcript"], "The groq only transcript.", "{history}");
+    assert_eq!(
+        record["final_transcript"], "The groq only transcript.",
+        "{history}"
+    );
 
     let failures = record["provider_failures"].as_array().unwrap();
     let disabled = failures
@@ -10508,25 +11275,41 @@ fn a_failed_groq_only_recording_still_records_deepgram_as_not_started() {
         // streaming failure aborts mid-Recording and may already have returned
         // the daemon to Idle, so the record is polled for below regardless.
         let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
-        assert_eq!(stopped["ok"], false, "{failure:?} must fail the Recording: {stopped}");
+        assert_eq!(
+            stopped["ok"], false,
+            "{failure:?} must fail the Recording: {stopped}"
+        );
 
         let deadline = Instant::now() + Duration::from_secs(3);
         let record = loop {
             let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
-            if history["history"].as_array().is_some_and(|records| !records.is_empty()) {
+            if history["history"]
+                .as_array()
+                .is_some_and(|records| !records.is_empty())
+            {
                 break history["history"][0].clone();
             }
-            assert!(Instant::now() < deadline, "no failed record was retained for {failure:?}");
+            assert!(
+                Instant::now() < deadline,
+                "no failed record was retained for {failure:?}"
+            );
             thread::sleep(Duration::from_millis(20));
         };
 
-        assert!(!record["error"].is_null(), "{failure:?} must retain an error: {record}");
+        assert!(
+            !record["error"].is_null(),
+            "{failure:?} must retain an error: {record}"
+        );
         let failures = record["provider_failures"].as_array().unwrap();
         let deepgram: Vec<_> = failures
             .iter()
             .filter(|entry| entry["provider"] == "deepgram")
             .collect();
-        assert_eq!(deepgram.len(), 1, "one Deepgram entry for {failure:?}: {record}");
+        assert_eq!(
+            deepgram.len(),
+            1,
+            "one Deepgram entry for {failure:?}: {record}"
+        );
         assert_eq!(deepgram[0]["stage"], "not_started", "{failure:?}: {record}");
         assert_eq!(
             deepgram[0]["diagnostic"], "Deepgram disabled for this Recording",
@@ -10562,7 +11345,11 @@ fn a_disabled_deepgram_processing_panic_still_records_deepgram_as_not_started() 
         .iter()
         .filter(|entry| entry["provider"] == "deepgram")
         .collect();
-    assert_eq!(deepgram.len(), 1, "one Deepgram entry after a panic: {record}");
+    assert_eq!(
+        deepgram.len(),
+        1,
+        "one Deepgram entry after a panic: {record}"
+    );
     assert_eq!(deepgram[0]["stage"], "not_started", "{record}");
     assert_eq!(
         deepgram[0]["diagnostic"], "Deepgram disabled for this Recording",
@@ -10658,14 +11445,18 @@ fn deepgram_cli_toggle_persists_the_setting_across_starts() {
     let off = run("off");
     assert!(off.status.success(), "{}", stderr(&off));
     assert!(
-        fs::read_to_string(&config_file).unwrap().contains("deepgram_enabled = false"),
+        fs::read_to_string(&config_file)
+            .unwrap()
+            .contains("deepgram_enabled = false"),
         "off persists a disabled setting"
     );
 
     let on = run("on");
     assert!(on.status.success(), "{}", stderr(&on));
     assert!(
-        fs::read_to_string(&config_file).unwrap().contains("deepgram_enabled = true"),
+        fs::read_to_string(&config_file)
+            .unwrap()
+            .contains("deepgram_enabled = true"),
         "on persists an enabled setting"
     );
 
@@ -11073,7 +11864,10 @@ fn smart_writing_real_wiring_reproves_grammar_http_and_credential_cache_miss() {
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
-    assert_eq!(record["final_transcript"], "There are two issues.", "{history}");
+    assert_eq!(
+        record["final_transcript"], "There are two issues.",
+        "{history}"
+    );
     assert!(
         record["dpr"].is_null(),
         "flag-off production dispatch must remain Smart Writing: {history}"
@@ -11084,7 +11878,10 @@ fn smart_writing_real_wiring_reproves_grammar_http_and_credential_cache_miss() {
     assert_eq!(smart["model_id"], "openai/gpt-oss-20b", "{history}");
     assert!(smart["credential_prep_latency_ms"].is_number(), "{history}");
     assert_eq!(smart["edits"][0]["code"], "edit_accepted", "{history}");
-    assert_eq!(commands.read("secret-tool.args"), "lookup\nvoisu-provider\ngroq\n");
+    assert_eq!(
+        commands.read("secret-tool.args"),
+        "lookup\nvoisu-provider\ngroq\n"
+    );
     daemon.terminate();
 }
 
@@ -11205,8 +12002,7 @@ fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
     assert_eq!(
-        stopped["evidence"]["reconciliation_requested"],
-        false,
+        stopped["evidence"]["reconciliation_requested"], false,
         "near-identical sources must validate locally without free-form reconciliation: {stopped}"
     );
     assert!(
@@ -11216,8 +12012,7 @@ fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
         "DPR path must record a real validation reason, not a synthetic skip: {stopped}"
     );
     assert_eq!(
-        stopped["evidence"]["transcript_selection"],
-        "near_identical_groq",
+        stopped["evidence"]["transcript_selection"], "near_identical_groq",
         "{stopped}"
     );
 
@@ -11226,8 +12021,8 @@ fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
     assert_eq!(request["model"], "qwen/qwen3.6-27b");
     assert_eq!(request["reasoning_effort"], "none");
     assert_eq!(request["response_format"]["type"], "json_object");
-    let user: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap())
-        .unwrap();
+    let user: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
     assert_eq!(user["policy"], "adaptive");
     assert_eq!(
         user["base_text"],
@@ -11237,8 +12032,7 @@ fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
     assert_eq!(
-        record["final_transcript"],
-        "goal build voisu context rust requirements fast!",
+        record["final_transcript"], "goal build voisu context rust requirements fast!",
         "{history}"
     );
     assert!(record["smart_writing"].is_null(), "{history}");
@@ -11271,7 +12065,10 @@ fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
     assert!(!encoded.contains("late_result_retained"), "{history}");
     assert!(!encoded.contains("candidate_text"), "{history}");
     assert!(!encoded.contains("apply_late"), "{history}");
-    assert_eq!(commands.read("secret-tool.args"), "lookup\nvoisu-provider\ngroq\n");
+    assert_eq!(
+        commands.read("secret-tool.args"),
+        "lookup\nvoisu-provider\ngroq\n"
+    );
     daemon.terminate();
 }
 
@@ -11327,18 +12124,19 @@ fn flagged_dpr_refuses_pure_outro_silence_without_delivery() {
         "expected hallucinated-suffix validation reason: {stopped}"
     );
     assert_eq!(
-        stopped["evidence"]["reconciliation_requested"],
-        false,
+        stopped["evidence"]["reconciliation_requested"], false,
         "pure-outro silence must not spend a model call: {stopped}"
     );
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
     assert!(
-        record["final_transcript"].is_null()
-            || record["final_transcript"].as_str() == Some(""),
+        record["final_transcript"].is_null() || record["final_transcript"].as_str() == Some(""),
         "no Final Transcript after pure-outro refusal: {history}"
     );
-    assert!(record["dpr"].is_null(), "DPR diagnostics only after format path: {history}");
+    assert!(
+        record["dpr"].is_null(),
+        "DPR diagnostics only after format path: {history}"
+    );
     daemon.terminate();
 }
 
@@ -11420,8 +12218,8 @@ fn flagged_dpr_snapshots_policy_per_recording_and_observes_later_config_changes(
     assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
     let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
-    let user: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap())
-        .unwrap();
+    let user: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
     assert_eq!(user["policy"], "structured", "{request}");
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     assert_eq!(history["history"].as_array().unwrap().len(), 2, "{history}");

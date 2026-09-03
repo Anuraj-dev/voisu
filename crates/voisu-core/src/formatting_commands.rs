@@ -65,10 +65,7 @@ pub struct NumberedListItem {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandEvent {
     /// Ordinary spoken text, including residual words after a `literal` escape.
-    Text {
-        text: String,
-        span: SourceSpan,
-    },
+    Text { text: String, span: SourceSpan },
     /// A recognized, consumed formatting command.
     Command {
         kind: CommandKind,
@@ -751,18 +748,12 @@ mod tests {
     fn f15b_literal_escape() {
         let input = "literal command new line then continue";
         assert_eq!(lit(input), "command new line then continue");
-        assert!(
-            !has_cmd(input),
-            "escape must not record a command span"
-        );
+        assert!(!has_cmd(input), "escape must not record a command span");
     }
 
     #[test]
     fn literal_escape_never_reparses_command_words() {
-        assert_eq!(
-            lit("literal command period"),
-            "command period"
-        );
+        assert_eq!(lit("literal command period"), "command period");
         assert_eq!(
             lit("say literal command exclamation point please"),
             "say command exclamation point please"
@@ -774,7 +765,9 @@ mod tests {
     #[test]
     fn f22b_quote() {
         assert_eq!(
-            lit("use the exact error command quote connection refused command unquote in the ticket"),
+            lit(
+                "use the exact error command quote connection refused command unquote in the ticket"
+            ),
             "use the exact error \"connection refused\" in the ticket"
         );
     }
@@ -896,10 +889,7 @@ mod tests {
     #[test]
     fn multi_whitespace_between_phrase_tokens() {
         assert_eq!(lit("ship it command  exclamation   point"), "ship it!");
-        assert_eq!(
-            lit("first command   new    line second"),
-            "first\nsecond"
-        );
+        assert_eq!(lit("first command   new    line second"), "first\nsecond");
     }
 
     // --- Source spans ---
@@ -1025,11 +1015,8 @@ mod tests {
             "/../../docs/research/smart-writing-behavior-corpus-2026-08-09.json"
         );
         let raw = std::fs::read_to_string(path).expect("behavior corpus readable");
-        let corpus: serde_json::Value =
-            serde_json::from_str(&raw).expect("behavior corpus JSON");
-        let fixtures = corpus["fixtures"]
-            .as_array()
-            .expect("fixtures array");
+        let corpus: serde_json::Value = serde_json::from_str(&raw).expect("behavior corpus JSON");
+        let fixtures = corpus["fixtures"].as_array().expect("fixtures array");
 
         // Fixtures where Literal output is exactly structural command rendering
         // (or identity for bare/ambiguity). Every fixture's expected.literal is
@@ -1046,18 +1033,12 @@ mod tests {
             let expected_literal = fx["expected"]["literal"].as_str().unwrap();
             let roles = fx["roles"]
                 .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str())
-                        .collect::<Vec<_>>()
-                })
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                 .unwrap_or_default();
             let category = fx["category"].as_str().unwrap_or("");
 
             let command_related = roles.iter().any(|r| {
-                *r == "command"
-                    || *r == "command_safety_counterexample"
-                    || r.contains("command")
+                *r == "command" || *r == "command_safety_counterexample" || r.contains("command")
             }) || category == "punctuation_command"
                 || category == "line_paragraph"
                 || category == "list"
@@ -1080,7 +1061,8 @@ mod tests {
                 "fixture {id}: render_commands_only must match expected.literal\n  input: {input:?}\n  got:   {got:?}\n  want:  {expected_literal:?}"
             );
 
-            if literal_differs && !input.to_ascii_lowercase().starts_with("literal ")
+            if literal_differs
+                && !input.to_ascii_lowercase().starts_with("literal ")
                 && !input.to_ascii_lowercase().contains(" literal command")
             {
                 // Real command applied (not merely escape) ⇒ has_command_span.
