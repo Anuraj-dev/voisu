@@ -156,7 +156,7 @@ Setup must be re-runnable. It must preserve provider credentials, dictionary dat
 
 Raja's host currently uses:
 
-- `voisu-bin` 0.35.2-1.
+- `voisu` 0.38.0-1 (source package, replacing the previous `voisu-bin`).
 - Clipboard Delivery.
 - Caps Lock mapped to `voisu toggle` in `~/.config/hypr/bindings.lua`.
 - `~/.config/systemd/user/voisu.service`, modeled on Omarchy's UWSM graphical-service ordering.
@@ -197,10 +197,15 @@ Do not claim Hyprland support until a packaged installation passes all of these 
 
 ## Latest host result
 
-On 2026-08-24, Raja validated the installed `voisu-bin` `0.35.2-1` on the
-Omarchy/Hyprland host. The daemon and Overlay were enabled and active, the
-daemon had the live Wayland environment, `voisu doctor` passed every check,
-Caps Lock started and stopped Recordings, and clipboard Delivery worked.
+On 2026-08-25, Raja built and installed the source package `voisu` `0.38.0-1`
+on the Omarchy/Hyprland host. The daemon and Overlay are enabled and active,
+the daemon has the live Wayland environment, `voisu doctor` passes every
+check, the Trigger Key starts and stops Recordings, and clipboard Delivery
+works. (Left Alt was the mapped key on 2026-08-25; the live binding is Caps
+Lock — see Current host configuration.)
+The six private #205 fixtures also replayed through Deepgram and Groq; all six
+selected Groq without requesting Intent Reconstruction, so Qwen quality and
+safety remain unscored pending audio adjudication.
 
 There is no active runtime issue on this configured host. The remaining items in
 this report are package and setup hardening: preserve the session-correct unit,

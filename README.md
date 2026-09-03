@@ -5,6 +5,9 @@ environment is Fedora KDE Plasma on Wayland. It runs as a set of systemd **user*
 services: press the Trigger Key, speak, and a validated Transcript is inserted
 into the focused application.
 
+Current development host: Arch Linux (Omarchy) with Hyprland. The Fedora
+statement above is the product's first-support target, not the current host.
+
 Project page and full install docs: **https://anuraj-dev.github.io/voisu/**
 
 ## Product promise

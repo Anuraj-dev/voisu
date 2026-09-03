@@ -44,22 +44,26 @@ Shipped and working in the current release:
 
 ## Current host status
 
-As of 2026-08-24, the installed `voisu-bin` `0.35.2-1` works on Raja's
-Omarchy/Hyprland host. Both user services are enabled and active. `voisu doctor`
-passes every check. Caps Lock starts and stops Recordings, and clipboard Delivery
-works. No active runtime issue is known on this configured host.
+As of 2026-08-25, the installed source package `voisu` `0.38.0-1` works on
+Raja's Omarchy/Hyprland host. Both user services are enabled and active.
+`voisu doctor` passes every check. Left Alt starts and stops Recordings, and
+clipboard Delivery works. The host-only Intent Reconstruction gate is enabled
+for #205. The #205 response-boundary repair is merged in
+[PR #217](https://github.com/Anuraj-dev/voisu/pull/217), but the experiment
+still needs audio-backed evaluation before any safety or quality claim. No
+active runtime issue is known on this configured host.
 
 The remaining work is release follow-through and transcript-quality experiments.
 It is not a current installation failure.
 
 ## Next
 
-- Finish the `v0.35.2` host replay for the section-loss fix: one controlled
-  prefix-loss case and one natural multi-cue Recording.
+- Finish audio adjudication and the evidence manifest for the six-recording
+  #205 pilot; the installed-path replay has already exercised all six fixtures.
 - Implement complete-source selection so a shorter but coherent provider result
   cannot beat a materially fuller safe result.
-- Add the host-only Intent Reconstruction path, then run the six-Recording pilot.
-  Run the 30–50 Recording trial only if that pilot passes.
+- Complete the host-only Intent Reconstruction pilot. Run the 30–50 Recording
+  trial only if that pilot passes.
 - Tune Raja's private vocabulary and use the measured results to decide whether
   Intent Reconstruction should stay experimental or become ordinary behavior.
 - Move the working Hyprland service setup into the package/setup flow and run the
