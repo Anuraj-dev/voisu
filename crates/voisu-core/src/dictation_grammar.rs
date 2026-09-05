@@ -29,9 +29,13 @@
 //!   (unit word preserved; only dollars get a symbol, per slice scope).
 //! - `fifty dollars` → `$50` replaces the spoken unit word with `$` — the
 //!   one sanctioned deletion, explicitly approved in the B3 slice scope.
+//!   Dangling amounts (`one dollar fifty`, `fifty dollars and five`) stay
+//!   spoken: a partial rewrite would mangle the remainder.
 //! - Email-speak needs the full email shape with a closed TLD allowlist;
-//!   `we met at the dot of dawn` and `worked at a dot com startup` stay
-//!   prose.
+//!   `we met at the dot of dawn`, `worked at a dot com startup`, and
+//!   `join our email list at example dot com` stay prose (a cue noun
+//!   directly before a bare local never authorizes conversion — the spoken
+//!   `at` is never deleted by the email transform).
 //!
 //! # Span safety
 //!
@@ -665,11 +669,12 @@ fn try_currency_span(
     if saw_and && tokens.get(k).is_none() {
         return None;
     }
-    if tokens.get(k).is_some_and(|t| is_cardinal_token(t.2))
-        && tokens
-            .get(k + 1)
-            .is_some_and(|t| currency_unit(token_core(t.2).0).is_some())
-    {
+    // Dangling amounts: a cardinal run following the unit without its own
+    // unit word (`one dollar fifty`, `twenty dollars forty`,
+    // `fifty dollars and five`) is a partial amount — converting the first
+    // part would leave a mangled remainder (`$1 fifty`), so the whole
+    // amount stays spoken.
+    if tokens.get(k).is_some_and(|t| is_cardinal_token(t.2)) {
         return None;
     }
 
@@ -709,12 +714,15 @@ fn try_currency_span(
 /// - the first `at` that fits the shape wins (`email me at foo at bar dot
 ///   com` → `email me at foo@bar.com`);
 /// - a bare single-word local part (no digit/`_`/`-`/dot cue) only converts
-///   when the address is the whole utterance or an email cue / spoken `at`
-///   chain introduces it — mid-sentence `goal look at example dot com` is a
-///   website reference and keeps the spoken `at` (pinned by the DPR
-///   pipeline). The residual limitation: a bare whole-utterance `look at
-///   example dot com` still matches the approved shape spec and converts;
-///   distinguishing it needs semantics the local lane must not guess;
+///   when the address is the whole utterance or the immediate predecessor
+///   is the spoken `at` participating in the address shape (`email me at
+///   foo at bar dot com`) — cue nouns directly before a bare local (`email
+///   list at …`, `mail log at …`, `address bar at …`) do NOT authorize, and
+///   mid-sentence `goal look at example dot com` keeps the spoken `at`
+///   (pinned by the DPR pipeline). The residual limitation: a bare
+///   whole-utterance `look at example dot com` still matches the approved
+///   shape spec and converts; distinguishing it needs semantics the local
+///   lane must not guess;
 /// - everything else — `we met at the dot of dawn`, `worked at a dot com
 ///   startup`, unknown TLDs — stays spoken.
 fn try_email_span(
@@ -807,25 +815,25 @@ fn try_email_span(
         return None;
     }
 
-    // Local-part authorization. A bare single-word local part with no
-    // technical character is the most prose-ambiguous shape — `look at
+    // Local-part authorization. A bare single-word local part (no digit,
+    // `_`, `-`, or dot cue) is the most prose-ambiguous shape — `look at
     // example dot com` is a website reference, not an address — so it only
-    // converts when the address is the whole utterance, or an email cue
-    // (`email` / `mail` / `address`) or a spoken `at` chain introduces it.
+    // converts when the address is the whole utterance, or the immediate
+    // predecessor is the spoken `at` that participates in the address shape
+    // (`email me at foo at bar dot com`). Cue nouns (`email`, `mail`,
+    // `address`) directly preceding a bare local do NOT authorize: `join
+    // our email list at example dot com` is a website reference, and
+    // converting would delete the spoken `at` and invent an address.
     // Technical or multi-word local parts (digits, `_`, `-`, dot cues) are
-    // trusted anywhere.
+    // trusted anywhere and do not share the bare path.
     let local_is_technical = !local_cues.is_empty()
         || local_words.iter().any(|w| {
             w.chars()
                 .any(|c| c.is_ascii_digit() || c == '_' || c == '-')
         });
     let whole_utterance = i == 0 && k == tokens.len();
-    let introduced = i > 0
-        && matches!(
-            ascii_lower(token_core(tokens[i - 1].2).0).as_str(),
-            "email" | "mail" | "address" | "at"
-        );
-    if !local_is_technical && !whole_utterance && !introduced {
+    let at_precedes = i > 0 && ascii_lower(token_core(tokens[i - 1].2).0) == "at";
+    if !local_is_technical && !whole_utterance && !at_precedes {
         return None;
     }
 
@@ -1079,6 +1087,11 @@ mod tests {
         assert_organize_unchanged("fifty dollars and fifty cents");
         assert_organize_unchanged("fifty dollars fifty cents");
         assert_organize_unchanged("fifty dollars and");
+        // Dangling amounts: a cardinal run after the unit without its own
+        // unit word — converting would leave `$1 fifty`-style mangling.
+        assert_organize_unchanged("one dollar fifty");
+        assert_organize_unchanged("twenty dollars forty");
+        assert_organize_unchanged("fifty dollars and five");
         assert_organize_unchanged("some dollars");
         assert_organize_unchanged("dollars");
     }
@@ -1111,10 +1124,6 @@ mod tests {
         );
         assert_eq!(grammar("foo at bar dot com."), "foo@bar.com.");
         assert_eq!(
-            grammar("email foo at bar dot com, today"),
-            "email foo@bar.com, today"
-        );
-        assert_eq!(
             grammar("foo2 at mail hyphen two dot co"),
             "foo2@mail-two.co"
         );
@@ -1122,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_local_part_needs_whole_utterance_or_a_cue() {
+    fn bare_local_part_needs_whole_utterance_or_spoken_at() {
         // Pinned DPR pipeline behavior: `goal look at example dot com` is a
         // website reference — the spoken `at` stays a word.
         assert_eq!(
@@ -1133,6 +1142,49 @@ mod tests {
         assert_eq!(
             grammar("foo at bar dot com today"),
             "foo at bar dot com today"
+        );
+        // REVIEW REVERSAL (PR #245 major): `email` directly before a bare
+        // local no longer authorizes conversion — that deleted the spoken
+        // `at` and invented an address. The pin was deliberately reversed:
+        // this now stays fully spoken.
+        assert_eq!(
+            grammar("email foo at bar dot com, today"),
+            "email foo at bar dot com, today"
+        );
+        // Pinned whole-utterance residual (approved B3 shape spec): the
+        // address as the entire utterance converts even when the local is a
+        // common verb — this residual cannot silently shift.
+        assert_eq!(grammar("look at example dot com"), "look@example.com");
+    }
+
+    #[test]
+    fn email_cue_nouns_do_not_authorize_a_bare_local() {
+        // Review regressions (PR #245 major): a cue noun directly before a
+        // bare local (`email list at …`, `mail log at …`, `address bar at
+        // …`) must not authorize conversion — the spoken `at` survives.
+        assert_eq!(
+            grammar("join our email list at example dot com"),
+            "join our email list at example dot com"
+        );
+        assert_eq!(
+            grammar("check the mail log at example dot com"),
+            "check the mail log at example dot com"
+        );
+        assert_eq!(
+            grammar("type it in the address bar at example dot com"),
+            "type it in the address bar at example dot com"
+        );
+        let b = organize_local_baseline("join our email list at example dot com", &adaptive());
+        assert!(
+            !b.rendered().contains('@'),
+            "cue-noun prose must not invent an address, got {:?}",
+            b.rendered()
+        );
+        // The authorized form is unchanged: the local's immediate
+        // predecessor is the spoken `at`.
+        assert_eq!(
+            grammar("email me at foo at bar dot com"),
+            "email me at foo@bar.com"
         );
     }
 
@@ -1299,8 +1351,18 @@ mod tests {
         assert_eq!(b.rendered(), "Meeting moved to 3:30 pm.");
         let b = organize_local_baseline("I paid fifty dollars for it", &adaptive());
         assert_eq!(b.rendered(), "I paid $50 for it.");
+        // REVIEW REVERSAL (PR #245 major): the cue-noun form below no longer
+        // converts (the old pin `Email foo@bar.com now.` deleted the spoken
+        // `at`); the at-chain form is the authorized mid-sentence shape.
+        let b = organize_local_baseline("email me at foo at bar dot com now", &adaptive());
+        assert_eq!(b.rendered(), "Email me at foo@bar.com now.");
         let b = organize_local_baseline("email foo at bar dot com now", &adaptive());
-        assert_eq!(b.rendered(), "Email foo@bar.com now.");
+        assert_eq!(
+            b.rendered(),
+            "Email foo at bar.com now.",
+            "cue-noun form stays spoken; the `dot` conversion is the pre-existing mark pass"
+        );
+        assert!(!b.rendered().contains('@'));
         let b = organize_local_baseline("back in twenty twenty-four", &adaptive());
         assert_eq!(b.rendered(), "Back in 2024.");
     }
