@@ -1,0 +1,25 @@
+{
+  "schema": "voisu-private-eval-case-result-v1",
+  "case_id": "numbers-two-step",
+  "origin": "manual",
+  "captured_at_unix_ms": 0,
+  "source_transcripts": [
+    {
+      "provider": "groq",
+      "text": "set timer for thirty seconds and open the second file"
+    }
+  ],
+  "final_transcript": "set timer for 30 seconds and open the second file",
+  "error": null,
+  "delivery": {
+    "delivered": false,
+    "method": null,
+    "fallback_reason": "synthetic example failure"
+  },
+  "telemetry": {
+    "telemetry_schema": 2,
+    "recording_duration_ms": 4100,
+    "stop_to_finalized_ms": 1180,
+    "stop_to_delivered_ms": 1340
+  }
+}
