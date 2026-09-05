@@ -198,13 +198,13 @@ pub fn parse_formatting_commands(validated_transcript: &str) -> ParsedCommands {
     }
 
     // Trailing ordinary text through end of input (preserves trailing whitespace).
-    if let Some(start) = ordinary_start {
-        if start < validated_transcript.len() {
-            events.push(CommandEvent::Text {
-                text: validated_transcript[start..].to_owned(),
-                span: SourceSpan::new(start, validated_transcript.len()),
-            });
-        }
+    if let Some(start) = ordinary_start
+        && start < validated_transcript.len()
+    {
+        events.push(CommandEvent::Text {
+            text: validated_transcript[start..].to_owned(),
+            span: SourceSpan::new(start, validated_transcript.len()),
+        });
     }
 
     // Drop empty text events that can appear when a command sits at the start.
@@ -222,13 +222,13 @@ fn flush_ordinary(
     ordinary_start: &mut Option<usize>,
     up_to: usize,
 ) {
-    if let Some(start) = ordinary_start.take() {
-        if start < up_to {
-            events.push(CommandEvent::Text {
-                text: source[start..up_to].to_owned(),
-                span: SourceSpan::new(start, up_to),
-            });
-        }
+    if let Some(start) = ordinary_start.take()
+        && start < up_to
+    {
+        events.push(CommandEvent::Text {
+            text: source[start..up_to].to_owned(),
+            span: SourceSpan::new(start, up_to),
+        });
     }
 }
 

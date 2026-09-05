@@ -862,11 +862,11 @@ impl RetentionPolicy {
             }
         }
         for record in &mut kept {
-            if let Some(audio) = &record.debug_audio {
-                if audio.is_expired(now_ms) {
-                    expired_audio.push(audio.file_name.clone());
-                    record.debug_audio = None;
-                }
+            if let Some(audio) = &record.debug_audio
+                && audio.is_expired(now_ms)
+            {
+                expired_audio.push(audio.file_name.clone());
+                record.debug_audio = None;
             }
         }
         PruneOutcome {

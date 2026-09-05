@@ -182,20 +182,19 @@ fn resolve_for_write_depth(path: &Path, depth: usize) -> PathBuf {
     if let Ok(canon) = fs::canonicalize(path) {
         return canon;
     }
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            if let Ok(target) = fs::read_link(path) {
-                let joined = if target.is_absolute() {
-                    normalize_path(&target)
-                } else if let Some(parent) = path.parent() {
-                    normalize_path(&parent.join(target))
-                } else {
-                    normalize_path(&target)
-                };
-                if joined != path {
-                    return resolve_for_write_depth(&joined, depth + 1);
-                }
-            }
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+        && let Ok(target) = fs::read_link(path)
+    {
+        let joined = if target.is_absolute() {
+            normalize_path(&target)
+        } else if let Some(parent) = path.parent() {
+            normalize_path(&parent.join(target))
+        } else {
+            normalize_path(&target)
+        };
+        if joined != path {
+            return resolve_for_write_depth(&joined, depth + 1);
         }
     }
     let mut current = path.to_path_buf();
@@ -257,12 +256,11 @@ fn git_root_of(path: &Path) -> Option<PathBuf> {
 
 pub fn write_report(report: &EvaluationReport, path: &Path) -> Result<(), String> {
     ensure_report_path_writable(path)?;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|err| {
-                format!("cannot create report directory {}: {err}", parent.display())
-            })?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("cannot create report directory {}: {err}", parent.display()))?;
     }
     let json = serde_json::to_string_pretty(report)
         .map_err(|err| format!("cannot serialize report: {err}"))?;

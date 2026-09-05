@@ -882,11 +882,11 @@ fn normalize_ranges(mut ranges: Vec<SourceSpan>) -> Vec<SourceSpan> {
     ranges.sort_by_key(|r| (r.start, r.end));
     let mut merged: Vec<SourceSpan> = Vec::new();
     for r in ranges {
-        if let Some(last) = merged.last_mut() {
-            if r.start <= last.end {
-                last.end = last.end.max(r.end);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && r.start <= last.end
+        {
+            last.end = last.end.max(r.end);
+            continue;
         }
         merged.push(r);
     }
@@ -1311,12 +1311,11 @@ fn apply_vocative_commas(text: &str, dictionary: &[&str], protected_names: &[&st
     let mut t = text.to_owned();
     // hey␠ → Hey,
     let protected = build_edit_protection(&t, dictionary, protected_names);
-    if let Some(rest) = strip_prefix_ci(&t, "hey") {
-        if rest.starts_with(|c: char| c.is_whitespace())
-            && !span_touches_protection(0, "hey".len(), &protected)
-        {
-            t = format!("Hey,{}", rest);
-        }
+    if let Some(rest) = strip_prefix_ci(&t, "hey")
+        && rest.starts_with(|c: char| c.is_whitespace())
+        && !span_touches_protection(0, "hey".len(), &protected)
+    {
+        t = format!("Hey,{}", rest);
     }
     // trailing ok / lol → , ok / , lol (before optional punct)
     let protected = build_edit_protection(&t, dictionary, protected_names);
@@ -1475,16 +1474,16 @@ fn apply_casing(text: &str, dictionary: &[&str], protected_names: &[&str]) -> St
         }
         let cs = byte_to_char[s];
         if is_sentence_or_line_start(text, s) {
-            if let Some(c) = chars.get_mut(cs) {
-                if c.is_alphabetic() {
-                    *c = c.to_ascii_uppercase();
-                }
+            if let Some(c) = chars.get_mut(cs)
+                && c.is_alphabetic()
+            {
+                *c = c.to_ascii_uppercase();
             }
         } else if tok == "i" || tok == "I" {
-            if tok.len() == 1 {
-                if let Some(c) = chars.get_mut(cs) {
-                    *c = 'I';
-                }
+            if tok.len() == 1
+                && let Some(c) = chars.get_mut(cs)
+            {
+                *c = 'I';
             }
         } else if WEEKDAYS.iter().any(|w| eq_ascii_ignore_case(tok, w)) {
             if let Some(c) = chars.get_mut(cs) {
@@ -1529,15 +1528,14 @@ fn build_edit_protection(text: &str, dictionary: &[&str], protected_names: &[&st
         let tokens = word_tokens(text);
         let mut i = 0;
         while i < tokens.len() {
-            if ascii_lower(tokens[i].2) == "quote" {
-                if let Some(j) =
+            if ascii_lower(tokens[i].2) == "quote"
+                && let Some(j) =
                     (i + 1..tokens.len()).find(|&j| ascii_lower(tokens[j].2) == "unquote")
-                {
-                    let start = tokens[i].1;
-                    let end = tokens[j].0;
-                    ranges.push(SourceSpan::new(start, end));
-                    i = j;
-                }
+            {
+                let start = tokens[i].1;
+                let end = tokens[j].0;
+                ranges.push(SourceSpan::new(start, end));
+                i = j;
             }
             i += 1;
         }
@@ -1596,26 +1594,26 @@ fn capitalize_numbered_list_items(text: &str, protected: &[bool]) -> String {
     let mut line_start = 0usize;
     text.lines()
         .map(|line| {
-            if let Some(rest) = line.split_once(". ") {
-                if rest.0.chars().all(|c| c.is_ascii_digit()) {
-                    let mut item = rest.1.to_owned();
-                    if let Some(first) = item.chars().next() {
-                        let item_start = line_start + rest.0.len() + 2;
-                        if first.is_alphabetic()
-                            && !span_touches_protection(
-                                item_start,
-                                item_start + first.len_utf8(),
-                                protected,
-                            )
-                        {
-                            let upper = first.to_ascii_uppercase();
-                            item = format!("{upper}{}", &item[first.len_utf8()..]);
-                        }
+            if let Some(rest) = line.split_once(". ")
+                && rest.0.chars().all(|c| c.is_ascii_digit())
+            {
+                let mut item = rest.1.to_owned();
+                if let Some(first) = item.chars().next() {
+                    let item_start = line_start + rest.0.len() + 2;
+                    if first.is_alphabetic()
+                        && !span_touches_protection(
+                            item_start,
+                            item_start + first.len_utf8(),
+                            protected,
+                        )
+                    {
+                        let upper = first.to_ascii_uppercase();
+                        item = format!("{upper}{}", &item[first.len_utf8()..]);
                     }
-                    let rendered = format!("{}. {item}", rest.0);
-                    line_start += line.len() + 1;
-                    return rendered;
                 }
+                let rendered = format!("{}. {item}", rest.0);
+                line_start += line.len() + 1;
+                return rendered;
             }
             line_start += line.len() + 1;
             line.to_owned()
@@ -1645,10 +1643,10 @@ fn is_closed_question(text: &str) -> bool {
         return true;
     }
     // trailing ok
-    if let Some(last) = body.split_whitespace().last() {
-        if ascii_lower(last.trim_end_matches(['.', '!', '?', ','])) == "ok" {
-            return true;
-        }
+    if let Some(last) = body.split_whitespace().last()
+        && ascii_lower(last.trim_end_matches(['.', '!', '?', ','])) == "ok"
+    {
+        return true;
     }
     false
 }

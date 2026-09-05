@@ -825,14 +825,14 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
             vec![ComposeErrorCode::Stale],
         );
     }
-    if let Some(sel) = selected.as_deref() {
-        if text_sha256_fingerprint(sel) != expected_fp {
-            return baseline_result(
-                baseline,
-                Some(FallbackTrigger::UnverifiableSourceDerivation),
-                vec![ComposeErrorCode::Stale],
-            );
-        }
+    if let Some(sel) = selected.as_deref()
+        && text_sha256_fingerprint(sel) != expected_fp
+    {
+        return baseline_result(
+            baseline,
+            Some(FallbackTrigger::UnverifiableSourceDerivation),
+            vec![ComposeErrorCode::Stale],
+        );
     }
 
     let recon = &candidate.reconciliation;
@@ -1367,16 +1367,16 @@ fn validate_candidate_shape(
         malformed = true;
     }
     for span in &candidate.derivation {
-        if let Some(ref p) = span.source_provider {
-            if SttProvider::parse(p).is_none() {
-                malformed = true;
-            }
+        if let Some(ref p) = span.source_provider
+            && SttProvider::parse(p).is_none()
+        {
+            malformed = true;
         }
         // Prototype: derivation.label must be null or a closed Structured label.
-        if let Some(ref lab) = span.label {
-            if !CLOSED_STRUCTURED_LABELS.contains(&lab.as_str()) {
-                malformed = true;
-            }
+        if let Some(ref lab) = span.label
+            && !CLOSED_STRUCTURED_LABELS.contains(&lab.as_str())
+        {
+            malformed = true;
         }
     }
 
@@ -1777,10 +1777,10 @@ fn claim_source_ranges(
     }
 
     let mut providers_to_cover: HashSet<String> = HashSet::new();
-    if let Some(sp) = selected_provider {
-        if source_map.contains_key(sp) {
-            providers_to_cover.insert(sp.to_owned());
-        }
+    if let Some(sp) = selected_provider
+        && source_map.contains_key(sp)
+    {
+        providers_to_cover.insert(sp.to_owned());
     }
     for (provider, ranges) in &claimed {
         if !ranges.is_empty() {
