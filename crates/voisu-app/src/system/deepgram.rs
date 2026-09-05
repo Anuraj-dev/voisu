@@ -156,9 +156,20 @@ fn percent_encode_query(value: &str) -> String {
 /// for a time window are superseded by later messages and must never reach the
 /// Transcript — so this can never blindly concatenate revisions of the same
 /// audio the way the removed per-chunk batch path did.
+///
+/// Alongside each final segment's text, the segment's word-level confidences
+/// (`channel/alternatives/0/words[].word`/`.confidence`) are accumulated in the
+/// same order. They are slice-B2's minimal confidence evidence: the
+/// user-vocabulary correction gate reads them; anything deeper is slice B4. A
+/// word without a finite numeric confidence is carried as `0.0` — unproven,
+/// never confidently transcribed — and every confidence is clamped to the
+/// `[0, 1]` domain the gate assumes. A `Results` message without a words array
+/// contributes nothing (the gate then falls back to applying, the documented
+/// asymmetry).
 #[derive(Default)]
 pub(super) struct TranscriptAccumulator {
     segments: Vec<String>,
+    words: Vec<(String, f64)>,
 }
 
 impl TranscriptAccumulator {
@@ -179,10 +190,38 @@ impl TranscriptAccumulator {
         if !text.is_empty() {
             self.segments.push(text.to_owned());
         }
+        for word in message
+            .pointer("/channel/alternatives/0/words")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(word_text) = word.get("word").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if word_text.is_empty() {
+                continue;
+            }
+            let confidence = word
+                .get("confidence")
+                .and_then(serde_json::Value::as_f64)
+                // Clamp to the [0, 1] confidence domain the correction gate
+                // assumes; a non-finite or missing number is unproven (0.0),
+                // never confidently transcribed.
+                .filter(|confidence| confidence.is_finite())
+                .map(|confidence| confidence.clamp(0.0, 1.0))
+                .unwrap_or(0.0);
+            self.words.push((word_text.to_owned(), confidence));
+        }
     }
 
     pub(super) fn text(&self) -> String {
         self.segments.join(" ")
+    }
+
+    /// The accumulated `(word, confidence)` evidence in transcript order.
+    pub(super) fn words(&self) -> Vec<(String, f64)> {
+        self.words.clone()
     }
 }
 
@@ -272,6 +311,13 @@ impl Drop for DeepgramStream {
 impl ProviderStream for DeepgramStream {
     fn provider(&self) -> Provider {
         Provider::Deepgram
+    }
+
+    fn word_confidences(&self) -> Vec<(String, f64)> {
+        self.transcript
+            .lock()
+            .expect("Deepgram transcript accumulator mutex poisoned")
+            .words()
     }
 
     fn send_audio(&mut self, chunk: AudioChunk) -> BoundaryFuture<'_, ()> {

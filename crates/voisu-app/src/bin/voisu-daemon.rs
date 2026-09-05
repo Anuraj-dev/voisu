@@ -50,11 +50,11 @@ use voisu_core::{
     IntentReconstructionDiagnostic, LifecycleEvidence, LifecycleStage, MergeResult, OverlayEvent,
     OverlayOutcome, PROTOCOL_VERSION, PasteActionState, PreparedTranscriptDecision, Provider,
     ProviderCompletion, ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream,
-    ProviderStreams, ReconciliationKind, ReconciliationModel, ReplayOutcome, Request, Response,
-    RetentionPolicy, ShortcutPortal, SmartWritingDiagnostic, SourceTranscript,
-    SourceTranscriptRecord, Transcript, TranscriptDecision, TranscriptDecisionPipeline,
-    TranscriptProvider, TranscriptValidator, TriggerKeyBinding, VersionEnvelope, replay_capture,
-    resolve_session, sanitize_source_transcripts, socket_path,
+    ProviderStreams, ProviderWordConfidences, ReconciliationKind, ReconciliationModel,
+    ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SmartWritingDiagnostic,
+    SourceTranscript, SourceTranscriptRecord, Transcript, TranscriptDecision,
+    TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator, TriggerKeyBinding,
+    VersionEnvelope, replay_capture, resolve_session, sanitize_source_transcripts, socket_path,
 };
 
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
@@ -778,12 +778,17 @@ async fn actor_loop(
                     // Resolve a single snapshot before adapters are built. The
                     // replay supervisor only receives these values; its tail is
                     // deliberately filesystem-free.
-                    let replay_terms = voisu_app::dictionary::merged_terms();
+                    let replay_snapshot = voisu_app::dictionary::dictionary_snapshot();
+                    let replay_terms = replay_snapshot.merged;
                     let replay_keyterms =
                         Arc::new(voisu_app::dictionary::deepgram_keyterms(&replay_terms));
                     let replay_whisper_prompt = Arc::new(
                         voisu_app::dictionary::whisper_prompt_for_terms(&replay_terms),
                     );
+                    validator
+                        .as_mut()
+                        .expect("validator is available")
+                        .set_user_vocabulary(replay_snapshot.user_terms);
                     validator
                         .as_mut()
                         .expect("validator is available")
@@ -864,7 +869,8 @@ async fn actor_loop(
                     // A dictionary edit becomes visible at this Recording
                     // boundary, never mid-utterance. Both providers and the
                     // validator receive derivatives of exactly this one snapshot.
-                    let session_terms = voisu_app::dictionary::merged_terms();
+                    let session_snapshot = voisu_app::dictionary::dictionary_snapshot();
+                    let session_terms = session_snapshot.merged;
                     let smart_dictionary_terms = session_terms.clone();
                     let session_keyterms = voisu_app::dictionary::deepgram_keyterms(&session_terms);
                     let session_whisper_prompt =
@@ -880,6 +886,10 @@ async fn actor_loop(
                         ));
                     }
                     let languages = ResolvedRecordingLanguages::new(language_declarations);
+                    validator
+                        .as_mut()
+                        .expect("validator is available")
+                        .set_user_vocabulary(session_snapshot.user_terms);
                     validator
                         .as_mut()
                         .expect("validator is available")
@@ -2289,6 +2299,10 @@ async fn process_recording(
             .await?;
         provider_failures = completed.provider_failures;
         evidence.provider_timings_ms = completed.timings_ms;
+        // Hand the validator the word-level confidence evidence the providers
+        // retained BEFORE validation: the user-vocabulary correction gate needs
+        // it when the final Transcript turns out to be the Deepgram source.
+        validator.set_word_confidences(completed.word_confidences);
         let sources = completed.sources;
         let dpr_source_snapshot = sources.clone();
         evidence.source_transcript_providers =
@@ -4127,6 +4141,14 @@ impl ControlledValidator {
 impl TranscriptValidator for ControlledValidator {
     fn set_dictionary_terms(&mut self, dictionary_terms: Vec<String>) {
         self.pipeline.set_dictionary_terms(dictionary_terms);
+    }
+
+    fn set_user_vocabulary(&mut self, user_vocabulary: Vec<String>) {
+        self.pipeline.set_user_vocabulary(user_vocabulary);
+    }
+
+    fn set_word_confidences(&mut self, word_confidences: Vec<ProviderWordConfidences>) {
+        self.pipeline.set_word_confidences(word_confidences);
     }
 
     fn validate(
