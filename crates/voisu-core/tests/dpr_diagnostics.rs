@@ -244,3 +244,95 @@ fn evaluation_feature_retains_one_clamped_candidate_for_compare_without_delivery
     ));
     assert!(production.late_evaluation().is_none());
 }
+
+/// B5: the per-span adjudication summary is additive on the persisted record,
+/// carries only counts/indices/closed reasons, and records written before B5
+/// (no field) still deserialize.
+#[test]
+fn span_adjudication_summary_is_additive_and_old_lines_still_deserialize() {
+    use voisu_core::{
+        CloudOutcome, ComposeInput, ComposeSource, LocalBaselineOptions, RenderingPolicy,
+        SourceSelection, SttProvider, compose_structured_candidate, organize_local_baseline,
+        parse_structured_candidate_json, text_sha256_fingerprint,
+    };
+
+    let source = "call Anuraj now about the release";
+    let baseline = organize_local_baseline(
+        source,
+        &LocalBaselineOptions {
+            policy: RenderingPolicy::Adaptive,
+            route: RenderingRoute::LocalWithOptionalCloud,
+            timing: None,
+        },
+    );
+    let fingerprint = text_sha256_fingerprint(source);
+    let sources = [ComposeSource {
+        provider: SttProvider::ProviderA,
+        available: true,
+        text: source.to_owned(),
+        primary: true,
+    }];
+    let selection = SourceSelection {
+        selected_provider: SttProvider::ProviderA,
+        reason: "only_available".to_owned(),
+    };
+    let candidate = parse_structured_candidate_json(
+        serde_json::json!({
+            "schema_version": "1",
+            "base_fingerprint": fingerprint,
+            "reconciliation": {"selected_provider": "provider_a", "reason": "only_available"},
+            "removals": [],
+            "conversions": [],
+            "layout": {"decision": "natural", "certainty": "clear"},
+            "labels": [],
+            "derivation": [
+                {"kind":"keep","source_provider":"provider_a","source_text":"call Anuraj now","output_text":"call anuraj now","conversion_id":null,"label":null},
+                {"kind":"keep","source_provider":"provider_a","source_text":"about the release","output_text":" about the release.","conversion_id":null,"label":null}
+            ]
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .expect("structured candidate");
+    let outcome = compose_structured_candidate(&ComposeInput {
+        local_baseline: &baseline,
+        base_fingerprint: &fingerprint,
+        sources: &sources,
+        source_selection: &selection,
+        protected_tokens: &["Anuraj"],
+        policy: RenderingPolicy::Adaptive,
+        cloud_outcome: CloudOutcome::Succeeded,
+        candidate: Some(&candidate),
+    });
+    assert_eq!(outcome.decision(), CompositionDecision::Accept);
+    let summary = outcome.span_summary().expect("per-span summary");
+    assert_eq!(summary.total_spans(), 2);
+    assert_eq!(summary.applied_spans(), 1);
+
+    let mut diagnostic = DprDiagnostic::production(&cloud_route(), Duration::ZERO);
+    diagnostic.cloud_request_started(Duration::from_millis(1));
+    diagnostic.composition_completed(
+        CompositionDecision::Accept,
+        None,
+        &[],
+        Duration::from_millis(2),
+    );
+    diagnostic.record_span_adjudication(summary);
+    let encoded = serde_json::to_string(&diagnostic).expect("serialize diagnostic");
+    assert!(encoded.contains("span_adjudication"));
+    assert!(encoded.contains("\"applied_spans\":1"));
+    let parsed: DprDiagnostic = serde_json::from_str(&encoded).expect("deserialize diagnostic");
+    let recorded = parsed.span_adjudication().expect("span adjudication");
+    assert_eq!(recorded.total_spans(), 2);
+    assert_eq!(recorded.applied_spans(), 1);
+    assert_eq!(recorded.rejected().len(), 1);
+    assert_eq!(recorded.rejected()[0].span_index(), 0);
+    assert_eq!(recorded.rejected()[0].reason(), ComposeErrorCode::Protected);
+
+    // Old lines (written before B5, field absent) still deserialize.
+    let legacy = serde_json::to_string(&DprDiagnostic::production(&cloud_route(), Duration::ZERO))
+        .expect("serialize legacy diagnostic");
+    assert!(!legacy.contains("span_adjudication"));
+    let revived: DprDiagnostic = serde_json::from_str(&legacy).expect("deserialize legacy");
+    assert!(revived.span_adjudication().is_none());
+}

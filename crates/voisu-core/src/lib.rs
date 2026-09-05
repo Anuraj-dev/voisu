@@ -44,7 +44,7 @@ pub use dpr_diagnostics::DPR_EVALUATION_LANE_COMPILE_GATED;
 pub use dpr_diagnostics::{
     DPR_DIAGNOSTIC_VERSION, DPR_LOCAL_FALLBACK_MESSAGE, DprDeliveryEvidence, DprDiagnostic,
     DprDiagnosticEvent, DprDiagnosticEventName, DprDiagnosticMode, DprFeedbackKind,
-    MAX_DPR_DIAGNOSTIC_EVENTS,
+    DprSpanAdjudication, DprSpanRejection, MAX_DPR_DIAGNOSTIC_EVENTS,
 };
 #[cfg(feature = "dpr-eval-late-retain")]
 pub use dpr_diagnostics::{
@@ -99,11 +99,12 @@ mod compose_gate;
 pub use compose_gate::{
     CLOSED_CONVERSIONS, CLOSED_SOURCE_SELECTION_REASONS, COMPOSE_GATE_CONTRACT_ID, CloudOutcome,
     ComposeCertainty, ComposeErrorCode, ComposeInput, ComposeOutcome, ComposeSource,
-    CompositionDecision, ConversionClaim, DeliveryFlags, DerivationSpan, FallbackTrigger,
-    LabelClaim, LayoutClaim, LayoutDecision, MAX_COMPOSE_CONVERSIONS, MAX_COMPOSE_DERIVATION_SPANS,
-    MAX_COMPOSE_FIELD_UTF8_BYTES, MAX_COMPOSE_LABELS, MAX_COMPOSE_REMOVALS, Reconciliation,
-    RemovalClaim, RemovalKind, SourceSelection, SpanKind, StructuredCandidate, SttProvider,
-    compose_structured_candidate, parse_structured_candidate_json,
+    ComposeSpanRejection, ComposeSpanSummary, CompositionDecision, ConversionClaim, DeliveryFlags,
+    DerivationSpan, FallbackTrigger, LabelClaim, LayoutClaim, LayoutDecision,
+    MAX_COMPOSE_CONVERSIONS, MAX_COMPOSE_DERIVATION_SPANS, MAX_COMPOSE_FIELD_UTF8_BYTES,
+    MAX_COMPOSE_LABELS, MAX_COMPOSE_REMOVALS, Reconciliation, RemovalClaim, RemovalKind,
+    SourceSelection, SpanKind, StructuredCandidate, SttProvider, compose_structured_candidate,
+    parse_structured_candidate_json,
 };
 
 mod format_edits;

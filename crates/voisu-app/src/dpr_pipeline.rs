@@ -696,7 +696,7 @@ pub async fn dpr_transform_and_deliver(
         }
     };
     let compose_finished_at = input.clock.elapsed();
-    let (rendered, delivery_flags, compose_decision, fallback_trigger, error_codes) =
+    let (rendered, delivery_flags, compose_decision, fallback_trigger, error_codes, span_summary) =
         if let Some(host_rendered) = format_rendered {
             if compose_finished_at >= delivery_deadline {
                 cloud_error = Some(DprCloudErrorClass::DeadlineExceeded);
@@ -716,6 +716,7 @@ pub async fn dpr_transform_and_deliver(
                     composed.decision(),
                     composed.fallback_trigger(),
                     composed.error_codes().to_vec(),
+                    composed.span_summary().cloned(),
                 )
             } else {
                 (
@@ -724,6 +725,7 @@ pub async fn dpr_transform_and_deliver(
                     CompositionDecision::Accept,
                     None,
                     Vec::new(),
+                    None,
                 )
             }
         } else {
@@ -757,6 +759,7 @@ pub async fn dpr_transform_and_deliver(
                 composed.decision(),
                 composed.fallback_trigger(),
                 composed.error_codes().to_vec(),
+                composed.span_summary().cloned(),
             )
         };
     diagnostic.composition_completed(
@@ -765,6 +768,11 @@ pub async fn dpr_transform_and_deliver(
         &error_codes,
         compose_finished_at,
     );
+    // B5 additive per-span evidence; absent for candidate-level rejects and
+    // soft salvage, so shipped (flag-off) records are byte-identical.
+    if let Some(summary) = span_summary.as_ref() {
+        diagnostic.record_span_adjudication(summary);
+    }
     diagnostic.delivery_emitted(input.clock.elapsed(), delivery_flags);
     let delivery = delivery.deliver(Transcript(rendered.clone())).await;
     DprTransformCompletion {

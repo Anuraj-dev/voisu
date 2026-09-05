@@ -7,6 +7,38 @@
 //!
 //! Behavior authority: `docs/research/developer-prompt-rendering-combined-call-prototype-2026-08-11.py`
 //! (`compose_fixture` + helpers) and corpus version **1.1.2**.
+//!
+//! # B5: per-span adjudication
+//!
+//! Since B5, derivation spans are adjudicated **per span**: every span runs the
+//! same local validation it faced before B5, spans that pass are rendered, and
+//! a failing span no longer discards the whole candidate.
+//!
+//! Droppable classes — the span is skipped and the local words are preserved:
+//!
+//! * unknown provider or `source_text` unfindable in the source
+//!   (`E_UNVERIFIABLE`): the span contributes nothing — its text is not
+//!   anchored to any source range, so nothing local is lost;
+//! * protected-fact violation (`E_PROTECTED` + `E_UNSAFE_SEMANTICS`): a
+//!   consuming span whose `source_text` carries a protected token but whose
+//!   `output_text` drops or alters it contributes its `source_text` verbatim;
+//! * `layout_break` with a non-whitespace body (`E_UNVERIFIABLE`): omitted;
+//! * placement overlap (`E_OVERLAP`): **precedence is first-in-candidate-order
+//!   wins** — the earlier span claims the source range and renders its edit;
+//!   a later span whose every literal occurrence is already claimed contributes
+//!   nothing, because its range is already rendered by the winner.
+//!
+//! Candidate-level classes stay whole-candidate rejects, byte-identical with
+//! the pre-B5 gate: shape/bounds/fingerprint/reconciliation gates, the
+//! declared-claims evidence loops, removal/label contracts against the
+//! candidate's own declarations, invented content (organize-only keeps and
+//! conversion outputs — corpus CC-08 keeps one invented span fatal), layout
+//! claims contradicting a clear natural layout, source-walk order violations,
+//! and full source coverage. When **every** span is dropped the outcome is
+//! exactly the pre-B5 reject for the first failing span (`FallbackBaseline`
+//! plus that span's trigger and codes), so all-rejected renders are
+//! byte-identical. [`ComposeOutcome::span_summary`] carries the additive
+//! per-span adjudication record (applied N/M, rejections with reasons).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
@@ -304,6 +336,54 @@ impl DeliveryFlags {
     }
 }
 
+/// One rejected derivation span in the B5 per-span adjudication summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComposeSpanRejection {
+    span_index: usize,
+    reason: ComposeErrorCode,
+}
+
+impl ComposeSpanRejection {
+    #[must_use]
+    pub fn span_index(&self) -> usize {
+        self.span_index
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> ComposeErrorCode {
+        self.reason
+    }
+}
+
+/// B5 additive per-span adjudication evidence: `applied_spans` of
+/// `total_spans` derivation spans passed local validation and were rendered;
+/// the rest were dropped with closed reasons (module doc lists the classes).
+/// Carried on [`ComposeOutcome::span_summary`]; candidate-level rejects and
+/// soft-salvage renders carry no summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComposeSpanSummary {
+    total_spans: usize,
+    applied_spans: usize,
+    rejected: Vec<ComposeSpanRejection>,
+}
+
+impl ComposeSpanSummary {
+    #[must_use]
+    pub const fn total_spans(&self) -> usize {
+        self.total_spans
+    }
+
+    #[must_use]
+    pub const fn applied_spans(&self) -> usize {
+        self.applied_spans
+    }
+
+    #[must_use]
+    pub fn rejected(&self) -> &[ComposeSpanRejection] {
+        &self.rejected
+    }
+}
+
 /// Result of hierarchical compose: the only sealed Final Transcript path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComposeOutcome {
@@ -312,6 +392,9 @@ pub struct ComposeOutcome {
     fallback_trigger: Option<FallbackTrigger>,
     error_codes: Vec<ComposeErrorCode>,
     delivery: DeliveryFlags,
+    /// B5 additive per-span adjudication record; `None` unless the gate
+    /// reached per-span adjudication and rendered at least one span.
+    span_summary: Option<ComposeSpanSummary>,
 }
 
 impl ComposeOutcome {
@@ -343,6 +426,13 @@ impl ComposeOutcome {
     #[must_use]
     pub fn delivery(&self) -> DeliveryFlags {
         self.delivery
+    }
+
+    /// B5 additive per-span adjudication record, when the gate adjudicated
+    /// derivation spans and applied at least one of them.
+    #[must_use]
+    pub fn span_summary(&self) -> Option<&ComposeSpanSummary> {
+        self.span_summary.as_ref()
     }
 }
 
@@ -759,6 +849,7 @@ fn outcome(
         fallback_trigger,
         error_codes,
         delivery: DeliveryFlags::dpr_default(),
+        span_summary: None,
     }
 }
 
@@ -967,7 +1058,51 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
     let layout_certainty = candidate.layout.certainty;
     let closed_label_set: HashSet<&str> = CLOSED_STRUCTURED_LABELS.iter().copied().collect();
 
-    for span in &candidate.derivation {
+    // ── B5: per-span adjudication ────────────────────────────────────────────
+    //
+    // Every derivation span runs the same local validation it faced pre-B5,
+    // but only the classes listed in the module doc are droppable; the rest
+    // stay whole-candidate rejects with byte-identical outcomes. Accepted
+    // spans render their `output_text`; dropped spans preserve the local words
+    // (their `source_text`) when that text is anchored to a free source range,
+    // and otherwise contribute nothing.
+
+    fn note_rejection(
+        rejected: &mut Vec<ComposeSpanRejection>,
+        first: &mut Option<(FallbackTrigger, Vec<ComposeErrorCode>)>,
+        index: usize,
+        trigger: FallbackTrigger,
+        codes: &[ComposeErrorCode],
+        reason: ComposeErrorCode,
+    ) {
+        rejected.push(ComposeSpanRejection {
+            span_index: index,
+            reason,
+        });
+        first.get_or_insert_with(|| (trigger, codes.to_vec()));
+    }
+
+    let mut parts: Vec<&str> = Vec::with_capacity(candidate.derivation.len());
+    // B5: the invented-atom gate judges what the candidate proposed against an
+    // ANCHORED source claim — applied spans and overlap-dropped spans (corpus
+    // CC-08 keeps one invented span fatal). A span discarded before anchoring
+    // (unfindable source, protected-fact violation) contributes nothing and
+    // its discarded proposal is not judged; a malformed layout_break body is a
+    // whitespace proposal by contract and would otherwise glue phantom atoms
+    // onto neighbouring words.
+    let mut atoms_parts: Vec<&str> = Vec::with_capacity(candidate.derivation.len());
+    // Spans whose proposal is fully discarded skip the keep/convert output
+    // sequence checks below (nothing of theirs renders or claims).
+    let mut discarded: Vec<bool> = vec![false; candidate.derivation.len()];
+    let mut claimed: HashMap<String, Vec<(usize, usize)>> =
+        source_map.keys().map(|p| (p.clone(), Vec::new())).collect();
+    let mut prev_start: HashMap<String, isize> =
+        source_map.keys().map(|p| (p.clone(), -1isize)).collect();
+    let mut applied_spans = 0usize;
+    let mut rejected_spans: Vec<ComposeSpanRejection> = Vec::new();
+    let mut first_rejection: Option<(FallbackTrigger, Vec<ComposeErrorCode>)> = None;
+
+    for (index, span) in candidate.derivation.iter().enumerate() {
         match span.kind {
             SpanKind::LayoutBreak => {
                 let out_lb = span.output_text.as_str();
@@ -976,39 +1111,55 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
                         .chars()
                         .all(|c| matches!(c, '\n' | '\r' | '\t' | ' '))
                 {
-                    return baseline_result(
-                        baseline,
-                        Some(FallbackTrigger::UnverifiableSourceDerivation),
-                        vec![ComposeErrorCode::Unverifiable],
+                    // Droppable: a malformed break carries no source words.
+                    note_rejection(
+                        &mut rejected_spans,
+                        &mut first_rejection,
+                        index,
+                        FallbackTrigger::UnverifiableSourceDerivation,
+                        &[ComposeErrorCode::Unverifiable],
+                        ComposeErrorCode::Unverifiable,
                     );
+                    discarded[index] = true;
+                    parts.push("");
+                    continue;
                 }
                 if layout_decision == LayoutDecision::Natural
                     && layout_certainty == ComposeCertainty::Clear
                     && is_multiparagraph_text(out_lb)
                 {
+                    // Candidate-level: the span contradicts the candidate's own
+                    // clear natural layout claim.
                     return baseline_result(
                         baseline,
                         Some(FallbackTrigger::UnsafeSemantics),
                         vec![ComposeErrorCode::UnsafeSemantics],
                     );
                 }
+                parts.push(out_lb);
+                atoms_parts.push(out_lb);
+                applied_spans += 1;
             }
             _ => {
                 let provider = span.source_provider.as_deref().unwrap_or("");
                 let source_text = span.source_text.as_str();
-                if !source_map.contains_key(provider) {
-                    return baseline_result(
-                        baseline,
-                        Some(FallbackTrigger::UnverifiableSourceDerivation),
-                        vec![ComposeErrorCode::Unverifiable],
+                if !source_map.contains_key(provider)
+                    || !source_contains(&source_map[provider], source_text)
+                {
+                    // Droppable: the span cannot be tied to the source, so
+                    // omitting it loses nothing of the source. Uncovered source
+                    // text still fails the candidate-level coverage gate below.
+                    note_rejection(
+                        &mut rejected_spans,
+                        &mut first_rejection,
+                        index,
+                        FallbackTrigger::UnverifiableSourceDerivation,
+                        &[ComposeErrorCode::Unverifiable],
+                        ComposeErrorCode::Unverifiable,
                     );
-                }
-                if !source_contains(&source_map[provider], source_text) {
-                    return baseline_result(
-                        baseline,
-                        Some(FallbackTrigger::UnverifiableSourceDerivation),
-                        vec![ComposeErrorCode::Unverifiable],
-                    );
+                    discarded[index] = true;
+                    parts.push("");
+                    continue;
                 }
                 if span.kind == SpanKind::Remove {
                     if !span.output_text.is_empty() {
@@ -1023,6 +1174,8 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
                         normalize_ws(source_text).to_lowercase(),
                     );
                     if !declared_removals.contains(&rem_key) {
+                        // Candidate-level: the derivation must agree with the
+                        // candidate's own removal declarations.
                         return baseline_result(
                             baseline,
                             Some(FallbackTrigger::UnverifiableSourceDerivation),
@@ -1104,11 +1257,86 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
                         );
                     }
                 }
+                if !span_preserves_protected_tokens(span, input.protected_tokens) {
+                    // Droppable: the span's edit may not drop or alter a
+                    // protected fact it carries; the span's original words are
+                    // preserved verbatim instead (when a free source range for
+                    // them exists). The discarded proposal is not judged.
+                    note_rejection(
+                        &mut rejected_spans,
+                        &mut first_rejection,
+                        index,
+                        FallbackTrigger::UnsafeSemantics,
+                        &[
+                            ComposeErrorCode::Protected,
+                            ComposeErrorCode::UnsafeSemantics,
+                        ],
+                        ComposeErrorCode::Protected,
+                    );
+                    discarded[index] = true;
+                    match place_span(&source_map, &claimed, &prev_start, provider, source_text) {
+                        SpanPlacement::Placed(start, end) => {
+                            claimed.get_mut(provider).unwrap().push((start, end));
+                            prev_start.insert(provider.to_owned(), start as isize);
+                            parts.push(source_text);
+                        }
+                        SpanPlacement::Overlapped | SpanPlacement::OutOfOrder => parts.push(""),
+                    }
+                    continue;
+                }
+                // Placement (B5): order violations stay candidate-level; an
+                // overlap drops only this span — first-in-candidate-order wins.
+                // The overlap-dropped span's proposal still stands against an
+                // anchored claim, so it stays in the invented-atom basis and
+                // the keep/convert sequence checks (corpus CC-08). Those
+                // sequence checks remain in their pre-B5 position (after
+                // coverage, below) so uncertain candidates still salvage.
+                match place_span(&source_map, &claimed, &prev_start, provider, source_text) {
+                    SpanPlacement::OutOfOrder => {
+                        return baseline_result(
+                            baseline,
+                            Some(FallbackTrigger::UnverifiableSourceDerivation),
+                            vec![ComposeErrorCode::Unverifiable],
+                        );
+                    }
+                    SpanPlacement::Overlapped => {
+                        note_rejection(
+                            &mut rejected_spans,
+                            &mut first_rejection,
+                            index,
+                            FallbackTrigger::UnverifiableSourceDerivation,
+                            &[ComposeErrorCode::Overlap],
+                            ComposeErrorCode::Overlap,
+                        );
+                        atoms_parts.push(span.output_text.as_str());
+                        parts.push("");
+                    }
+                    SpanPlacement::Placed(start, end) => {
+                        claimed.get_mut(provider).unwrap().push((start, end));
+                        prev_start.insert(provider.to_owned(), start as isize);
+                        atoms_parts.push(span.output_text.as_str());
+                        parts.push(span.output_text.as_str());
+                        applied_spans += 1;
+                    }
+                }
             }
         }
     }
 
-    let composed = compose_render(&candidate.derivation);
+    if applied_spans == 0 {
+        // Nothing survived adjudication: byte-identical with the pre-B5
+        // whole-candidate reject for the first failing span.
+        let (trigger, codes) =
+            first_rejection.expect("non-empty derivation with no applied spans has a rejection");
+        return baseline_result(baseline, Some(trigger), codes);
+    }
+
+    let span_summary = ComposeSpanSummary {
+        total_spans: candidate.derivation.len(),
+        applied_spans,
+        rejected: rejected_spans,
+    };
+    let composed: String = parts.concat();
 
     if layout_decision == LayoutDecision::Natural
         && layout_certainty == ComposeCertainty::Clear
@@ -1170,7 +1398,8 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
     let declared_conv_list: Vec<&str> = declared_conversion_ids.iter().copied().collect();
     let declared_lab_list: Vec<&str> = declared_labels.iter().copied().collect();
     let allowed = licensed_atoms(&source_map, &declared_conv_list, &declared_lab_list);
-    let out_atoms = lexical_atoms(&composed);
+    let proposed_atoms: String = atoms_parts.concat();
+    let out_atoms = lexical_atoms(&proposed_atoms);
     let invented: Vec<_> = out_atoms
         .iter()
         .filter(|a| !allowed.contains(a.as_str()))
@@ -1249,17 +1478,27 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
     }
 
     let selected_provider = Some(selection.selected_provider.as_str());
-    let placement_codes =
-        claim_source_ranges(&source_map, &candidate.derivation, selected_provider);
-    if !placement_codes.is_empty() {
+    // Coverage stays candidate-level: the derivation must still account for
+    // every non-whitespace character of the selected source (B5 uses the final
+    // claim set from per-span adjudication; semantics unchanged pre-B5).
+    if let Some(coverage_codes) = coverage_failure(&source_map, &claimed, selected_provider) {
         return baseline_result(
             baseline,
             Some(FallbackTrigger::UnverifiableSourceDerivation),
-            placement_codes,
+            coverage_codes,
         );
     }
 
-    for span in &candidate.derivation {
+    // Keep/convert output-sequence checks: unchanged pre-B5 position (after
+    // placement/coverage) and unchanged whole-candidate severity — a reworded
+    // keep or a mismatched conversion output is invented content, never a
+    // per-span drop (corpus CC-08 / CC-19). Spans discarded before anchoring
+    // (unfindable source, protected-fact violation) render and claim nothing,
+    // so their abandoned proposals are not judged here.
+    for (index, span) in candidate.derivation.iter().enumerate() {
+        if discarded[index] {
+            continue;
+        }
         let source_text = span.source_text.as_str();
         let output_text = span.output_text.as_str();
         if span.kind == SpanKind::Keep && !keep_organize_only(source_text, output_text) {
@@ -1296,7 +1535,9 @@ fn compose_impl(input: &ComposeInput<'_>) -> ComposeOutcome {
         }
     }
 
-    outcome(CompositionDecision::Accept, composed, None, vec![])
+    let mut accepted = outcome(CompositionDecision::Accept, composed, None, vec![]);
+    accepted.span_summary = Some(span_summary);
+    accepted
 }
 
 fn hard_outcome_map(outcome: CloudOutcome) -> Option<(FallbackTrigger, ComposeErrorCode)> {
@@ -1741,60 +1982,73 @@ fn ranges_overlap(a: (usize, usize), b: (usize, usize)) -> bool {
     a.0 < b.1 && b.0 < a.1
 }
 
-fn claim_source_ranges(
+/// Placement outcome for one consuming derivation span (B5).
+enum SpanPlacement {
+    /// Claimed the source byte range `(start, end)` for this span.
+    Placed(usize, usize),
+    /// Every literal occurrence of the span's `source_text` is already claimed
+    /// by an earlier candidate span: per-span drop (first-in-order wins).
+    Overlapped,
+    /// The only free occurrence starts before the previous claim on the same
+    /// provider: the derivation walk is out of order (candidate-level reject).
+    OutOfOrder,
+}
+
+/// B5: place one consuming span against its provider source — the first
+/// literal occurrence (case-insensitive, same matcher as pre-B5) that no
+/// earlier candidate span has claimed, in the derivation's walk order.
+///
+/// Split out of the pre-B5 `claim_source_ranges` so overlaps can drop a single
+/// span while order violations and coverage stay candidate-level.
+fn place_span(
     source_map: &BTreeMap<String, String>,
-    derivation: &[DerivationSpan],
-    selected_provider: Option<&str>,
-) -> Vec<ComposeErrorCode> {
-    let mut claimed: HashMap<String, Vec<(usize, usize)>> =
-        source_map.keys().map(|p| (p.clone(), Vec::new())).collect();
-    let mut prev_start: HashMap<String, isize> =
-        source_map.keys().map(|p| (p.clone(), -1isize)).collect();
-
-    for span in derivation {
-        if !matches!(
-            span.kind,
-            SpanKind::Keep | SpanKind::Remove | SpanKind::Convert | SpanKind::Label
-        ) {
-            continue;
-        }
-        let provider = span.source_provider.as_deref().unwrap_or("");
-        let source_text = span.source_text.as_str();
-        if !source_map.contains_key(provider) || source_text.is_empty() {
-            continue;
-        }
-        let hay = &source_map[provider];
-        let mut candidates = find_literal_spans(hay, source_text);
-        candidates.sort_by_key(|r| r.0);
-        if candidates.is_empty() {
-            continue;
-        }
-        let mut placed: Option<(usize, usize)> = None;
-        for cand in candidates {
-            let used = &claimed[provider];
-            if used.iter().any(|u| ranges_overlap(cand, *u)) {
-                continue;
-            }
-            placed = Some(cand);
-            break;
-        }
-        let Some((start, end)) = placed else {
-            return vec![ComposeErrorCode::Overlap];
-        };
-        if (start as isize) < prev_start[provider] {
-            return vec![ComposeErrorCode::Unverifiable];
-        }
-        prev_start.insert(provider.to_owned(), start as isize);
-        claimed.get_mut(provider).unwrap().push((start, end));
+    claimed: &HashMap<String, Vec<(usize, usize)>>,
+    prev_start: &HashMap<String, isize>,
+    provider: &str,
+    source_text: &str,
+) -> SpanPlacement {
+    let Some(hay) = source_map.get(provider) else {
+        return SpanPlacement::Overlapped;
+    };
+    if source_text.is_empty() {
+        return SpanPlacement::Overlapped;
     }
+    let mut candidates = find_literal_spans(hay, source_text);
+    candidates.sort_by_key(|r| r.0);
+    let mut placed: Option<(usize, usize)> = None;
+    for cand in candidates {
+        let used = claimed.get(provider).map(Vec::as_slice).unwrap_or_default();
+        if used.iter().any(|u| ranges_overlap(cand, *u)) {
+            continue;
+        }
+        placed = Some(cand);
+        break;
+    }
+    let Some((start, end)) = placed else {
+        return SpanPlacement::Overlapped;
+    };
+    if (start as isize) < prev_start.get(provider).copied().unwrap_or(-1) {
+        return SpanPlacement::OutOfOrder;
+    }
+    SpanPlacement::Placed(start, end)
+}
 
+/// B5: candidate-level coverage — every non-whitespace character of the
+/// selected source (and any provider the derivation claims against) must be
+/// covered by placed span claims. Extracted unchanged from the pre-B5
+/// `claim_source_ranges` tail.
+fn coverage_failure(
+    source_map: &BTreeMap<String, String>,
+    claimed: &HashMap<String, Vec<(usize, usize)>>,
+    selected_provider: Option<&str>,
+) -> Option<Vec<ComposeErrorCode>> {
     let mut providers_to_cover: HashSet<String> = HashSet::new();
     if let Some(sp) = selected_provider
         && source_map.contains_key(sp)
     {
         providers_to_cover.insert(sp.to_owned());
     }
-    for (provider, ranges) in &claimed {
+    for (provider, ranges) in claimed {
         if !ranges.is_empty() {
             providers_to_cover.insert(provider.clone());
         }
@@ -1822,11 +2076,23 @@ fn claim_source_ranges(
             // char_indices gives char start; for multi-byte, check start only
             // (research fixtures are ASCII).
             if !covered[i] {
-                return vec![ComposeErrorCode::Unverifiable];
+                return Some(vec![ComposeErrorCode::Unverifiable]);
             }
         }
     }
-    vec![]
+    None
+}
+
+/// B5: a consuming span may not drop or alter a protected fact it carries.
+/// Case-sensitive `contains` on both sides, mirroring the whole-render
+/// protected gate, so the per-span drop and the final render check enforce
+/// the same guarantee (a casing-only mismatch still fails the render gate
+/// exactly as pre-B5, corpus CC-15).
+fn span_preserves_protected_tokens(span: &DerivationSpan, protected_tokens: &[&str]) -> bool {
+    protected_tokens
+        .iter()
+        .filter(|token| !(*token).is_empty())
+        .all(|token| !span.source_text.contains(token) || span.output_text.contains(token))
 }
 
 fn licensed_atoms(
@@ -1849,10 +2115,6 @@ fn licensed_atoms(
         allowed.extend(lexical_atoms(label));
     }
     allowed
-}
-
-fn compose_render(derivation: &[DerivationSpan]) -> String {
-    derivation.iter().map(|s| s.output_text.as_str()).collect()
 }
 
 fn is_multiparagraph_text(text: &str) -> bool {
@@ -2274,6 +2536,281 @@ mod tests {
         assert!(
             got.error_codes()
                 .contains(&ComposeErrorCode::UnsafeSemantics)
+        );
+    }
+
+    // ── B5: per-span adjudication ────────────────────────────────────────────
+
+    /// No candidates at all: the gate renders the local baseline byte for
+    /// byte (the shipped flag-off shape — nothing feeds candidates).
+    #[test]
+    fn b5_no_candidates_renders_the_local_baseline() {
+        for cloud in ["succeeded", "skipped"] {
+            let mut fx = clone_fixture("CC-18");
+            fx["cloud_outcome"] = Value::String(cloud.into());
+            fx["candidate"] = Value::Null;
+            let (owned, candidate) = fixture_input(&fx);
+            assert!(candidate.is_none());
+            let got = compose_owned(&owned, candidate.as_ref());
+            assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
+            assert_eq!(got.rendered(), owned.local_baseline.rendered());
+            assert!(got.span_summary().is_none());
+        }
+    }
+
+    /// B5 core behavior: a span that drops a protected fact is dropped by
+    /// itself — its original words are preserved — while the other spans still
+    /// apply. Pre-B5 this shape fell back wholesale (CC-14 with one span).
+    #[test]
+    fn b5_protected_fact_violation_dropped_per_span_not_wholesale() {
+        let mut fx = clone_fixture("CC-14");
+        fx["cloud_outcome"] = Value::String("succeeded".into());
+        fx["sources"] = serde_json::json!([{
+            "provider": "provider_a",
+            "available": true,
+            "text": "call Anuraj now about the release",
+            "primary": true
+        }]);
+        fx["base_fingerprint"] = Value::String(crate::text_sha256_fingerprint(
+            "call Anuraj now about the release",
+        ));
+        fx["candidate"]["base_fingerprint"] = fx["base_fingerprint"].clone();
+        fx["candidate"]["derivation"] = serde_json::json!([
+            {
+                "kind": "keep",
+                "source_provider": "provider_a",
+                "source_text": "call Anuraj now",
+                "output_text": "call anuraj now",
+                "conversion_id": null,
+                "label": null
+            },
+            {
+                "kind": "keep",
+                "source_provider": "provider_a",
+                "source_text": "about the release",
+                "output_text": " about the release.",
+                "conversion_id": null,
+                "label": null
+            }
+        ]);
+        let got = run_fx(fx);
+        assert_eq!(got.decision(), CompositionDecision::Accept);
+        assert_eq!(got.rendered(), "call Anuraj now about the release.");
+        let summary = got.span_summary().expect("per-span summary");
+        assert_eq!(summary.total_spans(), 2);
+        assert_eq!(summary.applied_spans(), 1);
+        assert_eq!(summary.rejected().len(), 1);
+        assert_eq!(summary.rejected()[0].span_index(), 0);
+        assert_eq!(summary.rejected()[0].reason(), ComposeErrorCode::Protected);
+    }
+
+    /// A span whose `source_text` is not in the source is dropped by itself;
+    /// spans that do anchor still apply and full source coverage still holds.
+    #[test]
+    fn b5_unverifiable_span_dropped_valid_spans_apply() {
+        let mut fx = clone_fixture("CC-01");
+        fx["sources"] = serde_json::json!([{
+            "provider": "provider_a",
+            "available": true,
+            "text": "alpha beta gamma",
+            "primary": true
+        }]);
+        fx["base_fingerprint"] = Value::String(crate::text_sha256_fingerprint("alpha beta gamma"));
+        fx["candidate"]["base_fingerprint"] = fx["base_fingerprint"].clone();
+        fx["candidate"]["removals"] = Value::Array(vec![]);
+        fx["candidate"]["conversions"] = Value::Array(vec![]);
+        fx["candidate"]["derivation"] = serde_json::json!([
+            {"kind":"keep","source_provider":"provider_a","source_text":"alpha","output_text":"Alpha,","conversion_id":null,"label":null},
+            {"kind":"keep","source_provider":"provider_a","source_text":"delta epsilon","output_text":"Delta epsilon","conversion_id":null,"label":null},
+            {"kind":"keep","source_provider":"provider_a","source_text":"beta gamma","output_text":" beta gamma.","conversion_id":null,"label":null}
+        ]);
+        let got = run_fx(fx);
+        assert_eq!(got.decision(), CompositionDecision::Accept);
+        assert_eq!(got.rendered(), "Alpha, beta gamma.");
+        let summary = got.span_summary().expect("per-span summary");
+        assert_eq!(summary.total_spans(), 3);
+        assert_eq!(summary.applied_spans(), 2);
+        assert_eq!(summary.rejected().len(), 1);
+        assert_eq!(summary.rejected()[0].span_index(), 1);
+        assert_eq!(
+            summary.rejected()[0].reason(),
+            ComposeErrorCode::Unverifiable
+        );
+    }
+
+    /// B5 overlap precedence: two spans claiming the same source range — the
+    /// FIRST in candidate order wins and renders its edit; the later
+    /// overlapping span is dropped (its range is already rendered by the
+    /// winner). Precedence is candidate order, not output content.
+    #[test]
+    fn b5_overlapping_spans_first_in_candidate_order_wins() {
+        let build = |first_output: &str, second_output: &str| {
+            let mut fx = clone_fixture("CC-01");
+            fx["sources"] = serde_json::json!([{
+                "provider": "provider_a",
+                "available": true,
+                "text": "ship it well",
+                "primary": true
+            }]);
+            fx["base_fingerprint"] = Value::String(crate::text_sha256_fingerprint("ship it well"));
+            fx["candidate"]["base_fingerprint"] = fx["base_fingerprint"].clone();
+            fx["candidate"]["removals"] = Value::Array(vec![]);
+            fx["candidate"]["conversions"] = Value::Array(vec![]);
+            fx["candidate"]["derivation"] = serde_json::json!([
+                {"kind":"keep","source_provider":"provider_a","source_text":"ship it","output_text":first_output,"conversion_id":null,"label":null},
+                {"kind":"keep","source_provider":"provider_a","source_text":"ship it","output_text":second_output,"conversion_id":null,"label":null},
+                {"kind":"keep","source_provider":"provider_a","source_text":"well","output_text":" well.","conversion_id":null,"label":null}
+            ]);
+            fx
+        };
+
+        // The second (overlap-dropped) span's output carries a leading space
+        // the way real keep outputs do, so the invented-atom basis — which
+        // still judges anchored overlap-dropped proposals (CC-08) — does not
+        // glue phantom atoms across adjacent spans.
+        let got = run_fx(build("Ship it", " SHIP IT"));
+        assert_eq!(
+            got.decision(),
+            CompositionDecision::Accept,
+            "codes={:?} rendered={:?}",
+            got.error_code_strs(),
+            got.rendered()
+        );
+        assert_eq!(got.rendered(), "Ship it well.");
+        let summary = got.span_summary().expect("per-span summary");
+        assert_eq!(summary.total_spans(), 3);
+        assert_eq!(summary.applied_spans(), 2);
+        assert_eq!(summary.rejected().len(), 1);
+        assert_eq!(summary.rejected()[0].span_index(), 1);
+        assert_eq!(summary.rejected()[0].reason(), ComposeErrorCode::Overlap);
+
+        // Swapping candidate order swaps the winner.
+        let swapped = run_fx(build("SHIP IT", " Ship it"));
+        assert_eq!(swapped.decision(), CompositionDecision::Accept);
+        assert_eq!(swapped.rendered(), "SHIP IT well.");
+    }
+
+    /// When every span is dropped the outcome is byte-identical with the
+    /// pre-B5 whole-candidate reject: `FallbackBaseline` rendering the local
+    /// baseline with the FIRST failing span's trigger and codes.
+    #[test]
+    fn b5_all_spans_rejected_equals_pre_b5_reject_path() {
+        // Single span, protected violation — the CC-14 corpus reject itself.
+        let fx = clone_fixture("CC-14");
+        let (owned, candidate) = fixture_input(&fx);
+        let got = compose_owned(&owned, candidate.as_ref());
+        assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
+        assert_eq!(got.rendered(), owned.local_baseline.rendered());
+        assert_eq!(got.rendered(), "Call Anuraj about the release.");
+        assert_eq!(
+            got.fallback_trigger(),
+            Some(FallbackTrigger::UnsafeSemantics)
+        );
+        assert_eq!(
+            got.error_codes(),
+            &[
+                ComposeErrorCode::Protected,
+                ComposeErrorCode::UnsafeSemantics
+            ]
+        );
+        assert!(got.span_summary().is_none());
+
+        // Multi-span all-rejected: the first failing span's codes are kept.
+        let mut fx = clone_fixture("CC-14");
+        fx["cloud_outcome"] = Value::String("succeeded".into());
+        fx["sources"] = serde_json::json!([{
+            "provider": "provider_a",
+            "available": true,
+            "text": "call Anuraj now about the release",
+            "primary": true
+        }]);
+        fx["base_fingerprint"] = Value::String(crate::text_sha256_fingerprint(
+            "call Anuraj now about the release",
+        ));
+        fx["candidate"]["base_fingerprint"] = fx["base_fingerprint"].clone();
+        fx["candidate"]["derivation"] = serde_json::json!([
+            {"kind":"keep","source_provider":"provider_a","source_text":"call Anuraj now","output_text":"call anuraj now","conversion_id":null,"label":null},
+            {"kind":"keep","source_provider":"provider_a","source_text":"words never spoken","output_text":"Words never spoken.","conversion_id":null,"label":null}
+        ]);
+        let got = run_fx(fx);
+        assert_eq!(got.decision(), CompositionDecision::FallbackBaseline);
+        assert_eq!(got.rendered(), "Call Anuraj about the release.");
+        assert_eq!(
+            got.fallback_trigger(),
+            Some(FallbackTrigger::UnsafeSemantics)
+        );
+        assert_eq!(
+            got.error_codes(),
+            &[
+                ComposeErrorCode::Protected,
+                ComposeErrorCode::UnsafeSemantics
+            ]
+        );
+        assert!(got.span_summary().is_none());
+    }
+
+    /// Partial application is a fixed point: rebuilding the candidate from the
+    /// gate's own adjudicated output (the dropped span becomes a plain keep of
+    /// its preserved source text) and re-running the gate changes nothing —
+    /// the same rendered text now applies 2/2 with no rejections.
+    #[test]
+    fn b5_partial_application_is_idempotent() {
+        let build = |first_output: &str| {
+            let mut fx = clone_fixture("CC-14");
+            fx["cloud_outcome"] = Value::String("succeeded".into());
+            fx["sources"] = serde_json::json!([{
+                "provider": "provider_a",
+                "available": true,
+                "text": "call Anuraj now about the release",
+                "primary": true
+            }]);
+            fx["base_fingerprint"] = Value::String(crate::text_sha256_fingerprint(
+                "call Anuraj now about the release",
+            ));
+            fx["candidate"]["base_fingerprint"] = fx["base_fingerprint"].clone();
+            fx["candidate"]["derivation"] = serde_json::json!([
+                {"kind":"keep","source_provider":"provider_a","source_text":"call Anuraj now","output_text":first_output,"conversion_id":null,"label":null},
+                {"kind":"keep","source_provider":"provider_a","source_text":"about the release","output_text":" about the release.","conversion_id":null,"label":null}
+            ]);
+            fx
+        };
+
+        let partial = run_fx(build("call anuraj now"));
+        assert_eq!(partial.decision(), CompositionDecision::Accept);
+        assert_eq!(partial.rendered(), "call Anuraj now about the release.");
+        assert_eq!(partial.span_summary().expect("summary").applied_spans(), 1);
+
+        // The gate's own output as a candidate: the preserved span is now a
+        // plain keep, every span applies, nothing changes.
+        let reduced = run_fx(build("call Anuraj now"));
+        assert_eq!(reduced.decision(), CompositionDecision::Accept);
+        assert_eq!(reduced.rendered(), partial.rendered());
+        let summary = reduced.span_summary().expect("summary");
+        assert_eq!(summary.applied_spans(), 2);
+        assert!(summary.rejected().is_empty());
+    }
+
+    /// A layout_break with a non-whitespace body is dropped by itself while
+    /// the rest of the candidate still applies.
+    #[test]
+    fn b5_malformed_layout_break_dropped_per_span() {
+        let mut fx = clone_fixture("CC-01");
+        fx["candidate"]["derivation"] = serde_json::json!([
+            {"kind":"keep","source_provider":"provider_a","source_text":"ship it","output_text":"Ship it","conversion_id":null,"label":null},
+            {"kind":"layout_break","source_provider":null,"source_text":"","output_text":"x","conversion_id":null,"label":null},
+            {"kind":"convert","source_provider":"provider_a","source_text":"exclamation point","output_text":"!","conversion_id":"exclamation point→!","label":null}
+        ]);
+        let got = run_fx(fx);
+        assert_eq!(got.decision(), CompositionDecision::Accept);
+        assert_eq!(got.rendered(), "Ship it!");
+        let summary = got.span_summary().expect("per-span summary");
+        assert_eq!(summary.total_spans(), 3);
+        assert_eq!(summary.applied_spans(), 2);
+        assert_eq!(summary.rejected().len(), 1);
+        assert_eq!(summary.rejected()[0].span_index(), 1);
+        assert_eq!(
+            summary.rejected()[0].reason(),
+            ComposeErrorCode::Unverifiable
         );
     }
 
