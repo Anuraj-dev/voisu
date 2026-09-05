@@ -212,7 +212,6 @@ pub struct ProcessHint {
 ///
 /// `TimingCertainty` is shared from `crate::prompt_rendering` so T1 and T2
 /// do not define competing crate-root names.
-/// do not define competing crate-root names.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TimingHint {
     pub certainty: TimingCertainty,

@@ -49,9 +49,12 @@ jobs:
   clippy:
     name: Lint gate (clippy -D warnings, default + overlay)
     # libgtk4-layer-shell-dev (required to compile the `overlay` feature)
-    # first ships in Ubuntu 26.04; the 24.04 image that ubuntu-latest points
-    # to has no such package — release.yml uses an ubuntu:26.04 container for
-    # the same reason.
+    # first ships in Ubuntu 25.10 (universe); the 24.04 image that
+    # ubuntu-latest points to has only the GTK3 variant — release.yml uses an
+    # ubuntu:26.04 container for the same reason. NOTE: the ubuntu-26.04
+    # runner label is Public Preview (GitHub changelog 2026-06-11); if it is
+    # ever withdrawn, switch these jobs to ubuntu-latest + `container:
+    # ubuntu:26.04` (the release.yml pattern).
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:

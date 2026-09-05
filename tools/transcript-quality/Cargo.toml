@@ -3,7 +3,7 @@ name = "transcript-quality"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.92"
 publish = false
 description = "Private developer evaluator for saved Recordings (not packaged)"
 

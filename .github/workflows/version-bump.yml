@@ -6,11 +6,13 @@ name: Version bump
 # stays a deliberate manual `git push origin v<version>` (see
 # packaging/RELEASING.md) — this workflow never tags and never publishes.
 #
-# The version lives in FOUR synchronized places and they move together here:
+# The version lives in FIVE synchronized places and they move together here:
 #   1. crates/voisu-app/Cargo.toml   version = "X.Y.Z"
 #   2. crates/voisu-core/Cargo.toml  version = "X.Y.Z" (lockstep)
 #   3. packaging/voisu.spec          Version:        X.Y.Z (column-aligned)
 #   4. Cargo.lock                    (regenerated via `cargo update`)
+#   5. tools/transcript-quality/Cargo.lock  (voisu-core path-dep entry synced
+#      in place, then proven with `cargo metadata --locked`)
 # plus a prepended packaging/voisu.spec %changelog entry. The release pipeline's
 # validate stage fails closed if the tag name and the tree version disagree, and
 # packaging/rpm-lib.sh:voisu_derive_version() fails if cargo metadata and the
@@ -189,7 +191,7 @@ jobs:
             echo "range_base=${base}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Rewrite all four version locations and prepend the changelog
+      - name: Rewrite all five version locations and prepend the changelog
         id: apply
         if: steps.detect.outputs.bump_type != ''
         env:
