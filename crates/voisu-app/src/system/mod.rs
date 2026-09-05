@@ -1060,6 +1060,32 @@ mod tests {
         assert_eq!(GROQ_FULL_AUDIO_MAX_BYTES, 16_000 * 2 * 120);
     }
 
+    /// send_audio advances its pre-stream buffer with `Vec::drain(..step)`.
+    /// This pins the invariant that change relies on: draining the front
+    /// `step` bytes leaves exactly the tail that the previous
+    /// `buffer[step..].to_vec()` re-allocation produced, at production
+    /// geometry and at arbitrary lengths.
+    #[test]
+    fn groq_overlap_rotation_drain_matches_slice_to_vec() {
+        let step = GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES;
+        for &(len, cut) in &[
+            (GROQ_CHUNK_BYTES, step),
+            (4 * GROQ_CHUNK_BYTES, step),
+            (5_000_000, step),
+            (4096, 1000),
+            (1000, 1000),
+        ] {
+            let original: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut via_drain = original.clone();
+            via_drain.drain(..cut);
+            assert_eq!(
+                via_drain,
+                original[cut..].to_vec(),
+                "drain(..{cut}) must equal slice+to_vec for len={len}"
+            );
+        }
+    }
+
     #[test]
     fn groq_curl_config_carries_the_accuracy_gains() {
         let credential = Credential::new("secret-token".to_owned()).unwrap();

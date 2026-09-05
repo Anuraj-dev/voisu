@@ -227,8 +227,12 @@ impl ProviderStream for GroqStream {
             if groq_prestream_active(self.streamed_bytes) {
                 while self.buffer.len() >= GROQ_CHUNK_BYTES {
                     let pcm = self.buffer[..GROQ_CHUNK_BYTES].to_vec();
-                    self.buffer =
-                        self.buffer[GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES..].to_vec();
+                    // Drain (not re-slice into a fresh Vec): the shift happens
+                    // in place, so each 60 s chunk of a long pre-streamed
+                    // Recording does one memmove instead of allocating and
+                    // copying a fresh ~1.8 MB tail Vec.
+                    self.buffer
+                        .drain(..(GROQ_CHUNK_BYTES - GROQ_CHUNK_OVERLAP_BYTES));
                     let credential = self.credential.clone();
                     let endpoint = self.endpoint.clone();
                     let params = self.params.clone();
