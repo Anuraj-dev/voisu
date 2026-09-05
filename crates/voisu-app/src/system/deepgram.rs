@@ -10,6 +10,11 @@ pub struct DeepgramProvider {
     /// streaming URL. Ticket 04's shared dictionary is wired in here by the
     /// driver at merge; until then the list defaults to empty.
     keyterms: Vec<String>,
+    /// The Recording's resolved transcription-language snapshot. `None` falls
+    /// back to the shared config resolution at stream start; the daemon
+    /// supplies the same resolved value it declared to EnglishEligibility so
+    /// the request's language can never drift from the declaration.
+    language: Option<String>,
 }
 
 impl DeepgramProvider {
@@ -23,7 +28,26 @@ impl DeepgramProvider {
     /// Same as [`DeepgramProvider::new`] but with nova-3 `keyterm` boosting
     /// terms appended to every streaming connection URL.
     pub fn with_keyterms(reaper: ProviderReaper, keyterms: Vec<String>) -> Self {
-        Self { reaper, keyterms }
+        Self {
+            reaper,
+            keyterms,
+            language: None,
+        }
+    }
+
+    /// Builds a Deepgram provider from the Recording's resolved language
+    /// snapshot — the same value the daemon declares to EnglishEligibility and
+    /// hands to Groq, so both providers transcribe one declared language.
+    pub fn with_keyterms_and_language(
+        reaper: ProviderReaper,
+        keyterms: Vec<String>,
+        language: String,
+    ) -> Self {
+        Self {
+            reaper,
+            keyterms,
+            language: Some(language),
+        }
     }
 }
 
@@ -32,7 +56,11 @@ impl TranscriptProvider for DeepgramProvider {
         let credential = SecretStore::load(&mut SecretToolStore, Provider::Deepgram)?;
         let base = std::env::var("VOISU_DEEPGRAM_TRANSCRIPTION_URL")
             .unwrap_or_else(|_| "wss://api.deepgram.com/v1/listen".to_owned());
-        let url = deepgram_streaming_url(&base, &self.keyterms)?;
+        let language = self
+            .language
+            .clone()
+            .unwrap_or_else(crate::config::transcription_language);
+        let url = deepgram_streaming_url(&base, &self.keyterms, &language)?;
         Ok(Box::new(DeepgramStream::connect(
             url,
             credential,
@@ -43,30 +71,36 @@ impl TranscriptProvider for DeepgramProvider {
     }
 }
 
-/// Fixed query params for the Deepgram nova-3 real-time streaming connection:
-/// raw s16le/16kHz/mono PCM in, interim results on (finals are filtered by the
-/// accumulator), smart formatting, and explicit endpointing/utterance-end
-/// tuning for dictation pauses.
-const DEEPGRAM_STREAMING_PARAMS: &[(&str, &str)] = &[
-    ("model", "nova-3"),
-    ("language", DEFAULT_TRANSCRIPTION_LANGUAGE),
-    ("encoding", "linear16"),
-    ("sample_rate", "16000"),
-    ("channels", "1"),
-    ("interim_results", "true"),
-    ("smart_format", "true"),
-    ("punctuate", "true"),
-    ("endpointing", "300"),
-    ("utterance_end_ms", "1000"),
-];
+/// Query params for the Deepgram nova-3 real-time streaming connection, in
+/// wire order: raw s16le/16kHz/mono PCM in, the Recording's transcription
+/// language, interim results on (finals are filtered by the accumulator),
+/// smart formatting, and explicit endpointing/utterance-end tuning for
+/// dictation pauses. A function rather than a const so the language rides the
+/// resolved per-Recording snapshot while every other param stays fixed.
+fn deepgram_streaming_params(language: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("model", "nova-3".to_owned()),
+        ("language", language.to_owned()),
+        ("encoding", "linear16".to_owned()),
+        ("sample_rate", "16000".to_owned()),
+        ("channels", "1".to_owned()),
+        ("interim_results", "true".to_owned()),
+        ("smart_format", "true".to_owned()),
+        ("punctuate", "true".to_owned()),
+        ("endpointing", "300".to_owned()),
+        ("utterance_end_ms", "1000".to_owned()),
+    ]
+}
 
-/// Builds the streaming websocket URL from a base endpoint. `https`/`http`
-/// bases are rewritten to `wss`/`ws` so the existing endpoint override env var
-/// keeps working; plaintext `ws` is allowed only on loopback, mirroring the
-/// HTTPS policy of the batch endpoints.
+/// Builds the streaming websocket URL from a base endpoint and the Recording's
+/// resolved transcription language. `https`/`http` bases are rewritten to
+/// `wss`/`ws` so the existing endpoint override env var keeps working;
+/// plaintext `ws` is allowed only on loopback, mirroring the HTTPS policy of
+/// the batch endpoints.
 pub(super) fn deepgram_streaming_url(
     base: &str,
     keyterms: &[String],
+    language: &str,
 ) -> Result<String, BoundaryError> {
     if !endpoint_raw_string_is_allowed(base) {
         return Err(BoundaryError::new(
@@ -116,11 +150,11 @@ pub(super) fn deepgram_streaming_url(
     }
     let mut url = normalized;
     let mut separator = if url.contains('?') { '&' } else { '?' };
-    for (name, value) in DEEPGRAM_STREAMING_PARAMS {
+    for (name, value) in deepgram_streaming_params(language) {
         url.push(separator);
         url.push_str(name);
         url.push('=');
-        url.push_str(value);
+        url.push_str(&value);
         separator = '&';
     }
     for keyterm in keyterms {

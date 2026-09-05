@@ -345,15 +345,15 @@ diff cleanly; the daemon's output goes to stderr):
 
 ### Daemon replay gaps found while building B1 (for a later slice)
 
-1. **Replay output is not machine-readable.** `voisu replay` prints only the
-   human `response.message` ("replayed fixture through N Source
-   Transcript(s)"). There is no `--json`, and the replay `Response.evidence`
-   (`LifecycleEvidence`) carries providers, timings, selection, and decision
-   reasons — but **no Source Transcript texts and no final Transcript text**.
-   Until the daemon emits them, replay can run the real pipeline but the
-   harness cannot score it, so the outcome is always a SKIP. A later slice
-   can add `voisu replay --json` (print the full `Response`) plus transcript
-   text in the evidence, then write a sidecar with `"origin": "replay"`.
+1. **Replay output is not machine-readable — CLOSED for the daemon.**
+   `voisu replay --json` (also accepted after the fixture name) now prints the
+   full `Response` as JSON, and the replay `Response.evidence`
+   (`LifecycleEvidence`) additively carries `source_transcripts`
+   (provider-tagged texts) and `final_transcript`, clamped like history
+   records; the human message is unchanged when the flag is omitted. The
+   remaining half is harness-side only: capture that JSON into a sidecar with
+   `"origin": "replay"` is a future slice and the SKIP reason above stays
+   until that lands.
 2. **Fixtures are name-bound, not path-bound.** The daemon accepts only a
    plain file name and reads it from its private
    `diagnostics/fixtures/` directory (absolute paths are rejected); hence the
@@ -361,14 +361,15 @@ diff cleanly; the daemon's output goes to stderr):
 3. **Replays leave no diagnostic record.** Only live Recordings persist to
    `history.jsonl`, so `voisu history`/`voisu export` cannot capture a replay
    outcome either — the machine-readable sidecar has to be built by the
-   caller (this tool, in a later slice).
+   caller (this tool, in a later slice; the daemon now supplies the texts,
+   the caller only stores them).
 4. **Fixture format has no metadata.** A fixture is raw s16le/mono/16 kHz
    PCM with no header, duration, or sidecar, so corpus cases document the
    format by convention (`fixture.pcm`) and validate size only.
 5. **Replay uses the daemon's live configuration** (dictionary snapshot,
-   Deepgram toggle resolved at invocation), so replay results are only as
-   reproducible as the daemon state — worth remembering when comparing
-   replay-based runs across daemon restarts.
+   Deepgram toggle, transcription language resolved at invocation), so
+   replay results are only as reproducible as the daemon state — worth
+   remembering when comparing replay-based runs across daemon restarts.
 
 ## Privacy rules (hard)
 

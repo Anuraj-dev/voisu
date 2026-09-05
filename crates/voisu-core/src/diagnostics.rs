@@ -134,6 +134,14 @@ fn clamp_text(text: String) -> String {
     clamped
 }
 
+/// Clamps a transcript text to [`MAX_STORED_TEXT`] exactly as a persisted
+/// history record clamps it (char-boundary safe, `…` appended on truncation).
+/// Replay evidence uses this so a machine-read replay response is bounded by
+/// the same per-text budget as history.
+pub fn clamp_stored_transcript_text(text: String) -> String {
+    clamp_text(text)
+}
+
 /// Clamps `text` to at most `max_bytes` UTF-8 bytes on a char boundary. Unlike
 /// `clamp_text`, no ellipsis is appended — Smart Writing diagnostic clamps are
 /// exact byte budgets that fingerprints of the unclamped source cover for

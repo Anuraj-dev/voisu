@@ -18,7 +18,7 @@ commands:
   shortcut
   history [--json]
   export <correlation-id>
-  replay <fixture-name>
+  replay [--json] <fixture-name>
   doctor [--verbose|-v]
   auth set <groq|deepgram>
   auth verify <groq|deepgram>

@@ -5,6 +5,13 @@
 //! `$XDG_CONFIG_HOME/voisu/config.toml` (default `~/.config/voisu/config.toml`),
 //! read once at daemon start.
 //!
+//! Environment-configured options also live here: the rollout gates
+//! (`VOISU_ENABLE_DPR`, `VOISU_ENABLE_QWEN_FORMAT`,
+//! `VOISU_ENABLE_INTENT_RECONSTRUCTION`) and the transcription language
+//! (`VOISU_TRANSCRIPTION_LANGUAGE`, read by
+//! [`transcription_language`] at each Recording boundary and shared by the
+//! Groq and Deepgram request builders).
+//!
 //! The Deepgram default is **ON**: a fresh install runs the reconciled
 //! dual-Provider path for the best jargon accuracy, and the user opts into the
 //! fast Groq-only path with `voisu deepgram off` (or the
@@ -49,6 +56,23 @@ pub const ENABLE_DPR_ENV: &str = "VOISU_ENABLE_DPR";
 /// switch the formatting cloud contract off #139 derivation.
 pub const ENABLE_QWEN_FORMAT_ENV: &str = "VOISU_ENABLE_QWEN_FORMAT";
 pub const ENABLE_INTENT_RECONSTRUCTION_ENV: &str = "VOISU_ENABLE_INTENT_RECONSTRUCTION";
+
+/// Environment override selecting the transcription language requested from
+/// every active transcription Provider: Groq's `language` request field and
+/// Deepgram's streaming `language` query parameter both receive exactly this
+/// value, resolved once per Recording boundary. Values are normalized to
+/// lowercase and validated permissively (see
+/// [`resolve_transcription_language`]); unset keeps the historic
+/// [`crate::system::DEFAULT_TRANSCRIPTION_LANGUAGE`] behavior with no
+/// diagnostic, and an invalid value fails closed to that default with a
+/// local diagnostic rather than a per-provider guess.
+pub const TRANSCRIPTION_LANGUAGE_ENV: &str = "VOISU_TRANSCRIPTION_LANGUAGE";
+
+/// Longest language tag accepted from [`TRANSCRIPTION_LANGUAGE_ENV`]. Every
+/// common BCP-47 form (`en`, `en-US`, `zh-Hans-CN`, `yue-Hant-HK`, `es-419`)
+/// and Deepgram's `multi` fit well inside 16 ASCII bytes; anything longer is
+/// not a language code and is refused.
+pub const MAX_LANGUAGE_TAG_BYTES: usize = 16;
 
 /// How Voisu delivers a final Transcript after preserving it on the clipboard.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -246,6 +270,89 @@ fn parse_dpr_enablement(value: &str) -> bool {
 /// `None` is the packaged default (off). Each flag is parsed on its own.
 fn parse_optional_dpr_enablement(value: Option<&str>) -> bool {
     value.is_some_and(parse_dpr_enablement)
+}
+
+/// The transcription language this process requests from every transcription
+/// Provider, resolved once per Recording boundary so the value the Groq and
+/// Deepgram requests carry is exactly the value the Recording's language
+/// declarations (and therefore EnglishEligibility) recorded. Unset keeps the
+/// historic default with no diagnostic; an invalid value falls back to the
+/// default with a local (stderr/journal) diagnostic.
+pub fn transcription_language() -> String {
+    let default = crate::system::DEFAULT_TRANSCRIPTION_LANGUAGE;
+    let (language, diagnostic) = match std::env::var(TRANSCRIPTION_LANGUAGE_ENV) {
+        Ok(value) => resolve_transcription_language(Some(&value)),
+        Err(std::env::VarError::NotPresent) => resolve_transcription_language(None),
+        Err(std::env::VarError::NotUnicode(_)) => (
+            default.to_owned(),
+            Some(format!(
+                "{TRANSCRIPTION_LANGUAGE_ENV} is not valid Unicode; \
+                 falling back to {default}"
+            )),
+        ),
+    };
+    if let Some(diagnostic) = diagnostic {
+        // Local-only: the daemon journal or the invoking CLI's stderr.
+        eprintln!("{diagnostic}");
+    }
+    language
+}
+
+/// Pure resolution of the configured transcription language so the fallback
+/// rule is testable without touching the process environment. Returns the
+/// language to request and an optional local diagnostic.
+///
+/// * `None` (the variable is unset) is exactly the historic behavior: the
+///   default language, no diagnostic.
+/// * A permissive language tag — a 2–8 letter primary subtag (ISO 639-1/-3,
+///   or a provider code such as Deepgram's `multi`) followed by optional
+///   1–8 character alphanumeric BCP-47-style subtags, case-normalized to
+///   lowercase, total length capped at [`MAX_LANGUAGE_TAG_BYTES`] — is
+///   forwarded to both providers verbatim.
+/// * Anything else fails closed to the default with a diagnostic naming the
+///   rejected value, so one typo can never desynchronize the two providers'
+///   requests.
+pub fn resolve_transcription_language(raw: Option<&str>) -> (String, Option<String>) {
+    let default = crate::system::DEFAULT_TRANSCRIPTION_LANGUAGE;
+    let Some(raw) = raw else {
+        return (default.to_owned(), None);
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    if language_tag_is_allowed(&normalized) {
+        return (normalized, None);
+    }
+    (
+        default.to_owned(),
+        Some(format!(
+            "{TRANSCRIPTION_LANGUAGE_ENV}={raw:?} is not a usable language code \
+             (lowercase letters, digits, and single hyphens, e.g. en, en-US, \
+             es-419, multi); falling back to {default}"
+        )),
+    )
+}
+
+/// Whether `normalized` (already trimmed and lowercased) is a plausible
+/// transcription language tag. The check is deliberately permissive — an
+/// unknown but well-formed code is the provider's to reject visibly — but it
+/// refuses values that cannot be a language code at all: wrong shape, a
+/// leading/trailing/double hyphen, or anything past
+/// [`MAX_LANGUAGE_TAG_BYTES`].
+fn language_tag_is_allowed(normalized: &str) -> bool {
+    if normalized.is_empty() || normalized.len() > MAX_LANGUAGE_TAG_BYTES {
+        return false;
+    }
+    let mut subtags = normalized.split('-');
+    let Some(primary) = subtags.next() else {
+        return false;
+    };
+    (2..=8).contains(&primary.len())
+        && primary.bytes().all(|byte| byte.is_ascii_lowercase())
+        && subtags.all(|subtag| {
+            (1..=8).contains(&subtag.len())
+                && subtag
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
 }
 
 /// Persists the Rendering Policy, creating the `voisu` config directory if
@@ -728,6 +835,95 @@ mod tests {
     #[test]
     fn the_default_is_on_when_nothing_is_persisted() {
         assert!(resolve(false, None));
+    }
+
+    // ─── Slice B6: the transcription language surface ────────────────────────
+
+    #[test]
+    fn an_unset_transcription_language_is_exactly_the_historic_default() {
+        let (language, diagnostic) = resolve_transcription_language(None);
+        assert_eq!(
+            language,
+            crate::system::DEFAULT_TRANSCRIPTION_LANGUAGE,
+            "unset must keep today's behavior"
+        );
+        assert!(
+            diagnostic.is_none(),
+            "the unset default is silent: {diagnostic:?}"
+        );
+    }
+
+    #[test]
+    fn a_valid_transcription_language_is_forwarded_to_both_providers() {
+        // The same resolved value feeds the Groq language request field and the
+        // Deepgram streaming query param, so one validated code is what both
+        // requests carry.
+        for (raw, expected) in [
+            ("en", "en"),
+            ("de", "de"),
+            ("en-US", "en-us"),
+            ("es-419", "es-419"),
+            ("zh-Hans-CN", "zh-hans-cn"),
+            ("multi", "multi"),
+            ("  pt-BR  ", "pt-br"),
+        ] {
+            let (language, diagnostic) = resolve_transcription_language(Some(raw));
+            assert_eq!(language, expected, "raw {raw:?} must resolve to {expected}");
+            assert!(
+                diagnostic.is_none(),
+                "valid {raw:?} is silent: {diagnostic:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_transcription_language_is_case_normalized_before_use() {
+        for raw in ["EN", "En-Us", "MULTI", "ES-419"] {
+            let (language, diagnostic) = resolve_transcription_language(Some(raw));
+            assert_eq!(language, raw.to_ascii_lowercase(), "raw {raw:?}");
+            assert!(diagnostic.is_none(), "case folding is not an error");
+        }
+    }
+
+    #[test]
+    fn an_invalid_transcription_language_falls_back_to_the_default_with_a_diagnostic() {
+        for raw in [
+            "",
+            "   ",
+            "e",                                             // too short to be a primary subtag
+            "multi language", // a space is not a language tag character
+            "en_US",          // BCP-47 uses hyphens
+            "en--US",         // empty subtag
+            "-en",            // leading hyphen
+            "en-",            // trailing hyphen
+            "en.US",          // wrong separator
+            "1234",           // the primary subtag must be alphabetic
+            "ün-code",        // ASCII only
+            "x".repeat(MAX_LANGUAGE_TAG_BYTES + 1).as_str(), // length-capped
+        ] {
+            let (language, diagnostic) = resolve_transcription_language(Some(raw));
+            assert_eq!(
+                language,
+                crate::system::DEFAULT_TRANSCRIPTION_LANGUAGE,
+                "invalid {raw:?} must fall back to the default"
+            );
+            let diagnostic =
+                diagnostic.unwrap_or_else(|| panic!("invalid {raw:?} needs a diagnostic"));
+            assert!(
+                diagnostic.contains(TRANSCRIPTION_LANGUAGE_ENV),
+                "the diagnostic must name the variable: {diagnostic}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_language_cap_leaves_common_tags_usable() {
+        // Every documented provider form fits the cap; only longer junk is
+        // refused. A tag exactly at the cap validates; one byte more does not.
+        assert!(language_tag_is_allowed("yue-hant-hk"));
+        assert!(language_tag_is_allowed("zh-hans-cn"));
+        assert!(language_tag_is_allowed("abcdefgh-1234567"));
+        assert!(!language_tag_is_allowed("abcdefgh-12345678"));
     }
 
     #[test]
