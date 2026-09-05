@@ -581,4 +581,185 @@ mod tests {
         assert_eq!(wer.substitutions, 0);
         assert_eq!(wer.deletions, 0);
     }
+
+    const CORPUS_VOCABULARY: [&str; 5] = ["alpha", "beta", "gamma", "delta", "epsilon"];
+
+    /// Tiny deterministic PRNG (xorshift64) so the equivalence corpus is fixed:
+    /// a non-zero seed never reaches the zero state.
+    fn xorshift64(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    fn random_sequence(state: &mut u64, len: usize) -> Vec<String> {
+        (0..len)
+            .map(|_| {
+                CORPUS_VOCABULARY[(xorshift64(state) % CORPUS_VOCABULARY.len() as u64) as usize]
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// Applies 0..=7 random insert/delete/substitute edits, keeping the
+    /// hypothesis within the corpus length bound.
+    fn mutate_sequence(base: &[String], state: &mut u64) -> Vec<String> {
+        let mut seq: Vec<String> = base.to_vec();
+        for _ in 0..xorshift64(state) % 8 {
+            let pick = |state: &mut u64| {
+                CORPUS_VOCABULARY[(xorshift64(state) % CORPUS_VOCABULARY.len() as u64) as usize]
+                    .to_owned()
+            };
+            match xorshift64(state) % 3 {
+                0 if seq.len() < 40 => {
+                    let pos = (xorshift64(state) % (seq.len() as u64 + 1)) as usize;
+                    seq.insert(pos, pick(state));
+                }
+                0 => {
+                    let pos = (xorshift64(state) % seq.len() as u64) as usize;
+                    seq[pos] = pick(state);
+                }
+                1 if !seq.is_empty() => {
+                    let pos = (xorshift64(state) % seq.len() as u64) as usize;
+                    seq.remove(pos);
+                }
+                _ if seq.is_empty() => seq.push(pick(state)),
+                _ => {
+                    let pos = (xorshift64(state) % seq.len() as u64) as usize;
+                    seq[pos] = pick(state);
+                }
+            }
+        }
+        seq
+    }
+
+    /// Independent oracle: a plain full (n+1)x(m+1) matrix DP with traceback,
+    /// replicating the production tie-break order exactly (del when
+    /// `del <= ins && del <= sub`, else ins when `ins <= sub`, else
+    /// sub/match) and its traceback step accounting. Returns the op breakdown
+    /// plus the matrix edit distance.
+    fn reference_matrix_levenshtein_ops(
+        reference: &[String],
+        hypothesis: &[String],
+    ) -> (usize, usize, usize, usize) {
+        let n = reference.len();
+        let m = hypothesis.len();
+        let mut dp = vec![vec![0u32; m + 1]; n + 1];
+        let mut back = vec![vec![0u8; m + 1]; n + 1];
+        for i in 1..=n {
+            dp[i][0] = i as u32;
+            back[i][0] = 1;
+        }
+        for j in 1..=m {
+            dp[0][j] = j as u32;
+            back[0][j] = 2;
+        }
+        for i in 1..=n {
+            for j in 1..=m {
+                let cost = u32::from(reference[i - 1] != hypothesis[j - 1]);
+                let del = dp[i - 1][j] + 1;
+                let ins = dp[i][j - 1] + 1;
+                let sub = dp[i - 1][j - 1] + cost;
+                if del <= ins && del <= sub {
+                    dp[i][j] = del;
+                    back[i][j] = 1;
+                } else if ins <= sub {
+                    dp[i][j] = ins;
+                    back[i][j] = 2;
+                } else {
+                    dp[i][j] = sub;
+                    back[i][j] = 3;
+                }
+            }
+        }
+        let mut i = n;
+        let mut j = m;
+        let (mut insertions, mut deletions, mut substitutions) = (0usize, 0usize, 0usize);
+        while i > 0 || j > 0 {
+            match back[i][j] {
+                1 => {
+                    deletions += 1;
+                    i -= 1;
+                }
+                2 => {
+                    insertions += 1;
+                    j -= 1;
+                }
+                3 => {
+                    if reference[i - 1] != hypothesis[j - 1] {
+                        substitutions += 1;
+                    }
+                    i -= 1;
+                    j -= 1;
+                }
+                _ => break,
+            }
+        }
+        (insertions, deletions, substitutions, dp[n][m] as usize)
+    }
+
+    /// The production `levenshtein_ops` rolls the DP onto two rows and stores
+    /// only one backpointer byte per cell. This pins it, on a fixed seeded
+    /// corpus, against the full-matrix oracle above: identical op breakdown on
+    /// identical pairs, empty inputs, mutation-derived pairs, and fully random
+    /// pairs — and the invariant that the counted ops sum to the matrix edit
+    /// distance (no op dropped or double-counted by the traceback).
+    #[test]
+    fn levenshtein_ops_matches_reference_matrix_on_seeded_corpus() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15; // fixed seed
+        for case in 0..1000usize {
+            let (reference, hypothesis) = match case % 10 {
+                // Identical pairs (lengths 0..=40, so the empty pair included).
+                0 | 1 => {
+                    let len = (xorshift64(&mut state) % 41) as usize;
+                    let seq = random_sequence(&mut state, len);
+                    (seq.clone(), seq)
+                }
+                // Exactly one side empty.
+                2 => {
+                    let len = (xorshift64(&mut state) % 41) as usize;
+                    let seq = random_sequence(&mut state, len);
+                    if xorshift64(&mut state).is_multiple_of(2) {
+                        (seq, Vec::new())
+                    } else {
+                        (Vec::new(), seq)
+                    }
+                }
+                // Mutation-derived pair: hypothesis is the reference with a few
+                // random insert/delete/substitute edits.
+                3..=6 => {
+                    let len = (xorshift64(&mut state) % 41) as usize;
+                    let base = random_sequence(&mut state, len);
+                    (base.clone(), mutate_sequence(&base, &mut state))
+                }
+                // Fully random pair.
+                _ => {
+                    let n = (xorshift64(&mut state) % 41) as usize;
+                    let m = (xorshift64(&mut state) % 41) as usize;
+                    (
+                        random_sequence(&mut state, n),
+                        random_sequence(&mut state, m),
+                    )
+                }
+            };
+            let got = levenshtein_ops(&reference, &hypothesis);
+            let (expected_i, expected_d, expected_s, distance) =
+                reference_matrix_levenshtein_ops(&reference, &hypothesis);
+            assert_eq!(
+                got,
+                (expected_i, expected_d, expected_s),
+                "case {case}: n={} m={}",
+                reference.len(),
+                hypothesis.len()
+            );
+            let total_ops = got.0 + got.1 + got.2;
+            assert_eq!(
+                total_ops, distance,
+                "case {case}: ops must sum to the matrix edit distance"
+            );
+        }
+    }
 }
