@@ -203,9 +203,40 @@ fn curl_config_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Shared endpoint-transport policy: the authority may never carry userinfo
-/// (`user:pass@host` authenticates through the URL itself, which no provider
-/// endpoint legitimately does) and the host must be present.
+/// Raw-endpoint pre-parse gate shared by every endpoint transport policy.
+/// Rejects, before any parsing:
+/// - control characters the URL parser silently strips before validating
+///   (`\n`, `\r`, `\t` — so `localho\tst` cannot gate as plain `localhost`),
+///   plus `\0`, which has no place in an endpoint;
+/// - any `\`: the url crate ends its userinfo/host scan at `\` for special
+///   schemes while curl splits userinfo at the LAST `@` and accepts `\`
+///   inside it, so `http://localhost:8080\@attacker.example/` gates as
+///   loopback-without-userinfo yet curl connects to attacker.example;
+/// - any `@` in the raw authority: userinfo of ANY shape is invalid on a
+///   provider endpoint, and the EMPTY form (`http://@localhost/`) is
+///   invisible to the parsed accessors — `username()` is empty, `password()`
+///   is None, and the url crate drops the `@` from its serialization
+///   entirely — so only the raw authority can see it.
+pub(crate) fn endpoint_raw_string_is_allowed(endpoint: &str) -> bool {
+    if endpoint.contains(['\n', '\r', '\t', '\0', '\\']) {
+        return false;
+    }
+    let Some((_scheme, authority)) = endpoint.split_once("://") else {
+        // No scheme-shaped authority; the parse and scheme gates decide.
+        return true;
+    };
+    !authority
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .contains('@')
+}
+
+/// Shared endpoint-transport policy on the PARSED URL: the host must be
+/// present, and any surviving userinfo (non-empty username or any password)
+/// rejects — no legitimate provider endpoint authenticates through the URL
+/// itself. The raw empty-`@` form is caught earlier by
+/// `endpoint_raw_string_is_allowed`, which sees the string the way curl does.
 pub(crate) fn endpoint_authority_is_allowed(url: &url::Url) -> bool {
     url.host_str().is_some_and(|host| !host.is_empty())
         && url.username().is_empty()
@@ -2234,37 +2265,108 @@ mod tests {
         assert!(deepgram_streaming_url("http://localhost@attacker.example/listen", &[]).is_err());
         assert!(deepgram_streaming_url("wss://user@api.deepgram.com/v1/listen", &[]).is_err());
         assert!(deepgram_streaming_url("ws:///listen", &[]).is_err());
+        // The EMPTY userinfo form parses with no username and no password (the
+        // url crate drops the `@` entirely), so the raw authority is what sees it.
+        assert!(deepgram_streaming_url("ws://@localhost/listen", &[]).is_err());
+        // A `\` ends the url crate's userinfo scan but is accepted inside
+        // curl's last-`@` split: fail closed on the raw string.
+        assert!(
+            deepgram_streaming_url("ws://localhost:8080\\@attacker.example/listen", &[]).is_err()
+        );
     }
 
     #[test]
-    fn provider_endpoint_security_parses_the_url_instead_of_prefix_matching() {
-        assert!(provider_endpoint_is_secure(
+    fn provider_endpoint_gate_parses_the_url_instead_of_prefix_matching() {
+        let secure = |endpoint: &str| provider_endpoint_url(endpoint).is_some();
+        assert!(secure(
             "https://api.groq.com/openai/v1/audio/transcriptions"
         ));
-        assert!(provider_endpoint_is_secure(
-            "http://localhost:8080/transcribe"
-        ));
-        assert!(provider_endpoint_is_secure(
-            "http://127.0.0.1:9999/transcribe"
-        ));
-        assert!(provider_endpoint_is_secure("http://127.7.7.7/transcribe"));
-        assert!(!provider_endpoint_is_secure(
-            "http://attacker.example/transcribe"
-        ));
+        assert!(secure("http://localhost:8080/transcribe"));
+        assert!(secure("http://127.0.0.1:9999/transcribe"));
+        assert!(secure("http://127.7.7.7/transcribe"));
+        assert!(!secure("http://attacker.example/transcribe"));
         // Userinfo smuggling: both of these passed the old prefix checks — any
         // `https://…` passed, and `localhost:8080@…` starts with `localhost:` —
         // while the real parsed host is attacker.example.
-        assert!(!provider_endpoint_is_secure(
+        assert!(!secure(
             "https://user:pass@api.groq.com@attacker.example/transcribe"
         ));
-        assert!(!provider_endpoint_is_secure(
-            "http://localhost:8080@attacker.example/transcribe"
-        ));
+        assert!(!secure("http://localhost:8080@attacker.example/transcribe"));
         // Exact host comparison: a lookalike suffix is a different host.
-        assert!(!provider_endpoint_is_secure(
-            "http://localhost.attacker.example/transcribe"
+        assert!(!secure("http://localhost.attacker.example/transcribe"));
+        assert!(!secure("not a url"));
+    }
+
+    #[test]
+    fn provider_endpoint_gate_rejects_backslash_and_stripped_control_characters() {
+        let secure = |endpoint: &str| provider_endpoint_url(endpoint).is_some();
+        // The url crate stops its userinfo/host scan at `\` for special schemes
+        // while curl splits userinfo at the LAST `@` and accepts `\` inside it:
+        // this shape gates as loopback-without-userinfo yet connects to
+        // attacker.example, so the raw string fails closed before parsing.
+        assert!(!secure(
+            "http://localhost:8080\\@attacker.example/transcribe"
         ));
-        assert!(!provider_endpoint_is_secure("not a url"));
+        assert!(!secure(
+            "https://api.groq.com\\@attacker.example/transcribe"
+        ));
+        // The URL parser silently strips tab (and newline) before validating:
+        // `localho\tst` must not gate as `localhost`, and `\0` has no place in
+        // an endpoint.
+        assert!(!secure("http://localho\tst/transcribe"));
+        assert!(!secure("http://localhost/transcribe\r"));
+        assert!(!secure("http://localhost\0/transcribe"));
+    }
+
+    #[test]
+    fn provider_endpoint_gate_rejects_empty_userinfo() {
+        let secure = |endpoint: &str| provider_endpoint_url(endpoint).is_some();
+        // `http://@localhost/` parses with username()=="" and no password —
+        // indistinguishable from no userinfo at the parsed level, and the url
+        // crate drops the `@` from its serialization. The raw-authority gate
+        // sees it: any `@` in the authority is userinfo.
+        assert!(!secure("http://@localhost/transcribe"));
+        assert!(!secure("http://:pass@localhost/transcribe"));
+        assert!(!secure("http://user@localhost/transcribe"));
+        // An `@` in the path or query is not userinfo.
+        assert!(secure(
+            "https://api.groq.com/openai/v1/audio/transcriptions?at=@here"
+        ));
+    }
+
+    #[test]
+    fn groq_curl_paths_hand_over_the_gated_serialization() {
+        // A parseable endpoint is handed over exactly as the url crate
+        // serialized it — the string the policy verified is the string curl
+        // receives, so curl's looser last-`@`/`\` authority reading can never
+        // reinterpret it.
+        let handed = provider_endpoint_url("https://api.groq.com/openai/v1/audio/transcriptions")
+            .unwrap()
+            .as_str()
+            .to_owned();
+        assert_eq!(
+            handed,
+            "https://api.groq.com/openai/v1/audio/transcriptions"
+        );
+        let loopback = provider_endpoint_url("http://localhost:8080/transcribe")
+            .unwrap()
+            .as_str()
+            .to_owned();
+        assert_eq!(loopback, "http://localhost:8080/transcribe");
+        assert!(!loopback.contains('\\'));
+        // Even a backslash that survived into a parse (had the raw gate ever
+        // been bypassed) is serialized out of the authority: a `\`-terminated
+        // authority becomes a `/@…` PATH, which curl treats as a path.
+        let path_borne = url::Url::parse("https://api.groq.com/openai\\@attacker.example/x")
+            .unwrap()
+            .as_str()
+            .to_owned();
+        assert!(!path_borne.contains('\\'), "{path_borne}");
+        assert!(
+            path_borne.starts_with("https://api.groq.com/")
+                && path_borne.contains("/@attacker.example/x"),
+            "{path_borne}"
+        );
     }
 
     #[tokio::test]

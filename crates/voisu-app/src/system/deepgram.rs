@@ -68,7 +68,7 @@ pub(super) fn deepgram_streaming_url(
     base: &str,
     keyterms: &[String],
 ) -> Result<String, BoundaryError> {
-    if base.contains(['\n', '\r']) {
+    if !endpoint_raw_string_is_allowed(base) {
         return Err(BoundaryError::new(
             BoundaryKind::Provider,
             "Deepgram streaming endpoint must use WSS except on loopback",

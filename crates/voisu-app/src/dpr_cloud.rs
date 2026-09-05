@@ -20,7 +20,9 @@ use voisu_core::{
     parse_structured_candidate_json,
 };
 
-use crate::system::{endpoint_authority_is_allowed, parsed_host_is_loopback};
+use crate::system::{
+    endpoint_authority_is_allowed, endpoint_raw_string_is_allowed, parsed_host_is_loopback,
+};
 
 /// Preferred in-budget candidate from the approved #140 matrix.
 pub const DPR_GROQ_MODEL: &str = "openai/gpt-oss-20b";
@@ -602,7 +604,7 @@ fn ensure_rustls_ring_provider() {
 /// the raw authority — `http://localhost:8080@attacker.example/` is attacker
 /// .example carrying userinfo, not loopback.
 fn endpoint_is_allowed(endpoint: &str) -> bool {
-    if endpoint.is_empty() || endpoint.contains(['\n', '\r', '\0']) {
+    if !endpoint_raw_string_is_allowed(endpoint) {
         return false;
     }
     let Ok(url) = url::Url::parse(endpoint) else {
@@ -1046,6 +1048,13 @@ mod tests {
                 .is_err()
         );
         assert!(DprCloudClient::with_endpoint("http://localhost.attacker.example/test").is_err());
+        // Raw-string gate: a `\` re-reads as userinfo under curl-style last-`@`
+        // splitting, and the EMPTY userinfo form is invisible to the parsed
+        // accessors.
+        assert!(
+            DprCloudClient::with_endpoint("http://localhost:8080\\@attacker.example/test").is_err()
+        );
+        assert!(DprCloudClient::with_endpoint("http://@localhost/test").is_err());
     }
 
     fn valid_format_edits() -> Value {

@@ -395,18 +395,55 @@ impl HyprlandController for LiveHyprlandController {
     }
 }
 
+/// Whether a live binding's reported `key` claims the same physical trigger
+/// key as the managed `key` (`code:N`): the exact spelling plus the keysym
+/// aliases the plan-time accept list (`is_standalone_for`) already recognizes,
+/// so a personal bind spelled `Caps_Lock` cannot evade the duplicate check
+/// that the `code:66` spelling cannot (and `Alt_R` the same for `code:108`).
+/// No mapping is invented beyond that list.
+fn live_key_claims(key: &str, live_key: &str) -> bool {
+    if live_key == key {
+        return true;
+    }
+    PREFERRED_TRIGGER_KEYS
+        .iter()
+        .find(|candidate| candidate.code == key)
+        .is_some_and(|candidate| {
+            LuaBinding {
+                key: live_key.trim().to_owned(),
+                description: String::new(),
+                command: String::new(),
+                dispatcher: None,
+                dispatcher_arguments: None,
+                managed: false,
+            }
+            .is_standalone_for(*candidate)
+        })
+}
+
 /// Whether the compositor reports the Trigger Key as installed: EXACTLY one
 /// live managed binding for `key`/`command` and ZERO other bindings claiming
 /// the same key. A second modmask-0 binding on the key (the stale personal Caps
 /// Lock bind that once coexisted with the managed row) makes the Trigger Key
 /// fail at press time, so verification fails closed instead of reporting
-/// success next to a shadowing binding. Bindings on other keys, and opaque
-/// `__lua` rows that expose no key, never block.
+/// success next to a shadowing binding. Bindings on other keys, inside a
+/// non-default submap, or opaque `__lua` rows that expose no key, never block.
 pub fn hyprland_binding_is_installed(payload: &Value, key: &str, command: &str) -> bool {
     payload.as_array().is_some_and(|bindings| {
         let mut managed = 0_usize;
         let mut unmanaged_same_key = 0_usize;
         for binding in bindings {
+            // A binding inside a non-default submap only fires while that
+            // submap is active; it can neither deliver the Trigger Key nor
+            // shadow it. Hyprland reports the default submap as an absent or
+            // empty field.
+            let submap = binding
+                .get("submap")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !submap.is_empty() && !submap.eq_ignore_ascii_case("default") {
+                continue;
+            }
             if binding.get("modmask").and_then(Value::as_u64) != Some(0) {
                 continue;
             }
@@ -414,7 +451,10 @@ pub fn hyprland_binding_is_installed(payload: &Value, key: &str, command: &str) 
             let dispatcher = binding.get("dispatcher").and_then(Value::as_str);
             let argument = binding_argument(binding).map(str::trim);
             let native_exec = dispatcher == Some("exec")
-                && binding.get("key").and_then(Value::as_str) == Some(key)
+                && binding
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .is_some_and(|live_key| live_key_claims(key, live_key))
                 && argument == Some(command);
 
             // Current Hyprland Lua bindings are reported as dispatcher="__lua"
@@ -430,7 +470,11 @@ pub fn hyprland_binding_is_installed(payload: &Value, key: &str, command: &str) 
 
             if native_exec || lua_binding {
                 managed += 1;
-            } else if binding.get("key").and_then(Value::as_str) == Some(key) {
+            } else if binding
+                .get("key")
+                .and_then(Value::as_str)
+                .is_some_and(|live_key| live_key_claims(key, live_key))
+            {
                 // A different unmanaged binding on the same physical key.
                 unmanaged_same_key += 1;
             }
@@ -1577,7 +1621,7 @@ pub fn install_trigger_binding(
                 restore_original_and_reload(files, path, original.as_deref(), hyprland);
             Err(TriggerBindingError::VerificationFailed {
                 detail: format!(
-                    "Hyprland did not report exactly one {} ({}) binding running `{VOISU_TOGGLE_COMMAND}` with no other binding on the same key; a duplicate (e.g. a stale personal bind on that key) must be removed before the Trigger Key can work",
+                    "Hyprland did not report exactly one {} ({}) binding running `{VOISU_TOGGLE_COMMAND}` with no other default-submap binding on the same key; a duplicate (e.g. a stale personal bind on that key) must be removed before the Trigger Key can work",
                     key.label, key.code
                 ),
                 backup_path: backup,
@@ -1620,7 +1664,7 @@ fn verify_already_installed(
     } else {
         Err(TriggerBindingError::VerificationFailed {
             detail: format!(
-                "{} ({}) is managed by Voisu but Hyprland does not report exactly one binding for it with no other binding claiming the same key",
+                "{} ({}) is managed by Voisu but Hyprland does not report exactly one binding for it with no other default-submap binding claiming the same key",
                 key.label, key.code
             ),
             backup_path: backup.to_owned(),
@@ -2905,6 +2949,123 @@ o.bind("code:108", "Launcher", "launcher")"#;
             CAPS_LOCK.code,
             VOISU_TOGGLE_COMMAND
         ));
+    }
+
+    fn stale_row(key: &str) -> Value {
+        serde_json::json!([{
+            "key": key,
+            "modmask": 0,
+            "dispatcher": "exec",
+            "arg": "kitty"
+        }])
+    }
+
+    fn managed_row_plus(extra: Value) -> Value {
+        let mut rows = serde_json::json!([{
+            "key": "",
+            "modmask": 0,
+            "description": VOISU_TRIGGER_DESCRIPTION,
+            "dispatcher": "__lua",
+            "arg": "66"
+        }]);
+        rows.as_array_mut()
+            .unwrap()
+            .extend(extra.as_array().unwrap().iter().cloned());
+        rows
+    }
+
+    #[test]
+    fn hyprland_verification_counts_keysym_spellings_as_the_same_key() {
+        // A personal native bind spelled with the keysym claims the same
+        // physical key as the `code:N` spelling and must fail the duplicate
+        // check exactly like the exact-code spelling does.
+        for keysym in ["Caps_Lock", "CapsLock"] {
+            assert!(
+                !hyprland_binding_is_installed(
+                    &managed_row_plus(stale_row(keysym)),
+                    CAPS_LOCK.code,
+                    VOISU_TOGGLE_COMMAND
+                ),
+                "{keysym} must count as a duplicate of code:66"
+            );
+            assert!(!hyprland_binding_is_installed(
+                &stale_row(keysym),
+                CAPS_LOCK.code,
+                VOISU_TOGGLE_COMMAND
+            ));
+        }
+        assert!(
+            !hyprland_binding_is_installed(
+                &managed_row_plus(stale_row("Alt_R")),
+                RIGHT_ALT.code,
+                VOISU_TOGGLE_COMMAND
+            ),
+            "Alt_R must count as a duplicate of code:108"
+        );
+        // The same accept list works in the managed direction: a Voisu toggle
+        // written with the keysym spelling verifies as the one managed binding.
+        let managed_keysym = serde_json::json!([{
+            "key": "Caps_Lock",
+            "modmask": 0,
+            "dispatcher": "exec",
+            "arg": VOISU_TOGGLE_COMMAND
+        }]);
+        assert!(hyprland_binding_is_installed(
+            &managed_keysym,
+            CAPS_LOCK.code,
+            VOISU_TOGGLE_COMMAND
+        ));
+        // No invented mappings: a keysym that is not in the accept list is
+        // just another key, and an opaque `__lua` row claims nothing.
+        assert!(hyprland_binding_is_installed(
+            &managed_row_plus(stale_row("code:108")),
+            CAPS_LOCK.code,
+            VOISU_TOGGLE_COMMAND
+        ));
+        assert!(hyprland_binding_is_installed(
+            &managed_row_plus(stale_row("Caps_Lock_x")),
+            CAPS_LOCK.code,
+            VOISU_TOGGLE_COMMAND
+        ));
+    }
+
+    #[test]
+    fn hyprland_verification_ignores_duplicates_in_non_default_submaps() {
+        // A bind inside a non-default submap only fires while that submap is
+        // active and cannot shadow the default-submap Trigger Key.
+        let submapped = serde_json::json!([{
+            "key": CAPS_LOCK.code,
+            "modmask": 0,
+            "submap": "resize",
+            "dispatcher": "exec",
+            "arg": "kitty"
+        }]);
+        assert!(hyprland_binding_is_installed(
+            &managed_row_plus(submapped),
+            CAPS_LOCK.code,
+            VOISU_TOGGLE_COMMAND
+        ));
+        // The default submap is an absent, empty, or literal-"default" field —
+        // those duplicates still fail verification.
+        for default_submap in [None, Some(""), Some("default")] {
+            let mut duplicate = serde_json::json!([{
+                "key": CAPS_LOCK.code,
+                "modmask": 0,
+                "dispatcher": "exec",
+                "arg": "kitty"
+            }]);
+            if let Some(submap) = default_submap {
+                duplicate[0]["submap"] = serde_json::Value::String(submap.to_owned());
+            }
+            assert!(
+                !hyprland_binding_is_installed(
+                    &managed_row_plus(duplicate),
+                    CAPS_LOCK.code,
+                    VOISU_TOGGLE_COMMAND
+                ),
+                "a default-submap duplicate ({default_submap:?}) must fail verification"
+            );
+        }
     }
 
     #[test]
