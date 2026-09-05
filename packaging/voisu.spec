@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.44.1
+Version:        0.44.2
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,12 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Sat Sep 05 2026 Voisu maintainers <voisu@example.invalid> - 0.44.2-1
+- fix(transcript-quality): apply machine-applicable collapsible_if fixes
+- fix(review): tool MSRV 1.92; dedupe doc line; bump-workflow wording; runner comment
+- ci(version-bump): keep tools/transcript-quality lockfile in sync
+- ci: gates measure what ships — MSRV 1.92, overlay clippy, transcript-quality --locked, doc gate
+
 * Sat Sep 05 2026 Voisu maintainers <voisu@example.invalid> - 0.44.1-1
 - fix(security): close url-vs-curl parser differential; tighten binding checks
 - fix(security): parse provider endpoints; fail closed on duplicate Trigger Key bindings
