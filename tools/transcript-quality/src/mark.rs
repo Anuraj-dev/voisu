@@ -661,14 +661,14 @@ fn write_label(
     already_present: bool,
 ) -> Result<(), String> {
     let path = entry_dir.join(LABEL_FILE);
-    if already_present && path.is_file() {
-        if let Ok(existing) = fs::read_to_string(&path) {
-            if let Ok(previous) = serde_json::from_str::<LabelRecord>(&existing) {
-                if previous.label == label && previous.note == note {
-                    return Ok(());
-                }
-            }
-        }
+    if already_present
+        && path.is_file()
+        && let Ok(existing) = fs::read_to_string(&path)
+        && let Ok(previous) = serde_json::from_str::<LabelRecord>(&existing)
+        && previous.label == label
+        && previous.note == note
+    {
+        return Ok(());
     }
     let secrets = secret_values_from_env();
     let record = LabelRecord {
@@ -787,18 +787,18 @@ fn resolve_path_depth(path: &Path, depth: usize) -> PathBuf {
         return canon;
     }
     if let Ok(meta) = fs::symlink_metadata(&abs) {
-        if meta.file_type().is_symlink() {
-            if let Ok(target) = fs::read_link(&abs) {
-                let joined = if target.is_absolute() {
-                    normalize_path(&target)
-                } else if let Some(parent) = abs.parent() {
-                    normalize_path(&parent.join(target))
-                } else {
-                    normalize_path(&target)
-                };
-                if joined != abs {
-                    return resolve_path_depth(&joined, depth + 1);
-                }
+        if meta.file_type().is_symlink()
+            && let Ok(target) = fs::read_link(&abs)
+        {
+            let joined = if target.is_absolute() {
+                normalize_path(&target)
+            } else if let Some(parent) = abs.parent() {
+                normalize_path(&parent.join(target))
+            } else {
+                normalize_path(&target)
+            };
+            if joined != abs {
+                return resolve_path_depth(&joined, depth + 1);
             }
         }
         // Exists, but canonicalize failed (permissions, etc.). Do not recurse.
@@ -866,10 +866,11 @@ fn create_private_dir(path: &Path) -> Result<(), String> {
                 .map_err(|err| format!("cannot set permissions on {}: {err}", path.display()))
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() && !parent.exists() {
-                    create_private_dir(parent)?;
-                }
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+                && !parent.exists()
+            {
+                create_private_dir(parent)?;
             }
             DirBuilder::new()
                 .mode(0o700)
@@ -910,10 +911,10 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn write_private_replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() {
-            return Err(format!("refusing to follow symlink {}", path.display()));
-        }
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(format!("refusing to follow symlink {}", path.display()));
     }
     let mut file = OpenOptions::new()
         .write(true)

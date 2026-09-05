@@ -253,10 +253,10 @@ fn render_providers(record: &Value, style: &RenderStyle) -> String {
     let note = |list: Option<&Vec<Value>>, providers: &mut Vec<String>| {
         if let Some(list) = list {
             for entry in list {
-                if let Some(name) = entry.get("provider").and_then(Value::as_str) {
-                    if !providers.iter().any(|seen| seen == name) {
-                        providers.push(name.to_owned());
-                    }
+                if let Some(name) = entry.get("provider").and_then(Value::as_str)
+                    && !providers.iter().any(|seen| seen == name)
+                {
+                    providers.push(name.to_owned());
                 }
             }
         }
@@ -390,10 +390,10 @@ fn truncation_tag(record: &Value) -> Option<String> {
 /// The single most useful one-line reason a Recording produced no Transcript.
 fn failure_reason(record: &Value) -> Option<String> {
     for key in ["error", "validation_reason", "fallback_reason"] {
-        if let Some(reason) = str_field(record, key) {
-            if !reason.is_empty() {
-                return Some(truncate_inline(reason, 80));
-            }
+        if let Some(reason) = str_field(record, key)
+            && !reason.is_empty()
+        {
+            return Some(truncate_inline(reason, 80));
         }
     }
     None

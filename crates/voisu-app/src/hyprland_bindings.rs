@@ -1209,10 +1209,10 @@ fn load_lua_bindings_with_occupancy(
         },
     )?;
     let sibling_path = normalize_path(&root_path.with_file_name("bindings.lua"));
-    if !visited.contains(&sibling_path) {
-        if let Some(sibling) = files.read_to_string(&sibling_path)? {
-            bindings.extend(parse_lua_bindings(&sibling)?);
-        }
+    if !visited.contains(&sibling_path)
+        && let Some(sibling) = files.read_to_string(&sibling_path)?
+    {
+        bindings.extend(parse_lua_bindings(&sibling)?);
     }
     Ok(bindings)
 }

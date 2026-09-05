@@ -3086,20 +3086,20 @@ fn serve_mock_deepgram_connection(
                 }
             }
             Ok(Message::Text(text)) => {
-                if text.contains("CloseStream") {
-                    if let MockDeepgramBehavior::Finalize(transcript) = behavior {
-                        let results = format!(
-                            r#"{{"type":"Results","is_final":true,"speech_final":true,"channel":{{"alternatives":[{{"transcript":"{transcript}"}}]}}}}"#
-                        );
-                        let _ = socket.send(Message::Text(results));
-                        // The terminal summary Metadata confirms CloseStream
-                        // was processed; the client requires it before close.
-                        let _ = socket.send(Message::Text(
-                            r#"{"type":"Metadata","request_id":"mock-request"}"#.to_owned(),
-                        ));
-                        let _ = socket.send(Message::Close(None));
-                        break;
-                    }
+                if text.contains("CloseStream")
+                    && let MockDeepgramBehavior::Finalize(transcript) = behavior
+                {
+                    let results = format!(
+                        r#"{{"type":"Results","is_final":true,"speech_final":true,"channel":{{"alternatives":[{{"transcript":"{transcript}"}}]}}}}"#
+                    );
+                    let _ = socket.send(Message::Text(results));
+                    // The terminal summary Metadata confirms CloseStream
+                    // was processed; the client requires it before close.
+                    let _ = socket.send(Message::Text(
+                        r#"{"type":"Metadata","request_id":"mock-request"}"#.to_owned(),
+                    ));
+                    let _ = socket.send(Message::Close(None));
+                    break;
                 }
             }
             Ok(Message::Close(_)) | Err(_) => break,

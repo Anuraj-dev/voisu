@@ -396,15 +396,33 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     install_surface_feedback(
         application.clone(),
         selection,
-        window,
-        label,
-        meter,
-        glyph,
-        rendered_bars,
-        rendered,
-        capsule,
-        switched,
+        CapsuleFeedback {
+            window,
+            label,
+            meter,
+            glyph,
+            capsule,
+            rendered_bars,
+            rendered,
+            switched,
+        },
     );
+}
+
+/// Owned handles for the capsule's widgets and shared render state, moved into
+/// the poll loop's closure. Grouping them keeps `install_surface_feedback` under
+/// clippy's `too_many_arguments` limit; construction and destructuring are
+/// plain moves — no behavior change. (The borrowed view handed to
+/// `render_surface` each tick is `CapsuleSurface`.)
+struct CapsuleFeedback {
+    window: gtk::ApplicationWindow,
+    label: gtk::Label,
+    meter: gtk::DrawingArea,
+    glyph: gtk::Label,
+    capsule: gtk::Box,
+    rendered_bars: Rc<RefCell<[u8; 20]>>,
+    rendered: Rc<Cell<MeterState>>,
+    switched: Rc<Cell<bool>>,
 }
 
 fn install_surface_feedback(
@@ -412,15 +430,18 @@ fn install_surface_feedback(
     // Rung 2 is gone, so the only windowed backend is Layer Shell and the
     // fallback branch below is inert; the selection is no longer consulted here.
     _selection: FeedbackSelection,
-    window: gtk::ApplicationWindow,
-    label: gtk::Label,
-    meter: gtk::DrawingArea,
-    glyph: gtk::Label,
-    rendered_bars: Rc<RefCell<[u8; 20]>>,
-    rendered: Rc<Cell<MeterState>>,
-    capsule: gtk::Box,
-    switched: Rc<Cell<bool>>,
+    feedback: CapsuleFeedback,
 ) {
+    let CapsuleFeedback {
+        window,
+        label,
+        meter,
+        glyph,
+        capsule,
+        rendered_bars,
+        rendered,
+        switched,
+    } = feedback;
     let controller = Rc::new(RefCell::new(PresentationController::default()));
     // Rung 2 (a plain GTK window) is skipped, so the only windowed backend that
     // reaches here is Layer Shell, which the compositor keeps above and which

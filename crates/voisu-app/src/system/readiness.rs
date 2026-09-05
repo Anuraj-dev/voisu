@@ -478,20 +478,20 @@ where
 /// command for the host package manager.
 fn clipboard_finding() -> ReadinessFinding {
     let resolution = current_session();
-    if resolution.session == SessionKind::Wayland {
-        if let Some(finding) = shadowed_wl_clipboard_finding() {
-            return finding;
-        }
+    if resolution.session == SessionKind::Wayland
+        && let Some(finding) = shadowed_wl_clipboard_finding()
+    {
+        return finding;
     }
 
     clipboard_finding_for_candidates(clipboard_candidates(resolution.session))
 }
 
 fn clipboard_finding_for_backend(tool: ClipboardTool) -> ReadinessFinding {
-    if tool == ClipboardTool::WlClipboard {
-        if let Some(finding) = shadowed_wl_clipboard_finding() {
-            return finding;
-        }
+    if tool == ClipboardTool::WlClipboard
+        && let Some(finding) = shadowed_wl_clipboard_finding()
+    {
+        return finding;
     }
     clipboard_finding_for_candidates(std::slice::from_ref(&tool))
 }

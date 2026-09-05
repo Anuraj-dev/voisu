@@ -2142,19 +2142,19 @@ mod tests {
             let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
             let _ = second_up_tx.send(());
             while let Some(Ok(message)) = socket.next().await {
-                if let Message::Text(text) = message {
-                    if text.contains("CloseStream") {
-                        socket
-                            .send(Message::Text(deepgram_results_frame("after redial", true)))
-                            .await
-                            .unwrap();
-                        socket
-                            .send(Message::Text(deepgram_metadata_frame()))
-                            .await
-                            .unwrap();
-                        let _ = socket.send(Message::Close(None)).await;
-                        break;
-                    }
+                if let Message::Text(text) = message
+                    && text.contains("CloseStream")
+                {
+                    socket
+                        .send(Message::Text(deepgram_results_frame("after redial", true)))
+                        .await
+                        .unwrap();
+                    socket
+                        .send(Message::Text(deepgram_metadata_frame()))
+                        .await
+                        .unwrap();
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
                 }
             }
         });
@@ -2183,18 +2183,18 @@ mod tests {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
             while let Some(Ok(message)) = socket.next().await {
-                if let Message::Text(text) = message {
-                    if text.contains("CloseStream") {
-                        // A final Results but NO terminal Metadata before the
-                        // close: the server-side flush is unconfirmed, so the
-                        // Transcript may be truncated.
-                        socket
-                            .send(Message::Text(deepgram_results_frame("truncated", true)))
-                            .await
-                            .unwrap();
-                        let _ = socket.send(Message::Close(None)).await;
-                        break;
-                    }
+                if let Message::Text(text) = message
+                    && text.contains("CloseStream")
+                {
+                    // A final Results but NO terminal Metadata before the
+                    // close: the server-side flush is unconfirmed, so the
+                    // Transcript may be truncated.
+                    socket
+                        .send(Message::Text(deepgram_results_frame("truncated", true)))
+                        .await
+                        .unwrap();
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
                 }
             }
         });
@@ -3206,10 +3206,10 @@ mod tests {
             if let Some(pgid) = entry.retained_pgid() {
                 return pgid;
             }
-            if entry.has_launched_child() {
-                if let Some(pgid) = entry.retained_pgid() {
-                    return pgid;
-                }
+            if entry.has_launched_child()
+                && let Some(pgid) = entry.retained_pgid()
+            {
+                return pgid;
             }
             assert!(
                 Instant::now() < deadline,
@@ -3701,11 +3701,10 @@ mod tests {
                         }
                         _ = tokio::time::sleep(Duration::from_millis(5)) => {
                             // Barrier: secret payload written before Drop.
-                            if ready.exists() {
-                                if let Some(pgid) = entry_watch.retained_pgid() {
+                            if ready.exists()
+                                && let Some(pgid) = entry_watch.retained_pgid() {
                                     break pgid;
                                 }
-                            }
                             assert!(
                                 Instant::now() < deadline,
                                 "child never signalled ready before Drop test budget"
@@ -3808,11 +3807,10 @@ mod tests {
                     biased;
                     _ = &mut poll => panic!("hanging secret-tool finished before cancel"),
                     _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                        if ready.exists() {
-                            if let Some(pgid) = entry_watch.retained_pgid() {
+                        if ready.exists()
+                            && let Some(pgid) = entry_watch.retained_pgid() {
                                 break pgid;
                             }
-                        }
                         assert!(Instant::now() < deadline, "tool never signalled ready");
                     }
                 }

@@ -739,10 +739,10 @@ impl MaskedLineEditor {
     fn flush_utf8(&mut self) {
         let bytes = std::mem::take(&mut self.utf8_pending);
         self.utf8_expected = 0;
-        if let Ok(text) = std::str::from_utf8(&bytes) {
-            if let Some(ch) = text.chars().next() {
-                self.append_char(ch);
-            }
+        if let Ok(text) = std::str::from_utf8(&bytes)
+            && let Some(ch) = text.chars().next()
+        {
+            self.append_char(ch);
         }
         // Invalid bytes are dropped: no buffer entry, no star.
     }

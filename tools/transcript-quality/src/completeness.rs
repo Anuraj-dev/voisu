@@ -60,12 +60,13 @@ pub fn select_completeness_aware(groq: Option<&str>, deepgram: Option<&str>) -> 
                     provider: SourceProvider::Deepgram,
                     text: deepgram_text,
                 }
-            } else if is_contiguous_fragment(&deepgram_score.tokens, &groq_score.tokens) {
-                CompletenessChoice::Selected {
-                    provider: SourceProvider::Groq,
-                    text: groq_text,
-                }
-            } else if groq_score.beats(&deepgram_score) {
+            // Both paths select Groq: a Deepgram text that is a contiguous
+            // fragment of the Groq text, and a Groq score that simply wins.
+            // Merged into one branch (clippy::if_same_then_else); the fragment
+            // check stays first so the fragment rule still precedes scoring.
+            } else if is_contiguous_fragment(&deepgram_score.tokens, &groq_score.tokens)
+                || groq_score.beats(&deepgram_score)
+            {
                 CompletenessChoice::Selected {
                     provider: SourceProvider::Groq,
                     text: groq_text,

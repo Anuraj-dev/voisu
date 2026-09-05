@@ -177,10 +177,10 @@ fn organize_impl(source: &str, options: &LocalBaselineOptions) -> String {
     }
 
     // Clear pause → paragraph break; uncertain → single stream.
-    if let Some(timing) = options.timing.as_ref() {
-        if timing.certainty == TimingCertainty::Clear {
-            text = apply_clear_pause_breaks(&text, timing);
-        }
+    if let Some(timing) = options.timing.as_ref()
+        && timing.certainty == TimingCertainty::Clear
+    {
+        text = apply_clear_pause_breaks(&text, timing);
     }
 
     // Polish surrounding prose. Skip casing/period only when the whole
@@ -508,15 +508,15 @@ fn try_section_organize(text: &str, policy: RenderingPolicy) -> Option<String> {
             .unwrap_or(tokens.len());
         let body = &tokens[sec.body_start..body_end];
 
-        if sec.label == "Steps" {
-            if let Some(lines) = try_numbered_steps_body(body) {
-                if policy == RenderingPolicy::Structured && multi {
-                    parts.push(format!("Steps:\n{}", lines.join("\n")));
-                } else {
-                    parts.push(lines.join("\n"));
-                }
-                continue;
+        if sec.label == "Steps"
+            && let Some(lines) = try_numbered_steps_body(body)
+        {
+            if policy == RenderingPolicy::Structured && multi {
+                parts.push(format!("Steps:\n{}", lines.join("\n")));
+            } else {
+                parts.push(lines.join("\n"));
             }
+            continue;
         }
 
         if sec.label == "Goal" {
@@ -724,16 +724,16 @@ fn find_section_spans(tokens: &[(usize, usize, &str)]) -> Vec<SectionSpan> {
     }];
     let mut i = cue_len;
     while i < tokens.len() {
-        if let Some((label, cue_len)) = match_section_cue(tokens, i) {
-            if later_structure_cue(tokens, i) {
-                out.push(SectionSpan {
-                    label,
-                    cue_start: i,
-                    body_start: i + cue_len,
-                });
-                i += cue_len;
-                continue;
-            }
+        if let Some((label, cue_len)) = match_section_cue(tokens, i)
+            && later_structure_cue(tokens, i)
+        {
+            out.push(SectionSpan {
+                label,
+                cue_start: i,
+                body_start: i + cue_len,
+            });
+            i += cue_len;
+            continue;
         }
         i += 1;
     }
@@ -1155,15 +1155,14 @@ fn apply_bare_spoken_cues_pass(text: &str) -> (String, bool) {
     {
         let mut i = 0usize;
         while i < tokens.len() {
-            if spoken_cue_token(tokens[i].2) == "quote" {
-                if let Some(j) =
+            if spoken_cue_token(tokens[i].2) == "quote"
+                && let Some(j) =
                     (i + 1..tokens.len()).find(|&j| spoken_cue_token(tokens[j].2) == "unquote")
-                {
-                    quote_pairs.push((i, j));
-                    skip[i..=j].fill(true);
-                    i = j + 1;
-                    continue;
-                }
+            {
+                quote_pairs.push((i, j));
+                skip[i..=j].fill(true);
+                i = j + 1;
+                continue;
             }
             i += 1;
         }
@@ -1475,11 +1474,12 @@ fn apply_discourse_ok(text: &str) -> String {
         return out;
     }
     // Trailing ok (end of utterance): comma before ok; terminal ? applied later.
-    if let Some(last) = tokens.last() {
-        if ascii_lower(last.2) == "ok" && tokens.len() >= 2 {
-            let head = join_tokens(&tokens[..tokens.len() - 1]);
-            return format!("{head}, ok");
-        }
+    if let Some(last) = tokens.last()
+        && ascii_lower(last.2) == "ok"
+        && tokens.len() >= 2
+    {
+        let head = join_tokens(&tokens[..tokens.len() - 1]);
+        return format!("{head}, ok");
     }
     text.to_owned()
 }
@@ -1524,16 +1524,16 @@ fn apply_sentence_and_weekday_casing(text: &str, capitalize_weekdays: bool) -> S
             continue;
         }
         if is_sentence_or_line_start(text, s) {
-            if let Some(c) = chars.get_mut(cs) {
-                if c.is_alphabetic() {
-                    *c = c.to_ascii_uppercase();
-                }
+            if let Some(c) = chars.get_mut(cs)
+                && c.is_alphabetic()
+            {
+                *c = c.to_ascii_uppercase();
             }
         } else if core == "i" || core == "I" {
-            if core.len() == 1 {
-                if let Some(c) = chars.get_mut(cs) {
-                    *c = 'I';
-                }
+            if core.len() == 1
+                && let Some(c) = chars.get_mut(cs)
+            {
+                *c = 'I';
             }
         } else if capitalize_weekdays && WEEKDAYS.iter().any(|w| eq_ascii_ignore_case(core, w)) {
             if let Some(c) = chars.get_mut(cs) {
@@ -1571,10 +1571,10 @@ fn is_closed_question(text: &str) -> bool {
     if lower.contains("can you") || lower.contains("could you") || lower.contains("would you") {
         return true;
     }
-    if let Some(last) = body.split_whitespace().last() {
-        if ascii_lower(last.trim_end_matches(['.', '!', '?', ','])) == "ok" {
-            return true;
-        }
+    if let Some(last) = body.split_whitespace().last()
+        && ascii_lower(last.trim_end_matches(['.', '!', '?', ','])) == "ok"
+    {
+        return true;
     }
     false
 }
@@ -1770,10 +1770,10 @@ fn join_quote_interior(tokens: &[(usize, usize, &str)]) -> String {
         return String::new();
     }
     let mut parts: Vec<&str> = tokens.iter().map(|(_, _, t)| *t).collect();
-    if let Some(last) = parts.last_mut() {
-        if let Some(stripped) = last.strip_suffix(',') {
-            *last = stripped;
-        }
+    if let Some(last) = parts.last_mut()
+        && let Some(stripped) = last.strip_suffix(',')
+    {
+        *last = stripped;
     }
     parts.join(" ")
 }
