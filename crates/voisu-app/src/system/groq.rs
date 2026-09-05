@@ -83,6 +83,7 @@ impl TranscriptProvider for GroqProvider {
             chunks: VecDeque::new(),
             cancel: CancelRegistry::new(),
             reaper: self.reaper.clone(),
+            word_confidence_evidence: Vec::new(),
         }))
     }
 }
@@ -182,7 +183,8 @@ pub(super) struct GroqStream {
     pub(super) params: GroqRequestParams,
     pub(super) buffer: Vec<u8>,
     pub(super) streamed_bytes: usize,
-    pub(super) chunks: VecDeque<tokio::task::JoinHandle<Result<String, BoundaryError>>>,
+    pub(super) chunks:
+        VecDeque<tokio::task::JoinHandle<Result<GroqChunkTranscript, BoundaryError>>>,
     /// Per-Recording cancellation flag observed by each in-flight curl
     /// request's owning bounded wait. Because each Recording gets its own
     /// stream and flag, cancelling one Recording can never touch the next
@@ -192,6 +194,10 @@ pub(super) struct GroqStream {
     /// stream is dropped mid-abort, so their curl reap is retained and awaited
     /// rather than detached.
     pub(super) reaper: ProviderReaper,
+    /// Word-confidence evidence from the completed chunks (slice B4). Empty
+    /// until `complete()` merges the chunk responses, and empty for any
+    /// response that carried no word list.
+    pub(super) word_confidence_evidence: Vec<(String, f64)>,
 }
 
 /// A retained provider-stream cleanup: a future that awaits an adopted chunk
@@ -215,6 +221,10 @@ impl Drop for GroqStream {
 impl ProviderStream for GroqStream {
     fn provider(&self) -> Provider {
         Provider::Groq
+    }
+
+    fn word_confidences(&self) -> Vec<(String, f64)> {
+        self.word_confidence_evidence.clone()
     }
 
     fn send_audio(&mut self, chunk: AudioChunk) -> BoundaryFuture<'_, ()> {
@@ -317,13 +327,131 @@ impl ProviderStream for GroqStream {
                 })??;
                 transcripts.push(transcript);
             }
-            let text = merge_chunk_transcripts(transcripts);
+            let merged = merge_chunk_transcripts(transcripts);
+            // Retain the chunk word evidence on the stream for the coordinator
+            // to pull AFTER this completion resolves (before any deadline
+            // abort moves the stream away) — the same contract Deepgram's
+            // accumulator follows.
+            self.word_confidence_evidence = merged.words.clone();
             Ok(SourceTranscript {
                 provider: Provider::Groq,
-                text,
+                text: merged.text,
             })
         })
     }
+}
+
+/// One Groq transcription result: the transcript text plus the word-level
+/// confidence evidence derived from the response's word timestamps and
+/// per-segment `avg_logprob`. Empty `words` means the response carried no
+/// word evidence (a plain-JSON response, or no segments to derive from) —
+/// the pipeline treats that as no evidence, never as unproven words.
+#[derive(Clone, Debug, Default)]
+pub(super) struct GroqChunkTranscript {
+    pub(super) text: String,
+    pub(super) words: Vec<(String, f64)>,
+}
+
+/// Converts a Whisper per-segment `avg_logprob` (nats/token; values closer to
+/// zero are more confident) into the `[0, 1]` confidence domain the Deepgram
+/// ingest clamps to: `exp(avg_logprob)`, clamped, with a non-finite value
+/// treated as unproven (`0.0`), mirroring the Deepgram word-confidence clamps.
+fn logprob_confidence(avg_logprob: f64) -> f64 {
+    if !avg_logprob.is_finite() {
+        return 0.0;
+    }
+    avg_logprob.exp().clamp(0.0, 1.0)
+}
+
+/// The `avg_logprob` of the segment covering `word_start`: the LAST segment
+/// whose start is at or before the word's start, else the earliest segment
+/// that carries one. `None` when no segment carries an `avg_logprob`.
+fn covering_segment_logprob(segments: &[serde_json::Value], word_start: f64) -> Option<f64> {
+    let mut chosen: Option<f64> = None;
+    let mut chosen_start: Option<f64> = None;
+    let mut first: Option<f64> = None;
+    for segment in segments {
+        let Some(start) = segment.get("start").and_then(serde_json::Value::as_f64) else {
+            continue;
+        };
+        let Some(avg_logprob) = segment
+            .get("avg_logprob")
+            .and_then(serde_json::Value::as_f64)
+        else {
+            continue;
+        };
+        if first.is_none() {
+            first = Some(avg_logprob);
+        }
+        if start <= word_start && chosen_start.is_none_or(|best| start >= best) {
+            chosen_start = Some(start);
+            chosen = Some(avg_logprob);
+        }
+    }
+    chosen.or(first)
+}
+
+/// Parses a Groq transcription response body in the documented verbose_json
+/// shape: a top-level `text`, a `words[]` array of `{word, start, end}`
+/// entries, and a `segments[]` array whose entries carry `avg_logprob`. Each
+/// word's confidence is the exponential of its covering segment's
+/// `avg_logprob` (or the word's own `avg_logprob`, defensively, if a shape
+/// ever carries one). Words without any covering segment evidence are carried
+/// at `0.0` — unproven, never confidently transcribed. A response WITHOUT
+/// `text` but with segment texts (an unlikely shape skew) joins the segments;
+/// a response with neither is rejected. A plain-JSON response (only `text`)
+/// parses with empty words, degrading to today's no-evidence behavior.
+pub(super) fn parse_groq_transcription_response(
+    response: &serde_json::Value,
+) -> Result<GroqChunkTranscript, BoundaryError> {
+    let text = match response.get("text").and_then(serde_json::Value::as_str) {
+        Some(text) => text.to_owned(),
+        None => {
+            let segments: Vec<&str> = response
+                .get("segments")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|segment| segment.get("text").and_then(serde_json::Value::as_str))
+                .collect();
+            if segments.is_empty() {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Provider,
+                    "Groq response omitted text",
+                ));
+            }
+            segments.join(" ")
+        }
+    };
+    let segments = response
+        .get("segments")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let words = response
+        .get("words")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|word| {
+            let word_text = word.get("word").and_then(serde_json::Value::as_str)?;
+            if word_text.is_empty() {
+                return None;
+            }
+            let avg_logprob = word
+                .get("avg_logprob")
+                .and_then(serde_json::Value::as_f64)
+                .or_else(|| {
+                    word.get("start")
+                        .and_then(serde_json::Value::as_f64)
+                        .and_then(|start| covering_segment_logprob(&segments, start))
+                })
+                .map(logprob_confidence)
+                .unwrap_or(0.0);
+            Some((word_text.to_owned(), avg_logprob))
+        })
+        .collect();
+    Ok(GroqChunkTranscript { text, words })
 }
 
 pub(super) fn request_groq_chunk(
@@ -332,7 +460,7 @@ pub(super) fn request_groq_chunk(
     params: &GroqRequestParams,
     pcm: Vec<u8>,
     cancel: &CancelRegistry,
-) -> Result<String, BoundaryError> {
+) -> Result<GroqChunkTranscript, BoundaryError> {
     let mut file = tempfile::Builder::new()
         .prefix("voisu-recording-")
         .suffix(".flac")
@@ -381,24 +509,37 @@ pub(super) fn request_groq_chunk(
     }
     let response: serde_json::Value = serde_json::from_slice(&outcome.stdout)
         .map_err(|_| BoundaryError::new(BoundaryKind::Provider, "Groq returned malformed JSON"))?;
-    response
-        .get("text")
-        .and_then(|text| text.as_str())
-        .map(str::to_owned)
-        .ok_or_else(|| BoundaryError::new(BoundaryKind::Provider, "Groq response omitted text"))
+    parse_groq_transcription_response(&response)
 }
 
-pub(super) fn merge_chunk_transcripts(transcripts: Vec<String>) -> String {
+/// Stitches chunk transcripts by word overlap (the 4 s seam) and concatenates
+/// the chunks' word confidences with the SAME overlap skip, so a chunk's
+/// first `overlap` words — already retained from the previous chunk — do not
+/// double their evidence. The confidence list assumes each chunk's words[]
+/// corresponds to its text's whitespace words; any skew degrades downstream
+/// to no Groq evidence, never to wrong evidence.
+pub(super) fn merge_chunk_transcripts(
+    transcripts: Vec<GroqChunkTranscript>,
+) -> GroqChunkTranscript {
     let mut merged: Vec<String> = Vec::new();
+    let mut merged_words: Vec<(String, f64)> = Vec::new();
     for transcript in transcripts {
-        let words: Vec<String> = transcript.split_whitespace().map(str::to_owned).collect();
+        let words: Vec<String> = transcript
+            .text
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
         let overlap = (1..=merged.len().min(words.len()).min(GROQ_MERGE_OVERLAP_WORDS))
             .rev()
             .find(|count| merged[merged.len() - count..] == words[..*count])
             .unwrap_or(0);
         merged.extend(words.into_iter().skip(overlap));
+        merged_words.extend(transcript.words.into_iter().skip(overlap));
     }
-    merged.join(" ")
+    GroqChunkTranscript {
+        text: merged.join(" "),
+        words: merged_words,
+    }
 }
 
 pub(super) fn flac_from_pcm(pcm: &[u8]) -> Result<Vec<u8>, BoundaryError> {

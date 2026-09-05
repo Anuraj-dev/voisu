@@ -1857,6 +1857,7 @@ fn base_evidence(
         recovery_attempted: false,
         source_selection_diagnostic: None,
         intent_reconstruction: None,
+        confidence_arbitration: None,
     }
 }
 
@@ -2376,6 +2377,7 @@ async fn process_recording(
         evidence.fallback_reason = decision.fallback_reason;
         evidence.reconciliation_requested = decision.reconciliation_requested;
         evidence.recovery_attempted = decision.recovery_attempted;
+        evidence.confidence_arbitration = decision.confidence_arbitration;
         let dictionary_refs: Vec<&str> = dictionary_terms.iter().map(String::as_str).collect();
         // Formatting uses the validated Transcript text, not a re-selected raw
         // source. Compose evidence still comes from sanitized provider sources.
@@ -2953,6 +2955,7 @@ fn diagnostic_record(
     record.smart_writing = smart_writing;
     record.dpr = dpr;
     record.intent_reconstruction = evidence.intent_reconstruction.clone();
+    record.confidence_arbitration = evidence.confidence_arbitration.clone();
     record
 }
 
@@ -3124,6 +3127,7 @@ async fn replay_recording(
             evidence.fallback_reason = outcome.decision.fallback_reason.clone();
             evidence.reconciliation_requested = outcome.decision.reconciliation_requested;
             evidence.recovery_attempted = outcome.decision.recovery_attempted;
+            evidence.confidence_arbitration = outcome.decision.confidence_arbitration.clone();
             Response::with_evidence(
                 true,
                 Some(DaemonState::Idle),

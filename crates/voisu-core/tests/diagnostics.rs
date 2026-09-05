@@ -2,18 +2,18 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use voisu_core::{
-    AudioChunk, BoundaryFuture, CapturedAudio, DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS,
-    DebugAudioRecord, DiagnosticRecord, DiagnosticStore, EnglishEligibilityOutcome,
-    IntentReconstructionDiagnostic, IntentReconstructionEligibility, IntentReconstructionEvidence,
-    IntentReconstructionOutcome, LifecycleStage, MAX_MODEL_ID_UTF8_BYTES,
-    MAX_SMART_WRITING_DIAGNOSTIC_EDITS, MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES,
-    MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES, MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES,
-    PreparedTranscriptDecision, Provider, ProviderCoordinator, ProviderFailure,
-    ProviderFailureStage, ProviderStream, ProviderStreams, REDACTED, RetentionPolicy,
-    SMART_WRITING_DIAGNOSTIC_VERSION, SmartWritingDiagnostic, SmartWritingEditEvidence,
-    SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode, SourceTranscript,
-    TEXT_SHA256_FINGERPRINT_LEN, Transcript, TranscriptDecision, TranscriptSelection,
-    TranscriptValidator, clamp_utf8_bytes, correlation_id, export_record,
+    AudioChunk, BoundaryFuture, CapturedAudio, ConfidenceArbitrationDiagnostic,
+    ConfidenceArbitrationRejection, DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS, DebugAudioRecord,
+    DiagnosticRecord, DiagnosticStore, EnglishEligibilityOutcome, IntentReconstructionDiagnostic,
+    IntentReconstructionEligibility, IntentReconstructionEvidence, IntentReconstructionOutcome,
+    LifecycleStage, MAX_MODEL_ID_UTF8_BYTES, MAX_SMART_WRITING_DIAGNOSTIC_EDITS,
+    MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES, MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES,
+    MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES, PreparedTranscriptDecision, Provider,
+    ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream, ProviderStreams,
+    REDACTED, RetentionPolicy, SMART_WRITING_DIAGNOSTIC_VERSION, SmartWritingDiagnostic,
+    SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode,
+    SourceTranscript, TEXT_SHA256_FINGERPRINT_LEN, Transcript, TranscriptDecision,
+    TranscriptSelection, TranscriptValidator, clamp_utf8_bytes, correlation_id, export_record,
     is_text_sha256_fingerprint, replay_capture, text_sha256_fingerprint, unix_millis_now,
 };
 
@@ -837,6 +837,7 @@ impl TranscriptValidator for EchoValidator {
                     confidence: None,
                 },
                 intent_reconstruction: None,
+                confidence_arbitration: None,
             })
         })
     }
@@ -879,6 +880,7 @@ impl TranscriptValidator for DelayedPrepareValidator {
                     outcome: IntentReconstructionOutcome::Skipped,
                     candidate: None,
                 }),
+                confidence_arbitration: None,
             }))
         })
     }
@@ -1916,5 +1918,42 @@ fn smart_writing_new_record_defaults_smart_writing_to_none() {
     assert!(
         !encoded.contains("smart_writing"),
         "absent smart_writing is skipped on serialize: {encoded}"
+    );
+}
+
+#[test]
+fn confidence_arbitration_diagnostic_is_additive_on_the_record_wire() {
+    // A pre-B4 history line (no confidence_arbitration field) must still
+    // deserialize, and a B4 record round-trips its counts and closed reasons.
+    let pre_b4 = r#"{
+        "correlation_id": "rec-1-7-1",
+        "recording_id": 7,
+        "recorded_at_unix_ms": 1
+    }"#;
+    let decoded: DiagnosticRecord = serde_json::from_str(pre_b4).unwrap();
+    assert!(decoded.confidence_arbitration.is_none());
+
+    let mut record = DiagnosticRecord::new("rec-2-7-1".to_owned(), 7);
+    record.confidence_arbitration = Some(ConfidenceArbitrationDiagnostic {
+        regions_considered: 3,
+        regions_flipped: 1,
+        rejections: vec![
+            ConfidenceArbitrationRejection::ConfidenceGapNotDecisive,
+            ConfidenceArbitrationRejection::MeaningInvertingTokens,
+        ],
+    });
+    let encoded = serde_json::to_string(&record).unwrap();
+    assert!(encoded.contains("confidence_arbitration"));
+    assert!(encoded.contains("meaning_inverting_tokens"));
+    let decoded: DiagnosticRecord = serde_json::from_str(&encoded).unwrap();
+    let arbitration = decoded.confidence_arbitration.expect("round-trips");
+    assert_eq!(arbitration.regions_considered, 3);
+    assert_eq!(arbitration.regions_flipped, 1);
+    assert_eq!(
+        arbitration.rejections,
+        vec![
+            ConfidenceArbitrationRejection::ConfidenceGapNotDecisive,
+            ConfidenceArbitrationRejection::MeaningInvertingTokens,
+        ]
     );
 }

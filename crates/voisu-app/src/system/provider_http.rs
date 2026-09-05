@@ -220,7 +220,7 @@ impl ProviderHttpClient {
         params: GroqRequestParams,
         pcm: Vec<u8>,
         cancel: Arc<CancelRegistry>,
-    ) -> Result<String, BoundaryError> {
+    ) -> Result<super::GroqChunkTranscript, BoundaryError> {
         tokio::task::spawn_blocking(move || {
             request_groq_chunk(credential, endpoint, &params, pcm, &cancel)
         })
@@ -231,7 +231,13 @@ impl ProviderHttpClient {
 
 /// Builds the curl `--config` body for a Groq transcription request: the audio
 /// form part plus the accuracy gains — `model`, `language`, `temperature=0`,
-/// `response_format`, and (when non-empty) the vocabulary `prompt`. Rejects a
+/// `response_format`, and (when non-empty) the vocabulary `prompt`. Since
+/// slice B4 the request asks for `verbose_json` with BOTH timestamp
+/// granularities (`word` for the word list, `segment` for the per-segment
+/// `avg_logprob` the word confidences are derived from) — the documented
+/// OpenAI-compatible Whisper shape. The parser tolerates a server that
+/// ignores the format and returns plain JSON: the text is still extracted and
+/// the missing word list simply yields no confidence evidence. Rejects a
 /// model or language carrying control characters; a control-character-bearing
 /// prompt is defensively stripped rather than rejected. Kept pure and separate
 /// from the request so the request shape is testable without a network call.
@@ -258,7 +264,7 @@ pub(super) fn build_groq_curl_config(
     let path = curl_config_escape(file_path);
     let model = curl_config_escape(&params.model);
     let mut config = format!(
-        "url = \"{endpoint}\"\nheader = \"Authorization: Bearer {credential}\"\nform = \"file=@{path};filename=recording.flac;type=audio/flac\"\nform = \"model={model}\"\nform = \"response_format=json\"\nform = \"temperature=0\"\n"
+        "url = \"{endpoint}\"\nheader = \"Authorization: Bearer {credential}\"\nform = \"file=@{path};filename=recording.flac;type=audio/flac\"\nform = \"model={model}\"\nform = \"response_format=verbose_json\"\nform = \"timestamp_granularities[]=word\"\nform = \"timestamp_granularities[]=segment\"\nform = \"temperature=0\"\n"
     );
     if !params.language.is_empty() {
         let language = curl_config_escape(&params.language);

@@ -23,20 +23,24 @@ pub use wav::{WavScan, scan_wav_pcm};
 
 mod diagnostics;
 pub use diagnostics::{
-    DEFAULT_DEBUG_AUDIO_TTL, DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS, DebugAudioRecord,
-    DiagnosticExport, DiagnosticRecord, DiagnosticStore, EXPORT_ENV_ALLOWLIST,
-    EnglishEligibilityOutcome, IntentReconstructionDiagnostic, IntentReconstructionEligibility,
-    IntentReconstructionOutcome, MAX_MODEL_ID_UTF8_BYTES, MAX_SMART_WRITING_DIAGNOSTIC_EDITS,
-    MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES, MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES,
-    MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES, MAX_STORED_TEXT, PruneOutcome, REDACTED, ReplayOutcome,
-    RetentionPolicy, SMART_WRITING_DIAGNOSTIC_VERSION, SmartWritingDiagnostic,
-    SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode,
-    SourceCoverageRecord, SourceSelectionConfidence, SourceSelectionDiagnostic,
-    SourceTranscriptRecord, TELEMETRY_SCHEMA, TEXT_SHA256_FINGERPRINT_LEN, clamp_utf8_bytes,
-    correlation_id, export_record, is_secret_env_key, is_text_sha256_fingerprint,
-    redacted_environment, replay_capture, sanitize_url, scrub_embedded_urls, scrub_secret_values,
-    text_sha256_fingerprint, unix_millis_now,
+    ConfidenceArbitrationDiagnostic, ConfidenceArbitrationRejection, DEFAULT_DEBUG_AUDIO_TTL,
+    DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS, DebugAudioRecord, DiagnosticExport, DiagnosticRecord,
+    DiagnosticStore, EXPORT_ENV_ALLOWLIST, EnglishEligibilityOutcome,
+    IntentReconstructionDiagnostic, IntentReconstructionEligibility, IntentReconstructionOutcome,
+    MAX_CONFIDENCE_ARBITRATION_REJECTIONS, MAX_MODEL_ID_UTF8_BYTES,
+    MAX_SMART_WRITING_DIAGNOSTIC_EDITS, MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES,
+    MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES, MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES,
+    MAX_STORED_TEXT, PruneOutcome, REDACTED, ReplayOutcome, RetentionPolicy,
+    SMART_WRITING_DIAGNOSTIC_VERSION, SmartWritingDiagnostic, SmartWritingEditEvidence,
+    SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode, SourceCoverageRecord,
+    SourceSelectionConfidence, SourceSelectionDiagnostic, SourceTranscriptRecord, TELEMETRY_SCHEMA,
+    TEXT_SHA256_FINGERPRINT_LEN, clamp_utf8_bytes, correlation_id, export_record,
+    is_secret_env_key, is_text_sha256_fingerprint, redacted_environment, replay_capture,
+    sanitize_url, scrub_embedded_urls, scrub_secret_values, text_sha256_fingerprint,
+    unix_millis_now,
 };
+
+mod confidence_arbitration;
 
 mod dpr_diagnostics;
 #[cfg(not(feature = "dpr-eval-late-retain"))]
@@ -385,6 +389,12 @@ pub struct LifecycleEvidence {
     pub source_selection_diagnostic: Option<SourceSelectionDiagnostic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent_reconstruction: Option<IntentReconstructionDiagnostic>,
+    /// Slice B4 additive confidence-arbitration evidence. Absent when
+    /// arbitration did not run (single provider, missing confidence, or a
+    /// selection it never touches), so pre-B4 responses and history lines
+    /// stay parseable in both skew directions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_arbitration: Option<ConfidenceArbitrationDiagnostic>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1276,6 +1286,11 @@ pub struct TranscriptDecision {
     pub recovery_attempted: bool,
     pub source_selection_diagnostic: SourceSelectionDiagnostic,
     pub intent_reconstruction: Option<IntentReconstructionEvidence>,
+    /// Slice B4: additive confidence-arbitration evidence. `None` whenever
+    /// arbitration did not run (no both-sources-and-both-evidence case, or a
+    /// selection arbitration never touches) — the delivered text is then
+    /// byte-identical to the pre-B4 pipeline.
+    pub confidence_arbitration: Option<ConfidenceArbitrationDiagnostic>,
 }
 
 #[derive(Debug)]
@@ -1512,29 +1527,132 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 outcome: IntentReconstructionOutcome::Accepted,
                 candidate: bounded_candidate,
             }),
+            confidence_arbitration: None,
         })
     }
 
-    /// Produces the final Transcript decision, with the user's constrained
-    /// vocabulary corrections applied to the chosen final text.
+    /// Produces the final Transcript decision, with confidence-aware
+    /// divergence-point arbitration inside selection and the user's
+    /// constrained vocabulary corrections applied to the chosen final text.
     ///
-    /// Placement: the correction runs AFTER the final Transcript is chosen
-    /// (post-selection, post-reconciliation) and BEFORE the text reaches any
-    /// downstream consumer — DPR formatting, smart writing, and Delivery all
-    /// read `decision.transcript`, so every later validator and formatter sees
-    /// the corrected text and inserted term punctuation is never compared
-    /// against pre-correction text. The quality guards INSIDE the decision
-    /// logic vetted the provider-chosen text before this pass; a correction is
-    /// an exact whole-token rewrite with user-owned vocabulary that preserves
-    /// every content word's count, so those guard outcomes remain valid for
-    /// the corrected text, while `is_source_derived` — which must reject words
-    /// no provider literally heard — is never handed a correction to reject.
+    /// Placement: the uncorrected decision selects the incumbent whole
+    /// (a Source Transcript, a merge, or a repair). When BOTH providers
+    /// delivered a Source Transcript AND both retained word-confidence
+    /// evidence for their own text, the B4 arbitration pass
+    /// may then flip decisively-more-confident divergence points to the other
+    /// provider's words (slice B4) — still inside selection, before any
+    /// correction. The user-vocabulary correction then runs LAST, on whatever
+    /// text selection delivered: it is an exact whole-token rewrite with
+    /// user-owned vocabulary that preserves every content word's count, so
+    /// the quality-guard outcomes vetted inside the decision remain valid,
+    /// while `is_source_derived` — which must reject words no provider
+    /// literally heard — is never handed a correction to reject.
+    ///
+    /// Provenance rule (pinned): a flip changes the delivered text to mixed
+    /// provenance, but the word-confidence evidence the correction gate reads
+    /// stays the SELECTED (backbone) provider's — arbitration never re-tags
+    /// or merges evidence streams, so the correction gate's documented rules
+    /// apply unchanged.
     pub async fn decide(
         &mut self,
         sources: Vec<SourceTranscript>,
     ) -> Result<TranscriptDecision, BoundaryError> {
-        let decision = self.decide_uncorrected(sources).await?;
+        let decision = self.decide_uncorrected(sources.clone()).await?;
+        let decision = self.apply_confidence_arbitration(decision, &sources);
         Ok(self.apply_user_vocabulary_correction(decision))
+    }
+
+    /// Slice B4: flips divergent regions of the selected text to the other
+    /// provider's words when BOTH sides' confidence evidence makes the flip
+    /// decisive and every meaning-preservation guard holds. Everything else —
+    /// single provider, missing evidence, evidence that does not describe its
+    /// own text, non-source selections — returns the decision untouched:
+    /// byte-identical to the pre-B4 pipeline, with no arbitration diagnostic.
+    fn apply_confidence_arbitration(
+        &self,
+        mut decision: TranscriptDecision,
+        sources: &[SourceTranscript],
+    ) -> TranscriptDecision {
+        // Arbitration only ever rewords a selection that IS one provider's
+        // source text. A reconciled, repaired, or reconstructed final is not
+        // one provider's words, so there is no "other provider's words" to
+        // take and no aligned confidence to vouch for the splice.
+        if !matches!(
+            decision.selection,
+            TranscriptSelection::SourceDeepgram
+                | TranscriptSelection::SourceGroq
+                | TranscriptSelection::NearIdenticalGroq
+        ) {
+            return decision;
+        }
+        // The same sanitization the selection saw, so the texts arbitrated
+        // are the texts that were selected from.
+        let sanitized: Vec<SourceTranscript> = sanitize_source_transcripts(sources.to_vec())
+            .into_iter()
+            .filter(|source| !source.text.is_empty())
+            .collect();
+        let deepgram = sanitized
+            .iter()
+            .find(|source| source.provider == Provider::Deepgram);
+        let groq = sanitized
+            .iter()
+            .find(|source| source.provider == Provider::Groq);
+        let (Some(deepgram), Some(groq)) = (deepgram, groq) else {
+            return decision;
+        };
+        let (incumbent, other) = match decision.selection {
+            TranscriptSelection::SourceDeepgram => (deepgram, groq),
+            _ => (groq, deepgram),
+        };
+        // Belt-and-braces: the arbitrated text must BE the incumbent
+        // provider's source, or the alignment would describe a text the
+        // decision did not deliver.
+        if incumbent.text.trim() != decision.transcript.0 {
+            return decision;
+        }
+        // Both sides need their OWN provider's evidence; anything missing
+        // keeps the current behavior entirely (no flip, no diagnostic).
+        let incumbent_evidence = self
+            .word_confidences
+            .iter()
+            .find(|evidence| evidence.provider == incumbent.provider)
+            .map(|evidence| &evidence.words);
+        let other_evidence = self
+            .word_confidences
+            .iter()
+            .find(|evidence| evidence.provider == other.provider)
+            .map(|evidence| &evidence.words);
+        let (Some(incumbent_evidence), Some(other_evidence)) = (incumbent_evidence, other_evidence)
+        else {
+            return decision;
+        };
+        if incumbent_evidence.is_empty() || other_evidence.is_empty() {
+            return decision;
+        }
+        let Some(outcome) =
+            confidence_arbitration::arbitrate(confidence_arbitration::ArbitrationInput {
+                incumbent_text: incumbent.text.trim(),
+                incumbent_confidences: incumbent_evidence,
+                other_text: other.text.trim(),
+                other_confidences: other_evidence,
+                sources: &sanitized,
+            })
+        else {
+            return decision;
+        };
+        decision.confidence_arbitration = Some(ConfidenceArbitrationDiagnostic {
+            regions_considered: outcome.regions_considered,
+            regions_flipped: outcome.regions_flipped,
+            rejections: outcome.rejections,
+        });
+        if outcome.regions_flipped > 0 {
+            decision.transcript = Transcript(outcome.text);
+            decision.validation_reason = format!(
+                "{}; confidence arbitration flipped {} divergent region(s)",
+                decision.validation_reason, outcome.regions_flipped
+            );
+        }
+        decision
     }
 
     fn apply_user_vocabulary_correction(
@@ -1665,6 +1783,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                         Some(classification.confidence()),
                     ),
                     intent_reconstruction: None,
+                    confidence_arbitration: None,
                 });
             }
 
@@ -1705,6 +1824,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                             Some(gate.confidence),
                         ),
                         intent_reconstruction: None,
+                        confidence_arbitration: None,
                     });
                 }
                 // The better source itself failed a quality guardrail: fall
@@ -1782,6 +1902,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 recovery_attempted: false,
                 source_selection_diagnostic: source_selection_diagnostic(&sources, None, None),
                 intent_reconstruction: None,
+                confidence_arbitration: None,
             });
         }
 
@@ -1814,6 +1935,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 Some(SourceSelectionConfidence::High),
             ),
             intent_reconstruction: None,
+            confidence_arbitration: None,
         })
     }
 
@@ -1915,6 +2037,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 recovery_attempted: true,
                 source_selection_diagnostic: source_selection_diagnostic(sources, None, None),
                 intent_reconstruction: None,
+                confidence_arbitration: None,
             });
         }
         Ok(TranscriptDecision {
@@ -1926,6 +2049,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             recovery_attempted: true,
             source_selection_diagnostic: source_selection_diagnostic(sources, None, None),
             intent_reconstruction: None,
+            confidence_arbitration: None,
         })
     }
 }
@@ -1986,6 +2110,7 @@ fn contraction_source_fallback(
         recovery_attempted,
         source_selection_diagnostic: selection_diagnostic,
         intent_reconstruction: None,
+        confidence_arbitration: None,
     })
 }
 
@@ -2061,6 +2186,7 @@ fn safe_source_fallback(
             Some(SourceSelectionConfidence::High),
         ),
         intent_reconstruction: None,
+        confidence_arbitration: None,
     })
 }
 
@@ -2127,6 +2253,7 @@ fn source_fallback_decision(
         recovery_attempted,
         source_selection_diagnostic,
         intent_reconstruction: None,
+        confidence_arbitration: None,
     }
 }
 
@@ -3616,74 +3743,82 @@ fn script_count(text: &str) -> usize {
     scripts.into_iter().filter(|present| *present).count()
 }
 
+/// The normalized word sequence of a text: whitespace tokens stripped to
+/// alphanumeric content, case-folded, with contractions expanded. The SAME
+/// per-token normalization [`normalize_token`] applies, so provider word
+/// streams and texts normalize positionally against each other.
 fn normalized_words(text: &str) -> Vec<String> {
     text.split_whitespace()
-        .flat_map(|word| {
-            let word = word
-                .chars()
-                .filter_map(|character| match character {
-                    '\u{2019}' => Some('\''),
-                    character if character.is_alphanumeric() || character == '\'' => {
-                        Some(character)
-                    }
-                    _ => None,
-                })
-                .flat_map(char::to_lowercase)
-                .collect::<String>();
-            let expansion: &[&str] = match word.as_str() {
-                "aren't" => &["are", "not"],
-                "can't" => &["can", "not"],
-                "couldn't" => &["could", "not"],
-                "didn't" => &["did", "not"],
-                "doesn't" => &["does", "not"],
-                "don't" => &["do", "not"],
-                "hadn't" => &["had", "not"],
-                "hasn't" => &["has", "not"],
-                "haven't" => &["have", "not"],
-                "needn't" => &["need", "not"],
-                "isn't" => &["is", "not"],
-                "let's" => &["let", "us"],
-                "mustn't" => &["must", "not"],
-                "shan't" => &["shall", "not"],
-                "shouldn't" => &["should", "not"],
-                "they're" => &["they", "are"],
-                "wasn't" => &["was", "not"],
-                "we're" => &["we", "are"],
-                "weren't" => &["were", "not"],
-                "won't" => &["will", "not"],
-                "wouldn't" => &["would", "not"],
-                "you're" => &["you", "are"],
-                "i'm" => &["i", "am"],
-                "he's" => &["he", "is"],
-                "she's" => &["she", "is"],
-                "it's" => &["it", "is"],
-                "that's" => &["that", "is"],
-                "there's" => &["there", "is"],
-                "here's" => &["here", "is"],
-                "what's" => &["what", "is"],
-                "where's" => &["where", "is"],
-                "who's" => &["who", "is"],
-                "how's" => &["how", "is"],
-                "i've" => &["i", "have"],
-                "we've" => &["we", "have"],
-                "they've" => &["they", "have"],
-                "you've" => &["you", "have"],
-                "i'll" => &["i", "will"],
-                "we'll" => &["we", "will"],
-                "they'll" => &["they", "will"],
-                "you'll" => &["you", "will"],
-                "i'd" => &["i", "would"],
-                "he'd" => &["he", "would"],
-                "she'd" => &["she", "would"],
-                "we'd" => &["we", "would"],
-                "they'd" => &["they", "would"],
-                "you'd" => &["you", "would"],
-                _ => return vec![word.replace('\'', "")],
-            };
-            expansion.iter().map(|part| (*part).to_owned()).collect()
-        })
+        .flat_map(normalize_token)
         .filter(|word| !word.is_empty())
         .collect()
+}
+
+/// Normalizes ONE whitespace token the way [`normalized_words`] does:
+/// punctuation dropped (curly apostrophes folded to straight ones),
+/// lowercased, contractions expanded into their parts. A punctuation-only
+/// token normalizes to no words.
+pub(crate) fn normalize_token(word: &str) -> Vec<String> {
+    let word = word
+        .chars()
+        .filter_map(|character| match character {
+            '\u{2019}' => Some('\''),
+            character if character.is_alphanumeric() || character == '\'' => Some(character),
+            _ => None,
+        })
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let expansion: &[&str] = match word.as_str() {
+        "aren't" => &["are", "not"],
+        "can't" => &["can", "not"],
+        "couldn't" => &["could", "not"],
+        "didn't" => &["did", "not"],
+        "doesn't" => &["does", "not"],
+        "don't" => &["do", "not"],
+        "hadn't" => &["had", "not"],
+        "hasn't" => &["has", "not"],
+        "haven't" => &["have", "not"],
+        "needn't" => &["need", "not"],
+        "isn't" => &["is", "not"],
+        "let's" => &["let", "us"],
+        "mustn't" => &["must", "not"],
+        "shan't" => &["shall", "not"],
+        "shouldn't" => &["should", "not"],
+        "they're" => &["they", "are"],
+        "wasn't" => &["was", "not"],
+        "we're" => &["we", "are"],
+        "weren't" => &["were", "not"],
+        "won't" => &["will", "not"],
+        "wouldn't" => &["would", "not"],
+        "you're" => &["you", "are"],
+        "i'm" => &["i", "am"],
+        "he's" => &["he", "is"],
+        "she's" => &["she", "is"],
+        "it's" => &["it", "is"],
+        "that's" => &["that", "is"],
+        "there's" => &["there", "is"],
+        "here's" => &["here", "is"],
+        "what's" => &["what", "is"],
+        "where's" => &["where", "is"],
+        "who's" => &["who", "is"],
+        "how's" => &["how", "is"],
+        "i've" => &["i", "have"],
+        "we've" => &["we", "have"],
+        "they've" => &["they", "have"],
+        "you've" => &["you", "have"],
+        "i'll" => &["i", "will"],
+        "we'll" => &["we", "will"],
+        "they'll" => &["they", "will"],
+        "you'll" => &["you", "will"],
+        "i'd" => &["i", "would"],
+        "he'd" => &["he", "would"],
+        "she'd" => &["she", "would"],
+        "we'd" => &["we", "would"],
+        "they'd" => &["they", "would"],
+        "you'd" => &["you", "would"],
+        _ => return vec![word.replace('\'', "")],
+    };
+    expansion.iter().map(|part| (*part).to_owned()).collect()
 }
 
 fn word_edit_distance(left: &[String], right: &[String]) -> usize {
@@ -3755,9 +3890,11 @@ pub trait ProviderStream: Send {
 
     /// Word-level confidence evidence the stream retained for its finalized
     /// segments, as `(word, confidence)` pairs in transcript order. Providers
-    /// that do not expose word confidences keep the default: none. Slice B2
-    /// consumes only this minimal signal (the user-vocabulary correction
-    /// gate); deeper confidence-aware reconciliation is slice B4.
+    /// that do not expose word confidences keep the default: none. Slice B2's
+    /// user-vocabulary correction gate consumes this signal; since slice B4
+    /// the decision pipeline also uses it (per provider) to arbitrate
+    /// divergence points between the two Source Transcripts — Deepgram from
+    /// its streaming finals, Groq from the verbose_json word timestamps.
     fn word_confidences(&self) -> Vec<(String, f64)> {
         Vec::new()
     }
@@ -3935,9 +4072,12 @@ impl ProviderCoordinator {
 
         // Word-confidence evidence is pulled BEFORE the deadline path moves the
         // streams into abort: the Deepgram accumulator is settled once its
-        // completion future resolved, and a stream that never completed has no
-        // Source Transcript for the gate to apply to anyway.
+        // completion future resolved, and Groq's chunk word confidences are
+        // stored on its stream by its own completion — a stream that never
+        // completed has no Source Transcript for the gate to apply to anyway,
+        // and reports none.
         let deepgram_word_confidences = deepgram.word_confidences();
+        let groq_word_confidences = groq.word_confidences();
 
         if deadline_elapsed {
             // A provider that never produced a Source Transcript before the
@@ -4029,13 +4169,23 @@ impl ProviderCoordinator {
                 sources: transcripts,
                 timings_ms,
                 provider_failures,
-                word_confidences: if deepgram_word_confidences.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![ProviderWordConfidences {
-                        provider: Provider::Deepgram,
-                        words: deepgram_word_confidences,
-                    }]
+                word_confidences: {
+                    // One provider-tagged evidence entry per provider that
+                    // retained words, in Provider order (Deepgram, Groq).
+                    let mut word_confidences = Vec::new();
+                    if !deepgram_word_confidences.is_empty() {
+                        word_confidences.push(ProviderWordConfidences {
+                            provider: Provider::Deepgram,
+                            words: deepgram_word_confidences,
+                        });
+                    }
+                    if !groq_word_confidences.is_empty() {
+                        word_confidences.push(ProviderWordConfidences {
+                            provider: Provider::Groq,
+                            words: groq_word_confidences,
+                        });
+                    }
+                    word_confidences
                 },
             })
         }
