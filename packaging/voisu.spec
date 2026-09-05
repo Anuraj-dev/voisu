@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.44.3
+Version:        0.44.4
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,10 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Sat Sep 05 2026 Voisu maintainers <voisu@example.invalid> - 0.44.4-1
+- test(transcript-quality): seeded reference-matrix equivalence battery for levenshtein_ops
+- perf: measured quick wins — LazyLock regexes, buffer drain, rolling WER matrix
+
 * Sat Sep 05 2026 Voisu maintainers <voisu@example.invalid> - 0.44.3-1
 - fix(tests+overlay): inject portal endpoints in tests; bound Overlay status IPC
 
