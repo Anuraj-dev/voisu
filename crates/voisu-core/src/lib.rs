@@ -79,6 +79,8 @@ pub use prompt_rendering::{
     DELIVERY_STATE_UNSENT, RenderingPolicy, RenderingRoute, TimingCertainty,
 };
 
+mod dictation_grammar;
+
 mod local_baseline;
 pub use local_baseline::{
     LOCAL_BASELINE_CONTRACT_ID, LocalBaseline, LocalBaselineOptions, LocalTiming, PauseBoundary,

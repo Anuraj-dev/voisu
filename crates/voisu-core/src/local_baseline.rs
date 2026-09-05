@@ -149,10 +149,14 @@ fn organize_impl(source: &str, options: &LocalBaselineOptions) -> String {
     }
 
     if options.route == RenderingRoute::LiteralIdentity {
-        if !source_has_spoken_cue(source) {
-            return source.to_owned();
+        // Dictation grammar (numbers / times / currency / email-speak) is in
+        // the same spoken-cue class as the marks: it converts in the literal
+        // route too, then the marks pass runs on the converted text.
+        let grammared = crate::dictation_grammar::apply_dictation_grammar(source);
+        if !source_has_spoken_cue(&grammared) {
+            return grammared;
         }
-        return apply_bare_spoken_cues(source);
+        return apply_bare_spoken_cues(&grammared);
     }
 
     let mut text = source.to_owned();
@@ -160,6 +164,10 @@ fn organize_impl(source: &str, options: &LocalBaselineOptions) -> String {
     // R1-safe removals first (operate on raw spoken words).
     text = strip_leading_clear_fillers(&text);
     text = apply_clear_backtrack(&text);
+
+    // Dictation grammar (numbers / times / currency / email-speak) before
+    // the marks pass so email-speak consumes its own `dot` cues atomically.
+    text = crate::dictation_grammar::apply_dictation_grammar(&text);
 
     // Spoken marks / quotes before section organize so Structured Goal
     // bodies still convert `dash dash` and `quote,`.
@@ -818,6 +826,30 @@ fn cue_phrase_match(tokens: &[(usize, usize, &str)], i: usize, phrase: &[&str]) 
         .all(|(k, w)| spoken_cue_token(tokens[i + k].2) == *w)
 }
 
+/// Paired `quote … unquote` spans with a skip mask covering each pair
+/// inclusive of both cue tokens. Shared by the spoken-marks pass and the
+/// dictation-grammar pass so both protect the same quote interiors.
+pub(crate) fn quote_pairs_and_skip(
+    tokens: &[(usize, usize, &str)],
+) -> (Vec<(usize, usize)>, Vec<bool>) {
+    let mut quote_pairs: Vec<(usize, usize)> = Vec::new();
+    let mut skip = vec![false; tokens.len()];
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if spoken_cue_token(tokens[i].2) == "quote"
+            && let Some(j) =
+                (i + 1..tokens.len()).find(|&j| spoken_cue_token(tokens[j].2) == "unquote")
+        {
+            quote_pairs.push((i, j));
+            skip[i..=j].fill(true);
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    (quote_pairs, skip)
+}
+
 fn spoken_cue_token(tok: &str) -> String {
     let lower = ascii_lower(tok);
     if lower.ends_with(',') || lower.ends_with('.') {
@@ -1150,23 +1182,7 @@ fn apply_bare_spoken_cues_pass(text: &str) -> (String, bool) {
     }
 
     // Pass 1: paired quote … unquote (protect interior from further cue conversion).
-    let mut skip: Vec<bool> = vec![false; tokens.len()];
-    let mut quote_pairs: Vec<(usize, usize)> = Vec::new();
-    {
-        let mut i = 0usize;
-        while i < tokens.len() {
-            if spoken_cue_token(tokens[i].2) == "quote"
-                && let Some(j) =
-                    (i + 1..tokens.len()).find(|&j| spoken_cue_token(tokens[j].2) == "unquote")
-            {
-                quote_pairs.push((i, j));
-                skip[i..=j].fill(true);
-                i = j + 1;
-                continue;
-            }
-            i += 1;
-        }
-    }
+    let (quote_pairs, skip) = quote_pairs_and_skip(&tokens);
 
     // Metalinguistic "words X and Y" spans: do not convert symbol phrases inside.
     let meta = metalinguistic_mask(&tokens);
@@ -1329,7 +1345,7 @@ fn period_is_cue(tokens: &[(usize, usize, &str)], i: usize) -> bool {
     true
 }
 
-fn metalinguistic_mask(tokens: &[(usize, usize, &str)]) -> Vec<bool> {
+pub(crate) fn metalinguistic_mask(tokens: &[(usize, usize, &str)]) -> Vec<bool> {
     let mut mask = vec![false; tokens.len()];
     // "words A and B" or "words A and B and C" — mark A,B (and multi-word symbol phrases).
     for i in 0..tokens.len() {
@@ -1706,6 +1722,12 @@ fn is_protected_case_token(tok: &str) -> bool {
     if t.starts_with("http://") || t.starts_with("https://") {
         return true;
     }
+    // Email addresses produced by dictation grammar (`foo@bar.com`) keep
+    // their spoken casing; sentence-start capitalisation must not rewrite
+    // the local part.
+    if t.contains('@') {
+        return true;
+    }
     if t.starts_with("./") || t.starts_with("../") || t.starts_with("~/") {
         return true;
     }
@@ -1735,7 +1757,7 @@ fn is_protected_case_token(tok: &str) -> bool {
 
 // ─── Token helpers ───────────────────────────────────────────────────────────
 
-fn word_tokens(text: &str) -> Vec<(usize, usize, &str)> {
+pub(crate) fn word_tokens(text: &str) -> Vec<(usize, usize, &str)> {
     let mut out = Vec::new();
     let mut char_iter = text.char_indices().peekable();
     while let Some((start, ch)) = char_iter.next() {
@@ -1778,7 +1800,7 @@ fn join_quote_interior(tokens: &[(usize, usize, &str)]) -> String {
     parts.join(" ")
 }
 
-fn ascii_lower(s: &str) -> String {
+pub(crate) fn ascii_lower(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_ascii_uppercase() {
