@@ -125,7 +125,7 @@ fn clamp_text(text: String) -> String {
 }
 
 /// Clamps `text` to at most `max_bytes` UTF-8 bytes on a char boundary. Unlike
-/// [`clamp_text`], no ellipsis is appended — Smart Writing diagnostic clamps are
+/// `clamp_text`, no ellipsis is appended — Smart Writing diagnostic clamps are
 /// exact byte budgets that fingerprints of the unclamped source cover for
 /// equality.
 pub fn clamp_utf8_bytes(text: &str, max_bytes: usize) -> String {

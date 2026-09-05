@@ -81,29 +81,34 @@ pub(super) fn deepgram_streaming_url(
     } else {
         base.to_owned()
     };
-    let (plaintext, remainder) = if let Some(rest) = normalized.strip_prefix("wss://") {
-        (false, rest)
-    } else if let Some(rest) = normalized.strip_prefix("ws://") {
-        (true, rest)
-    } else {
-        return Err(BoundaryError::new(
+    let url = url::Url::parse(&normalized).map_err(|_| {
+        BoundaryError::new(
             BoundaryKind::Provider,
             "Deepgram streaming endpoint must use WSS except on loopback",
-        ));
-    };
-    let authority = remainder.split('/').next().unwrap_or_default();
+        )
+    })?;
     // Reject userinfo outright: `ws://127.0.0.1:80@attacker.example/…` has a
     // loopback-LOOKING authority prefix but its HOST is attacker.example, and
     // loopback-checking the raw authority string would send the Token header
     // there over plaintext. Deepgram auth travels in the Authorization header,
     // so no legitimate endpoint carries userinfo.
-    if authority.is_empty() || authority.contains('@') {
+    if !endpoint_authority_is_allowed(&url) {
         return Err(BoundaryError::new(
             BoundaryKind::Provider,
             "Deepgram streaming endpoint authority is invalid",
         ));
     }
-    if plaintext && !authority_is_loopback(authority) {
+    let plaintext = match url.scheme() {
+        "ws" => true,
+        "wss" => false,
+        _ => {
+            return Err(BoundaryError::new(
+                BoundaryKind::Provider,
+                "Deepgram streaming endpoint must use WSS except on loopback",
+            ));
+        }
+    };
+    if plaintext && !parsed_host_is_loopback(&url) {
         return Err(BoundaryError::new(
             BoundaryKind::Provider,
             "Deepgram streaming endpoint must use WSS except on loopback",

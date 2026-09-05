@@ -203,6 +203,28 @@ fn curl_config_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Shared endpoint-transport policy: the authority may never carry userinfo
+/// (`user:pass@host` authenticates through the URL itself, which no provider
+/// endpoint legitimately does) and the host must be present.
+pub(crate) fn endpoint_authority_is_allowed(url: &url::Url) -> bool {
+    url.host_str().is_some_and(|host| !host.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+/// Whether the URL's PARSED host is loopback: exactly `localhost`, an IPv4 in
+/// 127.0.0.0/8, or ::1. The comparison is on the parsed host only — never a
+/// prefix or suffix of the raw authority string — so `localhost.evil.test` is a
+/// different host and `localhost:8080@evil.test` is evil.test with userinfo.
+pub(crate) fn parsed_host_is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
 fn restricted_command(program: &str) -> Command {
     let mut command = Command::new(program);
     guard_external_child(&mut command);
@@ -1777,6 +1799,10 @@ mod tests {
         );
         assert!(deepgram_streaming_url("ws://deepgram.test/v1/listen", &[]).is_err());
         assert!(deepgram_streaming_url("http://deepgram.test/v1/listen", &[]).is_err());
+        // The loopback decision is the PARSED host: the whole 127.0.0.0/8 range
+        // is loopback, and a lookalike suffix is a different host entirely.
+        assert!(deepgram_streaming_url("ws://127.7.7.7:9/v1/listen", &[]).is_ok());
+        assert!(deepgram_streaming_url("ws://localhost.attacker.example/v1/listen", &[]).is_err());
         // A base that already carries a query keeps it and appends with '&'.
         let url = deepgram_streaming_url("wss://host/listen?tier=custom", &[]).unwrap();
         assert!(url.contains("?tier=custom&model=nova-3"), "{url}");
@@ -2208,6 +2234,37 @@ mod tests {
         assert!(deepgram_streaming_url("http://localhost@attacker.example/listen", &[]).is_err());
         assert!(deepgram_streaming_url("wss://user@api.deepgram.com/v1/listen", &[]).is_err());
         assert!(deepgram_streaming_url("ws:///listen", &[]).is_err());
+    }
+
+    #[test]
+    fn provider_endpoint_security_parses_the_url_instead_of_prefix_matching() {
+        assert!(provider_endpoint_is_secure(
+            "https://api.groq.com/openai/v1/audio/transcriptions"
+        ));
+        assert!(provider_endpoint_is_secure(
+            "http://localhost:8080/transcribe"
+        ));
+        assert!(provider_endpoint_is_secure(
+            "http://127.0.0.1:9999/transcribe"
+        ));
+        assert!(provider_endpoint_is_secure("http://127.7.7.7/transcribe"));
+        assert!(!provider_endpoint_is_secure(
+            "http://attacker.example/transcribe"
+        ));
+        // Userinfo smuggling: both of these passed the old prefix checks — any
+        // `https://…` passed, and `localhost:8080@…` starts with `localhost:` —
+        // while the real parsed host is attacker.example.
+        assert!(!provider_endpoint_is_secure(
+            "https://user:pass@api.groq.com@attacker.example/transcribe"
+        ));
+        assert!(!provider_endpoint_is_secure(
+            "http://localhost:8080@attacker.example/transcribe"
+        ));
+        // Exact host comparison: a lookalike suffix is a different host.
+        assert!(!provider_endpoint_is_secure(
+            "http://localhost.attacker.example/transcribe"
+        ));
+        assert!(!provider_endpoint_is_secure("not a url"));
     }
 
     #[tokio::test]

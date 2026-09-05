@@ -17,6 +17,8 @@ use std::fmt;
 use std::sync::Once;
 use std::time::Duration;
 
+use crate::system::{endpoint_authority_is_allowed, parsed_host_is_loopback};
+
 /// Exact production chat-completions endpoint
 /// (`MINIMAL_GRAMMAR_ENDPOINT` in the constants companion).
 pub const MINIMAL_GRAMMAR_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
@@ -253,28 +255,23 @@ fn ensure_rustls_ring_provider() {
     });
 }
 
-/// Production HTTPS always; plain HTTP only on loopback (test injection).
+/// Production HTTPS always; plain HTTP only on loopback (test injection). The
+/// URL is parsed so the loopback decision is the real host, never a prefix of
+/// the raw authority — `http://localhost:8080@attacker.example/` is attacker
+/// .example carrying userinfo, not loopback.
 fn endpoint_is_allowed(endpoint: &str) -> bool {
     if endpoint.is_empty() || endpoint.contains(['\n', '\r', '\0']) {
         return false;
     }
-    if endpoint.starts_with("https://") {
-        return true;
-    }
-    let Some(remainder) = endpoint.strip_prefix("http://") else {
+    let Ok(url) = url::Url::parse(endpoint) else {
         return false;
     };
-    authority_is_loopback(remainder.split('/').next().unwrap_or_default())
-}
-
-fn authority_is_loopback(authority: &str) -> bool {
-    let authority = authority.to_ascii_lowercase();
-    authority == "localhost"
-        || authority.starts_with("localhost:")
-        || authority == "127.0.0.1"
-        || authority.starts_with("127.0.0.1:")
-        || authority == "[::1]"
-        || authority.starts_with("[::1]:")
+    endpoint_authority_is_allowed(&url)
+        && match url.scheme() {
+            "https" => true,
+            "http" => parsed_host_is_loopback(&url),
+            _ => false,
+        }
 }
 
 fn map_reqwest_error(error: reqwest::Error) -> GrammarHttpError {
@@ -829,6 +826,20 @@ mod tests {
         ));
         assert!(GrammarHttpClient::with_endpoint("http://127.0.0.1:9/x").is_ok());
         assert!(GrammarHttpClient::with_endpoint("http://localhost:9/x").is_ok());
+        // The policy parses the URL: userinfo smuggling and lookalike suffixes
+        // must fail even when the raw authority prefix looks trusted.
+        assert!(matches!(
+            GrammarHttpClient::with_endpoint("http://localhost:8080@attacker.example/v1"),
+            Err(GrammarHttpError::InvalidEndpoint)
+        ));
+        assert!(matches!(
+            GrammarHttpClient::with_endpoint("https://user:pass@api.groq.com@attacker.example/v1"),
+            Err(GrammarHttpError::InvalidEndpoint)
+        ));
+        assert!(matches!(
+            GrammarHttpClient::with_endpoint("http://localhost.attacker.example/v1"),
+            Err(GrammarHttpError::InvalidEndpoint)
+        ));
     }
 
     #[tokio::test]

@@ -80,27 +80,30 @@ impl TranscriptProvider for GroqProvider {
     }
 }
 
+/// Transport policy for user-configured provider endpoints: the URL must parse
+/// under the URL grammar, carry no userinfo, and use HTTPS — plain HTTP only
+/// when the parsed host is loopback, so local test servers keep working.
+/// Parsing instead of prefix matching is what makes the check hold:
+/// `http://localhost:8080@attacker.example/` has a loopback-LOOKING authority
+/// prefix whose real host is attacker.example, and `https://a@b@c/` cannot be
+/// trusted from its prefix either.
 pub(super) fn provider_endpoint_is_secure(endpoint: &str) -> bool {
+    // The URL parser strips ASCII tab/newline before validating, so the raw
+    // control-character guard must run first to fail closed on them.
     if endpoint.contains(['\n', '\r']) {
         return false;
     }
-    if endpoint.starts_with("https://") {
-        return true;
-    }
-    let Some(remainder) = endpoint.strip_prefix("http://") else {
+    let Ok(url) = url::Url::parse(endpoint) else {
         return false;
     };
-    authority_is_loopback(remainder.split('/').next().unwrap_or_default())
-}
-
-pub(super) fn authority_is_loopback(authority: &str) -> bool {
-    let authority = authority.to_ascii_lowercase();
-    authority == "localhost"
-        || authority.starts_with("localhost:")
-        || authority == "127.0.0.1"
-        || authority.starts_with("127.0.0.1:")
-        || authority == "[::1]"
-        || authority.starts_with("[::1]:")
+    if !endpoint_authority_is_allowed(&url) {
+        return false;
+    }
+    match url.scheme() {
+        "https" => true,
+        "http" => parsed_host_is_loopback(&url),
+        _ => false,
+    }
 }
 
 /// The per-Recording Groq/Whisper request tuning built once at stream start:
