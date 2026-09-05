@@ -395,10 +395,10 @@ fn name_tokens(text: &str) -> Vec<String> {
 
 fn command_tokens(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    if voisu_core::is_command_shaped(text) {
-        if let Some(first) = tokenize(text).first() {
-            out.push(first.clone());
-        }
+    if voisu_core::is_command_shaped(text)
+        && let Some(first) = tokenize(text).first()
+    {
+        out.push(first.clone());
     }
     for tok in tokenize(text) {
         let flag = tok.starts_with("--")
