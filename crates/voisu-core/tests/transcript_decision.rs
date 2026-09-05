@@ -5,8 +5,8 @@ use std::time::Duration;
 use voisu_core::{
     BoundaryError, BoundaryFuture, BoundaryKind, CancelRegistry, IntentReconstructionEligibility,
     IntentReconstructionOutcome, IntentReconstructionRequest, MAX_STORED_TEXT, MergeResult,
-    PreparedTranscriptDecision, Provider, ReconciliationKind, ReconciliationModel,
-    SourceTranscript, TranscriptDecisionPipeline, TranscriptSelection,
+    PreparedTranscriptDecision, Provider, ProviderWordConfidences, ReconciliationKind,
+    ReconciliationModel, SourceTranscript, TranscriptDecisionPipeline, TranscriptSelection,
     sanitize_source_transcript_text, sanitize_source_transcripts,
 };
 
@@ -4113,4 +4113,305 @@ async fn fully_greek_extended_token_passes_validation() {
     assert_eq!(decision.selection, TranscriptSelection::Reconciled);
     assert!(!decision.recovery_attempted);
     assert!(decision.fallback_reason.is_none());
+}
+
+// ─── Slice B2: user-vocabulary constrained post-correction ───────────────────
+
+const CORRECTION_MARKER: &str = "user vocabulary corrections applied";
+
+fn deepgram_confidences(words: &[(&str, f64)]) -> Vec<ProviderWordConfidences> {
+    vec![ProviderWordConfidences {
+        provider: Provider::Deepgram,
+        words: words
+            .iter()
+            .map(|(word, confidence)| ((*word).to_owned(), *confidence))
+            .collect(),
+    }]
+}
+
+#[tokio::test]
+async fn a_single_deepgram_source_is_corrected_after_selection() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+    pipeline.set_user_vocabulary(vec!["Rust".to_owned()]);
+
+    let decision = pipeline
+        .decide(vec![SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "the rUst compiler".to_owned(),
+        }])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(decision.transcript.0, "the Rust compiler");
+    assert!(
+        decision.validation_reason.contains(CORRECTION_MARKER),
+        "{}",
+        decision.validation_reason
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn fully_confident_deepgram_words_skip_the_correction_in_the_pipeline() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+    pipeline.set_user_vocabulary(vec!["Rust".to_owned()]);
+    pipeline.set_word_confidences(deepgram_confidences(&[("the", 0.99), ("rust", 0.97)]));
+
+    let decision = pipeline
+        .decide(vec![SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "the rUst compiler".to_owned(),
+        }])
+        .await
+        .unwrap();
+
+    // The provider was confident: overriding it is the risky direction.
+    assert_eq!(decision.transcript.0, "the rUst compiler");
+    assert!(
+        !decision.validation_reason.contains(CORRECTION_MARKER),
+        "{}",
+        decision.validation_reason
+    );
+}
+
+#[tokio::test]
+async fn a_low_confidence_span_keeps_the_correction_in_the_pipeline() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+    pipeline.set_user_vocabulary(vec!["Rust".to_owned()]);
+    pipeline.set_word_confidences(deepgram_confidences(&[("the", 0.99), ("rust", 0.42)]));
+
+    let decision = pipeline
+        .decide(vec![SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "the rUst compiler".to_owned(),
+        }])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, "the Rust compiler");
+    assert!(decision.validation_reason.contains(CORRECTION_MARKER));
+}
+
+#[tokio::test]
+async fn a_groq_sourced_final_applies_the_correction_despite_deepgram_evidence() {
+    // The documented asymmetry: Deepgram confidences describe the DEEPGRAM
+    // text. A Groq-sourced final has no aligned evidence, so the user's
+    // substitution applies ungated even when confident evidence exists for the
+    // Recording.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+    pipeline.set_user_vocabulary(vec!["Rust".to_owned()]);
+    pipeline.set_word_confidences(deepgram_confidences(&[("rust", 0.97)]));
+
+    let decision = pipeline
+        .decide(vec![SourceTranscript {
+            provider: Provider::Groq,
+            text: "the rUst compiler".to_owned(),
+        }])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::SourceGroq);
+    assert_eq!(decision.transcript.0, "the Rust compiler");
+}
+
+#[tokio::test]
+async fn a_reconciled_merge_result_is_corrected_after_reconciliation() {
+    // The merge is source-derived ("rust", "today", "tomorrow" all come from
+    // the sources) and the correction runs on it AFTER selection: the merge
+    // passed is_source_derived as the providers wrote it, then the user's
+    // vocabulary canonicalizes the casing.
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::clone(&kinds),
+            text: "deploy the rUst service today and tomorrow".to_owned(),
+        },
+        Duration::from_millis(50),
+    );
+    pipeline.set_user_vocabulary(vec!["Rust".to_owned()]);
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "deploy the rUst service today".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "deploy the rust service tomorrow".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::Reconciled);
+    assert_eq!(
+        decision.transcript.0,
+        "deploy the Rust service today and tomorrow"
+    );
+}
+
+#[tokio::test]
+async fn built_in_dictionary_terms_never_correct_only_user_terms_do() {
+    // The merged selection dictionary (`dictionary_terms`) is evidence for
+    // source selection, NOT a correction source: only user-owned vocabulary
+    // rewrites the Transcript.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+    pipeline.set_dictionary_terms(vec!["daemon-reload".to_owned()]);
+
+    let decision = pipeline
+        .decide(vec![SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "run the daemon reload job".to_owned(),
+        }])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, "run the daemon reload job");
+    assert!(
+        !decision.validation_reason.contains(CORRECTION_MARKER),
+        "{}",
+        decision.validation_reason
+    );
+
+    // With the SAME term in the USER vocabulary, the spaced form rejoins.
+    pipeline.set_user_vocabulary(vec!["daemon-reload".to_owned()]);
+    let corrected = pipeline
+        .decide(vec![SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "run the daemon reload job".to_owned(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(corrected.transcript.0, "run the daemon-reload job");
+    assert!(corrected.validation_reason.contains(CORRECTION_MARKER));
+
+    // Idempotent: deciding on the already-corrected text changes nothing, so
+    // the marker (which records an APPLIED change) is absent on the re-run and
+    // the delivered text is identical.
+    let again = pipeline
+        .decide(vec![SourceTranscript {
+            provider: Provider::Deepgram,
+            text: corrected.transcript.0.clone(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(again.transcript.0, corrected.transcript.0);
+    assert!(
+        !again.validation_reason.contains(CORRECTION_MARKER),
+        "{}",
+        again.validation_reason
+    );
+}
+
+#[tokio::test]
+async fn an_empty_user_vocabulary_is_byte_identical() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+    pipeline.set_user_vocabulary(Vec::new());
+
+    let decision = pipeline
+        .decide(vec![SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "the rUst daemon reload transcript".to_owned(),
+        }])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, "the rUst daemon reload transcript");
+    assert!(
+        !decision.validation_reason.contains(CORRECTION_MARKER),
+        "{}",
+        decision.validation_reason
+    );
+}
+
+#[tokio::test]
+async fn an_accepted_intent_reconstruction_is_corrected() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
+        IntentModel {
+            requests: Arc::clone(&requests),
+            result: "Deploy the rUst service today.".to_owned(),
+            fail: false,
+        },
+        Duration::from_secs(5),
+        Vec::new(),
+    );
+    pipeline.set_user_vocabulary(vec!["Rust".to_owned()]);
+
+    let attempt = match pipeline.prepare(divergent_sources()).await.unwrap() {
+        PreparedTranscriptDecision::Reconstruct(attempt) => attempt,
+        PreparedTranscriptDecision::Ready(_) => panic!("material disagreement must reconstruct"),
+    };
+    let decision = pipeline.reconstruct(attempt).await.unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::IntentReconstructed);
+    assert_eq!(decision.transcript.0, "Deploy the Rust service today.");
+}
+
+#[tokio::test]
+async fn a_fallback_decision_from_a_failed_reconstruction_is_corrected() {
+    // The fallback was produced by decide (already corrected); the
+    // reconstruct wrapper re-applies idempotently.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
+        IntentModel {
+            requests: Arc::clone(&requests),
+            result: "ignored".to_owned(),
+            fail: true,
+        },
+        Duration::from_secs(5),
+        Vec::new(),
+    );
+    pipeline.set_user_vocabulary(vec!["Rust".to_owned()]);
+
+    let attempt = match pipeline.prepare(divergent_sources()).await.unwrap() {
+        PreparedTranscriptDecision::Reconstruct(attempt) => attempt,
+        PreparedTranscriptDecision::Ready(_) => panic!("material disagreement must reconstruct"),
+    };
+    let decision = pipeline.reconstruct(attempt).await.unwrap();
+
+    assert_ne!(decision.selection, TranscriptSelection::IntentReconstructed);
+    assert!(
+        decision.transcript.0.contains("Rust") || !decision.transcript.0.contains("rUst"),
+        "fallback text must not contain an uncorrected correctable span: {}",
+        decision.transcript.0
+    );
 }

@@ -1731,6 +1731,10 @@ pub async fn replay_capture(
     let completion = coordinator.complete_with_timings(audio).await?;
     let source_transcripts = completion.sources.clone();
     let provider_failures = completion.provider_failures;
+    // The replay exercises the SAME validation seam as a live Recording,
+    // including the user-vocabulary confidence gate, so the word evidence the
+    // providers retained must reach the validator before preparation.
+    validator.set_word_confidences(completion.word_confidences);
     let prepared = validator.prepare(completion.sources).await?;
     // Keep this origin aligned with the live Recording path: preparation owns
     // source classification and fallback selection, while this clock measures
