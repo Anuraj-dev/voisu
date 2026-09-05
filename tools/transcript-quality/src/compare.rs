@@ -27,7 +27,7 @@ pub fn render_compare(a: &ScoreRun, b: &ScoreRun) -> String {
     out.push_str(&format!(
         "{:<width$}  {:>10}  {:>5}  {:>5}  {:>5}  status\n",
         "case",
-        "dWER(pp)",
+        "dWER",
         "dI",
         "dD",
         "dS",

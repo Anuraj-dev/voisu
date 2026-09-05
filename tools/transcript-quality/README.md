@@ -318,7 +318,7 @@ cargo run --manifest-path tools/transcript-quality/Cargo.toml -- \
   compare /tmp/run-a.json /tmp/run-b.json
 ```
 
-Prints a per-case delta table (`dWER` in percentage points, `dI/dD/dS`,
+Prints a per-case delta table (raw-fraction `dWER`, `dI/dD/dS`,
 status transitions, `only in a/b`) plus aggregate deltas. The one-number
 recipe for a PR: score before, merge, score after, `compare`, paste the
 aggregate delta.
