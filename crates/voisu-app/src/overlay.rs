@@ -1,9 +1,18 @@
 //! Presentation-only state derived from the daemon's public observer response.
 //! This module owns no Recording, provider, or Delivery work.
 
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use voisu_core::{DaemonState, OverlayEvent, OverlayOutcome, Response};
+use voisu_core::{
+    Command, DaemonState, OverlayEvent, OverlayOutcome, Request, Response, socket_path,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum OverlayPhase {
@@ -852,6 +861,237 @@ pub fn poll_tick(
     }
 }
 
+/// One absolute deadline for a whole OverlayStatus round trip — connect,
+/// request write, and reply read together. The observer's status poll already
+/// budgeted 150 ms per read syscall; bounding the WHOLE round trip with the
+/// same value closes the trickling-peer freeze (a reply drip-fed under the
+/// per-syscall timeout used to stretch the round trip indefinitely) without
+/// changing what a healthy daemon experiences.
+pub const STATUS_ROUND_TRIP_DEADLINE: Duration = Duration::from_millis(150);
+
+/// The most reply bytes one OverlayStatus round trip may buffer. This is the
+/// CLI's `MAX_RESPONSE_BYTES` value (bin/voisu.rs derives it from the same
+/// retention policy: every retained record can hold two Source Transcripts and
+/// one final Transcript at the stored-text clamp, plus a flat four mebibytes
+/// for provider-failure diagnostics). Reusing it keeps every daemon-reply
+/// buffer in the tree answerable to the same bound; a reply past it is refused
+/// while it streams, exactly like the CLI's frame budget.
+pub const MAX_STATUS_RESPONSE_BYTES: usize =
+    voisu_core::DEFAULT_MAX_RECORDS * 4 * voisu_core::MAX_STORED_TEXT + 4 * 1024 * 1024;
+
+/// Cadence of the dedicated status worker — the observer's existing 200 ms
+/// status poll period.
+pub const STATUS_POLL_PERIOD: Duration = Duration::from_millis(200);
+
+/// One bounded OverlayStatus round trip against the daemon's observer socket:
+/// connect, write the request, and read the reply under one total deadline,
+/// refusing a reply that outgrows [`MAX_STATUS_RESPONSE_BYTES`]. Returns None
+/// when the daemon is unreachable, the deadline elapses, or the reply is
+/// malformed — the caller renders the unreachable path either way.
+pub fn fetch_status(deadline: Instant) -> Option<Response> {
+    let path = socket_path().ok()?;
+    let mut stream = connect_within(&path, deadline)?;
+    status_round_trip(&mut stream, deadline)
+}
+
+/// The request/response half of [`fetch_status`] over an already-connected
+/// stream, kept separate so the deadline and byte-cap behavior is testable
+/// over a socket pair without a daemon.
+fn status_round_trip(stream: &mut UnixStream, deadline: Instant) -> Option<Response> {
+    let mut request = serde_json::to_vec(&Request::new(Command::OverlayStatus)).ok()?;
+    request.push(b'\n');
+    write_within(stream, &request, deadline)?;
+    let response = read_until_eof_within(stream, deadline, MAX_STATUS_RESPONSE_BYTES)?;
+    serde_json::from_slice(&response).ok()
+}
+
+/// Nonblocking connect to the daemon socket, bounded by the shared deadline.
+/// The Level worker in the overlay binary drives the same primitives.
+pub fn connect_within(path: &std::path::Path, deadline: Instant) -> Option<UnixStream> {
+    // SAFETY: socket(2) has no memory preconditions; the raw descriptor is
+    // moved into an OwnedFd immediately, so every early return closes it.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: raw is a freshly created, valid descriptor owned by nothing else.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: sockaddr_un is plain old data; all-zeroes is a valid value.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= address.sun_path.len() {
+        return None;
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    let length = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+    // SAFETY: address is a properly initialized sockaddr_un and length is
+    // within its size.
+    let connected =
+        unsafe { libc::connect(fd.as_raw_fd(), std::ptr::addr_of!(address).cast(), length) };
+    if connected != 0 {
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINPROGRESS) | Some(libc::EAGAIN) => {
+                wait_within(fd.as_raw_fd(), libc::POLLOUT, deadline)?;
+                let mut error: libc::c_int = 0;
+                let mut error_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                // SAFETY: error and error_len are valid out-pointers of the
+                // exact size SO_ERROR writes.
+                let sockopt = unsafe {
+                    libc::getsockopt(
+                        fd.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        std::ptr::addr_of_mut!(error).cast(),
+                        &mut error_len,
+                    )
+                };
+                if sockopt != 0 || error != 0 {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(UnixStream::from(fd))
+}
+
+/// Wait for descriptor readiness until the shared deadline elapses.
+fn wait_within(fd: std::os::fd::RawFd, events: libc::c_short, deadline: Instant) -> Option<()> {
+    loop {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        let mut descriptor = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let millis = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: descriptor is a valid pollfd for the duration of the call.
+        match unsafe { libc::poll(&mut descriptor, 1, millis) } {
+            1.. => return Some(()),
+            0 => return None,
+            _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+            _ => return None,
+        }
+    }
+}
+
+pub fn write_within(stream: &mut UnixStream, bytes: &[u8], deadline: Instant) -> Option<()> {
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        match stream.write(remaining) {
+            Ok(0) => return None,
+            Ok(written) => remaining = &remaining[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_within(stream.as_raw_fd(), libc::POLLOUT, deadline)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(())
+}
+
+/// Read the peer's reply to EOF, refusing anything past `cap` bytes while it
+/// streams — the same fail-closed budget the CLI's frame reader applies.
+pub fn read_until_eof_within(
+    stream: &mut UnixStream,
+    deadline: Instant,
+    cap: usize,
+) -> Option<Vec<u8>> {
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => return Some(response),
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                // Checked against what has been buffered SO FAR, so an
+                // oversized reply is refused while it streams rather than
+                // after the buffer has already grown past the bound.
+                if response.len() > cap {
+                    return None;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_within(stream.as_raw_fd(), libc::POLLIN, deadline)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+}
+
+/// One finished status round trip, ready to render. `response: None` observes
+/// the daemon as unreachable for that round trip — still an observation, fed
+/// to the controller's unreachable path by the caller.
+#[derive(Debug)]
+pub struct StatusObservation {
+    pub response: Option<Response>,
+}
+
+/// The dedicated status-fetch worker. ALL OverlayStatus IPC runs on this
+/// thread; the caller's thread (the GTK main loop for the windowed rungs) only
+/// ever takes the newest finished round trip nonblockingly, so a slow or
+/// trickling daemon reply can never stall rendering, the 200 ms cadence, or
+/// timer disarming. It mirrors the overlay binary's LevelWorker contract: one
+/// bounded round trip per period, and only the newest result is published,
+/// which keeps the hand-off slot bounded at one value — an observation is
+/// dropped here when a newer round trip supersedes it before the caller took
+/// it, so a superseded reply can never be rendered.
+pub struct StatusWorker {
+    stop: Arc<AtomicBool>,
+    latest: Arc<Mutex<Option<StatusObservation>>>,
+}
+
+impl StatusWorker {
+    pub fn spawn() -> Self {
+        Self::spawn_with(|| fetch_status(Instant::now() + STATUS_ROUND_TRIP_DEADLINE))
+    }
+
+    /// The injectable seam for tests: `fetch` stands in for the real bounded
+    /// round trip.
+    fn spawn_with(fetch: impl Fn() -> Option<Response> + Send + 'static) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let latest = Arc::new(Mutex::new(None));
+        let thread_stop = Arc::clone(&stop);
+        let thread_latest = Arc::clone(&latest);
+        thread::spawn(move || {
+            while !thread_stop.load(Ordering::Relaxed) {
+                let response = fetch();
+                *thread_latest.lock().unwrap() = Some(StatusObservation { response });
+                thread::sleep(STATUS_POLL_PERIOD);
+            }
+        });
+        Self { stop, latest }
+    }
+
+    /// Nonblocking: the newest published observation, if any arrived since the
+    /// last take. `try_lock` keeps the caller's thread from ever waiting on
+    /// the worker.
+    pub fn take_latest(&self) -> Option<StatusObservation> {
+        self.latest.try_lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for StatusWorker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -976,6 +1216,110 @@ mod tests {
         let mut response = Response::success(state, state.cli_label());
         response.overlay_event = retained;
         response
+    }
+
+    /// A socket pair staged the way the daemon presents a reply: the peer
+    /// writes the response bytes and half-closes its send side, so the
+    /// observer's read-until-EOF sees the reply end while the peer stays alive
+    /// to accept the request write. The stream is nonblocking, matching what
+    /// `connect_within` hands the real round trip. The caller must keep the
+    /// peer end alive for the duration of the round trip.
+    fn staged_reply(reply: &[u8]) -> (UnixStream, UnixStream) {
+        let (mut server, client) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        server.write_all(reply).unwrap();
+        server.shutdown(std::net::Shutdown::Write).unwrap();
+        (server, client)
+    }
+
+    #[test]
+    fn status_reply_within_the_deadline_is_used() {
+        let reply = serde_json::to_vec(&overlay_status(DaemonState::Idle, None)).unwrap();
+        // Holding the peer end keeps the request write deliverable.
+        let (_peer, mut stream) = staged_reply(&reply);
+        let fetched =
+            status_round_trip(&mut stream, Instant::now() + STATUS_ROUND_TRIP_DEADLINE).unwrap();
+        // Byte-fidelity through serialize -> parse -> serialize: the parsed
+        // reply is the response the daemon sent, nothing degraded.
+        assert_eq!(serde_json::to_vec(&fetched).unwrap(), reply);
+    }
+
+    #[test]
+    fn status_reply_after_the_deadline_is_dropped() {
+        let (_silent_peer, mut stream) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        // The peer stays open and silent, so only the deadline can end the
+        // round trip — and it has already elapsed.
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(50))
+            .unwrap();
+        assert!(status_round_trip(&mut stream, deadline).is_none());
+    }
+
+    #[test]
+    fn oversized_status_reply_is_refused_like_the_cli_frame_budget() {
+        let reply = serde_json::to_vec(&overlay_status(DaemonState::Idle, None)).unwrap();
+        // Exactly the reply's length passes the cap...
+        let (_peer, mut stream) = staged_reply(&reply);
+        let accepted = read_until_eof_within(
+            &mut stream,
+            Instant::now() + STATUS_ROUND_TRIP_DEADLINE,
+            reply.len(),
+        )
+        .unwrap();
+        assert_eq!(accepted, reply);
+        // ...and one byte past it is refused while streaming rather than
+        // after the buffer has already grown past the bound.
+        let (_peer, mut stream) = staged_reply(&reply);
+        let refused = read_until_eof_within(
+            &mut stream,
+            Instant::now() + STATUS_ROUND_TRIP_DEADLINE,
+            reply.len() - 1,
+        );
+        assert!(refused.is_none());
+    }
+
+    #[test]
+    fn a_superseded_status_observation_is_never_taken() {
+        let worker = StatusWorker {
+            stop: Arc::new(AtomicBool::new(false)),
+            latest: Arc::new(Mutex::new(None)),
+        };
+        // Two round trips land before the caller takes: the one-slot hand-off
+        // keeps only the newest, so the superseded observation can never be
+        // rendered.
+        *worker.latest.lock().unwrap() = Some(StatusObservation {
+            response: Some(overlay_status(DaemonState::Idle, None)),
+        });
+        *worker.latest.lock().unwrap() = Some(StatusObservation {
+            response: Some(overlay_status(DaemonState::Recording, None)),
+        });
+        let taken = worker.take_latest().unwrap();
+        assert_eq!(taken.response.unwrap().state, Some(DaemonState::Recording));
+        assert!(worker.take_latest().is_none());
+    }
+
+    #[test]
+    fn status_worker_publishes_its_round_trips_off_thread() {
+        let worker =
+            StatusWorker::spawn_with(|| Some(overlay_status(DaemonState::Recording, None)));
+        // The worker's first round trip runs immediately; wait bounded for it
+        // to be published rather than sleeping a fixed time.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut taken = None;
+        while Instant::now() < deadline {
+            if let Some(observation) = worker.take_latest() {
+                taken = Some(observation);
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let observation = taken.expect("the worker published its first round trip");
+        assert_eq!(
+            observation.response.unwrap().state,
+            Some(DaemonState::Recording)
+        );
+        worker.stop();
     }
 
     #[test]
