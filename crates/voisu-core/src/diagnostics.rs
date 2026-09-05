@@ -88,6 +88,16 @@ const HISTORY_FILE: &str = "history.jsonl";
 /// Startup sweeps these, so it has to stay in step with the history file name.
 const HISTORY_TEMP_PREFIX: &str = "history.jsonl.tmp.";
 
+/// The telemetry schema this build writes. Schema 0 (the field absent or zero
+/// on an old line) means the only recorded latency was the single
+/// `release_to_text_ms`, measured from recording START and therefore inflated
+/// by the user's whole speech duration. Schema 2 records carry the truthful
+/// trio — `recording_duration_ms`, `stop_to_finalized_ms`,
+/// `stop_to_delivered_ms` — anchored at stop, so they are comparable across
+/// dictations of different lengths. Old lines keep deserializing: every new
+/// field defaults, so readers can branch on this marker without a migration.
+pub const TELEMETRY_SCHEMA: u32 = 2;
+
 /// Milliseconds since the Unix epoch, saturating to 0 before the epoch.
 pub fn unix_millis_now() -> u64 {
     SystemTime::now()
@@ -688,8 +698,34 @@ pub struct DiagnosticRecord {
     /// serialize this field, so a missing Source Transcript is never silent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_failures: Vec<ProviderFailure>,
+    /// DEPRECATED for latency analysis: measured from recording START, so it
+    /// includes the user's whole speech duration — a 60 s dictation looks 60 s
+    /// "slower" than a 3 s one, and every percentile computed over it is
+    /// corrupted. Still written (and parsed on old lines) only so existing
+    /// readers keep working; prefer the stop-anchored trio below.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_to_text_ms: Option<u64>,
+    /// Recording start → stop: the duration of the user's actual speech. The
+    /// denominator that makes the stop-anchored fields comparable across
+    /// dictations of different lengths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_duration_ms: Option<u64>,
+    /// Stop → the final transcript settled: validation and reconciliation (the
+    /// late-reconstruction window) have resolved and the delivered text is
+    /// known. Absent when no transcript ever settled (an abort before the
+    /// providers completed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_to_finalized_ms: Option<u64>,
+    /// Stop → Delivery completed (the moment `delivery_count` increments).
+    /// Unlike the deprecated `release_to_text_ms`, this excludes speech
+    /// duration, so it is comparable across dictations of any length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_to_delivered_ms: Option<u64>,
+    /// Which telemetry schema this record was written under: [`TELEMETRY_SCHEMA`]
+    /// for this build, 0 for a line written before the stop-anchored timings
+    /// existed (the field is absent there and defaults to 0).
+    #[serde(default)]
+    pub telemetry_schema: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -736,6 +772,10 @@ impl DiagnosticRecord {
             provider_timings_ms: Vec::new(),
             provider_failures: Vec::new(),
             release_to_text_ms: None,
+            recording_duration_ms: None,
+            stop_to_finalized_ms: None,
+            stop_to_delivered_ms: None,
+            telemetry_schema: TELEMETRY_SCHEMA,
             error: None,
             debug_audio: None,
             smart_writing: None,

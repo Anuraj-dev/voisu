@@ -12,11 +12,15 @@
 //! Recording <id>: <message>
 //! Recording <id>: outcome=<ok|error> correlation_id=<id> \
 //!   first_chunk_ms=<ms> capture_finalized_ms=<ms> \
-//!   provider_timings_ms=<provider>:<ms>[,<provider>:<ms>] release_to_text_ms=<ms>
+//!   provider_timings_ms=<provider>:<ms>[,<provider>:<ms>] release_to_text_ms=<ms> \
+//!   recording_duration_ms=<ms> stop_to_finalized_ms=<ms> stop_to_delivered_ms=<ms>
 //! ```
 //!
 //! Every structured key is always present. A value Voisu did not measure for
-//! that Recording renders as [`ABSENT`] rather than being omitted.
+//! that Recording renders as [`ABSENT`] rather than being omitted. The three
+//! stop-anchored timings exclude the user's speech duration, unlike the
+//! deprecated `release_to_text_ms` (measured from recording start), so latency
+//! percentiles computed over them are comparable across dictation lengths.
 
 use voisu_core::{LifecycleEvidence, Provider, ProviderTiming};
 
@@ -52,12 +56,16 @@ pub fn recording_journal_lines(
         structured: format!(
             "Recording {recording_id}: outcome={outcome} correlation_id={} \
              first_chunk_ms={} capture_finalized_ms={} provider_timings_ms={} \
-             release_to_text_ms={}",
+             release_to_text_ms={} recording_duration_ms={} stop_to_finalized_ms={} \
+             stop_to_delivered_ms={}",
             render_correlation_id(&evidence.correlation_id),
             render_millis(evidence.first_chunk_ms),
             render_millis(evidence.capture_finalized_ms),
             render_provider_timings(&evidence.provider_timings_ms),
             render_millis(evidence.release_to_text_ms),
+            render_millis(evidence.recording_duration_ms),
+            render_millis(evidence.stop_to_finalized_ms),
+            render_millis(evidence.stop_to_delivered_ms),
         ),
     }
 }
@@ -166,6 +174,13 @@ mod tests {
             ],
             provider_failures: Vec::new(),
             release_to_text_ms: Some(1_311),
+            // Stop anchored at 900 ms from start, so the stop-anchored fields
+            // are the deprecated start-anchored total minus the speech
+            // duration: 1288 − 900 = 388 to settlement, 1311 − 900 = 411 to
+            // delivery.
+            recording_duration_ms: Some(900),
+            stop_to_finalized_ms: Some(388),
+            stop_to_delivered_ms: Some(411),
             transcript_selection: None,
             validation_reason: None,
             fallback_reason: None,
@@ -184,7 +199,8 @@ mod tests {
             lines.structured,
             "Recording 7: outcome=ok correlation_id=rec-4242-7-1700000000000 \
              first_chunk_ms=118 capture_finalized_ms=842 \
-             provider_timings_ms=deepgram:412,groq:640 release_to_text_ms=1311"
+             provider_timings_ms=deepgram:412,groq:640 release_to_text_ms=1311 \
+             recording_duration_ms=900 stop_to_finalized_ms=388 stop_to_delivered_ms=411"
         );
     }
 
@@ -199,7 +215,8 @@ mod tests {
             lines.structured,
             "Recording 7: outcome=error correlation_id=rec-4242-7-1700000000000 \
              first_chunk_ms=118 capture_finalized_ms=842 \
-             provider_timings_ms=deepgram:412,groq:640 release_to_text_ms=1311"
+             provider_timings_ms=deepgram:412,groq:640 release_to_text_ms=1311 \
+             recording_duration_ms=900 stop_to_finalized_ms=388 stop_to_delivered_ms=411"
         );
     }
 
@@ -211,6 +228,9 @@ mod tests {
         evidence.capture_finalized_ms = None;
         evidence.provider_timings_ms = Vec::new();
         evidence.release_to_text_ms = None;
+        evidence.recording_duration_ms = None;
+        evidence.stop_to_finalized_ms = None;
+        evidence.stop_to_delivered_ms = None;
 
         assert_eq!(
             recording_journal_lines(9, &evidence, Some("capture ended without audio")),
@@ -218,7 +238,8 @@ mod tests {
                 human: "Recording 9: capture ended without audio".to_owned(),
                 structured: "Recording 9: outcome=error correlation_id=- first_chunk_ms=- \
                              capture_finalized_ms=- provider_timings_ms=- \
-                             release_to_text_ms=-"
+                             release_to_text_ms=- recording_duration_ms=- \
+                             stop_to_finalized_ms=- stop_to_delivered_ms=-"
                     .to_owned(),
             }
         );
@@ -247,7 +268,8 @@ mod tests {
             lines.structured,
             "Recording 7: outcome=error correlation_id=rec-4242-7-1700000000000 \
              first_chunk_ms=118 capture_finalized_ms=842 \
-             provider_timings_ms=deepgram:412,groq:640 release_to_text_ms=1311"
+             provider_timings_ms=deepgram:412,groq:640 release_to_text_ms=1311 \
+             recording_duration_ms=900 stop_to_finalized_ms=388 stop_to_delivered_ms=411"
         );
         assert!(!lines.structured.contains("pw-record"));
         assert!(!lines.structured.contains('\n'));
@@ -322,13 +344,16 @@ mod tests {
         // The line is a parseable key=value record: a duplicated key would make
         // percentile extraction ambiguous, and a missing one would make the
         // field set depend on the outcome.
-        const KEYS: [&str; 6] = [
+        const KEYS: [&str; 9] = [
             "outcome=",
             "correlation_id=",
             "first_chunk_ms=",
             "capture_finalized_ms=",
             "provider_timings_ms=",
             "release_to_text_ms=",
+            "recording_duration_ms=",
+            "stop_to_finalized_ms=",
+            "stop_to_delivered_ms=",
         ];
         for diagnostic in [None, Some("boundary failed")] {
             let lines = recording_journal_lines(1, &evidence(), diagnostic);

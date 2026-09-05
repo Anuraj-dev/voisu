@@ -32,9 +32,9 @@ pub use diagnostics::{
     RetentionPolicy, SMART_WRITING_DIAGNOSTIC_VERSION, SmartWritingDiagnostic,
     SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode,
     SourceCoverageRecord, SourceSelectionConfidence, SourceSelectionDiagnostic,
-    SourceTranscriptRecord, TEXT_SHA256_FINGERPRINT_LEN, clamp_utf8_bytes, correlation_id,
-    export_record, is_secret_env_key, is_text_sha256_fingerprint, redacted_environment,
-    replay_capture, sanitize_url, scrub_embedded_urls, scrub_secret_values,
+    SourceTranscriptRecord, TELEMETRY_SCHEMA, TEXT_SHA256_FINGERPRINT_LEN, clamp_utf8_bytes,
+    correlation_id, export_record, is_secret_env_key, is_text_sha256_fingerprint,
+    redacted_environment, replay_capture, sanitize_url, scrub_embedded_urls, scrub_secret_values,
     text_sha256_fingerprint, unix_millis_now,
 };
 
@@ -343,8 +343,29 @@ pub struct LifecycleEvidence {
     pub provider_timings_ms: Vec<ProviderTiming>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_failures: Vec<ProviderFailure>,
+    /// DEPRECATED for latency analysis: measured from recording START, so it
+    /// includes the user's whole speech duration — a 60 s dictation looks 60 s
+    /// "slower" than a 3 s one. Kept (and still written) only so old history
+    /// lines and old parsers stay readable; prefer `recording_duration_ms` and
+    /// `stop_to_delivered_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_to_text_ms: Option<u64>,
+    /// Recording start → stop: the duration of the user's actual speech. The
+    /// denominator that makes the stop-anchored fields comparable across
+    /// dictations of different lengths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_duration_ms: Option<u64>,
+    /// Stop → the final transcript settled: validation and reconciliation (the
+    /// late-reconstruction window) have resolved and the delivered text is
+    /// known. Absent when no transcript ever settled (an abort before the
+    /// providers completed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_to_finalized_ms: Option<u64>,
+    /// Stop → Delivery completed (the moment `delivery_count` increments).
+    /// Unlike the deprecated `release_to_text_ms`, this excludes speech
+    /// duration, so it is comparable across dictations of any length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_to_delivered_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_selection: Option<TranscriptSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

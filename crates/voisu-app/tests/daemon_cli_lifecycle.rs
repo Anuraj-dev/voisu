@@ -6739,6 +6739,11 @@ fn reordered_provider_completions_are_attributed_and_delivered_once_with_timings
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
+    // Let the Recording carry real speech duration: the stop-anchored timings
+    // must be smaller than the start→stop window, and with no gap the
+    // sub-10 ms recording would be shorter than the 40 ms fake provider delay.
+    // 500 ms is ~12x that delay, generous for a contended runner.
+    thread::sleep(Duration::from_millis(500));
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1);
@@ -6749,6 +6754,28 @@ fn reordered_provider_completions_are_attributed_and_delivered_once_with_timings
     assert!(stopped["evidence"]["first_chunk_ms"].is_number());
     assert!(stopped["evidence"]["capture_finalized_ms"].is_number());
     assert!(stopped["evidence"]["release_to_text_ms"].is_number());
+    // The truthful telemetry trio: the recording's speech duration is
+    // positive, and the stop-anchored timings are present and smaller than it
+    // — the clock starts at stop, so they no longer scale with dictation
+    // length. Settlement (reconciliation included) precedes delivery.
+    let recording_duration = stopped["evidence"]["recording_duration_ms"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("recording_duration_ms missing: {stopped}"));
+    assert!(recording_duration > 0, "{stopped}");
+    let stop_to_finalized = stopped["evidence"]["stop_to_finalized_ms"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("stop_to_finalized_ms missing: {stopped}"));
+    let stop_to_delivered = stopped["evidence"]["stop_to_delivered_ms"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("stop_to_delivered_ms missing: {stopped}"));
+    assert!(
+        stop_to_delivered < recording_duration,
+        "stop→delivered {stop_to_delivered}ms must exclude the {recording_duration}ms speech: {stopped}"
+    );
+    assert!(
+        stop_to_finalized <= stop_to_delivered,
+        "the transcript settles before Delivery completes: {stopped}"
+    );
     assert_eq!(
         stopped["evidence"]["provider_timings_ms"]
             .as_array()
@@ -6758,6 +6785,42 @@ fn reordered_provider_completions_are_attributed_and_delivered_once_with_timings
             .collect::<Vec<_>>(),
         vec!["deepgram", "groq"]
     );
+    // The persisted record carries the same trio under the schema marker, and
+    // the deprecated start-anchored release stays for old readers.
+    let history_deadline = Instant::now() + Duration::from_secs(5);
+    let history = loop {
+        let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
+        if history["history"]
+            .as_array()
+            .is_some_and(|records| records.len() == 1)
+        {
+            break history;
+        }
+        assert!(
+            Instant::now() < history_deadline,
+            "the timed Recording was never retained: {history}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let record = &history["history"][0];
+    assert_eq!(
+        record["telemetry_schema"],
+        voisu_core::TELEMETRY_SCHEMA,
+        "{history}"
+    );
+    assert_eq!(
+        record["recording_duration_ms"], recording_duration,
+        "{history}"
+    );
+    assert_eq!(
+        record["stop_to_finalized_ms"], stop_to_finalized,
+        "{history}"
+    );
+    assert_eq!(
+        record["stop_to_delivered_ms"], stop_to_delivered,
+        "{history}"
+    );
+    assert!(record["release_to_text_ms"].is_number(), "{history}");
 }
 
 #[test]
@@ -7598,7 +7661,8 @@ fn sigterm_while_a_recording_is_starting_persists_a_correlated_record() {
             line == format!(
                 "Recording 1: outcome=error correlation_id={correlation_id} \
                      first_chunk_ms=- capture_finalized_ms=- provider_timings_ms=- \
-                     release_to_text_ms=-"
+                     release_to_text_ms=- recording_duration_ms=- \
+                     stop_to_finalized_ms=- stop_to_delivered_ms=-"
             )
         }),
         "shutdown during startup must emit structured timings: {journal}"
@@ -10254,6 +10318,9 @@ fn a_delivered_recording_reports_its_per_stage_timings_to_the_journal() {
         "capture_finalized_ms=",
         "provider_timings_ms=",
         "release_to_text_ms=",
+        "recording_duration_ms=",
+        "stop_to_finalized_ms=",
+        "stop_to_delivered_ms=",
     ] {
         assert!(
             line.contains(key),
@@ -10330,6 +10397,9 @@ fn a_failed_recording_keeps_its_journal_message_and_gains_the_timings() {
         "capture_finalized_ms=",
         "provider_timings_ms=",
         "release_to_text_ms=",
+        "recording_duration_ms=",
+        "stop_to_finalized_ms=",
+        "stop_to_delivered_ms=",
     ] {
         assert!(
             line.contains(key),
@@ -10841,7 +10911,8 @@ fn startup_failure_is_correlated_in_the_response_and_retained_in_history() {
         structured,
         format!(
             "Recording 1: outcome=error correlation_id={correlation_id} first_chunk_ms=- \
-             capture_finalized_ms=- provider_timings_ms=- release_to_text_ms=-"
+             capture_finalized_ms=- provider_timings_ms=- release_to_text_ms=- \
+             recording_duration_ms=- stop_to_finalized_ms=- stop_to_delivered_ms=-"
         )
     );
     assert!(
