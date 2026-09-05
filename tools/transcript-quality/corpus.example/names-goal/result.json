@@ -1,0 +1,21 @@
+{
+  "schema": "voisu-private-eval-case-result-v1",
+  "case_id": "names-goal",
+  "origin": "manual",
+  "captured_at_unix_ms": 0,
+  "source_transcripts": [
+    {
+      "provider": "groq",
+      "text": "send the report to before Friday"
+    }
+  ],
+  "final_transcript": "send the report to before Friday",
+  "error": null,
+  "delivery": null,
+  "telemetry": {
+    "telemetry_schema": 2,
+    "recording_duration_ms": 2600,
+    "stop_to_finalized_ms": 870,
+    "stop_to_delivered_ms": null
+  }
+}

@@ -126,6 +126,16 @@ pub fn ensure_report_path_writable(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `path` is outside any git work tree or gitignored inside one.
+/// Fail-closed: an unknown `git check-ignore` status is an error, never "yes".
+pub(crate) fn git_path_is_ignored(path: &Path) -> Result<bool, String> {
+    let abs = normalize_path(path);
+    let Some(root) = git_root_of(&abs) else {
+        return Ok(true);
+    };
+    git_check_ignore(&root, &abs)
+}
+
 fn check_git_path_writable(path: &Path) -> Result<(), String> {
     let Some(root) = git_root_of(path) else {
         return Ok(());

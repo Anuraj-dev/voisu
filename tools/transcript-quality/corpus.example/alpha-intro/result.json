@@ -1,0 +1,28 @@
+{
+  "schema": "voisu-private-eval-case-result-v1",
+  "case_id": "alpha-intro",
+  "origin": "manual",
+  "captured_at_unix_ms": 0,
+  "source_transcripts": [
+    {
+      "provider": "groq",
+      "text": "alpha bravo charlie delta echo"
+    },
+    {
+      "provider": "deepgram",
+      "text": "alpha bravo charlie delta echo"
+    }
+  ],
+  "final_transcript": "alpha bravo charlie delta",
+  "error": null,
+  "delivery": {
+    "delivered": true,
+    "method": "clipboard_fallback"
+  },
+  "telemetry": {
+    "telemetry_schema": 2,
+    "recording_duration_ms": 3200,
+    "stop_to_finalized_ms": 940,
+    "stop_to_delivered_ms": 1012
+  }
+}

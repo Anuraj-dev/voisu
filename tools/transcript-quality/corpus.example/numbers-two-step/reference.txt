@@ -1,0 +1,1 @@
+set timer for thirty seconds and open the second file

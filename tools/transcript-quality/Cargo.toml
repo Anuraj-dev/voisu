@@ -6,6 +6,8 @@ license = "MIT"
 rust-version = "1.92"
 publish = false
 description = "Private developer evaluator for saved Recordings (not packaged)"
+# `cargo run -- <args>` (and every documented recipe) means the evaluator.
+default-run = "transcript-quality"
 
 # Standalone package: must not join the repo workspace (RPM `cargo --workspace`
 # would otherwise build and test this developer tool).

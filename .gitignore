@@ -27,3 +27,8 @@ _copr_srpm/
 /tools/transcript-quality/out/
 /tools/transcript-quality/target/
 **/transcript-quality-report.json
+
+# A real eval corpus (private audio + adjudicated references) may live here,
+# but only because this exact path is gitignored. corpus.example/ stays
+# tracked: it is synthetic and ships no audio.
+/tools/transcript-quality/corpus/
