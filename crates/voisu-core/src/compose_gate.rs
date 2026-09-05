@@ -9,6 +9,7 @@
 //! (`compose_fixture` + helpers) and corpus version **1.1.2**.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1458,8 +1459,14 @@ fn source_contains(source_text: &str, needle: &str) -> bool {
         .contains(&normalize_ws(needle).to_lowercase())
 }
 
-fn atom_re() -> Regex {
-    Regex::new(r"[A-Za-z0-9]+(?:[_./=+\-][A-Za-z0-9]+)*").expect("atom regex")
+/// Lexical atoms are scanned for every compose pass (licensed atoms, ordered
+/// output checks, source-span fallback), so the pattern compiles once per
+/// process instead of once per scan.
+static ATOM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[A-Za-z0-9]+(?:[_./=+\-][A-Za-z0-9]+)*").expect("atom regex"));
+
+fn atom_re() -> &'static Regex {
+    &ATOM_RE
 }
 
 fn lexical_atoms(text: &str) -> BTreeSet<String> {
@@ -1476,8 +1483,11 @@ fn lexical_atom_sequence(text: &str) -> Vec<String> {
         .collect()
 }
 
+static HEADER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[ \t]*([A-Za-z][A-Za-z0-9 ]*):(.*)$").expect("header regex"));
+
 fn structural_headers(text: &str) -> Vec<String> {
-    let re = Regex::new(r"^[ \t]*([A-Za-z][A-Za-z0-9 ]*):(.*)$").expect("header regex");
+    let re = &*HEADER_RE;
     let closed_cf: HashMap<String, &str> = CLOSED_STRUCTURED_LABELS
         .iter()
         .map(|l| (l.to_lowercase(), *l))
@@ -1554,11 +1564,12 @@ fn conversion_cue(conversion_id: &str) -> String {
 }
 
 fn cue_needles(cue: &str) -> Vec<String> {
+    static SPOKEN_CUE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)^spoken\s+(.+?)\s+cue$").expect("spoken cue"));
     if cue.is_empty() {
         return vec![];
     }
-    let re = Regex::new(r"(?i)^spoken\s+(.+?)\s+cue$").expect("spoken cue");
-    if let Some(caps) = re.captures(cue) {
+    if let Some(caps) = SPOKEN_CUE_RE.captures(cue) {
         return vec![caps.get(1).unwrap().as_str().trim().to_owned()];
     }
     if cue.contains('…') {
@@ -1589,8 +1600,9 @@ fn convert_output_matches(conversion_id: &str, source_text: &str, output_text: &
         .unwrap_or("");
 
     if rhs_template.contains('…') {
-        let re = Regex::new(r"(?is)quote\s+(.+?)\s+unquote").expect("quote re");
-        let Some(caps) = re.captures(source_text) else {
+        static QUOTE_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?is)quote\s+(.+?)\s+unquote").expect("quote re"));
+        let Some(caps) = QUOTE_RE.captures(source_text) else {
             return false;
         };
         let interior = normalize_ws(caps.get(1).unwrap().as_str());
@@ -1844,16 +1856,17 @@ fn compose_render(derivation: &[DerivationSpan]) -> String {
 }
 
 fn is_multiparagraph_text(text: &str) -> bool {
+    static MULTIPARAGRAPH_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\n[ \t]*\n").expect("mp re"));
     if text.is_empty() {
         return false;
     }
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    Regex::new(r"\n[ \t]*\n")
-        .expect("mp re")
-        .is_match(&normalized)
+    MULTIPARAGRAPH_RE.is_match(&normalized)
 }
 
 fn natural_layout_render(candidate: &StructuredCandidate) -> String {
+    static WS_RUN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]+").expect("ws re"));
     let mut parts = String::new();
     for span in &candidate.derivation {
         if span.kind == SpanKind::LayoutBreak {
@@ -1862,8 +1875,7 @@ fn natural_layout_render(candidate: &StructuredCandidate) -> String {
         }
         parts.push_str(&span.output_text);
     }
-    let re = Regex::new(r"[ \t]+").expect("ws re");
-    re.replace_all(&parts, " ").trim().to_owned()
+    WS_RUN_RE.replace_all(&parts, " ").trim().to_owned()
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

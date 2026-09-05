@@ -85,32 +85,38 @@ pub fn align_words(reference: &str, hypothesis: &str) -> WordError {
 fn levenshtein_ops(reference: &[String], hypothesis: &[String]) -> (usize, usize, usize) {
     let n = reference.len();
     let m = hypothesis.len();
-    let mut dp = vec![vec![0u32; m + 1]; n + 1];
-    let mut back: Vec<Vec<u8>> = vec![vec![0; m + 1]; n + 1];
+    // The per-cell DP values are only ever read from the previous row, so `dp`
+    // rolls on two rows; the traceback, however, needs the full backpointer
+    // history, so `back` keeps one byte per cell (flat, one allocation). A full
+    // (n+1)x(m+1) u32 matrix would put peak memory at 5 bytes per cell — about
+    // 500 MB for a 10k-word alignment versus about 100 MB here.
+    let mut dp = vec![vec![0u32; m + 1]; 2];
+    let mut back = vec![0u8; (n + 1) * (m + 1)];
+    let idx = |i: usize, j: usize| i * (m + 1) + j;
     // 1 = del, 2 = ins, 3 = sub/match
-    for i in 1..=n {
-        dp[i][0] = i as u32;
-        back[i][0] = 1;
-    }
     for j in 1..=m {
         dp[0][j] = j as u32;
-        back[0][j] = 2;
+        back[idx(0, j)] = 2;
     }
     for i in 1..=n {
+        let cur = i % 2;
+        let prev = 1 - cur;
+        dp[cur][0] = i as u32;
+        back[idx(i, 0)] = 1;
         for j in 1..=m {
             let cost = u32::from(reference[i - 1] != hypothesis[j - 1]);
-            let del = dp[i - 1][j] + 1;
-            let ins = dp[i][j - 1] + 1;
-            let sub = dp[i - 1][j - 1] + cost;
+            let del = dp[prev][j] + 1;
+            let ins = dp[cur][j - 1] + 1;
+            let sub = dp[prev][j - 1] + cost;
             if del <= ins && del <= sub {
-                dp[i][j] = del;
-                back[i][j] = 1;
+                dp[cur][j] = del;
+                back[idx(i, j)] = 1;
             } else if ins <= sub {
-                dp[i][j] = ins;
-                back[i][j] = 2;
+                dp[cur][j] = ins;
+                back[idx(i, j)] = 2;
             } else {
-                dp[i][j] = sub;
-                back[i][j] = 3;
+                dp[cur][j] = sub;
+                back[idx(i, j)] = 3;
             }
         }
     }
@@ -120,7 +126,7 @@ fn levenshtein_ops(reference: &[String], hypothesis: &[String]) -> (usize, usize
     let mut deletions = 0usize;
     let mut substitutions = 0usize;
     while i > 0 || j > 0 {
-        match back[i][j] {
+        match back[idx(i, j)] {
             1 => {
                 deletions += 1;
                 i -= 1;
@@ -559,5 +565,20 @@ mod tests {
         assert_eq!(wer.deletions, 0);
         assert_eq!(wer.substitutions, 0);
         assert_eq!(wer.error_rate, 0.0);
+    }
+
+    #[test]
+    fn word_error_breaks_down_substitutions_deletions_and_insertions() {
+        // ref: a b c d — hyp: a x c  -> one substitution (b->x), one deletion (d).
+        let wer = align_words("a b c d", "a x c");
+        assert_eq!(wer.substitutions, 1);
+        assert_eq!(wer.deletions, 1);
+        assert_eq!(wer.insertions, 0);
+        assert_eq!(wer.reference_tokens, 4);
+        // ref: a b — hyp: a b c d -> two insertions.
+        let wer = align_words("a b", "a b c d");
+        assert_eq!(wer.insertions, 2);
+        assert_eq!(wer.substitutions, 0);
+        assert_eq!(wer.deletions, 0);
     }
 }
