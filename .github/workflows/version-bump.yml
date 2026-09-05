@@ -269,11 +269,20 @@ jobs:
           # network and only the two path-local workspace crates move.
           cargo update -p voisu-app -p voisu-core
 
-      - name: Diff whitelist — only the four version files may have changed
+          # 5: tools/transcript-quality path-depends on voisu-core, so its own
+          # lockfile records the version this bump just moved; a stale entry
+          # breaks the tool's `--locked` CI gates until the next manual refresh.
+          # Edit the entry in place (deterministic, no index needed), then prove
+          # the lock still matches the manifests without touching it.
+          sed -i -E '/^name = "voisu-core"$/{n;s/^version = "[0-9]+\.[0-9]+\.[0-9]+"$/version = "'"$NEW_VERSION"'"/;}' \
+            tools/transcript-quality/Cargo.lock
+          cargo metadata --manifest-path tools/transcript-quality/Cargo.toml --locked > /dev/null
+
+      - name: Diff whitelist — only the version files may have changed
         if: steps.detect.outputs.bump_type != ''
         run: |
           set -euo pipefail
-          allowed=$'crates/voisu-app/Cargo.toml\ncrates/voisu-core/Cargo.toml\nCargo.lock\npackaging/voisu.spec'
+          allowed=$'crates/voisu-app/Cargo.toml\ncrates/voisu-core/Cargo.toml\nCargo.lock\npackaging/voisu.spec\ntools/transcript-quality/Cargo.lock'
           bad=0
           while IFS= read -r f; do
             [ -n "$f" ] || continue
@@ -313,7 +322,8 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add crates/voisu-app/Cargo.toml crates/voisu-core/Cargo.toml \
-                  Cargo.lock packaging/voisu.spec
+                  Cargo.lock packaging/voisu.spec \
+                  tools/transcript-quality/Cargo.lock
           git commit -m "chore(release): bump version to ${NEW_VERSION}"
           # No tag — tags stay manual and deliberate. A plain push to main; the
           # bot's push does not retrigger this workflow.
