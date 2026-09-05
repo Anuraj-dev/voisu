@@ -721,21 +721,21 @@ mod tests {
                 break;
             }
             request.extend_from_slice(&chunk[..read]);
-            if expected.is_none() {
-                if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let header_end = header_end + 4;
-                    let headers = String::from_utf8_lossy(&request[..header_end]);
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(str::trim)
-                                .and_then(|number| number.parse::<usize>().ok())
-                        })
-                        .expect("content length");
-                    expected = Some(header_end + content_length);
-                }
+            if expected.is_none()
+                && let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                let header_end = header_end + 4;
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(str::trim)
+                            .and_then(|number| number.parse::<usize>().ok())
+                    })
+                    .expect("content length");
+                expected = Some(header_end + content_length);
             }
             if expected.is_some_and(|length| request.len() >= length) {
                 break;

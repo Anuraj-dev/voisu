@@ -1343,10 +1343,10 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                     true,
                     false,
                 );
-                if let Some(confidence) = classification.diagnostic_confidence() {
-                    if let Ok(decision) = &mut fallback {
-                        decision.source_selection_diagnostic.confidence = Some(confidence);
-                    }
+                if let Some(confidence) = classification.diagnostic_confidence()
+                    && let Ok(decision) = &mut fallback
+                {
+                    decision.source_selection_diagnostic.confidence = Some(confidence);
                 }
                 return Ok(PreparedTranscriptDecision::Reconstruct(
                     IntentReconstructionAttempt {
@@ -1729,15 +1729,15 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             }
         };
         let failure = quality_failure_reason(&repaired.0, sources);
-        if let Some(failure) = &failure {
-            if !failure.is_contraction() {
-                return safe_source_fallback(
-                    sources,
-                    format!("recovery produced {}", failure.reason()),
-                    reconciliation_requested,
-                    true,
-                );
-            }
+        if let Some(failure) = &failure
+            && !failure.is_contraction()
+        {
+            return safe_source_fallback(
+                sources,
+                format!("recovery produced {}", failure.reason()),
+                reconciliation_requested,
+                true,
+            );
         }
         if !is_source_derived(&repaired.0, sources) {
             return safe_source_fallback(

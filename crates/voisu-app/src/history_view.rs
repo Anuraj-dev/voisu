@@ -15,7 +15,7 @@
 //!
 //! Every externally sourced string (delivered Transcript, Provider diagnostics,
 //! decision reasons) originates from a network STT provider and is therefore
-//! untrusted. All such text is routed through [`truncate_inline`], which strips
+//! untrusted. All such text is routed through `truncate_inline`, which strips
 //! terminal control bytes (ESC/BEL/backspace/DEL and other C0/C1 controls) so a
 //! hostile transcript cannot smuggle CSI screen-clears or OSC clipboard-hijack
 //! sequences into the user's terminal — even piped with color off.
@@ -227,10 +227,10 @@ fn render_providers(record: &Value, style: &RenderStyle) -> String {
     let note = |list: Option<&Vec<Value>>, providers: &mut Vec<String>| {
         if let Some(list) = list {
             for entry in list {
-                if let Some(name) = entry.get("provider").and_then(Value::as_str) {
-                    if !providers.iter().any(|seen| seen == name) {
-                        providers.push(name.to_owned());
-                    }
+                if let Some(name) = entry.get("provider").and_then(Value::as_str)
+                    && !providers.iter().any(|seen| seen == name)
+                {
+                    providers.push(name.to_owned());
                 }
             }
         }
@@ -364,10 +364,10 @@ fn truncation_tag(record: &Value) -> Option<String> {
 /// The single most useful one-line reason a Recording produced no Transcript.
 fn failure_reason(record: &Value) -> Option<String> {
     for key in ["error", "validation_reason", "fallback_reason"] {
-        if let Some(reason) = str_field(record, key) {
-            if !reason.is_empty() {
-                return Some(truncate_inline(reason, 80));
-            }
+        if let Some(reason) = str_field(record, key)
+            && !reason.is_empty()
+        {
+            return Some(truncate_inline(reason, 80));
         }
     }
     None

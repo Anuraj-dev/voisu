@@ -193,9 +193,8 @@ fn dropped_prefix_len(original: &[String], hypothesis: &[String]) -> usize {
         .zip(hypothesis.iter())
         .take_while(|(a, b)| a == b)
         .count();
-    if matched >= hypothesis.len().min(3) {
-        start
-    } else if is_suffix_alignment(original, hypothesis, start) {
+    // Both conditions return `start`; merged (clippy::if_same_then_else).
+    if matched >= hypothesis.len().min(3) || is_suffix_alignment(original, hypothesis, start) {
         start
     } else {
         0
@@ -475,7 +474,7 @@ fn missing_clauses(reference: &str, hypothesis: &str) -> Vec<String> {
     let hyp = tokenize(hypothesis);
     let hyp_set: std::collections::BTreeSet<&str> = hyp.iter().map(String::as_str).collect();
     let mut missing = Vec::new();
-    for clause in reference.split(|c: char| matches!(c, '.' | '!' | '?' | '\n')) {
+    for clause in reference.split(['.', '!', '?', '\n']) {
         let words = tokenize(clause);
         if words.len() < 4 {
             continue;

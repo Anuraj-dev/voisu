@@ -289,13 +289,13 @@ async fn read_bounded_body(
     mut response: reqwest::Response,
     max_body_bytes: usize,
 ) -> Result<Vec<u8>, GrammarHttpError> {
-    if let Some(content_length) = response.content_length() {
-        if content_length as usize > max_body_bytes {
-            // Drop response: cancel residual body download on the real stack.
-            return Err(GrammarHttpError::BodyTooLarge {
-                limit: max_body_bytes,
-            });
-        }
+    if let Some(content_length) = response.content_length()
+        && content_length as usize > max_body_bytes
+    {
+        // Drop response: cancel residual body download on the real stack.
+        return Err(GrammarHttpError::BodyTooLarge {
+            limit: max_body_bytes,
+        });
     }
 
     let mut body = Vec::new();

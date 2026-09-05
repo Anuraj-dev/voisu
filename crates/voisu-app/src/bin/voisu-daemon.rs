@@ -1058,12 +1058,12 @@ async fn actor_loop(
                             if !deepgram_enabled {
                                 normalize_disabled_deepgram(&mut record.provider_failures);
                             }
-                            if let Some(store) = diagnostics.as_ref() {
-                                if let Err(error) = store.record(record) {
-                                    eprintln!(
-                                        "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
-                                    );
-                                }
+                            if let Some(store) = diagnostics.as_ref()
+                                && let Err(error) = store.record(record)
+                            {
+                                eprintln!(
+                                    "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
+                                );
                             }
                             let mut evidence = base_evidence(
                                 id,
@@ -1281,12 +1281,12 @@ async fn actor_loop(
                             if !deepgram_enabled {
                                 normalize_disabled_deepgram(&mut record.provider_failures);
                             }
-                            if let Some(store) = diagnostics.as_ref() {
-                                if let Err(error) = store.record(record) {
-                                    eprintln!(
-                                        "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
-                                    );
-                                }
+                            if let Some(store) = diagnostics.as_ref()
+                                && let Err(error) = store.record(record)
+                            {
+                                eprintln!(
+                                    "Recording {id} [{correlation}]: writing diagnostics failed: {error}"
+                                );
                             }
                             let response = Response::with_evidence(
                                 false,
@@ -1358,29 +1358,29 @@ async fn actor_loop(
                 let _ = reply.send(response);
             }
             ActorMessage::PumpTerminated(id) => {
-                if matches!(&state, ActorState::Recording(recording) if recording.id == id) {
-                    if let Ok(recording) = take_active_recording(&mut state) {
-                        let _ = spawn_recording_processing(
-                            &mut state,
-                            recording,
-                            &mut validator,
-                            &mut delivery,
-                            diagnostics.clone(),
-                            debug_capture,
-                            controlled,
-                            deepgram_enabled,
-                            delivery_mode,
-                            focus_probe.clone(),
-                            configured_providers.clone(),
-                            None,
-                            true,
-                            tx.clone(),
-                            reaper.clone(),
-                            grammar_adapter.clone(),
-                            dpr_enabled,
-                            dpr_client.clone(),
-                        );
-                    }
+                if matches!(&state, ActorState::Recording(recording) if recording.id == id)
+                    && let Ok(recording) = take_active_recording(&mut state)
+                {
+                    let _ = spawn_recording_processing(
+                        &mut state,
+                        recording,
+                        &mut validator,
+                        &mut delivery,
+                        diagnostics.clone(),
+                        debug_capture,
+                        controlled,
+                        deepgram_enabled,
+                        delivery_mode,
+                        focus_probe.clone(),
+                        configured_providers.clone(),
+                        None,
+                        true,
+                        tx.clone(),
+                        reaper.clone(),
+                        grammar_adapter.clone(),
+                        dpr_enabled,
+                        dpr_client.clone(),
+                    );
                 }
             }
             ActorMessage::AuthorizeDelivery {
@@ -2206,10 +2206,10 @@ async fn process_recording(
                 None,
                 Some(&error),
             );
-            if let Some(store) = diagnostics.as_ref() {
-                if let Err(record_error) = store.record(record) {
-                    eprintln!("Recording {id}: writing diagnostics failed: {record_error}");
-                }
+            if let Some(store) = diagnostics.as_ref()
+                && let Err(record_error) = store.record(record)
+            {
+                eprintln!("Recording {id}: writing diagnostics failed: {record_error}");
             }
             return RecordingResult {
                 result: Err(error),
@@ -2249,12 +2249,10 @@ async fn process_recording(
         evidence.truncated_by = audio.truncated_by();
         evidence.capture_finalized_ms = Some(elapsed_millis(started_at));
         evidence.stages.push(LifecycleStage::CaptureFinalized);
-        if debug_capture {
-            if let Some(store) = diagnostics.as_ref() {
-                match store.store_debug_audio(&correlation_id, audio.pcm_s16le_mono_16khz()) {
-                    Ok(record) => debug_audio = Some(record),
-                    Err(error) => eprintln!("Recording {id}: debug audio capture failed: {error}"),
-                }
+        if debug_capture && let Some(store) = diagnostics.as_ref() {
+            match store.store_debug_audio(&correlation_id, audio.pcm_s16le_mono_16khz()) {
+                Ok(record) => debug_audio = Some(record),
+                Err(error) => eprintln!("Recording {id}: debug audio capture failed: {error}"),
             }
         }
         let english_eligible =
@@ -2477,10 +2475,10 @@ async fn process_recording(
         dpr,
         result.as_ref().err(),
     );
-    if let Some(store) = diagnostics.as_ref() {
-        if let Err(error) = store.record(record) {
-            eprintln!("Recording {id}: writing diagnostics failed: {error}");
-        }
+    if let Some(store) = diagnostics.as_ref()
+        && let Err(error) = store.record(record)
+    {
+        eprintln!("Recording {id}: writing diagnostics failed: {error}");
     }
 
     RecordingResult {
@@ -2681,12 +2679,12 @@ async fn supervise_recording(
                 None,
                 Some(&error),
             );
-            if let Some(store) = diagnostics.as_ref() {
-                if let Err(record_error) = store.record(record) {
-                    log_best_effort(format_args!(
-                        "Recording {id}: writing diagnostics failed: {record_error}"
-                    ));
-                }
+            if let Some(store) = diagnostics.as_ref()
+                && let Err(record_error) = store.record(record)
+            {
+                log_best_effort(format_args!(
+                    "Recording {id}: writing diagnostics failed: {record_error}"
+                ));
             }
             let (validator, delivery) =
                 rebuild_recording_adapters(controlled, delivery_mode, focus_probe.clone(), &reaper);

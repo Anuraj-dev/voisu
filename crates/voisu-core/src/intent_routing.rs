@@ -210,7 +210,7 @@ pub struct ProcessHint {
 
 /// Optional pause timing; weight toward cloud is always 0.
 ///
-/// [`TimingCertainty`] is shared from [`crate::prompt_rendering`] so T1 and T2
+/// [`TimingCertainty`] is shared from `crate::prompt_rendering` so T1 and T2
 /// do not define competing crate-root names.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TimingHint {
@@ -614,10 +614,11 @@ fn is_path_like(token: &str) -> bool {
         return true;
     }
     // Slash-containing path tokens (`foo/bar`, `crates/voisu-core/src/auth.rs`)
-    if let Some(idx) = token.find('/') {
-        if idx > 0 && idx + 1 < token.len() {
-            return true;
-        }
+    if let Some(idx) = token.find('/')
+        && idx > 0
+        && idx + 1 < token.len()
+    {
+        return true;
     }
     false
 }
@@ -712,10 +713,10 @@ fn command_anchor_ok(
     ) {
         return true;
     }
-    if let Some(p) = process_hint {
-        if matches!(p.class, ProcessClass::Shell | ProcessClass::Terminal) {
-            return true;
-        }
+    if let Some(p) = process_hint
+        && matches!(p.class, ProcessClass::Shell | ProcessClass::Terminal)
+    {
+        return true;
     }
     has_strong_cli_evidence(text)
 }
@@ -893,18 +894,17 @@ fn score_complexity(
         });
     }
 
-    if let Some(p) = process_hint {
-        if matches!(p.class, ProcessClass::CodingAgent | ProcessClass::GuiAgent)
-            && section_hits >= 1
-        {
-            let weight = weights::PROCESS_CODING_BOOST;
-            score += weight;
-            contributions.push(ScoreContribution {
-                signal: "process_coding_boost".to_string(),
-                weight,
-                detail: format!("process.class={}", p.class.as_str()),
-            });
-        }
+    if let Some(p) = process_hint
+        && matches!(p.class, ProcessClass::CodingAgent | ProcessClass::GuiAgent)
+        && section_hits >= 1
+    {
+        let weight = weights::PROCESS_CODING_BOOST;
+        score += weight;
+        contributions.push(ScoreContribution {
+            signal: "process_coding_boost".to_string(),
+            weight,
+            detail: format!("process.class={}", p.class.as_str()),
+        });
     }
 
     if let Some(t) = timing {

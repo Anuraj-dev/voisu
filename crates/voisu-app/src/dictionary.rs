@@ -221,7 +221,7 @@ pub fn user_terms() -> Result<Vec<String>, String> {
 /// The Deepgram keyterm vocabulary: `terms` truncated in order to the
 /// [`DEEPGRAM_KEYTERM_TOKEN_BUDGET`] and [`DEEPGRAM_KEYTERM_COUNT_LIMIT`].
 /// Deepgram returns a 400 response when its keyterm token cap is exceeded,
-/// which kills the whole streaming connection. [`token_upper_bound`] assumes
+/// which kills the whole streaming connection. `token_upper_bound` assumes
 /// token count never exceeds UTF-8 byte count when tokens consume at least one
 /// input byte and normalization does not expand it. Deepgram does not document
 /// its tokenizer, so this is a conservative engineering assumption for typical

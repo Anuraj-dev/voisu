@@ -536,22 +536,24 @@ fn validate_and_compose(
                 &edit.id,
             );
         }
-        if token_index.is_some() && anchored && rule_ok {
-            if let Some(anchor) = anchor {
-                let mapped = baseline
-                    .rendered()
-                    .get(anchor.rendered_start..anchor.rendered_end);
-                if mapped.is_none_or(|text| !text.eq_ignore_ascii_case(&edit.before)) {
-                    push_diagnostic(
-                        &mut diagnostics,
-                        &mut seen,
-                        GrammarErrorCode::Unmappable,
-                        "formatter anchor no longer names the source token",
-                        &edit.id,
-                    );
-                } else {
-                    accepted.push((edit, anchor));
-                }
+        if token_index.is_some()
+            && anchored
+            && rule_ok
+            && let Some(anchor) = anchor
+        {
+            let mapped = baseline
+                .rendered()
+                .get(anchor.rendered_start..anchor.rendered_end);
+            if mapped.is_none_or(|text| !text.eq_ignore_ascii_case(&edit.before)) {
+                push_diagnostic(
+                    &mut diagnostics,
+                    &mut seen,
+                    GrammarErrorCode::Unmappable,
+                    "formatter anchor no longer names the source token",
+                    &edit.id,
+                );
+            } else {
+                accepted.push((edit, anchor));
             }
         }
     }
@@ -984,11 +986,11 @@ fn normalize_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (start, end) in ranges {
-        if let Some(last) = merged.last_mut() {
-            if start <= last.1 {
-                last.1 = last.1.max(end);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+            continue;
         }
         merged.push((start, end));
     }

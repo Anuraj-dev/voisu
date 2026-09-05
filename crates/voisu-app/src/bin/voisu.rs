@@ -333,10 +333,10 @@ fn doctor(verbose: bool) -> ExitCode {
     // The live key checks reach the network; a test that pins other doctor
     // output opts out with VOISU_TEST_SKIP_DOCTOR_KEYS and covers the key
     // classification through dedicated seams instead.
-    if std::env::var_os("VOISU_TEST_SKIP_DOCTOR_KEYS").is_none() {
-        if let Some(runtime) = runtime.as_ref() {
-            rows.extend(provider_key_rows(runtime));
-        }
+    if std::env::var_os("VOISU_TEST_SKIP_DOCTOR_KEYS").is_none()
+        && let Some(runtime) = runtime.as_ref()
+    {
+        rows.extend(provider_key_rows(runtime));
     }
 
     let has_failure = rows.iter().any(|row| row.status == ReadinessStatus::Fail);
@@ -369,10 +369,10 @@ fn print_doctor_rows(rows: &[DoctorRow], verbose: bool) {
             label = DOCTOR_LABEL_WIDTH,
             value = DOCTOR_VALUE_WIDTH,
         );
-        if row.status == ReadinessStatus::Fail {
-            if let Some(action) = &row.action {
-                println!("    {action}");
-            }
+        if row.status == ReadinessStatus::Fail
+            && let Some(action) = &row.action
+        {
+            println!("    {action}");
         }
         if verbose {
             println!("    ({})", row.detail);
@@ -763,10 +763,11 @@ fn setup() -> ExitCode {
     // Integration tests can isolate the credential wizard while exercising
     // the real CLI; production never sets this seam.
     let wizard_only = std::env::var_os("VOISU_TEST_SETUP_WIZARD_ONLY").is_some();
-    if hyprland_config.is_some() && !wizard_only {
-        if let Err(error) = voisu_app::service::hyprland_overlay_preflight() {
-            return fail(4, &error);
-        }
+    if hyprland_config.is_some()
+        && !wizard_only
+        && let Err(error) = voisu_app::service::hyprland_overlay_preflight()
+    {
+        return fail(4, &error);
     }
     let mut wizard = StdioWizard;
     let outcome = run_setup(&mut wizard, &mut SecretToolStore, &mut LiveKeyValidator);

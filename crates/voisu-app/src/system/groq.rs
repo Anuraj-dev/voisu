@@ -394,12 +394,12 @@ pub(super) fn flac_from_pcm(pcm: &[u8]) -> Result<Vec<u8>, BoundaryError> {
     use flacenc::error::Verify;
     use flacenc::source::MemSource;
 
-    let mut chunks = pcm.chunks_exact(2);
+    let (chunks, remainder) = pcm.as_chunks::<2>();
     let samples: Vec<i32> = chunks
-        .by_ref()
-        .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]) as i32)
+        .iter()
+        .map(|bytes| i16::from_le_bytes(*bytes) as i32)
         .collect();
-    if !chunks.remainder().is_empty() {
+    if !remainder.is_empty() {
         return Err(BoundaryError::new(
             BoundaryKind::Provider,
             "Recording PCM length is invalid",
