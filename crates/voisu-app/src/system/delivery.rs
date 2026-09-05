@@ -34,6 +34,15 @@ pub trait RemoteDesktopPortal: Send {
     fn connect_paste(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>> {
         self.connect()
     }
+
+    /// The restore-token file this portal was explicitly configured with, when
+    /// one was injected instead of resolved from the environment. Token
+    /// lifecycle (load, rotate, clear) must hit the same file the portal
+    /// itself uses — including the clears the delivery adapters drive after a
+    /// terminal failure, where only the portal knows the configured location.
+    fn restore_token_file(&self) -> Option<&Path> {
+        None
+    }
 }
 
 pub trait NotificationBoundary: Send {
@@ -332,7 +341,11 @@ impl PortalPasteAction {
     fn remember_failure(&mut self, error: &BoundaryError) {
         let reason = error.diagnostic().to_owned();
         if error.is_permanent() || terminal_remote_desktop_failure(&reason) {
-            clear_restore_token();
+            clear_restore_token(
+                self.portal
+                    .as_deref()
+                    .and_then(RemoteDesktopPortal::restore_token_file),
+            );
             self.terminal_failure = Some(reason);
         }
     }
@@ -396,7 +409,7 @@ impl PortalClipboardDelivery {
     pub fn with_hyprland_paste(action: VerifiedPasteAction) -> Self {
         let paste = PortalPasteAction::with_live_revalidation(
             action.clone(),
-            Box::new(FedoraRemoteDesktopPortal),
+            Box::new(FedoraRemoteDesktopPortal::default()),
         );
         Self::with_paste_boundaries(Box::new(WlClipboard), action, Box::new(paste))
     }
@@ -449,7 +462,7 @@ impl DeliveryAdapter for PortalClipboardDelivery {
                                 self.setup_failure_terminal =
                                     terminal_remote_desktop_failure(&reason);
                                 if self.background_setup && self.setup_failure_terminal {
-                                    clear_restore_token();
+                                    clear_restore_token(self.portal.restore_token_file());
                                 }
                                 self.setup_retry_after = (!self.setup_failure_terminal)
                                     .then(|| Instant::now() + REMOTE_DESKTOP_RETRY_BACKOFF);
@@ -497,7 +510,7 @@ impl DeliveryAdapter for PortalClipboardDelivery {
                     let reason = error.diagnostic().to_owned();
                     self.setup_failure_terminal = terminal_remote_desktop_failure(&reason);
                     if self.background_setup && self.setup_failure_terminal {
-                        clear_restore_token();
+                        clear_restore_token(self.portal.restore_token_file());
                     }
                     self.setup_failure = Some(reason.clone());
                     self.setup_retry_after = (!self.setup_failure_terminal)
@@ -586,7 +599,7 @@ impl Default for PortalClipboardDelivery {
     fn default() -> Self {
         Self {
             clipboard: Box::new(WlClipboard),
-            portal: Box::new(FedoraRemoteDesktopPortal),
+            portal: Box::new(FedoraRemoteDesktopPortal::default()),
             paste: None,
             paste_action: None,
             direct_enabled: true,
@@ -605,7 +618,7 @@ impl Default for PortalClipboardDelivery {
 fn spawn_remote_desktop_setup()
 -> tokio::task::JoinHandle<Result<Box<dyn DirectDeliverySession>, BoundaryError>> {
     tokio::spawn(async {
-        let mut portal = FedoraRemoteDesktopPortal;
+        let mut portal = FedoraRemoteDesktopPortal::default();
         portal.connect().await
     })
 }

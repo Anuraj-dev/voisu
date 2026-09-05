@@ -33,6 +33,18 @@ fn restore_token_path() -> Option<PathBuf> {
     Some(state_root.join("voisu/remote-desktop.restore-token"))
 }
 
+/// The restore-token file in effect for a portal run: the explicitly injected
+/// path when one was configured (the harness seam — it never falls back to the
+/// environment), otherwise the standard location the daemon resolves today.
+/// Like the `VOISU_REMOTE_DESKTOP_TOKEN_FILE` override it replaces, an
+/// explicitly injected path only counts when absolute.
+fn restore_token_file(explicit: Option<&Path>) -> Option<PathBuf> {
+    match explicit {
+        Some(path) => path.is_absolute().then(|| path.to_path_buf()),
+        None => restore_token_path(),
+    }
+}
+
 fn private_restore_token_file(path: &Path) -> Option<File> {
     let metadata = fs::symlink_metadata(path).ok()?;
     if !metadata.file_type().is_file()
@@ -49,8 +61,8 @@ fn private_restore_token_file(path: &Path) -> Option<File> {
         .ok()
 }
 
-fn load_restore_token() -> Option<String> {
-    let path = restore_token_path()?;
+fn load_restore_token(explicit: Option<&Path>) -> Option<String> {
+    let path = restore_token_file(explicit)?;
     let file = private_restore_token_file(&path)?;
     let mut token = String::new();
     file.take(MAX_RESTORE_TOKEN_BYTES + 1)
@@ -59,11 +71,11 @@ fn load_restore_token() -> Option<String> {
     (!token.is_empty() && token.len() as u64 <= MAX_RESTORE_TOKEN_BYTES).then_some(token)
 }
 
-fn persist_restore_token(token: &str) -> bool {
+fn persist_restore_token(token: &str, explicit: Option<&Path>) -> bool {
     if token.is_empty() || token.len() as u64 > MAX_RESTORE_TOKEN_BYTES {
         return false;
     }
-    let Some(path) = restore_token_path() else {
+    let Some(path) = restore_token_file(explicit) else {
         return false;
     };
     let Some(parent) = path.parent() else {
@@ -109,13 +121,25 @@ fn persist_restore_token(token: &str) -> bool {
     true
 }
 
-pub(super) fn clear_restore_token() {
-    if let Some(path) = restore_token_path() {
+pub(super) fn clear_restore_token(explicit: Option<&Path>) {
+    if let Some(path) = restore_token_file(explicit) {
         let _ = fs::remove_file(path);
     }
 }
 
-pub struct FedoraRemoteDesktopPortal;
+/// Explicit endpoints for a [`FedoraRemoteDesktopPortal`]: the bus to dial and
+/// the restore-token file to use, injected by the caller instead of resolved
+/// from the process environment at call time. Only the harness seam constructs
+/// this; the daemon keeps the environment-resolved defaults.
+struct RemoteDesktopEndpoints {
+    bus_address: String,
+    token_file: PathBuf,
+}
+
+#[derive(Default)]
+pub struct FedoraRemoteDesktopPortal {
+    endpoints: Option<RemoteDesktopEndpoints>,
+}
 
 pub(super) struct DisabledRemoteDesktopPortal;
 
@@ -131,15 +155,48 @@ impl RemoteDesktopPortal for DisabledRemoteDesktopPortal {
 }
 
 impl FedoraRemoteDesktopPortal {
+    /// A portal bound to explicit endpoints: connections dial `bus_address`
+    /// directly and the restore token lives at `token_file`, so a host process
+    /// can drive this boundary without any in-process environment mutation.
+    /// Real daemon use keeps the default, which reads the session bus and the
+    /// standard token location exactly as before.
+    pub fn with_endpoints(bus_address: String, token_file: PathBuf) -> Self {
+        Self {
+            endpoints: Some(RemoteDesktopEndpoints {
+                bus_address,
+                token_file,
+            }),
+        }
+    }
+
+    /// The restore-token file this instance was configured with, if any.
+    fn token_file(&self) -> Option<&Path> {
+        self.endpoints
+            .as_ref()
+            .map(|endpoints| endpoints.token_file.as_path())
+    }
+
     async fn connect_inner(
+        &self,
         force_keyboard: bool,
     ) -> Result<Box<dyn DirectDeliverySession>, BoundaryError> {
         use std::sync::atomic::Ordering;
         use zbus::zvariant::Value;
 
-        let connection = zbus::Connection::session().await.map_err(|_| {
-            BoundaryError::new(BoundaryKind::Delivery, "RemoteDesktop portal unavailable")
-        })?;
+        let connection = match &self.endpoints {
+            Some(endpoints) => zbus::connection::Builder::address(endpoints.bus_address.as_str())
+                .map_err(|_| {
+                    BoundaryError::new(BoundaryKind::Delivery, "RemoteDesktop portal unavailable")
+                })?
+                .build()
+                .await
+                .map_err(|_| {
+                    BoundaryError::new(BoundaryKind::Delivery, "RemoteDesktop portal unavailable")
+                })?,
+            None => zbus::Connection::session().await.map_err(|_| {
+                BoundaryError::new(BoundaryKind::Delivery, "RemoteDesktop portal unavailable")
+            })?,
+        };
         let portal = zbus::Proxy::new(
             &connection,
             PORTAL_BUS_NAME,
@@ -194,7 +251,7 @@ impl FedoraRemoteDesktopPortal {
             .await
             .map_err(|_| BoundaryError::new(BoundaryKind::Delivery, "permission denied"))?;
 
-        let restore_token = load_restore_token();
+        let restore_token = load_restore_token(self.token_file());
         let mut select_options: std::collections::HashMap<&str, Value<'_>> =
             std::collections::HashMap::from([
                 ("handle_token", Value::from(format!("{prefix}_select"))),
@@ -214,7 +271,13 @@ impl FedoraRemoteDesktopPortal {
         )
         .await
         {
-            return Err(fail_and_close(&connection, session_path.as_str(), error).await);
+            return Err(fail_and_close(
+                &connection,
+                session_path.as_str(),
+                error,
+                self.token_file(),
+            )
+            .await);
         }
 
         let start_options: std::collections::HashMap<&str, Value<'_>> =
@@ -234,18 +297,24 @@ impl FedoraRemoteDesktopPortal {
         {
             Ok(results) => results,
             Err(error) => {
-                return Err(fail_and_close(&connection, session_path.as_str(), error).await);
+                return Err(fail_and_close(
+                    &connection,
+                    session_path.as_str(),
+                    error,
+                    self.token_file(),
+                )
+                .await);
             }
         };
         if let Some(token) = started
             .get("restore_token")
             .and_then(|value| value.downcast_ref::<zbus::zvariant::Str<'_>>().ok())
         {
-            let _ = persist_restore_token(token.as_str());
+            let _ = persist_restore_token(token.as_str(), self.token_file());
         } else if restore_token.is_some() {
             // Restore tokens are single-use. If Start did not rotate the
             // supplied token, retaining it would guarantee a stale retry.
-            clear_restore_token();
+            clear_restore_token(self.token_file());
         }
         let devices = started
             .get("devices")
@@ -288,17 +357,22 @@ impl FedoraRemoteDesktopPortal {
             session_path: session_object,
             closures,
             sender: Some(sender),
+            token_file: self.token_file().map(Path::to_path_buf),
         }) as Box<dyn DirectDeliverySession>)
     }
 }
 
 impl RemoteDesktopPortal for FedoraRemoteDesktopPortal {
+    fn restore_token_file(&self) -> Option<&Path> {
+        self.token_file()
+    }
+
     fn connect(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>> {
-        Box::pin(Self::connect_inner(false))
+        Box::pin(self.connect_inner(false))
     }
 
     fn connect_paste(&mut self) -> BoundaryFuture<'_, Box<dyn DirectDeliverySession>> {
-        Box::pin(Self::connect_inner(true))
+        Box::pin(self.connect_inner(true))
     }
 }
 
@@ -321,11 +395,12 @@ async fn fail_and_close(
     connection: &zbus::Connection,
     session_path: &str,
     error: BoundaryError,
+    token_file: Option<&Path>,
 ) -> BoundaryError {
     close_portal_session(connection, session_path).await;
     let error = classify_remote_desktop_failure(error);
     if error.is_permanent() || terminal_remote_desktop_failure(error.diagnostic()) {
-        clear_restore_token();
+        clear_restore_token(token_file);
     }
     error
 }
@@ -335,6 +410,9 @@ struct FedoraDirectDeliverySession {
     session_path: zbus::zvariant::OwnedObjectPath,
     closures: zbus::proxy::SignalStream<'static>,
     sender: Option<NativeEiSender>,
+    /// The restore-token location this session's portal was configured with,
+    /// so revocation clears the same file the portal reads and rotates.
+    token_file: Option<PathBuf>,
 }
 
 impl DirectDeliverySession for FedoraDirectDeliverySession {
@@ -346,7 +424,7 @@ impl DirectDeliverySession for FedoraDirectDeliverySession {
                 tokio::time::timeout(Duration::from_millis(1), self.closures.next()).await,
                 Ok(Some(_))
             ) {
-                clear_restore_token();
+                clear_restore_token(self.token_file.as_deref());
                 return Err(BoundaryError::new(
                     BoundaryKind::Delivery,
                     "permission revoked",
@@ -375,7 +453,7 @@ impl DirectDeliverySession for FedoraDirectDeliverySession {
                 tokio::time::timeout(Duration::from_millis(1), self.closures.next()).await,
                 Ok(Some(_))
             ) {
-                clear_restore_token();
+                clear_restore_token(self.token_file.as_deref());
                 return Err(BoundaryError::new(
                     BoundaryKind::Delivery,
                     "permission revoked",

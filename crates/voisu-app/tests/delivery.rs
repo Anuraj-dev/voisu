@@ -957,31 +957,25 @@ async fn production_portal_rotates_persistent_permission_and_connects_libei() {
         });
     });
     ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-    let prior = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
-    let prior_token_file = std::env::var_os("VOISU_REMOTE_DESKTOP_TOKEN_FILE");
     let token_dir = TempDir::new().unwrap();
     let token_file = token_dir.path().join("restore-token");
-    unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &bus.address) };
-    unsafe { std::env::set_var("VOISU_REMOTE_DESKTOP_TOKEN_FILE", &token_file) };
 
     let events = Arc::new(Mutex::new(Vec::new()));
     for text in ["first", "second"] {
+        // The portal is bound to the private bus and the token file
+        // explicitly, so the harness never mutates this process's
+        // environment (which concurrently running tests read).
         let mut delivery = PortalClipboardDelivery::with_boundaries(
             Box::new(RecordingClipboard(Arc::clone(&events))),
-            Box::new(FedoraRemoteDesktopPortal),
+            Box::new(FedoraRemoteDesktopPortal::with_endpoints(
+                bus.address.clone(),
+                token_file.clone(),
+            )),
         );
         let outcome = delivery.deliver(Transcript(text.to_owned())).await.unwrap();
         assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
     }
 
-    match prior {
-        Some(value) => unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", value) },
-        None => unsafe { std::env::remove_var("DBUS_SESSION_BUS_ADDRESS") },
-    }
-    match prior_token_file {
-        Some(value) => unsafe { std::env::set_var("VOISU_REMOTE_DESKTOP_TOKEN_FILE", value) },
-        None => unsafe { std::env::remove_var("VOISU_REMOTE_DESKTOP_TOKEN_FILE") },
-    }
     let _ = stop_tx.send(());
     let _ = service.join();
     let calls = calls.lock().unwrap();

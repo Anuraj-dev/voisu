@@ -2,10 +2,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::env;
-use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::UnixStream;
 use std::process::Command as ProcessCommand;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,10 +20,12 @@ use voisu_app::overlay::{
     BarSmoother, LIMIT_WARNING_CLASS, LevelPollAction, LevelPollLatch, LimitWarning,
     LimitWarningLatch, NoSpeechNotifyLatch, ObservedSignal, OverlayPhase, OverlayView,
     PresentationController, PresentationTracker, RecordingNotifyLatch, RungNotification,
-    TickAction, TickObservation, VISUAL_BAR_COUNT, edge_falloff_alpha, interpolate_bands,
+    STATUS_POLL_PERIOD, STATUS_ROUND_TRIP_DEADLINE, StatusWorker, TickAction, TickObservation,
+    VISUAL_BAR_COUNT, connect_within, edge_falloff_alpha, fetch_status, interpolate_bands,
     limit_notification_body, limit_warning_class, limit_warning_from_response,
-    notification_rung_choice, phase_glyph, poll_tick, recording_bar_height, recording_bar_rgb,
-    recording_identity, recording_remaining, resting_floor, sweep_brightness,
+    notification_rung_choice, phase_glyph, poll_tick, read_until_eof_within, recording_bar_height,
+    recording_bar_rgb, recording_identity, recording_remaining, resting_floor, sweep_brightness,
+    write_within,
 };
 use voisu_core::{Command, Request, Response, socket_path};
 
@@ -598,12 +596,14 @@ fn run_notification_feedback(selection: FeedbackSelection) -> i32 {
     let mut no_speech_latch = NoSpeechNotifyLatch::default();
     let mut limit_latch = LimitWarningLatch::default();
     loop {
+        let observation = read_status();
         notification_tick(
             &mut controller,
             &mut previous_phase,
             &mut no_speech_latch,
             &mut limit_latch,
             &notifier,
+            observation,
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -611,7 +611,10 @@ fn run_notification_feedback(selection: FeedbackSelection) -> i32 {
 
 /// The GTK-context notification driver, used only when a Layer Shell surface was
 /// selected but then failed to realize locally. It shares the same `Notifier`;
-/// the glib timeout only hands it the label to show.
+/// the glib timeout only hands it the label to show. The status fetch runs on
+/// a dedicated worker thread so a slow daemon reply can never stall this GTK
+/// main loop — the tick only takes the newest finished round trip
+/// nonblockingly, and keeps the current state when none has landed yet.
 fn install_notification_feedback(application: &gtk::Application) {
     // A notification backend has no window. Keep its GApplication alive for
     // the source lifetime so the polling timeout can actually run.
@@ -620,26 +623,32 @@ fn install_notification_feedback(application: &gtk::Application) {
         backend: FeedbackBackend::DesktopNotification,
         degradation: Some(FeedbackDegradation::SurfaceCreationFailure),
     });
+    let status_worker = StatusWorker::spawn();
     let controller = Rc::new(RefCell::new(PresentationController::default()));
     let previous_phase = Rc::new(RefCell::new(OverlayView::HIDDEN.phase));
     let no_speech_latch = Rc::new(RefCell::new(NoSpeechNotifyLatch::default()));
     let limit_latch = Rc::new(RefCell::new(LimitWarningLatch::default()));
-    gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
+    gtk::glib::timeout_add_local(STATUS_POLL_PERIOD, move || {
         let _hold = &hold;
-        notification_tick(
-            &mut controller.borrow_mut(),
-            &mut previous_phase.borrow_mut(),
-            &mut no_speech_latch.borrow_mut(),
-            &mut limit_latch.borrow_mut(),
-            &notifier,
-        );
+        if let Some(observation) = status_worker.take_latest() {
+            notification_tick(
+                &mut controller.borrow_mut(),
+                &mut previous_phase.borrow_mut(),
+                &mut no_speech_latch.borrow_mut(),
+                &mut limit_latch.borrow_mut(),
+                &notifier,
+                observation.response,
+            );
+        }
         gtk::glib::ControlFlow::Continue
     });
 }
 
 /// One poll of the daemon status: on a transition into a visible phase, hand the
 /// new label to the notifier (which fires a desktop notification, or logs the
-/// transition to the journal when the bus is unavailable). NoSpeech is gated
+/// transition to the journal when the bus is unavailable). `observation` is the
+/// round trip this tick renders — pre-fetched off the caller's thread by the
+/// status worker, or read inline by the non-GTK loop. NoSpeech is gated
 /// through `NoSpeechNotifyLatch` instead of the plain phase-transition check:
 /// a retained NoSpeech capsule can span an unreachable blip that recovers
 /// before the terminal window expires, which would otherwise look like two
@@ -652,9 +661,10 @@ fn notification_tick(
     no_speech_latch: &mut NoSpeechNotifyLatch,
     limit_latch: &mut LimitWarningLatch,
     notifier: &Notifier,
+    observation: Option<Response>,
 ) {
     let now = Instant::now();
-    let (view, signal, warning, identity, remaining) = match read_status() {
+    let (view, signal, warning, identity, remaining) = match observation {
         Some(response) => {
             let view = controller.observe(&response, now);
             (
@@ -1154,17 +1164,13 @@ fn rounded_rectangle(context: &gtk::cairo::Context, x: f64, y: f64, width: f64, 
     context.close_path();
 }
 
+/// One poll of the daemon status: the bounded round trip (total deadline plus
+/// reply byte cap, shared with the status worker) against the observer socket.
+/// Synchronous callers — the journal loop and this file's non-GTK notification
+/// loop — run on their own threads; the GTK status tick consumes the worker's
+/// published observations instead.
 fn read_status() -> Option<Response> {
-    let mut stream = UnixStream::connect(socket_path().ok()?).ok()?;
-    let request = serde_json::to_vec(&Request::new(Command::OverlayStatus)).ok()?;
-    stream.write_all(&request).ok()?;
-    stream.write_all(b"\n").ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(150)))
-        .ok()?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).ok()?;
-    serde_json::from_slice(&response).ok()
+    fetch_status(Instant::now() + STATUS_ROUND_TRIP_DEADLINE)
 }
 
 /// One Level round trip bounded by a single absolute deadline across
@@ -1179,123 +1185,8 @@ fn read_levels(after_seq: u64, deadline: Instant) -> Option<Vec<voisu_core::Leve
     let mut request = serde_json::to_vec(&Request::new(Command::Level { after_seq })).ok()?;
     request.push(b'\n');
     write_within(&mut stream, &request, deadline)?;
-    let response = read_until_eof_within(&mut stream, deadline)?;
+    let response = read_until_eof_within(&mut stream, deadline, MAX_LEVEL_RESPONSE_BYTES)?;
     serde_json::from_slice::<Response>(&response)
         .ok()?
         .level_frames
-}
-
-/// Nonblocking connect to the daemon socket, bounded by the shared deadline.
-fn connect_within(path: &std::path::Path, deadline: Instant) -> Option<UnixStream> {
-    // SAFETY: socket(2) has no memory preconditions; the raw descriptor is
-    // moved into an OwnedFd immediately, so every early return closes it.
-    let raw = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if raw < 0 {
-        return None;
-    }
-    // SAFETY: raw is a freshly created, valid descriptor owned by nothing else.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    // SAFETY: sockaddr_un is plain old data; all-zeroes is a valid value.
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    let bytes = path.as_os_str().as_bytes();
-    if bytes.len() >= address.sun_path.len() {
-        return None;
-    }
-    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
-        *slot = *byte as libc::c_char;
-    }
-    let length = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
-    // SAFETY: address is a properly initialized sockaddr_un and length is
-    // within its size.
-    let connected =
-        unsafe { libc::connect(fd.as_raw_fd(), std::ptr::addr_of!(address).cast(), length) };
-    if connected != 0 {
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::EINPROGRESS) | Some(libc::EAGAIN) => {
-                wait_within(fd.as_raw_fd(), libc::POLLOUT, deadline)?;
-                let mut error: libc::c_int = 0;
-                let mut error_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-                // SAFETY: error and error_len are valid out-pointers of the
-                // exact size SO_ERROR writes.
-                let sockopt = unsafe {
-                    libc::getsockopt(
-                        fd.as_raw_fd(),
-                        libc::SOL_SOCKET,
-                        libc::SO_ERROR,
-                        std::ptr::addr_of_mut!(error).cast(),
-                        &mut error_len,
-                    )
-                };
-                if sockopt != 0 || error != 0 {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-    }
-    Some(UnixStream::from(fd))
-}
-
-/// Wait for descriptor readiness until the shared deadline elapses.
-fn wait_within(fd: std::os::fd::RawFd, events: libc::c_short, deadline: Instant) -> Option<()> {
-    loop {
-        let remaining = deadline.checked_duration_since(Instant::now())?;
-        let mut descriptor = libc::pollfd {
-            fd,
-            events,
-            revents: 0,
-        };
-        let millis = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
-        // SAFETY: descriptor is a valid pollfd for the duration of the call.
-        match unsafe { libc::poll(&mut descriptor, 1, millis) } {
-            1.. => return Some(()),
-            0 => return None,
-            _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
-            _ => return None,
-        }
-    }
-}
-
-fn write_within(stream: &mut UnixStream, bytes: &[u8], deadline: Instant) -> Option<()> {
-    let mut remaining = bytes;
-    while !remaining.is_empty() {
-        match stream.write(remaining) {
-            Ok(0) => return None,
-            Ok(written) => remaining = &remaining[written..],
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                wait_within(stream.as_raw_fd(), libc::POLLOUT, deadline)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return None,
-        }
-    }
-    Some(())
-}
-
-fn read_until_eof_within(stream: &mut UnixStream, deadline: Instant) -> Option<Vec<u8>> {
-    let mut response = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => return Some(response),
-            Ok(read) => {
-                response.extend_from_slice(&buffer[..read]);
-                if response.len() > MAX_LEVEL_RESPONSE_BYTES {
-                    return None;
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                wait_within(stream.as_raw_fd(), libc::POLLIN, deadline)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return None,
-        }
-    }
 }
