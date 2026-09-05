@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.45.0
+Version:        0.46.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,10 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Sat Sep 05 2026 Voisu maintainers <voisu@example.invalid> - 0.46.0-1
+- docs(eval): dWER column renders raw fractions, not percentage points
+- feat(eval): corpus scoring harness — adjudicate, score, compare, one number per change
+
 * Sat Sep 05 2026 Voisu maintainers <voisu@example.invalid> - 0.45.0-1
 - fix(grammar): bare email locals authorize only via the spoken at or whole utterance
 - feat(grammar): spoken numbers, times, currency, email-speak in the local formatter
