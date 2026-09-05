@@ -1433,9 +1433,11 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
     /// Completes a prepared Intent Reconstruction attempt, with the user's
     /// constrained vocabulary corrections applied to whatever final Transcript
     /// the attempt ends in — an accepted reconstruction or its fallback. The
-    /// fallback decision may already have been corrected (it was produced by
-    /// `decide`); the correction is idempotent, so re-applying is a no-op and
-    /// never duplicates the evidence marker.
+    /// fallback decision is built UNCORRECTED by `safe_source_fallback` during
+    /// `prepare` (it never passes through the correcting `decide` wrapper);
+    /// this wrapper is what corrects it, exactly as it corrects an accepted
+    /// reconstruction. The correction is idempotent, so a decision that had
+    /// already been corrected is re-applied as a no-op.
     pub async fn reconstruct(
         &mut self,
         attempt: IntentReconstructionAttempt,

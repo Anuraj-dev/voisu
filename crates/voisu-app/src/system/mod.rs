@@ -1831,10 +1831,12 @@ mod tests {
         }));
         // A word without a numeric confidence is carried as 0.0 (unproven,
         // never confidently transcribed), and a wordless entry is skipped.
+        // Confidences are clamped to the [0, 1] domain at ingest.
         accumulator.ingest(&serde_json::json!({
             "type": "Results", "is_final": true,
             "channel": {"alternatives": [{"transcript": "now",
-                "words": [{"word": "now"}, {"confidence": 0.9}, {"word": "", "confidence": 1.0}]}]}
+                "words": [{"word": "now"}, {"confidence": 0.9}, {"word": "", "confidence": 1.0},
+                          {"word": "big", "confidence": 1.7}, {"word": "tiny", "confidence": -0.5}]}]}
         }));
 
         assert_eq!(
@@ -1845,6 +1847,8 @@ mod tests {
                 ("brown".to_owned(), 0.87),
                 ("fox".to_owned(), 0.99),
                 ("now".to_owned(), 0.0),
+                ("big".to_owned(), 1.0),
+                ("tiny".to_owned(), 0.0),
             ]
         );
     }

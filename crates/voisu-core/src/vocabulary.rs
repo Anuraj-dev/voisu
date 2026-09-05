@@ -26,10 +26,15 @@
 //!   confidently transcribed (any confidence below
 //!   [`CONFIDENT_WORD_SKIP_THRESHOLD`]). A fully confident span is left alone:
 //!   the provider heard it clearly and overriding it is the risky direction.
-//!   When confidences are unavailable for the span — a Groq-sourced, merged,
-//!   repaired, or reconstructed final Transcript, or a span whose words were
-//!   not parsed — the substitution IS applied: the user explicitly asked for
-//!   this vocabulary. That asymmetry is deliberate and documented.
+//!   Evidence is aligned BY OCCURRENCE: the Nth occurrence of a term's run
+//!   sequence in the Transcript reads the Nth occurrence of that sequence in
+//!   the evidence, so repeated terms never inherit a sibling's confidence.
+//!   When confidences are unavailable for that occurrence — a Groq-sourced,
+//!   merged, repaired, or reconstructed final Transcript, evidence that does
+//!   not reach the span, or a Transcript with more occurrences of the
+//!   sequence than the evidence has — the substitution IS applied: the user
+//!   explicitly asked for this vocabulary. That asymmetry is deliberate and
+//!   documented.
 //!
 //! Casing is preserved, not imposed: the matched span's casing shape decides
 //! how the canonical term is written back (lowercase → `term.to_lowercase()`,
@@ -37,12 +42,17 @@
 //! exactly as the user wrote it). A consistently-cased span therefore usually
 //! round-trips unchanged; the substitution's visible effect is canonicalizing
 //! inconsistent casing and rejoining punctuation-separated forms of hyphenated
-//! or slashed terms (`daemon reload` → `daemon-reload`).
+//! or slashed terms (`daemon reload` → `daemon-reload`). Terms whose written
+//! form contains a sentence terminal (`Node.js`) can never match — every gap
+//! into their separator would have to carry that terminal — so they fail
+//! closed entirely: they receive Deepgram keyterm boosting but never correct.
 //!
 //! The pass is idempotent and fail-closed by construction: it is a pure
 //! function over already-loaded terms, and an empty user dictionary (or a
 //! dictionary read failure, which the loader degrades to empty user terms with
 //! a local diagnostic) yields byte-identical output.
+
+use std::collections::HashMap;
 
 use crate::local_baseline::{metalinguistic_mask, quote_pairs_and_skip, word_tokens};
 
@@ -73,8 +83,8 @@ struct VocabularyTerm {
 /// `word_confidences` carries the Deepgram word-level confidence evidence for
 /// the FINAL text (empty when unavailable — see the module docs for when the
 /// caller supplies it). Words are `(word, confidence)` pairs in transcript
-/// order; confidence values are clamped to `[0, 1]` semantics by the caller
-/// (Deepgram reports 0..1).
+/// order; the Deepgram accumulator clamps every confidence to `[0, 1]` at
+/// ingest (a word without a usable number is carried as `0.0`, i.e. unproven).
 pub(crate) fn apply_user_vocabulary(
     text: &str,
     terms: &[String],
@@ -96,7 +106,17 @@ pub(crate) fn apply_user_vocabulary(
     // `quote … unquote` pairs (cues included) and say-the-words spans, using
     // the same masking machinery as the dictation-grammar pass.
     let masked = masked_ranges(text);
-    let confidence_runs = confidence_runs(word_confidences);
+    let evidence_runs = confidence_runs(word_confidences);
+
+    // Confidence evidence aligned BY OCCURRENCE: the Nth occurrence of a run
+    // sequence in the Transcript must read the Nth occurrence of that
+    // sequence in the evidence, so a repeated term never inherits a sibling's
+    // confidence (both directions: a confident second hearing stays untouched
+    // when the first was misheard, and a misheard second hearing is still
+    // corrected when the first was confident). Occurrences are counted in the
+    // TEXT — including ones this pass can never rewrite (masked spans), whose
+    // words were nonetheless spoken and transcribed.
+    let mut sequence_evidence: HashMap<&[String], SequenceEvidence> = HashMap::new();
 
     // Whole-token matches, longest-span-at-start first.
     let mut matches: Vec<Match> = Vec::new();
@@ -111,6 +131,14 @@ pub(crate) fn apply_user_vocabulary(
             {
                 continue;
             }
+            let state = sequence_evidence
+                .entry(term.runs.as_slice())
+                .or_insert_with(|| SequenceEvidence {
+                    next_text_occurrence: 0,
+                    minima: evidence_occurrence_minima(&term.runs, &evidence_runs),
+                });
+            let occurrence = state.next_text_occurrence;
+            state.next_text_occurrence += 1;
             let span_start = runs[start].start;
             let span_end = runs[end - 1].end;
             if !separators_allowed(text, &runs[start..end], &term.separators) {
@@ -122,7 +150,15 @@ pub(crate) fn apply_user_vocabulary(
             {
                 continue;
             }
-            if confidently_transcribed(&runs[start..end], &confidence_runs) {
+            // The occurrence's confidence: the minimum across its words (ALL
+            // words must be confident to skip). An occurrence beyond the
+            // evidence's own occurrence count has NO confidence for its span —
+            // the documented no-evidence → apply rule.
+            if state
+                .minima
+                .get(occurrence)
+                .is_some_and(|&minimum| minimum >= CONFIDENT_WORD_SKIP_THRESHOLD)
+            {
                 continue;
             }
             let shape = casing_shape(&text[span_start..span_end]);
@@ -170,8 +206,10 @@ impl VocabularyTerm {
     /// Parses a dictionary term into its run sequence. A term is eligible only
     /// when it both begins and ends with an alphanumeric character: a trailing
     /// symbol (`C#`) would require INVENTING that symbol in the Transcript —
-    /// the provider never heard it — so such terms are skipped here (they still
-    /// receive Deepgram keyterm boosting, which has no such hazard).
+    /// the provider never heard it — so such terms are skipped here. A term
+    /// whose internal separator is a sentence terminal (`Node.js`) stays
+    /// eligible by this check but can never match (see [`SENTENCE_TERMINALS`]):
+    /// it boosts, but never corrects.
     fn parse(term: &str) -> Option<Self> {
         let trimmed = term.trim();
         let first = trimmed.chars().next()?;
@@ -231,15 +269,26 @@ fn make_run(text: &str, start: usize, end: usize) -> TextRun {
     }
 }
 
+/// Sentence-terminal characters are NEVER admissible in a gap between matched
+/// runs — not even when the term's own written form contains them. A gap
+/// carrying one of these is a sentence boundary the provider heard; joining
+/// across it corrupts two sentences into one ("about Node. JS is great." must
+/// never become "about Node.js is great."). Because a dotted term's own joined
+/// form ("Node.js") can only match across a '.' gap, dotted terms fail closed
+/// entirely: they boost, but never correct.
+const SENTENCE_TERMINALS: [char; 3] = ['.', '!', '?'];
+
 /// Every character between consecutive matched runs must be whitespace or one
-/// of the term's own separators. This keeps the substitution from swallowing
-/// clause punctuation (`daemon, reload` never becomes `daemon-reload`) while
-/// allowing the plain space/hyphen/slash joins the term's written form implies.
+/// of the term's own separators — and never a sentence terminal. This keeps
+/// the substitution from swallowing clause punctuation (`daemon, reload` never
+/// becomes `daemon-reload`) while allowing the plain space/hyphen/slash joins
+/// the term's written form implies.
 fn separators_allowed(text: &str, runs: &[TextRun], separators: &[char]) -> bool {
     runs.windows(2).all(|pair| {
-        text[pair[0].end..pair[1].start]
-            .chars()
-            .all(|character| character.is_whitespace() || separators.contains(&character))
+        text[pair[0].end..pair[1].start].chars().all(|character| {
+            !SENTENCE_TERMINALS.contains(&character)
+                && (character.is_whitespace() || separators.contains(&character))
+        })
     })
 }
 
@@ -274,26 +323,38 @@ fn confidence_runs(word_confidences: &[(String, f64)]) -> Vec<(String, f64)> {
         .collect()
 }
 
-/// Whether the matched runs are fully confident in the Deepgram evidence. The
-/// FIRST run-sequence match in the confidence stream decides; a span whose
-/// words are absent from the evidence (or no evidence at all) is treated as
-/// NOT confidently transcribed, so the user's substitution applies.
-fn confidently_transcribed(runs: &[TextRun], confidence_runs: &[(String, f64)]) -> bool {
-    if runs.is_empty() || confidence_runs.len() < runs.len() {
-        return false;
+/// Per-run-sequence confidence evidence: how many text occurrences of the
+/// sequence have been seen so far, and the minimum confidence of each
+/// occurrence of the sequence in the flattened evidence stream.
+struct SequenceEvidence {
+    next_text_occurrence: usize,
+    minima: Vec<f64>,
+}
+
+/// The minimum confidence of each occurrence of `sequence` in the flattened
+/// evidence, in order. Every start position is scanned, so overlapping
+/// evidence occurrences each count; a text occurrence beyond this list's
+/// length has no evidence at all and is never treated as confident.
+fn evidence_occurrence_minima(sequence: &[String], evidence: &[(String, f64)]) -> Vec<f64> {
+    if sequence.is_empty() || sequence.len() > evidence.len() {
+        return Vec::new();
     }
-    'outer: for start in 0..=confidence_runs.len() - runs.len() {
-        for (offset, run) in runs.iter().enumerate() {
-            if confidence_runs[start + offset].0 != run.lowered {
-                continue 'outer;
-            }
-        }
-        return runs
+    let mut minima = Vec::new();
+    for start in 0..=evidence.len() - sequence.len() {
+        let window = &evidence[start..start + sequence.len()];
+        if window
             .iter()
-            .enumerate()
-            .all(|(offset, _)| confidence_runs[start + offset].1 >= CONFIDENT_WORD_SKIP_THRESHOLD);
+            .zip(sequence)
+            .all(|((word, _), expected)| word == expected)
+        {
+            let minimum = window
+                .iter()
+                .map(|(_, confidence)| *confidence)
+                .fold(f64::INFINITY, f64::min);
+            minima.push(minimum);
+        }
     }
-    false
+    minima
 }
 
 /// The casing shape of a matched span, judged across all cased characters of
@@ -583,5 +644,94 @@ mod tests {
         let confidences = vec![("rust,".to_owned(), 0.2)];
         let corrected = apply_user_vocabulary("rUst rocks", &terms(&["Rust"]), &confidences);
         assert_eq!(corrected, "Rust rocks");
+    }
+
+    #[test]
+    fn confidence_alignment_is_by_occurrence_not_first_match() {
+        // The reviewer's two-sided scenario: with a repeated sequence, the Nth
+        // text occurrence must read the Nth evidence occurrence — never
+        // occurrence #1's confidences.
+        let text = "Run daemon reload once. The daemon reload failed again.";
+        let dictionary = terms(&["daemon-reload"]);
+        // First pair shaky, second pair confident: the first span is corrected,
+        // the confidently-heard second span stays as spoken.
+        let first_shaky = vec![
+            ("daemon".to_owned(), 0.85),
+            ("reload".to_owned(), 0.88),
+            ("daemon".to_owned(), 0.97),
+            ("reload".to_owned(), 0.96),
+        ];
+        assert_eq!(
+            apply_user_vocabulary(text, &dictionary, &first_shaky),
+            "Run daemon-reload once. The daemon reload failed again.",
+            "the confident second hearing must not inherit the first's confidence"
+        );
+        // Reversed: the confident first span stays, the misheard second span is
+        // still corrected.
+        let first_confident = vec![
+            ("daemon".to_owned(), 0.97),
+            ("reload".to_owned(), 0.96),
+            ("daemon".to_owned(), 0.85),
+            ("reload".to_owned(), 0.88),
+        ];
+        assert_eq!(
+            apply_user_vocabulary(text, &dictionary, &first_confident),
+            "Run daemon reload once. The daemon-reload failed again.",
+            "the misheard second hearing must not inherit the first's confidence"
+        );
+    }
+
+    #[test]
+    fn text_occurrences_beyond_the_evidence_count_apply_without_confidence() {
+        // Three text occurrences, evidence for two: occurrence 1 is confident
+        // and skips, occurrence 2 is shaky and applies, occurrence 3 has no
+        // evidence and applies (the documented no-evidence → apply rule).
+        let text = "daemon reload. daemon reload. daemon reload.";
+        let dictionary = terms(&["daemon-reload"]);
+        let evidence = vec![
+            ("daemon".to_owned(), 0.97),
+            ("reload".to_owned(), 0.96),
+            ("daemon".to_owned(), 0.85),
+            ("reload".to_owned(), 0.88),
+        ];
+        assert_eq!(
+            apply_user_vocabulary(text, &dictionary, &evidence),
+            "daemon reload. daemon-reload. daemon-reload.",
+        );
+    }
+
+    #[test]
+    fn a_sentence_boundary_is_never_joined_even_for_a_dotted_term() {
+        // "Node. JS" spans two sentences: the gap carries a sentence terminal,
+        // so the dotted term must fail closed to as-spoken.
+        let text = "about Node. JS is great.";
+        let corrected = apply_user_vocabulary(text, &terms(&["Node.js"]), &[]);
+        assert_eq!(corrected, text);
+    }
+
+    #[test]
+    fn a_dotted_term_fails_closed_even_on_its_own_joined_form() {
+        // The only gap into "Node.js"'s own joined form carries the '.', a
+        // sentence terminal — indistinguishable locally from a real boundary —
+        // so dotted terms never correct at all: they boost, never rewrite.
+        let text = "about Node.js is great.";
+        let corrected = apply_user_vocabulary(text, &terms(&["Node.js"]), &[]);
+        assert_eq!(corrected, text);
+    }
+
+    #[test]
+    fn an_abbreviation_term_joins_on_whitespace_but_never_across_a_sentence_terminal() {
+        // "e.g" (no trailing terminal) spoken as two tokens with a plain space
+        // gap converts; the same tokens separated by ". " (a sentence terminal
+        // in the gap) stay exactly as spoken.
+        let dictionary = terms(&["e.g"]);
+        assert_eq!(
+            apply_user_vocabulary("wait e g now", &dictionary, &[]),
+            "wait e.g now"
+        );
+        assert_eq!(
+            apply_user_vocabulary("wait e. g now", &dictionary, &[]),
+            "wait e. g now"
+        );
     }
 }
