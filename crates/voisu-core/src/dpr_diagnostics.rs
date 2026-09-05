@@ -9,9 +9,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CloudRequest, ComposeErrorCode, CompositionDecision, DELIVERY_AUTO_SEND, DELIVERY_LIVE_TYPE,
-    DELIVERY_REPLACE_DELIVERED, DELIVERY_STATE_UNSENT, DeliveryFlags, FallbackTrigger,
-    RenderingRoute, RoutingDecision, RuleId,
+    CloudRequest, ComposeErrorCode, ComposeSpanSummary, CompositionDecision, DELIVERY_AUTO_SEND,
+    DELIVERY_LIVE_TYPE, DELIVERY_REPLACE_DELIVERED, DELIVERY_STATE_UNSENT, DeliveryFlags,
+    FallbackTrigger, RenderingRoute, RoutingDecision, RuleId,
 };
 
 #[cfg(feature = "dpr-eval-late-retain")]
@@ -94,6 +94,69 @@ pub struct DprDeliveryEvidence {
     auto_send: bool,
     live_type: bool,
     replace_delivered: bool,
+}
+
+/// B5 additive per-span adjudication evidence (applied N/M spans, rejections
+/// with closed reasons). Recorded only when the compose gate reached per-span
+/// adjudication; candidate-level rejects, soft salvage, and records written
+/// before B5 carry no field. `skip_serializing_if` plus serde `default` keep
+/// old persisted lines deserializable and new lines backward-readable.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DprSpanAdjudication {
+    total_spans: u32,
+    applied_spans: u32,
+    rejected: Vec<DprSpanRejection>,
+}
+
+/// One dropped derivation span with its closed rejection reason.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DprSpanRejection {
+    span_index: u32,
+    reason: ComposeErrorCode,
+}
+
+impl DprSpanAdjudication {
+    fn from_summary(summary: &ComposeSpanSummary) -> Self {
+        Self {
+            total_spans: u32::try_from(summary.total_spans()).unwrap_or(u32::MAX),
+            applied_spans: u32::try_from(summary.applied_spans()).unwrap_or(u32::MAX),
+            rejected: summary
+                .rejected()
+                .iter()
+                .map(|rejection| DprSpanRejection {
+                    span_index: u32::try_from(rejection.span_index()).unwrap_or(u32::MAX),
+                    reason: rejection.reason(),
+                })
+                .collect(),
+        }
+    }
+
+    #[must_use]
+    pub const fn total_spans(&self) -> u32 {
+        self.total_spans
+    }
+
+    #[must_use]
+    pub const fn applied_spans(&self) -> u32 {
+        self.applied_spans
+    }
+
+    #[must_use]
+    pub fn rejected(&self) -> &[DprSpanRejection] {
+        &self.rejected
+    }
+}
+
+impl DprSpanRejection {
+    #[must_use]
+    pub const fn span_index(&self) -> u32 {
+        self.span_index
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> ComposeErrorCode {
+        self.reason
+    }
 }
 
 impl DprDeliveryEvidence {
@@ -223,6 +286,8 @@ pub struct DprDiagnostic {
     compose_decision: Option<CompositionDecision>,
     fallback_trigger: Option<FallbackTrigger>,
     reason_codes: Vec<ComposeErrorCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    span_adjudication: Option<DprSpanAdjudication>,
     feedback_kind: DprFeedbackKind,
     feedback_message: Option<String>,
     delivery: DprDeliveryEvidence,
@@ -256,6 +321,7 @@ impl DprDiagnostic {
             compose_decision: None,
             fallback_trigger: None,
             reason_codes: Vec::new(),
+            span_adjudication: None,
             feedback_kind: DprFeedbackKind::Silent,
             feedback_message: None,
             delivery: DprDeliveryEvidence::dpr_default(),
@@ -342,6 +408,15 @@ impl DprDiagnostic {
                 }
             }
         }
+    }
+
+    /// Records the additive B5 per-span adjudication summary. Absent unless
+    /// the compose gate reached per-span adjudication; never carries candidate
+    /// text — only span counts, indices, and closed reason codes.
+    pub fn record_span_adjudication(&mut self, summary: &ComposeSpanSummary) {
+        let mut adjudication = DprSpanAdjudication::from_summary(summary);
+        adjudication.rejected.truncate(MAX_DPR_DIAGNOSTIC_EVENTS);
+        self.span_adjudication = Some(adjudication);
     }
 
     pub fn delivery_emitted(&mut self, at: Duration, flags: DeliveryFlags) {
@@ -443,6 +518,11 @@ impl DprDiagnostic {
     }
 
     #[must_use]
+    pub fn span_adjudication(&self) -> Option<&DprSpanAdjudication> {
+        self.span_adjudication.as_ref()
+    }
+
+    #[must_use]
     pub const fn delivery_flags(&self) -> &DprDeliveryEvidence {
         &self.delivery
     }
@@ -465,6 +545,9 @@ impl DprDiagnostic {
             keep
         });
         self.reason_codes.truncate(MAX_DPR_DIAGNOSTIC_EVENTS);
+        if let Some(adjudication) = self.span_adjudication.as_mut() {
+            adjudication.rejected.truncate(MAX_DPR_DIAGNOSTIC_EVENTS);
+        }
         match self.feedback_kind {
             DprFeedbackKind::Silent => self.feedback_message = None,
             DprFeedbackKind::MinimalStatus => {
