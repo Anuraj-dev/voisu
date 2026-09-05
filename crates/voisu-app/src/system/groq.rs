@@ -76,7 +76,7 @@ impl TranscriptProvider for GroqProvider {
                     .unwrap_or_else(crate::dictionary::whisper_prompt),
                 self.language
                     .clone()
-                    .unwrap_or_else(groq_transcription_language),
+                    .unwrap_or_else(crate::config::transcription_language),
             ),
             buffer: Vec::new(),
             streamed_bytes: 0,
@@ -136,13 +136,6 @@ impl GroqRequestParams {
             prompt,
         }
     }
-}
-
-/// Resolve the exact Groq transcription language once at a Recording boundary.
-#[must_use]
-pub fn groq_transcription_language() -> String {
-    std::env::var("VOISU_GROQ_LANGUAGE")
-        .unwrap_or_else(|_| DEFAULT_TRANSCRIPTION_LANGUAGE.to_owned())
 }
 
 /// Whether the Groq stream should pre-stream chunks yet. Recordings at or below

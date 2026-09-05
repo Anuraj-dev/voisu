@@ -9894,6 +9894,133 @@ fn fixture_dir(runtime_dir: &Path) -> PathBuf {
     diagnostics_dir(runtime_dir).join("fixtures")
 }
 
+/// Extracts one multipart form field's value from a captured Groq request body
+/// (curl `--form` framing: a `Content-Disposition: form-data; name="…"`,
+/// blank line, then the value line).
+fn groq_form_field<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    let marker = format!("name=\"{name}\"");
+    let start = body.find(&marker)? + marker.len();
+    let value = body[start..].trim_start_matches(['\r', '\n']);
+    let end = value.find("\r\n").unwrap_or(value.len());
+    Some(&value[..end])
+}
+
+// Slice B6: the configured transcription language reaches BOTH provider
+// requests — Deepgram's streaming `language` query param and Groq's `language`
+// form field — normalized to lowercase, from one Recording-boundary resolution.
+#[test]
+fn the_configured_transcription_language_reaches_both_provider_requests() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do /usr/bin/sleep 1; i=$((i + 1)); done\n",
+    );
+    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
+    let deepgram_endpoint = spawn_mock_deepgram(
+        commands.path(),
+        MockDeepgramBehavior::Finalize("The account is ready."),
+    );
+    let (groq_endpoint, groq_requests, _groq_live_requests, groq_server) =
+        local_groq_chunk_server(vec!["The account is ready."]);
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", &groq_endpoint),
+            ("VOISU_TRANSCRIPTION_LANGUAGE", "de-DE"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "pw-record.ready");
+    let stopped = voisu(runtime.path(), "stop");
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    wait_for_marker(commands.path(), "deepgram.closed");
+    groq_server.join().unwrap();
+
+    let handshake = fs::read_to_string(commands.path().join("deepgram.handshake")).unwrap();
+    assert!(
+        handshake.contains("language=de-de"),
+        "Deepgram must receive the normalized configured language: {handshake}"
+    );
+    let requests = groq_requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the Groq finalize request is captured");
+    let body = String::from_utf8_lossy(&requests[0]);
+    assert_eq!(
+        groq_form_field(&body, "language"),
+        Some("de-de"),
+        "Groq must receive the normalized configured language: {body}"
+    );
+}
+
+// The unset default must stay byte-identical to the pre-B6 behavior: both
+// providers are asked for the historic English default.
+#[test]
+fn the_unset_transcription_language_keeps_the_historic_english_request() {
+    let runtime = TempDir::new().unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(
+        commands.path(),
+        "pw-record",
+        "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do /usr/bin/sleep 1; i=$((i + 1)); done\n",
+    );
+    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
+    let deepgram_endpoint = spawn_mock_deepgram(
+        commands.path(),
+        MockDeepgramBehavior::Finalize("The account is ready."),
+    );
+    let (groq_endpoint, groq_requests, _groq_live_requests, groq_server) =
+        local_groq_chunk_server(vec!["The account is ready."]);
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("VOISU_DEEPGRAM_API_KEY", "deepgram-controlled-secret"),
+            ("VOISU_GROQ_API_KEY", "controlled-secret"),
+            ("VOISU_DEEPGRAM_TRANSCRIPTION_URL", &deepgram_endpoint),
+            ("VOISU_GROQ_TRANSCRIPTION_URL", &groq_endpoint),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    wait_for_marker(commands.path(), "pw-record.ready");
+    let stopped = voisu(runtime.path(), "stop");
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    wait_for_marker(commands.path(), "deepgram.closed");
+    groq_server.join().unwrap();
+
+    let handshake = fs::read_to_string(commands.path().join("deepgram.handshake")).unwrap();
+    assert!(
+        handshake.contains("language=en"),
+        "unset keeps the historic Deepgram language param: {handshake}"
+    );
+    let requests = groq_requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the Groq finalize request is captured");
+    let body = String::from_utf8_lossy(&requests[0]);
+    assert_eq!(
+        groq_form_field(&body, "language"),
+        Some("en"),
+        "unset keeps the historic Groq language form field: {body}"
+    );
+}
+
 #[test]
 fn fixed_fixture_replays_through_provider_and_validation_boundaries() {
     let runtime = TempDir::new().unwrap();
@@ -9924,9 +10051,126 @@ fn fixed_fixture_replays_through_provider_and_validation_boundaries() {
         replayed["evidence"]["transcript_selection"],
         "source_deepgram"
     );
+    // Replay evidence now carries the machine-readable transcripts (additive
+    // fields): both provider-tagged Source Transcripts and the final selected
+    // text, so a local evaluator can score a replay without scraping human
+    // output.
+    let sources = replayed["evidence"]["source_transcripts"]
+        .as_array()
+        .expect("replay evidence carries the Source Transcript texts");
+    assert_eq!(
+        sources
+            .iter()
+            .map(|source| (
+                source["provider"].as_str().unwrap(),
+                source["text"].as_str().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("deepgram", "Replay this dictation."),
+            ("groq", "Replay this dictation")
+        ],
+        "{replayed}"
+    );
+    assert_eq!(
+        replayed["evidence"]["final_transcript"], "Replay this dictation.",
+        "the selected Source Transcript becomes the final transcript: {replayed}"
+    );
     // The daemon stays reusable after a replay: a real Recording still works.
     assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
+}
+
+// The B1 harness gap, closed at the CLI: `voisu replay --json` prints the
+// machine-readable Response — evidence with both provider-tagged Source
+// Transcripts, the final Transcript, the decision detail, and the provider
+// timings — while the plain invocation keeps printing exactly the historic
+// human message. Both flag positions are accepted.
+#[test]
+fn replay_json_prints_machine_readable_evidence_and_human_mode_stays_identical() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Replay this dictation."),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Replay this dictation"),
+        ],
+    );
+    fs::write(
+        fixture_dir(runtime.path()).join("cli.pcm"),
+        vec![1_u8; 3_200],
+    )
+    .unwrap();
+
+    let human = voisu_with_env(runtime.path(), &["replay", "cli.pcm"], &[]);
+    assert!(human.status.success(), "{}", stderr(&human));
+    assert_eq!(
+        stdout(&human),
+        "replayed fixture through 2 Source Transcript(s)\n",
+        "the human output stays byte-identical to the pre---json CLI"
+    );
+
+    for arguments in [
+        vec!["replay", "--json", "cli.pcm"],
+        vec!["replay", "cli.pcm", "--json"],
+    ] {
+        let json = voisu_with_env(runtime.path(), &arguments, &[]);
+        assert!(
+            json.status.success(),
+            "{}: {}",
+            stderr(&json),
+            arguments.join(" ")
+        );
+        let parsed: Value = serde_json::from_str(&stdout(&json))
+            .expect("--json output must parse as machine-readable JSON");
+        assert_eq!(parsed["ok"], true, "{parsed}");
+        assert_eq!(
+            parsed["message"], "replayed fixture through 2 Source Transcript(s)",
+            "{parsed}"
+        );
+        let evidence = &parsed["evidence"];
+        // The provider-tagged Source Transcript texts.
+        let sources = evidence["source_transcripts"]
+            .as_array()
+            .expect("--json evidence carries the Source Transcript texts");
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| (
+                    source["provider"].as_str().unwrap(),
+                    source["text"].as_str().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("deepgram", "Replay this dictation."),
+                ("groq", "Replay this dictation")
+            ],
+            "{parsed}"
+        );
+        // The final selected Transcript.
+        assert_eq!(
+            evidence["final_transcript"], "Replay this dictation.",
+            "{parsed}"
+        );
+        // The decision detail and the telemetry trio.
+        assert_eq!(
+            evidence["transcript_selection"], "source_deepgram",
+            "{parsed}"
+        );
+        assert_eq!(
+            evidence["source_transcript_providers"],
+            serde_json::json!(["deepgram", "groq"]),
+            "{parsed}"
+        );
+        let timings = evidence["provider_timings_ms"]
+            .as_array()
+            .expect("--json evidence carries the provider timings");
+        assert_eq!(
+            timings.len(),
+            2,
+            "both provider timings are carried: {parsed}"
+        );
+    }
 }
 
 #[test]

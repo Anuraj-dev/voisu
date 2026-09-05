@@ -189,6 +189,8 @@ mod tests {
             source_selection_diagnostic: None,
             intent_reconstruction: None,
             confidence_arbitration: None,
+            source_transcripts: Vec::new(),
+            final_transcript: None,
         }
     }
 

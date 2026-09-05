@@ -34,10 +34,10 @@ pub use diagnostics::{
     SMART_WRITING_DIAGNOSTIC_VERSION, SmartWritingDiagnostic, SmartWritingEditEvidence,
     SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode, SourceCoverageRecord,
     SourceSelectionConfidence, SourceSelectionDiagnostic, SourceTranscriptRecord, TELEMETRY_SCHEMA,
-    TEXT_SHA256_FINGERPRINT_LEN, clamp_utf8_bytes, correlation_id, export_record,
-    is_secret_env_key, is_text_sha256_fingerprint, redacted_environment, replay_capture,
-    sanitize_url, scrub_embedded_urls, scrub_secret_values, text_sha256_fingerprint,
-    unix_millis_now,
+    TEXT_SHA256_FINGERPRINT_LEN, clamp_stored_transcript_text, clamp_utf8_bytes, correlation_id,
+    export_record, is_secret_env_key, is_text_sha256_fingerprint, redacted_environment,
+    replay_capture, sanitize_url, scrub_embedded_urls, scrub_secret_values,
+    text_sha256_fingerprint, unix_millis_now,
 };
 
 mod confidence_arbitration;
@@ -395,6 +395,18 @@ pub struct LifecycleEvidence {
     /// stay parseable in both skew directions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence_arbitration: Option<ConfidenceArbitrationDiagnostic>,
+    /// Replay-only additive evidence: the provider-tagged Source Transcript
+    /// texts the replay produced and the final selected Transcript text, so a
+    /// machine reader can score a replayed fixture without scraping human
+    /// output. Live Recordings never populate these — the persisted history
+    /// record already carries the same texts — and `default` plus
+    /// `skip_serializing_if` keep every pre-existing response and reader
+    /// byte-compatible in both skew directions. Texts are clamped to
+    /// [`MAX_STORED_TEXT`] exactly like history records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_transcripts: Vec<SourceTranscriptRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_transcript: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4391,4 +4403,117 @@ pub trait ShortcutSession: Send {
     /// signals that the underlying connection ended (all streams closed) — a
     /// recoverable stream failure the listener answers by rebinding.
     fn next_event(&mut self) -> BoundaryFuture<'_, ShortcutEvent>;
+}
+
+#[cfg(test)]
+mod replay_evidence_additivity_tests {
+    use super::*;
+
+    // The replay evidence texts are ADDITIVE: an older daemon's response —
+    // with no `source_transcripts` and no `final_transcript` — must keep
+    // deserializing, and an evidence without them must serialize without the
+    // keys, so pre-change clients and readers stay byte-compatible in both
+    // skew directions.
+    #[test]
+    fn evidence_without_replay_texts_round_trips_without_them() {
+        let old_json = r#"{
+            "recording_id": 7,
+            "correlation_id": "rec-4242-7-1700000000000",
+            "stages": ["providers_completed", "validation_completed"],
+            "delivery_count": 0,
+            "streamed_chunk_count": 0,
+            "source_transcript_providers": ["deepgram", "groq"],
+            "provider_timings_ms": []
+        }"#;
+        let evidence: LifecycleEvidence =
+            serde_json::from_str(old_json).expect("a pre-replay-texts response must deserialize");
+        assert!(evidence.source_transcripts.is_empty());
+        assert!(evidence.final_transcript.is_none());
+        let reencoded = serde_json::to_value(&evidence).unwrap();
+        assert!(
+            reencoded.get("source_transcripts").is_none(),
+            "empty replay texts must not appear on the wire: {reencoded}"
+        );
+        assert!(
+            reencoded.get("final_transcript").is_none(),
+            "an absent final transcript must not appear on the wire: {reencoded}"
+        );
+    }
+
+    #[test]
+    fn a_replay_response_evidence_carries_provider_tagged_texts_and_the_final() {
+        let evidence = LifecycleEvidence {
+            recording_id: 1,
+            correlation_id: "rec-1-1-1".to_owned(),
+            stages: vec![LifecycleStage::ProvidersCompleted],
+            delivery_count: 0,
+            delivery_method: None,
+            delivery_fallback_reason: None,
+            streamed_chunk_count: 0,
+            source_transcript_providers: vec![Provider::Deepgram, Provider::Groq],
+            first_chunk_ms: None,
+            capture_finalized_ms: None,
+            truncated_by: None,
+            provider_timings_ms: vec![
+                ProviderTiming {
+                    provider: Provider::Deepgram,
+                    completed_ms: 4,
+                },
+                ProviderTiming {
+                    provider: Provider::Groq,
+                    completed_ms: 6,
+                },
+            ],
+            provider_failures: Vec::new(),
+            release_to_text_ms: None,
+            recording_duration_ms: None,
+            stop_to_finalized_ms: None,
+            stop_to_delivered_ms: None,
+            transcript_selection: Some(TranscriptSelection::SourceDeepgram),
+            validation_reason: None,
+            fallback_reason: None,
+            reconciliation_requested: false,
+            recovery_attempted: false,
+            source_selection_diagnostic: None,
+            intent_reconstruction: None,
+            confidence_arbitration: None,
+            source_transcripts: vec![
+                SourceTranscriptRecord {
+                    provider: Provider::Deepgram,
+                    text: "Replay this dictation.".to_owned(),
+                },
+                SourceTranscriptRecord {
+                    provider: Provider::Groq,
+                    text: "Replay this dictation".to_owned(),
+                },
+            ],
+            final_transcript: Some("Replay this dictation.".to_owned()),
+        };
+        let encoded = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(
+            encoded["source_transcripts"]
+                .as_array()
+                .expect("source transcripts serialize")
+                .iter()
+                .map(|source| (
+                    source["provider"].as_str().unwrap(),
+                    source["text"].as_str().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("deepgram", "Replay this dictation."),
+                ("groq", "Replay this dictation")
+            ]
+        );
+        assert_eq!(encoded["final_transcript"], "Replay this dictation.");
+        // And it reads back through the same type, so a --json consumer can
+        // round-trip the shape.
+        let decoded: LifecycleEvidence =
+            serde_json::from_value(encoded).expect("replay evidence round-trips");
+        assert_eq!(
+            decoded.final_transcript.as_deref(),
+            Some("Replay this dictation.")
+        );
+        assert_eq!(decoded.source_transcripts.len(), 2);
+    }
 }

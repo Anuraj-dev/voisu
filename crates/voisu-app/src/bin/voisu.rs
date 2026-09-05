@@ -41,6 +41,7 @@ enum DiagnosticResponseKind {
 enum CliAction {
     Daemon(Command),
     History { json: bool },
+    Replay { path: String, json: bool },
     Doctor { verbose: bool },
     Setup,
     AuthSet(Provider),
@@ -61,6 +62,7 @@ fn main() -> ExitCode {
     match parse_command() {
         Ok(CliAction::Daemon(command)) => daemon_command(command),
         Ok(CliAction::History { json }) => history_command(json),
+        Ok(CliAction::Replay { path, json }) => replay_command(&path, json),
         Ok(CliAction::Doctor { verbose }) => doctor(verbose),
         Ok(CliAction::Setup) => setup(),
         Ok(CliAction::AuthSet(provider)) => match credential_from_stdin() {
@@ -173,6 +175,36 @@ fn daemon_command(command: Command) -> ExitCode {
     } else {
         fail(4, &response.message)
     }
+}
+
+/// `voisu replay <fixture-name>`. Without `--json` the output is exactly the
+/// historic human message. With `--json` the full machine-readable `Response`
+/// is printed — evidence including the provider-tagged Source Transcripts, the
+/// final Transcript text, the decision detail, and the provider timings — so
+/// local evaluation can score a replay without scraping human output. The
+/// response travels the same Unix-socket frame path as every command, so the
+/// `MAX_RESPONSE_BYTES` read budget applies to it; the daemon additionally
+/// clamps each evidence transcript to `MAX_STORED_TEXT`, keeping a replay
+/// response orders of magnitude below that budget.
+fn replay_command(path: &str, json: bool) -> ExitCode {
+    let response = match send_command(Command::Replay(ReplayFixturePath::new(path))) {
+        Ok(response) => response,
+        Err(code) => return code,
+    };
+    if !response.ok {
+        return fail(4, &response.message);
+    }
+    if json {
+        return match serde_json::to_string_pretty(&response) {
+            Ok(encoded) => {
+                println!("{encoded}");
+                ExitCode::SUCCESS
+            }
+            Err(_) => fail(1, "daemon returned an invalid replay response"),
+        };
+    }
+    println!("{}", response.message);
+    ExitCode::SUCCESS
 }
 
 /// `voisu history`. By default renders a human-first, newest-first view that
@@ -1143,9 +1175,18 @@ fn parse_command() -> Result<CliAction, String> {
         [command, correlation_id] if command == "export" => Ok(CliAction::Daemon(Command::Export(
             ExportCorrelationId::new(correlation_id.clone()),
         ))),
-        [command, path] if command == "replay" => Ok(CliAction::Daemon(Command::Replay(
-            ReplayFixturePath::new(path.clone()),
-        ))),
+        [command, path] if command == "replay" => Ok(CliAction::Replay {
+            path: path.clone(),
+            json: false,
+        }),
+        [command, flag, path] if command == "replay" && flag == "--json" => Ok(CliAction::Replay {
+            path: path.clone(),
+            json: true,
+        }),
+        [command, path, flag] if command == "replay" && flag == "--json" => Ok(CliAction::Replay {
+            path: path.clone(),
+            json: true,
+        }),
         [command] if command == "doctor" => Ok(CliAction::Doctor { verbose: false }),
         [command, flag] if command == "doctor" && (flag == "--verbose" || flag == "-v") => {
             Ok(CliAction::Doctor { verbose: true })
@@ -1261,7 +1302,7 @@ commands:
   shortcut
   history [--json]
   export <correlation-id>
-  replay <fixture-name>
+  replay [--json] <fixture-name>
   doctor [--verbose|-v]
   auth set <groq|deepgram>
   auth verify <groq|deepgram>

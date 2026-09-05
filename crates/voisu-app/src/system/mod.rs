@@ -90,6 +90,10 @@ pub const CREDENTIAL_PREP_WORK_DEADLINE: Duration = Duration::from_secs(13);
 /// and keep awaiting terminal child wait + pipe EOF.
 pub const CREDENTIAL_REAP_WATCHDOG: Duration = Duration::from_secs(2);
 
+/// The transcription language every provider is asked for when
+/// `VOISU_TRANSCRIPTION_LANGUAGE` is unset (or invalid — see
+/// `voisu_app::config::resolve_transcription_language`). Exactly the historic
+/// default, so an unset environment behaves byte-identically to before B6.
 pub const DEFAULT_TRANSCRIPTION_LANGUAGE: &str = "en";
 
 /// End-to-end budget shared by both sides of a paged history/export transfer.
@@ -1115,6 +1119,27 @@ mod tests {
         assert!(config.contains("Authorization: Bearer secret-token"));
     }
 
+    // Slice B6: the Groq language request field is wired to the same resolved
+    // value as Deepgram's `language` query param — any validated code is
+    // forwarded verbatim, not just the English default.
+    #[test]
+    fn groq_curl_config_carries_a_resolved_non_english_language() {
+        let credential = Credential::new("secret-token".to_owned()).unwrap();
+        let params = GroqRequestParams {
+            model: "whisper-large-v3".to_owned(),
+            language: "de-de".to_owned(),
+            prompt: String::new(),
+        };
+        let config = build_groq_curl_config(
+            "https://api.groq.com/v1",
+            &credential,
+            "/tmp/rec.wav",
+            &params,
+        )
+        .expect("valid config");
+        assert!(config.contains("form = \"language=de-de\""), "{config}");
+    }
+
     #[test]
     fn groq_recording_payload_is_valid_flac() {
         let pcm = vec![0_u8; 16_000 * 2];
@@ -2075,6 +2100,7 @@ mod tests {
                 "smart format".to_owned(),
                 "  ".to_owned(),
             ],
+            "en",
         )
         .unwrap();
         assert!(
@@ -2083,6 +2109,7 @@ mod tests {
         );
         for expected in [
             "model=nova-3",
+            "language=en",
             "encoding=linear16",
             "sample_rate=16000",
             "channels=1",
@@ -2103,18 +2130,50 @@ mod tests {
         );
     }
 
+    // Slice B6: the unset-environment default ("en") must produce a
+    // BYTE-IDENTICAL streaming URL to the pre-B6 fixed param list — same
+    // values, same order.
+    #[test]
+    fn deepgram_streaming_url_default_language_is_byte_identical_to_the_pre_b6_request() {
+        let url = deepgram_streaming_url("wss://api.deepgram.com/v1/listen", &[], "en").unwrap();
+        assert_eq!(
+            url,
+            "wss://api.deepgram.com/v1/listen?model=nova-3&language=en&encoding=linear16\
+             &sample_rate=16000&channels=1&interim_results=true&smart_format=true\
+             &punctuate=true&endpointing=300&utterance_end_ms=1000"
+        );
+    }
+
+    // A resolved non-English language rides the same query slot, and provider
+    // codes pass through verbatim — BCP-47 region tags and Deepgram's
+    // multi-language code alike.
+    #[test]
+    fn deepgram_streaming_url_carries_the_resolved_transcription_language() {
+        for language in ["de-de", "es-419", "multi"] {
+            let url =
+                deepgram_streaming_url("wss://api.deepgram.com/v1/listen", &[], language).unwrap();
+            assert!(
+                url.contains(&format!("&language={language}&")),
+                "{url} is missing language={language}"
+            );
+        }
+    }
+
     // An EMPTY dictionary must produce a byte-identical request: no keyterm
     // parameter at all, so the provider sees exactly the pre-B2 request.
     #[test]
     fn deepgram_streaming_url_with_no_keyterms_omits_the_parameter_entirely() {
-        let plain = deepgram_streaming_url("wss://api.deepgram.com/v1/listen", &[]).unwrap();
+        let plain = deepgram_streaming_url("wss://api.deepgram.com/v1/listen", &[], "en").unwrap();
         assert!(!plain.contains("keyterm="), "{plain}");
         // Blank terms are dropped by the URL builder itself (mirroring the
         // persisted-dictionary parser, which can never yield an empty term):
         // even a caller handing it blanks keeps the request byte-identical.
-        let blanks =
-            deepgram_streaming_url("wss://api.deepgram.com/v1/listen", &vec![String::new(); 3])
-                .unwrap();
+        let blanks = deepgram_streaming_url(
+            "wss://api.deepgram.com/v1/listen",
+            &vec![String::new(); 3],
+            "en",
+        )
+        .unwrap();
         assert_eq!(plain, blanks, "blank keyterms must change nothing");
     }
 
@@ -2125,7 +2184,8 @@ mod tests {
     fn deepgram_streaming_url_through_the_keyterm_cap_never_exceeds_the_budgets() {
         let terms: Vec<String> = (0..600).map(|index| format!("term{index:03}")).collect();
         let capped = crate::dictionary::deepgram_keyterms(&terms);
-        let url = deepgram_streaming_url("wss://api.deepgram.com/v1/listen", &capped).unwrap();
+        let url =
+            deepgram_streaming_url("wss://api.deepgram.com/v1/listen", &capped, "en").unwrap();
         assert_eq!(
             url.matches("keyterm=").count(),
             capped.len(),
@@ -2137,23 +2197,25 @@ mod tests {
     #[test]
     fn deepgram_streaming_url_rewrites_http_schemes_and_requires_wss_off_loopback() {
         assert!(
-            deepgram_streaming_url("https://api.deepgram.com/v1/listen", &[])
+            deepgram_streaming_url("https://api.deepgram.com/v1/listen", &[], "en")
                 .unwrap()
                 .starts_with("wss://api.deepgram.com/v1/listen?")
         );
         assert!(
-            deepgram_streaming_url("http://127.0.0.1:9999/v1/listen", &[])
+            deepgram_streaming_url("http://127.0.0.1:9999/v1/listen", &[], "en")
                 .unwrap()
                 .starts_with("ws://127.0.0.1:9999/v1/listen?")
         );
-        assert!(deepgram_streaming_url("ws://deepgram.test/v1/listen", &[]).is_err());
-        assert!(deepgram_streaming_url("http://deepgram.test/v1/listen", &[]).is_err());
+        assert!(deepgram_streaming_url("ws://deepgram.test/v1/listen", &[], "en").is_err());
+        assert!(deepgram_streaming_url("http://deepgram.test/v1/listen", &[], "en").is_err());
         // The loopback decision is the PARSED host: the whole 127.0.0.0/8 range
         // is loopback, and a lookalike suffix is a different host entirely.
-        assert!(deepgram_streaming_url("ws://127.7.7.7:9/v1/listen", &[]).is_ok());
-        assert!(deepgram_streaming_url("ws://localhost.attacker.example/v1/listen", &[]).is_err());
+        assert!(deepgram_streaming_url("ws://127.7.7.7:9/v1/listen", &[], "en").is_ok());
+        assert!(
+            deepgram_streaming_url("ws://localhost.attacker.example/v1/listen", &[], "en").is_err()
+        );
         // A base that already carries a query keeps it and appends with '&'.
-        let url = deepgram_streaming_url("wss://host/listen?tier=custom", &[]).unwrap();
+        let url = deepgram_streaming_url("wss://host/listen?tier=custom", &[], "en").unwrap();
         assert!(url.contains("?tier=custom&model=nova-3"), "{url}");
     }
 
@@ -2178,7 +2240,7 @@ mod tests {
         reaper: &ProviderReaper,
     ) -> DeepgramStream {
         DeepgramStream::connect(
-            deepgram_streaming_url(base, &[]).unwrap(),
+            deepgram_streaming_url(base, &[], "en").unwrap(),
             Credential::new("controlled-credential".to_owned()).unwrap(),
             keepalive,
             close_grace,
@@ -2579,17 +2641,24 @@ mod tests {
         // a loopback-looking userinfo but the HOST is attacker.example; the
         // Token header must never travel over that connection (let alone in
         // plaintext).
-        assert!(deepgram_streaming_url("ws://127.0.0.1:80@attacker.example/listen", &[]).is_err());
-        assert!(deepgram_streaming_url("http://localhost@attacker.example/listen", &[]).is_err());
-        assert!(deepgram_streaming_url("wss://user@api.deepgram.com/v1/listen", &[]).is_err());
-        assert!(deepgram_streaming_url("ws:///listen", &[]).is_err());
+        assert!(
+            deepgram_streaming_url("ws://127.0.0.1:80@attacker.example/listen", &[], "en").is_err()
+        );
+        assert!(
+            deepgram_streaming_url("http://localhost@attacker.example/listen", &[], "en").is_err()
+        );
+        assert!(
+            deepgram_streaming_url("wss://user@api.deepgram.com/v1/listen", &[], "en").is_err()
+        );
+        assert!(deepgram_streaming_url("ws:///listen", &[], "en").is_err());
         // The EMPTY userinfo form parses with no username and no password (the
         // url crate drops the `@` entirely), so the raw authority is what sees it.
-        assert!(deepgram_streaming_url("ws://@localhost/listen", &[]).is_err());
+        assert!(deepgram_streaming_url("ws://@localhost/listen", &[], "en").is_err());
         // A `\` ends the url crate's userinfo scan but is accepted inside
         // curl's last-`@` split: fail closed on the raw string.
         assert!(
-            deepgram_streaming_url("ws://localhost:8080\\@attacker.example/listen", &[]).is_err()
+            deepgram_streaming_url("ws://localhost:8080\\@attacker.example/listen", &[], "en")
+                .is_err()
         );
     }
 

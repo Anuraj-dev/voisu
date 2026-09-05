@@ -34,13 +34,12 @@ use voisu_app::smart_writing::{
     final_transform_and_deliver,
 };
 use voisu_app::system::{
-    CAPTURE_FINALIZE_DEADLINE, CredentialPreparationOwner, DEFAULT_TRANSCRIPTION_LANGUAGE,
-    DIAGNOSTIC_RESPONSE_DEADLINE, DeepgramProvider, DesktopNotifier, FedoraShortcutPortal,
-    GrammarCapability, GroqProvider, GuardedDelivery, INTENT_RECONSTRUCTION_DEADLINE,
-    MergeResultValidator, PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE,
-    PipeWireCapture, PortalClipboardDelivery, ProviderReaper, RECONCILIATION_DEADLINE,
-    RECOVERY_ABORT_DEADLINE, WlClipboard, clipboard_backend_display_reachable,
-    groq_transcription_language,
+    CAPTURE_FINALIZE_DEADLINE, CredentialPreparationOwner, DIAGNOSTIC_RESPONSE_DEADLINE,
+    DeepgramProvider, DesktopNotifier, FedoraShortcutPortal, GrammarCapability, GroqProvider,
+    GuardedDelivery, INTENT_RECONSTRUCTION_DEADLINE, MergeResultValidator,
+    PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture,
+    PortalClipboardDelivery, ProviderReaper, RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
+    WlClipboard, clipboard_backend_display_reachable,
 };
 use voisu_core::{
     ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
@@ -54,7 +53,8 @@ use voisu_core::{
     ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SmartWritingDiagnostic,
     SourceTranscript, SourceTranscriptRecord, Transcript, TranscriptDecision,
     TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator, TriggerKeyBinding,
-    VersionEnvelope, replay_capture, resolve_session, sanitize_source_transcripts, socket_path,
+    VersionEnvelope, clamp_stored_transcript_text, replay_capture, resolve_session,
+    sanitize_source_transcripts, socket_path,
 };
 
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
@@ -648,16 +648,14 @@ async fn actor_loop(
     // Production adapters are built only at a Recording or replay boundary,
     // after resolving that operation's dictionary snapshot below. Controlled
     // adapters keep their existing one-shot failure seams across retries.
-    let mut deepgram: Option<Box<dyn TranscriptProvider>> =
-        controlled.then(|| build_deepgram_provider(deepgram_enabled, true, &[], &reaper));
-    let mut groq: Option<Box<dyn TranscriptProvider>> = controlled.then(|| {
-        build_groq_provider(
-            true,
-            String::new(),
-            DEFAULT_TRANSCRIPTION_LANGUAGE.to_owned(),
-            &reaper,
-        )
-    });
+    // Controlled adapters are built once at daemon start with one language
+    // resolution; every production Recording/replay boundary resolves its own
+    // snapshot below. The controlled adapters themselves never send a request.
+    let daemon_language = voisu_app::config::transcription_language();
+    let mut deepgram: Option<Box<dyn TranscriptProvider>> = controlled
+        .then(|| build_deepgram_provider(deepgram_enabled, true, &[], &daemon_language, &reaper));
+    let mut groq: Option<Box<dyn TranscriptProvider>> =
+        controlled.then(|| build_groq_provider(true, String::new(), daemon_language, &reaper));
     // The processing supervisor cannot inspect task-local provider state after a
     // panic, so retain the providers configured for this Recording beside the
     // actor-owned adapters and pass that list into every supervised stop path.
@@ -785,6 +783,10 @@ async fn actor_loop(
                     let replay_whisper_prompt = Arc::new(
                         voisu_app::dictionary::whisper_prompt_for_terms(&replay_terms),
                     );
+                    // One language resolution for the whole replay: both
+                    // provider builders and the supervised rebuild tail receive
+                    // exactly this snapshot.
+                    let replay_language = Arc::new(voisu_app::config::transcription_language());
                     validator
                         .as_mut()
                         .expect("validator is available")
@@ -798,12 +800,13 @@ async fn actor_loop(
                             deepgram_enabled,
                             false,
                             &replay_keyterms,
+                            &replay_language,
                             &reaper,
                         ));
                         groq = Some(build_groq_provider(
                             false,
                             replay_whisper_prompt.as_ref().clone(),
-                            groq_transcription_language(),
+                            replay_language.as_ref().clone(),
                             &reaper,
                         ));
                     }
@@ -841,6 +844,7 @@ async fn actor_loop(
                         deepgram_enabled,
                         replay_keyterms,
                         replay_whisper_prompt,
+                        replay_language,
                         reply,
                         tx.clone(),
                         reaper.clone(),
@@ -877,13 +881,16 @@ async fn actor_loop(
                         voisu_app::dictionary::whisper_prompt_for_terms(&session_terms);
                     let writing_mode = voisu_app::config::writing_mode();
                     let rendering_policy = voisu_app::config::rendering_policy();
-                    let groq_language = groq_transcription_language();
-                    let mut language_declarations = vec![(Provider::Groq, groq_language.clone())];
+                    // One language resolution per Recording boundary: the same
+                    // value is declared for every active provider (so
+                    // EnglishEligibility reads exactly what the requests send)
+                    // and handed to both request builders.
+                    let transcription_language = voisu_app::config::transcription_language();
+                    let mut language_declarations =
+                        vec![(Provider::Groq, transcription_language.clone())];
                     if deepgram_enabled {
-                        language_declarations.push((
-                            Provider::Deepgram,
-                            DEFAULT_TRANSCRIPTION_LANGUAGE.to_owned(),
-                        ));
+                        language_declarations
+                            .push((Provider::Deepgram, transcription_language.clone()));
                     }
                     let languages = ResolvedRecordingLanguages::new(language_declarations);
                     validator
@@ -899,12 +906,13 @@ async fn actor_loop(
                             deepgram_enabled,
                             false,
                             &session_keyterms,
+                            &transcription_language,
                             &reaper,
                         ));
                         groq = Some(build_groq_provider(
                             false,
                             session_whisper_prompt,
-                            groq_language,
+                            transcription_language,
                             &reaper,
                         ));
                     }
@@ -1858,6 +1866,11 @@ fn base_evidence(
         source_selection_diagnostic: None,
         intent_reconstruction: None,
         confidence_arbitration: None,
+        // Replay-only transcript texts; the replay path fills them, live
+        // Recordings leave them absent (the history record already carries
+        // the same texts).
+        source_transcripts: Vec::new(),
+        final_transcript: None,
     }
 }
 
@@ -1883,11 +1896,14 @@ fn duration_millis(duration: Duration) -> u64 {
 ///
 /// `keyterms` is an already-resolved Recording or replay snapshot. This builder
 /// never calls `merged_terms()`: the supervised replay tail can rebuild safely
-/// without filesystem I/O or fallible logging.
+/// without filesystem I/O or fallible logging. `language` is the Recording's
+/// already-resolved transcription-language snapshot, shared with Groq and the
+/// EnglishEligibility declaration.
 fn build_deepgram_provider(
     deepgram_enabled: bool,
     controlled: bool,
     keyterms: &[String],
+    language: &str,
     reaper: &ProviderReaper,
 ) -> Box<dyn TranscriptProvider> {
     if !deepgram_enabled {
@@ -1895,9 +1911,10 @@ fn build_deepgram_provider(
     } else if controlled {
         Box::new(ControlledProvider::from_env(Provider::Deepgram))
     } else {
-        Box::new(DeepgramProvider::with_keyterms(
+        Box::new(DeepgramProvider::with_keyterms_and_language(
             reaper.clone(),
             keyterms.to_vec(),
+            language.to_owned(),
         ))
     }
 }
@@ -2981,6 +2998,7 @@ async fn supervise_replay(
     deepgram_enabled: bool,
     keyterms: Arc<Vec<String>>,
     whisper_prompt: Arc<String>,
+    language: Arc<String>,
     reply: oneshot::Sender<Response>,
     actor: mpsc::Sender<ActorMessage>,
     reaper: ProviderReaper,
@@ -3003,6 +3021,7 @@ async fn supervise_replay(
                 deepgram_enabled,
                 &keyterms,
                 whisper_prompt.as_ref(),
+                &language,
                 &reaper,
             );
             ReplayCompletion {
@@ -3026,12 +3045,15 @@ async fn supervise_replay(
 }
 
 /// Rebuilds the provider and validation adapters after a replay panic dropped
-/// the originals. Mirrors the actor's startup construction.
+/// the originals. Mirrors the actor's startup construction. `language` is the
+/// replay's already-resolved language snapshot, so the tail needs no
+/// environment read and can emit no stray stderr.
 fn rebuild_replay_adapters(
     controlled: bool,
     deepgram_enabled: bool,
     keyterms: &[String],
     whisper_prompt: &str,
+    language: &str,
     reaper: &ProviderReaper,
 ) -> (
     Box<dyn TranscriptProvider>,
@@ -3043,7 +3065,8 @@ fn rebuild_replay_adapters(
     // tail, which must stay panic-free and free of filesystem I/O and stray
     // stderr. A live `voisu deepgram` toggle still takes effect only after the
     // documented daemon restart.
-    let deepgram = build_deepgram_provider(deepgram_enabled, controlled, keyterms, reaper);
+    let deepgram =
+        build_deepgram_provider(deepgram_enabled, controlled, keyterms, language, reaper);
     if controlled {
         (
             deepgram,
@@ -3058,7 +3081,7 @@ fn rebuild_replay_adapters(
             build_groq_provider(
                 false,
                 whisper_prompt.to_owned(),
-                groq_transcription_language(),
+                language.to_owned(),
                 reaper,
             ),
             if voisu_app::config::intent_reconstruction_enabled() {
@@ -3128,6 +3151,18 @@ async fn replay_recording(
             evidence.reconciliation_requested = outcome.decision.reconciliation_requested;
             evidence.recovery_attempted = outcome.decision.recovery_attempted;
             evidence.confidence_arbitration = outcome.decision.confidence_arbitration.clone();
+            // Machine-readable replay evidence: the provider-tagged Source
+            // Transcript texts and the final selected Transcript, clamped to
+            // the same per-text budget as history so the response stays
+            // bounded. Local-only, like every replay output.
+            evidence.source_transcripts = outcome
+                .source_transcripts
+                .iter()
+                .map(SourceTranscriptRecord::new)
+                .collect();
+            evidence.final_transcript = Some(clamp_stored_transcript_text(
+                outcome.decision.transcript.0.clone(),
+            ));
             Response::with_evidence(
                 true,
                 Some(DaemonState::Idle),
