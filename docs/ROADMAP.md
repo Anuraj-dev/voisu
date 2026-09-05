@@ -14,12 +14,19 @@ Shipped and working in the current release:
 
 - **Daemon** — runs as a systemd **user** service. Manages Recording lifecycle,
   the Trigger Key, provider streaming, and Delivery. Works without GTK.
-- **CLI** (`voisu`) — `voisu setup` guided wizard to validate and store provider
-  keys, `voisu delivery <mode>`, `voisu doctor` diagnostics, plus service
-  control through `systemctl --user`.
-- **Cloud providers** — Groq and Deepgram. Voisu streams to both concurrently
-  and reconciles their Source Transcripts within a bounded Provider Deadline,
-  using the valid result already available.
+- **CLI** (`voisu`) — `voisu setup` guided wizard, `voisu doctor` diagnostics,
+  recording control (`start`, `stop`, `toggle`, `status`, `shortcut`),
+  local diagnostics (`history`, `export`, `replay`), provider keys
+  (`auth set` / `auth verify`), behavior toggles (`deepgram on|off`,
+  `delivery`, `writing`, `rendering`), a personal pronunciation dictionary
+  (`dictionary add` / `remove` / `list`), and user-service management
+  (`voisu service install` / `start` / `stop` / `restart` / `status` /
+  `uninstall`). See the command reference in `README.md`.
+- **Cloud providers** — Groq and Deepgram. Deepgram streams the live
+  Recording; Groq receives the full audio at stop (a Recording past the
+  ~two-minute full-audio limit is transcribed in overlapping 60 s chunks
+  instead). Voisu reconciles the two Source Transcripts within a bounded
+  Provider Deadline, using the valid result already available.
 - **Trigger Key via desktop portals** — no raw input-device or privileged
   `uinput` access on the normal path. On KDE Plasma / GNOME a system dialog
   appears once and the choice persists.
@@ -44,11 +51,11 @@ Shipped and working in the current release:
 
 ## Current host status
 
-As of 2026-08-25, the installed source package `voisu` `0.38.0-1` works on
+As of 2026-09-05, the installed source package `voisu` `0.43.2-1` works on
 Raja's Omarchy/Hyprland host. Both user services are enabled and active.
-`voisu doctor` passes every check. Left Alt starts and stops Recordings, and
-clipboard Delivery works. The host-only Intent Reconstruction gate is enabled
-for #205. The #205 response-boundary repair is merged in
+`voisu doctor --verbose` passes every check. Caps Lock starts and stops
+Recordings, and clipboard Delivery works. The host-only Intent Reconstruction
+gate remains enabled for #205. The #205 response-boundary repair is merged in
 [PR #217](https://github.com/Anuraj-dev/voisu/pull/217), but the experiment
 still needs audio-backed evaluation before any safety or quality claim. No
 active runtime issue is known on this configured host.

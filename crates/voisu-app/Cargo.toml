@@ -1,6 +1,6 @@
 [package]
 name = "voisu-app"
-version = "0.43.2"
+version = "0.44.1"
 description = "Cloud-first Linux dictation for Wayland"
 edition.workspace = true
 license.workspace = true
@@ -106,6 +106,9 @@ serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Parsed-host endpoint policy (already in the tree via reqwest): prefix matching
+# on raw endpoint strings is bypassable, so the transport checks parse first.
+url = "2"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 voisu-core = { path = "../voisu-core" }
 xkbcommon = { version = "0.9", default-features = false }

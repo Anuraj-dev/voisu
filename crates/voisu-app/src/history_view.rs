@@ -157,22 +157,48 @@ fn render_record(index: usize, record: &Value, style: &RenderStyle) -> String {
 
     let capture_finalized = u64_field(record, "capture_finalized_ms");
     let release = u64_field(record, "release_to_text_ms");
-    // Tail = release_to_text_ms − capture_finalized_ms. A reversed pair
-    // (release earlier than capture) is an invalid record; `checked_sub`
-    // renders it as `—` rather than fabricating a plausible "tail 0ms".
-    let tail = match (capture_finalized, release) {
+    let stop_to_finalized = u64_field(record, "stop_to_finalized_ms");
+    let stop_to_delivered = u64_field(record, "stop_to_delivered_ms");
+    let recording_duration = u64_field(record, "recording_duration_ms");
+    // Tail latency is `stop_to_delivered_ms` on telemetry-schema-2 records —
+    // measured from stop, so it excludes speech duration. A legacy record only
+    // carried the start-anchored `release_to_text_ms` (inflated by the whole
+    // dictation); the best tail it supports is `release_to_text_ms −
+    // capture_finalized_ms`. A reversed pair (release earlier than capture) is
+    // an invalid record; `checked_sub` renders it as `—` rather than
+    // fabricating a plausible "tail 0ms".
+    let legacy_tail = match (capture_finalized, release) {
         (Some(capture), Some(release)) => release.checked_sub(capture),
         _ => None,
     };
+    let tail = stop_to_delivered.or(legacy_tail);
+    // Schema-2 records surface the stop-anchored timings instead of the
+    // deprecated start-anchored release: `settle` is stop → final transcript
+    // settled, `speech` is how long the user actually dictated.
+    let schema_2 = u64_field(record, "telemetry_schema") == Some(2)
+        || stop_to_delivered.is_some()
+        || stop_to_finalized.is_some()
+        || recording_duration.is_some();
 
     // Header: recency and the latency that matters.
-    let header = format!(
-        "{} {}  ·  tail {}  ·  release {}",
+    let mut header = format!(
+        "{} {}  ·  tail {}",
         style.paint(&format!("{index}."), Ansi::Bold),
         style.paint(&when, Ansi::Dim),
         style.paint(&millis_or_dash(tail), Ansi::CyanBold),
-        style.paint(&millis_or_dash(release), Ansi::Dim),
     );
+    if schema_2 {
+        header.push_str(&format!(
+            "  ·  settle {}  ·  speech {}",
+            style.paint(&millis_or_dash(stop_to_finalized), Ansi::Dim),
+            style.paint(&millis_or_dash(recording_duration), Ansi::Dim),
+        ));
+    } else {
+        header.push_str(&format!(
+            "  ·  release {}",
+            style.paint(&millis_or_dash(release), Ansi::Dim),
+        ));
+    }
     lines.push_str(&header);
     if let Some(tag) = delivery_tag(record) {
         lines.push_str("  ");
@@ -551,6 +577,32 @@ mod tests {
         assert!(out.contains("Groq: \"Render the full record\""), "{out}");
         assert!(out.contains("Deepgram ok 1620ms"), "{out}");
         assert!(out.contains("Groq ok 1450ms"), "{out}");
+    }
+
+    #[test]
+    fn schema_2_records_render_the_stop_anchored_timings() {
+        let out = render_one(json!({
+            "recorded_at_unix_ms": NOW - 120_000,
+            "final_transcript": "Honest timings",
+            "selection": "near_identical_groq",
+            "telemetry_schema": 2,
+            "release_to_text_ms": 1832,
+            "recording_duration_ms": 1620,
+            "stop_to_finalized_ms": 212,
+            "stop_to_delivered_ms": 402,
+            "provider_timings_ms": [
+                {"provider": "deepgram", "completed_ms": 1500},
+                {"provider": "groq", "completed_ms": 1450}
+            ],
+            "delivery_count": 1,
+            "delivery_method": "compositor_submitted"
+        }));
+        // Tail is the truthful stop-anchored value, and the start-anchored
+        // release (1832 ms, inflated by the whole dictation) is not shown.
+        assert!(out.contains("tail 402ms"), "{out}");
+        assert!(out.contains("settle 212ms"), "{out}");
+        assert!(out.contains("speech 1620ms"), "{out}");
+        assert!(!out.contains("release"), "{out}");
     }
 
     #[test]

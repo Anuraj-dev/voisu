@@ -500,7 +500,7 @@ fn merged_terms_with(user: Vec<String>) -> Vec<String> {
 
 /// Builds a comma-separated glossary from `terms`, appending terms in order
 /// until adding the next one would cross [`WHISPER_PROMPT_TOKEN_BUDGET`] real
-/// tokens. Truncation uses the conservative [`token_upper_bound`] so the result
+/// tokens. Truncation uses the conservative `token_upper_bound` so the result
 /// provably never exceeds the budget.
 fn whisper_prompt_from_terms(terms: &[String]) -> String {
     let mut prompt = String::new();

@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.43.2
+Version:        0.44.1
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,14 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Sat Sep 05 2026 Voisu maintainers <voisu@example.invalid> - 0.44.1-1
+- fix(security): close url-vs-curl parser differential; tighten binding checks
+- fix(security): parse provider endpoints; fail closed on duplicate Trigger Key bindings
+
+* Sat Sep 05 2026 Voisu maintainers <voisu@example.invalid> - 0.44.0-1
+- feat(telemetry): truthful stop-anchored latency fields (schema 2)
+- docs: truth pass on provider model, host status, and CLI reference
+
 * Thu Sep 03 2026 Voisu maintainers <voisu@example.invalid> - 0.43.2-1
 - test(app): wait out the reconstruction window before the settled history assert
 - ci: cover tools/transcript-quality in the format gate

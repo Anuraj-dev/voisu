@@ -54,12 +54,19 @@ impl TranscriptProvider for GroqProvider {
         let credential = SecretStore::load(&mut SecretToolStore, Provider::Groq)?;
         let endpoint = std::env::var("VOISU_GROQ_TRANSCRIPTION_URL")
             .unwrap_or_else(|_| "https://api.groq.com/openai/v1/audio/transcriptions".to_owned());
-        if !provider_endpoint_is_secure(&endpoint) {
-            return Err(BoundaryError::new(
-                BoundaryKind::Provider,
-                "Groq transcription endpoint must use HTTPS except on loopback",
-            ));
-        }
+        // Hand curl the GATED serialization, never the raw string: the policy
+        // verified the url crate's parse, and curl's own last-`@` userinfo
+        // split accepts `\` in the authority, so a raw hand-over could be
+        // reinterpreted into a target other than the one that was gated.
+        let endpoint = provider_endpoint_url(&endpoint)
+            .ok_or_else(|| {
+                BoundaryError::new(
+                    BoundaryKind::Provider,
+                    "Groq transcription endpoint must use HTTPS except on loopback",
+                )
+            })?
+            .as_str()
+            .to_owned();
         Ok(Box::new(GroqStream {
             credential,
             endpoint,
@@ -80,27 +87,30 @@ impl TranscriptProvider for GroqProvider {
     }
 }
 
-pub(super) fn provider_endpoint_is_secure(endpoint: &str) -> bool {
-    if endpoint.contains(['\n', '\r']) {
-        return false;
+/// Parses `endpoint` under the provider transport policy: the URL must parse
+/// cleanly (no control characters, backslash, or raw-authority `@` — see
+/// `endpoint_raw_string_is_allowed`), carry no userinfo, and use HTTPS unless
+/// the parsed host is loopback, so local test servers keep working. Returns the
+/// parsed URL so the Groq curl paths hand over the GATED SERIALIZATION
+/// (`url.as_str()`) instead of the raw string: curl splits userinfo at the
+/// LAST `@` and accepts `\` inside the authority, while the url crate reads
+/// both differently, so a raw hand-over could send the Bearer key somewhere
+/// other than the host that was gated. Parsing instead of prefix matching is
+/// what makes the policy hold: `http://localhost:8080@attacker.example/` has a
+/// loopback-LOOKING authority prefix whose real host is attacker.example.
+pub(super) fn provider_endpoint_url(endpoint: &str) -> Option<url::Url> {
+    if !endpoint_raw_string_is_allowed(endpoint) {
+        return None;
     }
-    if endpoint.starts_with("https://") {
-        return true;
+    let url = url::Url::parse(endpoint).ok()?;
+    if !endpoint_authority_is_allowed(&url) {
+        return None;
     }
-    let Some(remainder) = endpoint.strip_prefix("http://") else {
-        return false;
-    };
-    authority_is_loopback(remainder.split('/').next().unwrap_or_default())
-}
-
-pub(super) fn authority_is_loopback(authority: &str) -> bool {
-    let authority = authority.to_ascii_lowercase();
-    authority == "localhost"
-        || authority.starts_with("localhost:")
-        || authority == "127.0.0.1"
-        || authority.starts_with("127.0.0.1:")
-        || authority == "[::1]"
-        || authority.starts_with("[::1]:")
+    match url.scheme() {
+        "https" => Some(url),
+        "http" if parsed_host_is_loopback(&url) => Some(url),
+        _ => None,
+    }
 }
 
 /// The per-Recording Groq/Whisper request tuning built once at stream start:

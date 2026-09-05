@@ -1837,6 +1837,9 @@ fn base_evidence(
         provider_timings_ms: Vec::new(),
         provider_failures: Vec::new(),
         release_to_text_ms: None,
+        recording_duration_ms: None,
+        stop_to_finalized_ms: None,
+        stop_to_delivered_ms: None,
         transcript_selection: None,
         validation_reason: None,
         fallback_reason: None,
@@ -1853,7 +1856,12 @@ fn atomic_millis(value: &AtomicU64) -> Option<u64> {
 }
 
 fn elapsed_millis(started_at: Instant) -> u64 {
-    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    duration_millis(started_at.elapsed())
+}
+
+/// Milliseconds of a measured duration, saturating on overflow.
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Builds the Deepgram Provider adapter for this daemon. When Deepgram is
@@ -2174,6 +2182,12 @@ async fn process_recording(
         mut evidence,
     } = recording;
     let _ = stop_tx.send(());
+    // `utterance_end` (stamped above, the instant the actor handed the stopped
+    // Recording off) anchors every stop-anchored telemetry field, so they
+    // exclude the user's speech duration — unlike the deprecated
+    // `release_to_text_ms`, which is measured from `started_at`.
+    evidence.recording_duration_ms =
+        Some(duration_millis(utterance_end.duration_since(started_at)));
     let pump = pump.await;
     evidence.streamed_chunk_count = chunk_counter.load(Ordering::SeqCst);
     evidence.first_chunk_ms = atomic_millis(&first_chunk_ms);
@@ -2328,6 +2342,10 @@ async fn process_recording(
                 }
             }
         };
+        // The transcript is now settled: validation and any reconciliation (the
+        // late-reconstruction window) have resolved and the delivered text is
+        // known. Measured from the stop, so it excludes speech duration.
+        evidence.stop_to_finalized_ms = Some(elapsed_millis(utterance_end));
         if let Some(attempt) = &decision.intent_reconstruction {
             evidence.intent_reconstruction = Some(IntentReconstructionDiagnostic {
                 model: voisu_app::system::DEFAULT_GROQ_RECONCILIATION_MODEL.to_owned(),
@@ -2434,6 +2452,9 @@ async fn process_recording(
         evidence.delivery_method = Some(delivery_outcome.method);
         evidence.delivery_fallback_reason = delivery_outcome.fallback_reason;
         evidence.release_to_text_ms = Some(elapsed_millis(started_at));
+        // Delivery completed: measured from the stop, so it excludes the
+        // speech duration that inflates the deprecated `release_to_text_ms`.
+        evidence.stop_to_delivered_ms = Some(elapsed_millis(utterance_end));
         evidence.stages.push(LifecycleStage::DeliveryCompleted);
         Ok(())
     }
@@ -2910,6 +2931,9 @@ fn diagnostic_record(
     record.truncated_by = evidence.truncated_by;
     record.provider_timings_ms = evidence.provider_timings_ms.clone();
     record.release_to_text_ms = evidence.release_to_text_ms;
+    record.recording_duration_ms = evidence.recording_duration_ms;
+    record.stop_to_finalized_ms = evidence.stop_to_finalized_ms;
+    record.stop_to_delivered_ms = evidence.stop_to_delivered_ms;
     record.error = error.map(|error| error.public_message().to_owned());
     record.debug_audio = debug_audio;
     record.smart_writing = smart_writing;
