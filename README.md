@@ -104,6 +104,28 @@ Run `voisu doctor` if the Trigger Key does not respond — it reports a portal
 without a usable GlobalShortcuts interface, and adds `--verbose` for the full
 reasoning behind each check.
 
+## Command reference
+
+`voisu` controls the daemon (`voisu-daemon`). All history and diagnostics stay
+local to your machine.
+
+| Command | Purpose |
+| --- | --- |
+| `voisu start` / `stop` / `toggle` / `status` | Control and inspect the daemon |
+| `voisu shortcut` | Show the desktop-approved Trigger Key |
+| `voisu setup` | Guided wizard: Trigger Key, Delivery, provider keys |
+| `voisu auth set` / `auth verify <groq\|deepgram>` | Store or verify a provider key (key on stdin) |
+| `voisu deepgram on` / `off` | Enable or disable Deepgram streaming |
+| `voisu delivery [type\|clipboard\|guarded]` | Show or set the Delivery mode |
+| `voisu writing [smart\|literal]` | Show or set the writing mode |
+| `voisu rendering [natural\|adaptive\|structured]` | Show or set the rendering policy |
+| `voisu dictionary add` / `remove <term>` / `list` | Personal pronunciation dictionary |
+| `voisu history [--json]` | Recent local diagnostic history |
+| `voisu export <correlation-id>` | Redacted diagnostic export for one Recording |
+| `voisu replay <path>` | Replay a captured fixture through the pipeline |
+| `voisu doctor [--verbose]` | Host readiness diagnostics |
+| `voisu service install` / `start` / `stop` / `restart` / `status` / `uninstall` | Manage the user services |
+
 ## License
 
 Voisu is licensed under the [MIT License](LICENSE).
