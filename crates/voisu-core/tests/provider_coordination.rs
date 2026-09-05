@@ -551,3 +551,69 @@ fn boundary_errors_separate_redacted_public_text_from_local_diagnostics() {
     assert_eq!(error.diagnostic(), "authorization=Bearer controlled-secret");
     assert!(!error.public_message().contains("controlled-secret"));
 }
+// ─── Slice B4: provider-tagged word-confidence evidence per provider ─────────
+
+/// A stream that completes with a Source Transcript AND word-confidence
+/// evidence, as the Deepgram streaming finals and the Groq verbose_json chunks
+/// retain them.
+struct ConfidentStream {
+    provider: Provider,
+    words: Vec<(String, f64)>,
+}
+
+impl ProviderStream for ConfidentStream {
+    fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    fn send_audio(&mut self, _chunk: AudioChunk) -> BoundaryFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn complete(&mut self, _audio: CapturedAudio) -> BoundaryFuture<'_, SourceTranscript> {
+        let provider = self.provider;
+        let text = format!("{provider:?} Source Transcript");
+        Box::pin(async move { Ok(SourceTranscript { provider, text }) })
+    }
+
+    fn word_confidences(&self) -> Vec<(String, f64)> {
+        self.words.clone()
+    }
+}
+
+#[tokio::test]
+async fn provider_completion_carries_each_providers_own_word_evidence() {
+    let streams = ProviderStreams {
+        deepgram: Box::new(ConfidentStream {
+            provider: Provider::Deepgram,
+            words: vec![
+                ("please".to_owned(), 0.3),
+                ("deploy".to_owned(), 0.9),
+                ("cache".to_owned(), 0.95),
+            ],
+        }),
+        groq: Box::new(ConfidentStream {
+            provider: Provider::Groq,
+            words: vec![
+                ("please".to_owned(), 0.95),
+                ("deploy".to_owned(), 0.95),
+                ("cache".to_owned(), 0.2),
+            ],
+        }),
+    };
+    let completion =
+        ProviderCoordinator::start(Duration::from_secs(5), Duration::from_secs(1), streams)
+            .complete_with_timings(CapturedAudio::empty())
+            .await
+            .unwrap();
+
+    assert_eq!(completion.word_confidences.len(), 2);
+    assert_eq!(completion.word_confidences[0].provider, Provider::Deepgram);
+    assert_eq!(completion.word_confidences[0].words[2].0, "cache");
+    assert_eq!(completion.word_confidences[1].provider, Provider::Groq);
+    assert_eq!(completion.word_confidences[1].words[2].1, 0.2);
+}

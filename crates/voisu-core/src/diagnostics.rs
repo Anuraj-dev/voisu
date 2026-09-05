@@ -263,6 +263,50 @@ pub struct IntentReconstructionDiagnostic {
     pub candidate: Option<String>,
 }
 
+/// Bound on the recorded rejection list so a pathological recording cannot
+/// grow a history line without bound; regions past the cap still count in
+/// `regions_considered`, only their per-region reason entries are dropped.
+pub const MAX_CONFIDENCE_ARBITRATION_REJECTIONS: usize = 32;
+
+/// Slice B4 additive confidence-arbitration evidence: how many divergent
+/// regions the decision pipeline considered between the two Source
+/// Transcripts, how many flipped to the other provider's words, and why the
+/// rest did not. Recorded only when arbitration RAN — both Source Transcripts
+/// present and both providers' word-confidence evidence retained — so a
+/// single-provider or no-confidence Recording carries no field, exactly as
+/// before B4. Closed reason codes only; no transcript text is ever recorded.
+/// `skip_serializing_if` plus serde `default` keep old persisted lines
+/// deserializable and new lines backward-readable (telemetry schema
+/// unchanged).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ConfidenceArbitrationDiagnostic {
+    pub regions_considered: u32,
+    pub regions_flipped: u32,
+    pub rejections: Vec<ConfidenceArbitrationRejection>,
+}
+
+/// One closed reason a considered divergence region was NOT flipped to the
+/// other provider's words. Evaluation order: shape, masks, meaning, then the
+/// decisive confidence gap.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfidenceArbitrationRejection {
+    /// A word in the region has no confidence from its own provider.
+    MissingConfidence,
+    /// The incumbent-vs-other confidence gap did not clear both thresholds.
+    ConfidenceGapNotDecisive,
+    /// A negation, number, question, or polarity word sits in the region.
+    MeaningInvertingTokens,
+    /// An empty side, a word-count change beyond the documented bound, or a
+    /// region boundary that cuts an expanded contraction mid-token.
+    RegionShapeUnsafe,
+    /// The region sits inside a spoken quote or say-the-words span.
+    MaskedSpan,
+    /// The assembled candidate failed the source-derived or quality gates, so
+    /// every flip in the pass was rejected.
+    CandidateRejected,
+}
+
 impl IntentReconstructionDiagnostic {
     fn normalize(&mut self) {
         self.model = clamp_utf8_bytes(&self.model, MAX_MODEL_ID_UTF8_BYTES);
@@ -741,6 +785,10 @@ pub struct DiagnosticRecord {
     pub dpr: Option<DprDiagnostic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent_reconstruction: Option<IntentReconstructionDiagnostic>,
+    /// Slice B4 additive confidence-arbitration evidence. Absent when
+    /// arbitration did not run, so pre-B4 lines stay deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_arbitration: Option<ConfidenceArbitrationDiagnostic>,
 }
 
 impl DiagnosticRecord {
@@ -781,6 +829,7 @@ impl DiagnosticRecord {
             smart_writing: None,
             dpr: None,
             intent_reconstruction: None,
+            confidence_arbitration: None,
         }
     }
 

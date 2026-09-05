@@ -188,6 +188,7 @@ mod tests {
             recovery_attempted: false,
             source_selection_diagnostic: None,
             intent_reconstruction: None,
+            confidence_arbitration: None,
         }
     }
 

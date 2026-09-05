@@ -4415,3 +4415,414 @@ async fn a_fallback_decision_from_a_failed_reconstruction_is_corrected() {
         decision.transcript.0
     );
 }
+
+// ─── Slice B4: confidence-aware divergence-point arbitration ─────────────────
+
+const ARBITRATION_MARKER: &str = "confidence arbitration flipped";
+
+fn provider_confidences(provider: Provider, words: &[(&str, f64)]) -> Vec<ProviderWordConfidences> {
+    vec![ProviderWordConfidences {
+        provider,
+        words: words
+            .iter()
+            .map(|(word, confidence)| ((*word).to_owned(), *confidence))
+            .collect(),
+    }]
+}
+
+/// A near-identical pair whose single divergence is one misheard word
+/// ("cash" for "cache"): similarity 7/8 clears the 0.85 near-identical bar,
+/// and the pipeline's documented default keeps the whole GROQ transcript.
+fn near_identical_sources() -> Vec<SourceTranscript> {
+    vec![
+        SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "please deploy the cache migration for the service".to_owned(),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: "please deploy the cash migration for the service".to_owned(),
+        },
+    ]
+}
+
+fn groq_cash_evidence() -> Vec<ProviderWordConfidences> {
+    provider_confidences(
+        Provider::Groq,
+        &[
+            ("please", 0.9),
+            ("deploy", 0.9),
+            ("the", 0.9),
+            ("cash", 0.3),
+            ("migration", 0.9),
+            ("for", 0.9),
+            ("the", 0.9),
+            ("service", 0.9),
+        ],
+    )
+}
+
+fn deepgram_cache_evidence(cache_confidence: f64) -> Vec<ProviderWordConfidences> {
+    provider_confidences(
+        Provider::Deepgram,
+        &[
+            ("please", 0.95),
+            ("deploy", 0.95),
+            ("the", 0.95),
+            ("cache", cache_confidence),
+            ("migration", 0.95),
+            ("for", 0.95),
+            ("the", 0.95),
+            ("service", 0.95),
+        ],
+    )
+}
+
+#[tokio::test]
+async fn confidence_arbitration_flips_a_decisively_more_confident_divergence() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+    let mut word_evidence = groq_cash_evidence();
+    word_evidence.extend(deepgram_cache_evidence(0.95));
+    pipeline.set_word_confidences(word_evidence);
+
+    let decision = pipeline.decide(near_identical_sources()).await.unwrap();
+
+    // The Groq default held the selection; arbitration replaced only the
+    // divergence point with the other provider's decisively-confident word.
+    assert_eq!(decision.selection, TranscriptSelection::NearIdenticalGroq);
+    assert_eq!(
+        decision.transcript.0,
+        "please deploy the cache migration for the service"
+    );
+    assert!(
+        decision.validation_reason.contains(ARBITRATION_MARKER),
+        "{}",
+        decision.validation_reason
+    );
+    let arbitration = decision.confidence_arbitration.expect("arbitration ran");
+    assert_eq!(arbitration.regions_considered, 1);
+    assert_eq!(arbitration.regions_flipped, 1);
+    assert!(arbitration.rejections.is_empty());
+    // The near-identical path never spent a reconciliation call.
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn arbitration_keeps_the_incumbent_word_when_the_gap_is_not_decisive() {
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        Duration::from_millis(50),
+    );
+    // The other side's hearing is below the decisive bar: keep the incumbent.
+    let mut word_evidence = groq_cash_evidence();
+    word_evidence.extend(deepgram_cache_evidence(0.74));
+    pipeline.set_word_confidences(word_evidence);
+
+    let decision = pipeline.decide(near_identical_sources()).await.unwrap();
+
+    assert_eq!(
+        decision.transcript.0,
+        "please deploy the cash migration for the service"
+    );
+    assert!(!decision.validation_reason.contains(ARBITRATION_MARKER));
+    let arbitration = decision.confidence_arbitration.expect("arbitration ran");
+    assert_eq!(arbitration.regions_considered, 1);
+    assert_eq!(arbitration.regions_flipped, 0);
+    assert_eq!(arbitration.rejections.len(), 1);
+}
+
+#[tokio::test]
+async fn arbitration_never_flips_a_negation_in_the_pipeline() {
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        Duration::from_millis(50),
+    );
+    // The Groq incumbent heard "not" (shaky); Deepgram heard "now"
+    // (confident). Flipping would silently delete the negation.
+    let mut word_evidence = provider_confidences(
+        Provider::Groq,
+        &[
+            ("the", 0.9),
+            ("daemon", 0.9),
+            ("will", 0.9),
+            ("not", 0.3),
+            ("restart", 0.9),
+            ("today", 0.9),
+            ("please", 0.9),
+        ],
+    );
+    word_evidence.extend(provider_confidences(
+        Provider::Deepgram,
+        &[
+            ("the", 0.95),
+            ("daemon", 0.95),
+            ("will", 0.95),
+            ("now", 0.95),
+            ("restart", 0.95),
+            ("today", 0.95),
+            ("please", 0.95),
+        ],
+    ));
+    pipeline.set_word_confidences(word_evidence);
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "the daemon will now restart today please".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "the daemon will not restart today please".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        decision.transcript.0,
+        "the daemon will not restart today please"
+    );
+    assert!(!decision.validation_reason.contains(ARBITRATION_MARKER));
+    let arbitration = decision.confidence_arbitration.expect("arbitration ran");
+    assert_eq!(arbitration.regions_flipped, 0);
+    assert_eq!(arbitration.rejections.len(), 1);
+}
+
+/// A materially-disagreeing pair whose reconciliation fails: the safe-source
+/// fallback selects the whole DEEPGRAM transcript (the fuller, higher-quality
+/// source), which heard "cash" shakily while Groq heard "cache" confidently.
+/// Both providers' evidence in one list, as the daemon hands it to the
+/// pipeline.
+fn deepgram_cash_incumbent_evidence() -> Vec<ProviderWordConfidences> {
+    let mut evidence = provider_confidences(
+        Provider::Deepgram,
+        &[
+            ("please", 0.9),
+            ("deploy", 0.9),
+            ("the", 0.9),
+            ("cash", 0.3),
+            ("migration", 0.9),
+            ("for", 0.9),
+            ("the", 0.9),
+            ("rust", 0.97),
+            ("service", 0.9),
+            ("today", 0.9),
+        ],
+    );
+    evidence.extend(provider_confidences(
+        Provider::Groq,
+        &[
+            ("please", 0.95),
+            ("deploy", 0.95),
+            ("the", 0.95),
+            ("cache", 0.95),
+            ("migration", 0.95),
+            ("for", 0.95),
+            ("the", 0.95),
+            ("rust", 0.95),
+            ("service", 0.95),
+        ],
+    ));
+    evidence
+}
+
+fn deepgram_cash_incumbent_sources() -> Vec<SourceTranscript> {
+    vec![
+        SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "please deploy the cash migration for the rust service today".to_owned(),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: "please deploy the cache migration for the rust service".to_owned(),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn arbitration_flips_when_the_deepgram_incumbent_is_the_uncertain_side() {
+    let mut pipeline =
+        TranscriptDecisionPipeline::new(FailingReconcileModel, Duration::from_millis(50));
+    // The reconciliation fails, the safe-source fallback selects the whole
+    // Deepgram transcript, and arbitration flips only the shaky "cash" to
+    // Groq's confident "cache" — Deepgram's fuller rendering (its "today")
+    // is preserved.
+    pipeline.set_word_confidences(deepgram_cash_incumbent_evidence());
+
+    let decision = pipeline
+        .decide(deepgram_cash_incumbent_sources())
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(
+        decision.transcript.0,
+        "please deploy the cache migration for the rust service today"
+    );
+    let arbitration = decision.confidence_arbitration.expect("arbitration ran");
+    assert_eq!(arbitration.regions_considered, 2);
+    assert_eq!(arbitration.regions_flipped, 1);
+}
+
+#[tokio::test]
+async fn the_correction_gate_keeps_reading_the_selected_providers_evidence_after_a_flip() {
+    // The provenance rule: after a flip the text is mixed-provenance, but the
+    // correction gate still reads the SELECTED provider's (Deepgram's)
+    // evidence. "rust" was confidently heard by Deepgram (0.97), so the user's
+    // "Rust" casing correction is skipped exactly as it would be without the
+    // flip — even though Groq's stream also contains "rust".
+    let mut pipeline =
+        TranscriptDecisionPipeline::new(FailingReconcileModel, Duration::from_millis(50));
+    pipeline.set_user_vocabulary(vec!["Rust".to_owned()]);
+    pipeline.set_word_confidences(deepgram_cash_incumbent_evidence());
+
+    let decision = pipeline
+        .decide(deepgram_cash_incumbent_sources())
+        .await
+        .unwrap();
+
+    assert!(
+        decision.validation_reason.contains(ARBITRATION_MARKER),
+        "{}",
+        decision.validation_reason
+    );
+    assert_eq!(
+        decision.transcript.0, "please deploy the cache migration for the rust service today",
+        "the flip lands and the confidently-heard rust stays uncorrected"
+    );
+    assert!(!decision.validation_reason.contains(CORRECTION_MARKER));
+}
+
+#[tokio::test]
+async fn a_single_provider_recording_is_byte_identical_without_arbitration() {
+    // Deepgram-only presence (e.g. Groq missed the Provider Deadline) with
+    // stale evidence from both providers still must be byte-identical to the
+    // pre-B4 pipeline — and carry no arbitration diagnostic.
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        Duration::from_millis(50),
+    );
+    let mut word_evidence = deepgram_cache_evidence(0.95);
+    word_evidence.extend(groq_cash_evidence());
+    pipeline.set_word_confidences(word_evidence);
+
+    let decision = pipeline
+        .decide(vec![SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "please deploy the cache migration for the service".to_owned(),
+        }])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(
+        decision.transcript.0,
+        "please deploy the cache migration for the service"
+    );
+    assert!(!decision.validation_reason.contains(ARBITRATION_MARKER));
+    assert!(decision.confidence_arbitration.is_none());
+}
+
+#[tokio::test]
+async fn missing_evidence_on_either_provider_keeps_old_behavior_entirely() {
+    // Both sources present, but Groq retained no word confidences (e.g. an
+    // older fixture or a response without words): the whole pass is skipped.
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        Duration::from_millis(50),
+    );
+    pipeline.set_word_confidences(deepgram_cache_evidence(0.95));
+
+    let decision = pipeline.decide(near_identical_sources()).await.unwrap();
+
+    assert_eq!(
+        decision.transcript.0,
+        "please deploy the cash migration for the service"
+    );
+    assert!(!decision.validation_reason.contains(ARBITRATION_MARKER));
+    assert!(decision.confidence_arbitration.is_none());
+}
+
+#[tokio::test]
+async fn a_reconciled_final_is_never_arbitrated() {
+    // A merge is not one provider's words: there is no "other provider's
+    // words" to take and no aligned confidence to vouch for the splice.
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::new(Mutex::new(Vec::new())),
+            text: "deploy the cache migration today".to_owned(),
+        },
+        Duration::from_millis(50),
+    );
+    let mut word_evidence = groq_cash_evidence();
+    word_evidence.extend(deepgram_cache_evidence(0.95));
+    pipeline.set_word_confidences(word_evidence);
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "deploy the cache migration today".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "deploy the cash migration tomorrow".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::Reconciled);
+    assert_eq!(decision.transcript.0, "deploy the cache migration today");
+    assert!(decision.confidence_arbitration.is_none());
+}
+
+#[tokio::test]
+async fn an_intent_reconstruction_fallback_is_never_arbitrated() {
+    // Intent Reconstruction consumes uncorrected sanitized sources; its
+    // fallback decision is built directly by the safe-source fallback and
+    // must reach the correction pass exactly as before B4.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
+        IntentModel {
+            requests: Arc::clone(&requests),
+            result: "ignored".to_owned(),
+            fail: true,
+        },
+        Duration::from_secs(5),
+        Vec::new(),
+    );
+    let mut word_evidence = groq_cash_evidence();
+    word_evidence.extend(deepgram_cache_evidence(0.95));
+    pipeline.set_word_confidences(word_evidence);
+
+    let attempt = match pipeline.prepare(divergent_sources()).await.unwrap() {
+        PreparedTranscriptDecision::Reconstruct(attempt) => attempt,
+        PreparedTranscriptDecision::Ready(_) => panic!("material disagreement must reconstruct"),
+    };
+    let decision = pipeline.reconstruct(attempt).await.unwrap();
+
+    assert_ne!(decision.selection, TranscriptSelection::IntentReconstructed);
+    assert!(
+        decision.transcript.0.starts_with("Schedule")
+            || decision.transcript.0.starts_with("Cancel"),
+        "the fallback must be a whole Source Transcript: {}",
+        decision.transcript.0
+    );
+    assert!(decision.confidence_arbitration.is_none());
+}

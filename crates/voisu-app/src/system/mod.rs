@@ -1105,7 +1105,13 @@ mod tests {
         assert!(config.contains("form = \"language=en\""));
         assert!(config.contains("form = \"temperature=0\""));
         assert!(config.contains("form = \"prompt=Tokio, serde, SELinux\""));
-        assert!(config.contains("form = \"response_format=json\""));
+        // Slice B4: word-timestamp granularities ride on verbose_json, and
+        // BOTH granularities are requested — `word` for the word list and
+        // `segment` for the per-segment avg_logprob the word confidences are
+        // derived from.
+        assert!(config.contains("form = \"response_format=verbose_json\""));
+        assert!(config.contains("form = \"timestamp_granularities[]=word\""));
+        assert!(config.contains("form = \"timestamp_granularities[]=segment\""));
         assert!(config.contains("Authorization: Bearer secret-token"));
     }
 
@@ -1182,9 +1188,213 @@ mod tests {
         // must be collapsed, not duplicated, at the 4 s chunk boundary.
         let first: Vec<String> = (0..40).map(|i| format!("w{i}")).collect();
         let second: Vec<String> = (10..60).map(|i| format!("w{i}")).collect();
-        let merged = merge_chunk_transcripts(vec![first.join(" "), second.join(" ")]);
+        let merged = merge_chunk_transcripts(vec![
+            GroqChunkTranscript {
+                text: first.join(" "),
+                words: Vec::new(),
+            },
+            GroqChunkTranscript {
+                text: second.join(" "),
+                words: Vec::new(),
+            },
+        ]);
         let expected: Vec<String> = (0..60).map(|i| format!("w{i}")).collect();
-        assert_eq!(merged, expected.join(" "), "the 30-word overlap is deduped");
+        assert_eq!(
+            merged.text,
+            expected.join(" "),
+            "the 30-word overlap is deduped"
+        );
+    }
+
+    // ─── Slice B4: Groq verbose_json fixtures (documented API shape) ────────
+
+    /// A realistic single-segment verbose_json response, built from the
+    /// documented Groq/OpenAI-compatible Whisper shape: top-level `text`, a
+    /// `words[]` array of `{word, start, end}` entries, and a `segments[]`
+    /// array whose entries carry `avg_logprob` (nats/token, closer to zero is
+    /// more confident).
+    const VERBOSE_JSON_ONE_SEGMENT: &str = r#"{
+        "task": "transcribe",
+        "language": "en",
+        "duration": 2.1,
+        "text": "Deploy the cache migration today.",
+        "words": [
+            {"word": "Deploy", "start": 0.08, "end": 0.52},
+            {"word": "the", "start": 0.56, "end": 0.71},
+            {"word": "cache", "start": 0.75, "end": 1.09},
+            {"word": "migration", "start": 1.14, "end": 1.72},
+            {"word": "today.", "start": 1.78, "end": 2.05}
+        ],
+        "x_groq": {"id": "req_01j", "runtime": {"model": "whisper-large-v3", "processed_by": "whisper-asr"}},
+        "segments": [
+            {
+                "id": 0,
+                "seek": 0,
+                "start": 0.0,
+                "end": 2.1,
+                "text": " Deploy the cache migration today.",
+                "tokens": [1, 2],
+                "temperature": 0.0,
+                "avg_logprob": -0.15,
+                "compression_ratio": 1.4,
+                "no_speech_prob": 0.013,
+                "transient": false
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn a_verbose_json_fixture_parses_text_and_word_confidences() {
+        let response: serde_json::Value = serde_json::from_str(VERBOSE_JSON_ONE_SEGMENT).unwrap();
+        let parsed = parse_groq_transcription_response(&response).expect("parses");
+        assert_eq!(parsed.text, "Deploy the cache migration today.");
+        assert_eq!(parsed.words.len(), 5);
+        // exp(-0.15) ≈ 0.861: a confident segment yields confident words.
+        let expected = (-0.15_f64).exp().clamp(0.0, 1.0);
+        assert!(
+            parsed
+                .words
+                .iter()
+                .all(|(_, confidence)| (confidence - expected).abs() < 1e-9),
+            "every word inherits its covering segment's confidence: {parsed:?}"
+        );
+        assert_eq!(parsed.words[0].0, "Deploy");
+        assert_eq!(parsed.words[4].0, "today.");
+    }
+
+    #[test]
+    fn a_verbose_json_word_inherits_its_own_covering_segment_logprob() {
+        // Two segments: the first confident (-0.10), the second shaky (-1.20).
+        // Each word must read the segment its start timestamp falls in — the
+        // occurrence/position rule, never a single global confidence.
+        let response: serde_json::Value = serde_json::from_str(
+            r#"{
+            "text": "Deploy the service now",
+            "words": [
+                {"word": "Deploy", "start": 0.10, "end": 0.50},
+                {"word": "the", "start": 0.55, "end": 0.70},
+                {"word": "service", "start": 1.20, "end": 1.80},
+                {"word": "now", "start": 1.85, "end": 2.10}
+            ],
+            "segments": [
+                {"id": 0, "start": 0.0, "end": 1.0, "text": "Deploy the", "avg_logprob": -0.10},
+                {"id": 1, "start": 1.0, "end": 2.2, "text": "service now", "avg_logprob": -1.20}
+            ]
+        }"#,
+        )
+        .unwrap();
+        let parsed = parse_groq_transcription_response(&response).expect("parses");
+        let confident = (-0.10_f64).exp();
+        let shaky = (-1.20_f64).exp();
+        assert_eq!(parsed.words[0].1, confident);
+        assert_eq!(parsed.words[1].1, confident);
+        assert_eq!(parsed.words[2].1, shaky);
+        assert_eq!(parsed.words[3].1, shaky);
+    }
+
+    #[test]
+    fn a_word_before_every_segment_falls_back_to_the_earliest_segment() {
+        let response: serde_json::Value = serde_json::from_str(
+            r#"{
+            "text": "hello",
+            "words": [{"word": "hello", "start": 0.0, "end": 0.4}],
+            "segments": [
+                {"id": 0, "start": 0.5, "end": 1.0, "text": "hello", "avg_logprob": -0.30}
+            ]
+        }"#,
+        )
+        .unwrap();
+        let parsed = parse_groq_transcription_response(&response).expect("parses");
+        assert_eq!(parsed.words[0].1, (-0.30_f64).exp().clamp(0.0, 1.0));
+    }
+
+    #[test]
+    fn non_finite_and_missing_logprob_evidence_is_unproven_not_confident() {
+        // A word whose covering segment carries a NaN avg_logprob — and a
+        // response whose segments carry none at all — degrades to 0.0,
+        // mirroring the Deepgram ingest clamp.
+        let response: serde_json::Value = serde_json::from_str(
+            r#"{
+            "text": "hello there",
+            "words": [
+                {"word": "hello", "start": 0.1, "end": 0.4},
+                {"word": "there", "start": 0.5, "end": 0.9}
+            ],
+            "segments": [
+                {"id": 0, "start": 0.0, "end": 1.0, "text": "hello there", "avg_logprob": "not-a-number"},
+                {"id": 1, "start": 1.0, "end": 2.0, "text": "more"}
+            ]
+        }"#,
+        )
+        .unwrap();
+        let parsed = parse_groq_transcription_response(&response).expect("parses");
+        assert!(
+            parsed
+                .words
+                .iter()
+                .all(|(_, confidence)| *confidence == 0.0)
+        );
+    }
+
+    #[test]
+    fn a_plain_json_response_degrades_to_text_without_evidence() {
+        // A server that ignored response_format and returned the historic
+        // plain shape must still deliver its text — the Groq flow degrades to
+        // the pre-B4 no-evidence behavior instead of failing the Recording.
+        let response: serde_json::Value =
+            serde_json::from_str(r#"{"text": "deploy the cache migration today"}"#).unwrap();
+        let parsed = parse_groq_transcription_response(&response).expect("parses");
+        assert_eq!(parsed.text, "deploy the cache migration today");
+        assert!(parsed.words.is_empty());
+    }
+
+    #[test]
+    fn a_verbose_json_response_without_text_or_segments_is_rejected() {
+        let response: serde_json::Value =
+            serde_json::from_str(r#"{"task": "transcribe"}"#).unwrap();
+        let error = parse_groq_transcription_response(&response).unwrap_err();
+        assert_eq!(error.diagnostic(), "Groq response omitted text");
+    }
+
+    #[test]
+    fn chunk_confidence_evidence_merges_with_the_same_overlap_skip() {
+        // Two chunks whose texts share a 3-word seam: the merged confidence
+        // list must skip the second chunk's first three entries exactly as
+        // the text skip drops its first three words, so no seam word carries
+        // doubled evidence.
+        let first = GroqChunkTranscript {
+            text: "deploy the cache migration".to_owned(),
+            words: vec![
+                ("deploy".to_owned(), 0.9),
+                ("the".to_owned(), 0.9),
+                ("cache".to_owned(), 0.2),
+                ("migration".to_owned(), 0.9),
+            ],
+        };
+        let second = GroqChunkTranscript {
+            text: "cache migration finished today".to_owned(),
+            words: vec![
+                ("cache".to_owned(), 0.8),
+                ("migration".to_owned(), 0.8),
+                ("finished".to_owned(), 0.8),
+                ("today".to_owned(), 0.8),
+            ],
+        };
+        let merged = merge_chunk_transcripts(vec![first, second]);
+        assert_eq!(merged.text, "deploy the cache migration finished today");
+        assert_eq!(
+            merged
+                .words
+                .iter()
+                .map(|(word, _)| word.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deploy", "the", "cache", "migration", "finished", "today"],
+            "the seam's duplicated words do not double their evidence"
+        );
+        assert_eq!(
+            merged.words[2].1, 0.2,
+            "the FIRST chunk's seam confidence wins"
+        );
     }
 
     #[tokio::test]
@@ -1469,6 +1679,7 @@ mod tests {
             chunks: VecDeque::new(),
             cancel: CancelRegistry::new(),
             reaper: reaper.clone(),
+            word_confidence_evidence: Vec::new(),
         };
 
         // Drive complete() far enough to issue the finalize request, then drop it
@@ -1511,7 +1722,7 @@ mod tests {
     fn spawn_blocking_backed_chunk(
         cancel: Arc<CancelRegistry>,
     ) -> (
-        tokio::task::JoinHandle<Result<String, BoundaryError>>,
+        tokio::task::JoinHandle<Result<GroqChunkTranscript, BoundaryError>>,
         BlockingChunkProbe,
     ) {
         let entered = Arc::new(AtomicBool::new(false));
@@ -1590,6 +1801,7 @@ mod tests {
                 chunks: VecDeque::from([groq_chunk]),
                 cancel: groq_cancel,
                 reaper: reaper.clone(),
+                word_confidence_evidence: Vec::new(),
             }),
         };
 
@@ -1670,6 +1882,7 @@ mod tests {
             chunks: VecDeque::from([chunk]),
             cancel,
             reaper: reaper.clone(),
+            word_confidence_evidence: Vec::new(),
         };
         std::thread::spawn(move || drop(stream))
             .join()
