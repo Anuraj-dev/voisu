@@ -95,6 +95,8 @@ pub use intent_routing::{
     route_intent,
 };
 
+mod vocabulary;
+
 mod compose_gate;
 pub use compose_gate::{
     CLOSED_CONVERSIONS, CLOSED_SOURCE_SELECTION_REASONS, COMPOSE_GATE_CONTRACT_ID, CloudOutcome,
@@ -1293,6 +1295,16 @@ pub struct TranscriptDecisionPipeline<M> {
     model: M,
     deadline: Duration,
     dictionary_terms: Vec<String>,
+    /// The USER's personal dictionary terms, for the constrained
+    /// post-correction pass. Deliberately separate from `dictionary_terms`
+    /// (the merged vocabulary used for selection evidence and reconciliation
+    /// context): only user-owned terms may rewrite the Transcript, and an
+    /// empty user dictionary must leave the pipeline's output byte-identical.
+    user_vocabulary: Vec<String>,
+    /// Word-level provider confidence evidence for the current Recording's
+    /// transcripts, used to gate corrections on the Deepgram-sourced final
+    /// Transcript (see `vocabulary`).
+    word_confidences: Vec<ProviderWordConfidences>,
     intent_reconstruction: bool,
 }
 
@@ -1302,6 +1314,8 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             model,
             deadline,
             dictionary_terms: Vec::new(),
+            user_vocabulary: Vec::new(),
+            word_confidences: Vec::new(),
             intent_reconstruction: false,
         }
     }
@@ -1315,6 +1329,8 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             model,
             deadline,
             dictionary_terms,
+            user_vocabulary: Vec::new(),
+            word_confidences: Vec::new(),
             intent_reconstruction: false,
         }
     }
@@ -1328,12 +1344,29 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             model,
             deadline,
             dictionary_terms,
+            user_vocabulary: Vec::new(),
+            word_confidences: Vec::new(),
             intent_reconstruction: true,
         }
     }
 
     pub fn set_dictionary_terms(&mut self, dictionary_terms: Vec<String>) {
         self.dictionary_terms = dictionary_terms;
+    }
+
+    /// Sets the user's personal dictionary terms for the post-correction pass.
+    /// The daemon derives them from the SAME single dictionary snapshot that
+    /// feeds keyterms/whisper prompt/`dictionary_terms`, so one Recording never
+    /// mixes vocabulary versions.
+    pub fn set_user_vocabulary(&mut self, user_vocabulary: Vec<String>) {
+        self.user_vocabulary = user_vocabulary;
+    }
+
+    /// Sets the word-level confidence evidence for this Recording's provider
+    /// transcripts. Empty by default; the daemon supplies what its providers
+    /// retained before validation runs.
+    pub fn set_word_confidences(&mut self, word_confidences: Vec<ProviderWordConfidences>) {
+        self.word_confidences = word_confidences;
     }
 
     pub async fn prepare(
@@ -1397,7 +1430,21 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         Ok(PreparedTranscriptDecision::Ready(decision))
     }
 
+    /// Completes a prepared Intent Reconstruction attempt, with the user's
+    /// constrained vocabulary corrections applied to whatever final Transcript
+    /// the attempt ends in — an accepted reconstruction or its fallback. The
+    /// fallback decision may already have been corrected (it was produced by
+    /// `decide`); the correction is idempotent, so re-applying is a no-op and
+    /// never duplicates the evidence marker.
     pub async fn reconstruct(
+        &mut self,
+        attempt: IntentReconstructionAttempt,
+    ) -> Result<TranscriptDecision, BoundaryError> {
+        let decision = self.reconstruct_uncorrected(attempt).await?;
+        Ok(self.apply_user_vocabulary_correction(decision))
+    }
+
+    async fn reconstruct_uncorrected(
         &mut self,
         attempt: IntentReconstructionAttempt,
     ) -> Result<TranscriptDecision, BoundaryError> {
@@ -1465,7 +1512,66 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         })
     }
 
+    /// Produces the final Transcript decision, with the user's constrained
+    /// vocabulary corrections applied to the chosen final text.
+    ///
+    /// Placement: the correction runs AFTER the final Transcript is chosen
+    /// (post-selection, post-reconciliation) and BEFORE the text reaches any
+    /// downstream consumer — DPR formatting, smart writing, and Delivery all
+    /// read `decision.transcript`, so every later validator and formatter sees
+    /// the corrected text and inserted term punctuation is never compared
+    /// against pre-correction text. The quality guards INSIDE the decision
+    /// logic vetted the provider-chosen text before this pass; a correction is
+    /// an exact whole-token rewrite with user-owned vocabulary that preserves
+    /// every content word's count, so those guard outcomes remain valid for
+    /// the corrected text, while `is_source_derived` — which must reject words
+    /// no provider literally heard — is never handed a correction to reject.
     pub async fn decide(
+        &mut self,
+        sources: Vec<SourceTranscript>,
+    ) -> Result<TranscriptDecision, BoundaryError> {
+        let decision = self.decide_uncorrected(sources).await?;
+        Ok(self.apply_user_vocabulary_correction(decision))
+    }
+
+    fn apply_user_vocabulary_correction(
+        &self,
+        mut decision: TranscriptDecision,
+    ) -> TranscriptDecision {
+        if self.user_vocabulary.is_empty() {
+            return decision;
+        }
+        // The confidence gate applies ONLY when the final Transcript IS the
+        // Deepgram source: that is the one text whose words carry Deepgram
+        // confidences. Groq-sourced, merged, repaired, and reconstructed
+        // finals have no aligned word evidence, so their substitutions apply
+        // ungated — the user explicitly asked for this vocabulary.
+        let word_confidences: &[(String, f64)] =
+            if decision.selection == TranscriptSelection::SourceDeepgram {
+                self.word_confidences
+                    .iter()
+                    .find(|evidence| evidence.provider == Provider::Deepgram)
+                    .map(|evidence| evidence.words.as_slice())
+                    .unwrap_or(&[])
+            } else {
+                &[]
+            };
+        let corrected = vocabulary::apply_user_vocabulary(
+            &decision.transcript.0,
+            &self.user_vocabulary,
+            word_confidences,
+        );
+        if corrected != decision.transcript.0 {
+            decision.transcript = Transcript(corrected);
+            decision.validation_reason = format!(
+                "{}; user vocabulary corrections applied",
+                decision.validation_reason
+            );
+        }
+        decision
+    }
+
+    async fn decide_uncorrected(
         &mut self,
         mut sources: Vec<SourceTranscript>,
     ) -> Result<TranscriptDecision, BoundaryError> {
@@ -3643,6 +3749,25 @@ pub trait ProviderStream: Send {
     fn send_audio(&mut self, chunk: AudioChunk) -> BoundaryFuture<'_, ()>;
     fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()>;
     fn complete(&mut self, audio: CapturedAudio) -> BoundaryFuture<'_, SourceTranscript>;
+
+    /// Word-level confidence evidence the stream retained for its finalized
+    /// segments, as `(word, confidence)` pairs in transcript order. Providers
+    /// that do not expose word confidences keep the default: none. Slice B2
+    /// consumes only this minimal signal (the user-vocabulary correction
+    /// gate); deeper confidence-aware reconciliation is slice B4.
+    fn word_confidences(&self) -> Vec<(String, f64)> {
+        Vec::new()
+    }
+}
+
+/// Word-level confidence evidence from one Provider's streaming transcript.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderWordConfidences {
+    pub provider: Provider,
+    /// `(word, confidence)` pairs in transcript order. A word whose provider
+    /// did not report a confidence is carried with `0.0` so the correction
+    /// gate treats it as unproven rather than confident.
+    pub words: Vec<(String, f64)>,
 }
 
 pub struct ProviderStreams {
@@ -3665,6 +3790,11 @@ pub struct ProviderCompletion {
     /// the Provider Deadline — with its stage and boundary diagnostic. This is
     /// what keeps a missing Source Transcript visible instead of silent.
     pub provider_failures: Vec<ProviderFailure>,
+    /// Word-level confidence evidence per provider that retained it (today:
+    /// Deepgram's streaming finals). Absent from providers without word
+    /// evidence. Consumed by the validation pipeline's user-vocabulary
+    /// correction gate.
+    pub word_confidences: Vec<ProviderWordConfidences>,
 }
 
 impl ProviderCoordinator {
@@ -3800,6 +3930,12 @@ impl ProviderCoordinator {
             }
         }
 
+        // Word-confidence evidence is pulled BEFORE the deadline path moves the
+        // streams into abort: the Deepgram accumulator is settled once its
+        // completion future resolved, and a stream that never completed has no
+        // Source Transcript for the gate to apply to anyway.
+        let deepgram_word_confidences = deepgram.word_confidences();
+
         if deadline_elapsed {
             // A provider that never produced a Source Transcript before the
             // Provider Deadline is abandoned below — record its absence so it is
@@ -3890,6 +4026,14 @@ impl ProviderCoordinator {
                 sources: transcripts,
                 timings_ms,
                 provider_failures,
+                word_confidences: if deepgram_word_confidences.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![ProviderWordConfidences {
+                        provider: Provider::Deepgram,
+                        words: deepgram_word_confidences,
+                    }]
+                },
             })
         }
     }
@@ -3901,6 +4045,16 @@ fn duration_millis(duration: Duration) -> u64 {
 
 pub trait TranscriptValidator: Send {
     fn set_dictionary_terms(&mut self, _dictionary_terms: Vec<String>) {}
+
+    /// Sets the user's personal dictionary terms for the constrained
+    /// post-correction pass. Default: no user vocabulary, so corrections are
+    /// disabled and pipeline output is byte-identical.
+    fn set_user_vocabulary(&mut self, _user_vocabulary: Vec<String>) {}
+
+    /// Sets the word-level confidence evidence for this Recording's provider
+    /// transcripts. Default: none, which leaves every user-vocabulary
+    /// substitution ungated (the documented asymmetry).
+    fn set_word_confidences(&mut self, _word_confidences: Vec<ProviderWordConfidences>) {}
 
     fn validate(
         &mut self,
@@ -3929,6 +4083,14 @@ pub trait TranscriptValidator: Send {
 impl<M: ReconciliationModel> TranscriptValidator for TranscriptDecisionPipeline<M> {
     fn set_dictionary_terms(&mut self, dictionary_terms: Vec<String>) {
         TranscriptDecisionPipeline::set_dictionary_terms(self, dictionary_terms);
+    }
+
+    fn set_user_vocabulary(&mut self, user_vocabulary: Vec<String>) {
+        TranscriptDecisionPipeline::set_user_vocabulary(self, user_vocabulary);
+    }
+
+    fn set_word_confidences(&mut self, word_confidences: Vec<ProviderWordConfidences>) {
+        TranscriptDecisionPipeline::set_word_confidences(self, word_confidences);
     }
 
     fn validate(

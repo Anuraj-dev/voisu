@@ -42,6 +42,14 @@ impl TranscriptValidator for MergeResultValidator {
         self.pipeline.set_dictionary_terms(dictionary_terms);
     }
 
+    fn set_user_vocabulary(&mut self, user_vocabulary: Vec<String>) {
+        self.pipeline.set_user_vocabulary(user_vocabulary);
+    }
+
+    fn set_word_confidences(&mut self, word_confidences: Vec<ProviderWordConfidences>) {
+        self.pipeline.set_word_confidences(word_confidences);
+    }
+
     fn validate(
         &mut self,
         sources: Vec<SourceTranscript>,

@@ -144,7 +144,40 @@ fn builtin_terms() -> Vec<String> {
 /// This is the shared read-only seam consumed by both the Whisper prompt
 /// builder and, in ticket 05, Deepgram keyterm boosting.
 pub fn merged_terms() -> Vec<String> {
-    merged_terms_with(load_user_terms(&user_dictionary_path()))
+    dictionary_snapshot().merged
+}
+
+/// One consistent dictionary read: the user's personal terms and the merged
+/// vocabulary derived from exactly that read. The daemon resolves this ONCE per
+/// Recording boundary so the Deepgram keyterms, the Whisper prompt, the
+/// pipeline's selection dictionary, and the user-vocabulary correction list are
+/// all derivatives of a single snapshot — one Recording can never mix
+/// vocabulary versions, and the dictionary file is never read twice.
+pub struct DictionarySnapshot {
+    /// The user's personal terms, in stored order. The user-vocabulary
+    /// correction pass consumes exactly this list: only user-owned terms may
+    /// rewrite a Transcript, so an empty personal dictionary disables
+    /// corrections entirely (byte-identical output).
+    pub user_terms: Vec<String>,
+    /// User terms ahead of the built-in developer glossary, de-duplicated.
+    pub merged: Vec<String>,
+}
+
+/// Loads the snapshot from the user dictionary path. A missing file yields
+/// empty user terms (built-ins only); a genuine read failure degrades to empty
+/// user terms with a local stderr diagnostic — correction fails closed by
+/// simply not firing, never by failing the pipeline.
+pub fn dictionary_snapshot() -> DictionarySnapshot {
+    dictionary_snapshot_at(&user_dictionary_path())
+}
+
+/// Path-parameterised core of [`dictionary_snapshot`], so the one-read contract
+/// (user terms and their merge derived from exactly one read) is testable
+/// without touching the real dictionary path.
+fn dictionary_snapshot_at(path: &Path) -> DictionarySnapshot {
+    let user_terms = load_user_terms(path);
+    let merged = merged_terms_with(user_terms.clone());
+    DictionarySnapshot { user_terms, merged }
 }
 
 /// Adds a user term to the end of the personal dictionary. Existing terms are
@@ -840,6 +873,29 @@ Tokio   # inline comment
         let terms = read_user_terms(&path).unwrap();
         assert!(terms.iter().any(|t| t == "alpha"), "alpha lost: {terms:?}");
         assert!(terms.iter().any(|t| t == "beta"), "beta lost: {terms:?}");
+    }
+
+    #[test]
+    fn snapshot_derives_user_terms_and_merged_vocabulary_from_one_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dictionary.txt");
+        std::fs::write(&path, "wayfinder\n").unwrap();
+
+        let snapshot = dictionary_snapshot_at(&path);
+
+        assert_eq!(snapshot.user_terms, vec!["wayfinder".to_owned()]);
+        assert_eq!(snapshot.merged[0], "wayfinder", "user terms ride first");
+        assert!(
+            snapshot.merged.iter().any(|term| term == "Claude"),
+            "built-ins follow in the same snapshot"
+        );
+    }
+
+    #[test]
+    fn a_missing_dictionary_yields_empty_user_terms_and_builtin_merges() {
+        let snapshot = dictionary_snapshot_at(Path::new("/nonexistent/voisu/dictionary.txt"));
+        assert!(snapshot.user_terms.is_empty());
+        assert_eq!(snapshot.merged, builtin_terms());
     }
 
     #[test]

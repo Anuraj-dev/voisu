@@ -30,12 +30,12 @@ use voisu_core::{
     Credential, DeadlineClock, DeliveryAdapter, DeliveryOutcome, IntentReconstructionAttempt,
     IntentReconstructionRequest, KeyDiagnosis, KeyLocation, MergeResult, PACKAGE_MANAGERS,
     PROTOCOL_VERSION, PackageManager, PreparedTranscriptDecision, Provider, ProviderAuthenticator,
-    ProviderKeyStatus, ProviderStream, ReadinessCapability, ReadinessFinding, ReadinessInspector,
-    ReadinessStatus, ReconciliationKind, ReconciliationModel, Request, Response, SecretStore,
-    SessionKind, SessionResolution, ShortcutPortal, ShortcutSession, SourceTranscript, Transcript,
-    TranscriptDecision, TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator,
-    TriggerKeyBinding, VersionEnvelope, WavScan, clipboard_candidates, install_instruction,
-    resolve_session, scan_wav_pcm, socket_path,
+    ProviderKeyStatus, ProviderStream, ProviderWordConfidences, ReadinessCapability,
+    ReadinessFinding, ReadinessInspector, ReadinessStatus, ReconciliationKind, ReconciliationModel,
+    Request, Response, SecretStore, SessionKind, SessionResolution, ShortcutPortal,
+    ShortcutSession, SourceTranscript, Transcript, TranscriptDecision, TranscriptDecisionPipeline,
+    TranscriptProvider, TranscriptValidator, TriggerKeyBinding, VersionEnvelope, WavScan,
+    clipboard_candidates, install_instruction, resolve_session, scan_wav_pcm, socket_path,
 };
 
 use crate::audio_level::{
@@ -1806,6 +1806,50 @@ mod tests {
     }
 
     #[test]
+    fn transcript_accumulator_keeps_word_confidences_from_finals_only() {
+        let mut accumulator = TranscriptAccumulator::default();
+        // An interim revision's words are superseded and must never be kept.
+        accumulator.ingest(&serde_json::json!({
+            "type": "Results", "is_final": false,
+            "channel": {"alternatives": [{"transcript": "the quick brown",
+                "words": [{"word": "the", "confidence": 0.1}]}]}
+        }));
+        accumulator.ingest(&serde_json::json!({
+            "type": "Results", "is_final": true,
+            "channel": {"alternatives": [{"transcript": "the quick brown fox",
+                "words": [
+                    {"word": "the", "confidence": 0.98},
+                    {"word": "quick", "confidence": 0.31},
+                    {"word": "brown", "confidence": 0.87},
+                    {"word": "fox", "confidence": 0.99}
+                ]}]}
+        }));
+        // A final segment without a words array contributes no evidence.
+        accumulator.ingest(&serde_json::json!({
+            "type": "Results", "is_final": true,
+            "channel": {"alternatives": [{"transcript": "jumps over."}]}
+        }));
+        // A word without a numeric confidence is carried as 0.0 (unproven,
+        // never confidently transcribed), and a wordless entry is skipped.
+        accumulator.ingest(&serde_json::json!({
+            "type": "Results", "is_final": true,
+            "channel": {"alternatives": [{"transcript": "now",
+                "words": [{"word": "now"}, {"confidence": 0.9}, {"word": "", "confidence": 1.0}]}]}
+        }));
+
+        assert_eq!(
+            accumulator.words(),
+            vec![
+                ("the".to_owned(), 0.98),
+                ("quick".to_owned(), 0.31),
+                ("brown".to_owned(), 0.87),
+                ("fox".to_owned(), 0.99),
+                ("now".to_owned(), 0.0),
+            ]
+        );
+    }
+
+    #[test]
     fn deepgram_streaming_url_carries_nova3_params_and_repeated_encoded_keyterms() {
         let url = deepgram_streaming_url(
             "wss://api.deepgram.com/v1/listen",
@@ -1840,6 +1884,37 @@ mod tests {
             2,
             "blank keyterms must be dropped: {url}"
         );
+    }
+
+    // An EMPTY dictionary must produce a byte-identical request: no keyterm
+    // parameter at all, so the provider sees exactly the pre-B2 request.
+    #[test]
+    fn deepgram_streaming_url_with_no_keyterms_omits_the_parameter_entirely() {
+        let plain = deepgram_streaming_url("wss://api.deepgram.com/v1/listen", &[]).unwrap();
+        assert!(!plain.contains("keyterm="), "{plain}");
+        // Blank terms are dropped by the URL builder itself (mirroring the
+        // persisted-dictionary parser, which can never yield an empty term):
+        // even a caller handing it blanks keeps the request byte-identical.
+        let blanks =
+            deepgram_streaming_url("wss://api.deepgram.com/v1/listen", &vec![String::new(); 3])
+                .unwrap();
+        assert_eq!(plain, blanks, "blank keyterms must change nothing");
+    }
+
+    // The DAEMON wiring caps the keyterms through `deepgram_keyterms` before
+    // the URL builder sees them; through that seam the streaming request never
+    // exceeds Deepgram's count and token budgets.
+    #[test]
+    fn deepgram_streaming_url_through_the_keyterm_cap_never_exceeds_the_budgets() {
+        let terms: Vec<String> = (0..600).map(|index| format!("term{index:03}")).collect();
+        let capped = crate::dictionary::deepgram_keyterms(&terms);
+        let url = deepgram_streaming_url("wss://api.deepgram.com/v1/listen", &capped).unwrap();
+        assert_eq!(
+            url.matches("keyterm=").count(),
+            capped.len(),
+            "every capped term is sent exactly once: {url}"
+        );
+        assert!(capped.len() <= crate::dictionary::DEEPGRAM_KEYTERM_COUNT_LIMIT);
     }
 
     #[test]
