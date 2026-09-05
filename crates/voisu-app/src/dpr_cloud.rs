@@ -20,6 +20,10 @@ use voisu_core::{
     parse_structured_candidate_json,
 };
 
+use crate::system::{
+    endpoint_authority_is_allowed, endpoint_raw_string_is_allowed, parsed_host_is_loopback,
+};
+
 /// Preferred in-budget candidate from the approved #140 matrix.
 pub const DPR_GROQ_MODEL: &str = "openai/gpt-oss-20b";
 pub const DPR_GROQ_REASONING_EFFORT: &str = "low";
@@ -595,27 +599,23 @@ fn ensure_rustls_ring_provider() {
     });
 }
 
+/// Production HTTPS always; plain HTTP only on loopback (test injection). The
+/// URL is parsed so the loopback decision is the real host, never a prefix of
+/// the raw authority — `http://localhost:8080@attacker.example/` is attacker
+/// .example carrying userinfo, not loopback.
 fn endpoint_is_allowed(endpoint: &str) -> bool {
-    if endpoint.is_empty() || endpoint.contains(['\n', '\r', '\0']) {
+    if !endpoint_raw_string_is_allowed(endpoint) {
         return false;
     }
-    if endpoint.starts_with("https://") {
-        return true;
-    }
-    let Some(remainder) = endpoint.strip_prefix("http://") else {
+    let Ok(url) = url::Url::parse(endpoint) else {
         return false;
     };
-    let authority = remainder
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    authority == "localhost"
-        || authority.starts_with("localhost:")
-        || authority == "127.0.0.1"
-        || authority.starts_with("127.0.0.1:")
-        || authority == "[::1]"
-        || authority.starts_with("[::1]:")
+    endpoint_authority_is_allowed(&url)
+        && match url.scheme() {
+            "https" => true,
+            "http" => parsed_host_is_loopback(&url),
+            _ => false,
+        }
 }
 
 #[cfg(test)]
@@ -1038,6 +1038,23 @@ mod tests {
         assert!(DprCloudClient::with_endpoint("http://127.0.0.1:1234/test").is_ok());
         assert!(DprCloudClient::with_endpoint("http://example.com/test").is_err());
         assert!(DprCloudClient::with_endpoint("file:///tmp/socket").is_err());
+        // The policy parses the URL: userinfo smuggling and lookalike suffixes
+        // must fail even when the raw authority prefix looks trusted.
+        assert!(
+            DprCloudClient::with_endpoint("http://localhost:8080@attacker.example/test").is_err()
+        );
+        assert!(
+            DprCloudClient::with_endpoint("https://user@api.groq.com@attacker.example/test")
+                .is_err()
+        );
+        assert!(DprCloudClient::with_endpoint("http://localhost.attacker.example/test").is_err());
+        // Raw-string gate: a `\` re-reads as userinfo under curl-style last-`@`
+        // splitting, and the EMPTY userinfo form is invisible to the parsed
+        // accessors.
+        assert!(
+            DprCloudClient::with_endpoint("http://localhost:8080\\@attacker.example/test").is_err()
+        );
+        assert!(DprCloudClient::with_endpoint("http://@localhost/test").is_err());
     }
 
     fn valid_format_edits() -> Value {

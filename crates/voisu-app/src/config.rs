@@ -135,12 +135,12 @@ pub const DEFAULT_DEEPGRAM_ENABLED: bool = true;
 
 /// Writing Mode defaults to Smart so a fresh install gets Formatting (and
 /// optional Minimal Grammar when eligible). Unreadable or invalid config fails
-/// closed to Literal instead — see [`resolve_writing_mode`].
+/// closed to Literal instead — see `resolve_writing_mode`.
 pub const DEFAULT_WRITING_MODE: WritingMode = WritingMode::Smart;
 
 /// Rendering Policy defaults to Adaptive (constants JSON / #144). Unreadable
 /// or invalid config fails closed to Natural (local-only safest) — see
-/// [`resolve_rendering_policy`].
+/// `resolve_rendering_policy`.
 pub const DEFAULT_RENDERING_POLICY: RenderingPolicy = voisu_core::DEFAULT_RENDERING_POLICY;
 
 /// Smart Writing remains the production path until an explicit rollout flag.
@@ -154,7 +154,7 @@ pub const DEFAULT_QWEN_FORMAT_ENABLED: bool = false;
 
 /// Whether the Deepgram Provider is enabled for Recordings.
 ///
-/// The env override [`DISABLE_DEEPGRAM_ENV`] wins over the persisted file: when
+/// The env override `DISABLE_DEEPGRAM_ENV` wins over the persisted file: when
 /// it is set, Deepgram is disabled regardless of the file. Otherwise the
 /// persisted `config.toml` decides, defaulting to [`DEFAULT_DEEPGRAM_ENABLED`]
 /// (ON) when the file is absent, unreadable, or does not carry the key.

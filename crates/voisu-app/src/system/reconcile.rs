@@ -166,12 +166,17 @@ fn request_groq_intent_reconstruction(
 ) -> Result<MergeResult, BoundaryError> {
     let endpoint = std::env::var("VOISU_GROQ_RECONCILIATION_URL")
         .unwrap_or_else(|_| "https://api.groq.com/openai/v1/chat/completions".to_owned());
-    if !provider_endpoint_is_secure(&endpoint) {
-        return Err(BoundaryError::new(
-            BoundaryKind::Validation,
-            "Groq Intent Reconstruction endpoint must use HTTPS except on loopback",
-        ));
-    }
+    // Hand curl the GATED serialization, never the raw string (see
+    // `provider_endpoint_url`).
+    let endpoint = provider_endpoint_url(&endpoint)
+        .ok_or_else(|| {
+            BoundaryError::new(
+                BoundaryKind::Validation,
+                "Groq Intent Reconstruction endpoint must use HTTPS except on loopback",
+            )
+        })?
+        .as_str()
+        .to_owned();
     let body = groq_intent_reconstruction_request_body(&request).to_string();
     let config = format!(
         "url = \"{}\"\nheader = \"Authorization: Bearer {}\"\nheader = \"Content-Type: application/json\"\ndata = \"{}\"\n",
@@ -263,12 +268,17 @@ fn request_groq_reconciliation(
 ) -> Result<MergeResult, BoundaryError> {
     let endpoint = std::env::var("VOISU_GROQ_RECONCILIATION_URL")
         .unwrap_or_else(|_| "https://api.groq.com/openai/v1/chat/completions".to_owned());
-    if !provider_endpoint_is_secure(&endpoint) {
-        return Err(BoundaryError::new(
-            BoundaryKind::Validation,
-            "Groq reconciliation endpoint must use HTTPS except on loopback",
-        ));
-    }
+    // Hand curl the GATED serialization, never the raw string (see
+    // `provider_endpoint_url`).
+    let endpoint = provider_endpoint_url(&endpoint)
+        .ok_or_else(|| {
+            BoundaryError::new(
+                BoundaryKind::Validation,
+                "Groq reconciliation endpoint must use HTTPS except on loopback",
+            )
+        })?
+        .as_str()
+        .to_owned();
     let model = std::env::var("VOISU_GROQ_RECONCILIATION_MODEL")
         .unwrap_or_else(|_| DEFAULT_GROQ_RECONCILIATION_MODEL.to_owned());
     if model.trim().is_empty() || model.contains(['\n', '\r']) {

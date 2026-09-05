@@ -15,7 +15,7 @@
 //!
 //! Every externally sourced string (delivered Transcript, Provider diagnostics,
 //! decision reasons) originates from a network STT provider and is therefore
-//! untrusted. All such text is routed through [`truncate_inline`], which strips
+//! untrusted. All such text is routed through `truncate_inline`, which strips
 //! terminal control bytes (ESC/BEL/backspace/DEL and other C0/C1 controls) so a
 //! hostile transcript cannot smuggle CSI screen-clears or OSC clipboard-hijack
 //! sequences into the user's terminal — even piped with color off.

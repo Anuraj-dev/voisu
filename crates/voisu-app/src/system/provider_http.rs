@@ -51,7 +51,7 @@ impl ProviderHttpClient {
     /// Performs a live credential round trip and classifies the outcome. A
     /// transport failure (curl missing, timeout, connection refused) is a
     /// transient `Unreachable`, never a wrong-key verdict. Tests bypass the
-    /// network via `VOISU_TEST_AUTH_{GROQ,DEEPGRAM}` (see [`controlled_key_status`]).
+    /// network via `VOISU_TEST_AUTH_{GROQ,DEEPGRAM}` (see `controlled_key_status`).
     pub async fn check(&self, provider: Provider, credential: Credential) -> ProviderKeyStatus {
         let controlled = match provider {
             Provider::Groq => std::env::var_os("VOISU_TEST_AUTH_GROQ"),
