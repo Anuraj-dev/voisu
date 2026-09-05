@@ -42,10 +42,10 @@
 //! exactly as the user wrote it). A consistently-cased span therefore usually
 //! round-trips unchanged; the substitution's visible effect is canonicalizing
 //! inconsistent casing and rejoining punctuation-separated forms of hyphenated
-//! or slashed terms (`daemon reload` → `daemon-reload`). Terms whose written
-//! form contains a sentence terminal (`Node.js`) can never match — every gap
-//! into their separator would have to carry that terminal — so they fail
-//! closed entirely: they receive Deepgram keyterm boosting but never correct.
+//! or slashed terms (`daemon reload` → `daemon-reload`). Sentence terminals
+//! are never admitted in a gap, so dotted terms correct only
+//! whitespace-joined forms (`Node js` → `Node.js`) and never across marked
+//! boundaries (`Node. JS` and `Node.js` stay as spoken).
 //!
 //! The pass is idempotent and fail-closed by construction: it is a pure
 //! function over already-loaded terms, and an empty user dictionary (or a
@@ -116,12 +116,22 @@ pub(crate) fn apply_user_vocabulary(
     // corrected when the first was confident). Occurrences are counted in the
     // TEXT — including ones this pass can never rewrite (masked spans), whose
     // words were nonetheless spoken and transcribed.
+    //
+    // The text-occurrence counter lives PER TERM (a local of the term loop
+    // below); ONLY the minima cache is shared, keyed by run sequence. Two
+    // dictionary entries with identical run sequences (`Rust` + `Rust`,
+    // `daemon-reload` + `daemon reload` — the raw user list is not
+    // de-duplicated) each match the same text spans, and each must read the
+    // evidence by its OWN occurrence index: a shared counter would make the
+    // second term's first span read the second evidence occurrence — or none,
+    // applying a confidently-heard span ungated.
     let mut sequence_evidence: HashMap<&[String], SequenceEvidence> = HashMap::new();
 
     // Whole-token matches, longest-span-at-start first.
     let mut matches: Vec<Match> = Vec::new();
     let runs = alphanumeric_runs(text);
     for (term_index, term) in terms.iter().enumerate() {
+        let mut text_occurrence = 0usize;
         for start in 0..runs.len().saturating_sub(term.runs.len() - 1) {
             let end = start + term.runs.len();
             if !runs[start..end]
@@ -131,14 +141,8 @@ pub(crate) fn apply_user_vocabulary(
             {
                 continue;
             }
-            let state = sequence_evidence
-                .entry(term.runs.as_slice())
-                .or_insert_with(|| SequenceEvidence {
-                    next_text_occurrence: 0,
-                    minima: evidence_occurrence_minima(&term.runs, &evidence_runs),
-                });
-            let occurrence = state.next_text_occurrence;
-            state.next_text_occurrence += 1;
+            let occurrence = text_occurrence;
+            text_occurrence += 1;
             let span_start = runs[start].start;
             let span_end = runs[end - 1].end;
             if !separators_allowed(text, &runs[start..end], &term.separators) {
@@ -151,10 +155,16 @@ pub(crate) fn apply_user_vocabulary(
                 continue;
             }
             // The occurrence's confidence: the minimum across its words (ALL
-            // words must be confident to skip). An occurrence beyond the
-            // evidence's own occurrence count has NO confidence for its span —
-            // the documented no-evidence → apply rule.
-            if state
+            // words must be confident to skip), from the shared per-sequence
+            // cache. An occurrence beyond the evidence's own occurrence count
+            // has NO confidence for its span — the documented no-evidence →
+            // apply rule.
+            let minima = sequence_evidence
+                .entry(term.runs.as_slice())
+                .or_insert_with(|| SequenceEvidence {
+                    minima: evidence_occurrence_minima(&term.runs, &evidence_runs),
+                });
+            if minima
                 .minima
                 .get(occurrence)
                 .is_some_and(|&minimum| minimum >= CONFIDENT_WORD_SKIP_THRESHOLD)
@@ -208,8 +218,9 @@ impl VocabularyTerm {
     /// symbol (`C#`) would require INVENTING that symbol in the Transcript —
     /// the provider never heard it — so such terms are skipped here. A term
     /// whose internal separator is a sentence terminal (`Node.js`) stays
-    /// eligible by this check but can never match (see [`SENTENCE_TERMINALS`]):
-    /// it boosts, but never corrects.
+    /// eligible by this check, but sentence terminals are never admitted in a
+    /// gap (see [`SENTENCE_TERMINALS`]), so it corrects only whitespace-joined
+    /// forms and never across a marked boundary.
     fn parse(term: &str) -> Option<Self> {
         let trimmed = term.trim();
         let first = trimmed.chars().next()?;
@@ -273,9 +284,9 @@ fn make_run(text: &str, start: usize, end: usize) -> TextRun {
 /// runs — not even when the term's own written form contains them. A gap
 /// carrying one of these is a sentence boundary the provider heard; joining
 /// across it corrupts two sentences into one ("about Node. JS is great." must
-/// never become "about Node.js is great."). Because a dotted term's own joined
-/// form ("Node.js") can only match across a '.' gap, dotted terms fail closed
-/// entirely: they boost, but never correct.
+/// never become "about Node.js is great."). A dotted term therefore corrects
+/// only whitespace-joined forms ("Node js" → "Node.js") and never across a
+/// marked boundary ("Node. JS", or its own joined "Node.js", stay as spoken).
 const SENTENCE_TERMINALS: [char; 3] = ['.', '!', '?'];
 
 /// Every character between consecutive matched runs must be whitespace or one
@@ -323,11 +334,15 @@ fn confidence_runs(word_confidences: &[(String, f64)]) -> Vec<(String, f64)> {
         .collect()
 }
 
-/// Per-run-sequence confidence evidence: how many text occurrences of the
-/// sequence have been seen so far, and the minimum confidence of each
-/// occurrence of the sequence in the flattened evidence stream.
+/// Per-run-sequence confidence CACHE: the minimum confidence of each
+/// occurrence of the sequence in the flattened evidence stream. The
+/// text-occurrence counter deliberately does NOT live here — it is a local of
+/// the per-term loop — because two dictionary entries with identical run
+/// sequences (`Rust` + `Rust`, `daemon-reload` + `daemon reload`) each match
+/// the same text spans and each must read the evidence by its own occurrence
+/// index; a shared counter would hand the second term's first span the second
+/// evidence occurrence, or none (ungated apply on a confident hearing).
 struct SequenceEvidence {
-    next_text_occurrence: usize,
     minima: Vec<f64>,
 }
 
@@ -701,6 +716,67 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicated_term_reads_its_own_occurrence_index() {
+        // The reviewer's trace: `parse_user_terms` does NOT de-duplicate, so
+        // ["Rust", "Rust"] reaches the correction with identical run
+        // sequences. Each term must count text occurrences for ITSELF: with a
+        // shared counter, the second term's first span read occurrence #1's
+        // evidence (or none) and rewrote a 0.97-confidence hearing.
+        let dictionary = terms(&["Rust", "Rust"]);
+        let confident = vec![("the".to_owned(), 0.99), ("rust".to_owned(), 0.97)];
+        assert_eq!(
+            apply_user_vocabulary("the rUst compiler", &dictionary, &confident),
+            "the rUst compiler",
+            "both terms must skip the same confident span via occurrence 0"
+        );
+        // Without evidence both terms still propose the same rewrite; overlap
+        // resolution delivers it exactly once.
+        assert_eq!(
+            apply_user_vocabulary("the rUst compiler", &dictionary, &[]),
+            "the Rust compiler"
+        );
+    }
+
+    #[test]
+    fn separator_variant_terms_share_the_minima_cache_not_the_counter() {
+        // `daemon-reload` and `daemon_reload` lower to the SAME run sequence,
+        // so the minima cache is shared — but each term counts text
+        // occurrences for itself. A shared counter made the second term's
+        // first span read occurrence #1 (none here) and rewrite a confidently
+        // heard "daemon reload" into "daemon_reload".
+        let dictionary = terms(&["daemon-reload", "daemon_reload"]);
+        let confident = vec![("daemon".to_owned(), 0.97), ("reload".to_owned(), 0.96)];
+        assert_eq!(
+            apply_user_vocabulary("run daemon reload", &dictionary, &confident),
+            "run daemon reload",
+            "both separator variants must skip the confident span"
+        );
+        // The shared cache still serves the apply path: with a shaky word both
+        // terms propose the same span, and the first dictionary entry wins.
+        let shaky = vec![("daemon".to_owned(), 0.5), ("reload".to_owned(), 0.96)];
+        assert_eq!(
+            apply_user_vocabulary("run daemon reload", &dictionary, &shaky),
+            "run daemon-reload"
+        );
+    }
+
+    #[test]
+    fn an_internal_exclamation_terminal_is_refused_like_a_period() {
+        // The '!' leg of SENTENCE_TERMINALS: "wow! Really" is a boundary the
+        // provider heard and is never joined; the unmarked spaced form still
+        // corrects (mixed casing shape → the term as written).
+        let dictionary = terms(&["wow!Really"]);
+        assert_eq!(
+            apply_user_vocabulary("it went wow! Really fast", &dictionary, &[]),
+            "it went wow! Really fast"
+        );
+        assert_eq!(
+            apply_user_vocabulary("it went wow rEally fast", &dictionary, &[]),
+            "it went wow!Really fast"
+        );
+    }
+
+    #[test]
     fn a_sentence_boundary_is_never_joined_even_for_a_dotted_term() {
         // "Node. JS" spans two sentences: the gap carries a sentence terminal,
         // so the dotted term must fail closed to as-spoken.
@@ -710,10 +786,11 @@ mod tests {
     }
 
     #[test]
-    fn a_dotted_term_fails_closed_even_on_its_own_joined_form() {
+    fn a_dotted_term_never_rewrites_its_own_marked_form() {
         // The only gap into "Node.js"'s own joined form carries the '.', a
         // sentence terminal — indistinguishable locally from a real boundary —
-        // so dotted terms never correct at all: they boost, never rewrite.
+        // so the marked form stays exactly as spoken. (The whitespace-joined
+        // form "Node js" still corrects; see the abbreviation test below.)
         let text = "about Node.js is great.";
         let corrected = apply_user_vocabulary(text, &terms(&["Node.js"]), &[]);
         assert_eq!(corrected, text);
