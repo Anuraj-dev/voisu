@@ -257,7 +257,7 @@ pub(super) fn groq_intent_reconstruction_request_body(
         "reasoning_effort": "none",
         "temperature": 0,
         "messages": [
-            {"role": "system", "content": "Infer the user's most likely intended wording from both Source Transcripts. Neither source is truth. Novel wording is allowed. Return exactly one JSON object with exactly this shape: {\"wording\":\"...\"}. The wording value must contain the final transcript. Do not add any other keys, markdown fences, or explanation. Deterministic host code owns structural layout."},
+            {"role": "system", "content": "Infer the user's most likely intended wording from both Source Transcripts. Neither source is truth. Novel wording is allowed. When the user spells a word letter by letter (for example a n t i g r a v i t y or ANTIGRAVITYCLI), join those letters into the intended word (Antigravity / Antigravity CLI) instead of leaving spaces or inventing a different name. Return exactly one JSON object with exactly this shape: {\"wording\":\"...\"}. The wording value must contain the final transcript. Do not add any other keys, markdown fences, or explanation. Deterministic host code owns structural layout."},
             {"role": "user", "content": serde_json::json!({
                 "sources": sources,
                 "dictionary": request.dictionary_terms,

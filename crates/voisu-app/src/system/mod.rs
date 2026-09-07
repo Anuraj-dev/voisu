@@ -3459,12 +3459,11 @@ mod tests {
             body["response_format"],
             serde_json::json!({"type": "json_object"})
         );
-        assert!(
-            body["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("exactly this shape: {\"wording\":\"...\"}")
-        );
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("exactly this shape: {\"wording\":\"...\"}"));
+        assert!(system.contains(
+            "When the user spells a word letter by letter (for example a n t i g r a v i t y or ANTIGRAVITYCLI), join those letters into the intended word (Antigravity / Antigravity CLI) instead of leaving spaces or inventing a different name."
+        ));
         let user: serde_json::Value =
             serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
         assert_eq!(user["sources"].as_array().unwrap().len(), 2);
