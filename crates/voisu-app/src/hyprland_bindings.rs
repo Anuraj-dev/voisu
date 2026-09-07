@@ -27,8 +27,8 @@ pub struct PasteShortcut {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PasteBehavior {
     /// The known Omarchy helper chooses a different application shortcut for a
-    /// terminal. The daemon emits the verified binding key and lets Hyprland
-    /// perform that focus-sensitive choice.
+    /// terminal. Immediately before emit, the daemon reads the focused window
+    /// tags and presses `terminal` or `normal` itself.
     OmarchyUniversal {
         normal: PasteShortcut,
         terminal: PasteShortcut,
@@ -775,6 +775,17 @@ pub fn discover_paste_action_from_sources(
     Ok(discover_paste_action(&sources, &live))
 }
 
+/// Whether the daemon can ask this Hyprland instance to press keys.
+///
+/// Distinct from binding verification: an empty or missing compositor
+/// signature means the press path cannot run even if a Paste Action would
+/// otherwise verify.
+pub fn hyprland_press_path_available() -> bool {
+    std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
 /// Production discovery for the daemon. A missing or unreadable source is a
 /// safe clipboard-only result; setup/diagnostic callers that need the exact
 /// failure should use [`discover_paste_action_from_sources`] directly.
@@ -849,7 +860,7 @@ fn live_binding_matches_source(live: &Value, source: &LuaBinding) -> bool {
     }
 }
 
-fn shortcut_parts(binding: &str) -> Option<(u64, String)> {
+pub(crate) fn shortcut_parts(binding: &str) -> Option<(u64, String)> {
     let pieces = binding
         .split('+')
         .map(str::trim)
@@ -871,6 +882,40 @@ fn shortcut_parts(binding: &str) -> Option<(u64, String)> {
         };
     }
     Some((modmask, key.to_owned()))
+}
+
+/// Splits a verified chord into Hyprland `send_key_state` tokens. Only
+/// `[A-Za-z0-9_]+` pieces are returned; anything else fails closed.
+pub(crate) fn sanitized_send_key_tokens(binding: &str) -> Option<(String, String)> {
+    let _ = shortcut_parts(binding)?;
+    let pieces = binding
+        .split('+')
+        .map(str::trim)
+        .filter(|piece| !piece.is_empty())
+        .collect::<Vec<_>>();
+    let key = *pieces.last()?;
+    if !is_safe_lua_token(key) {
+        return None;
+    }
+    let mut mods = Vec::new();
+    for modifier in &pieces[..pieces.len().saturating_sub(1)] {
+        if !is_safe_lua_token(modifier) {
+            return None;
+        }
+        let token = match modifier.to_ascii_uppercase().as_str() {
+            "SHIFT" => "SHIFT",
+            "CTRL" | "CONTROL" => "CTRL",
+            "ALT" => "ALT",
+            "SUPER" | "META" | "WIN" | "MOD4" => "SUPER",
+            _ => return None,
+        };
+        mods.push(token);
+    }
+    Some((mods.join(" + "), key.to_owned()))
+}
+
+fn is_safe_lua_token(token: &str) -> bool {
+    !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn normalize_key(key: &str) -> String {
@@ -4086,5 +4131,29 @@ o.bind("CTRL + SHIFT + P", "Paste transcript", my_paste)
         }]);
 
         assert!(discover_paste_action(&[source], &live).is_none());
+    }
+
+    #[test]
+    fn sanitized_send_key_tokens_keep_omarchy_and_simple_chords() {
+        assert_eq!(
+            sanitized_send_key_tokens("CTRL + V"),
+            Some(("CTRL".to_owned(), "V".to_owned()))
+        );
+        assert_eq!(
+            sanitized_send_key_tokens("SHIFT + Insert"),
+            Some(("SHIFT".to_owned(), "Insert".to_owned()))
+        );
+        assert_eq!(
+            sanitized_send_key_tokens("CTRL + SHIFT + P"),
+            Some(("CTRL + SHIFT".to_owned(), "P".to_owned()))
+        );
+        assert_eq!(
+            sanitized_send_key_tokens("CONTROL + v"),
+            Some(("CTRL".to_owned(), "v".to_owned()))
+        );
+        assert_eq!(sanitized_send_key_tokens("code:66"), None);
+        assert_eq!(sanitized_send_key_tokens("CTRL + code:66"), None);
+        assert_eq!(sanitized_send_key_tokens("CAPS + V"), None);
+        assert_eq!(sanitized_send_key_tokens(""), None);
     }
 }

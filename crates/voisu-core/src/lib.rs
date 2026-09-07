@@ -477,6 +477,22 @@ pub enum PasteActionState {
     NotRequired,
 }
 
+/// How clipboard Delivery will press a verified Paste Action, if at all.
+///
+/// Distinct from [`PasteActionState`]: a binding can be verified while the
+/// Hyprland press path still cannot run.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PasteBackend {
+    /// Clipboard Delivery selected the native Hyprland paste adapter.
+    Hyprland,
+    /// A verified action exists (or would) but the Hyprland press path cannot run.
+    Unavailable,
+    /// Type, guarded, opt-out, or clipboard-only with no action.
+    #[default]
+    NotRequired,
+}
+
 /// Readiness captured in the daemon's own environment at process start.
 ///
 /// This is intentionally reported by the daemon rather than inferred by the
@@ -495,6 +511,10 @@ pub struct DaemonReadiness {
     pub hyprland_instance_signature: Option<String>,
     pub delivery_mode: String,
     pub paste_action: PasteActionState,
+    /// Whether clipboard Delivery can ask Hyprland to press the Paste Action.
+    /// Defaulted so older daemons without this field still deserialize.
+    #[serde(default)]
+    pub paste_backend: PasteBackend,
     /// The first clipboard writer available in the daemon's PATH, if any.
     /// Presence alone does not mean it can reach the daemon's display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4403,6 +4423,27 @@ pub trait ShortcutSession: Send {
     /// signals that the underlying connection ended (all streams closed) — a
     /// recoverable stream failure the listener answers by rebinding.
     fn next_event(&mut self) -> BoundaryFuture<'_, ShortcutEvent>;
+}
+
+#[cfg(test)]
+mod daemon_readiness_additivity_tests {
+    use super::*;
+
+    #[test]
+    fn paste_backend_defaults_so_old_json_still_parses() {
+        let old_json = r#"{
+            "session_type": "wayland",
+            "wayland_display": "wayland-0",
+            "x11_display": null,
+            "delivery_mode": "clipboard",
+            "paste_action": "verified",
+            "clipboard_usable": true
+        }"#;
+        let readiness: DaemonReadiness = serde_json::from_str(old_json)
+            .expect("a pre-paste-backend readiness payload must deserialize");
+        assert_eq!(readiness.paste_action, PasteActionState::Verified);
+        assert_eq!(readiness.paste_backend, PasteBackend::NotRequired);
+    }
 }
 
 #[cfg(test)]

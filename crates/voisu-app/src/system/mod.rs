@@ -3152,6 +3152,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn with_hyprland_paste_does_not_start_remote_desktop_setup() {
+        let delivery = PortalClipboardDelivery::with_hyprland_paste(test_paste_action());
+        assert!(delivery.hyprland_paste_skips_remote_desktop());
+    }
+
+    #[tokio::test]
     async fn production_paste_starts_portal_setup_before_the_first_invoke() {
         let paste = PortalPasteAction::with_live_revalidation(
             test_paste_action(),

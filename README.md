@@ -79,8 +79,9 @@ How you pick the Trigger Key depends on your desktop's portal:
   Lock as the Trigger Key also disables lock-toggle on that key.
 
   Type Delivery does not work on Hyprland: its portal implements no
-  RemoteDesktop interface, which is Voisu's only text-injection path. Setup
-  selects clipboard Delivery:
+  RemoteDesktop interface. Setup selects clipboard Delivery, which preserves
+  the Transcript and then asks Hyprland to press a verified Paste Action
+  chord. RemoteDesktop is not used on that path:
 
   ```sh
   voisu delivery clipboard
