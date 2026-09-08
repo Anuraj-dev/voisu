@@ -424,7 +424,10 @@ cat > "$dir/clipboard"
     assert!(started.status.success(), "{}", stderr(&started));
     wait_for_marker(commands.path(), "pw-record.ready");
     let status_started = Instant::now();
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    assert_eq!(
+        status_headline(&voisu(runtime.path(), "status")),
+        "Recording\n"
+    );
     // Single-shot spawn+IPC latency on a contended runner tails past any
     // sub-second bound; the promptness that matters is "not stalled", so keep
     // the outer bound generous instead of racing the scheduler.
@@ -605,7 +608,10 @@ cat > "$dir/clipboard"
     // Stop only after the full 64000 bytes were emitted, so the content
     // assertion below compares against the complete captured Recording.
     wait_for_marker(commands.path(), "pw-record.ready");
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    assert_eq!(
+        status_headline(&voisu(runtime.path(), "status")),
+        "Recording\n"
+    );
 
     let stopped = voisu(runtime.path(), "stop");
     assert!(stopped.status.success(), "{}", stderr(&stopped));
@@ -1277,7 +1283,7 @@ printf '%s' "$((count + 1))" > "$dir/delivery.count"
             "{failure}"
         );
         assert_eq!(
-            stdout(&voisu(runtime.path(), "status")),
+            status_headline(&voisu(runtime.path(), "status")),
             "idle\n",
             "{failure}"
         );
@@ -1332,7 +1338,10 @@ cat > "$dir/clipboard"
     assert!(voisu(runtime.path(), "start").status.success());
     // Confirm the Recording is actively capturing, then prove no Groq chunk was
     // pre-streamed: a short Recording issues its one request only at finalize.
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    assert_eq!(
+        status_headline(&voisu(runtime.path(), "status")),
+        "Recording\n"
+    );
     wait_for_marker(commands.path(), "pw-record.ready");
     assert_eq!(
         live_requests.load(Ordering::SeqCst),
@@ -1440,7 +1449,7 @@ cat > "$dir/clipboard"
         !Path::new(&format!("/proc/{first_pid}")).exists(),
         "failed provider start must kill and reap pw-record"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 
     if let Err(err) = fs::remove_file(commands.path().join("pw-record.ready")) {
         assert_eq!(
@@ -1594,7 +1603,7 @@ cat > /dev/null
     };
     status_thread.join().unwrap();
     assert!(status.status.success(), "{}", stderr(&status));
-    assert_eq!(stdout(&status), "processing\n");
+    assert_eq!(status_headline(&status), "processing\n");
 
     let stopped = stop.join().unwrap();
     assert!(stopped.status.success(), "{}", stderr(&stopped));
@@ -1635,7 +1644,7 @@ while [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
     assert_eq!(stderr(&rejected), "Source Transcripts are unavailable\n");
     assert!(!stderr(&rejected).contains("controlled-secret"));
     assert!(!stderr(&rejected).contains("example.invalid"));
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     let diagnostics = daemon.terminate_and_stderr();
     assert!(!diagnostics.contains("controlled-secret"));
     assert!(!diagnostics.contains("example.invalid"));
@@ -1672,7 +1681,7 @@ fn production_groq_quality_failure_is_classified_through_the_public_cli() {
     assert_eq!(stderr(&rejected), "Transcript failed quality validation\n");
     request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
 }
 
@@ -1711,7 +1720,7 @@ fn production_groq_5xx_is_recoverable_through_the_public_cli() {
     assert_eq!(stderr(&rejected), "Source Transcripts are unavailable\n");
     request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
 }
 
@@ -1752,7 +1761,7 @@ fn production_slow_groq_endpoint_is_bounded_and_recoverable() {
     assert!(started.elapsed() < PROCESSING_RESPONSE_DEADLINE);
     request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
@@ -1784,7 +1793,7 @@ fn production_capture_death_mid_recording_self_recovers_without_stop() {
     // lag on a contended CI core; the loop returns as soon as Idle is observed.
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        if stdout(&voisu(runtime.path(), "status")) == "idle\n" {
+        if status_headline(&voisu(runtime.path(), "status")) == "idle\n" {
             assert!(voisu(runtime.path(), "start").status.success());
             let diagnostics = daemon.terminate_and_stderr();
             // Which capture-failure diagnostic wins is a benign daemon-side race:
@@ -1912,7 +1921,7 @@ cat > "$dir/clipboard"
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
         "Recovered microphone."
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 }
 
 #[test]
@@ -1942,7 +1951,7 @@ fn production_missing_wl_copy_is_reported_and_recoverable() {
     assert_eq!(stderr(&rejected), "Transcript Delivery failed\n");
     request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
 }
 
@@ -2489,7 +2498,7 @@ fn production_recording_quality_failure(script_body: &str, expected: &str) {
     let stopped = voisu(runtime.path(), "stop");
     assert_eq!(stopped.status.code(), Some(4));
     assert_eq!(stderr(&stopped), format!("{expected}\n"));
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 
     // Every rejected Recording must leave the daemon ready for the next one.
     assert!(voisu(runtime.path(), "start").status.success());
@@ -2609,7 +2618,7 @@ fn status_is_responsive_and_processing_is_observable_during_provider_work() {
     let mut observed = false;
     while Instant::now() < deadline {
         let status = voisu(runtime.path(), "status");
-        if stdout(&status) == "processing\n" {
+        if status_headline(&status) == "processing\n" {
             observed = true;
             break;
         }
@@ -2622,7 +2631,7 @@ fn status_is_responsive_and_processing_is_observable_during_provider_work() {
 
     let stop = stop.join().unwrap();
     assert!(stop.status.success(), "{}", stderr(&stop));
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 }
 
 #[test]
@@ -2638,12 +2647,12 @@ fn capture_finalization_failure_is_redacted_and_the_next_recording_succeeds() {
     assert_eq!(failed.status.code(), Some(4));
     assert_eq!(stderr(&failed), "Recording capture failed\n");
     assert!(!stderr(&failed).contains("controlled-secret"));
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 
     assert!(voisu(runtime.path(), "start").status.success());
     let recovered = voisu(runtime.path(), "stop");
     assert!(recovered.status.success(), "{}", stderr(&recovered));
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 }
 
 #[test]
@@ -2679,7 +2688,7 @@ fn capture_pump_panic_fails_the_recording_and_the_next_recording_succeeds() {
 
     let recovered = voisu(runtime.path(), "stop");
     assert!(recovered.status.success(), "{}", stderr(&recovered));
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 }
 
 #[test]
@@ -2694,7 +2703,7 @@ fn processing_task_panic_records_aborted_unknown_outcomes_and_rebuilds_adapters(
         stderr(&failed),
         "Recording processing failed at an unknown point\n"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
@@ -2717,7 +2726,7 @@ fn processing_task_panic_records_aborted_unknown_outcomes_and_rebuilds_adapters(
     assert!(voisu(runtime.path(), "start").status.success());
     let recovered = voisu(runtime.path(), "stop");
     assert!(recovered.status.success(), "{}", stderr(&recovered));
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 }
 
 impl Drop for Daemon {
@@ -3256,6 +3265,14 @@ fn wait_until_missing(path: &Path) {
 
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn status_headline(output: &Output) -> String {
+    let text = stdout(output);
+    match text.split_once('\n') {
+        Some((line, _)) => format!("{line}\n"),
+        None => text,
+    }
 }
 
 fn stderr(output: &Output) -> String {
@@ -5503,7 +5520,7 @@ fn status_distinguishes_daemon_unavailable_from_idle() {
     let _daemon = Daemon::start(runtime.path());
     let idle = voisu(runtime.path(), "status");
     assert!(idle.status.success(), "{}", stderr(&idle));
-    assert_eq!(stdout(&idle), "idle\n");
+    assert_eq!(status_headline(&idle), "idle\n");
 }
 
 const OVERLAY_STATUS: &str = r#"{"version":1,"command":"overlaystatus"}"#;
@@ -5519,7 +5536,7 @@ fn overlay_status_carries_the_delivered_event_while_lifecycle_responses_do_not()
     assert!(idle.get("overlay_event").is_none());
 
     // Normal CLI Status is unchanged by the observer path.
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
 
     // The lifecycle Stop response must NOT carry the observer payload; the
@@ -5542,7 +5559,7 @@ fn overlay_status_carries_the_delivered_event_while_lifecycle_responses_do_not()
         again["overlay_event"]["id"],
         observed["overlay_event"]["id"]
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 }
 
 #[test]
@@ -5660,7 +5677,10 @@ fn saturating_observers_stuck_mid_frame_never_perturb_recording_delivery_or_the_
     // proving per-connection read isolation: a blocked accept/serve path would
     // instead stall this Status until the readers' deadline elapsed.
     let responsive = Instant::now();
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    assert_eq!(
+        status_headline(&voisu(runtime.path(), "status")),
+        "Recording\n"
+    );
     assert!(
         responsive.elapsed() < Duration::from_secs(1),
         "status stalled under saturation"
@@ -5713,7 +5733,7 @@ fn an_unknown_observer_command_is_rejected_without_disturbing_the_daemon() {
         "unknown command was not rejected: {response}"
     );
 
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 }
 
 #[test]
@@ -5796,7 +5816,10 @@ fn level_poll_filters_by_cursor_over_deterministic_paused_frames() {
     );
     assert_eq!(drained["level_frames"], serde_json::json!([]), "{drained}");
 
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    assert_eq!(
+        status_headline(&voisu(runtime.path(), "status")),
+        "Recording\n"
+    );
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
@@ -5877,20 +5900,23 @@ fn concurrent_start_begins_exactly_one_recording() {
     );
     let status = voisu(runtime.path(), "status");
     assert!(status.status.success(), "{}", stderr(&status));
-    assert_eq!(stdout(&status), "Recording\n");
+    assert_eq!(status_headline(&status), "Recording\n");
 
     for _ in 0..2 {
         let stop = voisu(runtime.path(), "stop");
         assert!(stop.status.success(), "{}", stderr(&stop));
-        assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+        assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 
         let start = voisu(runtime.path(), "start");
         assert!(start.status.success(), "{}", stderr(&start));
-        assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+        assert_eq!(
+            status_headline(&voisu(runtime.path(), "status")),
+            "Recording\n"
+        );
     }
     let stop = voisu(runtime.path(), "stop");
     assert!(stop.status.success(), "{}", stderr(&stop));
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 }
 
 #[test]
@@ -5923,7 +5949,7 @@ fn stop_completes_recording_and_delivery_then_returns_to_idle() {
 
     let status = voisu(runtime.path(), "status");
     assert!(status.status.success(), "{}", stderr(&status));
-    assert_eq!(stdout(&status), "idle\n");
+    assert_eq!(status_headline(&status), "idle\n");
 }
 
 #[test]
@@ -5968,7 +5994,7 @@ fn one_valid_source_transcript_delivers_once_when_the_other_provider_fails() {
         stopped["evidence"]["source_transcript_providers"],
         serde_json::json!(["deepgram"])
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 }
 
 #[test]
@@ -6867,7 +6893,7 @@ fi
     );
     assert_eq!(stopped["evidence"]["transcript_selection"], "source_groq");
     assert!(commands.path().join("reconciliation.started").exists());
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     let pid = fs::read_to_string(commands.path().join("reconciliation.pid")).unwrap();
     assert!(
         !Path::new(&format!("/proc/{}", pid.trim())).exists(),
@@ -6960,7 +6986,7 @@ printf '{"text":"Groq wins"}'
         stopped["evidence"]["source_transcript_providers"],
         serde_json::json!(["groq"])
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     // The gated abort closes the websocket BEFORE the daemon acknowledges and
     // Idle becomes observable, so at this point the close is already on the
     // wire: only the mock's cross-thread observation lag is granted, not an
@@ -7030,7 +7056,7 @@ printf '{"text":"Groq wins"}'
         stopped["evidence"]["source_transcript_providers"],
         serde_json::json!(["groq"])
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     // The failed stream's websocket is torn down before Idle is observable,
     // not left dangling; only observation lag is granted.
     assert_marker_appears_within(
@@ -7145,7 +7171,10 @@ fn toggle_has_the_same_observable_transitions_as_start_then_stop() {
     let start = voisu(runtime.path(), "toggle");
     assert!(start.status.success(), "{}", stderr(&start));
     assert_eq!(stdout(&start), "Recording started\n");
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    assert_eq!(
+        status_headline(&voisu(runtime.path(), "status")),
+        "Recording\n"
+    );
 
     let stop = voisu(runtime.path(), "toggle");
     assert!(stop.status.success(), "{}", stderr(&stop));
@@ -7153,7 +7182,7 @@ fn toggle_has_the_same_observable_transitions_as_start_then_stop() {
         stdout(&stop),
         "Transcript submitted through the compositor; preserved on the clipboard\n"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 }
 
 /// A private D-Bus session bus for one test: a real `dbus-daemon` in an
@@ -7824,7 +7853,7 @@ impl Drop for MockPortal {
 fn wait_for_status(runtime_dir: &Path, expected: &str) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let status = stdout(&voisu(runtime_dir, "status"));
+        let status = status_headline(&voisu(runtime_dir, "status"));
         if status == expected {
             return;
         }
@@ -8006,7 +8035,7 @@ fn concurrent_trigger_key_activations_cannot_overlap_recordings() {
         let records = history["history"].as_array().unwrap();
         if records.len() == 2
             && records.iter().all(|record| record["delivery_count"] == 1)
-            && stdout(&voisu(runtime.path(), "status")) == "idle\n"
+            && status_headline(&voisu(runtime.path(), "status")) == "idle\n"
         {
             return;
         }
@@ -8418,12 +8447,15 @@ fn trigger_key_permission_denial_leaves_cli_control_usable() {
         stdout(&voisu(runtime.path(), "toggle")),
         "Recording started\n"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    assert_eq!(
+        status_headline(&voisu(runtime.path(), "status")),
+        "Recording\n"
+    );
     assert_eq!(
         stdout(&voisu(runtime.path(), "toggle")),
         "Transcript submitted through the compositor; preserved on the clipboard\n"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 
     // The denied bind must not leak the already-created portal session: the
     // daemon closes it, observable as a real Session.Close on the mock.
@@ -8482,7 +8514,7 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
         stdout(&stopped),
         "Direct Delivery unavailable; Transcript is on the clipboard\n"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
         "Portal recovery Transcript."
@@ -8621,7 +8653,7 @@ fn unavailable_portal_leaves_cli_control_usable() {
         stdout(&voisu(runtime.path(), "toggle")),
         "Transcript submitted through the compositor; preserved on the clipboard\n"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
@@ -8659,7 +8691,7 @@ fn trigger_key_binds_without_restart_once_the_portal_becomes_available() {
         stdout(&voisu(runtime.path(), "toggle")),
         "Transcript submitted through the compositor; preserved on the clipboard\n"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 
     // The portal comes up: the daemon must bind the Trigger Key on its own, with
     // NO restart, and the Trigger Key must then drive Recordings.
@@ -8776,7 +8808,10 @@ fn injected_xdg_runtime_dirs_are_isolated() {
 
     assert!(socket_path(active_runtime.path()).exists());
     assert!(!socket_path(other_runtime.path()).exists());
-    assert_eq!(stdout(&voisu(active_runtime.path(), "status")), "idle\n");
+    assert_eq!(
+        status_headline(&voisu(active_runtime.path(), "status")),
+        "idle\n"
+    );
 
     let unavailable = voisu(other_runtime.path(), "status");
     assert_eq!(unavailable.status.code(), Some(3));
@@ -8943,7 +8978,7 @@ fn sigterm_cleans_up_and_a_crash_leaves_a_safely_recoverable_socket() {
     Daemon::start(runtime.path()).crash();
     assert!(path.exists(), "SIGKILL should leave a stale socket fixture");
     let replacement = Daemon::start(runtime.path());
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     drop(replacement);
 }
 
@@ -9030,7 +9065,7 @@ exec setsid sleep infinity
     }
 
     let replacement = Daemon::start(runtime.path());
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
     assert!(voisu(runtime.path(), "stop").status.success());
     replacement.terminate();
@@ -9099,7 +9134,10 @@ done
         state, 'Z',
         "pw-record is a zombie: it was killed by the thread reap"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "Recording\n");
+    assert_eq!(
+        status_headline(&voisu(runtime.path(), "status")),
+        "Recording\n"
+    );
     daemon.terminate();
 }
 
@@ -9151,7 +9189,7 @@ fn single_instance_rejection_preserves_the_live_daemon_and_cleanup_owns_one_inod
         .unwrap();
     assert!(!second.status.success());
     assert_eq!(stderr(&second), "voisu-daemon is already running\n");
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 
     let original_inode = fs::symlink_metadata(&path).unwrap().ino();
     fs::remove_file(&path).unwrap();
@@ -9253,7 +9291,7 @@ fn live_chunks_flow_to_providers_during_the_recording_not_only_after_stop() {
         stop["evidence"]["streamed_chunk_count"].as_u64().unwrap() >= streamed_during,
         "final evidence must retain the streamed chunk count"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 }
 
 #[test]
@@ -9274,7 +9312,7 @@ fn partial_provider_start_failure_aborts_the_capture_and_surfaces_abort_errors()
     assert_eq!(failed.status.code(), Some(4));
     assert_eq!(stderr(&failed), "Source Transcripts are unavailable\n");
     assert!(!stderr(&failed).contains("controlled"));
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 
     // The one-shot provider failure is spent, so the next Recording proves the
     // aborted resources were left in a clean, reusable state.
@@ -9320,7 +9358,7 @@ fn start_during_recovery_is_rejected_retryably_then_succeeds() {
         stderr(&rejected),
         "Recording recovery in progress; retry shortly\n"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 
     // Once the bounded abort acknowledges, the next Recording succeeds.
     let restarted = start_recording_when_recovered(runtime.path());
@@ -9397,7 +9435,7 @@ while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
     // the tokio task that awaits it (a detached blocking curl would keep
     // running for up to 14s, overlapping the next Recording).
     let idle_deadline = Instant::now() + Duration::from_secs(8);
-    while stdout(&voisu(runtime.path(), "status")) != "idle\n" {
+    while status_headline(&voisu(runtime.path(), "status")) != "idle\n" {
         assert!(
             Instant::now() < idle_deadline,
             "failed Recording must recover to idle"
@@ -9510,7 +9548,7 @@ while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
     // Only after the stale finalize request is provably dead does the daemon
     // return to idle and accept the next Recording.
     let idle_deadline = Instant::now() + Duration::from_secs(8);
-    while stdout(&voisu(runtime.path(), "status")) != "idle\n" {
+    while status_headline(&voisu(runtime.path(), "status")) != "idle\n" {
         assert!(
             Instant::now() < idle_deadline,
             "failed Recording must recover to idle"
@@ -9586,7 +9624,7 @@ printf '{"text":"unused Groq Source Transcript"}'
     // the sibling Groq test above and costs nothing on a healthy host: the poll
     // returns as soon as idle is observed.
     let idle_deadline = Instant::now() + Duration::from_secs(8);
-    while stdout(&voisu(runtime.path(), "status")) != "idle\n" {
+    while status_headline(&voisu(runtime.path(), "status")) != "idle\n" {
         assert!(
             Instant::now() < idle_deadline,
             "failed Recording must recover to idle"
@@ -9614,7 +9652,7 @@ fn capture_finalization_abort_failure_is_surfaced_into_diagnostics() {
     let failed = voisu(runtime.path(), "stop");
     assert_eq!(failed.status.code(), Some(4));
     assert_eq!(stderr(&failed), "Recording capture failed\n");
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
@@ -9644,7 +9682,7 @@ fn provider_work_is_aborted_not_dropped_when_the_recording_capture_fails() {
     let failed = voisu(runtime.path(), "stop");
     assert_eq!(failed.status.code(), Some(4));
     assert_eq!(stderr(&failed), "Recording capture failed\n");
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 
     // The next Recording must succeed after the aborted one.
     assert!(voisu(runtime.path(), "start").status.success());
@@ -9672,7 +9710,7 @@ fn repeated_failures_never_deliver_and_the_next_recording_delivers_once() {
         let failed = voisu(runtime.path(), "stop");
         assert_eq!(failed.status.code(), Some(4));
         assert_eq!(stderr(&failed), "Recording capture failed\n");
-        assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+        assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     }
 
     assert!(voisu(runtime.path(), "start").status.success());
@@ -9716,7 +9754,7 @@ fn cli_termination_during_stop_cannot_abandon_the_daemon_or_duplicate_delivery()
     let mut stop = stop.spawn().unwrap();
 
     let processing_deadline = Instant::now() + Duration::from_secs(2);
-    while stdout(&voisu(runtime.path(), "status")) != "processing\n" {
+    while status_headline(&voisu(runtime.path(), "status")) != "processing\n" {
         assert!(
             Instant::now() < processing_deadline,
             "daemon never accepted Stop before CLI termination"
@@ -9915,7 +9953,7 @@ fn a_stalled_provider_send_does_not_prevent_stop_from_completing() {
         elapsed < Duration::from_secs(5),
         "stop must not wait on a stalled provider send, elapsed {elapsed:?}"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 }
 
 #[test]
@@ -9942,7 +9980,7 @@ fn a_stalled_partial_start_abort_keeps_the_daemon_responsive() {
     );
 
     let status_started = Instant::now();
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     assert!(
         status_started.elapsed() < Duration::from_millis(1500),
         "status must stay responsive while the abort is stalled"
@@ -9999,7 +10037,7 @@ fn oversized_and_slow_frames_do_not_block_or_kill_the_daemon() {
     let mut slow = UnixStream::connect(&path).unwrap();
     slow.write_all(b"{\"version\":2").unwrap();
     let status_started = Instant::now();
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     // A daemon that blocked on the slow frame would stall Status for the slow
     // connection's ~2 s read deadline, so the outer bound must stay well below
     // that while still tolerating contended-runner spawn latency.
@@ -10024,7 +10062,7 @@ fn oversized_and_slow_frames_do_not_block_or_kill_the_daemon() {
     let mut response = String::new();
     let _ = BufReader::new(oversized).read_line(&mut response);
     assert!(response.is_empty());
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 }
 
 /// The per-test `XDG_STATE_HOME`. The diagnostics store is durable state, so
@@ -10391,7 +10429,7 @@ fn fixed_fixture_replays_through_provider_and_validation_boundaries() {
         "the selected Source Transcript becomes the final transcript: {replayed}"
     );
     // The daemon stays reusable after a replay: a real Recording still works.
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
 }
 
@@ -10582,7 +10620,7 @@ fn replay_of_a_missing_fixture_is_rejected_and_leaves_the_daemon_reusable() {
     let request = r#"{"version":1,"command":{"replay":"nonexistent.pcm"}}"#;
     let replayed = ipc_request(runtime.path(), request);
     assert_eq!(replayed["ok"], false, "{replayed}");
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
 }
 
@@ -10604,7 +10642,7 @@ fn replay_rejects_a_symlink_planted_inside_the_fixture_directory() {
         replayed["ok"], false,
         "O_NOFOLLOW must refuse the symlink: {replayed}"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
 }
 
 #[test]
@@ -10625,7 +10663,7 @@ fn replay_rejects_a_fifo_without_wedging_the_daemon() {
         replayed["ok"], false,
         "a FIFO is not a regular file: {replayed}"
     );
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     assert!(voisu(runtime.path(), "start").status.success());
 }
 
@@ -10649,7 +10687,7 @@ fn replay_partial_provider_start_failure_aborts_the_started_stream_and_recovers(
         r#"{"version":1,"command":{"replay":"dictation.pcm"}}"#,
     );
     assert_eq!(replayed["ok"], false, "{replayed}");
-    assert_eq!(stdout(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
     // The failure was one-shot; the daemon is fully reusable afterwards.
     let retried = ipc_request(
         runtime.path(),

@@ -10,7 +10,7 @@ use voisu_app::system::{
     ProviderHttpClient, SecretToolStore,
 };
 use voisu_core::{
-    BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, DaemonReadiness,
+    AsrMode, BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, DaemonReadiness,
     ExportCorrelationId, KeyDiagnosis, KeyLocation, PROTOCOL_VERSION, PasteActionState,
     PasteBackend, Provider, ProviderAuthenticator, ProviderKeyStatus, ReadinessInspector,
     ReadinessStatus, ReplayFixturePath, Request, Response, SecretStore, SessionKind,
@@ -47,6 +47,7 @@ enum CliAction {
     AuthSet(Provider),
     AuthVerify(Provider),
     SetDeepgram(bool),
+    SetAsrMode(AsrMode),
     Delivery(Option<DeliveryMode>),
     Writing(Option<WritingMode>),
     Rendering(Option<RenderingPolicy>),
@@ -71,6 +72,7 @@ fn main() -> ExitCode {
         },
         Ok(CliAction::AuthVerify(provider)) => auth_verify(provider),
         Ok(CliAction::SetDeepgram(enabled)) => set_deepgram(enabled),
+        Ok(CliAction::SetAsrMode(mode)) => set_asr_mode(mode),
         Ok(CliAction::Delivery(mode)) => delivery(mode),
         Ok(CliAction::Writing(mode)) => writing(mode),
         Ok(CliAction::Rendering(policy)) => rendering(policy),
@@ -169,7 +171,7 @@ fn daemon_command(command: Command) -> ExitCode {
                 Err(_) => return fail(1, "daemon returned an invalid diagnostic history"),
             }
         } else {
-            println!("{}", response.message);
+            voisu_app::asr_mode::write_cli_status(&response.message, response.asr_mode.as_ref());
         }
         ExitCode::SUCCESS
     } else {
@@ -883,6 +885,16 @@ fn auth_set(provider: Provider, credential: Credential) -> ExitCode {
 /// Persists the Deepgram on/off toggle to the local config file. The daemon
 /// reads it at start, so the change takes effect on the next daemon start; the
 /// message reminds the user to restart a running daemon.
+fn set_asr_mode(mode: AsrMode) -> ExitCode {
+    match voisu_app::asr_mode::apply_cli_mode(mode) {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(error.exit_code, &error.message),
+    }
+}
+
 fn set_deepgram(enabled: bool) -> ExitCode {
     match voisu_app::config::set_deepgram_enabled(enabled) {
         Ok(_) => {
@@ -1240,6 +1252,7 @@ fn parse_command() -> Result<CliAction, String> {
         [command, state] if command == "deepgram" => {
             Ok(CliAction::SetDeepgram(parse_toggle(state)?))
         }
+        [command, mode] if command == "mode" => Ok(CliAction::SetAsrMode(parse_asr_mode(mode)?)),
         [command] if command == "delivery" => Ok(CliAction::Delivery(None)),
         [command, mode] if command == "delivery" => {
             Ok(CliAction::Delivery(Some(parse_delivery_mode(mode)?)))
@@ -1285,6 +1298,10 @@ fn parse_service_action(value: &str) -> Result<UserServiceAction, String> {
             "service action must be install, start, stop, restart, status, or uninstall".to_owned(),
         ),
     }
+}
+
+fn parse_asr_mode(value: &str) -> Result<AsrMode, String> {
+    AsrMode::parse(value).ok_or_else(|| "mode must be local or cloud".to_owned())
 }
 
 fn parse_toggle(value: &str) -> Result<bool, String> {
@@ -1342,6 +1359,7 @@ commands:
   auth set <groq|deepgram>
   auth verify <groq|deepgram>
   deepgram <on|off>
+  mode <local|cloud>
   delivery [type|clipboard|guarded]
   writing [smart|literal]
   rendering [natural|adaptive|structured]

@@ -23,6 +23,7 @@ commands:
   auth set <groq|deepgram>
   auth verify <groq|deepgram>
   deepgram <on|off>
+  mode <local|cloud>
   delivery [type|clipboard|guarded]
   writing [smart|literal]
   rendering [natural|adaptive|structured]

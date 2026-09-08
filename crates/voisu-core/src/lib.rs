@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+mod asr_mode;
+pub use asr_mode::{ASR_MODE_V1, AsrMode, AsrModeStatus, LocalReadiness};
+
 mod session;
 pub use session::{
     ClipboardTool, PACKAGE_MANAGERS, PackageManager, SessionKind, SessionResolution,
@@ -218,6 +221,10 @@ pub enum Command {
     /// Replays a fixed captured fixture at the given path through the provider
     /// and validation boundaries without capturing audio again.
     Replay(ReplayFixturePath),
+    /// Persist an explicit Local or Cloud ASR selection. Additive in protocol 1;
+    /// an older daemon cannot decode this command.
+    #[serde(rename = "set_asr_mode")]
+    SetAsrMode(AsrMode),
 }
 
 /// Correlation ID accepted by the diagnostic-export command.
@@ -555,6 +562,13 @@ pub struct Response {
     /// not send this field and older clients ignore it on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness: Option<DaemonReadiness>,
+    /// Protocol 1 capabilities advertised by this daemon. Absence means the
+    /// peer does not implement the named contract; never infer Cloud.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// Structured ASR mode status. Missing on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asr_mode: Option<AsrModeStatus>,
 }
 
 /// One transport page of a serialized diagnostic history or export.
@@ -637,6 +651,8 @@ impl Response {
             level_frames: None,
             recording_remaining_ms: None,
             readiness: None,
+            capabilities: Vec::new(),
+            asr_mode: None,
         }
     }
 
