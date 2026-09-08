@@ -4,9 +4,9 @@
 use std::time::Duration;
 
 use voisu_app::local_worker::{
-    BakeoffCase, CaseKind, CriticalKind, DurationBand, Eligibility, FakeCapture, FakeWorker,
-    FeasibilityRunner, GateVerdict, RuntimeFamily, Split, WorkerState, WorkerSupervisor,
-    evaluate_report, evaluation_order, locked_host_profiles, packaged_unit_restrictions,
+    BakeoffCase, CaseKind, CriticalKind, DurationBand, Eligibility, FakeWorker, FeasibilityRunner,
+    GateVerdict, RuntimeFamily, Split, WorkerState, WorkerSupervisor, evaluate_report,
+    evaluation_order, locked_host_profiles, packaged_unit_restrictions,
     refuse_production_weight_download, whisper_cpp_paths,
 };
 use voisu_app::local_worker::{Correlation, TranscribeRequest};
@@ -67,30 +67,19 @@ fn locked_english_bakeoff_stays_pending_without_a_winner() {
         scripted_hypothesis: None,
     };
 
-    let mut speech_runner = FeasibilityRunner::harness(
-        FakeWorker {
-            scripted_text: Some("hello raja".into()),
-            ..FakeWorker::default()
-        },
-        FakeCapture {
-            pcm: speech.pcm.clone(),
-            speech: speech.speech,
-        },
-    );
+    let mut speech_runner = FeasibilityRunner::harness(FakeWorker::default());
     speech_runner.prepare(correlation()).unwrap();
     let speech_outcome = speech_runner.run_case(&speech).unwrap();
     assert!(speech_outcome.delivered);
     assert!(speech_outcome.critical_failures.is_empty());
     let timings = speech_outcome.timings.as_ref().unwrap();
-    assert!(timings.stop_to_delivered_ms < timings.recording_duration_ms);
-
-    let mut negative_runner = FeasibilityRunner::harness(
-        FakeWorker::default(),
-        FakeCapture {
-            pcm: negative.pcm.clone(),
-            speech: negative.speech,
-        },
+    assert!(
+        timings
+            .stop_to_delivered_ms
+            .is_some_and(|ms| ms < timings.recording_duration_ms)
     );
+
+    let mut negative_runner = FeasibilityRunner::harness(FakeWorker::default());
     negative_runner.prepare(correlation()).unwrap();
     let negative_outcome = negative_runner.run_case(&negative).unwrap();
     assert!(!negative_outcome.delivered);
@@ -103,6 +92,8 @@ fn locked_english_bakeoff_stays_pending_without_a_winner() {
             "harness smoke with scripted FakeWorker".into(),
             "locked 100+20 English corpus is not in CI".into(),
         ],
+        None,
+        false,
     );
     assert_eq!(report.verdict, GateVerdict::PendingEvidence);
     assert!(!report.winner_selected);

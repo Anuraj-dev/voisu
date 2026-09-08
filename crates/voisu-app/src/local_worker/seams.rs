@@ -3,6 +3,7 @@
 //! The feasibility runner talks only to these seams so L6 can later substitute
 //! the shipped capture/supervisor/Delivery without rewriting scoring.
 
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use voisu_core::Transcript;
@@ -22,7 +23,12 @@ pub struct FinalizedRecording {
 }
 
 pub trait CaptureSeam {
-    fn finalize(&mut self, recording_id: &str) -> Result<FinalizedRecording, SeamError>;
+    fn finalize(
+        &mut self,
+        recording_id: &str,
+        pcm: &[u8],
+        speech: Duration,
+    ) -> Result<FinalizedRecording, SeamError>;
 }
 
 pub trait DeliverySeam {
@@ -45,21 +51,21 @@ pub struct DeliveryToken {
     generation: u64,
 }
 
-#[derive(Clone, Debug)]
-pub struct FakeCapture {
-    pub pcm: Vec<u8>,
-    pub speech: Duration,
-}
+#[derive(Clone, Debug, Default)]
+pub struct FakeCapture;
 
 impl CaptureSeam for FakeCapture {
-    fn finalize(&mut self, recording_id: &str) -> Result<FinalizedRecording, SeamError> {
+    fn finalize(
+        &mut self,
+        recording_id: &str,
+        pcm: &[u8],
+        speech: Duration,
+    ) -> Result<FinalizedRecording, SeamError> {
         let utterance_end = Instant::now();
-        let recording_start = utterance_end
-            .checked_sub(self.speech)
-            .unwrap_or(utterance_end);
+        let recording_start = utterance_end.checked_sub(speech).unwrap_or(utterance_end);
         Ok(FinalizedRecording {
             recording_id: recording_id.to_owned(),
-            pcm: self.pcm.clone(),
+            pcm: pcm.to_vec(),
             recording_start,
             utterance_end,
         })
@@ -69,12 +75,15 @@ impl CaptureSeam for FakeCapture {
 #[derive(Clone, Debug, Default)]
 pub struct FakeDelivery {
     pub delivered: Vec<String>,
-    spent: Option<String>,
+    spent: BTreeSet<String>,
     next_generation: u64,
 }
 
 impl DeliverySeam for FakeDelivery {
     fn authorize(&mut self, recording_id: &str) -> Result<DeliveryToken, SeamError> {
+        if self.spent.contains(recording_id) {
+            return Err(SeamError::DuplicateDelivery);
+        }
         self.next_generation += 1;
         Ok(DeliveryToken {
             recording_id: recording_id.to_owned(),
@@ -83,13 +92,13 @@ impl DeliverySeam for FakeDelivery {
     }
 
     fn deliver(&mut self, token: DeliveryToken, transcript: &Transcript) -> Result<(), SeamError> {
-        if self.spent.as_deref() == Some(token.recording_id.as_str()) {
+        if self.spent.contains(&token.recording_id) {
             return Err(SeamError::DuplicateDelivery);
         }
         if token.generation != self.next_generation {
             return Err(SeamError::StaleToken);
         }
-        self.spent = Some(token.recording_id);
+        self.spent.insert(token.recording_id);
         self.delivered.push(transcript.0.clone());
         Ok(())
     }
@@ -141,6 +150,18 @@ mod tests {
             Err(SeamError::DuplicateDelivery)
         );
         assert_eq!(delivery.delivered, vec!["hello".to_owned()]);
+        assert_eq!(
+            delivery.authorize("rec-1"),
+            Err(SeamError::DuplicateDelivery)
+        );
+        let rec2 = delivery.authorize("rec-2").unwrap();
+        delivery
+            .deliver(rec2, &Transcript("second".into()))
+            .unwrap();
+        assert_eq!(
+            delivery.delivered,
+            vec!["hello".to_owned(), "second".to_owned()]
+        );
     }
 
     #[test]
@@ -157,11 +178,10 @@ mod tests {
 
     #[test]
     fn capture_stop_timestamp_is_the_utterance_end() {
-        let mut capture = FakeCapture {
-            pcm: vec![0, 0],
-            speech: Duration::from_millis(2_500),
-        };
-        let finalized = capture.finalize("rec-1").unwrap();
+        let mut capture = FakeCapture;
+        let finalized = capture
+            .finalize("rec-1", &[0, 0], Duration::from_millis(2_500))
+            .unwrap();
         let speech = finalized
             .utterance_end
             .saturating_duration_since(finalized.recording_start);

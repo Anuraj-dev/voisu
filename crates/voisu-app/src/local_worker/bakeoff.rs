@@ -167,7 +167,7 @@ pub struct StageTimings {
     pub delivery_ms: u64,
     pub recording_duration_ms: u64,
     pub stop_to_finalized_ms: u64,
-    pub stop_to_delivered_ms: u64,
+    pub stop_to_delivered_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -181,6 +181,8 @@ pub struct CaseOutcome {
     pub critical_failures: Vec<String>,
     pub timings: Option<StageTimings>,
     pub observed_device: String,
+    pub band: DurationBand,
+    pub stratum: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -199,6 +201,17 @@ pub struct BakeoffReport {
     pub verdict: GateVerdict,
     pub cases: Vec<CaseOutcome>,
     pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SoakEvidence {
+    pub recordings: usize,
+    pub hours: u32,
+    pub warmup: usize,
+    pub rss_growth_mib: u64,
+    pub crash: bool,
+    pub unreaped: bool,
+    pub unexpected_network: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -220,11 +233,11 @@ pub struct FeasibilityRunner<C, D> {
 
 impl FeasibilityRunner<FakeCapture, FakeDelivery> {
     #[must_use]
-    pub fn harness(worker: FakeWorker, capture: FakeCapture) -> Self {
+    pub fn harness(worker: FakeWorker) -> Self {
         let mut supervisor = WorkerSupervisor::absent();
         let _ = supervisor.attach_ready(worker, Instant::now());
         Self {
-            capture,
+            capture: FakeCapture,
             supervisor,
             delivery: FakeDelivery::default(),
             sentinel: CloudCapabilitySentinel::new(),
@@ -262,12 +275,14 @@ impl<C: CaptureSeam, D: DeliverySeam> FeasibilityRunner<C, D> {
         }
 
         let capture_started = Instant::now();
-        let finalized = self.capture.finalize(&case.id).map_err(RunnerError::Seam)?;
+        let finalized = self
+            .capture
+            .finalize(&case.id, &case.pcm, case.speech)
+            .map_err(RunnerError::Seam)?;
         let capture_finalization_ms = millis(capture_started.elapsed());
         let recovery_fsync_ms = 0;
-        let mut pcm = finalized.pcm;
-        if pcm.is_empty() {
-            pcm = case.pcm.clone();
+        if let Some(worker) = self.supervisor.child_mut() {
+            worker.scripted_text = case.scripted_hypothesis.clone();
         }
 
         let inference_started = Instant::now();
@@ -280,10 +295,14 @@ impl<C: CaptureSeam, D: DeliverySeam> FeasibilityRunner<C, D> {
         };
         let outcome = self
             .supervisor
-            .transcribe(super::supervisor::TranscribeRequest { correlation, pcm })
+            .transcribe(super::supervisor::TranscribeRequest {
+                correlation,
+                pcm: finalized.pcm,
+            })
             .map_err(RunnerError::Supervisor)?;
         let inference_ms = millis(inference_started.elapsed());
         let formatting_ms = 0;
+        let finalized_at = Instant::now();
 
         let (hypothesis, observed_device, no_text) = match outcome {
             WorkerOutcome::Transcript {
@@ -297,8 +316,9 @@ impl<C: CaptureSeam, D: DeliverySeam> FeasibilityRunner<C, D> {
 
         let mut delivered = false;
         let mut delivery_ms = 0;
-        let delivery_started = Instant::now();
+        let mut delivered_at = finalized_at;
         if let Some(text) = hypothesis.as_ref() {
+            let delivery_started = Instant::now();
             let token = self
                 .delivery
                 .authorize(&case.id)
@@ -308,13 +328,8 @@ impl<C: CaptureSeam, D: DeliverySeam> FeasibilityRunner<C, D> {
                 .map_err(RunnerError::Seam)?;
             delivered = true;
             delivery_ms = millis(delivery_started.elapsed());
+            delivered_at = Instant::now();
         }
-        let delivered_at = Instant::now();
-        let finalized_at = if delivered {
-            delivered_at
-        } else {
-            inference_started + Duration::from_millis(inference_ms)
-        };
         let stop = stop_anchored_timings(
             finalized.recording_start,
             finalized.utterance_end,
@@ -359,9 +374,11 @@ impl<C: CaptureSeam, D: DeliverySeam> FeasibilityRunner<C, D> {
                 delivery_ms,
                 recording_duration_ms: stop.recording_duration_ms,
                 stop_to_finalized_ms: stop.stop_to_finalized_ms,
-                stop_to_delivered_ms: stop.stop_to_delivered_ms,
+                stop_to_delivered_ms: delivered.then_some(stop.stop_to_delivered_ms),
             }),
             observed_device,
+            band: case.band,
+            stratum: case.stratum.clone(),
         })
     }
 }
@@ -430,18 +447,25 @@ pub fn evaluate_report(
     cases: &[BakeoffCase],
     outcomes: Vec<CaseOutcome>,
     notes: Vec<String>,
+    soak: Option<&SoakEvidence>,
+    native_packaged_runtime: bool,
 ) -> BakeoffReport {
     let counts = sample_counts(cases);
     let lock = corpus_lock_satisfied(cases);
     let mut delivered_ms: Vec<u64> = outcomes
         .iter()
+        .filter(|row| row.split == Split::HeldOut && row.kind == CaseKind::Speech && row.delivered)
         .filter_map(|row| {
             row.timings
                 .as_ref()
-                .map(|timing| timing.stop_to_delivered_ms)
+                .and_then(|timing| timing.stop_to_delivered_ms)
         })
         .collect();
     delivered_ms.sort_unstable();
+    let mut notes = notes;
+    // A false Go is forbidden: this harness never publishes a winner, and a
+    // missing corpus is not a bakeoff result even if smoke WER is zero.
+    let verdict = bakeoff_verdict(lock, &outcomes, soak, native_packaged_runtime, &mut notes);
     BakeoffReport {
         corpus_contract: CORPUS_CONTRACT_ID,
         corpus_version: CORPUS_VERSION,
@@ -454,12 +478,148 @@ pub fn evaluate_report(
         p50_stop_to_delivered_ms: percentile_nearest_rank(&delivered_ms, 50),
         p95_stop_to_delivered_ms: percentile_nearest_rank(&delivered_ms, 95),
         max_stop_to_delivered_ms: delivered_ms.last().copied(),
-        // Go requires L6 packaged measurements. L2 locks thresholds and never
-        // promotes a harness smoke or missing corpus into a winner.
-        verdict: GateVerdict::PendingEvidence,
+        verdict,
         cases: outcomes,
         notes,
     }
+}
+
+fn bakeoff_verdict(
+    lock: bool,
+    outcomes: &[CaseOutcome],
+    soak: Option<&SoakEvidence>,
+    native_packaged_runtime: bool,
+    notes: &mut Vec<String>,
+) -> GateVerdict {
+    if !lock {
+        notes.push(
+            "corpus lock unsatisfied; PendingEvidence is not a publishable bakeoff result".into(),
+        );
+        return GateVerdict::PendingEvidence;
+    }
+    if quality_gate_failed(outcomes) {
+        notes.push("locked quality or Stop-to-Delivery gate failed".into());
+        return GateVerdict::NoGo;
+    }
+    if let Some(soak) = soak {
+        if soak_gate_failed(soak) {
+            notes.push("locked soak gate failed".into());
+            return GateVerdict::NoGo;
+        }
+    } else {
+        notes.push("soak evidence missing; cannot publish a bakeoff result".into());
+        return GateVerdict::PendingEvidence;
+    }
+    if !native_packaged_runtime {
+        notes.push("packaged runtime evidence missing; cannot publish a bakeoff result".into());
+        return GateVerdict::PendingEvidence;
+    }
+    notes.push("L2 harness never assigns Go; host-packaged proof is out of scope".into());
+    GateVerdict::PendingEvidence
+}
+
+fn quality_gate_failed(outcomes: &[CaseOutcome]) -> bool {
+    let held_speech: Vec<&CaseOutcome> = outcomes
+        .iter()
+        .filter(|row| row.split == Split::HeldOut && row.kind == CaseKind::Speech)
+        .collect();
+    if corpus_wer(&held_speech).is_some_and(|wer| wer > WER_OVERALL_MAX) {
+        return true;
+    }
+    let mut strata = BTreeSet::new();
+    for row in &held_speech {
+        strata.insert(row.stratum.as_str());
+    }
+    for stratum in strata {
+        let rows: Vec<&CaseOutcome> = held_speech
+            .iter()
+            .copied()
+            .filter(|row| row.stratum == stratum)
+            .collect();
+        if corpus_wer(&rows).is_some_and(|wer| wer > WER_STRATUM_MAX) {
+            return true;
+        }
+    }
+    if held_speech
+        .iter()
+        .any(|row| !row.critical_failures.is_empty())
+    {
+        return true;
+    }
+    if outcomes
+        .iter()
+        .any(|row| row.kind == CaseKind::Negative && (row.delivered || row.hypothesis.is_some()))
+    {
+        return true;
+    }
+    if p95_for_bands(
+        outcomes,
+        &[DurationBand::OneToTen, DurationBand::TenToThirty],
+    )
+    .is_some_and(|p95| p95 > WARM_P95_UP_TO_30S_MS)
+    {
+        return true;
+    }
+    if p95_for_bands(outcomes, &[DurationBand::ThirtyToOneTwenty])
+        .is_some_and(|p95| p95 > WARM_P95_UP_TO_120S_MS)
+    {
+        return true;
+    }
+    outcomes.iter().any(|row| {
+        row.kind == CaseKind::Speech
+            && row.delivered
+            && row
+                .timings
+                .as_ref()
+                .and_then(|timing| timing.stop_to_delivered_ms)
+                .is_some_and(|ms| ms > millis(STOP_PROCESSING))
+    })
+}
+
+fn corpus_wer(rows: &[&CaseOutcome]) -> Option<f64> {
+    let mut errors = 0usize;
+    let mut refs = 0usize;
+    for row in rows {
+        let Some(wer) = &row.wer else {
+            continue;
+        };
+        errors += wer.insertions + wer.deletions + wer.substitutions;
+        refs += wer.reference_tokens;
+    }
+    if refs == 0 {
+        None
+    } else {
+        Some(errors as f64 / refs as f64)
+    }
+}
+
+fn p95_for_bands(outcomes: &[CaseOutcome], bands: &[DurationBand]) -> Option<u64> {
+    let mut samples: Vec<u64> = outcomes
+        .iter()
+        .filter(|row| {
+            row.split == Split::HeldOut
+                && row.kind == CaseKind::Speech
+                && row.delivered
+                && bands.contains(&row.band)
+        })
+        .filter_map(|row| {
+            row.timings
+                .as_ref()
+                .and_then(|timing| timing.stop_to_delivered_ms)
+        })
+        .collect();
+    samples.sort_unstable();
+    percentile_nearest_rank(&samples, 95)
+}
+
+fn soak_gate_failed(soak: &SoakEvidence) -> bool {
+    soak.recordings < SOAK_RECORDINGS
+        || soak.hours < SOAK_MIN_HOURS
+        || soak.warmup < SOAK_WARMUP
+        || soak.rss_growth_mib > RSS_GROWTH_MAX_MIB
+        || soak.crash
+        || soak.unreaped
+        || soak.unexpected_network
 }
 
 /// Locked scoring normalization: whitespace split, lowercase, strip a closed
@@ -616,6 +776,8 @@ mod tests {
             &cases,
             Vec::new(),
             vec!["no native whisper.cpp weights in CI".into()],
+            None,
+            false,
         );
         assert!(!report.winner_selected);
         assert!(!report.measurements_invented);
@@ -638,16 +800,9 @@ mod tests {
 
     #[test]
     fn harness_runner_records_stop_anchored_timings_without_claiming_go() {
-        let case = speech_case("rec-speech", "hello raja", "hello raja", vec![1, 0, 3, 0]);
-        let worker = FakeWorker {
-            scripted_text: Some("hello raja".into()),
-            ..FakeWorker::default()
-        };
-        let capture = FakeCapture {
-            pcm: case.pcm.clone(),
-            speech: Duration::from_millis(2_000),
-        };
-        let mut runner = FeasibilityRunner::harness(worker, capture);
+        let mut case = speech_case("rec-speech", "hello raja", "hello raja", vec![1, 0, 3, 0]);
+        case.speech = Duration::from_millis(2_000);
+        let mut runner = FeasibilityRunner::harness(FakeWorker::default());
         runner
             .prepare(Correlation {
                 daemon_nonce: "bakeoff".into(),
@@ -667,13 +822,20 @@ mod tests {
             "speech interval must stay on the Recording clock, got {}",
             timings.recording_duration_ms
         );
-        assert!(timings.stop_to_delivered_ms < timings.recording_duration_ms);
+        assert!(
+            timings
+                .stop_to_delivered_ms
+                .is_some_and(|ms| ms < timings.recording_duration_ms)
+        );
+        assert!(timings.stop_to_finalized_ms <= timings.stop_to_delivered_ms.unwrap_or(u64::MAX));
         assert_eq!(outcome.observed_device, "cpu");
         let report = evaluate_report(
             RuntimeFamily::WhisperCppProcess,
             std::slice::from_ref(&case),
             vec![outcome],
             vec!["harness smoke; locked corpus not present".into()],
+            None,
+            false,
         );
         assert_eq!(report.verdict, GateVerdict::PendingEvidence);
         assert!(!report.winner_selected);
@@ -694,11 +856,7 @@ mod tests {
             critical: Vec::new(),
             scripted_hypothesis: None,
         };
-        let capture = FakeCapture {
-            pcm: case.pcm.clone(),
-            speech: case.speech,
-        };
-        let mut runner = FeasibilityRunner::harness(FakeWorker::default(), capture);
+        let mut runner = FeasibilityRunner::harness(FakeWorker::default());
         runner
             .prepare(Correlation {
                 daemon_nonce: "bakeoff".into(),
@@ -718,15 +876,7 @@ mod tests {
     fn critical_name_mismatch_is_recorded() {
         let mut case = speech_case("c", "call raja", "call alex", vec![1, 0]);
         case.critical = vec![(CriticalKind::Name, "raja".into())];
-        let worker = FakeWorker {
-            scripted_text: Some("call alex".into()),
-            ..FakeWorker::default()
-        };
-        let capture = FakeCapture {
-            pcm: case.pcm.clone(),
-            speech: Duration::from_millis(200),
-        };
-        let mut runner = FeasibilityRunner::harness(worker, capture);
+        let mut runner = FeasibilityRunner::harness(FakeWorker::default());
         runner
             .prepare(Correlation {
                 daemon_nonce: "bakeoff".into(),
@@ -738,5 +888,95 @@ mod tests {
             .unwrap();
         let outcome = runner.run_case(&case).unwrap();
         assert_eq!(outcome.critical_failures, vec!["Name:raja".to_owned()]);
+    }
+
+    #[test]
+    fn one_runner_uses_each_case_pcm_and_scripted_hypothesis() {
+        let alpha = speech_case("alpha", "alpha", "alpha", vec![1, 0]);
+        let bravo = speech_case("bravo", "bravo", "bravo", vec![3, 0]);
+        let mut runner = FeasibilityRunner::harness(FakeWorker::default());
+        runner
+            .prepare(Correlation {
+                daemon_nonce: "bakeoff".into(),
+                generation: 1,
+                request_id: "prep".into(),
+                recording_id: "prep".into(),
+                model_receipt_hash: "harness-no-weights".into(),
+            })
+            .unwrap();
+        let first = runner.run_case(&alpha).unwrap();
+        let second = runner.run_case(&bravo).unwrap();
+        assert_eq!(first.hypothesis.as_deref(), Some("alpha"));
+        assert_eq!(second.hypothesis.as_deref(), Some("bravo"));
+    }
+
+    #[test]
+    fn locked_corpus_with_failing_wer_is_nogo() {
+        let mut cases = Vec::new();
+        for i in 0..100 {
+            cases.push(BakeoffCase {
+                id: format!("s{i}"),
+                kind: CaseKind::Speech,
+                split: if i < 20 {
+                    Split::Tuning
+                } else {
+                    Split::HeldOut
+                },
+                band: if i < 5 {
+                    DurationBand::OneTwentyToSixHundred
+                } else {
+                    DurationBand::OneToTen
+                },
+                audio_hash: format!("hs{i}"),
+                reference: "hello raja".into(),
+                pcm: vec![1, 0],
+                speech: Duration::from_millis(200),
+                stratum: "pilot-quiet".into(),
+                critical: Vec::new(),
+                scripted_hypothesis: Some("wrong".into()),
+            });
+        }
+        for i in 0..20 {
+            cases.push(BakeoffCase {
+                id: format!("n{i}"),
+                kind: CaseKind::Negative,
+                split: Split::HeldOut,
+                band: DurationBand::OneToTen,
+                audio_hash: format!("hn{i}"),
+                reference: String::new(),
+                pcm: vec![0, 0],
+                speech: Duration::from_millis(50),
+                stratum: "silence".into(),
+                critical: Vec::new(),
+                scripted_hypothesis: None,
+            });
+        }
+        assert!(corpus_lock_satisfied(&cases));
+        let outcomes: Vec<CaseOutcome> = cases
+            .iter()
+            .map(|case| CaseOutcome {
+                id: case.id.clone(),
+                kind: case.kind,
+                split: case.split,
+                delivered: case.kind == CaseKind::Speech,
+                hypothesis: case.scripted_hypothesis.clone(),
+                wer: Some(align_words(&case.reference, "wrong")),
+                critical_failures: Vec::new(),
+                timings: None,
+                observed_device: "cpu".into(),
+                band: case.band,
+                stratum: case.stratum.clone(),
+            })
+            .collect();
+        let report = evaluate_report(
+            RuntimeFamily::WhisperCppProcess,
+            &cases,
+            outcomes,
+            Vec::new(),
+            None,
+            false,
+        );
+        assert_eq!(report.verdict, GateVerdict::NoGo);
+        assert!(!report.winner_selected);
     }
 }

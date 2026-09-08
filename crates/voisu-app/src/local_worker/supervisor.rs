@@ -89,7 +89,6 @@ pub struct FakeWorker {
     pub model_receipt_hash: String,
     pub observed_device: String,
     pub scripted_text: Option<String>,
-    pub terminal_sent: bool,
 }
 
 impl Default for FakeWorker {
@@ -99,7 +98,6 @@ impl Default for FakeWorker {
             model_receipt_hash: "harness-no-weights".into(),
             observed_device: "cpu".into(),
             scripted_text: None,
-            terminal_sent: false,
         }
     }
 }
@@ -114,7 +112,6 @@ impl WorkerChild for FakeWorker {
             ControlFrame::Prepare(correlation) => {
                 let expected = self.live_correlation(&correlation);
                 correlations_match(&expected, &correlation).map_err(SupervisorError::Protocol)?;
-                self.terminal_sent = false;
                 Ok(WorkerFrame::Ready {
                     correlation,
                     observed_device: self.observed_device.clone(),
@@ -124,13 +121,16 @@ impl WorkerChild for FakeWorker {
                 correlation,
                 pcm_bytes,
             } => {
-                if self.terminal_sent {
-                    return Err(SupervisorError::Protocol(FrameError::DuplicateTerminal));
-                }
                 let pcm = pcm.unwrap_or_default();
-                validate_pcm(pcm, Some(pcm_bytes)).map_err(SupervisorError::Protocol)?;
-                if pcm_bytes != pcm.len() {
+                validate_pcm(pcm, None).map_err(SupervisorError::Protocol)?;
+                if pcm.len() > pcm_bytes {
                     return Err(SupervisorError::Protocol(FrameError::ExtraAudio));
+                }
+                if pcm.len() != pcm_bytes {
+                    return Err(SupervisorError::Protocol(FrameError::DeclaredPcmMismatch {
+                        declared: pcm_bytes,
+                        actual: pcm.len(),
+                    }));
                 }
                 let expected = Correlation {
                     daemon_nonce: correlation.daemon_nonce.clone(),
@@ -140,36 +140,31 @@ impl WorkerChild for FakeWorker {
                     model_receipt_hash: self.model_receipt_hash.clone(),
                 };
                 correlations_match(&expected, &correlation).map_err(SupervisorError::Protocol)?;
-                // One terminal frame per request; a warm worker accepts the next
-                // Transcribe after this one completes.
-                self.terminal_sent = true;
-                if is_silence_pcm(pcm) {
-                    self.terminal_sent = false;
-                    return Ok(WorkerFrame::NoText {
+                let frame = if is_silence_pcm(pcm) {
+                    WorkerFrame::NoText {
                         correlation,
                         reason: "silence".into(),
-                    });
-                }
-                if let Some(text) = &self.scripted_text {
+                    }
+                } else if let Some(text) = &self.scripted_text {
                     validate_transcript(text).map_err(SupervisorError::Protocol)?;
                     if text.trim().is_empty() {
-                        self.terminal_sent = false;
-                        return Ok(WorkerFrame::NoText {
+                        WorkerFrame::NoText {
                             correlation,
                             reason: "empty".into(),
-                        });
+                        }
+                    } else {
+                        WorkerFrame::Transcript {
+                            correlation,
+                            text: text.clone(),
+                        }
                     }
-                    self.terminal_sent = false;
-                    return Ok(WorkerFrame::Transcript {
+                } else {
+                    WorkerFrame::NoText {
                         correlation,
-                        text: text.clone(),
-                    });
-                }
-                self.terminal_sent = false;
-                Ok(WorkerFrame::NoText {
-                    correlation,
-                    reason: "no-scripted-hypothesis".into(),
-                })
+                        reason: "no-scripted-hypothesis".into(),
+                    }
+                };
+                Ok(frame)
             }
             ControlFrame::Cancel { .. } => Ok(WorkerFrame::Error {
                 code: "cancelled".into(),
@@ -200,6 +195,7 @@ pub struct WorkerSupervisor<C> {
     child: Option<C>,
     restarts: RestartBudget,
     observed_device: String,
+    last_terminal_request: Option<String>,
 }
 
 impl<C: WorkerChild> WorkerSupervisor<C> {
@@ -210,6 +206,7 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
             child: None,
             restarts: RestartBudget::default(),
             observed_device: "unknown".into(),
+            last_terminal_request: None,
         }
     }
 
@@ -222,7 +219,38 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         self.restarts.try_register(now)?;
         self.child = Some(child);
         self.state = WorkerState::Ready;
+        self.last_terminal_request = None;
         Ok(())
+    }
+
+    pub fn child_mut(&mut self) -> Option<&mut C> {
+        self.child.as_mut()
+    }
+
+    fn conclude_exchange(
+        &mut self,
+        result: Result<WorkerFrame, SupervisorError>,
+        deadline_exceeded: bool,
+    ) -> Result<WorkerFrame, SupervisorError> {
+        if deadline_exceeded {
+            self.state = WorkerState::Unavailable;
+            self.last_terminal_request = None;
+            return Err(SupervisorError::TimedOut);
+        }
+        match result {
+            Ok(frame) => Ok(frame),
+            Err(err @ SupervisorError::Protocol(_)) => {
+                // Child is still live; a finished exchange must not stay
+                // Loading/Busy. Generation stays valid for the next request.
+                self.state = WorkerState::Ready;
+                Err(err)
+            }
+            Err(err) => {
+                self.state = WorkerState::Unavailable;
+                self.last_terminal_request = None;
+                Err(err)
+            }
+        }
     }
 
     pub fn prepare(
@@ -233,30 +261,29 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         if matches!(self.state, WorkerState::Busy | WorkerState::Stopping) {
             return Err(SupervisorError::Busy);
         }
-        let child = self
-            .child
-            .as_mut()
-            .ok_or(SupervisorError::NotReady(self.state))?;
+        if self.child.is_none() {
+            return Err(SupervisorError::NotReady(self.state));
+        }
         self.state = WorkerState::Loading;
         let started = now;
-        let frame = child.exchange(ControlFrame::Prepare(correlation), None)?;
+        let exchanged = self
+            .child
+            .as_mut()
+            .expect("child checked")
+            .exchange(ControlFrame::Prepare(correlation), None);
+        let frame = self.conclude_exchange(exchanged, started.elapsed() > LOAD_DEADLINE)?;
         match frame {
             WorkerFrame::Ready {
                 observed_device, ..
             } => {
-                if started.elapsed() > LOAD_DEADLINE {
-                    self.state = WorkerState::Unavailable;
-                    return Err(SupervisorError::TimedOut);
-                }
                 self.observed_device = observed_device;
                 self.state = WorkerState::Ready;
                 Ok(started.elapsed())
             }
             _ => {
                 self.state = WorkerState::Unavailable;
-                Err(SupervisorError::Unavailable(
-                    "prepare returned a non-ready frame",
-                ))
+                self.last_terminal_request = None;
+                Err(SupervisorError::Protocol(FrameError::Unsolicited))
             }
         }
     }
@@ -269,27 +296,27 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
             return Err(SupervisorError::NotReady(self.state));
         }
         validate_pcm(&request.pcm, Some(request.pcm.len())).map_err(SupervisorError::Protocol)?;
-        let child = self
-            .child
-            .as_mut()
-            .ok_or(SupervisorError::NotReady(self.state))?;
+        let request_id = request.correlation.request_id.clone();
+        if self.last_terminal_request.as_ref() == Some(&request_id) {
+            return Err(SupervisorError::Protocol(FrameError::DuplicateTerminal));
+        }
+        if self.child.is_none() {
+            return Err(SupervisorError::NotReady(self.state));
+        }
         self.state = WorkerState::Busy;
         let started = Instant::now();
-        let frame = child.exchange(
+        let exchanged = self.child.as_mut().expect("child checked").exchange(
             ControlFrame::Transcribe {
                 correlation: request.correlation,
                 pcm_bytes: request.pcm.len(),
             },
             Some(&request.pcm),
         );
-        if started.elapsed() > STOP_PROCESSING {
-            self.state = WorkerState::Unavailable;
-            return Err(SupervisorError::TimedOut);
-        }
-        let frame = frame?;
-        self.state = WorkerState::Ready;
+        let frame = self.conclude_exchange(exchanged, started.elapsed() > STOP_PROCESSING)?;
         match frame {
             WorkerFrame::Transcript { text, .. } => {
+                self.last_terminal_request = Some(request_id);
+                self.state = WorkerState::Ready;
                 if text.trim().is_empty() {
                     Ok(WorkerOutcome::NoText {
                         reason: "empty".into(),
@@ -302,15 +329,17 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
                     })
                 }
             }
-            WorkerFrame::NoText { reason, .. } => Ok(WorkerOutcome::NoText {
-                reason,
-                observed_device: self.observed_device.clone(),
-            }),
-            _ => {
-                self.state = WorkerState::Unavailable;
-                Err(SupervisorError::Unavailable(
-                    "non-terminal transcribe frame",
-                ))
+            WorkerFrame::NoText { reason, .. } => {
+                self.last_terminal_request = Some(request_id);
+                self.state = WorkerState::Ready;
+                Ok(WorkerOutcome::NoText {
+                    reason,
+                    observed_device: self.observed_device.clone(),
+                })
+            }
+            WorkerFrame::Ready { .. } | WorkerFrame::Error { .. } => {
+                self.state = WorkerState::Ready;
+                Err(SupervisorError::Protocol(FrameError::Unsolicited))
             }
         }
     }
@@ -417,6 +446,49 @@ mod tests {
             error,
             SupervisorError::Protocol(FrameError::CorrelationMismatch)
         ));
+        assert_eq!(supervisor.state(), WorkerState::Ready);
+        let follow_up = supervisor
+            .transcribe(TranscribeRequest {
+                correlation: corr(),
+                pcm: vec![1, 0],
+            })
+            .unwrap();
+        assert!(matches!(
+            follow_up,
+            WorkerOutcome::Transcript { ref text, .. } if text == "hi"
+        ));
+        assert_eq!(supervisor.state(), WorkerState::Ready);
+    }
+
+    #[test]
+    fn duplicate_request_id_is_rejected_without_leaving_busy() {
+        let mut supervisor = ready_supervisor(Some("hi"));
+        supervisor
+            .transcribe(TranscribeRequest {
+                correlation: corr(),
+                pcm: vec![1, 0],
+            })
+            .unwrap();
+        let error = supervisor
+            .transcribe(TranscribeRequest {
+                correlation: corr(),
+                pcm: vec![1, 0],
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SupervisorError::Protocol(FrameError::DuplicateTerminal)
+        ));
+        assert_eq!(supervisor.state(), WorkerState::Ready);
+        let mut next = corr();
+        next.request_id = "q2".into();
+        let outcome = supervisor
+            .transcribe(TranscribeRequest {
+                correlation: next,
+                pcm: vec![1, 0],
+            })
+            .unwrap();
+        assert!(matches!(outcome, WorkerOutcome::Transcript { .. }));
     }
 
     #[test]
@@ -459,12 +531,31 @@ mod tests {
     #[test]
     fn process_wrapped_worker_speaks_length_prefixed_protocol() {
         use std::io::{Read, Write};
+        use std::path::PathBuf;
         use std::process::{Command, Stdio};
+        use std::thread;
 
         use crate::local_worker::protocol::{decode_json_frame, encode_json_frame};
+        use crate::local_worker::runtime::whisper_cpp_paths;
         use crate::local_worker::sandbox::scrub_worker_environment;
 
         spawn_program_allowed(std::path::Path::new("/usr/bin/true")).unwrap();
+        assert!(
+            std::env::var_os("VOISU_L2_SPAWN_WHISPER").is_none(),
+            "CI must not spawn whisper.cpp; VOISU_L2_SPAWN_WHISPER is a host-only gate"
+        );
+        assert!(
+            whisper_cpp_paths().binary.is_none() || whisper_cpp_paths().model.is_none(),
+            "CI must not inject a whisper.cpp model; production weights stay undownloaded"
+        );
+
+        let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file());
+        let Some(python) = python else {
+            return;
+        };
 
         let script = r#"
 import json, struct, sys
@@ -504,17 +595,42 @@ out = {k: msg[k] for k in ('daemon_nonce', 'generation', 'request_id', 'recordin
 out.update({'v': 1, 'kind': 'no_text', 'reason': 'silence'})
 write_frame(out)
 "#;
-        let mut child = Command::new("python3")
+        let mut child = Command::new(&python)
             .args(["-c", script])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .env_clear()
             .envs(scrub_worker_environment(std::env::vars_os()).retained)
             .spawn()
             .expect("python3 protocol stand-in");
         let mut stdin = child.stdin.take().expect("stdin");
-        let mut stdout = child.stdout.take().expect("stdout");
+        let stdout = child.stdout.take().expect("stdout");
+        let mut stderr = child.stderr.take().expect("stderr");
+        let stderr_thread = thread::spawn(move || {
+            let mut drained = Vec::new();
+            let mut buf = [0_u8; 256];
+            loop {
+                match stderr.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if drained.len() < crate::local_worker::MAX_RETAINED_STDERR_BYTES {
+                            let room =
+                                crate::local_worker::MAX_RETAINED_STDERR_BYTES - drained.len();
+                            drained.extend_from_slice(&buf[..n.min(room)]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            drained
+        });
+        let stdout_thread = thread::spawn(move || {
+            let mut collected = Vec::new();
+            let mut stdout = stdout;
+            let _ = stdout.read_to_end(&mut collected);
+            collected
+        });
         let prepare = serde_json::json!({
             "v": 1,
             "kind": "prepare",
@@ -544,13 +660,31 @@ write_frame(out)
         stdin.flush().unwrap();
         drop(stdin);
 
-        let mut collected = Vec::new();
-        stdout.read_to_end(&mut collected).unwrap();
-        let status = child.wait().unwrap();
+        let deadline = Instant::now() + STOP_PROCESSING;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let reap_deadline = Instant::now() + crate::local_worker::REAP_OBSERVE;
+                    while Instant::now() < reap_deadline {
+                        if let Ok(Some(status)) = child.try_wait() {
+                            panic!("process-wrapped stand-in exceeded STOP_PROCESSING: {status}");
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    panic!("process-wrapped stand-in unreaped after REAP_OBSERVE");
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Err(error) => panic!("wait failed: {error}"),
+            }
+        };
         assert!(
             status.success(),
             "process-wrapped stand-in failed: {status}"
         );
+        let collected = stdout_thread.join().expect("stdout reader");
+        let _ = stderr_thread.join();
         let (ready, used) = decode_json_frame(&collected).unwrap();
         assert_eq!(ready["kind"], "ready");
         assert_eq!(ready["observed_device"], "cpu");

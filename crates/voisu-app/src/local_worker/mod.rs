@@ -18,7 +18,8 @@ mod supervisor;
 pub use bakeoff::{
     BakeoffCase, BakeoffReport, COLD_READY_MAX_MS, CORPUS_CONTRACT_ID, CORPUS_VERSION, CaseKind,
     CaseOutcome, CriticalKind, DurationBand, FeasibilityRunner, GateVerdict, HostProfile, HostRole,
-    Split, evaluate_report, locked_host_profiles, locked_thresholds, percentile_nearest_rank,
+    SoakEvidence, Split, evaluate_report, locked_host_profiles, locked_thresholds,
+    percentile_nearest_rank,
 };
 pub use bounds::{
     CANCEL_GRACE, IPC_MARGIN, LOAD_DEADLINE, MAX_CACHE_BYTES, MAX_CPU_CORES,

@@ -144,16 +144,19 @@ where
         if name.ends_with("_API_KEY") || name.contains("SECRET") || name.contains("TOKEN") {
             continue;
         }
-        // PATH is required to resolve allowlisted runtime libraries after
-        // Landlock; the launcher still execs an absolute program path.
-        if name == "PATH" || name == "LANG" || name == "LC_ALL" {
+        // Absolute worker exec + ld.so (DT_RPATH/ldconfig) resolve libraries.
+        // PATH is not retained so a descendant cannot exec an unexpected binary.
+        if name == "LANG" || name == "LC_ALL" {
             retained.insert(name.to_owned(), value);
         }
     }
     ScrubbedEnvironment { retained }
 }
 
-/// Landlock allowlist: runtime libs, chosen model, approved GPU nodes, private cache.
+/// Landlock allowlist for the CPU-only L2 spike: runtime libs, chosen model,
+/// private cache. GPU device nodes are omitted until a supported GPU host
+/// profile is measured; adding `/dev/dri` or NVIDIA nodes without that
+/// measurement would over-allow.
 #[must_use]
 pub fn landlock_allowlist(model: PathBuf, cache: PathBuf) -> Vec<PathBuf> {
     vec![
@@ -220,10 +223,7 @@ mod tests {
             (OsString::from("LANG"), OsString::from("C")),
         ];
         let scrubbed = scrub_worker_environment(inherited);
-        assert_eq!(
-            scrubbed.retained.get("PATH").map(OsString::as_os_str),
-            Some(OsStr::new("/usr/bin"))
-        );
+        assert!(!scrubbed.retained.contains_key("PATH"));
         assert!(!scrubbed.retained.contains_key("VOISU_GROQ_API_KEY"));
         assert!(!scrubbed.retained.contains_key("https_proxy"));
         assert!(!scrubbed.retained.contains_key("LD_PRELOAD"));
@@ -261,5 +261,11 @@ mod tests {
         assert!(!rendered.iter().any(|path| path.contains("/home")));
         assert!(!rendered.iter().any(|path| path.contains(".config")));
         assert!(!rendered.iter().any(|path| path.contains("diagnostics")));
+        assert!(
+            !rendered.iter().any(|path| path.contains("/dev/dri")
+                || path.contains("nvidia")
+                || path.contains("/dev/dxg")),
+            "CPU-only spike must not allow GPU nodes before a measured GPU profile"
+        );
     }
 }

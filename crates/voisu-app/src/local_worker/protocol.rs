@@ -4,7 +4,8 @@
 //! separate bounded transfer. Worker stdout is protocol only.
 
 use super::bounds::{
-    MAX_JSON_DEPTH, MAX_JSON_FIELDS, MAX_JSON_FRAME_BYTES, MAX_PCM_BYTES, MAX_TRANSCRIPT_BYTES,
+    MAX_ERROR_METADATA_BYTES, MAX_JSON_DEPTH, MAX_JSON_FIELDS, MAX_JSON_FRAME_BYTES,
+    MAX_METADATA_BYTES, MAX_PCM_BYTES, MAX_TRANSCRIPT_BYTES,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -31,6 +32,7 @@ pub enum FrameError {
     EmbeddedNul,
     ExtraAudio,
     CorrelationMismatch,
+    MetadataTooLarge { bytes: usize },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -201,14 +203,18 @@ pub fn parse_worker(value: &serde_json::Value) -> Result<WorkerFrame, FrameError
             correlation: correlation_from(value)?,
             reason: required_string(value, "reason")?,
         }),
-        Some("error") => Ok(WorkerFrame::Error {
-            code: required_string(value, "code")?,
-            metadata: value
+        Some("error") => {
+            let metadata = value
                 .get("metadata")
                 .and_then(serde_json::Value::as_object)
                 .cloned()
-                .unwrap_or_default(),
-        }),
+                .unwrap_or_default();
+            retain_error_metadata(&metadata)?;
+            Ok(WorkerFrame::Error {
+                code: required_string(value, "code")?,
+                metadata,
+            })
+        }
         _ => Err(FrameError::InvalidJson),
     }
 }
@@ -245,6 +251,19 @@ fn correlation_from(value: &serde_json::Value) -> Result<Correlation, FrameError
         recording_id: required_string(value, "recording_id")?,
         model_receipt_hash: required_string(value, "model_receipt_hash")?,
     })
+}
+
+fn retain_error_metadata(
+    metadata: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), FrameError> {
+    let encoded = serde_json::to_vec(&serde_json::Value::Object(metadata.clone()))
+        .map_err(|_| FrameError::InvalidJson)?;
+    if encoded.len() > MAX_ERROR_METADATA_BYTES || encoded.len() > MAX_METADATA_BYTES {
+        return Err(FrameError::MetadataTooLarge {
+            bytes: encoded.len(),
+        });
+    }
+    Ok(())
 }
 
 fn check_json_bounds(
@@ -388,5 +407,20 @@ mod tests {
             correlations_match(&corr(), &got),
             Err(FrameError::CorrelationMismatch)
         );
+    }
+
+    #[test]
+    fn error_metadata_is_rejected_past_the_four_kib_retain_cap() {
+        let blob = "x".repeat(MAX_ERROR_METADATA_BYTES + 1);
+        let value = serde_json::json!({
+            "v": 1,
+            "kind": "error",
+            "code": "native",
+            "metadata": { "detail": blob },
+        });
+        assert!(matches!(
+            parse_worker(&value),
+            Err(FrameError::MetadataTooLarge { .. })
+        ));
     }
 }
