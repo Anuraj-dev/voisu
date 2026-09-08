@@ -29,8 +29,8 @@ pub use fetch::{
 };
 pub use health::{CandidateHealth, HealthError, HealthProbe, HealthReport, verify_candidate};
 pub use installer::{
-    InstallAbort, InstallConsent, InstallError, InstallIo, InstallRequest, MaintenanceError,
-    MaintenanceKind, MaintenanceReservation, install_entry,
+    InstallAbort, InstallClock, InstallConsent, InstallError, InstallIo, InstallRequest,
+    MaintenanceError, MaintenanceKind, MaintenanceReservation, install_entry,
 };
 pub use receipt::{ActiveReceipt, ReceiptError, from_entry};
 pub use store::{ModelLease, ModelStore, StoreError, StoreLock, models_dir, models_dir_from};

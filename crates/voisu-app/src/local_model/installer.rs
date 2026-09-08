@@ -3,7 +3,9 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::local_worker::{PROTOCOL_VERSION, refuse_production_weight_download};
 
@@ -94,6 +96,37 @@ impl Default for InstallIo {
     }
 }
 
+/// Elapsed install time. Tests advance the offset; they must not backdate `Instant`.
+#[derive(Clone, Debug)]
+pub struct InstallClock {
+    origin: Instant,
+    offset_ns: Arc<AtomicU64>,
+}
+
+impl Default for InstallClock {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+            offset_ns: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl InstallClock {
+    #[must_use]
+    pub fn elapsed(&self) -> Duration {
+        self.origin
+            .elapsed()
+            .saturating_add(Duration::from_nanos(self.offset_ns.load(Ordering::Relaxed)))
+    }
+
+    #[cfg(test)]
+    pub fn advance(&self, duration: Duration) {
+        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        self.offset_ns.fetch_add(nanos, Ordering::Relaxed);
+    }
+}
+
 pub struct InstallRequest<'a, F, H, M> {
     pub store: &'a mut ModelStore,
     pub entry: &'a CatalogEntry,
@@ -102,7 +135,7 @@ pub struct InstallRequest<'a, F, H, M> {
     pub maintenance: &'a M,
     pub consent: InstallConsent,
     pub io: InstallIo,
-    pub started: Instant,
+    pub clock: InstallClock,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,7 +200,7 @@ where
     if request.io.available_bytes < request.entry.total_bytes().saturating_mul(2) {
         return Err(InstallError::NoSpace);
     }
-    deadline(request.started)?;
+    deadline(request.clock.elapsed())?;
     if !request.entry.abi_supported() {
         return Err(InstallError::Abi);
     }
@@ -200,7 +233,7 @@ where
                 expected_bytes: file.bytes,
             })
             .map_err(map_fetch)?;
-        deadline(request.started)?;
+        deadline(request.clock.elapsed())?;
         if u64::try_from(fetched.body.len()).unwrap_or(u64::MAX) != file.bytes {
             return Err(InstallError::Size);
         }
@@ -210,12 +243,12 @@ where
         if let Some(errno) = request.io.fail_write {
             return Err(map_write_errno(errno));
         }
-        let write_started = Instant::now();
+        let write_started = request.clock.elapsed();
         let mut dest =
             safe_fs::create_exclusive_file(&staging, file.name).map_err(InstallError::Fs)?;
         safe_fs::durable_write(&mut dest, &fetched.body).map_err(InstallError::Fs)?;
-        no_progress(write_started)?;
-        deadline(request.started)?;
+        no_progress(request.clock.elapsed().saturating_sub(write_started))?;
+        deadline(request.clock.elapsed())?;
     }
     if request.io.abort == Some(InstallAbort::AfterFetch) {
         return abort(prior);
@@ -269,16 +302,16 @@ fn tree_hash(dir: &Path, entry: &CatalogEntry) -> Result<String, InstallError> {
     Ok(sha256_hex(joined.as_bytes()))
 }
 
-fn deadline(started: Instant) -> Result<(), InstallError> {
-    if started.elapsed() > INSTALL_DEADLINE {
+fn deadline(elapsed: Duration) -> Result<(), InstallError> {
+    if elapsed > INSTALL_DEADLINE {
         Err(InstallError::Deadline)
     } else {
         Ok(())
     }
 }
 
-fn no_progress(started: Instant) -> Result<(), InstallError> {
-    if started.elapsed() > NO_PROGRESS {
+fn no_progress(elapsed: Duration) -> Result<(), InstallError> {
+    if elapsed > NO_PROGRESS {
         Err(InstallError::Deadline)
     } else {
         Ok(())
@@ -324,7 +357,7 @@ impl From<MaintenanceError> for InstallError {
 mod tests {
     use super::*;
     use crate::local_model::catalog::{CatalogEntry, ci_fixture_entry, shipped_catalog};
-    use crate::local_model::fetch::{ScriptedFetcher, ScriptedHop};
+    use crate::local_model::fetch::{FetchResponse, ScriptedFetcher, ScriptedHop};
     use crate::local_model::health::{CandidateHealth, FailingHealth};
     use std::time::Duration;
 
@@ -358,7 +391,7 @@ mod tests {
             maintenance: &IdleMaintenance,
             consent: consent(entry),
             io: InstallIo::default(),
-            started: Instant::now(),
+            clock: InstallClock::default(),
         })
         .unwrap()
     }
@@ -396,7 +429,7 @@ mod tests {
             maintenance: &IdleMaintenance,
             consent: consent(entry),
             io: InstallIo::default(),
-            started: Instant::now(),
+            clock: InstallClock::default(),
         })
         .unwrap_err();
         assert_eq!(error, InstallError::ProductionWeightsForbidden);
@@ -419,7 +452,7 @@ mod tests {
             maintenance: &IdleMaintenance,
             consent: consent(entry),
             io: InstallIo::default(),
-            started: Instant::now(),
+            clock: InstallClock::default(),
         })
         .unwrap_err();
         assert!(matches!(
@@ -442,7 +475,7 @@ mod tests {
             maintenance: &IdleMaintenance,
             consent: consent(entry),
             io: InstallIo::default(),
-            started: Instant::now(),
+            clock: InstallClock::default(),
         })
         .unwrap_err();
         assert!(matches!(
@@ -469,7 +502,7 @@ mod tests {
                 fail_write: Some(libc::ENOSPC),
                 ..InstallIo::default()
             },
-            started: Instant::now(),
+            clock: InstallClock::default(),
         })
         .unwrap_err();
         assert_eq!(error, InstallError::NoSpace);
@@ -496,7 +529,7 @@ mod tests {
             maintenance: &IdleMaintenance,
             consent: consent(entry),
             io: InstallIo::default(),
-            started: Instant::now(),
+            clock: InstallClock::default(),
         })
         .unwrap_err();
         assert!(matches!(
@@ -525,7 +558,7 @@ mod tests {
             maintenance: &IdleMaintenance,
             consent: consent(entry),
             io: InstallIo::default(),
-            started: Instant::now(),
+            clock: InstallClock::default(),
         })
         .unwrap_err();
         assert!(matches!(error, InstallError::Health(_)));
@@ -559,7 +592,7 @@ mod tests {
                     abort: Some(abort_at),
                     ..InstallIo::default()
                 },
-                started: Instant::now(),
+                clock: InstallClock::default(),
             })
             .unwrap_err();
             assert_eq!(error, InstallError::Aborted, "{abort_at:?}");
@@ -598,7 +631,7 @@ mod tests {
             maintenance: &IdleMaintenance,
             consent: consent(entry),
             io: InstallIo::default(),
-            started: Instant::now(),
+            clock: InstallClock::default(),
         })
         .unwrap_err();
         assert_eq!(error, InstallError::Busy);
@@ -618,7 +651,7 @@ mod tests {
             },
             consent: consent(entry),
             io: InstallIo::default(),
-            started: Instant::now(),
+            clock: InstallClock::default(),
         })
         .unwrap_err();
         assert!(matches!(
@@ -633,31 +666,51 @@ mod tests {
         assert!(safe_fs::relative_file_name(name).is_err());
     }
 
+    struct ClockedFetcher {
+        inner: ScriptedFetcher,
+        clock: InstallClock,
+        per_fetch: Duration,
+    }
+
+    impl ArtifactFetcher for ClockedFetcher {
+        fn fetch(&self, request: &FetchRequest) -> Result<FetchResponse, FetchError> {
+            self.clock.advance(self.per_fetch);
+            self.inner.fetch(request)
+        }
+    }
+
     #[test]
     fn no_progress_rejects_stalled_write_not_completed_fetch() {
-        let stalled = Instant::now()
-            .checked_sub(NO_PROGRESS + Duration::from_secs(1))
-            .expect("monotonic clock covers NO_PROGRESS");
+        let stalled = NO_PROGRESS + Duration::from_secs(1);
         assert_eq!(no_progress(stalled), Err(InstallError::Deadline));
-        assert_eq!(no_progress(Instant::now()), Ok(()));
+        assert_eq!(no_progress(NO_PROGRESS), Ok(()));
+        assert_eq!(no_progress(Duration::ZERO), Ok(()));
+        assert_eq!(deadline(stalled), Ok(()));
+        assert_eq!(
+            deadline(INSTALL_DEADLINE + Duration::from_secs(1)),
+            Err(InstallError::Deadline)
+        );
     }
 
     #[test]
     fn fetch_longer_than_no_progress_still_installs() {
         let (_temp, mut store) = open_store();
         let entry = ci_fixture_entry();
-        let started = Instant::now()
-            .checked_sub(NO_PROGRESS + Duration::from_secs(1))
-            .expect("monotonic clock covers NO_PROGRESS");
+        let clock = InstallClock::default();
+        let fetcher = ClockedFetcher {
+            inner: fixture_fetcher(),
+            clock: clock.clone(),
+            per_fetch: NO_PROGRESS + Duration::from_secs(1),
+        };
         let receipt = install_entry(InstallRequest {
             store: &mut store,
             entry,
-            fetcher: &fixture_fetcher(),
+            fetcher: &fetcher,
             health: &CandidateHealth::default(),
             maintenance: &IdleMaintenance,
             consent: consent(entry),
             io: InstallIo::default(),
-            started,
+            clock,
         })
         .unwrap();
         assert_eq!(receipt.catalog_id, "l3-health-fixture");
@@ -665,5 +718,30 @@ mod tests {
             store.load_active().unwrap().unwrap().catalog_id,
             receipt.catalog_id
         );
+    }
+
+    #[test]
+    fn fetch_past_install_deadline_is_rejected() {
+        let (_temp, mut store) = open_store();
+        let entry = ci_fixture_entry();
+        let clock = InstallClock::default();
+        let fetcher = ClockedFetcher {
+            inner: fixture_fetcher(),
+            clock: clock.clone(),
+            per_fetch: INSTALL_DEADLINE + Duration::from_secs(1),
+        };
+        let error = install_entry(InstallRequest {
+            store: &mut store,
+            entry,
+            fetcher: &fetcher,
+            health: &CandidateHealth::default(),
+            maintenance: &IdleMaintenance,
+            consent: consent(entry),
+            io: InstallIo::default(),
+            clock,
+        })
+        .unwrap_err();
+        assert_eq!(error, InstallError::Deadline);
+        assert!(store.load_active().unwrap().is_none());
     }
 }

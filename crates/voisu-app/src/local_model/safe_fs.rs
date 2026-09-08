@@ -111,8 +111,10 @@ fn create_owned_components(path: &Path) -> Result<(), SafeFsError> {
                 fs::set_permissions(&built, fs::Permissions::from_mode(0o700))?;
                 if created == 0 {
                     // Crash before these fsyncs drops the new name and 0700 mode.
-                    dir.sync_all()?;
-                    parent_dir.sync_all()?;
+                    #[cfg(test)]
+                    durability::record(durability::Event::Mkdir(built.clone()));
+                    sync_opened_dir(&dir, &built)?;
+                    sync_opened_dir(&parent_dir, parent)?;
                 }
             }
             Err(error) => return Err(error.into()),
@@ -311,6 +313,11 @@ pub fn durable_rename(from: &Path, to: &Path) -> Result<(), SafeFsError> {
     // File contents are already synced; names in the staging directory are not.
     sync_dir(from)?;
     fs::rename(from, to)?;
+    #[cfg(test)]
+    durability::record(durability::Event::Rename {
+        from: from.to_path_buf(),
+        to: to.to_path_buf(),
+    });
     if let Some(parent) = to.parent() {
         sync_dir(parent)?;
     }
@@ -318,8 +325,61 @@ pub fn durable_rename(from: &Path, to: &Path) -> Result<(), SafeFsError> {
 }
 
 fn sync_dir(path: &Path) -> Result<(), SafeFsError> {
-    open_dir(path)?.sync_all()?;
+    sync_opened_dir(&open_dir(path)?, path)
+}
+
+fn sync_opened_dir(file: &File, path: &Path) -> Result<(), SafeFsError> {
+    file.sync_all()?;
+    record_sync(path);
     Ok(())
+}
+
+fn record_sync(path: &Path) {
+    #[cfg(test)]
+    durability::record(durability::Event::SyncDir(path.to_path_buf()));
+    #[cfg(not(test))]
+    let _ = path;
+}
+
+#[cfg(test)]
+mod durability {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum Event {
+        Mkdir(PathBuf),
+        SyncDir(PathBuf),
+        Rename { from: PathBuf, to: PathBuf },
+    }
+
+    thread_local! {
+        static EVENTS: RefCell<Option<Vec<Event>>> = const { RefCell::new(None) };
+    }
+
+    pub fn enable() -> Guard {
+        EVENTS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+        Guard
+    }
+
+    pub fn record(event: Event) {
+        EVENTS.with(|slot| {
+            if let Some(events) = slot.borrow_mut().as_mut() {
+                events.push(event);
+            }
+        });
+    }
+
+    pub fn snapshot() -> Vec<Event> {
+        EVENTS.with(|slot| slot.borrow().clone().unwrap_or_default())
+    }
+
+    pub struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            EVENTS.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
 }
 
 fn open_path_nofollow(path: &Path) -> Result<File, SafeFsError> {
@@ -455,6 +515,7 @@ fn openat2_relative(
 
 #[cfg(test)]
 mod tests {
+    use super::durability;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
@@ -521,8 +582,60 @@ mod tests {
             .join("id")
             .join("rev")
             .join("hash");
-        ensure_private_dir(dest.parent().unwrap()).unwrap();
+        let dest_parent = dest.parent().unwrap().to_path_buf();
+        let _trace = durability::enable();
+        ensure_private_dir(&dest_parent).unwrap();
+        let created = durability::snapshot();
+        for (index, event) in created.iter().enumerate() {
+            let durability::Event::Mkdir(path) = event else {
+                continue;
+            };
+            let parent = path.parent().expect("created dir has a parent");
+            assert_eq!(
+                created.get(index + 1),
+                Some(&durability::Event::SyncDir(path.clone())),
+                "new dir {} must be synced before its parent",
+                path.display()
+            );
+            assert_eq!(
+                created.get(index + 2),
+                Some(&durability::Event::SyncDir(parent.to_path_buf())),
+                "new name {} must be synced in {}",
+                path.display(),
+                parent.display()
+            );
+        }
+        assert!(
+            created.iter().any(
+                |event| matches!(event, durability::Event::Mkdir(path) if path == &dest_parent)
+            ),
+            "revision parent must be created and synced"
+        );
+
         durable_rename(&staging, &dest).unwrap();
+        let events = durability::snapshot();
+        let rename_at = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    durability::Event::Rename { from, to } if from == &staging && to == &dest
+                )
+            })
+            .expect("rename must be recorded");
+        assert!(
+            events[..rename_at]
+                .iter()
+                .any(|event| matches!(event, durability::Event::SyncDir(path) if path == &staging)),
+            "staging names must be durable before rename"
+        );
+        assert!(
+            events[rename_at + 1..].iter().any(
+                |event| matches!(event, durability::Event::SyncDir(path) if path == &dest_parent)
+            ),
+            "destination parent must be synced after rename"
+        );
+
         assert!(!staging.exists());
         let mut got = Vec::new();
         open_existing_file(&dest, "model.bin")
@@ -530,29 +643,5 @@ mod tests {
             .read_to_end(&mut got)
             .unwrap();
         assert_eq!(got, b"abc");
-
-        let source = include_str!("safe_fs.rs");
-        let rename_fn = source
-            .split("pub fn durable_rename")
-            .nth(1)
-            .unwrap()
-            .split("fn open_path_nofollow")
-            .next()
-            .unwrap();
-        assert!(
-            rename_fn.contains("sync_dir(from)"),
-            "staging names must be durable before rename"
-        );
-        let mkdir = source
-            .split("fn create_owned_components")
-            .nth(1)
-            .unwrap()
-            .split("pub fn relative_file_name")
-            .next()
-            .unwrap();
-        assert!(
-            mkdir.contains("parent_dir.sync_all()"),
-            "new catalog/revision names must be durable in their parents"
-        );
     }
 }

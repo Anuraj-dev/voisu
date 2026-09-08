@@ -245,4 +245,85 @@ mod tests {
         assert!(!stale.exists());
         assert!(active.join("model.bin").exists());
     }
+
+    #[test]
+    fn lease_protects_artifact_without_active_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ModelStore::open(temp.path().to_path_buf()).unwrap();
+        let entry = crate::local_model::catalog::ci_fixture_entry();
+        let dir = store.artifact_dir(entry, "leased0nly");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("model.bin"), b"keep").unwrap();
+        assert!(store.load_active().unwrap().is_none());
+
+        store.acquire_lease(&receipt::from_entry(entry, "leased0nly"), dir.clone());
+        assert_eq!(store.remove_unleased(&dir), Err(StoreError::Leased));
+        assert!(dir.join("model.bin").exists());
+
+        store.release_lease();
+        store.remove_unleased(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn lease_protects_while_receipt_is_active() {
+        let (_temp, mut store, artifact) = store_with_active_artifact();
+        let receipt = store.load_active().unwrap().unwrap();
+        store.acquire_lease(&receipt, artifact.clone());
+        assert_eq!(store.remove_unleased(&artifact), Err(StoreError::Leased));
+        assert!(artifact.join("model.bin").exists());
+        store.release_lease();
+        assert_eq!(store.remove_unleased(&artifact), Err(StoreError::Leased));
+        assert!(artifact.join("model.bin").exists());
+    }
+
+    #[test]
+    fn descendant_of_active_artifact_is_leased() {
+        let (_temp, store, artifact) = store_with_active_artifact();
+        let nested = artifact.join("model.bin");
+        assert_eq!(store.remove_unleased(&nested), Err(StoreError::Leased));
+        assert!(nested.exists());
+    }
+
+    #[test]
+    fn non_artifact_cleanup_targets_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ModelStore::open(temp.path().to_path_buf()).unwrap();
+        assert!(store.load_active().unwrap().is_none());
+        let not_artifact = StoreError::Path("cleanup target is not an artifact directory".into());
+
+        assert_eq!(
+            store.remove_unleased(store.root()),
+            Err(not_artifact.clone())
+        );
+
+        let scratch = store.root().join("scratch.bin");
+        fs::write(&scratch, b"x").unwrap();
+        assert_eq!(store.remove_unleased(&scratch), Err(not_artifact.clone()));
+        assert!(scratch.exists());
+
+        let other = store.root().join("other");
+        fs::create_dir(&other).unwrap();
+        assert_eq!(store.remove_unleased(&other), Err(not_artifact.clone()));
+        assert!(other.exists());
+
+        let staging = store.staging_dir("token");
+        fs::create_dir(&staging).unwrap();
+        assert_eq!(store.remove_unleased(&staging), Err(not_artifact.clone()));
+        assert!(staging.exists());
+
+        let shallow = store.root().join("artifacts").join("id").join("rev");
+        fs::create_dir_all(&shallow).unwrap();
+        assert_eq!(store.remove_unleased(&shallow), Err(not_artifact.clone()));
+        assert!(shallow.exists());
+
+        let stale = store.artifact_dir(crate::local_model::catalog::ci_fixture_entry(), "deadbeef");
+        fs::create_dir_all(&stale).unwrap();
+        let nested = stale.join("old.bin");
+        fs::write(&nested, b"drop").unwrap();
+        assert_eq!(store.remove_unleased(&nested), Err(not_artifact));
+        assert!(nested.exists());
+        store.remove_unleased(&stale).unwrap();
+        assert!(!stale.exists());
+    }
 }
