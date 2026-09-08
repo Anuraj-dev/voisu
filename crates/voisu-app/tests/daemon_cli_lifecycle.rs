@@ -109,6 +109,33 @@ fn isolate_deepgram_config(command: &mut Command, environment: &[(&str, &str)]) 
     Some(dir)
 }
 
+/// Pass this (value ignored) so the child leaves
+/// `VOISU_ENABLE_INTENT_RECONSTRUCTION` genuinely unset — Smart default then
+/// enables IR the way a packaged install does. Do not inherit the parent
+/// process env.
+const UNSET_INTENT_RECONSTRUCTION: &str = "VOISU_TEST_UNSET_INTENT_RECONSTRUCTION";
+
+/// Tests default Smart Writing Mode, which enables Intent Reconstruction
+/// unless this env is a force-off. Isolate to `0` so ordinary lifecycle tests
+/// keep the historic IR-off path; tests that want IR pass `1` explicitly;
+/// production unset+Smart uses [`UNSET_INTENT_RECONSTRUCTION`].
+fn isolate_intent_reconstruction_env(command: &mut Command, environment: &[(&str, &str)]) {
+    if environment
+        .iter()
+        .any(|(name, _)| *name == UNSET_INTENT_RECONSTRUCTION)
+    {
+        command.env_remove("VOISU_ENABLE_INTENT_RECONSTRUCTION");
+        command.env_remove(UNSET_INTENT_RECONSTRUCTION);
+        return;
+    }
+    if !environment
+        .iter()
+        .any(|(name, _)| *name == "VOISU_ENABLE_INTENT_RECONSTRUCTION")
+    {
+        command.env("VOISU_ENABLE_INTENT_RECONSTRUCTION", "0");
+    }
+}
+
 fn isolate_process_group(command: &mut Command) {
     // SAFETY: setpgid is an async-signal-safe syscall and this hook runs in the
     // child after fork, before exec, without touching shared process state.
@@ -170,17 +197,12 @@ impl Daemon {
         {
             command.env_remove("VOISU_ENABLE_QWEN_FORMAT");
         }
-        if !environment
-            .iter()
-            .any(|(name, _)| *name == "VOISU_ENABLE_INTENT_RECONSTRUCTION")
-        {
-            command.env_remove("VOISU_ENABLE_INTENT_RECONSTRUCTION");
-        }
         disable_shortcuts_unless_bus_injected(&mut command, environment);
         let config_dir = isolate_deepgram_config(&mut command, environment);
         for (name, value) in environment {
             command.env(name, value);
         }
+        isolate_intent_reconstruction_env(&mut command, environment);
         isolate_process_group(&mut command);
         let mut child = command.spawn().expect("daemon should start");
 
@@ -284,6 +306,7 @@ impl Daemon {
         for (name, value) in environment {
             command.env(name, value);
         }
+        isolate_intent_reconstruction_env(&mut command, environment);
         if let Some(stub) = provider_stub.as_ref() {
             command.env("PATH", format!("{}:{original_path}", stub.path().display()));
         }
@@ -6017,6 +6040,129 @@ fn material_disagreement_reconciles_with_recorded_selection_and_validation() {
     assert_eq!(
         stopped["evidence"]["validation_reason"],
         "Merge Result passed validation"
+    );
+}
+
+#[test]
+fn unset_env_and_default_smart_writing_mode_run_intent_reconstruction() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            (UNSET_INTENT_RECONSTRUCTION, "1"),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Book the room Tuesday afternoon.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "Schedule the review Wednesday morning.",
+            ),
+            (
+                "VOISU_TEST_RECONCILIATION_RESULT",
+                "Book the review on Wednesday morning.",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
+    assert_eq!(
+        stopped["evidence"]["transcript_selection"], "intent_reconstructed",
+        "{stopped}"
+    );
+    assert_eq!(
+        stopped["evidence"]["intent_reconstruction"]["eligibility"], "material_disagreement",
+        "{stopped}"
+    );
+    assert_eq!(
+        stopped["evidence"]["intent_reconstruction"]["outcome"], "accepted",
+        "{stopped}"
+    );
+}
+
+#[test]
+fn literal_writing_mode_skips_intent_reconstruction_even_when_env_is_on() {
+    let runtime = TempDir::new().unwrap();
+    let config = TempDir::new().unwrap();
+    fs::create_dir_all(config.path().join("voisu")).unwrap();
+    fs::write(
+        config.path().join("voisu/config.toml"),
+        "deepgram_enabled = true\nwriting_mode = \"literal\"\n",
+    )
+    .unwrap();
+    let config_home = config.path().display().to_string();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("XDG_CONFIG_HOME", &config_home),
+            ("VOISU_ENABLE_INTENT_RECONSTRUCTION", "1"),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Book the room Tuesday afternoon.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "Schedule the review Wednesday morning.",
+            ),
+            (
+                "VOISU_TEST_RECONCILIATION_RESULT",
+                "Book the review on Wednesday morning.",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["evidence"]["delivery_count"], 1, "{stopped}");
+    assert_eq!(
+        stopped["evidence"]["transcript_selection"], "reconciled",
+        "{stopped}"
+    );
+    assert!(
+        stopped["evidence"]["intent_reconstruction"].is_null(),
+        "{stopped}"
+    );
+}
+
+#[test]
+fn smart_writing_mode_can_force_off_intent_reconstruction() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_ENABLE_INTENT_RECONSTRUCTION", "0"),
+            (
+                "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
+                "Book the room Tuesday afternoon.",
+            ),
+            (
+                "VOISU_TEST_GROQ_TRANSCRIPT",
+                "Schedule the review Wednesday morning.",
+            ),
+            (
+                "VOISU_TEST_RECONCILIATION_RESULT",
+                "Book the review on Wednesday morning.",
+            ),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(
+        stopped["evidence"]["transcript_selection"], "reconciled",
+        "{stopped}"
+    );
+    assert!(
+        stopped["evidence"]["intent_reconstruction"].is_null(),
+        "{stopped}"
     );
 }
 
@@ -12040,6 +12186,44 @@ fn delivery_cli_sets_gets_and_persists_guarded_while_rejecting_invalid_modes() {
         stderr(&bad).contains("delivery mode must be type, clipboard, or guarded"),
         "{}",
         stderr(&bad)
+    );
+}
+
+#[test]
+fn writing_cli_reports_intent_reconstruction_from_writing_mode_not_process_env() {
+    let config = TempDir::new().unwrap();
+    let run = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_voisu"))
+            .args(arguments)
+            .env("XDG_CONFIG_HOME", config.path())
+            .env("VOISU_ENABLE_INTENT_RECONSTRUCTION", "0")
+            .output()
+            .unwrap()
+    };
+
+    let initial = run(&["writing"]);
+    assert!(initial.status.success(), "{}", stderr(&initial));
+    assert_eq!(
+        stdout(&initial),
+        "writing mode: smart (Intent Reconstruction on unless the daemon env forces it off)\n"
+    );
+
+    let literal = run(&["writing", "literal"]);
+    assert!(literal.status.success(), "{}", stderr(&literal));
+    assert_eq!(
+        stdout(&literal),
+        "Writing mode set to literal for new Recordings (Intent Reconstruction off); restart the daemon to apply (voisu service restart)\n"
+    );
+    assert_eq!(
+        stdout(&run(&["writing"])),
+        "writing mode: literal (Intent Reconstruction off)\n"
+    );
+
+    let smart = run(&["writing", "smart"]);
+    assert!(smart.status.success(), "{}", stderr(&smart));
+    assert_eq!(
+        stdout(&smart),
+        "Writing mode set to smart for new Recordings (Intent Reconstruction on unless the daemon env forces it off); restart the daemon to apply (voisu service restart)\n"
     );
 }
 

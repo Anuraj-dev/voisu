@@ -118,7 +118,7 @@ local to your machine.
 | `voisu auth set` / `auth verify <groq\|deepgram>` | Store or verify a provider key (key on stdin) |
 | `voisu deepgram on` / `off` | Enable or disable Deepgram streaming |
 | `voisu delivery [type\|clipboard\|guarded]` | Show or set the Delivery mode |
-| `voisu writing [smart\|literal]` | Show or set the writing mode |
+| `voisu writing [smart\|literal]` | Show or set writing mode. Smart formats and enables Intent Reconstruction; Literal keeps wording and disables it |
 | `voisu rendering [natural\|adaptive\|structured]` | Show or set the rendering policy |
 | `voisu dictionary add` / `remove <term>` / `list` | Personal pronunciation dictionary |
 | `voisu history [--json]` | Recent local diagnostic history |
