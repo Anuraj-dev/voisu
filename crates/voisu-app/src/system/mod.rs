@@ -2664,6 +2664,7 @@ mod tests {
 
     #[test]
     fn provider_endpoint_gate_parses_the_url_instead_of_prefix_matching() {
+        // HTTPS or loopback HTTP for live providers — not a model-catalog download gate.
         let secure = |endpoint: &str| provider_endpoint_url(endpoint).is_some();
         assert!(secure(
             "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -2682,6 +2683,12 @@ mod tests {
         // Exact host comparison: a lookalike suffix is a different host.
         assert!(!secure("http://localhost.attacker.example/transcribe"));
         assert!(!secure("not a url"));
+    }
+
+    #[ignore = "L0-DEFECT: R4 catalog URL parser is not implemented"]
+    #[test]
+    fn catalog_download_url_rejects_uncataloged_https_and_http_loopback() {
+        unimplemented!("catalog_download_url must not reuse provider_endpoint_url");
     }
 
     #[test]

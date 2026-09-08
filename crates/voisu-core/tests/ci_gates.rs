@@ -1,8 +1,3 @@
-//! L0 verification floor for CI lockfiles and the undeclared toolchain matrix.
-//!
-//! These tests encode the intended commands and named defects. They read the
-//! committed workflow; they do not spawn cargo.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -19,9 +14,15 @@ fn ci_workflow() -> String {
         .expect("CI workflow must be readable")
 }
 
+fn uses_line_contains(ci: &str, needle: &str) -> bool {
+    ci.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("- uses:") && trimmed.contains(needle)
+    })
+}
+
 #[test]
 fn workspace_test_gate_uses_committed_lockfile() {
-    // Intended default test gate: cargo test --workspace --locked
     let ci = ci_workflow();
     assert!(
         ci.contains("cargo test --workspace --locked"),
@@ -34,32 +35,32 @@ fn workspace_test_gate_uses_committed_lockfile() {
 }
 
 #[test]
-fn toolchain_matrix_is_named_as_an_l6_blocker() {
-    // L0-DEFECT / L6 blocker: no rust-toolchain.toml. Default CI jobs float on
-    // dtolnay/rust-toolchain@stable; the MSRV job pins 1.92.0 to match
-    // workspace rust-version = "1.92". L6 must pin the default jobs to a
-    // concrete channel or fail closed. Do not bump MSRV here.
-    let root = workspace_root();
-    assert!(
-        !root.join("rust-toolchain.toml").is_file(),
-        "rust-toolchain.toml is absent on purpose until default CI jobs stop floating on @stable"
-    );
-    let cargo = fs::read_to_string(root.join("Cargo.toml")).expect("workspace Cargo.toml");
+fn msrv_job_is_pinned_to_1_92_0() {
+    let cargo =
+        fs::read_to_string(workspace_root().join("Cargo.toml")).expect("workspace Cargo.toml");
     assert!(
         cargo.contains("rust-version = \"1.92\""),
         "workspace MSRV must stay 1.92"
     );
-    let ci = ci_workflow();
     assert!(
-        ci.contains("dtolnay/rust-toolchain@stable"),
-        "default CI jobs currently float on @stable"
+        uses_line_contains(&ci_workflow(), "dtolnay/rust-toolchain@1.92.0"),
+        "MSRV job must pin dtolnay/rust-toolchain@1.92.0 on a uses: line"
     );
+}
+
+#[test]
+fn default_ci_jobs_pin_stable_on_the_uses_line() {
     assert!(
-        ci.contains("dtolnay/rust-toolchain@1.92.0"),
-        "MSRV job must stay pinned at 1.92.0"
+        uses_line_contains(&ci_workflow(), "dtolnay/rust-toolchain@stable"),
+        "default CI jobs must use dtolnay/rust-toolchain@stable on a uses: line"
     );
+}
+
+#[ignore = "L0-DEFECT: rust-toolchain.toml does not pin default CI jobs"]
+#[test]
+fn rust_toolchain_toml_pins_the_default_ci_channel() {
     assert!(
-        ci.contains("L0-DEFECT"),
-        "CI must name the undeclared toolchain matrix as an L6 blocker"
+        workspace_root().join("rust-toolchain.toml").is_file(),
+        "default CI jobs should be pinned by rust-toolchain.toml"
     );
 }

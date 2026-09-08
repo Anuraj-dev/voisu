@@ -40,7 +40,8 @@ pub use diagnostics::{
     replay_capture, sanitize_url, scrub_embedded_urls, scrub_secret_values,
     text_sha256_fingerprint, unix_millis_now,
 };
-pub use timing::{StopAnchoredTimings, duration_millis, millis_between, stop_anchored_timings};
+pub(crate) use timing::duration_millis;
+pub use timing::{StopAnchoredTimings, stop_anchored_timings};
 
 mod confidence_arbitration;
 

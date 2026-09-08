@@ -345,6 +345,8 @@ impl ShortcutPortal for FedoraShortcutPortal {
                     return Err(error);
                 }
             };
+            // Records the portal-approved description; does not fail closed if
+            // that chord is already occupied on the desktop.
             let binding = TriggerKeyBinding::new(
                 approved_trigger_description(&results)
                     .unwrap_or_else(|| TRIGGER_KEY_DESCRIPTION.to_owned()),

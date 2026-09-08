@@ -17,11 +17,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install native test dependencies
         run: sudo apt-get update && sudo apt-get install --yes libxkbcommon-dev
-      # L0-DEFECT / L6 blocker: default jobs float on @stable while the MSRV
-      # job pins 1.92.0 (workspace rust-version = "1.92"). There is no
-      # rust-toolchain.toml, so local rustup and these jobs can diverge from
-      # MSRV. L6 must pin the default jobs to a concrete channel or fail
-      # closed. Do not bump MSRV here.
+      # Floats on @stable; the MSRV job pins 1.92.0. Pin both together.
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -66,8 +62,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install --yes libxkbcommon-dev libgtk-4-dev libgtk4-layer-shell-dev
-      # L0-DEFECT / L6 blocker: same undeclared matrix as the test job
-      # (@stable vs MSRV 1.92.0; no rust-toolchain.toml).
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -94,8 +88,6 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      # L0-DEFECT / L6 blocker: same undeclared matrix as the test job
-      # (@stable vs MSRV 1.92.0; no rust-toolchain.toml).
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -139,8 +131,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install native doc dependencies
         run: sudo apt-get update && sudo apt-get install --yes libxkbcommon-dev
-      # L0-DEFECT / L6 blocker: same undeclared matrix as the test job
-      # (@stable vs MSRV 1.92.0; no rust-toolchain.toml).
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Broken intra-doc links (e.g. public docs linking private items) fail
@@ -158,8 +148,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install --yes libxkbcommon-dev libgtk-4-dev libgtk4-layer-shell-dev
-      # L0-DEFECT / L6 blocker: this job pins 1.92.0 while other jobs use
-      # @stable. rust-toolchain.toml is absent. Keep MSRV at 1.92.0.
       - uses: dtolnay/rust-toolchain@1.92.0
       - uses: Swatinem/rust-cache@v2
       # rust-version declared in the workspace Cargo.toml; prove the declared
