@@ -164,11 +164,26 @@ pub fn persist_asr_mode_at(
     state_dir: &Path,
     mode: AsrMode,
 ) -> Result<AsrModeCommit, PersistError> {
+    persist_asr_mode_at_with(config_path, state_dir, mode, commit_revision)
+}
+
+fn persist_asr_mode_at_with(
+    config_path: &Path,
+    state_dir: &Path,
+    mode: AsrMode,
+    commit_revision: impl FnOnce(&Path, u64) -> Result<u64, PersistError>,
+) -> Result<AsrModeCommit, PersistError> {
     let state_dir = ensure_private_state_dir_at(state_dir).map_err(PersistError::Intact)?;
     let _lock = ConfigLock::acquire(config_path).map_err(PersistError::Intact)?;
+    // Validate revision before replacing config; a later revision failure is
+    // indeterminate because the mode write already happened.
+    let next = read_revision_at(&state_dir)
+        .map_err(|error| PersistError::Intact(error.message().to_owned()))?
+        .saturating_add(1);
     write_mode_initialized_marker(&state_dir)?;
     config::write_asr_mode_unlocked(config_path, mode).map_err(map_write_error)?;
-    let revision = bump_revision(&state_dir)?;
+    let revision = commit_revision(&state_dir, next)
+        .map_err(|error| PersistError::Indeterminate(error.message().to_owned()))?;
     Ok(AsrModeCommit {
         mode,
         revision,
@@ -216,15 +231,8 @@ fn marker_present(state_dir: &Path) -> Result<bool, AdmissionError> {
     }
 }
 
-fn bump_revision(state_dir: &Path) -> Result<u64, PersistError> {
-    let path = revision_path(state_dir);
-    let current = read_revision_at(state_dir).map_err(|error| match error {
-        AdmissionError::Access(message) | AdmissionError::Blocked(message) => {
-            PersistError::Intact(message)
-        }
-    })?;
-    let next = current.saturating_add(1);
-    durable_replace(&path, format!("{next}\n").as_bytes())?;
+fn commit_revision(state_dir: &Path, next: u64) -> Result<u64, PersistError> {
+    durable_replace(&revision_path(state_dir), format!("{next}\n").as_bytes())?;
     Ok(next)
 }
 
@@ -292,6 +300,8 @@ fn durable_replace(path: &Path, contents: &[u8]) -> Result<(), PersistError> {
 }
 
 pub fn load_mode(config_path: &Path, state_dir: &Path) -> Result<(AsrMode, u64), AdmissionError> {
+    // Same exclusive lock persist holds, so marker/config/revision cannot tear.
+    let _lock = ConfigLock::acquire(config_path).map_err(AdmissionError::Access)?;
     let marker = marker_present(state_dir)?;
     let revision = read_revision_at(state_dir)?;
     match fs::read_to_string(config_path) {
@@ -346,12 +356,17 @@ fn parse_asr_mode_document(contents: &str) -> Result<Option<AsrMode>, AdmissionE
                 "malformed TOML in daemon config; admission blocked".to_owned(),
             ));
         }
-        if !seen.insert(key.to_owned()) {
+        let seen_key = if is_asr_mode_key(key) {
+            ASR_MODE_KEY
+        } else {
+            key
+        };
+        if !seen.insert(seen_key.to_owned()) {
             return Err(AdmissionError::Blocked(format!(
                 "duplicate root key {key} in daemon config; admission blocked"
             )));
         }
-        if key != ASR_MODE_KEY {
+        if !is_asr_mode_key(key) {
             continue;
         }
         let value = value.trim();
@@ -370,6 +385,10 @@ fn parse_asr_mode_document(contents: &str) -> Result<Option<AsrMode>, AdmissionE
 
 fn strip_comment(line: &str) -> &str {
     line.split('#').next().unwrap_or(line)
+}
+
+fn is_asr_mode_key(key: &str) -> bool {
+    key == ASR_MODE_KEY || key == "\"asr_mode\"" || key == "'asr_mode'"
 }
 
 pub fn admit_recording() -> Result<RecordingAdmission, AdmissionError> {
@@ -848,6 +867,30 @@ mod tests {
     }
 
     #[test]
+    fn quoted_double_asr_mode_key_loads_local_without_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config.toml");
+        let state = home.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(&config, "\"asr_mode\" = \"local\"\n").unwrap();
+        let (mode, _) = load_mode(&config, &state).unwrap();
+        assert_eq!(mode, AsrMode::Local);
+        assert_ne!(mode, AsrMode::Cloud);
+    }
+
+    #[test]
+    fn quoted_single_asr_mode_key_loads_local_without_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config.toml");
+        let state = home.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(&config, "'asr_mode' = 'local'\n").unwrap();
+        let (mode, _) = load_mode(&config, &state).unwrap();
+        assert_eq!(mode, AsrMode::Local);
+        assert_ne!(mode, AsrMode::Cloud);
+    }
+
+    #[test]
     fn unknown_mode_never_becomes_cloud() {
         let contents = "asr_mode = \"hybrid\"\n";
         let error = parse_asr_mode_document(contents).unwrap_err();
@@ -857,6 +900,13 @@ mod tests {
     #[test]
     fn duplicate_root_keys_block_admission() {
         let contents = "asr_mode = \"local\"\nasr_mode = \"cloud\"\n";
+        let error = parse_asr_mode_document(contents).unwrap_err();
+        assert!(error.message().contains("duplicate"));
+    }
+
+    #[test]
+    fn quoted_and_bare_asr_mode_keys_are_duplicates() {
+        let contents = "\"asr_mode\" = \"local\"\nasr_mode = \"cloud\"\n";
         let error = parse_asr_mode_document(contents).unwrap_err();
         assert!(error.message().contains("duplicate"));
     }
@@ -897,6 +947,41 @@ mod tests {
         let contents = fs::read_to_string(&config).unwrap();
         assert!(contents.contains("asr_mode = \"local\""));
         assert_eq!(contents.matches("asr_mode").count(), 1);
+    }
+
+    #[test]
+    fn unreadable_revision_before_replace_is_intact() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config.toml");
+        let state = home.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(&config, "custom = 1\n").unwrap();
+        fs::write(revision_path(&state), "not-a-number\n").unwrap();
+        let error = persist_asr_mode_at(&config, &state, AsrMode::Local).unwrap_err();
+        assert!(
+            !error.is_indeterminate(),
+            "revision was invalid before replace: {}",
+            error.message()
+        );
+        assert_eq!(fs::read_to_string(&config).unwrap(), "custom = 1\n");
+    }
+
+    #[test]
+    fn revision_write_failure_after_config_replace_is_indeterminate() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config.toml");
+        let state = home.path().join("state");
+        let error = persist_asr_mode_at_with(&config, &state, AsrMode::Local, |_state, _next| {
+            Err(PersistError::Intact("cannot stage revision".to_owned()))
+        })
+        .unwrap_err();
+        assert!(
+            error.is_indeterminate(),
+            "config already changed: {}",
+            error.message()
+        );
+        let contents = fs::read_to_string(&config).unwrap();
+        assert!(contents.contains("asr_mode = \"local\""), "{contents}");
     }
 
     #[test]

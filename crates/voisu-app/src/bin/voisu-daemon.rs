@@ -585,9 +585,8 @@ async fn actor_loop(
         match message {
             ActorMessage::Command(command, reply) => match command {
                 Command::Status => {
-                    let mut response = status_response(&state, daemon_readiness.as_ref());
-                    asr_mode::attach_status(&mut response, active_asr_mode(&state));
-                    let _ = reply.send(response);
+                    let response = status_response(&state, daemon_readiness.as_ref());
+                    reply_with_asr_status(response, active_asr_mode(&state), reply);
                 }
                 Command::SetAsrMode(mode) => {
                     let daemon_state = state_label(&state);
@@ -602,13 +601,12 @@ async fn actor_loop(
                     });
                 }
                 Command::OverlayStatus => {
-                    let mut response = overlay_status_response(
+                    let response = overlay_status_response(
                         &state,
                         last_overlay_event.as_ref(),
                         daemon_readiness.as_ref(),
                     );
-                    asr_mode::attach_status(&mut response, active_asr_mode(&state));
-                    let _ = reply.send(response);
+                    reply_with_asr_status(response, active_asr_mode(&state), reply);
                 }
                 Command::Level { after_seq } => {
                     let _ = reply.send(Response::with_level_frames(levels.after(after_seq)));
@@ -682,11 +680,13 @@ async fn actor_loop(
                     ));
                 }
                 Command::Replay(fixture_name) if matches!(state, ActorState::Idle) => {
-                    if let Err(response) = asr_mode::admit_cloud_capture(
+                    if let Err(response) = admit_cloud_capture_off_actor(
                         asr_mode::CaptureKind::Replay,
                         state_label(&state),
                         active_asr_mode(&state),
-                    ) {
+                    )
+                    .await
+                    {
                         let _ = reply.send(*response);
                         continue;
                     }
@@ -788,11 +788,13 @@ async fn actor_loop(
                     ));
                 }
                 Command::Start | Command::Toggle if matches!(state, ActorState::Idle) => {
-                    let admitted_mode = match asr_mode::admit_cloud_capture(
+                    let admitted_mode = match admit_cloud_capture_off_actor(
                         asr_mode::CaptureKind::Start,
                         state_label(&state),
                         active_asr_mode(&state),
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(mode) => mode,
                         Err(response) => {
                             let _ = reply.send(*response);
@@ -1579,6 +1581,33 @@ fn spawn_recording_processing(
         reaper,
     ));
     Ok(())
+}
+
+fn reply_with_asr_status(
+    mut response: Response,
+    active: Option<AsrMode>,
+    reply: oneshot::Sender<Response>,
+) {
+    // ConfigLock flocks; keep it off the daemon actor.
+    tokio::task::spawn_blocking(move || {
+        asr_mode::attach_status(&mut response, active);
+        let _ = reply.send(response);
+    });
+}
+
+async fn admit_cloud_capture_off_actor(
+    kind: asr_mode::CaptureKind,
+    daemon_state: DaemonState,
+    active: Option<AsrMode>,
+) -> Result<AsrMode, Box<Response>> {
+    tokio::task::spawn_blocking(move || asr_mode::admit_cloud_capture(kind, daemon_state, active))
+        .await
+        .unwrap_or_else(|_| {
+            Err(Box::new(Response::rejected(
+                Some(daemon_state),
+                "ASR mode admission is unavailable",
+            )))
+        })
 }
 
 fn state_label(state: &ActorState) -> DaemonState {
