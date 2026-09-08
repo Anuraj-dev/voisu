@@ -111,6 +111,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 url = "2"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 voisu-core = { path = "../voisu-core" }
+sha2 = "0.10"
+webpki-roots = "1"
 xkbcommon = { version = "0.9", default-features = false }
 zbus = { version = "5.13.2", default-features = false, features = ["tokio"] }
 gtk4 = { version = "0.11", features = ["v4_10"], optional = true }

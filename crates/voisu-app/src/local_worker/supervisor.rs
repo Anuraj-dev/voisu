@@ -29,6 +29,9 @@ pub enum SupervisorError {
     Runtime(RuntimeError),
     Busy,
     Unavailable(&'static str),
+    Crashed,
+    OutOfMemory,
+    LoadAborted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,6 +100,15 @@ pub struct FakeWorker {
     pub response_correlation: Option<Correlation>,
     /// Scripted reap result. Default is a clean exit.
     pub reap: ReapOutcome,
+    /// When set, Prepare/Transcribe returns this worker error code.
+    pub scripted_error: Option<String>,
+    /// Exchange fails as a crash instead of a protocol frame.
+    pub crash: bool,
+    /// Cancel does not reap; the child may still emit a late frame.
+    pub ignore_cancel: bool,
+    /// Transcribe stays in-flight until cancel; a late Transcript may follow.
+    pub hold_until_cancel: bool,
+    pub queued_late: Option<String>,
 }
 
 impl Default for FakeWorker {
@@ -109,6 +121,11 @@ impl Default for FakeWorker {
             block_for: None,
             response_correlation: None,
             reap: ReapOutcome::Exited,
+            scripted_error: None,
+            crash: false,
+            ignore_cancel: false,
+            hold_until_cancel: false,
+            queued_late: None,
         }
     }
 }
@@ -123,6 +140,15 @@ impl WorkerChild for FakeWorker {
         if would_exceed_deadline(deadline, self.block_for) {
             return Err(SupervisorError::TimedOut);
         }
+        if self.crash {
+            return Err(SupervisorError::Crashed);
+        }
+        if let Some(code) = &self.scripted_error {
+            return Ok(WorkerFrame::Error {
+                code: code.clone(),
+                metadata: serde_json::Map::new(),
+            });
+        }
         match control {
             ControlFrame::Prepare(correlation) => {
                 let expected = self.live_correlation(&correlation);
@@ -136,6 +162,10 @@ impl WorkerChild for FakeWorker {
                 correlation,
                 pcm_bytes,
             } => {
+                if self.hold_until_cancel {
+                    self.queued_late = self.scripted_text.clone();
+                    return Err(SupervisorError::Busy);
+                }
                 let pcm = pcm.unwrap_or_default();
                 validate_pcm(pcm, None).map_err(SupervisorError::Protocol)?;
                 if pcm.len() > pcm_bytes {
@@ -190,6 +220,9 @@ impl WorkerChild for FakeWorker {
     }
 
     fn cancel_and_reap(&mut self) -> Result<ReapOutcome, SupervisorError> {
+        if self.ignore_cancel {
+            return Ok(ReapOutcome::Unreaped);
+        }
         Ok(self.reap)
     }
 }
@@ -277,6 +310,9 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
                 self.state = on_protocol;
                 Err(err)
             }
+            Err(err @ SupervisorError::Crashed)
+            | Err(err @ SupervisorError::OutOfMemory)
+            | Err(err @ SupervisorError::LoadAborted) => Err(self.fail_and_reap(err)),
             Err(err) => {
                 self.state = WorkerState::Unavailable;
                 self.last_terminal_request = None;
@@ -311,6 +347,30 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
     fn protocol_reject(&mut self, err: FrameError) -> SupervisorError {
         self.state = WorkerState::Ready;
         SupervisorError::Protocol(err)
+    }
+
+    fn fail_and_reap(&mut self, err: SupervisorError) -> SupervisorError {
+        let outcome = match self.child.as_mut() {
+            Some(child) => child.cancel_and_reap().unwrap_or(ReapOutcome::Unreaped),
+            None => ReapOutcome::Exited,
+        };
+        self.apply_reap(outcome);
+        if self.state != WorkerState::Unavailable {
+            self.state = WorkerState::Unavailable;
+        }
+        err
+    }
+
+    fn map_worker_error(&mut self, code: &str, unknown: WorkerState) -> SupervisorError {
+        match code {
+            "oom" => self.fail_and_reap(SupervisorError::OutOfMemory),
+            "crash" => self.fail_and_reap(SupervisorError::Crashed),
+            "load_abort" => self.fail_and_reap(SupervisorError::LoadAborted),
+            _ => {
+                self.state = unknown;
+                SupervisorError::Protocol(FrameError::Unsolicited)
+            }
+        }
     }
 
     pub fn prepare(
@@ -353,6 +413,9 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
                 self.observed_device = observed_device;
                 self.state = WorkerState::Ready;
                 Ok(now.elapsed())
+            }
+            WorkerFrame::Error { code, .. } => {
+                Err(self.map_worker_error(&code, WorkerState::Unavailable))
             }
             _ => {
                 self.state = WorkerState::Unavailable;
@@ -429,7 +492,10 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
                     observed_device: self.observed_device.clone(),
                 })
             }
-            WorkerFrame::Ready { .. } | WorkerFrame::Error { .. } => {
+            WorkerFrame::Error { code, .. } => {
+                Err(self.map_worker_error(&code, WorkerState::Ready))
+            }
+            WorkerFrame::Ready { .. } => {
                 self.state = WorkerState::Ready;
                 Err(SupervisorError::Protocol(FrameError::Unsolicited))
             }
