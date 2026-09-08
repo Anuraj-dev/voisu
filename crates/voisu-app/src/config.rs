@@ -2,8 +2,9 @@
 //!
 //! Today this holds the Deepgram Provider switch, Delivery mode, Writing Mode,
 //! Developer Prompt Rendering policy, and ASR mode. It is persisted as TOML at
-//! `$XDG_CONFIG_HOME/voisu/config.toml` (default `~/.config/voisu/config.toml`),
-//! read once at daemon start.
+//! `$XDG_CONFIG_HOME/voisu/config.toml` (default `~/.config/voisu/config.toml`).
+//! `asr_mode` is re-read at Start/Replay admission under the shared config lock.
+//! Other keys may still be snapshotted at daemon start.
 //!
 //! Environment-configured options also live here: the rollout gates
 //! (`VOISU_ENABLE_DPR`, `VOISU_ENABLE_QWEN_FORMAT`) and the transcription
@@ -204,10 +205,14 @@ pub fn deepgram_enabled() -> bool {
 /// Persists the Deepgram toggle, creating the `voisu` config directory if
 /// needed, and returns the path written so the CLI can report it.
 pub fn set_deepgram_enabled(enabled: bool) -> Result<PathBuf, String> {
-    let path = config_path();
-    let _lock = ConfigLock::acquire(&path)?;
-    write_setting(&path, enabled)?;
-    Ok(path)
+    set_deepgram_enabled_at(&config_path(), enabled)
+}
+
+/// Path-scoped Deepgram setter so concurrent lock tests do not touch process env.
+pub(crate) fn set_deepgram_enabled_at(path: &Path, enabled: bool) -> Result<PathBuf, String> {
+    let _lock = ConfigLock::acquire(path)?;
+    write_setting(path, enabled)?;
+    Ok(path.to_path_buf())
 }
 
 /// The configured Delivery mode, defaulting safely to compositor submission.
@@ -712,14 +717,14 @@ fn strip_comment(line: &str) -> &str {
 /// merging so a rewrite never accumulates duplicate headers.
 const MANAGED_LINES: [&str; 3] = [
     "# Voisu daemon configuration.",
-    "# Recording Provider, Delivery, Writing Mode, Rendering Policy, and ASR mode settings; read once at daemon start.",
+    "# ASR mode is re-read at Start/Replay; other keys may be snapshotted at daemon start.",
     "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, `voisu rendering`, and `voisu mode` commands.",
 ];
 
 /// Managed header lines emitted by earlier releases. Stripped alongside
 /// [`MANAGED_LINES`] so upgrading an existing config never strands stale
 /// headers above the rewritten block.
-const LEGACY_MANAGED_LINES: [&str; 8] = [
+const LEGACY_MANAGED_LINES: [&str; 9] = [
     "# Whether the Deepgram Provider participates in a Recording.",
     "# Managed by `voisu deepgram on|off`; read once at daemon start.",
     // Pre-Writing-Mode managed body lines (delivery-only era).
@@ -731,6 +736,7 @@ const LEGACY_MANAGED_LINES: [&str; 8] = [
     // Pre-ASR-mode managed body lines (rendering-policy era).
     "# Recording Provider, Delivery, Writing Mode, and Rendering Policy settings; read once at daemon start.",
     "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, and `voisu rendering` commands.",
+    "# Recording Provider, Delivery, Writing Mode, Rendering Policy, and ASR mode settings; read once at daemon start.",
 ];
 
 /// Persists the toggle, creating the parent `voisu` directory if needed and

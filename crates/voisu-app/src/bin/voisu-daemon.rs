@@ -590,14 +590,16 @@ async fn actor_loop(
                     let _ = reply.send(response);
                 }
                 Command::SetAsrMode(mode) => {
-                    let mut response = asr_mode::apply_set_asr_mode(mode);
-                    asr_mode::attach_status(&mut response, active_asr_mode(&state));
-                    if response.ok
-                        && let Some(status) = response.asr_mode.as_mut()
-                    {
-                        status.pending = Some(mode);
-                    }
-                    let _ = reply.send(response);
+                    let daemon_state = state_label(&state);
+                    let active = active_asr_mode(&state);
+                    tokio::task::spawn_blocking(move || {
+                        let persist = asr_mode::persist_asr_mode(mode);
+                        let _ = reply.send(asr_mode::set_asr_mode_response(
+                            persist,
+                            daemon_state,
+                            active,
+                        ));
+                    });
                 }
                 Command::OverlayStatus => {
                     let mut response = overlay_status_response(
@@ -680,8 +682,12 @@ async fn actor_loop(
                     ));
                 }
                 Command::Replay(fixture_name) if matches!(state, ActorState::Idle) => {
-                    if let Some(response) = asr_mode::reject_replay_if_not_cloud() {
-                        let _ = reply.send(response);
+                    if let Err(response) = asr_mode::admit_cloud_capture(
+                        asr_mode::CaptureKind::Replay,
+                        state_label(&state),
+                        active_asr_mode(&state),
+                    ) {
+                        let _ = reply.send(*response);
                         continue;
                     }
                     let id = next_id;
@@ -782,10 +788,17 @@ async fn actor_loop(
                     ));
                 }
                 Command::Start | Command::Toggle if matches!(state, ActorState::Idle) => {
-                    if let Some(response) = asr_mode::reject_start_if_not_cloud() {
-                        let _ = reply.send(response);
-                        continue;
-                    }
+                    let admitted_mode = match asr_mode::admit_cloud_capture(
+                        asr_mode::CaptureKind::Start,
+                        state_label(&state),
+                        active_asr_mode(&state),
+                    ) {
+                        Ok(mode) => mode,
+                        Err(response) => {
+                            let _ = reply.send(*response);
+                            continue;
+                        }
+                    };
                     let id = next_id;
                     next_id += 1;
                     // A dictionary edit becomes visible at this Recording
@@ -840,7 +853,7 @@ async fn actor_loop(
                     state = ActorState::Starting {
                         id,
                         correlation_id: voisu_core::correlation_id(id),
-                        asr_mode: AsrMode::Cloud,
+                        asr_mode: admitted_mode,
                     };
                     if let Some(delivery) = delivery.as_mut()
                         && let Err(error) = delivery.recording_started().await
@@ -873,7 +886,7 @@ async fn actor_loop(
                                 level_ring,
                                 writing_mode,
                                 rendering_policy,
-                                asr_mode: AsrMode::Cloud,
+                                asr_mode: admitted_mode,
                                 dictionary_terms: smart_dictionary_terms,
                                 languages,
                                 reply,

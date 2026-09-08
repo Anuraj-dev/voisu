@@ -7,6 +7,8 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::os::fd::{FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -79,6 +81,22 @@ impl AdmissionError {
 pub enum RecordingAdmission {
     Cloud { mode: AsrMode, revision: u64 },
     LocalUnavailable { revision: u64, error: String },
+}
+
+/// Start and Replay share one admission helper so Local cannot construct providers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureKind {
+    Start,
+    Replay,
+}
+
+impl CaptureKind {
+    fn refused_message(self) -> &'static str {
+        match self {
+            Self::Start => LOCAL_START_REFUSED,
+            Self::Replay => LOCAL_REPLAY_REFUSED,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -447,38 +465,99 @@ pub fn attach_status(response: &mut Response, active: Option<AsrMode>) {
     response.asr_mode = Some(status_report(active));
 }
 
-pub fn reject_start_if_not_cloud() -> Option<Response> {
-    reject_if_not_cloud(LOCAL_START_REFUSED)
-}
-
-pub fn reject_replay_if_not_cloud() -> Option<Response> {
-    reject_if_not_cloud(LOCAL_REPLAY_REFUSED)
-}
-
-fn reject_if_not_cloud(local_message: &str) -> Option<Response> {
-    match admit_recording() {
-        Ok(RecordingAdmission::Cloud { .. }) => None,
-        Ok(RecordingAdmission::LocalUnavailable { .. }) => {
-            let mut response = Response::rejected(Some(DaemonState::Idle), local_message);
-            attach_status(&mut response, None);
-            Some(response)
-        }
-        Err(error) => {
-            let mut response = Response::rejected(Some(DaemonState::Idle), error.message());
-            attach_status(&mut response, None);
-            Some(response)
-        }
+/// Historic first line, then pending/active/revision/readiness when advertised.
+pub fn write_cli_status(message: &str, asr: Option<&AsrModeStatus>) {
+    println!("{message}");
+    let Some(asr) = asr else {
+        return;
+    };
+    match asr.pending {
+        Some(mode) => println!("asr mode pending: {}", mode.as_str()),
+        None => println!("asr mode pending: unknown"),
+    }
+    if let Some(active) = asr.active {
+        println!("asr mode active: {}", active.as_str());
+    }
+    match asr.revision {
+        Some(revision) => println!("config revision: {revision}"),
+        None => println!("config revision: unknown"),
+    }
+    println!(
+        "local readiness: {}",
+        format_local_readiness(&asr.local_readiness)
+    );
+    if let Some(error) = &asr.admission_error {
+        println!("asr admission: {error}");
     }
 }
 
-pub fn apply_set_asr_mode(mode: AsrMode) -> Response {
-    match persist_asr_mode(mode) {
+fn format_local_readiness(readiness: &LocalReadiness) -> String {
+    match readiness {
+        LocalReadiness::Absent => "absent".to_owned(),
+        LocalReadiness::Verifying => "verifying".to_owned(),
+        LocalReadiness::Loading => "loading".to_owned(),
+        LocalReadiness::Ready {
+            model_identity: None,
+        } => "ready".to_owned(),
+        LocalReadiness::Ready {
+            model_identity: Some(identity),
+        } => format!("ready ({identity})"),
+        LocalReadiness::Busy => "busy".to_owned(),
+        LocalReadiness::Stopping => "stopping".to_owned(),
+        LocalReadiness::Unavailable { error } => format!("unavailable ({error})"),
+    }
+}
+
+/// Snapshot admission, then Cloud resources or a rejection before capture.
+pub fn admit_cloud_capture(
+    kind: CaptureKind,
+    daemon_state: DaemonState,
+    active: Option<AsrMode>,
+) -> Result<AsrMode, Box<Response>> {
+    match admit_recording() {
+        Ok(RecordingAdmission::Cloud { mode, .. }) => match select_resources(mode) {
+            AsrPathResources::Cloud => Ok(mode),
+            AsrPathResources::Local { .. } => Err(Box::new(reject_capture(
+                kind.refused_message(),
+                daemon_state,
+                active,
+            ))),
+        },
+        Ok(RecordingAdmission::LocalUnavailable { .. }) => Err(Box::new(reject_capture(
+            kind.refused_message(),
+            daemon_state,
+            active,
+        ))),
+        Err(error) => Err(Box::new(reject_capture(
+            error.message(),
+            daemon_state,
+            active,
+        ))),
+    }
+}
+
+fn reject_capture(
+    message: impl Into<String>,
+    daemon_state: DaemonState,
+    active: Option<AsrMode>,
+) -> Response {
+    let mut response = Response::rejected(Some(daemon_state), message);
+    attach_status(&mut response, active);
+    response
+}
+
+pub fn set_asr_mode_response(
+    persist: Result<AsrModeCommit, PersistError>,
+    daemon_state: DaemonState,
+    active: Option<AsrMode>,
+) -> Response {
+    match persist {
         Ok(commit) => {
             let mut response = Response::success(
-                DaemonState::Idle,
+                daemon_state,
                 format!("ASR mode set to {}", commit.mode.as_str()),
             );
-            attach_status(&mut response, None);
+            attach_status(&mut response, active);
             if let Some(status) = response.asr_mode.as_mut() {
                 status.pending = Some(commit.mode);
                 status.revision = Some(commit.revision);
@@ -486,8 +565,8 @@ pub fn apply_set_asr_mode(mode: AsrMode) -> Response {
             response
         }
         Err(error) => {
-            let mut response = Response::rejected(Some(DaemonState::Idle), error.message());
-            attach_status(&mut response, None);
+            let mut response = Response::rejected(Some(daemon_state), error.message());
+            attach_status(&mut response, active);
             response
         }
     }
@@ -501,8 +580,8 @@ pub fn apply_cli_mode(mode: AsrMode) -> Result<String, CliModeError> {
 }
 
 fn try_connect_daemon() -> Result<UnixStream, String> {
-    let path = socket_path().map_err(|error| error.to_owned())?;
-    UnixStream::connect(path).map_err(|error| error.to_string())
+    let path = socket_path()?;
+    connect_unix_bounded(&path, IO_DEADLINE)
 }
 
 fn set_mode_over_ipc(stream: UnixStream, mode: AsrMode) -> Result<String, CliModeError> {
@@ -531,33 +610,133 @@ fn set_mode_over_ipc(stream: UnixStream, mode: AsrMode) -> Result<String, CliMod
 fn set_mode_offline(mode: AsrMode) -> Result<String, CliModeError> {
     let socket = socket_path().map_err(|error| CliModeError::new(3, error))?;
     match daemon_lock::try_acquire_lifetime_lock() {
-        Ok(_lock) => {
-            if UnixStream::connect(&socket).is_ok() {
-                return Err(CliModeError::new(
-                    3,
-                    "daemon lock is held with an unavailable IPC socket",
-                ));
+        Ok(lock) => match connect_unix_bounded(&socket, IO_DEADLINE) {
+            Ok(stream) => {
+                drop(lock);
+                set_mode_over_ipc(stream, mode)
             }
-            let commit = persist_asr_mode(mode)
-                .map_err(|error| CliModeError::new(4, error.message().to_owned()))?;
-            Ok(format!(
-                "ASR mode set to {}; it applies at the next supported daemon start",
-                commit.mode.as_str()
-            ))
-        }
-        Err(_) => {
-            if UnixStream::connect(&socket).is_ok() {
-                return Err(CliModeError::new(
-                    3,
-                    "daemon became reachable; retry `voisu mode`",
-                ));
+            Err(_) => {
+                let commit = persist_asr_mode(mode)
+                    .map_err(|error| CliModeError::new(4, error.message().to_owned()))?;
+                Ok(format!(
+                    "ASR mode set to {}; it applies at the next supported daemon start",
+                    commit.mode.as_str()
+                ))
             }
-            Err(CliModeError::new(
+        },
+        Err(_) => match connect_unix_bounded(&socket, IO_DEADLINE) {
+            Ok(stream) => set_mode_over_ipc(stream, mode),
+            Err(_) => Err(CliModeError::new(
                 3,
                 "daemon lock is held but IPC is unavailable; mode left untouched",
-            ))
+            )),
+        },
+    }
+}
+
+fn connect_unix_bounded(path: &Path, timeout: Duration) -> Result<UnixStream, String> {
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: sockaddr_un is a C struct; zeroing is the documented connect setup.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if bytes.len() >= addr.sun_path.len() {
+        return Err("daemon socket path is too long".to_owned());
+    }
+    for (index, byte) in bytes.iter().enumerate() {
+        addr.sun_path[index] = *byte as libc::c_char;
+    }
+    // SAFETY: a fresh socket fd is owned until transferred to UnixStream or closed.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "cannot open daemon socket: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let connected = unsafe {
+        libc::connect(
+            fd,
+            std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if connected != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS) && error.kind() != ErrorKind::WouldBlock
+        {
+            unsafe { libc::close(fd) };
+            return Err(error.to_string());
+        }
+        let started = Instant::now();
+        loop {
+            let remaining = timeout
+                .checked_sub(started.elapsed())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| {
+                    unsafe { libc::close(fd) };
+                    "daemon connection deadline elapsed".to_owned()
+                })?;
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let millis = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+            let polled = unsafe { libc::poll(&mut pollfd, 1, millis) };
+            if polled == 0 {
+                unsafe { libc::close(fd) };
+                return Err("daemon connection deadline elapsed".to_owned());
+            }
+            if polled < 0 {
+                let poll_error = std::io::Error::last_os_error();
+                if poll_error.kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                unsafe { libc::close(fd) };
+                return Err(poll_error.to_string());
+            }
+            let mut so_error: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let option = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    std::ptr::addr_of_mut!(so_error).cast(),
+                    &mut len,
+                )
+            };
+            if option != 0 {
+                let sock_error = std::io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                return Err(sock_error.to_string());
+            }
+            if so_error != 0 {
+                unsafe { libc::close(fd) };
+                return Err(std::io::Error::from_raw_os_error(so_error).to_string());
+            }
+            break;
         }
     }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+    if flags >= 0 {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+    // SAFETY: fd is a connected socket we uniquely own.
+    let stream = unsafe { UnixStream::from_raw_fd(fd as RawFd) };
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .map_err(|error| error.to_string())?;
+    Ok(stream)
 }
 
 fn send_request(mut stream: UnixStream, command: Command) -> Result<Response, CliModeError> {
@@ -765,5 +944,38 @@ mod tests {
         let (mode, revision) = load_mode(&path, &state).unwrap();
         assert!(matches!(mode, AsrMode::Cloud | AsrMode::Local));
         assert!(revision >= 1);
+    }
+
+    #[test]
+    fn concurrent_mode_and_deepgram_setters_keep_both_keys() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        let state = home.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let workers = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    if index % 2 == 0 {
+                        persist_asr_mode_at(&path, &state, AsrMode::Local).unwrap();
+                    } else {
+                        crate::config::set_deepgram_enabled_at(&path, false).unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.matches("asr_mode").count(), 1, "{contents}");
+        assert_eq!(
+            contents.matches("deepgram_enabled").count(),
+            1,
+            "{contents}"
+        );
+        assert!(contents.contains("asr_mode = \"local\""), "{contents}");
+        assert!(contents.contains("deepgram_enabled = false"), "{contents}");
     }
 }

@@ -171,7 +171,7 @@ fn daemon_command(command: Command) -> ExitCode {
                 Err(_) => return fail(1, "daemon returned an invalid diagnostic history"),
             }
         } else {
-            println!("{}", response.message);
+            voisu_app::asr_mode::write_cli_status(&response.message, response.asr_mode.as_ref());
         }
         ExitCode::SUCCESS
     } else {

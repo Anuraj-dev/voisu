@@ -161,6 +161,13 @@ fn matching_cli_and_daemon_set_cloud_and_keep_local_unavailable() {
 
     let started = harness.voisu(&["start"]);
     assert!(started.status.success(), "{}", stderr(&started));
+    let printed = harness.voisu(&["status"]);
+    assert!(printed.status.success(), "{}", stderr(&printed));
+    let printed = stdout(&printed);
+    assert!(printed.starts_with("Recording\n"), "{printed}");
+    assert!(printed.contains("asr mode pending: cloud"), "{printed}");
+    assert!(printed.contains("asr mode active: cloud"), "{printed}");
+    assert!(printed.contains("local readiness: absent"), "{printed}");
     let _ = harness.voisu(&["stop"]);
 }
 
@@ -192,6 +199,45 @@ fn local_mode_refuses_start_before_capture() {
         "{}",
         stderr(&started)
     );
+    let printed = harness.voisu(&["status"]);
+    let printed = stdout(&printed);
+    assert!(printed.contains("asr mode pending: local"), "{printed}");
+    assert!(
+        printed.contains("local readiness: unavailable (Local selected; model unavailable)"),
+        "{printed}"
+    );
+}
+
+#[test]
+fn local_mode_refuses_replay_before_capture() {
+    let harness = Harness::new();
+    let _daemon = harness.start_daemon();
+    assert!(harness.voisu(&["mode", "local"]).status.success());
+    let replayed = harness.voisu(&["replay", "missing.wav"]);
+    assert_eq!(replayed.status.code(), Some(4), "{replayed:?}");
+    assert!(
+        stderr(&replayed).contains("Replay refused before capture"),
+        "{}",
+        stderr(&replayed)
+    );
+}
+
+#[test]
+fn mode_change_during_recording_keeps_active_cloud_and_pending_local() {
+    let harness = Harness::new();
+    let _daemon = harness.start_daemon();
+    assert!(harness.voisu(&["start"]).status.success());
+    let set = harness.voisu(&["mode", "local"]);
+    assert!(set.status.success(), "{}", stderr(&set));
+    let status = ipc(&harness.socket(), r#"{"version":1,"command":"status"}"#);
+    assert_eq!(status["state"], "recording");
+    assert_eq!(status["asr_mode"]["pending"], "local");
+    assert_eq!(status["asr_mode"]["active"], "cloud");
+    let printed = stdout(&harness.voisu(&["status"]));
+    assert!(printed.starts_with("Recording\n"), "{printed}");
+    assert!(printed.contains("asr mode pending: local"), "{printed}");
+    assert!(printed.contains("asr mode active: cloud"), "{printed}");
+    let _ = harness.voisu(&["stop"]);
 }
 
 #[test]
