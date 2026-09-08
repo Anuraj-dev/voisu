@@ -95,6 +95,8 @@ pub struct FakeWorker {
     pub block_for: Option<Duration>,
     /// If set, the worker echoes this correlation instead of the inbound one.
     pub response_correlation: Option<Correlation>,
+    /// Scripted reap result. Default is a clean exit.
+    pub reap: ReapOutcome,
 }
 
 impl Default for FakeWorker {
@@ -106,6 +108,7 @@ impl Default for FakeWorker {
             scripted_text: None,
             block_for: None,
             response_correlation: None,
+            reap: ReapOutcome::Exited,
         }
     }
 }
@@ -187,7 +190,7 @@ impl WorkerChild for FakeWorker {
     }
 
     fn cancel_and_reap(&mut self) -> Result<ReapOutcome, SupervisorError> {
-        Ok(ReapOutcome::Exited)
+        Ok(self.reap)
     }
 }
 
@@ -241,6 +244,9 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
     }
 
     pub fn attach_ready(&mut self, child: C, now: Instant) -> Result<(), SupervisorError> {
+        if self.child.is_some() {
+            return Err(SupervisorError::Unavailable("worker still attached"));
+        }
         self.restarts.try_register(now)?;
         self.child = Some(child);
         self.state = WorkerState::Ready;
@@ -256,6 +262,7 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         &mut self,
         result: Result<WorkerFrame, SupervisorError>,
         deadline: Instant,
+        on_protocol: WorkerState,
     ) -> Result<WorkerFrame, SupervisorError> {
         let timed_out =
             matches!(result, Err(SupervisorError::TimedOut)) || Instant::now() > deadline;
@@ -265,9 +272,9 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         match result {
             Ok(frame) => Ok(frame),
             Err(err @ SupervisorError::Protocol(_)) => {
-                // Child is still live; a finished exchange must not stay
-                // Loading/Busy. Generation stays valid for the next request.
-                self.state = WorkerState::Ready;
+                // Prepare protocol errors stay non-ready. Transcribe may return
+                // Ready only after a valid correlated Ready already landed.
+                self.state = on_protocol;
                 Err(err)
             }
             Err(err) => {
@@ -278,19 +285,27 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         }
     }
 
-    /// Bound a hung exchange: reap, detach, and leave Absent/Unavailable.
+    /// Bound a hung exchange: reap, keep unreaped children, else detach.
     fn timeout_and_reap(&mut self) -> SupervisorError {
         let outcome = match self.child.as_mut() {
             Some(child) => child.cancel_and_reap().unwrap_or(ReapOutcome::Unreaped),
             None => ReapOutcome::Exited,
         };
-        self.child = None;
-        self.last_terminal_request = None;
-        self.state = match outcome {
-            ReapOutcome::Unreaped => WorkerState::Unavailable,
-            ReapOutcome::Exited | ReapOutcome::Killed => WorkerState::Absent,
-        };
+        self.apply_reap(outcome);
         SupervisorError::TimedOut
+    }
+
+    fn apply_reap(&mut self, outcome: ReapOutcome) {
+        self.last_terminal_request = None;
+        match outcome {
+            ReapOutcome::Unreaped => {
+                self.state = WorkerState::Unavailable;
+            }
+            ReapOutcome::Exited | ReapOutcome::Killed => {
+                self.child = None;
+                self.state = WorkerState::Absent;
+            }
+        }
     }
 
     fn protocol_reject(&mut self, err: FrameError) -> SupervisorError {
@@ -325,14 +340,15 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
             None,
             deadline,
         );
-        let frame = self.conclude_exchange(exchanged, deadline)?;
+        let frame = self.conclude_exchange(exchanged, deadline, WorkerState::Unavailable)?;
         match frame {
             WorkerFrame::Ready {
                 correlation,
                 observed_device,
             } => {
                 if let Err(err) = correlations_match(&expected, &correlation) {
-                    return Err(self.protocol_reject(err));
+                    self.state = WorkerState::Unavailable;
+                    return Err(SupervisorError::Protocol(err));
                 }
                 self.observed_device = observed_device;
                 self.state = WorkerState::Ready;
@@ -379,7 +395,7 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
             Some(&request.pcm),
             deadline,
         );
-        let frame = self.conclude_exchange(exchanged, deadline)?;
+        let frame = self.conclude_exchange(exchanged, deadline, WorkerState::Ready)?;
         match frame {
             WorkerFrame::Transcript { text, correlation } => {
                 if let Err(err) = correlations_match(&expected, &correlation) {
@@ -426,11 +442,7 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
             Some(child) => child.cancel_and_reap()?,
             None => ReapOutcome::Exited,
         };
-        self.child = None;
-        self.state = match outcome {
-            ReapOutcome::Unreaped => WorkerState::Unavailable,
-            ReapOutcome::Exited | ReapOutcome::Killed => WorkerState::Absent,
-        };
+        self.apply_reap(outcome);
         Ok(outcome)
     }
 }
@@ -641,12 +653,112 @@ mod tests {
             error,
             SupervisorError::Protocol(FrameError::CorrelationMismatch)
         ));
-        assert_eq!(supervisor.state(), WorkerState::Ready);
+        assert_eq!(supervisor.state(), WorkerState::Unavailable);
+        assert!(supervisor.child_mut().is_some());
+        let transcribe = supervisor
+            .transcribe(TranscribeRequest {
+                correlation: corr(),
+                pcm: vec![1, 0],
+            })
+            .unwrap_err();
+        assert!(matches!(
+            transcribe,
+            SupervisorError::NotReady(WorkerState::Unavailable)
+        ));
         if let Some(child) = supervisor.child_mut() {
             child.response_correlation = None;
         }
         supervisor.prepare(corr(), Instant::now()).unwrap();
         assert_eq!(supervisor.state(), WorkerState::Ready);
+    }
+
+    #[test]
+    fn prepare_protocol_error_does_not_leave_ready() {
+        let worker = FakeWorker {
+            generation: 99,
+            ..FakeWorker::default()
+        };
+        let mut supervisor = WorkerSupervisor::absent();
+        supervisor.attach_ready(worker, Instant::now()).unwrap();
+        let error = supervisor.prepare(corr(), Instant::now()).unwrap_err();
+        assert!(matches!(
+            error,
+            SupervisorError::Protocol(FrameError::CorrelationMismatch)
+        ));
+        assert_eq!(supervisor.state(), WorkerState::Unavailable);
+        assert!(supervisor.child_mut().is_some());
+        let transcribe = supervisor
+            .transcribe(TranscribeRequest {
+                correlation: corr(),
+                pcm: vec![1, 0],
+            })
+            .unwrap_err();
+        assert!(matches!(
+            transcribe,
+            SupervisorError::NotReady(WorkerState::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn unreaped_cancel_keeps_child_and_rejects_attach() {
+        let worker = FakeWorker {
+            reap: ReapOutcome::Unreaped,
+            ..FakeWorker::default()
+        };
+        let mut supervisor = WorkerSupervisor::absent();
+        supervisor.attach_ready(worker, Instant::now()).unwrap();
+        supervisor.prepare(corr(), Instant::now()).unwrap();
+        assert_eq!(supervisor.cancel().unwrap(), ReapOutcome::Unreaped);
+        assert_eq!(supervisor.state(), WorkerState::Unavailable);
+        assert!(supervisor.child_mut().is_some());
+        let attach = supervisor
+            .attach_ready(FakeWorker::default(), Instant::now())
+            .unwrap_err();
+        assert!(matches!(attach, SupervisorError::Unavailable(_)));
+        assert!(supervisor.child_mut().is_some());
+        assert_eq!(supervisor.state(), WorkerState::Unavailable);
+        if let Some(child) = supervisor.child_mut() {
+            child.reap = ReapOutcome::Exited;
+        }
+        assert_eq!(supervisor.cancel().unwrap(), ReapOutcome::Exited);
+        assert_eq!(supervisor.state(), WorkerState::Absent);
+        assert!(supervisor.child_mut().is_none());
+        supervisor
+            .attach_ready(FakeWorker::default(), Instant::now())
+            .unwrap();
+        assert_eq!(supervisor.state(), WorkerState::Ready);
+    }
+
+    #[test]
+    fn unreaped_timeout_keeps_child_and_rejects_attach() {
+        let worker = FakeWorker {
+            block_for: Some(Duration::from_millis(20)),
+            reap: ReapOutcome::Unreaped,
+            ..FakeWorker::default()
+        };
+        let mut supervisor = WorkerSupervisor::absent();
+        supervisor.attach_ready(worker, Instant::now()).unwrap();
+        let error = supervisor
+            .prepare_until(
+                corr(),
+                Instant::now(),
+                Instant::now() + Duration::from_millis(1),
+            )
+            .unwrap_err();
+        assert!(matches!(error, SupervisorError::TimedOut));
+        assert_eq!(supervisor.state(), WorkerState::Unavailable);
+        assert!(supervisor.child_mut().is_some());
+        let attach = supervisor
+            .attach_ready(FakeWorker::default(), Instant::now())
+            .unwrap_err();
+        assert!(matches!(attach, SupervisorError::Unavailable(_)));
+        assert!(supervisor.child_mut().is_some());
+        if let Some(child) = supervisor.child_mut() {
+            child.reap = ReapOutcome::Exited;
+        }
+        assert_eq!(supervisor.cancel().unwrap(), ReapOutcome::Exited);
+        assert_eq!(supervisor.state(), WorkerState::Absent);
+        assert!(supervisor.child_mut().is_none());
     }
 
     #[test]
