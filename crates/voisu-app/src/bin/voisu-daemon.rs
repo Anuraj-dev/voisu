@@ -17,6 +17,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use voisu_app::asr_mode;
+use voisu_app::asr_mode_queue::AsrModeQueue;
 use voisu_app::audio_level::{LevelRegistry, LevelRing};
 use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
 use voisu_app::daemon_lock::SingleInstance;
@@ -51,8 +52,8 @@ use voisu_core::{
     OverlayOutcome, PROTOCOL_VERSION, PasteActionState, PasteBackend, PreparedTranscriptDecision,
     Provider, ProviderCompletion, ProviderCoordinator, ProviderFailure, ProviderFailureStage,
     ProviderStream, ProviderStreams, ProviderWordConfidences, ReconciliationKind,
-    ReconciliationModel, ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal,
-    SmartWritingDiagnostic, SourceTranscript, SourceTranscriptRecord, Transcript,
+    ReconciliationModel, ReplayFixturePath, ReplayOutcome, Request, Response, RetentionPolicy,
+    ShortcutPortal, SmartWritingDiagnostic, SourceTranscript, SourceTranscriptRecord, Transcript,
     TranscriptDecision, TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator,
     TriggerKeyBinding, VersionEnvelope, clamp_stored_transcript_text, replay_capture,
     resolve_session, sanitize_source_transcripts, socket_path,
@@ -355,6 +356,12 @@ enum ActorMessage {
     /// binding once (or `None` when the portal is unavailable or denied), so the
     /// `Shortcut` command can display it. Binding never gates Recording control.
     ShortcutBound(Option<TriggerKeyBinding>),
+    /// Off-actor ASR admission finished. Begin capture only if this token is
+    /// still the pending start.
+    CaptureAdmitted {
+        token: u64,
+        result: Result<AsrMode, Box<Response>>,
+    },
     /// Graceful shutdown request from the signal handler. The actor stops any
     /// active Recording, waits for every in-flight workflow to acknowledge —
     /// each workflow drains the provider reaper before acknowledging — and only
@@ -433,8 +440,19 @@ struct PumpOutput {
     capture_limit: Option<CaptureLimit>,
 }
 
+enum PendingCapture {
+    Start,
+    Replay(ReplayFixturePath),
+}
+
 enum ActorState {
     Idle,
+    /// Start/Replay admission is off the loop so Stop/Shutdown stay handleable.
+    Admitting {
+        token: u64,
+        pending: PendingCapture,
+        reply: oneshot::Sender<Response>,
+    },
     Starting {
         id: u64,
         correlation_id: String,
@@ -580,6 +598,8 @@ async fn actor_loop(
     // the state returns to Idle, then acknowledges and returns so `shutdown`
     // can join this task before the runtime is torn down.
     let mut shutdown_ack: Option<oneshot::Sender<()>> = None;
+    let asr_queue = AsrModeQueue::spawn();
+    let mut next_admission_token: u64 = 0;
 
     while let Some(message) = rx.recv().await {
         match message {
@@ -589,16 +609,7 @@ async fn actor_loop(
                     reply_with_asr_status(response, active_asr_mode(&state), reply);
                 }
                 Command::SetAsrMode(mode) => {
-                    let daemon_state = state_label(&state);
-                    let active = active_asr_mode(&state);
-                    tokio::task::spawn_blocking(move || {
-                        let persist = asr_mode::persist_asr_mode(mode);
-                        let _ = reply.send(asr_mode::set_asr_mode_response(
-                            persist,
-                            daemon_state,
-                            active,
-                        ));
-                    });
+                    asr_queue.persist(mode, state_label(&state), active_asr_mode(&state), reply);
                 }
                 Command::OverlayStatus => {
                     let response = overlay_status_response(
@@ -680,95 +691,21 @@ async fn actor_loop(
                     ));
                 }
                 Command::Replay(fixture_name) if matches!(state, ActorState::Idle) => {
-                    if let Err(response) = admit_cloud_capture_off_actor(
+                    let token = next_admission_token;
+                    next_admission_token = next_admission_token.saturating_add(1);
+                    enqueue_capture_admission(
+                        &asr_queue,
+                        tx.clone(),
+                        token,
                         asr_mode::CaptureKind::Replay,
                         state_label(&state),
                         active_asr_mode(&state),
-                    )
-                    .await
-                    {
-                        let _ = reply.send(*response);
-                        continue;
-                    }
-                    let id = next_id;
-                    next_id += 1;
-                    state = ActorState::Replaying(id);
-                    // Resolve a single snapshot before adapters are built. The
-                    // replay supervisor only receives these values; its tail is
-                    // deliberately filesystem-free.
-                    let replay_snapshot = voisu_app::dictionary::dictionary_snapshot();
-                    let replay_terms = replay_snapshot.merged;
-                    let replay_keyterms =
-                        Arc::new(voisu_app::dictionary::deepgram_keyterms(&replay_terms));
-                    let replay_whisper_prompt = Arc::new(
-                        voisu_app::dictionary::whisper_prompt_for_terms(&replay_terms),
                     );
-                    // One language resolution for the whole replay: both
-                    // provider builders and the supervised rebuild tail receive
-                    // exactly this snapshot.
-                    let replay_language = Arc::new(voisu_app::config::transcription_language());
-                    validator
-                        .as_mut()
-                        .expect("validator is available")
-                        .set_user_vocabulary(replay_snapshot.user_terms);
-                    validator
-                        .as_mut()
-                        .expect("validator is available")
-                        .set_dictionary_terms(replay_terms);
-                    if !controlled {
-                        deepgram = Some(build_deepgram_provider(
-                            deepgram_enabled,
-                            false,
-                            &replay_keyterms,
-                            &replay_language,
-                            &reaper,
-                        ));
-                        groq = Some(build_groq_provider(
-                            false,
-                            replay_whisper_prompt.as_ref().clone(),
-                            replay_language.as_ref().clone(),
-                            &reaper,
-                        ));
-                    }
-                    let current_deepgram = deepgram.take().expect("Deepgram adapter is available");
-                    let current_groq = groq.take().expect("Groq adapter is available");
-                    let current_validator = validator.take().expect("validator is available");
-                    let provider_deadline = if controlled_deadlines
-                        && std::env::var_os("VOISU_TEST_PROVIDER_DEADLINE_MS").is_some()
-                    {
-                        env_millis("VOISU_TEST_PROVIDER_DEADLINE_MS").max(Duration::from_millis(1))
-                    } else {
-                        PROVIDER_DEADLINE
-                    };
-                    // The replay runs supervised: its JoinHandle is awaited by a
-                    // wrapper that reports completion on EVERY path, including a
-                    // panic — otherwise a panic would drop the borrowed adapters
-                    // and wedge the daemon in Replaying forever.
-                    let replay = tokio::spawn(replay_recording(
-                        fixture_name.into_inner(),
-                        id,
-                        diagnostics
-                            .as_ref()
-                            .expect("diagnostics availability checked above")
-                            .fixture_dir(),
-                        current_deepgram,
-                        current_groq,
-                        current_validator,
-                        provider_deadline,
-                        deepgram_enabled,
-                    ));
-                    tokio::spawn(supervise_replay(
-                        replay,
-                        id,
-                        controlled,
-                        deepgram_enabled,
-                        replay_keyterms,
-                        replay_whisper_prompt,
-                        replay_language,
+                    state = ActorState::Admitting {
+                        token,
+                        pending: PendingCapture::Replay(fixture_name),
                         reply,
-                        tx.clone(),
-                        reaper.clone(),
-                    ));
+                    };
                 }
                 Command::Replay(_) => {
                     let _ = reply.send(Response::rejected(
@@ -788,118 +725,35 @@ async fn actor_loop(
                     ));
                 }
                 Command::Start | Command::Toggle if matches!(state, ActorState::Idle) => {
-                    let admitted_mode = match admit_cloud_capture_off_actor(
+                    let token = next_admission_token;
+                    next_admission_token = next_admission_token.saturating_add(1);
+                    enqueue_capture_admission(
+                        &asr_queue,
+                        tx.clone(),
+                        token,
                         asr_mode::CaptureKind::Start,
                         state_label(&state),
                         active_asr_mode(&state),
-                    )
-                    .await
-                    {
-                        Ok(mode) => mode,
-                        Err(response) => {
-                            let _ = reply.send(*response);
-                            continue;
-                        }
+                    );
+                    state = ActorState::Admitting {
+                        token,
+                        pending: PendingCapture::Start,
+                        reply,
                     };
-                    let id = next_id;
-                    next_id += 1;
-                    // A dictionary edit becomes visible at this Recording
-                    // boundary, never mid-utterance. Both providers and the
-                    // validator receive derivatives of exactly this one snapshot.
-                    let session_snapshot = voisu_app::dictionary::dictionary_snapshot();
-                    let session_terms = session_snapshot.merged;
-                    let smart_dictionary_terms = session_terms.clone();
-                    let session_keyterms = voisu_app::dictionary::deepgram_keyterms(&session_terms);
-                    let session_whisper_prompt =
-                        voisu_app::dictionary::whisper_prompt_for_terms(&session_terms);
-                    let writing_mode = voisu_app::config::writing_mode();
-                    let rendering_policy = voisu_app::config::rendering_policy();
-                    // One language resolution per Recording boundary: the same
-                    // value is declared for every active provider (so
-                    // EnglishEligibility reads exactly what the requests send)
-                    // and handed to both request builders.
-                    let transcription_language = voisu_app::config::transcription_language();
-                    let mut language_declarations =
-                        vec![(Provider::Groq, transcription_language.clone())];
-                    if deepgram_enabled {
-                        language_declarations
-                            .push((Provider::Deepgram, transcription_language.clone()));
-                    }
-                    let languages = ResolvedRecordingLanguages::new(language_declarations);
-                    validator
-                        .as_mut()
-                        .expect("validator is available")
-                        .set_user_vocabulary(session_snapshot.user_terms);
-                    validator
-                        .as_mut()
-                        .expect("validator is available")
-                        .set_dictionary_terms(session_terms);
-                    if !controlled {
-                        deepgram = Some(build_deepgram_provider(
-                            deepgram_enabled,
-                            false,
-                            &session_keyterms,
-                            &transcription_language,
-                            &reaper,
-                        ));
-                        groq = Some(build_groq_provider(
-                            false,
-                            session_whisper_prompt,
-                            transcription_language,
-                            &reaper,
-                        ));
-                    }
-                    // The correlation ID exists from the moment the Recording is
-                    // accepted, so startup failures and recovery evidence are
-                    // correlated even though no adapter has started yet.
-                    state = ActorState::Starting {
-                        id,
-                        correlation_id: voisu_core::correlation_id(id),
-                        asr_mode: admitted_mode,
-                    };
-                    if let Some(delivery) = delivery.as_mut()
-                        && let Err(error) = delivery.recording_started().await
-                    {
-                        eprintln!(
-                            "Recording {id}: Delivery start precondition failed closed: {}",
-                            error.diagnostic()
-                        );
-                    }
-                    let mut current_capture = capture.take().expect("capture adapter is available");
-                    let mut current_deepgram =
-                        deepgram.take().expect("Deepgram adapter is available");
-                    let mut current_groq = groq.take().expect("Groq adapter is available");
-                    let actor = tx.clone();
-                    let level_ring = levels.begin_recording();
-                    tokio::task::spawn_blocking(move || {
-                        let result = begin_recording(
-                            &mut current_capture,
-                            &mut current_deepgram,
-                            &mut current_groq,
-                            id,
-                        );
-                        let _ = actor.blocking_send(ActorMessage::Started(Box::new(
-                            StartupCompletion {
-                                id,
-                                capture: current_capture,
-                                deepgram: current_deepgram,
-                                groq: current_groq,
-                                result,
-                                level_ring,
-                                writing_mode,
-                                rendering_policy,
-                                asr_mode: admitted_mode,
-                                dictionary_terms: smart_dictionary_terms,
-                                languages,
-                                reply,
-                            },
-                        )));
-                    });
                 }
                 Command::Start => {
                     let _ = reply.send(Response::rejected(
                         Some(state_label(&state)),
                         "Recording already active",
+                    ));
+                }
+                Command::Stop | Command::Toggle
+                    if matches!(state, ActorState::Admitting { .. }) =>
+                {
+                    cancel_pending_admission(&mut state, "Recording cancelled");
+                    let _ = reply.send(Response::rejected(
+                        Some(DaemonState::Idle),
+                        "No Recording active",
                     ));
                 }
                 Command::Stop | Command::Toggle if matches!(state, ActorState::Recording(_)) => {
@@ -954,6 +808,219 @@ async fn actor_loop(
                     ));
                 }
             },
+            ActorMessage::CaptureAdmitted { token, result } => {
+                let pending = match std::mem::replace(&mut state, ActorState::Idle) {
+                    ActorState::Admitting {
+                        token: current,
+                        pending,
+                        reply,
+                    } if current == token => Some((pending, reply)),
+                    other => {
+                        state = other;
+                        None
+                    }
+                };
+                let Some((pending, reply)) = pending else {
+                    continue;
+                };
+                let admitted_mode = match result {
+                    Ok(mode) => mode,
+                    Err(response) => {
+                        let _ = reply.send(*response);
+                        continue;
+                    }
+                };
+                if shutdown_ack.is_some() {
+                    let _ = reply.send(Response::rejected(
+                        Some(DaemonState::Idle),
+                        "daemon is shutting down",
+                    ));
+                    continue;
+                }
+                match pending {
+                    PendingCapture::Replay(fixture_name) => {
+                        let id = next_id;
+                        next_id += 1;
+                        state = ActorState::Replaying(id);
+                        // Resolve a single snapshot before adapters are built. The
+                        // replay supervisor only receives these values; its tail is
+                        // deliberately filesystem-free.
+                        let replay_snapshot = voisu_app::dictionary::dictionary_snapshot();
+                        let replay_terms = replay_snapshot.merged;
+                        let replay_keyterms =
+                            Arc::new(voisu_app::dictionary::deepgram_keyterms(&replay_terms));
+                        let replay_whisper_prompt = Arc::new(
+                            voisu_app::dictionary::whisper_prompt_for_terms(&replay_terms),
+                        );
+                        // One language resolution for the whole replay: both
+                        // provider builders and the supervised rebuild tail receive
+                        // exactly this snapshot.
+                        let replay_language = Arc::new(voisu_app::config::transcription_language());
+                        validator
+                            .as_mut()
+                            .expect("validator is available")
+                            .set_user_vocabulary(replay_snapshot.user_terms);
+                        validator
+                            .as_mut()
+                            .expect("validator is available")
+                            .set_dictionary_terms(replay_terms);
+                        if !controlled {
+                            deepgram = Some(build_deepgram_provider(
+                                deepgram_enabled,
+                                false,
+                                &replay_keyterms,
+                                &replay_language,
+                                &reaper,
+                            ));
+                            groq = Some(build_groq_provider(
+                                false,
+                                replay_whisper_prompt.as_ref().clone(),
+                                replay_language.as_ref().clone(),
+                                &reaper,
+                            ));
+                        }
+                        let current_deepgram =
+                            deepgram.take().expect("Deepgram adapter is available");
+                        let current_groq = groq.take().expect("Groq adapter is available");
+                        let current_validator = validator.take().expect("validator is available");
+                        let provider_deadline = if controlled_deadlines
+                            && std::env::var_os("VOISU_TEST_PROVIDER_DEADLINE_MS").is_some()
+                        {
+                            env_millis("VOISU_TEST_PROVIDER_DEADLINE_MS")
+                                .max(Duration::from_millis(1))
+                        } else {
+                            PROVIDER_DEADLINE
+                        };
+                        // The replay runs supervised: its JoinHandle is awaited by a
+                        // wrapper that reports completion on EVERY path, including a
+                        // panic — otherwise a panic would drop the borrowed adapters
+                        // and wedge the daemon in Replaying forever.
+                        let replay = tokio::spawn(replay_recording(
+                            fixture_name.into_inner(),
+                            id,
+                            diagnostics
+                                .as_ref()
+                                .expect("diagnostics availability checked above")
+                                .fixture_dir(),
+                            current_deepgram,
+                            current_groq,
+                            current_validator,
+                            provider_deadline,
+                            deepgram_enabled,
+                        ));
+                        tokio::spawn(supervise_replay(
+                            replay,
+                            id,
+                            controlled,
+                            deepgram_enabled,
+                            replay_keyterms,
+                            replay_whisper_prompt,
+                            replay_language,
+                            reply,
+                            tx.clone(),
+                            reaper.clone(),
+                        ));
+                    }
+                    PendingCapture::Start => {
+                        let id = next_id;
+                        next_id += 1;
+                        // A dictionary edit becomes visible at this Recording
+                        // boundary, never mid-utterance. Both providers and the
+                        // validator receive derivatives of exactly this one snapshot.
+                        let session_snapshot = voisu_app::dictionary::dictionary_snapshot();
+                        let session_terms = session_snapshot.merged;
+                        let smart_dictionary_terms = session_terms.clone();
+                        let session_keyterms =
+                            voisu_app::dictionary::deepgram_keyterms(&session_terms);
+                        let session_whisper_prompt =
+                            voisu_app::dictionary::whisper_prompt_for_terms(&session_terms);
+                        let writing_mode = voisu_app::config::writing_mode();
+                        let rendering_policy = voisu_app::config::rendering_policy();
+                        // One language resolution per Recording boundary: the same
+                        // value is declared for every active provider (so
+                        // EnglishEligibility reads exactly what the requests send)
+                        // and handed to both request builders.
+                        let transcription_language = voisu_app::config::transcription_language();
+                        let mut language_declarations =
+                            vec![(Provider::Groq, transcription_language.clone())];
+                        if deepgram_enabled {
+                            language_declarations
+                                .push((Provider::Deepgram, transcription_language.clone()));
+                        }
+                        let languages = ResolvedRecordingLanguages::new(language_declarations);
+                        validator
+                            .as_mut()
+                            .expect("validator is available")
+                            .set_user_vocabulary(session_snapshot.user_terms);
+                        validator
+                            .as_mut()
+                            .expect("validator is available")
+                            .set_dictionary_terms(session_terms);
+                        if !controlled {
+                            deepgram = Some(build_deepgram_provider(
+                                deepgram_enabled,
+                                false,
+                                &session_keyterms,
+                                &transcription_language,
+                                &reaper,
+                            ));
+                            groq = Some(build_groq_provider(
+                                false,
+                                session_whisper_prompt,
+                                transcription_language,
+                                &reaper,
+                            ));
+                        }
+                        // The correlation ID exists from the moment the Recording is
+                        // accepted, so startup failures and recovery evidence are
+                        // correlated even though no adapter has started yet.
+                        state = ActorState::Starting {
+                            id,
+                            correlation_id: voisu_core::correlation_id(id),
+                            asr_mode: admitted_mode,
+                        };
+                        if let Some(delivery) = delivery.as_mut()
+                            && let Err(error) = delivery.recording_started().await
+                        {
+                            eprintln!(
+                                "Recording {id}: Delivery start precondition failed closed: {}",
+                                error.diagnostic()
+                            );
+                        }
+                        let mut current_capture =
+                            capture.take().expect("capture adapter is available");
+                        let mut current_deepgram =
+                            deepgram.take().expect("Deepgram adapter is available");
+                        let mut current_groq = groq.take().expect("Groq adapter is available");
+                        let actor = tx.clone();
+                        let level_ring = levels.begin_recording();
+                        tokio::task::spawn_blocking(move || {
+                            let result = begin_recording(
+                                &mut current_capture,
+                                &mut current_deepgram,
+                                &mut current_groq,
+                                id,
+                            );
+                            let _ = actor.blocking_send(ActorMessage::Started(Box::new(
+                                StartupCompletion {
+                                    id,
+                                    capture: current_capture,
+                                    deepgram: current_deepgram,
+                                    groq: current_groq,
+                                    result,
+                                    level_ring,
+                                    writing_mode,
+                                    rendering_policy,
+                                    asr_mode: admitted_mode,
+                                    dictionary_terms: smart_dictionary_terms,
+                                    languages,
+                                    reply,
+                                },
+                            )));
+                        });
+                    }
+                }
+            }
             ActorMessage::Started(started) => {
                 let StartupCompletion {
                     id,
@@ -1455,6 +1522,9 @@ async fn actor_loop(
             }
             ActorMessage::Shutdown(ack) => {
                 shutdown_ack = Some(ack);
+                if matches!(state, ActorState::Admitting { .. }) {
+                    cancel_pending_admission(&mut state, "daemon is shutting down");
+                }
                 if matches!(state, ActorState::Recording(_)) {
                     // Stop the active Recording exactly like a Stop command with
                     // no client reply: processing runs to completion (Delivery
@@ -1595,26 +1665,34 @@ fn reply_with_asr_status(
     });
 }
 
-async fn admit_cloud_capture_off_actor(
+fn enqueue_capture_admission(
+    queue: &AsrModeQueue,
+    actor: mpsc::Sender<ActorMessage>,
+    token: u64,
     kind: asr_mode::CaptureKind,
     daemon_state: DaemonState,
     active: Option<AsrMode>,
-) -> Result<AsrMode, Box<Response>> {
-    tokio::task::spawn_blocking(move || asr_mode::admit_cloud_capture(kind, daemon_state, active))
-        .await
-        .unwrap_or_else(|_| {
-            Err(Box::new(Response::rejected(
-                Some(daemon_state),
-                "ASR mode admission is unavailable",
-            )))
-        })
+) {
+    queue.admit(kind, daemon_state, active, move |result| {
+        let _ = actor.blocking_send(ActorMessage::CaptureAdmitted { token, result });
+    });
+}
+
+fn cancel_pending_admission(state: &mut ActorState, message: &str) {
+    match std::mem::replace(state, ActorState::Idle) {
+        ActorState::Admitting { reply, .. } => {
+            let _ = reply.send(Response::rejected(Some(DaemonState::Idle), message));
+        }
+        other => *state = other,
+    }
 }
 
 fn state_label(state: &ActorState) -> DaemonState {
     match state {
-        ActorState::Idle | ActorState::Recovering(_) | ActorState::Replaying(_) => {
-            DaemonState::Idle
-        }
+        ActorState::Idle
+        | ActorState::Admitting { .. }
+        | ActorState::Recovering(_)
+        | ActorState::Replaying(_) => DaemonState::Idle,
         ActorState::Starting { .. } => DaemonState::Recording,
         ActorState::Recording(_) => DaemonState::Recording,
         ActorState::Processing(_) => DaemonState::Processing,
@@ -1626,6 +1704,7 @@ fn active_asr_mode(state: &ActorState) -> Option<AsrMode> {
         ActorState::Starting { asr_mode, .. } => Some(*asr_mode),
         ActorState::Recording(recording) => Some(recording.asr_mode),
         ActorState::Idle
+        | ActorState::Admitting { .. }
         | ActorState::Processing(_)
         | ActorState::Recovering(_)
         | ActorState::Replaying(_) => None,
@@ -1664,6 +1743,7 @@ fn status_response_with_feedback(
             }
             ActorState::Processing(evidence) => Some(evidence.clone()),
             ActorState::Idle
+            | ActorState::Admitting { .. }
             | ActorState::Starting { .. }
             | ActorState::Recovering(_)
             | ActorState::Replaying(_) => None,

@@ -1,4 +1,5 @@
 pub mod asr_mode;
+pub mod asr_mode_queue;
 pub mod audio_level;
 pub mod config;
 pub mod daemon_lock;

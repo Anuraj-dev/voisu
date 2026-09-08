@@ -209,6 +209,47 @@ fn local_mode_refuses_start_before_capture() {
 }
 
 #[test]
+fn stop_is_answered_while_start_admission_waits_on_config_lock() {
+    let harness = Harness::new();
+    let _daemon = harness.start_daemon();
+    let lock_path = harness
+        .config_file()
+        .parent()
+        .unwrap()
+        .join("config.toml.lock");
+    fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    unsafe {
+        assert_eq!(
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&lock),
+                libc::LOCK_EX | libc::LOCK_NB
+            ),
+            0
+        );
+    }
+    let mut start_cmd = harness.command(env!("CARGO_BIN_EXE_voisu"));
+    start_cmd.arg("start");
+    let start = thread::spawn(move || start_cmd.output().expect("start"));
+    thread::sleep(Duration::from_millis(100));
+    let began = Instant::now();
+    let stop = harness.voisu(&["stop"]);
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "Stop waited {:?}",
+        began.elapsed()
+    );
+    assert_eq!(stop.status.code(), Some(4), "{stop:?}");
+    drop(lock);
+    let _ = start.join();
+}
+
+#[test]
 fn local_mode_refuses_replay_before_capture() {
     let harness = Harness::new();
     let _daemon = harness.start_daemon();

@@ -36,6 +36,7 @@ use std::io::{ErrorKind, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Re-export for CLI and callers that already import config modes.
 pub use voisu_core::{AsrMode, RenderingPolicy};
@@ -54,6 +55,12 @@ const RENDERING_POLICY_KEY: &str = "rendering_policy";
 
 /// The root configuration key selecting Cloud or Local ASR.
 pub(crate) const ASR_MODE_KEY: &str = "asr_mode";
+
+/// Bare and quoted spellings of [`ASR_MODE_KEY`]. Escaped keys are not decoded
+/// and must not be treated as this key.
+pub(crate) fn is_asr_mode_key(key: &str) -> bool {
+    key == ASR_MODE_KEY || key == "\"asr_mode\"" || key == "'asr_mode'"
+}
 
 /// Explicit rollout gate for the DPR pipeline. Only `1` or `true` enables it;
 /// missing, empty, or malformed values keep Smart Writing in production.
@@ -457,23 +464,7 @@ pub(crate) struct ConfigLock {
 
 impl ConfigLock {
     pub(crate) fn acquire(config_path: &Path) -> Result<Self, String> {
-        let parent = config_path
-            .parent()
-            .ok_or_else(|| format!("config path has no parent: {}", config_path.display()))?;
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "cannot create config directory {}: {error}",
-                parent.display()
-            )
-        })?;
-        let lock_path = config_lock_path(config_path);
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .open(&lock_path)
-            .map_err(|error| format!("cannot open config lock {}: {error}", lock_path.display()))?;
+        let (file, lock_path) = open_config_lock(config_path)?;
         // SAFETY: a valid owned fd is passed to flock; return value is checked.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(format!(
@@ -484,6 +475,57 @@ impl ConfigLock {
         }
         Ok(Self { _file: file })
     }
+
+    /// Exclusive lock with a deadline so admission cannot stall forever on flock.
+    pub(crate) fn acquire_bounded(config_path: &Path, deadline: Duration) -> Result<Self, String> {
+        let (file, lock_path) = open_config_lock(config_path)?;
+        let started = Instant::now();
+        loop {
+            // SAFETY: a valid owned fd is passed to flock; return value is checked.
+            let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if locked == 0 {
+                return Ok(Self { _file: file });
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != ErrorKind::WouldBlock && error.raw_os_error() != Some(libc::EAGAIN) {
+                return Err(format!(
+                    "cannot lock config {}: {error}",
+                    lock_path.display()
+                ));
+            }
+            let remaining = deadline
+                .checked_sub(started.elapsed())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| {
+                    format!(
+                        "cannot lock config {}: deadline elapsed",
+                        lock_path.display()
+                    )
+                })?;
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+    }
+}
+
+fn open_config_lock(config_path: &Path) -> Result<(File, PathBuf), String> {
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| format!("config path has no parent: {}", config_path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "cannot create config directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let lock_path = config_lock_path(config_path);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|error| format!("cannot open config lock {}: {error}", lock_path.display()))?;
+    Ok((file, lock_path))
 }
 
 impl Drop for ConfigLock {
@@ -893,7 +935,7 @@ fn merge_content(
             && in_root
             && trimmed
                 .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == ASR_MODE_KEY);
+                .is_some_and(|(key, _)| is_asr_mode_key(key.trim()));
         if is_managed_comment
             || is_root_deepgram_enabled
             || is_root_delivery_mode
@@ -1709,6 +1751,17 @@ other_key = 5
             1,
             "{contents}"
         );
+    }
+
+    #[test]
+    fn writing_asr_mode_replaces_quoted_and_bare_keys() {
+        let existing = "\"asr_mode\" = \"local\"\n'asr_mode' = \"local\"\ncustom = 1\n";
+        let out = merge_content(existing, None, None, None, None, Some(AsrMode::Cloud));
+        assert_eq!(out.matches("asr_mode").count(), 1, "{out}");
+        assert!(out.contains("asr_mode = \"cloud\""), "{out}");
+        assert!(!out.contains("\"asr_mode\""), "{out}");
+        assert!(!out.contains("'asr_mode'"), "{out}");
+        assert!(out.contains("custom = 1"), "{out}");
     }
 
     #[test]

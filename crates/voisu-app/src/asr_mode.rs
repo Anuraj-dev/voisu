@@ -19,7 +19,7 @@ use voisu_core::{
     Request, Response, VersionEnvelope, socket_path,
 };
 
-use crate::config::{self, ASR_MODE_KEY, ConfigLock};
+use crate::config::{self, ASR_MODE_KEY, ConfigLock, is_asr_mode_key};
 use crate::daemon_lock;
 
 const MODE_INITIALIZED_NAME: &str = "mode-initialized";
@@ -174,7 +174,8 @@ fn persist_asr_mode_at_with(
     commit_revision: impl FnOnce(&Path, u64) -> Result<u64, PersistError>,
 ) -> Result<AsrModeCommit, PersistError> {
     let state_dir = ensure_private_state_dir_at(state_dir).map_err(PersistError::Intact)?;
-    let _lock = ConfigLock::acquire(config_path).map_err(PersistError::Intact)?;
+    let _lock =
+        ConfigLock::acquire_bounded(config_path, IO_DEADLINE).map_err(PersistError::Intact)?;
     // Validate revision before replacing config; a later revision failure is
     // indeterminate because the mode write already happened.
     let next = read_revision_at(&state_dir)
@@ -301,7 +302,8 @@ fn durable_replace(path: &Path, contents: &[u8]) -> Result<(), PersistError> {
 
 pub fn load_mode(config_path: &Path, state_dir: &Path) -> Result<(AsrMode, u64), AdmissionError> {
     // Same exclusive lock persist holds, so marker/config/revision cannot tear.
-    let _lock = ConfigLock::acquire(config_path).map_err(AdmissionError::Access)?;
+    let _lock =
+        ConfigLock::acquire_bounded(config_path, IO_DEADLINE).map_err(AdmissionError::Access)?;
     let marker = marker_present(state_dir)?;
     let revision = read_revision_at(state_dir)?;
     match fs::read_to_string(config_path) {
@@ -356,6 +358,13 @@ fn parse_asr_mode_document(contents: &str) -> Result<Option<AsrMode>, AdmissionE
                 "malformed TOML in daemon config; admission blocked".to_owned(),
             ));
         }
+        // Escapes are not decoded; treating them as a missing key would default
+        // to Cloud and route an explicit Local file through capture.
+        if key.contains('\\') {
+            return Err(AdmissionError::Blocked(
+                "unsupported TOML key syntax in daemon config; admission blocked".to_owned(),
+            ));
+        }
         let seen_key = if is_asr_mode_key(key) {
             ASR_MODE_KEY
         } else {
@@ -385,10 +394,6 @@ fn parse_asr_mode_document(contents: &str) -> Result<Option<AsrMode>, AdmissionE
 
 fn strip_comment(line: &str) -> &str {
     line.split('#').next().unwrap_or(line)
-}
-
-fn is_asr_mode_key(key: &str) -> bool {
-    key == ASR_MODE_KEY || key == "\"asr_mode\"" || key == "'asr_mode'"
 }
 
 pub fn admit_recording() -> Result<RecordingAdmission, AdmissionError> {
@@ -891,6 +896,27 @@ mod tests {
     }
 
     #[test]
+    fn unicode_escaped_asr_mode_key_is_blocked_not_cloud() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config.toml");
+        let state = home.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(&config, "\"\\u0061sr_mode\" = \"local\"\n").unwrap();
+        let error = load_mode(&config, &state).unwrap_err();
+        assert!(matches!(error, AdmissionError::Blocked(_)));
+        assert!(
+            error.message().contains("unsupported TOML key syntax"),
+            "{}",
+            error.message()
+        );
+        assert!(
+            !error.message().to_ascii_lowercase().contains("cloud"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
     fn unknown_mode_never_becomes_cloud() {
         let contents = "asr_mode = \"hybrid\"\n";
         let error = parse_asr_mode_document(contents).unwrap_err();
@@ -999,6 +1025,45 @@ mod tests {
         );
         assert!(contents.contains("custom = 7"), "{contents}");
         assert!(contents.contains("asr_mode = \"cloud\""), "{contents}");
+    }
+
+    #[test]
+    fn persist_replaces_quoted_asr_mode_key() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config.toml");
+        let state = home.path().join("state");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "\"asr_mode\" = \"local\"\ncustom = 1\n").unwrap();
+        persist_asr_mode_at(&config, &state, AsrMode::Cloud).unwrap();
+        let contents = fs::read_to_string(&config).unwrap();
+        assert_eq!(contents.matches("asr_mode").count(), 1, "{contents}");
+        assert!(contents.contains("asr_mode = \"cloud\""), "{contents}");
+        assert!(!contents.contains("\"asr_mode\""), "{contents}");
+        let (mode, _) = load_mode(&config, &state).unwrap();
+        assert_eq!(mode, AsrMode::Cloud);
+    }
+
+    #[test]
+    fn admission_does_not_wait_unbounded_for_config_lock() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config.toml");
+        let state = home.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(&config, "asr_mode = \"cloud\"\n").unwrap();
+        let _held = ConfigLock::acquire(&config).unwrap();
+        let started = Instant::now();
+        let error = load_mode(&config, &state).unwrap_err();
+        assert!(
+            started.elapsed() < IO_DEADLINE + Duration::from_millis(500),
+            "bounded lock waited {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(error, AdmissionError::Access(_)));
+        assert!(
+            error.message().contains("deadline elapsed"),
+            "{}",
+            error.message()
+        );
     }
 
     #[test]
