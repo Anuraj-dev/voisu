@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.53.0
+Version:        0.54.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,10 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Tue Sep 08 2026 Voisu maintainers <voisu@example.invalid> - 0.54.0-1
+- feat(local): add R3/R5 spike and locked English bakeoff harness (#255)
+- test(diagnostics): prove stop-anchored timing excludes speech (#254)
+
 * Tue Sep 08 2026 Voisu maintainers <voisu@example.invalid> - 0.53.0-1
 - feat(config): enable Intent Reconstruction from writing smart
 
