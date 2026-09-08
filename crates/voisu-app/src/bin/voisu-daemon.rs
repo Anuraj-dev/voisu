@@ -1,9 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Read;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,8 +16,10 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use voisu_app::asr_mode;
 use voisu_app::audio_level::{LevelRegistry, LevelRing};
 use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
+use voisu_app::daemon_lock::SingleInstance;
 use voisu_app::dpr_cloud::DprCloudClient;
 use voisu_app::dpr_pipeline::{
     DprCloudCapability, DprPipelineClockOrigin, DprTransformInput, SystemDprPipelineClock,
@@ -42,7 +43,7 @@ use voisu_app::system::{
     WlClipboard, clipboard_backend_display_reachable,
 };
 use voisu_core::{
-    ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
+    ActiveCapture, AsrMode, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
     CancelRegistry, CaptureLimit, CapturedAudio, Command, DaemonReadiness, DaemonState,
     DeadlineClock, DeliveryAdapter, DeliveryMethod, DeliveryOutcome, DiagnosticPage,
     DiagnosticRecord, DiagnosticStore, DprDiagnostic, EnglishEligibilityOutcome,
@@ -137,7 +138,7 @@ async fn run() -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "daemon socket has no parent directory".to_owned())?;
-    create_private_runtime_dirs(parent)?;
+    voisu_app::daemon_lock::create_private_runtime_dirs(parent)?;
     // Declared before the socket guard so it drops LAST on shutdown: the single-
     // instance lock must outlive socket cleanup, otherwise a replacement daemon
     // could acquire the lock and be spuriously rejected by the still-present socket.
@@ -162,7 +163,7 @@ async fn run() -> Result<(), String> {
     // runtime directory because logind removes it at logout; serving history
     // from there would silently claim durability the store does not have.
     let retention = RetentionPolicy::from_env();
-    let diagnostics = match create_private_state_dir().and_then(|state| {
+    let diagnostics = match asr_mode::ensure_private_state_dir().and_then(|state| {
         DiagnosticStore::open(state.join("diagnostics"), retention)
             .map(Arc::new)
             .map_err(|error| format!("cannot open diagnostics store: {error}"))
@@ -303,113 +304,6 @@ async fn shutdown(
     Ok(())
 }
 
-fn create_private_runtime_dirs(parent: &Path) -> Result<(), String> {
-    let runtime = voisu_core::runtime_dir()?;
-    let mut current = runtime;
-    for component in ["voisu".to_owned(), format!("v{PROTOCOL_VERSION}")] {
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                    return Err(format!(
-                        "unsafe runtime path component: {}",
-                        current.display()
-                    ));
-                }
-                if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o700
-                {
-                    return Err(format!(
-                        "runtime directory is not private: {}",
-                        current.display()
-                    ));
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::DirBuilder::new()
-                    .mode(0o700)
-                    .create(&current)
-                    .map_err(|error| format!("cannot create private runtime directory: {error}"))?;
-            }
-            Err(error) => return Err(format!("cannot inspect runtime directory: {error}")),
-        }
-    }
-    if current != parent {
-        return Err("unexpected daemon runtime directory".to_owned());
-    }
-    Ok(())
-}
-
-/// Creates Voisu's durable state directory and holds it to the same privacy
-/// contract the runtime directory has: a real directory (never a symlink), owned
-/// by this user, mode 0700.
-///
-/// The XDG state ROOT is shared ground — other applications keep their state
-/// beside Voisu's — so it is only created, with the process umask, and never
-/// re-permissioned. Only Voisu's own directory below it is locked down.
-/// `DiagnosticStore::open` then applies the identical check to the store and its
-/// audio and fixture subdirectories, so moving the store off tmpfs does not
-/// weaken the hardening it had there.
-fn create_private_state_dir() -> Result<PathBuf, String> {
-    let dir = voisu_core::state_dir()?;
-    let root = dir
-        .parent()
-        .ok_or_else(|| "state directory has no parent".to_owned())?;
-    fs::create_dir_all(root)
-        .map_err(|error| format!("cannot create state root {}: {error}", root.display()))?;
-    match fs::symlink_metadata(&dir) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(format!("unsafe state path: {}", dir.display()));
-            }
-            // SAFETY: geteuid has no preconditions and does not mutate memory.
-            if metadata.uid() != unsafe { libc::geteuid() } {
-                return Err(format!(
-                    "state directory is not owned by the current user: {}",
-                    dir.display()
-                ));
-            }
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-                .map_err(|error| format!("cannot secure state directory: {error}"))?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&dir)
-                .map_err(|error| format!("cannot create private state directory: {error}"))?;
-        }
-        Err(error) => return Err(format!("cannot inspect state directory: {error}")),
-    }
-    Ok(dir)
-}
-
-struct SingleInstance(File);
-
-impl SingleInstance {
-    fn acquire(path: &Path) -> Result<Self, String> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(path)
-            .map_err(|error| format!("cannot open daemon lock: {error}"))?;
-        // SAFETY: flock only reads the valid file descriptor and flags.
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result != 0 {
-            return Err("voisu-daemon is already running".to_owned());
-        }
-        Ok(Self(file))
-    }
-}
-
-impl Drop for SingleInstance {
-    fn drop(&mut self) {
-        // SAFETY: this instance owns a valid open descriptor until Drop completes.
-        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
-
 fn prepare_socket_path(path: &Path) -> Result<(), String> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -490,6 +384,7 @@ struct StartupCompletion {
     level_ring: Arc<LevelRing>,
     writing_mode: WritingMode,
     rendering_policy: RenderingPolicy,
+    asr_mode: AsrMode,
     dictionary_terms: Vec<String>,
     languages: ResolvedRecordingLanguages,
     reply: oneshot::Sender<Response>,
@@ -522,6 +417,7 @@ struct ActiveRecording {
     deadline_clock: DeadlineClock,
     writing_mode: WritingMode,
     rendering_policy: RenderingPolicy,
+    asr_mode: AsrMode,
     dictionary_terms: Vec<String>,
     languages: ResolvedRecordingLanguages,
     evidence: LifecycleEvidence,
@@ -542,6 +438,7 @@ enum ActorState {
     Starting {
         id: u64,
         correlation_id: String,
+        asr_mode: AsrMode,
     },
     Recording(ActiveRecording),
     Processing(LifecycleEvidence),
@@ -688,15 +585,27 @@ async fn actor_loop(
         match message {
             ActorMessage::Command(command, reply) => match command {
                 Command::Status => {
-                    let response = status_response(&state, daemon_readiness.as_ref());
+                    let mut response = status_response(&state, daemon_readiness.as_ref());
+                    asr_mode::attach_status(&mut response, active_asr_mode(&state));
+                    let _ = reply.send(response);
+                }
+                Command::SetAsrMode(mode) => {
+                    let mut response = asr_mode::apply_set_asr_mode(mode);
+                    asr_mode::attach_status(&mut response, active_asr_mode(&state));
+                    if response.ok
+                        && let Some(status) = response.asr_mode.as_mut()
+                    {
+                        status.pending = Some(mode);
+                    }
                     let _ = reply.send(response);
                 }
                 Command::OverlayStatus => {
-                    let response = overlay_status_response(
+                    let mut response = overlay_status_response(
                         &state,
                         last_overlay_event.as_ref(),
                         daemon_readiness.as_ref(),
                     );
+                    asr_mode::attach_status(&mut response, active_asr_mode(&state));
                     let _ = reply.send(response);
                 }
                 Command::Level { after_seq } => {
@@ -771,6 +680,10 @@ async fn actor_loop(
                     ));
                 }
                 Command::Replay(fixture_name) if matches!(state, ActorState::Idle) => {
+                    if let Some(response) = asr_mode::reject_replay_if_not_cloud() {
+                        let _ = reply.send(response);
+                        continue;
+                    }
                     let id = next_id;
                     next_id += 1;
                     state = ActorState::Replaying(id);
@@ -869,6 +782,10 @@ async fn actor_loop(
                     ));
                 }
                 Command::Start | Command::Toggle if matches!(state, ActorState::Idle) => {
+                    if let Some(response) = asr_mode::reject_start_if_not_cloud() {
+                        let _ = reply.send(response);
+                        continue;
+                    }
                     let id = next_id;
                     next_id += 1;
                     // A dictionary edit becomes visible at this Recording
@@ -923,6 +840,7 @@ async fn actor_loop(
                     state = ActorState::Starting {
                         id,
                         correlation_id: voisu_core::correlation_id(id),
+                        asr_mode: AsrMode::Cloud,
                     };
                     if let Some(delivery) = delivery.as_mut()
                         && let Err(error) = delivery.recording_started().await
@@ -955,6 +873,7 @@ async fn actor_loop(
                                 level_ring,
                                 writing_mode,
                                 rendering_policy,
+                                asr_mode: AsrMode::Cloud,
                                 dictionary_terms: smart_dictionary_terms,
                                 languages,
                                 reply,
@@ -1030,6 +949,7 @@ async fn actor_loop(
                     level_ring,
                     writing_mode,
                     rendering_policy,
+                    asr_mode: started_asr_mode,
                     dictionary_terms,
                     languages,
                     reply,
@@ -1048,6 +968,7 @@ async fn actor_loop(
                     ActorState::Starting {
                         id: starting_id,
                         correlation_id,
+                        ..
                     } if *starting_id == id => Some(correlation_id.clone()),
                     _ => None,
                 };
@@ -1222,6 +1143,7 @@ async fn actor_loop(
                                 deadline_clock,
                                 writing_mode,
                                 rendering_policy,
+                                asr_mode: started_asr_mode,
                                 dictionary_terms,
                                 languages,
                                 evidence,
@@ -1654,6 +1576,17 @@ fn state_label(state: &ActorState) -> DaemonState {
         ActorState::Starting { .. } => DaemonState::Recording,
         ActorState::Recording(_) => DaemonState::Recording,
         ActorState::Processing(_) => DaemonState::Processing,
+    }
+}
+
+fn active_asr_mode(state: &ActorState) -> Option<AsrMode> {
+    match state {
+        ActorState::Starting { asr_mode, .. } => Some(*asr_mode),
+        ActorState::Recording(recording) => Some(recording.asr_mode),
+        ActorState::Idle
+        | ActorState::Processing(_)
+        | ActorState::Recovering(_)
+        | ActorState::Replaying(_) => None,
     }
 }
 
@@ -2208,6 +2141,7 @@ async fn process_recording(
         deadline_clock: _,
         writing_mode,
         rendering_policy,
+        asr_mode: _,
         dictionary_terms,
         languages,
         mut evidence,

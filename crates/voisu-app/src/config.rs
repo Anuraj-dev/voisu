@@ -1,7 +1,7 @@
 //! Minimal persisted daemon configuration.
 //!
 //! Today this holds the Deepgram Provider switch, Delivery mode, Writing Mode,
-//! and Developer Prompt Rendering policy. It is persisted as TOML at
+//! Developer Prompt Rendering policy, and ASR mode. It is persisted as TOML at
 //! `$XDG_CONFIG_HOME/voisu/config.toml` (default `~/.config/voisu/config.toml`),
 //! read once at daemon start.
 //!
@@ -30,11 +30,14 @@
 //! Pure resolution tests cover the snapshot contract here; full daemon wire is
 //! DPR-T5. Persisting the policy does **not** change Smart Writing outcomes.
 
+use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 /// Re-export for CLI and callers that already import config modes.
-pub use voisu_core::RenderingPolicy;
+pub use voisu_core::{AsrMode, RenderingPolicy};
 
 /// The single configuration key: whether the Deepgram Provider is enabled.
 const DEEPGRAM_ENABLED_KEY: &str = "deepgram_enabled";
@@ -47,6 +50,9 @@ const WRITING_MODE_KEY: &str = "writing_mode";
 
 /// The root configuration key selecting Developer Prompt Rendering policy.
 const RENDERING_POLICY_KEY: &str = "rendering_policy";
+
+/// The root configuration key selecting Cloud or Local ASR.
+pub(crate) const ASR_MODE_KEY: &str = "asr_mode";
 
 /// Explicit rollout gate for the DPR pipeline. Only `1` or `true` enables it;
 /// missing, empty, or malformed values keep Smart Writing in production.
@@ -199,6 +205,7 @@ pub fn deepgram_enabled() -> bool {
 /// needed, and returns the path written so the CLI can report it.
 pub fn set_deepgram_enabled(enabled: bool) -> Result<PathBuf, String> {
     let path = config_path();
+    let _lock = ConfigLock::acquire(&path)?;
     write_setting(&path, enabled)?;
     Ok(path)
 }
@@ -213,6 +220,7 @@ pub fn delivery_mode() -> DeliveryMode {
 /// and returns the path written so the CLI can report it.
 pub fn set_delivery_mode(mode: DeliveryMode) -> Result<PathBuf, String> {
     let path = config_path();
+    let _lock = ConfigLock::acquire(&path)?;
     write_delivery_mode(&path, mode)?;
     Ok(path)
 }
@@ -230,6 +238,7 @@ pub fn writing_mode() -> WritingMode {
 /// and returns the path written so the CLI can report it.
 pub fn set_writing_mode(mode: WritingMode) -> Result<PathBuf, String> {
     let path = config_path();
+    let _lock = ConfigLock::acquire(&path)?;
     write_writing_mode(&path, mode)?;
     Ok(path)
 }
@@ -376,6 +385,7 @@ fn language_tag_is_allowed(normalized: &str) -> bool {
 /// needed, and returns the path written so the CLI can report it.
 pub fn set_rendering_policy(policy: RenderingPolicy) -> Result<PathBuf, String> {
     let path = config_path();
+    let _lock = ConfigLock::acquire(&path)?;
     write_rendering_policy(&path, policy)?;
     Ok(path)
 }
@@ -430,8 +440,63 @@ pub fn config_dir() -> PathBuf {
 
 /// The resolved config path: `$XDG_CONFIG_HOME/voisu/config.toml`, falling back
 /// to `~/.config/voisu/config.toml`. Mirrors the user dictionary resolution.
-fn config_path() -> PathBuf {
+pub(crate) fn config_path() -> PathBuf {
     config_dir().join("config.toml")
+}
+
+/// Exclusive interprocess lock covering every config setter's read/validate/
+/// change/write. Held on a stable sibling `config.toml.lock`.
+pub(crate) struct ConfigLock {
+    _file: File,
+}
+
+impl ConfigLock {
+    pub(crate) fn acquire(config_path: &Path) -> Result<Self, String> {
+        let parent = config_path
+            .parent()
+            .ok_or_else(|| format!("config path has no parent: {}", config_path.display()))?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "cannot create config directory {}: {error}",
+                parent.display()
+            )
+        })?;
+        let lock_path = config_lock_path(config_path);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|error| format!("cannot open config lock {}: {error}", lock_path.display()))?;
+        // SAFETY: a valid owned fd is passed to flock; return value is checked.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!(
+                "cannot lock config {}: {}",
+                lock_path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        // SAFETY: the fd is still open and owned until this struct drops.
+        unsafe {
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn config_lock_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_else(|| std::ffi::OsString::from("config.toml"));
+    name.push(".lock");
+    path.with_file_name(name)
 }
 
 /// Reads the persisted Deepgram setting. A missing file yields `None` (the
@@ -647,14 +712,14 @@ fn strip_comment(line: &str) -> &str {
 /// merging so a rewrite never accumulates duplicate headers.
 const MANAGED_LINES: [&str; 3] = [
     "# Voisu daemon configuration.",
-    "# Recording Provider, Delivery, Writing Mode, and Rendering Policy settings; read once at daemon start.",
-    "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, and `voisu rendering` commands.",
+    "# Recording Provider, Delivery, Writing Mode, Rendering Policy, and ASR mode settings; read once at daemon start.",
+    "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, `voisu rendering`, and `voisu mode` commands.",
 ];
 
 /// Managed header lines emitted by earlier releases. Stripped alongside
 /// [`MANAGED_LINES`] so upgrading an existing config never strands stale
 /// headers above the rewritten block.
-const LEGACY_MANAGED_LINES: [&str; 6] = [
+const LEGACY_MANAGED_LINES: [&str; 8] = [
     "# Whether the Deepgram Provider participates in a Recording.",
     "# Managed by `voisu deepgram on|off`; read once at daemon start.",
     // Pre-Writing-Mode managed body lines (delivery-only era).
@@ -663,6 +728,9 @@ const LEGACY_MANAGED_LINES: [&str; 6] = [
     // Pre-Rendering-Policy managed body lines (writing-mode era).
     "# Recording Provider, Delivery, and Writing Mode settings; read once at daemon start.",
     "# Managed by the `voisu deepgram`, `voisu delivery`, and `voisu writing` commands.",
+    // Pre-ASR-mode managed body lines (rendering-policy era).
+    "# Recording Provider, Delivery, Writing Mode, and Rendering Policy settings; read once at daemon start.",
+    "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, and `voisu rendering` commands.",
 ];
 
 /// Persists the toggle, creating the parent `voisu` directory if needed and
@@ -670,22 +738,27 @@ const LEGACY_MANAGED_LINES: [&str; 6] = [
 /// same-directory temp file is fully written then renamed into place, so an
 /// interrupted write never leaves a partially written config.
 fn write_setting(path: &Path, enabled: bool) -> Result<(), String> {
-    write_config(path, Some(enabled), None, None, None)
+    write_config(path, Some(enabled), None, None, None, None)
 }
 
 /// Persists the Delivery mode without discarding the other managed root keys.
 fn write_delivery_mode(path: &Path, mode: DeliveryMode) -> Result<(), String> {
-    write_config(path, None, Some(mode), None, None)
+    write_config(path, None, Some(mode), None, None, None)
 }
 
 /// Persists the Writing Mode without discarding the other managed root keys.
 fn write_writing_mode(path: &Path, mode: WritingMode) -> Result<(), String> {
-    write_config(path, None, None, Some(mode), None)
+    write_config(path, None, None, Some(mode), None, None)
 }
 
 /// Persists the Rendering Policy without discarding the other managed root keys.
 fn write_rendering_policy(path: &Path, policy: RenderingPolicy) -> Result<(), String> {
-    write_config(path, None, None, None, Some(policy))
+    write_config(path, None, None, None, Some(policy), None)
+}
+
+/// Persists ASR mode. Caller must already hold [`ConfigLock`].
+pub(crate) fn write_asr_mode_unlocked(path: &Path, mode: AsrMode) -> Result<(), String> {
+    write_config(path, None, None, None, None, Some(mode))
 }
 
 /// Rewrites managed root settings while preserving every other line. Only the
@@ -697,6 +770,7 @@ fn write_config(
     delivery_mode: Option<DeliveryMode>,
     writing_mode: Option<WritingMode>,
     rendering_policy: Option<RenderingPolicy>,
+    asr_mode: Option<AsrMode>,
 ) -> Result<(), String> {
     let parent = path
         .parent()
@@ -729,6 +803,7 @@ fn write_config(
             delivery_mode,
             writing_mode,
             rendering_policy,
+            asr_mode,
         ),
     )
 }
@@ -746,6 +821,24 @@ fn write_atomic(path: &Path, parent: &Path, contents: &str) -> Result<(), String
         .map_err(|error| format!("cannot write config {}: {error}", path.display()))?;
     file.persist(path)
         .map_err(|error| format!("cannot persist config {}: {}", path.display(), error.error))?;
+    // Rename made the new file visible. Sync the directory entry before ack;
+    // a failure here is indeterminate, not proof the old file is intact.
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "indeterminate: config replaced at {} but file sync failed: {error}",
+                path.display()
+            )
+        })?;
+    File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| {
+            format!(
+                "indeterminate: config replaced at {} but directory sync failed: {error}",
+                path.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -759,6 +852,7 @@ fn merge_content(
     delivery_mode: Option<DeliveryMode>,
     writing_mode: Option<WritingMode>,
     rendering_policy: Option<RenderingPolicy>,
+    asr_mode: Option<AsrMode>,
 ) -> String {
     let mut in_root = true;
     let mut preserved: Vec<&str> = Vec::new();
@@ -789,11 +883,17 @@ fn merge_content(
             && trimmed
                 .split_once('=')
                 .is_some_and(|(key, _)| key.trim() == RENDERING_POLICY_KEY);
+        let is_root_asr_mode = asr_mode.is_some()
+            && in_root
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == ASR_MODE_KEY);
         if is_managed_comment
             || is_root_deepgram_enabled
             || is_root_delivery_mode
             || is_root_writing_mode
             || is_root_rendering_policy
+            || is_root_asr_mode
         {
             continue;
         }
@@ -804,6 +904,7 @@ fn merge_content(
         delivery_mode,
         writing_mode,
         rendering_policy,
+        asr_mode,
     );
     let body = preserved.join("\n");
     let body = body.trim_matches('\n');
@@ -821,6 +922,7 @@ fn render(
     delivery_mode: Option<DeliveryMode>,
     writing_mode: Option<WritingMode>,
     rendering_policy: Option<RenderingPolicy>,
+    asr_mode: Option<AsrMode>,
 ) -> String {
     let mut out = String::new();
     for line in MANAGED_LINES {
@@ -841,6 +943,9 @@ fn render(
             "{RENDERING_POLICY_KEY} = \"{}\"\n",
             policy.as_str()
         ));
+    }
+    if let Some(mode) = asr_mode {
+        out.push_str(&format!("{ASR_MODE_KEY} = \"{}\"\n", mode.as_str()));
     }
     out
 }
@@ -1125,27 +1230,39 @@ other_key = 5
     #[test]
     fn a_rendered_file_round_trips_through_the_parser() {
         assert_eq!(
-            parse_deepgram_enabled(&render(Some(true), None, None, None)),
+            parse_deepgram_enabled(&render(Some(true), None, None, None, None)),
             Some(true)
         );
         assert_eq!(
-            parse_deepgram_enabled(&render(Some(false), None, None, None)),
+            parse_deepgram_enabled(&render(Some(false), None, None, None, None)),
             Some(false)
         );
         assert_eq!(
-            parse_writing_mode(&render(None, None, Some(WritingMode::Literal), None)),
+            parse_writing_mode(&render(None, None, Some(WritingMode::Literal), None, None)),
             WritingModeLoad::Known(WritingMode::Literal)
         );
         assert_eq!(
-            parse_writing_mode(&render(None, None, Some(WritingMode::Smart), None)),
+            parse_writing_mode(&render(None, None, Some(WritingMode::Smart), None, None)),
             WritingModeLoad::Known(WritingMode::Smart)
         );
         assert_eq!(
-            parse_rendering_policy(&render(None, None, None, Some(RenderingPolicy::Structured))),
+            parse_rendering_policy(&render(
+                None,
+                None,
+                None,
+                Some(RenderingPolicy::Structured),
+                None,
+            )),
             RenderingPolicyLoad::Known(RenderingPolicy::Structured)
         );
         assert_eq!(
-            parse_rendering_policy(&render(None, None, None, Some(RenderingPolicy::Adaptive))),
+            parse_rendering_policy(&render(
+                None,
+                None,
+                None,
+                Some(RenderingPolicy::Adaptive),
+                None,
+            )),
             RenderingPolicyLoad::Known(RenderingPolicy::Adaptive)
         );
     }
