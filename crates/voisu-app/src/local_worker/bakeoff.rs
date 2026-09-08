@@ -220,6 +220,9 @@ pub struct SampleCounts {
     pub negative: usize,
     pub tuning_speech: usize,
     pub held_out_speech: usize,
+    pub one_to_ten: usize,
+    pub ten_to_thirty: usize,
+    pub thirty_to_one_twenty: usize,
     pub longest_band: usize,
 }
 
@@ -337,9 +340,14 @@ impl<C: CaptureSeam, D: DeliverySeam> FeasibilityRunner<C, D> {
             delivered_at,
         );
 
-        let wer = hypothesis
-            .as_deref()
-            .map(|text| align_words(&case.reference, text));
+        // Speech with no Transcript is a full-deletion WER, not a dropped sample.
+        let wer = match case.kind {
+            CaseKind::Speech => Some(align_words(
+                &case.reference,
+                hypothesis.as_deref().unwrap_or(""),
+            )),
+            CaseKind::Negative => None,
+        };
         let mut critical_failures = Vec::new();
         if case.kind == CaseKind::Negative {
             if delivered || hypothesis.is_some() {
@@ -399,8 +407,11 @@ pub fn sample_counts(cases: &[BakeoffCase]) -> SampleCounts {
                     Split::Tuning => counts.tuning_speech += 1,
                     Split::HeldOut => counts.held_out_speech += 1,
                 }
-                if case.band == DurationBand::OneTwentyToSixHundred {
-                    counts.longest_band += 1;
+                match case.band {
+                    DurationBand::OneToTen => counts.one_to_ten += 1,
+                    DurationBand::TenToThirty => counts.ten_to_thirty += 1,
+                    DurationBand::ThirtyToOneTwenty => counts.thirty_to_one_twenty += 1,
+                    DurationBand::OneTwentyToSixHundred => counts.longest_band += 1,
                 }
             }
             CaseKind::Negative => counts.negative += 1,
@@ -416,6 +427,9 @@ pub fn corpus_lock_satisfied(cases: &[BakeoffCase]) -> bool {
         || counts.negative < MIN_NEGATIVE_RECORDINGS
         || counts.tuning_speech > MAX_TUNING_SPEECH
         || counts.held_out_speech < MIN_HELD_OUT_SPEECH
+        || counts.one_to_ten == 0
+        || counts.ten_to_thirty == 0
+        || counts.thirty_to_one_twenty == 0
         || counts.longest_band < MIN_LONGEST_BAND
     {
         return false;
@@ -877,6 +891,7 @@ mod tests {
         let outcome = runner.run_case(&case).unwrap();
         assert!(!outcome.delivered);
         assert!(outcome.hypothesis.is_none());
+        assert!(outcome.wer.is_none());
         assert!(outcome.critical_failures.is_empty());
     }
 
@@ -961,8 +976,7 @@ mod tests {
         assert_eq!(second.hypothesis.as_deref(), Some("bravo"));
     }
 
-    #[test]
-    fn locked_corpus_with_failing_wer_is_nogo() {
+    fn locked_size_corpus(band_for: impl Fn(usize) -> DurationBand) -> Vec<BakeoffCase> {
         let mut cases = Vec::new();
         for i in 0..100 {
             cases.push(BakeoffCase {
@@ -973,11 +987,7 @@ mod tests {
                 } else {
                     Split::HeldOut
                 },
-                band: if i < 5 {
-                    DurationBand::OneTwentyToSixHundred
-                } else {
-                    DurationBand::OneToTen
-                },
+                band: band_for(i),
                 audio_hash: format!("hs{i}"),
                 reference: "hello raja".into(),
                 pcm: vec![1, 0],
@@ -1002,7 +1012,70 @@ mod tests {
                 scripted_hypothesis: None,
             });
         }
+        cases
+    }
+
+    fn all_speech_bands(i: usize) -> DurationBand {
+        match i {
+            0..=4 => DurationBand::OneTwentyToSixHundred,
+            20 => DurationBand::TenToThirty,
+            21 => DurationBand::ThirtyToOneTwenty,
+            _ => DurationBand::OneToTen,
+        }
+    }
+
+    #[test]
+    fn speech_no_text_contributes_full_deletion_wer() {
+        let mut case = speech_case("speech-empty", "hello raja", "ignored", vec![1, 0]);
+        case.scripted_hypothesis = None;
+        let mut runner = FeasibilityRunner::harness(FakeWorker::default());
+        runner
+            .prepare(Correlation {
+                daemon_nonce: "bakeoff".into(),
+                generation: 1,
+                request_id: "prep".into(),
+                recording_id: "prep".into(),
+                model_receipt_hash: "harness-no-weights".into(),
+            })
+            .unwrap();
+        let outcome = runner.run_case(&case).unwrap();
+        assert!(outcome.hypothesis.is_none());
+        let wer = outcome
+            .wer
+            .as_ref()
+            .expect("speech NoText must score against empty hypothesis");
+        assert_eq!(wer.deletions, 2);
+        assert_eq!(wer.insertions, 0);
+        assert_eq!(wer.substitutions, 0);
+        assert_eq!(wer.reference_tokens, 2);
+        assert_eq!(wer.error_rate, 1.0);
+        assert_eq!(corpus_wer(&[&outcome]), Some(1.0));
+    }
+
+    #[test]
+    fn locked_corpus_missing_a_middle_band_fails_the_lock() {
+        let cases = locked_size_corpus(|i| match i {
+            0..=4 => DurationBand::OneTwentyToSixHundred,
+            20 => DurationBand::TenToThirty,
+            _ => DurationBand::OneToTen,
+        });
+        let counts = sample_counts(&cases);
+        assert!(counts.one_to_ten >= 1);
+        assert!(counts.ten_to_thirty >= 1);
+        assert_eq!(counts.thirty_to_one_twenty, 0);
+        assert!(counts.longest_band >= MIN_LONGEST_BAND);
+        assert!(!corpus_lock_satisfied(&cases));
+    }
+
+    #[test]
+    fn locked_corpus_with_failing_wer_is_nogo() {
+        let cases = locked_size_corpus(all_speech_bands);
         assert!(corpus_lock_satisfied(&cases));
+        let counts = sample_counts(&cases);
+        assert!(counts.one_to_ten >= 1);
+        assert!(counts.ten_to_thirty >= 1);
+        assert!(counts.thirty_to_one_twenty >= 1);
+        assert!(counts.longest_band >= MIN_LONGEST_BAND);
         let outcomes: Vec<CaseOutcome> = cases
             .iter()
             .map(|case| CaseOutcome {
