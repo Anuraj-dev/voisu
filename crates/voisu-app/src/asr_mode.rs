@@ -432,6 +432,7 @@ pub fn select_resources(mode: AsrMode) -> AsrPathResources {
 }
 
 fn production_local_readiness() -> LocalReadiness {
+    let _ = crate::local_model::observe_for_admission();
     LocalReadiness::Unavailable {
         error: LOCAL_UNAVAILABLE.to_owned(),
     }

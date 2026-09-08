@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use voisu_core::{Transcript, stop_anchored_timings};
+use voisu_core::Transcript;
 
 use super::bounds::{LOAD_DEADLINE, STOP_PROCESSING};
 use super::protocol::Correlation;
@@ -168,6 +168,29 @@ pub struct StageTimings {
     pub recording_duration_ms: u64,
     pub stop_to_finalized_ms: u64,
     pub stop_to_delivered_ms: Option<u64>,
+}
+
+struct StopAnchoredTimings {
+    recording_duration_ms: u64,
+    stop_to_finalized_ms: u64,
+    stop_to_delivered_ms: u64,
+}
+
+/// L0 helper is not on this merge base; keep stop-anchored math local.
+fn stop_anchored_timings_local(
+    recording_start: Instant,
+    utterance_end: Instant,
+    finalized_at: Instant,
+    delivered_at: Instant,
+) -> StopAnchoredTimings {
+    let millis = |start: Instant, end: Instant| {
+        u64::try_from(end.saturating_duration_since(start).as_millis()).unwrap_or(u64::MAX)
+    };
+    StopAnchoredTimings {
+        recording_duration_ms: millis(recording_start, utterance_end),
+        stop_to_finalized_ms: millis(utterance_end, finalized_at),
+        stop_to_delivered_ms: millis(utterance_end, delivered_at),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -333,7 +356,7 @@ impl<C: CaptureSeam, D: DeliverySeam> FeasibilityRunner<C, D> {
             delivery_ms = millis(delivery_started.elapsed());
             delivered_at = Instant::now();
         }
-        let stop = stop_anchored_timings(
+        let stop = stop_anchored_timings_local(
             finalized.recording_start,
             finalized.utterance_end,
             finalized_at,

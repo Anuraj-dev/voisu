@@ -1,4 +1,4 @@
-//! L2 Local ASR feasibility spike and locked English bakeoff harness.
+//! Local ASR worker seams: L2 bakeoff harness plus L3 supervised lifecycle.
 //!
 //! This module is **not** product Local ASR. The daemon does not admit a Local
 //! Recording path here; Local remains unavailable until L4. No model winner is
@@ -9,6 +9,7 @@
 
 mod bakeoff;
 mod bounds;
+mod lifecycle;
 mod protocol;
 mod runtime;
 mod sandbox;
@@ -29,10 +30,11 @@ pub use bounds::{
     MAX_WORKER_TASKS, PCM_BITS, PCM_CHANNELS, PCM_SAMPLE_RATE_HZ, REAP_OBSERVE, RESTART_WINDOW,
     STOP_PROCESSING, local_response_deadline, worker_cpu_quota_cores, worker_memory_ceiling_bytes,
 };
+pub use lifecycle::{LocalLifecycle, production_local_admission};
 pub use protocol::{
-    ControlFrame, Correlation, FrameError, ProtocolVersion, WorkerFrame, decode_json_frame,
-    encode_json_frame, is_silence_pcm, parse_control, parse_worker, validate_pcm,
-    validate_transcript,
+    ControlFrame, Correlation, FrameError, PROTOCOL_VERSION, ProtocolVersion, WorkerFrame,
+    decode_json_frame, encode_json_frame, is_silence_pcm, parse_control, parse_worker,
+    validate_pcm, validate_transcript,
 };
 pub use runtime::{
     Eligibility, RuntimeCandidate, RuntimeError, RuntimeFamily, evaluation_order,
@@ -57,28 +59,36 @@ pub use supervisor::{
 #[cfg(test)]
 mod product_unavailable_tests {
     #[test]
-    fn product_daemon_does_not_admit_local_worker() {
+    fn product_daemon_does_not_grow_a_local_god_file() {
         let daemon = include_str!("../bin/voisu-daemon.rs");
         assert!(
             !daemon.contains("local_worker"),
-            "L2 must not wire Local ASR into voisu-daemon.rs"
+            "L3 keeps worker lifecycle out of voisu-daemon.rs"
         );
         assert!(
-            !daemon.contains("asr_mode"),
-            "L2 must not add Local mode admission to the product daemon"
+            !daemon.contains("local_model"),
+            "L3 keeps catalog/installer out of voisu-daemon.rs"
+        );
+        assert!(
+            daemon.contains("CaptureKind::Start"),
+            "Start still goes through the L1 admission seam"
         );
     }
 
     #[test]
-    fn product_cli_does_not_gain_local_mode() {
+    fn product_cli_mode_exists_without_installer_dump() {
         let cli = include_str!("../bin/voisu.rs");
         assert!(
             !cli.contains("local_worker"),
-            "L2 must not wire Local ASR into voisu.rs"
+            "L3 keeps worker lifecycle out of voisu.rs"
         );
         assert!(
-            !cli.contains("mode local"),
-            "L2 must not add `voisu mode local` (L1/L4 work)"
+            !cli.contains("local_model"),
+            "L3 keeps catalog/installer out of voisu.rs"
+        );
+        assert!(
+            cli.contains("mode <local|cloud>"),
+            "L1 mode command remains the CLI call site"
         );
     }
 }
