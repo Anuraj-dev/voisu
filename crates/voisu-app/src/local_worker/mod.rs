@@ -73,6 +73,10 @@ mod product_unavailable_tests {
             daemon.contains("CaptureKind::Start"),
             "Start still goes through the L1 admission seam"
         );
+        assert!(
+            daemon.contains("local_routing"),
+            "L4 Local routing is a daemon call site"
+        );
     }
 
     #[test]

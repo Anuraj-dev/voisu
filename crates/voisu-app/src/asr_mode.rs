@@ -26,6 +26,7 @@ const MODE_INITIALIZED_NAME: &str = "mode-initialized";
 const CONFIG_REVISION_NAME: &str = "config-revision";
 const IO_DEADLINE: Duration = Duration::from_secs(2);
 const MAX_MODE_RESPONSE_BYTES: usize = 64 * 1024;
+#[allow(dead_code)]
 const LOCAL_UNAVAILABLE: &str = "Local selected; model unavailable";
 const LOCAL_START_REFUSED: &str = "Local ASR is unavailable; Start refused before capture";
 const LOCAL_REPLAY_REFUSED: &str = "Local ASR is unavailable; Replay refused before capture";
@@ -79,8 +80,19 @@ impl AdmissionError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecordingAdmission {
-    Cloud { mode: AsrMode, revision: u64 },
-    LocalUnavailable { revision: u64, error: String },
+    Cloud {
+        mode: AsrMode,
+        revision: u64,
+    },
+    Local {
+        mode: AsrMode,
+        revision: u64,
+        model_identity: String,
+    },
+    LocalUnavailable {
+        revision: u64,
+        error: String,
+    },
 }
 
 /// Start and Replay share one admission helper so Local cannot construct providers.
@@ -411,11 +423,25 @@ pub fn admit_recording_at(
     let (mode, revision) = load_mode(config_path, state_dir)?;
     match select_resources(mode) {
         AsrPathResources::Cloud => Ok(RecordingAdmission::Cloud { mode, revision }),
+        AsrPathResources::Local { readiness } if readiness.admits_capture() => {
+            match crate::local_routing::admit_local(true) {
+                crate::local_routing::LocalAdmission::Ready { model_identity, .. } => {
+                    Ok(RecordingAdmission::Local {
+                        mode,
+                        revision,
+                        model_identity,
+                    })
+                }
+                crate::local_routing::LocalAdmission::Unavailable { error } => {
+                    Ok(RecordingAdmission::LocalUnavailable { revision, error })
+                }
+            }
+        }
         AsrPathResources::Local { readiness } => Ok(RecordingAdmission::LocalUnavailable {
             revision,
             error: match readiness {
                 LocalReadiness::Unavailable { error } => error,
-                _ => LOCAL_UNAVAILABLE.to_owned(),
+                _ => LOCAL_START_REFUSED.to_owned(),
             },
         }),
     }
@@ -433,9 +459,7 @@ pub fn select_resources(mode: AsrMode) -> AsrPathResources {
 
 fn production_local_readiness() -> LocalReadiness {
     let _ = crate::local_model::observe_for_admission();
-    LocalReadiness::Unavailable {
-        error: LOCAL_UNAVAILABLE.to_owned(),
-    }
+    crate::local_routing::production_readiness()
 }
 
 pub fn status_report(active: Option<AsrMode>) -> AsrModeStatus {
@@ -467,6 +491,10 @@ pub fn status_report_at(
                 AsrMode::Local => production_local_readiness(),
             },
             admission_error: None,
+            audio_retention: Some(crate::local_recovery::audio_retention_label(
+                std::env::var_os("VOISU_DEBUG_CAPTURE").is_some(),
+                crate::local_recovery::enabled(),
+            )),
         },
         Err(error) => blocked_status(active, error.message()),
     }
@@ -482,6 +510,7 @@ fn blocked_status(active: Option<AsrMode>, error: impl Into<String>) -> AsrModeS
             error: error.clone(),
         },
         admission_error: Some(error),
+        audio_retention: None,
     }
 }
 
@@ -514,6 +543,9 @@ pub fn write_cli_status(message: &str, asr: Option<&AsrModeStatus>) {
     if let Some(error) = &asr.admission_error {
         println!("asr admission: {error}");
     }
+    if let Some(retention) = &asr.audio_retention {
+        println!("audio retention: {retention}");
+    }
 }
 
 fn format_local_readiness(readiness: &LocalReadiness) -> String {
@@ -533,8 +565,8 @@ fn format_local_readiness(readiness: &LocalReadiness) -> String {
     }
 }
 
-/// Snapshot admission, then Cloud resources or a rejection before capture.
-pub fn admit_cloud_capture(
+/// Snapshot admission, then Cloud or Local resources, or a rejection before capture.
+pub fn admit_capture(
     kind: CaptureKind,
     daemon_state: DaemonState,
     active: Option<AsrMode>,
@@ -548,6 +580,7 @@ pub fn admit_cloud_capture(
                 active,
             ))),
         },
+        Ok(RecordingAdmission::Local { mode, .. }) => Ok(mode),
         Ok(RecordingAdmission::LocalUnavailable { .. }) => Err(Box::new(reject_capture(
             kind.refused_message(),
             daemon_state,
@@ -559,6 +592,15 @@ pub fn admit_cloud_capture(
             active,
         ))),
     }
+}
+
+/// Historic name: Cloud-only until L4. Delegates to [`admit_capture`].
+pub fn admit_cloud_capture(
+    kind: CaptureKind,
+    daemon_state: DaemonState,
+    active: Option<AsrMode>,
+) -> Result<AsrMode, Box<Response>> {
+    admit_capture(kind, daemon_state, active)
 }
 
 fn reject_capture(
@@ -955,6 +997,9 @@ mod tests {
                 assert_eq!(error, LOCAL_UNAVAILABLE);
             }
             RecordingAdmission::Cloud { .. } => panic!("Local must not admit as Cloud"),
+            RecordingAdmission::Local { .. } => {
+                panic!("Local must not admit without a Ready worker")
+            }
         }
         assert!(!matches!(
             select_resources(AsrMode::Local),

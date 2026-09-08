@@ -1,6 +1,7 @@
 pub mod asr_mode;
 pub mod asr_mode_queue;
 pub mod audio_level;
+pub mod cloud_ownership;
 pub mod config;
 pub mod daemon_lock;
 pub mod dictionary;
@@ -13,6 +14,10 @@ pub mod history_view;
 pub mod hyprland_bindings;
 pub mod journal;
 pub mod local_model;
+pub mod local_offline;
+pub mod local_recovery;
+pub mod local_routing;
+pub mod local_tail;
 pub mod local_worker;
 pub mod minimal_grammar;
 pub mod overlay;

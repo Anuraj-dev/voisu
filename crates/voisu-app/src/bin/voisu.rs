@@ -368,6 +368,7 @@ fn doctor(verbose: bool) -> ExitCode {
     // output opts out with VOISU_TEST_SKIP_DOCTOR_KEYS and covers the key
     // classification through dedicated seams instead.
     if std::env::var_os("VOISU_TEST_SKIP_DOCTOR_KEYS").is_none()
+        && !voisu_app::local_routing::skip_cloud_doctor_probes()
         && let Some(runtime) = runtime.as_ref()
     {
         rows.extend(provider_key_rows(runtime));

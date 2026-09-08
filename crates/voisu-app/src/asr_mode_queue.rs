@@ -40,7 +40,7 @@ impl AsrModeQueue {
     pub fn spawn() -> Self {
         Self::spawn_with(
             Box::new(persist_asr_mode),
-            Box::new(asr_mode::admit_cloud_capture),
+            Box::new(asr_mode::admit_capture),
         )
     }
 
@@ -156,6 +156,7 @@ mod tests {
                     "Local ASR is unavailable; Start refused before capture",
                 ))),
             },
+            Ok(RecordingAdmission::Local { mode, .. }) => Ok(mode),
             Ok(RecordingAdmission::LocalUnavailable { .. }) => Err(Box::new(Response::rejected(
                 Some(daemon_state),
                 "Local ASR is unavailable; Start refused before capture",

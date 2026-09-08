@@ -19,6 +19,7 @@ use tokio::time::timeout;
 use voisu_app::asr_mode;
 use voisu_app::asr_mode_queue::AsrModeQueue;
 use voisu_app::audio_level::{LevelRegistry, LevelRing};
+use voisu_app::cloud_ownership;
 use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
 use voisu_app::daemon_lock::SingleInstance;
 use voisu_app::dpr_cloud::DprCloudClient;
@@ -27,7 +28,10 @@ use voisu_app::dpr_pipeline::{
     dpr_pipeline_clock_origin, dpr_protected_tokens, dpr_source_context, dpr_transform_and_deliver,
 };
 use voisu_app::focus::SharedFocusProbe;
-use voisu_app::grammar_http::GrammarHttpClient;
+use voisu_app::local_recovery;
+use voisu_app::local_routing;
+use voisu_app::local_tail::TerminalDecision;
+
 use voisu_app::hyprland_bindings::VerifiedPasteAction;
 use voisu_app::journal::{escape_journal_control, recording_journal_lines};
 use voisu_app::minimal_grammar::MinimalGrammarAdapter;
@@ -181,6 +185,8 @@ async fn run() -> Result<(), String> {
             None
         }
     };
+    local_recovery::expire_at_startup();
+    local_recovery::spawn_hourly_expiry();
 
     // An over-long VOISU_RECORDING_DEADLINE_MS is clamped to the one bounded
     // maximum. Say so once here rather than at the clamp itself, which runs on
@@ -517,37 +523,10 @@ async fn actor_loop(
     let controlled = test_mode.as_deref() == Some(std::ffi::OsStr::new("controlled"));
     let controlled_deadlines =
         controlled || test_mode.as_deref() == Some(std::ffi::OsStr::new("system-boundaries"));
-    let grammar_adapter = if controlled {
-        std::env::var("VOISU_TEST_MINIMAL_GRAMMAR_ENDPOINT")
-            .ok()
-            .and_then(|endpoint| GrammarHttpClient::with_endpoint(endpoint).ok())
-            .map(MinimalGrammarAdapter::new)
-    } else {
-        match MinimalGrammarAdapter::production() {
-            Ok(adapter) => Some(adapter),
-            Err(error) => {
-                eprintln!("Minimal Grammar unavailable: {error}");
-                None
-            }
-        }
-    };
     let dpr_enabled = voisu_app::config::dpr_enabled();
     let qwen_format_enabled = voisu_app::config::qwen_format_enabled();
-    let dpr_client = if !dpr_enabled || !qwen_format_enabled {
-        None
-    } else if controlled {
-        std::env::var("VOISU_TEST_DPR_ENDPOINT")
-            .ok()
-            .and_then(|endpoint| DprCloudClient::with_endpoint(endpoint).ok())
-    } else {
-        match DprCloudClient::groq() {
-            Ok(client) => Some(client),
-            Err(error) => {
-                eprintln!("Developer Prompt Rendering cloud unavailable: {error}");
-                None
-            }
-        }
-    };
+    let mut grammar_adapter = None;
+    let mut dpr_client = None;
     let mut capture: Option<Box<dyn AudioCapture>> = Some(if controlled {
         Box::new(ControlledCapture::from_env(levels.clone()))
     } else {
@@ -837,7 +816,97 @@ async fn actor_loop(
                     ));
                     continue;
                 }
+                if admitted_mode == AsrMode::Cloud {
+                    let owned = cloud_ownership::construct_for_cloud(
+                        admitted_mode,
+                        controlled,
+                        dpr_enabled,
+                        qwen_format_enabled,
+                        None,
+                    );
+                    if grammar_adapter.is_none() {
+                        grammar_adapter = owned.grammar;
+                    }
+                    if dpr_client.is_none() {
+                        dpr_client = owned.dpr;
+                    }
+                } else {
+                    grammar_adapter = None;
+                    dpr_client = None;
+                }
                 match pending {
+                    PendingCapture::Replay(fixture_name) if admitted_mode == AsrMode::Local => {
+                        let id = next_id;
+                        next_id += 1;
+                        state = ActorState::Replaying(id);
+                        let replay_snapshot = voisu_app::dictionary::dictionary_snapshot();
+                        let writing_mode = voisu_app::config::writing_mode();
+                        let fixture_dir = diagnostics
+                            .as_ref()
+                            .expect("diagnostics availability checked above")
+                            .fixture_dir();
+                        let current_validator = validator.take().expect("validator is available");
+                        let (deepgram_slot, groq_slot) = local_routing::cloud_free_slots();
+                        let fixture_name = fixture_name.into_inner();
+                        let replay = tokio::spawn(async move {
+                            let rec_id = format!("rec-{id}");
+                            let bytes = match read_fixture(&fixture_dir, &fixture_name) {
+                                Ok(bytes) => bytes,
+                                Err(error) => {
+                                    return ReplayResult {
+                                        deepgram: deepgram_slot,
+                                        groq: groq_slot,
+                                        validator: current_validator,
+                                        response: Response::rejected(
+                                            Some(DaemonState::Idle),
+                                            error.diagnostic(),
+                                        ),
+                                    };
+                                }
+                            };
+                            let response = match local_routing::complete_replay(
+                                &rec_id,
+                                bytes,
+                                &replay_snapshot.user_terms,
+                                writing_mode,
+                                false,
+                                local_recovery::enabled(),
+                            ) {
+                                Ok(TerminalDecision::Transcript(text)) => Response::success(
+                                    DaemonState::Idle,
+                                    format!("Replay completed: {text}"),
+                                ),
+                                Ok(TerminalDecision::NoText { reason }) => Response::success(
+                                    DaemonState::Idle,
+                                    format!("Replay completed: no text ({reason})"),
+                                ),
+                                Err(error) => {
+                                    Response::rejected(Some(DaemonState::Idle), error.message())
+                                }
+                            };
+                            ReplayResult {
+                                deepgram: deepgram_slot,
+                                groq: groq_slot,
+                                validator: current_validator,
+                                response,
+                            }
+                        });
+                        let empty_terms = Arc::new(Vec::new());
+                        let empty_prompt = Arc::new(String::new());
+                        let empty_language = Arc::new(String::new());
+                        tokio::spawn(supervise_replay(
+                            replay,
+                            id,
+                            true,
+                            false,
+                            empty_terms,
+                            empty_prompt,
+                            empty_language,
+                            reply,
+                            tx.clone(),
+                            reaper.clone(),
+                        ));
+                    }
                     PendingCapture::Replay(fixture_name) => {
                         let id = next_id;
                         next_id += 1;
@@ -922,6 +991,14 @@ async fn actor_loop(
                         ));
                     }
                     PendingCapture::Start => {
+                        if admitted_mode == AsrMode::Local
+                            && let Err(error) =
+                                local_routing::quota_before_local_capture(local_recovery::enabled())
+                        {
+                            let _ = reply
+                                .send(Response::rejected(Some(DaemonState::Idle), error.message()));
+                            continue;
+                        }
                         let id = next_id;
                         next_id += 1;
                         // A dictionary edit becomes visible at this Recording
@@ -956,7 +1033,7 @@ async fn actor_loop(
                             .as_mut()
                             .expect("validator is available")
                             .set_dictionary_terms(session_terms);
-                        if !controlled {
+                        if admitted_mode != AsrMode::Local && !controlled {
                             deepgram = Some(build_deepgram_provider(
                                 deepgram_enabled,
                                 false,
@@ -989,9 +1066,15 @@ async fn actor_loop(
                         }
                         let mut current_capture =
                             capture.take().expect("capture adapter is available");
-                        let mut current_deepgram =
-                            deepgram.take().expect("Deepgram adapter is available");
-                        let mut current_groq = groq.take().expect("Groq adapter is available");
+                        let (mut current_deepgram, mut current_groq) =
+                            if admitted_mode == AsrMode::Local {
+                                local_routing::cloud_free_slots()
+                            } else {
+                                (
+                                    deepgram.take().expect("Deepgram adapter is available"),
+                                    groq.take().expect("Groq adapter is available"),
+                                )
+                            };
                         let actor = tx.clone();
                         let level_ring = levels.begin_recording();
                         tokio::task::spawn_blocking(move || {
@@ -1037,7 +1120,7 @@ async fn actor_loop(
                     reply,
                 } = *started;
                 capture = Some(returned_capture);
-                if controlled {
+                if controlled && started_asr_mode != AsrMode::Local {
                     deepgram = Some(returned_deepgram);
                     groq = Some(returned_groq);
                 } else {
@@ -1230,12 +1313,18 @@ async fn actor_loop(
                                 languages,
                                 evidence,
                             });
+                            if started_asr_mode == AsrMode::Local {
+                                local_routing::begin_live(&format!("rec-{id}"));
+                            }
                             let _ = reply.send(Response::success(
                                 DaemonState::Recording,
                                 "Recording started",
                             ));
                         }
                         Err(failure) => {
+                            if started_asr_mode == AsrMode::Local {
+                                local_routing::abandon_live(&format!("rec-{id}"));
+                            }
                             level_ring.deactivate();
                             let recovering =
                                 failure.capture.is_some() || failure.provider_stream.is_some();
@@ -2258,7 +2347,7 @@ async fn process_recording(
         deadline_clock: _,
         writing_mode,
         rendering_policy,
-        asr_mode: _,
+        asr_mode,
         dictionary_terms,
         languages,
         mut evidence,
@@ -2347,6 +2436,56 @@ async fn process_recording(
         evidence.truncated_by = audio.truncated_by();
         evidence.capture_finalized_ms = Some(elapsed_millis(started_at));
         evidence.stages.push(LifecycleStage::CaptureFinalized);
+        if asr_mode == AsrMode::Local {
+            let pcm = audio.pcm_s16le_mono_16khz().to_vec();
+            let _ = providers.abort().await;
+            let rec_id = format!("rec-{id}");
+            let recovery = local_recovery::enabled();
+            match local_routing::complete_recording(
+                &rec_id,
+                pcm,
+                &dictionary_terms,
+                writing_mode,
+                recovery,
+                false,
+            ) {
+                Ok(completion) => match completion.decision {
+                    TerminalDecision::NoText { reason } => {
+                        local_routing::abandon_live(&rec_id);
+                        evidence.stages.push(LifecycleStage::ValidationCompleted);
+                        return Err(BoundaryError::new(BoundaryKind::SilentRecording, reason));
+                    }
+                    TerminalDecision::Transcript(text) => {
+                        local_routing::prepare_delivery(&rec_id, recovery).map_err(|error| {
+                            BoundaryError::new(BoundaryKind::Delivery, error.message())
+                        })?;
+                        let mut authorized = CorrelationAuthorizedDelivery {
+                            inner: delivery.as_mut(),
+                            actor: actor.clone(),
+                            recording_id: id,
+                            correlation_id: correlation_id.clone(),
+                        };
+                        let outcome = authorized.deliver(Transcript(text.clone())).await?;
+                        let _ = outcome;
+                        local_routing::finish_delivery(&rec_id, &text, recovery).map_err(
+                            |error| BoundaryError::new(BoundaryKind::Delivery, error.message()),
+                        )?;
+                        final_transcript = Some(text);
+                        evidence.stages.push(LifecycleStage::ValidationCompleted);
+                        evidence.stages.push(LifecycleStage::DeliveryCompleted);
+                        return Ok(());
+                    }
+                },
+                Err(error) => {
+                    local_routing::mark_recovery_failed(&rec_id, recovery);
+                    local_routing::abandon_live(&rec_id);
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Validation,
+                        error.message(),
+                    ));
+                }
+            }
+        }
         if debug_capture && let Some(store) = diagnostics.as_ref() {
             match store.store_debug_audio(&correlation_id, audio.pcm_s16le_mono_16khz()) {
                 Ok(record) => debug_audio = Some(record),

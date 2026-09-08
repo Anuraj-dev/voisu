@@ -72,6 +72,9 @@ pub struct AsrModeStatus {
     pub local_readiness: LocalReadiness,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_error: Option<String>,
+    /// Discloses debug-capture and/or local-recovery audio retention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_retention: Option<String>,
 }
 
 #[cfg(test)]
