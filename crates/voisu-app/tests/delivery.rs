@@ -16,8 +16,8 @@ use voisu_app::focus::SharedFocusProbe;
 use voisu_app::hyprland_bindings::{PasteBehavior, PasteShortcut, VerifiedPasteAction};
 use voisu_app::system::{
     ClipboardBoundary, DirectDeliverySession, FedoraRemoteDesktopPortal, GuardedDelivery,
-    NotificationBoundary, PasteBoundary, PortalClipboardDelivery, PortalPasteAction,
-    RemoteDesktopPortal,
+    HyprlandActiveWindow, HyprlandKeyEmitter, HyprlandPasteAction, NotificationBoundary,
+    PasteBoundary, PortalClipboardDelivery, PortalPasteAction, RemoteDesktopPortal,
 };
 use voisu_core::{
     BoundaryError, BoundaryFuture, BoundaryKind, DeliveryAdapter, DeliveryMethod, DeliveryOutcome,
@@ -229,6 +229,87 @@ fn verified_paste_action() -> VerifiedPasteAction {
         live_binding_identity: "test-live-binding".to_owned(),
         behavior: PasteBehavior::Simple,
     }
+}
+
+fn omarchy_paste_action() -> VerifiedPasteAction {
+    VerifiedPasteAction {
+        shortcut: PasteShortcut {
+            binding: "SUPER + V".to_owned(),
+        },
+        description: "Universal paste".to_owned(),
+        live_binding_identity: "91".to_owned(),
+        behavior: PasteBehavior::OmarchyUniversal {
+            normal: PasteShortcut {
+                binding: "CTRL + V".to_owned(),
+            },
+            terminal: PasteShortcut {
+                binding: "SHIFT + Insert".to_owned(),
+            },
+        },
+    }
+}
+
+struct RecordingEmitter {
+    events: Arc<Mutex<Vec<String>>>,
+    fail_on: Option<&'static str>,
+}
+
+impl HyprlandKeyEmitter for RecordingEmitter {
+    fn send_key_state(&mut self, mods: &str, key: &str, down: bool) -> Result<(), BoundaryError> {
+        let state = if down { "down" } else { "up" };
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("send_key_state:{mods}:{key}:{state}"));
+        if self.fail_on == Some(state) {
+            return Err(BoundaryError::new(
+                BoundaryKind::Delivery,
+                "Hyprland send_key_state failed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct ScriptedWindow(Result<Vec<u8>, &'static str>);
+
+impl HyprlandActiveWindow for ScriptedWindow {
+    fn active_window_json(&mut self) -> Result<Vec<u8>, BoundaryError> {
+        self.0
+            .clone()
+            .map_err(|reason| BoundaryError::new(BoundaryKind::Delivery, reason))
+    }
+}
+
+struct UnusedWindow;
+
+impl HyprlandActiveWindow for UnusedWindow {
+    fn active_window_json(&mut self) -> Result<Vec<u8>, BoundaryError> {
+        panic!("Simple Paste Action must not query the active window")
+    }
+}
+
+fn hyprland_delivery(
+    events: Arc<Mutex<Vec<String>>>,
+    action: VerifiedPasteAction,
+    window: Box<dyn HyprlandActiveWindow>,
+    live_action: Option<VerifiedPasteAction>,
+    fail_on: Option<&'static str>,
+) -> PortalClipboardDelivery {
+    let paste = HyprlandPasteAction::with_test_runtime(
+        action.clone(),
+        Box::new(RecordingEmitter {
+            events: Arc::clone(&events),
+            fail_on,
+        }),
+        window,
+        live_action,
+    );
+    PortalClipboardDelivery::with_paste_boundaries(
+        Box::new(RecordingClipboard(events)),
+        action,
+        Box::new(paste),
+    )
 }
 
 impl DeliveryAdapter for RecordingDelivery {
@@ -620,6 +701,232 @@ async fn no_verified_paste_action_is_explicitly_clipboard_only() {
     assert_eq!(
         events.lock().unwrap().as_slice(),
         ["clipboard:clipboard only"]
+    );
+}
+
+#[tokio::test]
+async fn with_hyprland_paste_preserves_clipboard_then_emits_one_send_key_state() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let action = verified_paste_action();
+    let mut delivery = hyprland_delivery(
+        Arc::clone(&events),
+        action.clone(),
+        Box::new(UnusedWindow),
+        Some(action),
+        None,
+    );
+
+    let outcome = delivery
+        .deliver(Transcript("final transcript".to_owned()))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.method, DeliveryMethod::CompositorSubmitted);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [
+            "clipboard:final transcript",
+            "send_key_state:CTRL + SHIFT:P:down",
+            "send_key_state:CTRL + SHIFT:P:up",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn hyprland_omarchy_universal_emits_shift_insert_for_a_terminal_window() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let action = omarchy_paste_action();
+    let mut delivery = hyprland_delivery(
+        Arc::clone(&events),
+        action.clone(),
+        Box::new(ScriptedWindow(Ok(
+            br#"{"address":"0x123","tags":["default-opacity*","terminal*"]}"#.to_vec(),
+        ))),
+        Some(action),
+        None,
+    );
+
+    let outcome = delivery
+        .deliver(Transcript("terminal transcript".to_owned()))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.method, DeliveryMethod::CompositorSubmitted);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [
+            "clipboard:terminal transcript",
+            "send_key_state:SHIFT:Insert:down",
+            "send_key_state:SHIFT:Insert:up",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn hyprland_omarchy_universal_emits_ctrl_v_for_a_non_terminal_window() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let action = omarchy_paste_action();
+    let mut delivery = hyprland_delivery(
+        Arc::clone(&events),
+        action.clone(),
+        Box::new(ScriptedWindow(Ok(
+            br#"{"address":"0x123","tags":["default-opacity*"]}"#.to_vec(),
+        ))),
+        Some(action),
+        None,
+    );
+
+    let outcome = delivery
+        .deliver(Transcript("editor transcript".to_owned()))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.method, DeliveryMethod::CompositorSubmitted);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [
+            "clipboard:editor transcript",
+            "send_key_state:CTRL:V:down",
+            "send_key_state:CTRL:V:up",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn hyprland_active_window_query_failure_keeps_clipboard_and_does_not_retry() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let action = omarchy_paste_action();
+    let mut delivery = hyprland_delivery(
+        Arc::clone(&events),
+        action.clone(),
+        Box::new(ScriptedWindow(Err("active window unavailable"))),
+        Some(action),
+        None,
+    );
+
+    let first = delivery
+        .deliver(Transcript("kept transcript".to_owned()))
+        .await
+        .unwrap();
+    let second = delivery
+        .deliver(Transcript("second transcript".to_owned()))
+        .await
+        .unwrap();
+
+    assert_eq!(first.method, DeliveryMethod::ClipboardFallback);
+    assert_eq!(second.method, DeliveryMethod::ClipboardFallback);
+    assert!(
+        first
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Transcript remains on the clipboard"))
+    );
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["clipboard:kept transcript", "clipboard:second transcript",]
+    );
+}
+
+#[tokio::test]
+async fn hyprland_unusable_active_window_keeps_clipboard_without_keys() {
+    for (label, payload) in [
+        ("zero address", br#"{"address":"0x0"}"#.as_slice()),
+        ("empty address", br#"{"address":""}"#.as_slice()),
+        ("invalid json", br#"not-json"#.as_slice()),
+    ] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let action = omarchy_paste_action();
+        let mut delivery = hyprland_delivery(
+            Arc::clone(&events),
+            action.clone(),
+            Box::new(ScriptedWindow(Ok(payload.to_vec()))),
+            Some(action),
+            None,
+        );
+
+        let outcome = delivery
+            .deliver(Transcript("kept transcript".to_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback, "{label}");
+        assert!(
+            outcome
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Transcript remains on the clipboard")),
+            "{label}"
+        );
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["clipboard:kept transcript"],
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hyprland_live_revalidation_mismatch_keeps_clipboard() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let action = verified_paste_action();
+    let mut stale = action.clone();
+    stale.live_binding_identity = "other-binding".to_owned();
+    let mut delivery = hyprland_delivery(
+        Arc::clone(&events),
+        action,
+        Box::new(UnusedWindow),
+        Some(stale),
+        None,
+    );
+
+    let outcome = delivery
+        .deliver(Transcript("stale binding".to_owned()))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
+    assert!(
+        outcome
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Transcript remains on the clipboard"))
+    );
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["clipboard:stale binding"]
+    );
+}
+
+#[tokio::test]
+async fn hyprland_emitter_error_after_clipboard_write_is_clipboard_fallback() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let action = verified_paste_action();
+    let mut delivery = hyprland_delivery(
+        Arc::clone(&events),
+        action.clone(),
+        Box::new(UnusedWindow),
+        Some(action),
+        Some("down"),
+    );
+
+    let outcome = delivery
+        .deliver(Transcript("preserved transcript".to_owned()))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
+    assert!(
+        outcome
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Transcript remains on the clipboard"))
+    );
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [
+            "clipboard:preserved transcript",
+            "send_key_state:CTRL + SHIFT:P:down",
+        ]
     );
 }
 

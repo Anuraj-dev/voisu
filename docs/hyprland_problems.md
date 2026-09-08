@@ -105,7 +105,7 @@ Voisu currently defaults to `type`. Type Delivery requires a RemoteDesktop porta
 #### Intended fix
 
 - During Hyprland setup, select `clipboard` Delivery by default.
-- Explain that clipboard mode preserves the final Transcript on the clipboard first. If a verified Hyprland Paste Action exists, Voisu then emits that shortcut once. Unverified or failed paste stays clipboard-only.
+- Explain that clipboard mode preserves the final Transcript on the clipboard first. If a verified Hyprland Paste Action exists, Voisu then asks Hyprland to press that application paste chord once through `send_key_state`. Clipboard Delivery does not use the RemoteDesktop portal. Unverified or failed paste stays clipboard-only.
 - Keep the setting persistent across service restarts and package upgrades.
 - Do not silently fall back to simulated typing or an unverified paste.
 

@@ -202,6 +202,7 @@ impl PortalPasteAction {
         Self::with_options(action, portal, None)
     }
 
+    #[cfg(test)]
     pub(super) fn with_live_revalidation(
         action: VerifiedPasteAction,
         portal: Box<dyn RemoteDesktopPortal>,
@@ -351,6 +352,245 @@ impl PortalPasteAction {
     }
 }
 
+const HYPRLAND_KEY_UP_DELAY: Duration = Duration::from_millis(50);
+
+/// Presses a verified Hyprland chord by asking the compositor for key-down
+/// then key-up. Command text stays owned by Hyprland; only sanitized tokens
+/// are interpolated into a fixed `send_key_state` snippet.
+pub trait HyprlandKeyEmitter: Send {
+    fn send_key_state(&mut self, mods: &str, key: &str, down: bool) -> Result<(), BoundaryError>;
+}
+
+/// Focused-window probe used to choose Omarchy's terminal vs normal chord.
+pub trait HyprlandActiveWindow: Send {
+    fn active_window_json(&mut self) -> Result<Vec<u8>, BoundaryError>;
+}
+
+struct HyprctlKeyEmitter;
+
+impl HyprlandKeyEmitter for HyprctlKeyEmitter {
+    fn send_key_state(&mut self, mods: &str, key: &str, down: bool) -> Result<(), BoundaryError> {
+        let lua = send_key_state_lua(mods, key, down);
+        run_restricted_stdout("hyprctl", &["eval", &lua])
+            .map(|_| ())
+            .ok_or_else(|| {
+                BoundaryError::new(BoundaryKind::Delivery, "Hyprland send_key_state failed")
+            })
+    }
+}
+
+struct HyprctlActiveWindow;
+
+impl HyprlandActiveWindow for HyprctlActiveWindow {
+    fn active_window_json(&mut self) -> Result<Vec<u8>, BoundaryError> {
+        run_restricted_stdout("hyprctl", &["activewindow", "-j"])
+            .ok_or_else(|| BoundaryError::new(BoundaryKind::Delivery, "active window unavailable"))
+    }
+}
+
+fn send_key_state_lua(mods: &str, key: &str, down: bool) -> String {
+    let state = if down { "down" } else { "up" };
+    format!(
+        r#"hl.dispatch(hl.dsp.send_key_state({{ mods = "{mods}", key = "{key}", state = "{state}" }}))"#
+    )
+}
+
+fn classify_hyprland_active_window(payload: &[u8]) -> Result<bool, BoundaryError> {
+    let window: serde_json::Value = serde_json::from_slice(payload)
+        .map_err(|_| BoundaryError::new(BoundaryKind::Delivery, "active window unavailable"))?;
+    let address = window
+        .get("address")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if address.is_empty() || address == "0x0" {
+        return Err(BoundaryError::new(
+            BoundaryKind::Delivery,
+            "no focused window",
+        ));
+    }
+    let terminal = window
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tags| {
+            tags.iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|tag| tag.strip_suffix('*').unwrap_or(tag) == "terminal")
+        });
+    Ok(terminal)
+}
+
+pub struct HyprlandPasteAction {
+    action: VerifiedPasteAction,
+    emitter: Box<dyn HyprlandKeyEmitter>,
+    window: Box<dyn HyprlandActiveWindow>,
+    live_action_verifier: Option<LivePasteActionVerifier>,
+}
+
+impl HyprlandPasteAction {
+    fn production(action: VerifiedPasteAction) -> Self {
+        Self {
+            action,
+            emitter: Box::new(HyprctlKeyEmitter),
+            window: Box::new(HyprctlActiveWindow),
+            live_action_verifier: Some(Arc::new(
+                crate::hyprland_bindings::discover_live_paste_action,
+            )),
+        }
+    }
+
+    pub fn with_test_runtime(
+        action: VerifiedPasteAction,
+        emitter: Box<dyn HyprlandKeyEmitter>,
+        window: Box<dyn HyprlandActiveWindow>,
+        live_action: Option<VerifiedPasteAction>,
+    ) -> Self {
+        Self {
+            action,
+            emitter,
+            window,
+            live_action_verifier: Some(Arc::new(move || live_action.clone())),
+        }
+    }
+
+    async fn emit_chord(&mut self, mods: &str, key: &str) -> Result<(), BoundaryError> {
+        let mods = mods.to_owned();
+        let key = key.to_owned();
+        let mut emitter = std::mem::replace(&mut self.emitter, Box::new(HyprctlKeyEmitter));
+        let down_mods = mods.clone();
+        let down_key = key.clone();
+        let (emitter, down) = tokio::task::spawn_blocking(move || {
+            let result = emitter.send_key_state(&down_mods, &down_key, true);
+            (emitter, result)
+        })
+        .await
+        .map_err(|_| {
+            BoundaryError::new(BoundaryKind::Delivery, "Hyprland send_key_state failed")
+        })?;
+        if let Err(error) = down {
+            self.emitter = emitter;
+            return Err(error);
+        }
+
+        struct PendingUp {
+            emitter: Option<Box<dyn HyprlandKeyEmitter>>,
+            mods: String,
+            key: String,
+            pending: bool,
+        }
+        impl PendingUp {
+            fn release_up(&mut self) {
+                if self.pending
+                    && let Some(emitter) = self.emitter.as_mut()
+                {
+                    let _ = emitter.send_key_state(&self.mods, &self.key, false);
+                    self.pending = false;
+                }
+            }
+
+            fn restore(mut self) -> Box<dyn HyprlandKeyEmitter> {
+                self.release_up();
+                self.emitter.take().expect("Paste Action emitter")
+            }
+        }
+        impl Drop for PendingUp {
+            fn drop(&mut self) {
+                self.release_up();
+            }
+        }
+
+        let mut pending = PendingUp {
+            emitter: Some(emitter),
+            mods,
+            key,
+            pending: true,
+        };
+        tokio::time::sleep(HYPRLAND_KEY_UP_DELAY).await;
+        let mut emitter = pending.emitter.take().expect("Paste Action emitter");
+        let up_mods = pending.mods.clone();
+        let up_key = pending.key.clone();
+        match tokio::task::spawn_blocking(move || {
+            let result = emitter.send_key_state(&up_mods, &up_key, false);
+            (emitter, result)
+        })
+        .await
+        {
+            Ok((emitter, result)) => {
+                pending.emitter = Some(emitter);
+                pending.pending = result.is_err();
+                self.emitter = pending.restore();
+                result
+            }
+            Err(_) => {
+                pending.pending = false;
+                Err(BoundaryError::new(
+                    BoundaryKind::Delivery,
+                    "Hyprland send_key_state failed",
+                ))
+            }
+        }
+    }
+
+    async fn active_window_json(&mut self) -> Result<Vec<u8>, BoundaryError> {
+        let mut window = std::mem::replace(&mut self.window, Box::new(HyprctlActiveWindow));
+        let (window, result) = tokio::task::spawn_blocking(move || {
+            let result = window.active_window_json();
+            (window, result)
+        })
+        .await
+        .map_err(|_| BoundaryError::new(BoundaryKind::Delivery, "active window unavailable"))?;
+        self.window = window;
+        result
+    }
+}
+
+impl PasteBoundary for HyprlandPasteAction {
+    fn invoke(&mut self, action: &VerifiedPasteAction) -> BoundaryFuture<'_, ()> {
+        let expected = self.action.clone();
+        let requested = action.clone();
+        Box::pin(async move {
+            if expected != requested {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Delivery,
+                    "verified Paste Action changed during Delivery",
+                ));
+            }
+            if let Some(verifier) = self.live_action_verifier.clone() {
+                let live_action = tokio::task::spawn_blocking(move || verifier())
+                    .await
+                    .ok()
+                    .flatten();
+                if live_action.as_ref() != Some(&requested) {
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Delivery,
+                        "verified Paste Action is no longer active",
+                    ));
+                }
+            }
+            let chord = match &requested.behavior {
+                crate::hyprland_bindings::PasteBehavior::Simple => {
+                    requested.shortcut.binding.clone()
+                }
+                crate::hyprland_bindings::PasteBehavior::OmarchyUniversal { normal, terminal } => {
+                    let json = self.active_window_json().await?;
+                    if classify_hyprland_active_window(&json)? {
+                        terminal.binding.clone()
+                    } else {
+                        normal.binding.clone()
+                    }
+                }
+            };
+            let (mods, key) = crate::hyprland_bindings::sanitized_send_key_tokens(&chord)
+                .ok_or_else(|| {
+                    BoundaryError::new(
+                        BoundaryKind::Delivery,
+                        "verified Paste Action shortcut cannot be emitted safely",
+                    )
+                })?;
+            self.emit_chord(&mods, &key).await
+        })
+    }
+}
+
 impl PortalClipboardDelivery {
     pub fn with_boundaries(
         clipboard: Box<dyn ClipboardBoundary>,
@@ -407,11 +647,19 @@ impl PortalClipboardDelivery {
     }
 
     pub fn with_hyprland_paste(action: VerifiedPasteAction) -> Self {
-        let paste = PortalPasteAction::with_live_revalidation(
+        Self::with_paste_boundaries(
+            Box::new(WlClipboard),
             action.clone(),
-            Box::new(FedoraRemoteDesktopPortal::default()),
-        );
-        Self::with_paste_boundaries(Box::new(WlClipboard), action, Box::new(paste))
+            Box::new(HyprlandPasteAction::production(action)),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn hyprland_paste_skips_remote_desktop(&self) -> bool {
+        self.setup.is_none()
+            && self.session.is_none()
+            && self.paste.is_some()
+            && !self.direct_enabled
     }
 }
 
@@ -621,4 +869,52 @@ fn spawn_remote_desktop_setup()
         let mut portal = FedoraRemoteDesktopPortal::default();
         portal.connect().await
     })
+}
+
+#[cfg(test)]
+mod hyprland_paste_lua_tests {
+    use super::send_key_state_lua;
+
+    fn expected(mods: &str, key: &str, state: &str) -> String {
+        format!(
+            r#"hl.dispatch(hl.dsp.send_key_state({{ mods = "{mods}", key = "{key}", state = "{state}" }}))"#
+        )
+    }
+
+    fn skeleton(lua: &str, mods: &str, key: &str, state: &str) -> String {
+        lua.replace(&format!("mods = \"{mods}\""), "mods = \"\"")
+            .replace(&format!("key = \"{key}\""), "key = \"\"")
+            .replace(&format!("state = \"{state}\""), "state = \"\"")
+    }
+
+    #[test]
+    fn hyprland_send_key_state_lua_interpolates_only_sanitized_tokens() {
+        assert_eq!(
+            send_key_state_lua("CTRL", "V", true),
+            expected("CTRL", "V", "down")
+        );
+        assert_eq!(
+            send_key_state_lua("CTRL", "V", false),
+            expected("CTRL", "V", "up")
+        );
+        assert_eq!(
+            send_key_state_lua("SHIFT", "Insert", true),
+            expected("SHIFT", "Insert", "down")
+        );
+        assert_eq!(
+            send_key_state_lua("SHIFT", "Insert", false),
+            expected("SHIFT", "Insert", "up")
+        );
+
+        let ctrl_down = send_key_state_lua("CTRL", "V", true);
+        let shift_up = send_key_state_lua("SHIFT", "Insert", false);
+        assert_eq!(
+            skeleton(&ctrl_down, "CTRL", "V", "down"),
+            skeleton(&shift_up, "SHIFT", "Insert", "up")
+        );
+        assert_eq!(
+            skeleton(&ctrl_down, "CTRL", "V", "down"),
+            r#"hl.dispatch(hl.dsp.send_key_state({ mods = "", key = "", state = "" }))"#
+        );
+    }
 }

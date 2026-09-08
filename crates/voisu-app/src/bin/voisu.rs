@@ -11,10 +11,10 @@ use voisu_app::system::{
 };
 use voisu_core::{
     BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, DaemonReadiness,
-    ExportCorrelationId, KeyDiagnosis, KeyLocation, PROTOCOL_VERSION, PasteActionState, Provider,
-    ProviderAuthenticator, ProviderKeyStatus, ReadinessInspector, ReadinessStatus,
-    ReplayFixturePath, Request, Response, SecretStore, SessionKind, VersionEnvelope,
-    provider_free_tier_hint, resolve_session, socket_path,
+    ExportCorrelationId, KeyDiagnosis, KeyLocation, PROTOCOL_VERSION, PasteActionState,
+    PasteBackend, Provider, ProviderAuthenticator, ProviderKeyStatus, ReadinessInspector,
+    ReadinessStatus, ReplayFixturePath, Request, Response, SecretStore, SessionKind,
+    VersionEnvelope, provider_free_tier_hint, resolve_session, socket_path,
 };
 
 /// The most response the CLI will buffer — per transport frame, and in total
@@ -431,7 +431,7 @@ fn focus_guard_row(backend: voisu_app::focus::FocusBackendKind) -> DoctorRow {
 }
 
 fn daemon_readiness_rows(readiness: &DaemonReadiness) -> Vec<DoctorRow> {
-    let mut rows = Vec::with_capacity(5);
+    let mut rows = Vec::with_capacity(6);
     let daemon_session_matches = daemon_session_matches_cli(readiness);
     rows.push(daemon_session_row(readiness));
 
@@ -459,7 +459,7 @@ fn daemon_readiness_rows(readiness: &DaemonReadiness) -> Vec<DoctorRow> {
         PasteActionState::Verified => DoctorRow::new(
             "Paste action",
             ReadinessStatus::Pass,
-            "Hyprland Paste Action was verified by the daemon",
+            "Hyprland Paste Action binding was verified by the daemon",
         )
         .value("verified"),
         PasteActionState::ClipboardOnly => DoctorRow::new(
@@ -474,6 +474,27 @@ fn daemon_readiness_rows(readiness: &DaemonReadiness) -> Vec<DoctorRow> {
             "the selected Delivery mode does not use a Hyprland Paste Action",
         )
         .value("not selected"),
+    });
+
+    rows.push(match readiness.paste_backend {
+        PasteBackend::Hyprland => DoctorRow::new(
+            "Paste backend",
+            ReadinessStatus::Pass,
+            "the daemon emits the verified Paste Action through Hyprland send_key_state",
+        )
+        .value("hyprland"),
+        PasteBackend::Unavailable => DoctorRow::new(
+            "Paste backend",
+            ReadinessStatus::Warn,
+            "a verified Paste Action binding exists, but the Hyprland press path cannot run",
+        )
+        .value("unavailable"),
+        PasteBackend::NotRequired => DoctorRow::new(
+            "Paste backend",
+            ReadinessStatus::Skip,
+            "the selected Delivery mode does not use the Hyprland press path",
+        )
+        .value("not required"),
     });
 
     let clipboard_value = readiness

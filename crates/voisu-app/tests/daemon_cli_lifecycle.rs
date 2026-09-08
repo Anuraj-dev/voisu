@@ -3499,6 +3499,10 @@ fn doctor_reports_clipboard_only_when_hyprland_paste_is_unverified() {
         output.contains(&doctor_line("Paste action", "clipboard-only", "WARN")),
         "{output}"
     );
+    assert!(
+        output.contains(&doctor_line("Paste backend", "not required", "SKIP")),
+        "{output}"
+    );
 }
 
 #[test]
@@ -3552,9 +3556,173 @@ printf '[{"key":"P","modmask":5,"description":"Paste transcript","dispatcher":"e
         &format!(r#"{{"version":{PROTOCOL_VERSION},"command":"status"}}"#),
     );
     assert_eq!(status["readiness"]["paste_action"], "clipboard_only");
+    assert_eq!(status["readiness"]["paste_backend"], "not_required");
     assert!(
         !commands.path().join("hyprctl.called").exists(),
         "the opt-out adapter must not perform independent Hyprland paste discovery"
+    );
+}
+
+fn hyprland_paste_fixture(config_home: &Path, commands: &Path) {
+    let hypr = config_home.join("hypr");
+    fs::create_dir_all(&hypr).unwrap();
+    fs::write(
+        hypr.join("hyprland.lua"),
+        r#"o.bind("CTRL + SHIFT + P", "Paste transcript", "wl-paste")"#,
+    )
+    .unwrap();
+    write_fake_command(
+        commands,
+        "hyprctl",
+        r#"dir=$(dirname "$0")
+: > "$dir/hyprctl.called"
+printf '[{"key":"P","modmask":5,"description":"Paste transcript","dispatcher":"exec","arg":"wl-paste"}]'
+"#,
+    );
+    write_fake_command(commands, "wl-copy", "cat >/dev/null\n");
+    write_fake_command(commands, "wl-paste", "exit 0\n");
+}
+
+#[test]
+fn doctor_reports_hyprland_paste_backend_when_action_is_verified() {
+    let config_home = TempDir::new().unwrap();
+    let voisu_config = config_home.path().join("voisu");
+    fs::create_dir_all(&voisu_config).unwrap();
+    fs::write(
+        voisu_config.join("config.toml"),
+        "deepgram_enabled = false\ndelivery_mode = \"clipboard\"\n",
+    )
+    .unwrap();
+    let commands = TempDir::new().unwrap();
+    hyprland_paste_fixture(config_home.path(), commands.path());
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-8"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test"),
+            ("VOISU_DISABLE_SHORTCUTS", "1"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/voisu-no-portal"),
+        ],
+    );
+
+    let status = ipc_request(
+        runtime.path(),
+        &format!(r#"{{"version":{PROTOCOL_VERSION},"command":"status"}}"#),
+    );
+    assert_eq!(status["readiness"]["paste_action"], "verified");
+    assert_eq!(status["readiness"]["paste_backend"], "hyprland");
+
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor", "--verbose"],
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-8"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test"),
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
+            ("VOISU_TEST_OVERLAY_READINESS", "ready"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
+    );
+    let output = stdout(&doctor);
+    assert!(doctor.status.success(), "{output}");
+    assert!(
+        output.contains(&doctor_line("Paste action", "verified", "PASS")),
+        "{output}"
+    );
+    assert!(
+        output.contains(&doctor_line("Paste backend", "hyprland", "PASS")),
+        "{output}"
+    );
+    assert!(
+        output.contains("Hyprland Paste Action binding was verified by the daemon"),
+        "{output}"
+    );
+    assert!(
+        output.contains("emits the verified Paste Action through Hyprland send_key_state"),
+        "{output}"
+    );
+}
+
+#[test]
+fn doctor_reports_hyprland_paste_backend_unavailable_without_press_path() {
+    let config_home = TempDir::new().unwrap();
+    let voisu_config = config_home.path().join("voisu");
+    fs::create_dir_all(&voisu_config).unwrap();
+    fs::write(
+        voisu_config.join("config.toml"),
+        "deepgram_enabled = false\ndelivery_mode = \"clipboard\"\n",
+    )
+    .unwrap();
+    let commands = TempDir::new().unwrap();
+    hyprland_paste_fixture(config_home.path(), commands.path());
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-9"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", ""),
+            ("VOISU_DISABLE_SHORTCUTS", "1"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/voisu-no-portal"),
+        ],
+    );
+
+    let status = ipc_request(
+        runtime.path(),
+        &format!(r#"{{"version":{PROTOCOL_VERSION},"command":"status"}}"#),
+    );
+    assert_eq!(status["readiness"]["paste_action"], "verified");
+    assert_eq!(status["readiness"]["paste_backend"], "unavailable");
+
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor", "--verbose"],
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-9"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", ""),
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
+    );
+    let output = stdout(&doctor);
+    assert!(doctor.status.success(), "{output}");
+    assert!(
+        output.contains(&doctor_line("Paste action", "verified", "PASS")),
+        "{output}"
+    );
+    assert!(
+        output.contains(&doctor_line("Paste backend", "unavailable", "WARN")),
+        "{output}"
+    );
+    assert!(
+        output.contains("Hyprland Paste Action binding was verified by the daemon"),
+        "{output}"
+    );
+    assert!(
+        output.contains("the Hyprland press path cannot run"),
+        "{output}"
     );
 }
 

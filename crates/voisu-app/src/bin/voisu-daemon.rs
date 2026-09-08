@@ -47,14 +47,14 @@ use voisu_core::{
     DeadlineClock, DeliveryAdapter, DeliveryMethod, DeliveryOutcome, DiagnosticPage,
     DiagnosticRecord, DiagnosticStore, DprDiagnostic, EnglishEligibilityOutcome,
     IntentReconstructionDiagnostic, LifecycleEvidence, LifecycleStage, MergeResult, OverlayEvent,
-    OverlayOutcome, PROTOCOL_VERSION, PasteActionState, PreparedTranscriptDecision, Provider,
-    ProviderCompletion, ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream,
-    ProviderStreams, ProviderWordConfidences, ReconciliationKind, ReconciliationModel,
-    ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal, SmartWritingDiagnostic,
-    SourceTranscript, SourceTranscriptRecord, Transcript, TranscriptDecision,
-    TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator, TriggerKeyBinding,
-    VersionEnvelope, clamp_stored_transcript_text, replay_capture, resolve_session,
-    sanitize_source_transcripts, socket_path,
+    OverlayOutcome, PROTOCOL_VERSION, PasteActionState, PasteBackend, PreparedTranscriptDecision,
+    Provider, ProviderCompletion, ProviderCoordinator, ProviderFailure, ProviderFailureStage,
+    ProviderStream, ProviderStreams, ProviderWordConfidences, ReconciliationKind,
+    ReconciliationModel, ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal,
+    SmartWritingDiagnostic, SourceTranscript, SourceTranscriptRecord, Transcript,
+    TranscriptDecision, TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator,
+    TriggerKeyBinding, VersionEnvelope, clamp_stored_transcript_text, replay_capture,
+    resolve_session, sanitize_source_transcripts, socket_path,
 };
 
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
@@ -204,9 +204,10 @@ async fn run() -> Result<(), String> {
         None
     };
 
-    let (initial_delivery, initial_paste_action) =
+    let (initial_delivery, initial_paste_action, initial_paste_backend) =
         build_delivery_adapter(controlled, delivery_mode, focus_probe.clone());
-    let daemon_readiness = daemon_readiness_snapshot(delivery_mode, initial_paste_action);
+    let daemon_readiness =
+        daemon_readiness_snapshot(delivery_mode, initial_paste_action, initial_paste_backend);
     let (actor_tx, actor_rx) = mpsc::channel(64);
     let levels = LevelRegistry::default();
     // The actor-owned reaper supervises capture and provider-stream cleanup.
@@ -1715,6 +1716,7 @@ fn status_response_with_feedback(
 fn daemon_readiness_snapshot(
     delivery_mode: DeliveryMode,
     paste_action: PasteActionState,
+    paste_backend: PasteBackend,
 ) -> Option<DaemonReadiness> {
     let controlled =
         std::env::var_os("VOISU_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("controlled"));
@@ -1766,6 +1768,7 @@ fn daemon_readiness_snapshot(
         hyprland_instance_signature,
         delivery_mode: delivery_mode.as_str().to_owned(),
         paste_action,
+        paste_backend,
         clipboard_usable,
         clipboard_backend,
     })
@@ -2808,7 +2811,7 @@ fn build_delivery_adapter(
     controlled: bool,
     delivery_mode: DeliveryMode,
     focus_probe: Option<SharedFocusProbe>,
-) -> (Box<dyn DeliveryAdapter>, PasteActionState) {
+) -> (Box<dyn DeliveryAdapter>, PasteActionState, PasteBackend) {
     if controlled {
         (
             Box::new(ControlledDelivery),
@@ -2819,6 +2822,7 @@ fn build_delivery_adapter(
             } else {
                 PasteActionState::NotRequired
             },
+            PasteBackend::NotRequired,
         )
     } else if std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_some() {
         (
@@ -2831,28 +2835,51 @@ fn build_delivery_adapter(
             } else {
                 PasteActionState::NotRequired
             },
+            PasteBackend::NotRequired,
         )
     } else {
         match delivery_mode {
             DeliveryMode::Type => (
                 Box::new(PortalClipboardDelivery::default()),
                 PasteActionState::NotRequired,
+                PasteBackend::NotRequired,
             ),
             DeliveryMode::Clipboard => {
                 let (paste_action, verified) = paste_action_selection();
-                let adapter = match verified {
-                    Some(action) => {
+                match (
+                    verified,
+                    voisu_app::hyprland_bindings::hyprland_press_path_available(),
+                ) {
+                    (Some(action), true) => {
                         eprintln!("verified Hyprland Paste Action: {}", action.description);
-                        Box::new(PortalClipboardDelivery::with_hyprland_paste(action))
+                        (
+                            Box::new(PortalClipboardDelivery::with_hyprland_paste(action)),
+                            paste_action,
+                            PasteBackend::Hyprland,
+                        )
                     }
-                    None => {
+                    (Some(action), false) => {
+                        eprintln!(
+                            "verified Hyprland Paste Action {}; press path unavailable; Delivery will remain clipboard-only",
+                            action.description
+                        );
+                        (
+                            Box::new(PortalClipboardDelivery::clipboard_only()),
+                            paste_action,
+                            PasteBackend::Unavailable,
+                        )
+                    }
+                    (None, _) => {
                         eprintln!(
                             "no verified Hyprland Paste Action; Delivery will remain clipboard-only"
                         );
-                        Box::new(PortalClipboardDelivery::clipboard_only())
+                        (
+                            Box::new(PortalClipboardDelivery::clipboard_only()),
+                            paste_action,
+                            PasteBackend::NotRequired,
+                        )
                     }
-                };
-                (adapter, paste_action)
+                }
             }
             DeliveryMode::Guarded => {
                 let focus = focus_probe.unwrap_or_else(|| {
@@ -2868,6 +2895,7 @@ fn build_delivery_adapter(
                         Box::new(DesktopNotifier),
                     )),
                     PasteActionState::NotRequired,
+                    PasteBackend::NotRequired,
                 )
             }
         }
