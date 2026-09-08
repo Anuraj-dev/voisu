@@ -53,8 +53,8 @@ use voisu_core::{
     ReconciliationModel, ReplayOutcome, Request, Response, RetentionPolicy, ShortcutPortal,
     SmartWritingDiagnostic, SourceTranscript, SourceTranscriptRecord, Transcript,
     TranscriptDecision, TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator,
-    TriggerKeyBinding, VersionEnvelope, clamp_stored_transcript_text, replay_capture,
-    resolve_session, sanitize_source_transcripts, socket_path,
+    TriggerKeyBinding, VersionEnvelope, clamp_stored_transcript_text, millis_between,
+    replay_capture, resolve_session, sanitize_source_transcripts, socket_path,
 };
 
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
@@ -2217,8 +2217,7 @@ async fn process_recording(
     // Recording off) anchors every stop-anchored telemetry field, so they
     // exclude the user's speech duration — unlike the deprecated
     // `release_to_text_ms`, which is measured from `started_at`.
-    evidence.recording_duration_ms =
-        Some(duration_millis(utterance_end.duration_since(started_at)));
+    evidence.recording_duration_ms = Some(millis_between(started_at, utterance_end));
     let pump = pump.await;
     evidence.streamed_chunk_count = chunk_counter.load(Ordering::SeqCst);
     evidence.first_chunk_ms = atomic_millis(&first_chunk_ms);
@@ -2380,7 +2379,7 @@ async fn process_recording(
         // The transcript is now settled: validation and any reconciliation (the
         // late-reconstruction window) have resolved and the delivered text is
         // known. Measured from the stop, so it excludes speech duration.
-        evidence.stop_to_finalized_ms = Some(elapsed_millis(utterance_end));
+        evidence.stop_to_finalized_ms = Some(millis_between(utterance_end, Instant::now()));
         if let Some(attempt) = &decision.intent_reconstruction {
             evidence.intent_reconstruction = Some(IntentReconstructionDiagnostic {
                 model: voisu_app::system::DEFAULT_GROQ_RECONCILIATION_MODEL.to_owned(),
@@ -2490,7 +2489,7 @@ async fn process_recording(
         evidence.release_to_text_ms = Some(elapsed_millis(started_at));
         // Delivery completed: measured from the stop, so it excludes the
         // speech duration that inflates the deprecated `release_to_text_ms`.
-        evidence.stop_to_delivered_ms = Some(elapsed_millis(utterance_end));
+        evidence.stop_to_delivered_ms = Some(millis_between(utterance_end, Instant::now()));
         evidence.stages.push(LifecycleStage::DeliveryCompleted);
         Ok(())
     }
