@@ -11,6 +11,13 @@ const FIXTURE_PCM: &[u8] = b"voisu-l3-health-pcm\0";
 const FIXTURE_MODEL_SHA: &str = "0baba5aced9189d1fa6b1d464744c379d31c6874564d2d05dc40f7c305a0c96f";
 const FIXTURE_PCM_SHA: &str = "1af47a487fa2083c5924dc26e21e16c606458d55bf45d840ca171323838f72bf";
 
+/// Hugging Face git commit that introduced these GGML blobs (not `main`).
+const WHISPER_CPP_HF_REV: &str = "80da2d8bfee42b0e836fc3a9890373e5defc00a6";
+const GGML_BASE_EN_SHA: &str = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002";
+const GGML_BASE_EN_BYTES: u64 = 147_964_211;
+const GGML_SMALL_EN_SHA: &str = "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d";
+const GGML_SMALL_EN_BYTES: u64 = 487_614_201;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileKind {
     Weights,
@@ -112,6 +119,8 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 pub fn verify_file_digest(bytes: &[u8], expected_hex: &str, expected_len: u64) -> bool {
     u64::try_from(bytes.len()).is_ok_and(|len| len == expected_len)
         && expected_hex.len() == SHA256_HEX_LEN
+        && expected_hex.bytes().all(|b| b.is_ascii_hexdigit())
+        && expected_hex.bytes().any(|b| b != b'0')
         && sha256_hex(bytes) == expected_hex
 }
 
@@ -171,7 +180,7 @@ const SHIPPED_ENTRIES: &[CatalogEntry] = &[
     },
     CatalogEntry {
         id: "whisper-cpp-ggml-base.en",
-        revision: "ggerganov-whisper.cpp-unselected",
+        revision: WHISPER_CPP_HF_REV,
         language: "en",
         required_names: &["ggml-base.en.bin"],
         runtime_abi: WHISPER_ABI,
@@ -183,7 +192,7 @@ const SHIPPED_ENTRIES: &[CatalogEntry] = &[
         provenance: Provenance {
             publisher: "ggerganov/whisper.cpp",
             source: "https://huggingface.co/ggerganov/whisper.cpp",
-            revision: "catalog-pin-unelected",
+            revision: WHISPER_CPP_HF_REV,
         },
         redistribution: Redistribution {
             allowed: true,
@@ -191,9 +200,9 @@ const SHIPPED_ENTRIES: &[CatalogEntry] = &[
         },
         files: &[CatalogFile {
             name: "ggml-base.en.bin",
-            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
-            bytes: 1,
-            url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+            sha256_hex: GGML_BASE_EN_SHA,
+            bytes: GGML_BASE_EN_BYTES,
+            url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/80da2d8bfee42b0e836fc3a9890373e5defc00a6/ggml-base.en.bin",
             kind: FileKind::Weights,
         }],
         allowed_hosts: &["huggingface.co"],
@@ -201,7 +210,7 @@ const SHIPPED_ENTRIES: &[CatalogEntry] = &[
     },
     CatalogEntry {
         id: "whisper-cpp-ggml-small.en",
-        revision: "ggerganov-whisper.cpp-unselected",
+        revision: WHISPER_CPP_HF_REV,
         language: "en",
         required_names: &["ggml-small.en.bin"],
         runtime_abi: WHISPER_ABI,
@@ -213,7 +222,7 @@ const SHIPPED_ENTRIES: &[CatalogEntry] = &[
         provenance: Provenance {
             publisher: "ggerganov/whisper.cpp",
             source: "https://huggingface.co/ggerganov/whisper.cpp",
-            revision: "catalog-pin-unelected",
+            revision: WHISPER_CPP_HF_REV,
         },
         redistribution: Redistribution {
             allowed: true,
@@ -221,9 +230,9 @@ const SHIPPED_ENTRIES: &[CatalogEntry] = &[
         },
         files: &[CatalogFile {
             name: "ggml-small.en.bin",
-            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
-            bytes: 1,
-            url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
+            sha256_hex: GGML_SMALL_EN_SHA,
+            bytes: GGML_SMALL_EN_BYTES,
+            url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/80da2d8bfee42b0e836fc3a9890373e5defc00a6/ggml-small.en.bin",
             kind: FileKind::Weights,
         }],
         allowed_hosts: &["huggingface.co"],
@@ -238,6 +247,10 @@ impl CatalogEntry {
 
     pub fn total_bytes(&self) -> u64 {
         self.files.iter().map(|file| file.bytes).sum()
+    }
+
+    pub fn abi_supported(&self) -> bool {
+        !self.runtime_abi.abi_id.is_empty() && self.runtime_abi.protocol == PROTOCOL_VERSION
     }
 
     #[must_use]
@@ -273,18 +286,51 @@ mod tests {
     }
 
     #[test]
-    fn production_entries_are_unelected_and_not_ollama() {
+    fn production_entries_pin_immutable_revisions_not_main() {
         let catalog = shipped_catalog();
         assert!(bakeoff_winner(&catalog).is_none());
         for entry in catalog.entries {
             assert_ne!(entry.runtime_abi.family, RuntimeFamily::FasterWhisper);
             assert!(!format!("{entry:?}").to_ascii_lowercase().contains("ollama"));
+            assert!(entry.abi_supported());
+            for file in entry.files {
+                assert_eq!(file.sha256_hex.len(), SHA256_HEX_LEN);
+                assert!(file.sha256_hex.bytes().any(|b| b != b'0'));
+                assert!(file.bytes > 1);
+                assert!(!file.url.contains("/resolve/main/"));
+            }
         }
+        let production = catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.production_weights)
+            .collect::<Vec<_>>();
+        assert_eq!(production.len(), 2);
         assert!(
-            catalog
-                .entries
+            production
                 .iter()
-                .any(|entry| entry.production_weights && entry.id.contains("whisper-cpp"))
+                .all(|entry| entry.revision == WHISPER_CPP_HF_REV)
         );
+        assert_eq!(
+            production[0].file("ggml-base.en.bin").unwrap().bytes,
+            GGML_BASE_EN_BYTES
+        );
+        assert_eq!(
+            production[0].file("ggml-base.en.bin").unwrap().sha256_hex,
+            GGML_BASE_EN_SHA
+        );
+        assert_eq!(
+            production[1].file("ggml-small.en.bin").unwrap().bytes,
+            GGML_SMALL_EN_BYTES
+        );
+        assert_eq!(
+            production[1].file("ggml-small.en.bin").unwrap().sha256_hex,
+            GGML_SMALL_EN_SHA
+        );
+    }
+
+    #[test]
+    fn all_zero_digest_is_not_a_pin() {
+        assert!(!verify_file_digest(&[0], &"0".repeat(64), 1));
     }
 }

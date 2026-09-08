@@ -176,7 +176,8 @@ struct StopAnchoredTimings {
     stop_to_delivered_ms: u64,
 }
 
-/// L0 helper is not on this merge base; keep stop-anchored math local.
+/// Stop-anchored math lives beside the scorer so warm/cold gates share the
+/// utterance-end origin used for WER, not a capture-start clock.
 fn stop_anchored_timings_local(
     recording_start: Instant,
     utterance_end: Instant,

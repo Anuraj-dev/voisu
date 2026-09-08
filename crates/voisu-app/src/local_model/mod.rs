@@ -4,6 +4,11 @@
 //! capture stays gated until L4. No bakeoff winner is selected. Ollama is not
 //! a candidate.
 
+use std::time::Duration;
+
+pub const INSTALL_DEADLINE: Duration = Duration::from_secs(30 * 60);
+pub const NO_PROGRESS: Duration = Duration::from_secs(30);
+
 mod catalog;
 mod fetch;
 mod health;
@@ -22,13 +27,13 @@ pub use fetch::{
     ArtifactFetcher, FetchError, FetchRequest, FetchResponse, ProductionHttps, ScriptedFetcher,
     ScriptedHop, follow_catalog_redirects,
 };
-pub use health::{HealthError, HealthProbe, HealthReport, PassingHealth};
+pub use health::{CandidateHealth, HealthError, HealthProbe, HealthReport, verify_candidate};
 pub use installer::{
-    INSTALL_DEADLINE, InstallAbort, InstallConsent, InstallError, InstallIo, InstallRequest,
-    MaintenanceError, MaintenanceKind, MaintenanceReservation, NO_PROGRESS, install_entry,
+    InstallAbort, InstallConsent, InstallError, InstallIo, InstallRequest, MaintenanceError,
+    MaintenanceKind, MaintenanceReservation, install_entry,
 };
-pub use receipt::{ActiveReceipt, ReceiptError};
-pub use store::{ModelLease, ModelStore, StoreError, models_dir, models_dir_from};
+pub use receipt::{ActiveReceipt, ReceiptError, from_entry};
+pub use store::{ModelLease, ModelStore, StoreError, StoreLock, models_dir, models_dir_from};
 pub use url_policy::{CatalogUrl, UrlPolicyError, validate_catalog_url};
 
 use crate::local_worker::production_local_admission;

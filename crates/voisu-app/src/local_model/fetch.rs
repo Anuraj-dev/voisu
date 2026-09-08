@@ -1,14 +1,19 @@
 //! Catalog HTTPS fetch. Ignores proxy environment. No free-form caller URLs.
 
 use std::collections::VecDeque;
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use rustls::pki_types::ServerName;
 
 use super::url_policy::{
     CatalogUrl, UrlPolicyError, check_url, resolve_redirect, validate_catalog_url,
 };
+use super::{INSTALL_DEADLINE, NO_PROGRESS};
+
+const MAX_HEADER_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FetchError {
@@ -19,6 +24,8 @@ pub enum FetchError {
     Status(u16),
     Io(String),
     NoSpace,
+    Deadline,
+    NoProgress,
 }
 
 impl From<UrlPolicyError> for FetchError {
@@ -53,8 +60,14 @@ pub struct ProductionHttps;
 
 impl ArtifactFetcher for ProductionHttps {
     fn fetch(&self, request: &FetchRequest) -> Result<FetchResponse, FetchError> {
-        follow_catalog_redirects(request, https_get)
+        ensure_ring_provider();
+        let started = Instant::now();
+        follow_catalog_redirects(request, |url| https_get(url, request, started))
     }
+}
+
+fn ensure_ring_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 pub fn follow_catalog_redirects<F>(
@@ -142,8 +155,15 @@ impl ArtifactFetcher for ScriptedFetcher {
     }
 }
 
-fn https_get(url: &CatalogUrl) -> Result<Hop, FetchError> {
+fn https_get(
+    url: &CatalogUrl,
+    request: &FetchRequest,
+    started: Instant,
+) -> Result<Hop, FetchError> {
     // Proxy environment is never read. Direct HTTPS to the catalog host only.
+    if started.elapsed() > INSTALL_DEADLINE {
+        return Err(FetchError::Deadline);
+    }
     let host = url
         .https
         .host_str()
@@ -152,7 +172,10 @@ fn https_get(url: &CatalogUrl) -> Result<Hop, FetchError> {
     check_url(&url.https, &[&host]).map_err(FetchError::from)?;
     let server_name = ServerName::try_from(host.clone())
         .map_err(|_| FetchError::Policy(UrlPolicyError::MissingHost))?;
-    let tcp = std::net::TcpStream::connect((host.as_str(), 443)).map_err(io_err)?;
+    let tcp = connect_https(&host, started)?;
+    tcp.set_read_timeout(Some(NO_PROGRESS)).map_err(io_err)?;
+    tcp.set_write_timeout(Some(NO_PROGRESS)).map_err(io_err)?;
+    ensure_ring_provider();
     let conn = rustls::ClientConnection::new(https_config(), server_name).map_err(tls_err)?;
     let mut stream = rustls::StreamOwned::new(conn, tcp);
     let path = if url.https.path().is_empty() {
@@ -171,9 +194,77 @@ fn https_get(url: &CatalogUrl) -> Result<Hop, FetchError> {
     )
     .map_err(io_err)?;
     stream.flush().map_err(io_err)?;
+    let raw = read_capped_http(&mut stream, request.expected_bytes, started)?;
+    parse_http_hop(&raw, request.expected_bytes)
+}
+
+fn read_capped_http<R: Read>(
+    stream: &mut R,
+    expected_bytes: u64,
+    started: Instant,
+) -> Result<Vec<u8>, FetchError> {
+    let body_cap = usize::try_from(expected_bytes.saturating_add(1)).unwrap_or(usize::MAX);
+    let total_cap = MAX_HEADER_BYTES.saturating_add(body_cap);
     let mut raw = Vec::new();
-    io::Read::read_to_end(&mut stream, &mut raw).map_err(io_err)?;
-    parse_http_hop(&raw)
+    let mut buf = [0_u8; 4096];
+    let mut headers_done = false;
+    loop {
+        if started.elapsed() > INSTALL_DEADLINE {
+            return Err(FetchError::Deadline);
+        }
+        let n = match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(error)
+                if error.kind() == ErrorKind::TimedOut || error.kind() == ErrorKind::WouldBlock =>
+            {
+                return Err(FetchError::NoProgress);
+            }
+            Err(error) => return Err(io_err(error)),
+        };
+        raw.extend_from_slice(&buf[..n]);
+        if !headers_done {
+            if let Some(pos) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+                if pos + 4 > MAX_HEADER_BYTES {
+                    return Err(FetchError::Io("HTTP headers exceed cap".into()));
+                }
+                headers_done = true;
+                let body_len = raw.len() - (pos + 4);
+                if body_len > body_cap {
+                    return Err(FetchError::Oversized {
+                        expected: expected_bytes,
+                        actual: body_len as u64,
+                    });
+                }
+            } else if raw.len() > MAX_HEADER_BYTES {
+                return Err(FetchError::Io("HTTP headers exceed cap".into()));
+            }
+        } else if raw.len() > total_cap {
+            return Err(FetchError::Oversized {
+                expected: expected_bytes,
+                actual: raw.len() as u64,
+            });
+        }
+    }
+    Ok(raw)
+}
+
+fn connect_https(host: &str, started: Instant) -> Result<TcpStream, FetchError> {
+    let addrs = (host, 443).to_socket_addrs().map_err(io_err)?;
+    let mut last = None;
+    for addr in addrs {
+        if started.elapsed() > INSTALL_DEADLINE {
+            return Err(FetchError::Deadline);
+        }
+        match TcpStream::connect_timeout(&addr, NO_PROGRESS) {
+            Ok(tcp) => return Ok(tcp),
+            Err(error) if error.kind() == ErrorKind::TimedOut => {
+                last = Some(FetchError::NoProgress);
+            }
+            Err(error) => last = Some(io_err(error)),
+        }
+    }
+    Err(last.unwrap_or_else(|| FetchError::Io("no HTTPS addresses".into())))
 }
 
 fn https_config() -> Arc<rustls::ClientConfig> {
@@ -186,11 +277,14 @@ fn https_config() -> Arc<rustls::ClientConfig> {
     )
 }
 
-fn parse_http_hop(raw: &[u8]) -> Result<Hop, FetchError> {
+fn parse_http_hop(raw: &[u8], expected_bytes: u64) -> Result<Hop, FetchError> {
     let header_end = raw
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .ok_or_else(|| FetchError::Io("truncated HTTP headers".into()))?;
+    if header_end + 4 > MAX_HEADER_BYTES {
+        return Err(FetchError::Io("HTTP headers exceed cap".into()));
+    }
     let (headers, body) = raw.split_at(header_end + 4);
     let text = std::str::from_utf8(headers)
         .map_err(|_| FetchError::Io("HTTP headers are not UTF-8".into()))?;
@@ -210,7 +304,15 @@ fn parse_http_hop(raw: &[u8]) -> Result<Hop, FetchError> {
         }
     }
     match status {
-        200 => Ok(Hop::Body(body.to_vec())),
+        200 => {
+            if body.len() as u64 > expected_bytes {
+                return Err(FetchError::Oversized {
+                    expected: expected_bytes,
+                    actual: body.len() as u64,
+                });
+            }
+            Ok(Hop::Body(body.to_vec()))
+        }
         301 | 302 | 303 | 307 | 308 => {
             let location =
                 location.ok_or_else(|| FetchError::Io("redirect without Location".into()))?;
@@ -223,6 +325,8 @@ fn parse_http_hop(raw: &[u8]) -> Result<Hop, FetchError> {
 fn io_err(error: io::Error) -> FetchError {
     if error.raw_os_error() == Some(libc::ENOSPC) {
         FetchError::NoSpace
+    } else if error.kind() == ErrorKind::TimedOut {
+        FetchError::NoProgress
     } else {
         FetchError::Io(error.to_string())
     }
@@ -290,18 +394,38 @@ mod tests {
         assert!(!production.contains("var_os"));
         assert!(!production.contains("std::env"));
         assert!(production.contains("Proxy environment is never read"));
+        assert!(production.contains("install_default"));
+        assert!(production.contains("set_read_timeout"));
+        assert!(production.contains("connect_timeout"));
+        assert!(production.contains("NO_PROGRESS"));
+        assert!(production.contains("INSTALL_DEADLINE"));
     }
 
     #[test]
     fn http_parse_redirect_and_ok() {
         let redirect = b"HTTP/1.1 302 Found\r\nLocation: /b\r\n\r\n";
         assert_eq!(
-            parse_http_hop(redirect).unwrap(),
+            parse_http_hop(redirect, 4).unwrap(),
             Hop::Redirect {
                 location: "/b".into()
             }
         );
         let ok = b"HTTP/1.1 200 OK\r\n\r\nabcd";
-        assert_eq!(parse_http_hop(ok).unwrap(), Hop::Body(b"abcd".to_vec()));
+        assert_eq!(parse_http_hop(ok, 4).unwrap(), Hop::Body(b"abcd".to_vec()));
+        assert!(matches!(
+            parse_http_hop(b"HTTP/1.1 200 OK\r\n\r\nabcde", 4),
+            Err(FetchError::Oversized {
+                expected: 4,
+                actual: 5
+            })
+        ));
+    }
+
+    #[test]
+    fn capped_read_rejects_body_past_expected() {
+        let started = Instant::now();
+        let payload = b"HTTP/1.1 200 OK\r\n\r\n0123456789";
+        let error = read_capped_http(&mut payload.as_slice(), 4, started).unwrap_err();
+        assert!(matches!(error, FetchError::Oversized { expected: 4, .. }));
     }
 }

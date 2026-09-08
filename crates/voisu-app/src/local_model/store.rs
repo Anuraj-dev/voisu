@@ -25,9 +25,18 @@ pub struct ModelLease {
     pub catalog_id: String,
 }
 
+pub struct StoreLock {
+    file: File,
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 pub struct ModelStore {
     root: PathBuf,
-    lock: Option<File>,
     lease: Option<ModelLease>,
 }
 
@@ -57,11 +66,7 @@ impl ModelStore {
         safe_fs::ensure_private_dir(&root.join("private")).map_err(StoreError::Fs)?;
         safe_fs::ensure_private_dir(&root.join("artifacts")).map_err(StoreError::Fs)?;
         safe_fs::ensure_private_dir(&root.join("staging")).map_err(StoreError::Fs)?;
-        Ok(Self {
-            root,
-            lock: None,
-            lease: None,
-        })
+        Ok(Self { root, lease: None })
     }
 
     #[must_use]
@@ -69,7 +74,7 @@ impl ModelStore {
         &self.root
     }
 
-    pub fn lock_exclusive(&mut self) -> Result<(), StoreError> {
+    pub fn lock_exclusive(&self) -> Result<StoreLock, StoreError> {
         let path = self.root.join("store.lock");
         let file = OpenOptions::new()
             .read(true)
@@ -83,14 +88,7 @@ impl ModelStore {
         if result != 0 {
             return Err(StoreError::Busy);
         }
-        self.lock = Some(file);
-        Ok(())
-    }
-
-    pub fn unlock(&mut self) {
-        if let Some(file) = self.lock.take() {
-            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        }
+        Ok(StoreLock { file })
     }
 
     pub fn load_active(&self) -> Result<Option<ActiveReceipt>, StoreError> {
@@ -156,14 +154,6 @@ impl ModelStore {
     }
 }
 
-impl Drop for ModelStore {
-    fn drop(&mut self) {
-        if let Some(file) = self.lock.take() {
-            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,9 +172,9 @@ mod tests {
     #[test]
     fn concurrent_lock_is_busy() {
         let temp = tempfile::tempdir().unwrap();
-        let mut first = ModelStore::open(temp.path().to_path_buf()).unwrap();
-        first.lock_exclusive().unwrap();
-        let mut second = ModelStore::open(temp.path().to_path_buf()).unwrap();
-        assert_eq!(second.lock_exclusive(), Err(StoreError::Busy));
+        let first = ModelStore::open(temp.path().to_path_buf()).unwrap();
+        let _held = first.lock_exclusive().unwrap();
+        let second = ModelStore::open(temp.path().to_path_buf()).unwrap();
+        assert!(matches!(second.lock_exclusive(), Err(StoreError::Busy)));
     }
 }

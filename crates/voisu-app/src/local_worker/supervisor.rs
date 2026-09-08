@@ -106,6 +106,9 @@ pub struct FakeWorker {
     pub crash: bool,
     /// Cancel does not reap; the child may still emit a late frame.
     pub ignore_cancel: bool,
+    /// Transcribe stays in-flight until cancel; a late Transcript may follow.
+    pub hold_until_cancel: bool,
+    pub queued_late: Option<String>,
 }
 
 impl Default for FakeWorker {
@@ -121,6 +124,8 @@ impl Default for FakeWorker {
             scripted_error: None,
             crash: false,
             ignore_cancel: false,
+            hold_until_cancel: false,
+            queued_late: None,
         }
     }
 }
@@ -157,6 +162,10 @@ impl WorkerChild for FakeWorker {
                 correlation,
                 pcm_bytes,
             } => {
+                if self.hold_until_cancel {
+                    self.queued_late = self.scripted_text.clone();
+                    return Err(SupervisorError::Busy);
+                }
                 let pcm = pcm.unwrap_or_default();
                 validate_pcm(pcm, None).map_err(SupervisorError::Protocol)?;
                 if pcm.len() > pcm_bytes {

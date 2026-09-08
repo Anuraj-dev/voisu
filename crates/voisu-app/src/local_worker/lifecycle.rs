@@ -28,6 +28,7 @@ pub struct LocalLifecycle<C, D> {
     live: Option<LiveWork>,
     daemon_nonce: String,
     generation: u64,
+    model_receipt_hash: String,
 }
 
 impl LocalLifecycle<FakeWorker, FakeDelivery> {
@@ -46,6 +47,7 @@ impl<C: WorkerChild, D: DeliverySeam> LocalLifecycle<C, D> {
             live: None,
             daemon_nonce: "l3".into(),
             generation: 0,
+            model_receipt_hash: String::new(),
         }
     }
 
@@ -61,6 +63,10 @@ impl<C: WorkerChild, D: DeliverySeam> LocalLifecycle<C, D> {
 
     pub fn delivery_mut(&mut self) -> &mut D {
         &mut self.delivery
+    }
+
+    pub fn pin_model_receipt_hash(&mut self, hash: impl Into<String>) {
+        self.model_receipt_hash = hash.into();
     }
 
     pub fn attach(&mut self, child: C, now: Instant) -> Result<(), SupervisorError> {
@@ -89,7 +95,7 @@ impl<C: WorkerChild, D: DeliverySeam> LocalLifecycle<C, D> {
             generation: self.generation,
             request_id: request_id.to_owned(),
             recording_id: recording_id.to_owned(),
-            model_receipt_hash: "l3-receipt".into(),
+            model_receipt_hash: self.model_receipt_hash.clone(),
         };
         self.live = Some(LiveWork {
             generation: self.generation,
@@ -178,7 +184,7 @@ impl<C: WorkerChild, D: DeliverySeam> LocalLifecycle<C, D> {
             generation: self.generation.max(1),
             request_id: request_id.to_owned(),
             recording_id: recording_id.to_owned(),
-            model_receipt_hash: "l3-receipt".into(),
+            model_receipt_hash: self.model_receipt_hash.clone(),
         }
     }
 }
@@ -195,12 +201,19 @@ mod tests {
     use crate::local_worker::MAX_RESTARTS;
     use std::time::Duration;
 
+    fn fixture_receipt_hash() -> String {
+        crate::local_model::from_entry(crate::local_model::ci_fixture_entry(), "l3-artifact")
+            .receipt_hash
+    }
+
     fn ready(text: &str) -> LocalLifecycle<FakeWorker, FakeDelivery> {
         let mut life = LocalLifecycle::harness();
+        let hash = fixture_receipt_hash();
+        life.pin_model_receipt_hash(hash.clone());
         let worker = FakeWorker {
             scripted_text: Some(text.into()),
             generation: 1,
-            model_receipt_hash: "l3-receipt".into(),
+            model_receipt_hash: hash,
             ..FakeWorker::default()
         };
         life.attach(worker, Instant::now()).unwrap();
@@ -219,10 +232,12 @@ mod tests {
     #[test]
     fn load_abort_does_not_admit_capture_or_delivery() {
         let mut life = LocalLifecycle::harness();
+        let hash = fixture_receipt_hash();
+        life.pin_model_receipt_hash(hash.clone());
         let worker = FakeWorker {
             scripted_error: Some("load_abort".into()),
             generation: 1,
-            model_receipt_hash: "l3-receipt".into(),
+            model_receipt_hash: hash,
             ..FakeWorker::default()
         };
         life.attach(worker, Instant::now()).unwrap();
@@ -276,29 +291,41 @@ mod tests {
 
     #[test]
     fn ignored_cancel_invalidates_generation_before_late_result() {
-        let mut life = ready("late");
-        if let Some(child) = life.supervisor.child_mut() {
-            child.ignore_cancel = true;
-        }
-        let _ = life.transcribe("rec-1", "q", vec![1, 0]);
-        life.delivery_mut().delivered.clear();
-        life.live = Some(LiveWork {
+        let mut life = LocalLifecycle::harness();
+        let hash = fixture_receipt_hash();
+        life.pin_model_receipt_hash(hash.clone());
+        let worker = FakeWorker {
+            scripted_text: Some("late".into()),
             generation: 1,
-            request_id: "q".into(),
-            recording_id: "rec-1".into(),
-            token: None,
-        });
+            model_receipt_hash: hash.clone(),
+            ignore_cancel: true,
+            hold_until_cancel: true,
+            ..FakeWorker::default()
+        };
+        life.attach(worker, Instant::now()).unwrap();
+        if let Some(child) = life.supervisor.child_mut() {
+            child.generation = life.generation;
+        }
+        life.prepare("rec-1", Instant::now()).unwrap();
+        let inflight = life.transcribe("rec-1", "q", vec![1, 0]).unwrap_err();
+        assert!(matches!(inflight, SupervisorError::Busy));
+        assert!(life.delivery_mut().delivered.is_empty());
         let outcome = life.cancel().unwrap();
         assert_eq!(outcome, ReapOutcome::Unreaped);
+        let late_text = life
+            .supervisor
+            .child_mut()
+            .and_then(|child| child.queued_late.clone())
+            .expect("in-flight FakeWorker queued a late Transcript");
         let late = WorkerFrame::Transcript {
             correlation: Correlation {
                 daemon_nonce: "l3".into(),
                 generation: 1,
                 request_id: "q".into(),
                 recording_id: "rec-1".into(),
-                model_receipt_hash: "l3-receipt".into(),
+                model_receipt_hash: hash,
             },
-            text: "late".into(),
+            text: late_text,
         };
         assert!(life.inject_late_frame(late, "rec-1").is_ok());
         assert!(life.delivery_mut().delivered.is_empty());
@@ -314,7 +341,7 @@ mod tests {
                 generation: 1,
                 request_id: "q".into(),
                 recording_id: "rec-1".into(),
-                model_receipt_hash: "l3-receipt".into(),
+                model_receipt_hash: fixture_receipt_hash(),
             },
             text: "late".into(),
         };

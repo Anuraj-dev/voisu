@@ -3,9 +3,9 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crate::local_worker::refuse_production_weight_download;
+use crate::local_worker::{PROTOCOL_VERSION, refuse_production_weight_download};
 
 use super::catalog::{CatalogEntry, sha256_hex, verify_file_digest};
 use super::fetch::{ArtifactFetcher, FetchError, FetchRequest};
@@ -13,9 +13,7 @@ use super::health::{HealthError, HealthProbe};
 use super::receipt::{self, ActiveReceipt};
 use super::safe_fs::{self, SafeFsError};
 use super::store::{ModelStore, StoreError};
-
-pub const INSTALL_DEADLINE: Duration = Duration::from_secs(30 * 60);
-pub const NO_PROGRESS: Duration = Duration::from_secs(30);
+use super::{INSTALL_DEADLINE, NO_PROGRESS};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstallAbort {
@@ -152,7 +150,7 @@ where
             )));
         }
     }
-    request.store.lock_exclusive().map_err(map_store)?;
+    let _lock = request.store.lock_exclusive().map_err(map_store)?;
     let prior = request.store.load_active().map_err(map_store)?;
     if request.io.abort == Some(InstallAbort::AfterLock) {
         return abort(prior);
@@ -170,6 +168,9 @@ where
         return Err(InstallError::NoSpace);
     }
     deadline(request.started)?;
+    if !request.entry.abi_supported() {
+        return Err(InstallError::Abi);
+    }
 
     let token = format!("s-{}", sha256_hex(request.entry.id.as_bytes()));
     let staging = request.store.staging_dir(&token);
@@ -189,6 +190,8 @@ where
             .iter()
             .map(|host| (*host).to_owned())
             .collect();
+        no_progress(Instant::now())?;
+        let fetch_started = Instant::now();
         let fetched = request
             .fetcher
             .fetch(&FetchRequest {
@@ -196,7 +199,8 @@ where
                 allowed_hosts: hosts,
                 expected_bytes: file.bytes,
             })
-            .map_err(InstallError::Fetch)?;
+            .map_err(map_fetch)?;
+        no_progress(fetch_started)?;
         if u64::try_from(fetched.body.len()).unwrap_or(u64::MAX) != file.bytes {
             return Err(InstallError::Size);
         }
@@ -206,29 +210,34 @@ where
         if let Some(errno) = request.io.fail_write {
             return Err(map_write_errno(errno));
         }
+        let write_started = Instant::now();
         let mut dest =
             safe_fs::create_exclusive_file(&staging, file.name).map_err(InstallError::Fs)?;
         safe_fs::durable_write(&mut dest, &fetched.body).map_err(InstallError::Fs)?;
+        no_progress(write_started)?;
         deadline(request.started)?;
     }
     if request.io.abort == Some(InstallAbort::AfterFetch) {
         return abort(prior);
     }
 
-    safe_fs::inspect_tree(&staging).map_err(InstallError::Fs)?;
+    crate::local_model::verify_candidate(request.entry, &staging).map_err(InstallError::Health)?;
     let artifact_hash = tree_hash(&staging, request.entry)?;
-    if request.entry.runtime_abi.abi_id.is_empty() {
+    if request.entry.runtime_abi.protocol != PROTOCOL_VERSION
+        || request.entry.runtime_abi.abi_id.is_empty()
+    {
         return Err(InstallError::Abi);
     }
     let dest = request.store.artifact_dir(request.entry, &artifact_hash);
-    if dest.exists() {
-        safe_fs::inspect_tree(&dest).map_err(InstallError::Fs)?;
+    if safe_fs::dir_present(&dest).map_err(InstallError::Fs)? {
+        crate::local_model::verify_candidate(request.entry, &dest).map_err(InstallError::Health)?;
         let _ = fs::remove_dir_all(&staging);
     } else {
         if let Some(parent) = dest.parent() {
             safe_fs::ensure_private_dir(parent).map_err(InstallError::Fs)?;
         }
         safe_fs::durable_rename(&staging, &dest).map_err(InstallError::Fs)?;
+        crate::local_model::verify_candidate(request.entry, &dest).map_err(InstallError::Health)?;
     }
     if request.io.abort == Some(InstallAbort::AfterPublish) {
         return abort(prior);
@@ -250,8 +259,11 @@ where
 fn tree_hash(dir: &Path, entry: &CatalogEntry) -> Result<String, InstallError> {
     let mut joined = String::new();
     for file in entry.files {
-        let bytes = fs::read(dir.join(file.name))
-            .map_err(|error| InstallError::Fs(SafeFsError::Io(error.to_string())))?;
+        let bytes =
+            safe_fs::read_existing_file(dir, file.name, file.bytes).map_err(InstallError::Fs)?;
+        if !verify_file_digest(&bytes, file.sha256_hex, file.bytes) {
+            return Err(InstallError::Hash);
+        }
         joined.push_str(&sha256_hex(&bytes));
     }
     Ok(sha256_hex(joined.as_bytes()))
@@ -259,6 +271,14 @@ fn tree_hash(dir: &Path, entry: &CatalogEntry) -> Result<String, InstallError> {
 
 fn deadline(started: Instant) -> Result<(), InstallError> {
     if started.elapsed() > INSTALL_DEADLINE {
+        Err(InstallError::Deadline)
+    } else {
+        Ok(())
+    }
+}
+
+fn no_progress(started: Instant) -> Result<(), InstallError> {
+    if started.elapsed() > NO_PROGRESS {
         Err(InstallError::Deadline)
     } else {
         Ok(())
@@ -274,6 +294,13 @@ fn map_store(error: StoreError) -> InstallError {
     match error {
         StoreError::Busy => InstallError::Busy,
         other => InstallError::Store(other),
+    }
+}
+
+fn map_fetch(error: FetchError) -> InstallError {
+    match error {
+        FetchError::Deadline | FetchError::NoProgress => InstallError::Deadline,
+        other => InstallError::Fetch(other),
     }
 }
 
@@ -298,7 +325,8 @@ mod tests {
     use super::*;
     use crate::local_model::catalog::{CatalogEntry, ci_fixture_entry, shipped_catalog};
     use crate::local_model::fetch::{ScriptedFetcher, ScriptedHop};
-    use crate::local_model::health::{FailingHealth, PassingHealth};
+    use crate::local_model::health::{CandidateHealth, FailingHealth};
+    use std::time::Duration;
 
     fn consent(entry: &CatalogEntry) -> InstallConsent {
         InstallConsent {
@@ -326,7 +354,7 @@ mod tests {
             store,
             entry,
             fetcher: &fixture_fetcher(),
-            health: &PassingHealth,
+            health: &CandidateHealth::default(),
             maintenance: &IdleMaintenance,
             consent: consent(entry),
             io: InstallIo::default(),
@@ -364,7 +392,7 @@ mod tests {
             store: &mut store,
             entry,
             fetcher: &fixture_fetcher(),
-            health: &PassingHealth,
+            health: &CandidateHealth::default(),
             maintenance: &IdleMaintenance,
             consent: consent(entry),
             io: InstallIo::default(),
@@ -387,7 +415,7 @@ mod tests {
             store: &mut store,
             entry,
             fetcher: &fetcher,
-            health: &PassingHealth,
+            health: &CandidateHealth::default(),
             maintenance: &IdleMaintenance,
             consent: consent(entry),
             io: InstallIo::default(),
@@ -410,7 +438,7 @@ mod tests {
             store: &mut store,
             entry,
             fetcher: &fetcher,
-            health: &PassingHealth,
+            health: &CandidateHealth::default(),
             maintenance: &IdleMaintenance,
             consent: consent(entry),
             io: InstallIo::default(),
@@ -428,13 +456,13 @@ mod tests {
     fn enospc_keeps_prior_receipt() {
         let (_temp, mut store) = open_store();
         let prior = install_ok(&mut store);
-        store.unlock();
+
         let entry = ci_fixture_entry();
         let error = install_entry(InstallRequest {
             store: &mut store,
             entry,
             fetcher: &fixture_fetcher(),
-            health: &PassingHealth,
+            health: &CandidateHealth::default(),
             maintenance: &IdleMaintenance,
             consent: consent(entry),
             io: InstallIo {
@@ -455,7 +483,7 @@ mod tests {
     fn redirect_escape_does_not_replace_receipt() {
         let (_temp, mut store) = open_store();
         let prior = install_ok(&mut store);
-        store.unlock();
+
         let entry = ci_fixture_entry();
         let fetcher = ScriptedFetcher::new(vec![ScriptedHop::Redirect(
             "https://evil.example/weights.bin".into(),
@@ -464,7 +492,7 @@ mod tests {
             store: &mut store,
             entry,
             fetcher: &fetcher,
-            health: &PassingHealth,
+            health: &CandidateHealth::default(),
             maintenance: &IdleMaintenance,
             consent: consent(entry),
             io: InstallIo::default(),
@@ -485,7 +513,7 @@ mod tests {
     fn failed_health_does_not_activate() {
         let (_temp, mut store) = open_store();
         let prior = install_ok(&mut store);
-        store.unlock();
+
         let entry = ci_fixture_entry();
         let error = install_entry(InstallRequest {
             store: &mut store,
@@ -518,13 +546,13 @@ mod tests {
         ] {
             let (_temp, mut store) = open_store();
             let prior = install_ok(&mut store);
-            store.unlock();
+
             let entry = ci_fixture_entry();
             let error = install_entry(InstallRequest {
                 store: &mut store,
                 entry,
                 fetcher: &fixture_fetcher(),
-                health: &PassingHealth,
+                health: &CandidateHealth::default(),
                 maintenance: &IdleMaintenance,
                 consent: consent(entry),
                 io: InstallIo {
@@ -544,17 +572,29 @@ mod tests {
     }
 
     #[test]
+    fn sequential_installs_on_the_same_store_release_the_lock() {
+        let (_temp, mut store) = open_store();
+        let first = install_ok(&mut store);
+        let second = install_ok(&mut store);
+        assert_eq!(first.catalog_id, second.catalog_id);
+        assert_eq!(
+            store.load_active().unwrap().unwrap().receipt_hash,
+            second.receipt_hash
+        );
+    }
+
+    #[test]
     fn concurrent_setup_is_serialized() {
         let temp = tempfile::tempdir().unwrap();
-        let mut first = ModelStore::open(temp.path().to_path_buf()).unwrap();
-        first.lock_exclusive().unwrap();
+        let first = ModelStore::open(temp.path().to_path_buf()).unwrap();
+        let _held = first.lock_exclusive().unwrap();
         let mut second = ModelStore::open(temp.path().to_path_buf()).unwrap();
         let entry = ci_fixture_entry();
         let error = install_entry(InstallRequest {
             store: &mut second,
             entry,
             fetcher: &fixture_fetcher(),
-            health: &PassingHealth,
+            health: &CandidateHealth::default(),
             maintenance: &IdleMaintenance,
             consent: consent(entry),
             io: InstallIo::default(),
@@ -572,7 +612,7 @@ mod tests {
             store: &mut store,
             entry,
             fetcher: &fixture_fetcher(),
-            health: &PassingHealth,
+            health: &CandidateHealth::default(),
             maintenance: &BusyMaintenance {
                 kind: MaintenanceKind::Recording,
             },

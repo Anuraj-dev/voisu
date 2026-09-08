@@ -1,12 +1,12 @@
 //! Directory-descriptor relative opens. Symlinks, FIFOs, and escapes fail.
 
 use std::ffi::CString;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Write};
+use std::fs::{self, File};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Component, Path};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SafeFsError {
@@ -16,38 +16,102 @@ pub enum SafeFsError {
     Fifo,
     Device,
     UnsafeName,
+    WorldWritable,
+    NotFound,
     Io(String),
 }
 
 impl From<io::Error> for SafeFsError {
     fn from(error: io::Error) -> Self {
-        Self::Io(error.to_string())
+        if error.kind() == ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENOENT) {
+            Self::NotFound
+        } else {
+            Self::Io(error.to_string())
+        }
     }
 }
 
 pub fn ensure_private_dir(path: &Path) -> Result<(), SafeFsError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                return Err(SafeFsError::Symlink);
+    if let Some(parent) = path.parent() {
+        check_ancestors(parent)?;
+    }
+    create_owned_components(path)
+}
+
+fn check_ancestors(mut path: &Path) -> Result<(), SafeFsError> {
+    loop {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(SafeFsError::Symlink);
+                }
+                if !metadata.is_dir() {
+                    return Err(SafeFsError::NotRegular);
+                }
+                let mode = metadata.mode();
+                let other_write = mode & 0o002 != 0;
+                let sticky = mode & 0o1000 != 0;
+                if other_write && !sticky {
+                    return Err(SafeFsError::WorldWritable);
+                }
+                if metadata.uid() == unsafe { libc::geteuid() } && mode & 0o022 != 0 && !sticky {
+                    return Err(SafeFsError::WorldWritable);
+                }
             }
-            if !metadata.is_dir() {
-                return Err(SafeFsError::NotRegular);
-            }
-            if metadata.uid() != unsafe { libc::geteuid() } {
-                return Err(SafeFsError::Io(
-                    "directory is not owned by the current user".into(),
-                ));
-            }
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .recursive(true)
-                .create(path)?;
+        match path.parent() {
+            Some(parent) if parent != path => path = parent,
+            _ => break,
         }
-        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn create_owned_components(path: &Path) -> Result<(), SafeFsError> {
+    let mut built = PathBuf::new();
+    for component in path.components() {
+        built.push(component.as_os_str());
+        match component {
+            Component::Prefix(_) | Component::RootDir => continue,
+            Component::CurDir | Component::ParentDir => return Err(SafeFsError::Escape),
+            Component::Normal(_) => {}
+        }
+        match fs::symlink_metadata(&built) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(SafeFsError::Symlink);
+                }
+                if !metadata.is_dir() {
+                    return Err(SafeFsError::NotRegular);
+                }
+                let dir = open_dir(&built)?;
+                drop(dir);
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let parent = built.parent().ok_or(SafeFsError::Escape)?;
+                let parent_dir = open_dir(parent)?;
+                let name = built.file_name().ok_or(SafeFsError::UnsafeName)?;
+                let c_name = CString::new(name.as_bytes()).map_err(|_| SafeFsError::UnsafeName)?;
+                let created =
+                    unsafe { libc::mkdirat(parent_dir.as_raw_fd(), c_name.as_ptr(), 0o700) };
+                if created != 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() != ErrorKind::AlreadyExists {
+                        return Err(err.into());
+                    }
+                }
+                let dir = open_dir(&built)?;
+                if dir.metadata()?.uid() != unsafe { libc::geteuid() } {
+                    return Err(SafeFsError::Io(
+                        "directory is not owned by the current user".into(),
+                    ));
+                }
+                fs::set_permissions(&built, fs::Permissions::from_mode(0o700))?;
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(())
 }
@@ -98,42 +162,120 @@ pub fn create_exclusive_file(dir: &Path, name: &str) -> Result<File, SafeFsError
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-pub fn inspect_tree(root: &Path) -> Result<(), SafeFsError> {
-    inspect_tree_at(root, Path::new(""))
-}
-
-fn inspect_tree_at(root: &Path, rel: &Path) -> Result<(), SafeFsError> {
-    let path = if rel.as_os_str().is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(rel)
-    };
-    let metadata = fs::symlink_metadata(&path)?;
-    if metadata.file_type().is_symlink() {
-        return Err(SafeFsError::Symlink);
-    }
-    if metadata.file_type().is_fifo() {
-        return Err(SafeFsError::Fifo);
-    }
-    if metadata.file_type().is_block_device() || metadata.file_type().is_char_device() {
-        return Err(SafeFsError::Device);
-    }
-    if metadata.is_dir() {
-        for entry in fs::read_dir(&path)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if name == "." || name == ".." {
-                continue;
-            }
-            if name.as_bytes().contains(&b'/') {
-                return Err(SafeFsError::Escape);
-            }
-            inspect_tree_at(root, &rel.join(name))?;
-        }
-        return Ok(());
-    }
+pub fn open_existing_file(dir: &Path, name: &str) -> Result<File, SafeFsError> {
+    let name = relative_file_name(name)?;
+    let dir_file = open_dir(dir)?;
+    let c_name = CString::new(name).map_err(|_| SafeFsError::UnsafeName)?;
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NOCTTY;
+    let fd = open_relative(dir_file.as_raw_fd(), &c_name, flags, 0)?;
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    reject_special(&metadata)?;
     if !metadata.is_file() {
         return Err(SafeFsError::NotRegular);
+    }
+    Ok(file)
+}
+
+pub fn read_existing_file(
+    dir: &Path,
+    name: &str,
+    expected_bytes: u64,
+) -> Result<Vec<u8>, SafeFsError> {
+    let mut file = open_existing_file(dir, name)?;
+    let mut bytes = Vec::new();
+    let cap = expected_bytes
+        .saturating_add(1)
+        .try_into()
+        .unwrap_or(usize::MAX);
+    let mut buf = [0_u8; 8192];
+    loop {
+        if bytes.len() > cap {
+            return Err(SafeFsError::Io("file exceeds catalog size".into()));
+        }
+        match file.read(&mut buf)? {
+            0 => break,
+            n => bytes.extend_from_slice(&buf[..n]),
+        }
+        if bytes.len() as u64 > expected_bytes {
+            return Err(SafeFsError::Io("file exceeds catalog size".into()));
+        }
+    }
+    Ok(bytes)
+}
+
+pub fn dir_present(path: &Path) -> Result<bool, SafeFsError> {
+    match open_dir(path) {
+        Ok(_) => Ok(true),
+        Err(SafeFsError::NotFound) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn inspect_tree(root: &Path) -> Result<(), SafeFsError> {
+    let file = open_path_nofollow(root)?;
+    inspect_opened(&file)
+}
+
+fn inspect_opened(file: &File) -> Result<(), SafeFsError> {
+    let metadata = file.metadata()?;
+    reject_special(&metadata)?;
+    if metadata.is_file() {
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Err(SafeFsError::NotRegular);
+    }
+    let dirfd = file.as_raw_fd();
+    let proc = format!("/proc/self/fd/{dirfd}");
+    for entry in fs::read_dir(&proc)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "." || name == ".." {
+            continue;
+        }
+        if name.as_bytes().contains(&b'/') || name.as_bytes().contains(&0) {
+            return Err(SafeFsError::Escape);
+        }
+        let c_name = CString::new(name.as_bytes()).map_err(|_| SafeFsError::UnsafeName)?;
+        let flags =
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_NONBLOCK;
+        let fd = open_relative(dirfd, &c_name, flags, 0)?;
+        let child = unsafe { File::from_raw_fd(fd) };
+        inspect_opened(&child)?;
+    }
+    Ok(())
+}
+
+pub fn list_regular_names(root: &Path) -> Result<Vec<String>, SafeFsError> {
+    let dir = open_dir(root)?;
+    let dirfd = dir.as_raw_fd();
+    let proc = format!("/proc/self/fd/{dirfd}");
+    let mut names = Vec::new();
+    for entry in fs::read_dir(proc)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let utf = name.to_str().ok_or(SafeFsError::UnsafeName)?.to_owned();
+        relative_file_name(&utf)?;
+        names.push(utf);
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn reject_special(metadata: &fs::Metadata) -> Result<(), SafeFsError> {
+    let ft = metadata.file_type();
+    if ft.is_symlink() {
+        return Err(SafeFsError::Symlink);
+    }
+    if ft.is_fifo() {
+        return Err(SafeFsError::Fifo);
+    }
+    if ft.is_block_device() || ft.is_char_device() || ft.is_socket() {
+        return Err(SafeFsError::Device);
     }
     Ok(())
 }
@@ -145,11 +287,21 @@ pub fn durable_write(file: &mut File, bytes: &[u8]) -> Result<(), SafeFsError> {
 }
 
 pub fn durable_rename(from: &Path, to: &Path) -> Result<(), SafeFsError> {
-    if to.exists() {
+    if dir_present(to)? {
         return Err(SafeFsError::Io(format!(
             "refusing to replace existing path {}",
             to.display()
         )));
+    }
+    match fs::symlink_metadata(to) {
+        Ok(_) => {
+            return Err(SafeFsError::Io(format!(
+                "refusing to replace existing path {}",
+                to.display()
+            )));
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     fs::rename(from, to)?;
     if let Some(parent) = to.parent() {
@@ -158,18 +310,57 @@ pub fn durable_rename(from: &Path, to: &Path) -> Result<(), SafeFsError> {
     Ok(())
 }
 
+fn open_path_nofollow(path: &Path) -> Result<File, SafeFsError> {
+    open_walk(path, false)
+}
+
 fn open_dir(path: &Path) -> Result<File, SafeFsError> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| {
-            if error.raw_os_error() == Some(libc::ELOOP) {
-                SafeFsError::Symlink
-            } else {
-                error.into()
+    open_walk(path, true)
+}
+
+fn open_walk(path: &Path, must_dir: bool) -> Result<File, SafeFsError> {
+    let components: Vec<_> = path.components().collect();
+    if components.is_empty() {
+        return Err(SafeFsError::UnsafeName);
+    }
+    let mut current: Option<File> = None;
+    for (index, component) in components.iter().enumerate() {
+        let last = index + 1 == components.len();
+        match component {
+            Component::Prefix(_) | Component::ParentDir => return Err(SafeFsError::Escape),
+            Component::CurDir => continue,
+            Component::RootDir => {
+                let fd = unsafe {
+                    libc::open(
+                        c"/".as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOCTTY,
+                    )
+                };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                current = Some(unsafe { File::from_raw_fd(fd) });
             }
-        })
+            Component::Normal(name) => {
+                let c_name = CString::new(name.as_bytes()).map_err(|_| SafeFsError::UnsafeName)?;
+                let mut flags =
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NOCTTY;
+                if !last || must_dir {
+                    flags |= libc::O_DIRECTORY;
+                }
+                if last && !must_dir {
+                    flags |= libc::O_NONBLOCK;
+                }
+                let dirfd = current
+                    .as_ref()
+                    .map(File::as_raw_fd)
+                    .unwrap_or(libc::AT_FDCWD);
+                let fd = open_relative(dirfd, &c_name, flags, 0)?;
+                current = Some(unsafe { File::from_raw_fd(fd) });
+            }
+        }
+    }
+    current.ok_or(SafeFsError::UnsafeName)
 }
 
 fn open_relative(
@@ -183,13 +374,19 @@ fn open_relative(
     }
     let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags, mode) };
     if fd < 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ELOOP) {
-            return Err(SafeFsError::Symlink);
-        }
-        return Err(error.into());
+        return Err(map_open_errno(io::Error::last_os_error()));
     }
     Ok(fd)
+}
+
+fn map_open_errno(error: io::Error) -> SafeFsError {
+    match error.raw_os_error() {
+        Some(libc::ELOOP) => SafeFsError::Symlink,
+        Some(libc::EXDEV) => SafeFsError::Escape,
+        Some(libc::ENXIO) => SafeFsError::Fifo,
+        Some(libc::ENOENT) => SafeFsError::NotFound,
+        _ => error.into(),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -228,10 +425,7 @@ fn openat2_relative(
         if error.raw_os_error() == Some(libc::ENOSYS) {
             return None;
         }
-        if error.raw_os_error() == Some(libc::ELOOP) || error.raw_os_error() == Some(libc::EXDEV) {
-            return Some(Err(SafeFsError::Escape));
-        }
-        return Some(Err(error.into()));
+        return Some(Err(map_open_errno(error)));
     }
     Some(Ok(fd as RawFd))
 }
@@ -250,7 +444,7 @@ fn openat2_relative(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixDatagram;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn traversal_and_dot_names_are_rejected() {
@@ -278,6 +472,24 @@ mod tests {
             assert_eq!(libc::mkfifo(c.as_ptr(), 0o600), 0);
         }
         assert_eq!(inspect_tree(&fifo), Err(SafeFsError::Fifo));
-        let _ = UnixDatagram::unbound();
+    }
+
+    #[test]
+    fn world_writable_non_sticky_ancestor_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let ancestor = root.path().join("open");
+        fs::create_dir(&ancestor).unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o777)).unwrap();
+        let child = ancestor.join("models");
+        assert_eq!(ensure_private_dir(&child), Err(SafeFsError::WorldWritable));
+    }
+
+    #[test]
+    fn inspect_opens_with_nofollow_directory_flags() {
+        let source = include_str!("safe_fs.rs");
+        assert!(source.contains("O_DIRECTORY"));
+        assert!(source.contains("O_NOFOLLOW"));
+        assert!(source.contains("RESOLVE_BENEATH"));
+        assert!(source.contains("RESOLVE_NO_SYMLINKS"));
     }
 }
