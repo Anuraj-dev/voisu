@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.51.0
+Version:        0.52.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,9 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Tue Sep 08 2026 Voisu maintainers <voisu@example.invalid> - 0.52.0-1
+- feat(delivery): paste Hyprland transcripts through send_key_state
+
 * Mon Sep 07 2026 Voisu maintainers <voisu@example.invalid> - 0.51.0-1
 - feat(ir): join letter-by-letter spellings in Intent Reconstruction
 
