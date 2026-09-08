@@ -54,7 +54,7 @@ use voisu_core::{
     SmartWritingDiagnostic, SourceTranscript, SourceTranscriptRecord, Transcript,
     TranscriptDecision, TranscriptDecisionPipeline, TranscriptProvider, TranscriptValidator,
     TriggerKeyBinding, VersionEnvelope, clamp_stored_transcript_text, replay_capture,
-    resolve_session, sanitize_source_transcripts, socket_path,
+    resolve_session, sanitize_source_transcripts, socket_path, stop_anchored_timings,
 };
 
 const MAX_FRAME_BYTES: u64 = 16 * 1024;
@@ -1883,12 +1883,7 @@ fn atomic_millis(value: &AtomicU64) -> Option<u64> {
 }
 
 fn elapsed_millis(started_at: Instant) -> u64 {
-    duration_millis(started_at.elapsed())
-}
-
-/// Milliseconds of a measured duration, saturating on overflow.
-fn duration_millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Builds the Deepgram Provider adapter for this daemon. When Deepgram is
@@ -2217,8 +2212,10 @@ async fn process_recording(
     // Recording off) anchors every stop-anchored telemetry field, so they
     // exclude the user's speech duration — unlike the deprecated
     // `release_to_text_ms`, which is measured from `started_at`.
-    evidence.recording_duration_ms =
-        Some(duration_millis(utterance_end.duration_since(started_at)));
+    evidence.recording_duration_ms = Some(
+        stop_anchored_timings(started_at, utterance_end, utterance_end, utterance_end)
+            .recording_duration_ms,
+    );
     let pump = pump.await;
     evidence.streamed_chunk_count = chunk_counter.load(Ordering::SeqCst);
     evidence.first_chunk_ms = atomic_millis(&first_chunk_ms);
@@ -2380,7 +2377,10 @@ async fn process_recording(
         // The transcript is now settled: validation and any reconciliation (the
         // late-reconstruction window) have resolved and the delivered text is
         // known. Measured from the stop, so it excludes speech duration.
-        evidence.stop_to_finalized_ms = Some(elapsed_millis(utterance_end));
+        let finalized_at = Instant::now();
+        let timings = stop_anchored_timings(started_at, utterance_end, finalized_at, finalized_at);
+        evidence.recording_duration_ms = Some(timings.recording_duration_ms);
+        evidence.stop_to_finalized_ms = Some(timings.stop_to_finalized_ms);
         if let Some(attempt) = &decision.intent_reconstruction {
             evidence.intent_reconstruction = Some(IntentReconstructionDiagnostic {
                 model: voisu_app::system::DEFAULT_GROQ_RECONCILIATION_MODEL.to_owned(),
@@ -2488,9 +2488,11 @@ async fn process_recording(
         evidence.delivery_method = Some(delivery_outcome.method);
         evidence.delivery_fallback_reason = delivery_outcome.fallback_reason;
         evidence.release_to_text_ms = Some(elapsed_millis(started_at));
-        // Delivery completed: measured from the stop, so it excludes the
-        // speech duration that inflates the deprecated `release_to_text_ms`.
-        evidence.stop_to_delivered_ms = Some(elapsed_millis(utterance_end));
+        let delivered_at = Instant::now();
+        let timings = stop_anchored_timings(started_at, utterance_end, finalized_at, delivered_at);
+        evidence.recording_duration_ms = Some(timings.recording_duration_ms);
+        evidence.stop_to_finalized_ms = Some(timings.stop_to_finalized_ms);
+        evidence.stop_to_delivered_ms = Some(timings.stop_to_delivered_ms);
         evidence.stages.push(LifecycleStage::DeliveryCompleted);
         Ok(())
     }

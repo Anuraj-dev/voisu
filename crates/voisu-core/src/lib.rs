@@ -22,6 +22,7 @@ mod wav;
 pub use wav::{WavScan, scan_wav_pcm};
 
 mod diagnostics;
+mod timing;
 pub use diagnostics::{
     ConfidenceArbitrationDiagnostic, ConfidenceArbitrationRejection, DEFAULT_DEBUG_AUDIO_TTL,
     DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS, DebugAudioRecord, DiagnosticExport, DiagnosticRecord,
@@ -39,6 +40,8 @@ pub use diagnostics::{
     replay_capture, sanitize_url, scrub_embedded_urls, scrub_secret_values,
     text_sha256_fingerprint, unix_millis_now,
 };
+pub(crate) use timing::duration_millis;
+pub use timing::{StopAnchoredTimings, stop_anchored_timings};
 
 mod confidence_arbitration;
 
@@ -4222,10 +4225,6 @@ impl ProviderCoordinator {
             })
         }
     }
-}
-
-fn duration_millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 pub trait TranscriptValidator: Send {

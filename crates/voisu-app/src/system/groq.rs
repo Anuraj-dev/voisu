@@ -99,6 +99,7 @@ impl TranscriptProvider for GroqProvider {
 /// other than the host that was gated. Parsing instead of prefix matching is
 /// what makes the policy hold: `http://localhost:8080@attacker.example/` has a
 /// loopback-LOOKING authority prefix whose real host is attacker.example.
+/// Live-provider transport only (HTTPS, or HTTP on loopback); not a download allowlist.
 pub(super) fn provider_endpoint_url(endpoint: &str) -> Option<url::Url> {
     if !endpoint_raw_string_is_allowed(endpoint) {
         return None;
