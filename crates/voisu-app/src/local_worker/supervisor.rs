@@ -74,10 +74,12 @@ impl RestartBudget {
 }
 
 pub trait WorkerChild {
+    /// Must return `TimedOut` instead of blocking past `deadline`.
     fn exchange(
         &mut self,
         control: ControlFrame,
         pcm: Option<&[u8]>,
+        deadline: Instant,
     ) -> Result<WorkerFrame, SupervisorError>;
     fn cancel_and_reap(&mut self) -> Result<ReapOutcome, SupervisorError>;
 }
@@ -89,6 +91,10 @@ pub struct FakeWorker {
     pub model_receipt_hash: String,
     pub observed_device: String,
     pub scripted_text: Option<String>,
+    /// Simulated work duration. Compared to `deadline` without sleeping.
+    pub block_for: Option<Duration>,
+    /// If set, the worker echoes this correlation instead of the inbound one.
+    pub response_correlation: Option<Correlation>,
 }
 
 impl Default for FakeWorker {
@@ -98,6 +104,8 @@ impl Default for FakeWorker {
             model_receipt_hash: "harness-no-weights".into(),
             observed_device: "cpu".into(),
             scripted_text: None,
+            block_for: None,
+            response_correlation: None,
         }
     }
 }
@@ -107,13 +115,17 @@ impl WorkerChild for FakeWorker {
         &mut self,
         control: ControlFrame,
         pcm: Option<&[u8]>,
+        deadline: Instant,
     ) -> Result<WorkerFrame, SupervisorError> {
+        if would_exceed_deadline(deadline, self.block_for) {
+            return Err(SupervisorError::TimedOut);
+        }
         match control {
             ControlFrame::Prepare(correlation) => {
                 let expected = self.live_correlation(&correlation);
                 correlations_match(&expected, &correlation).map_err(SupervisorError::Protocol)?;
                 Ok(WorkerFrame::Ready {
-                    correlation,
+                    correlation: self.outbound_correlation(correlation),
                     observed_device: self.observed_device.clone(),
                 })
             }
@@ -140,6 +152,7 @@ impl WorkerChild for FakeWorker {
                     model_receipt_hash: self.model_receipt_hash.clone(),
                 };
                 correlations_match(&expected, &correlation).map_err(SupervisorError::Protocol)?;
+                let correlation = self.outbound_correlation(correlation);
                 let frame = if is_silence_pcm(pcm) {
                     WorkerFrame::NoText {
                         correlation,
@@ -188,6 +201,18 @@ impl FakeWorker {
             model_receipt_hash: self.model_receipt_hash.clone(),
         }
     }
+
+    fn outbound_correlation(&self, inbound: Correlation) -> Correlation {
+        self.response_correlation.clone().unwrap_or(inbound)
+    }
+}
+
+fn would_exceed_deadline(deadline: Instant, block_for: Option<Duration>) -> bool {
+    let start = Instant::now();
+    if start >= deadline {
+        return true;
+    }
+    block_for.is_some_and(|block| deadline.saturating_duration_since(start) < block)
 }
 
 pub struct WorkerSupervisor<C> {
@@ -230,12 +255,12 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
     fn conclude_exchange(
         &mut self,
         result: Result<WorkerFrame, SupervisorError>,
-        deadline_exceeded: bool,
+        deadline: Instant,
     ) -> Result<WorkerFrame, SupervisorError> {
-        if deadline_exceeded {
-            self.state = WorkerState::Unavailable;
-            self.last_terminal_request = None;
-            return Err(SupervisorError::TimedOut);
+        let timed_out =
+            matches!(result, Err(SupervisorError::TimedOut)) || Instant::now() > deadline;
+        if timed_out {
+            return Err(self.timeout_and_reap());
         }
         match result {
             Ok(frame) => Ok(frame),
@@ -253,10 +278,39 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         }
     }
 
+    /// Bound a hung exchange: reap, detach, and leave Absent/Unavailable.
+    fn timeout_and_reap(&mut self) -> SupervisorError {
+        let outcome = match self.child.as_mut() {
+            Some(child) => child.cancel_and_reap().unwrap_or(ReapOutcome::Unreaped),
+            None => ReapOutcome::Exited,
+        };
+        self.child = None;
+        self.last_terminal_request = None;
+        self.state = match outcome {
+            ReapOutcome::Unreaped => WorkerState::Unavailable,
+            ReapOutcome::Exited | ReapOutcome::Killed => WorkerState::Absent,
+        };
+        SupervisorError::TimedOut
+    }
+
+    fn protocol_reject(&mut self, err: FrameError) -> SupervisorError {
+        self.state = WorkerState::Ready;
+        SupervisorError::Protocol(err)
+    }
+
     pub fn prepare(
         &mut self,
         correlation: Correlation,
         now: Instant,
+    ) -> Result<Duration, SupervisorError> {
+        self.prepare_until(correlation, now, now + LOAD_DEADLINE)
+    }
+
+    fn prepare_until(
+        &mut self,
+        correlation: Correlation,
+        now: Instant,
+        deadline: Instant,
     ) -> Result<Duration, SupervisorError> {
         if matches!(self.state, WorkerState::Busy | WorkerState::Stopping) {
             return Err(SupervisorError::Busy);
@@ -265,20 +319,24 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
             return Err(SupervisorError::NotReady(self.state));
         }
         self.state = WorkerState::Loading;
-        let started = now;
-        let exchanged = self
-            .child
-            .as_mut()
-            .expect("child checked")
-            .exchange(ControlFrame::Prepare(correlation), None);
-        let frame = self.conclude_exchange(exchanged, started.elapsed() > LOAD_DEADLINE)?;
+        let expected = correlation.clone();
+        let exchanged = self.child.as_mut().expect("child checked").exchange(
+            ControlFrame::Prepare(correlation),
+            None,
+            deadline,
+        );
+        let frame = self.conclude_exchange(exchanged, deadline)?;
         match frame {
             WorkerFrame::Ready {
-                observed_device, ..
+                correlation,
+                observed_device,
             } => {
+                if let Err(err) = correlations_match(&expected, &correlation) {
+                    return Err(self.protocol_reject(err));
+                }
                 self.observed_device = observed_device;
                 self.state = WorkerState::Ready;
-                Ok(started.elapsed())
+                Ok(now.elapsed())
             }
             _ => {
                 self.state = WorkerState::Unavailable;
@@ -292,6 +350,14 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         &mut self,
         request: TranscribeRequest,
     ) -> Result<WorkerOutcome, SupervisorError> {
+        self.transcribe_until(request, Instant::now() + STOP_PROCESSING)
+    }
+
+    fn transcribe_until(
+        &mut self,
+        request: TranscribeRequest,
+        deadline: Instant,
+    ) -> Result<WorkerOutcome, SupervisorError> {
         if self.state != WorkerState::Ready {
             return Err(SupervisorError::NotReady(self.state));
         }
@@ -304,17 +370,21 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
             return Err(SupervisorError::NotReady(self.state));
         }
         self.state = WorkerState::Busy;
-        let started = Instant::now();
+        let expected = request.correlation.clone();
         let exchanged = self.child.as_mut().expect("child checked").exchange(
             ControlFrame::Transcribe {
                 correlation: request.correlation,
                 pcm_bytes: request.pcm.len(),
             },
             Some(&request.pcm),
+            deadline,
         );
-        let frame = self.conclude_exchange(exchanged, started.elapsed() > STOP_PROCESSING)?;
+        let frame = self.conclude_exchange(exchanged, deadline)?;
         match frame {
-            WorkerFrame::Transcript { text, .. } => {
+            WorkerFrame::Transcript { text, correlation } => {
+                if let Err(err) = correlations_match(&expected, &correlation) {
+                    return Err(self.protocol_reject(err));
+                }
                 self.last_terminal_request = Some(request_id);
                 self.state = WorkerState::Ready;
                 if text.trim().is_empty() {
@@ -329,7 +399,13 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
                     })
                 }
             }
-            WorkerFrame::NoText { reason, .. } => {
+            WorkerFrame::NoText {
+                reason,
+                correlation,
+            } => {
+                if let Err(err) = correlations_match(&expected, &correlation) {
+                    return Err(self.protocol_reject(err));
+                }
                 self.last_terminal_request = Some(request_id);
                 self.state = WorkerState::Ready;
                 Ok(WorkerOutcome::NoText {
@@ -526,6 +602,111 @@ mod tests {
             error,
             SupervisorError::NotReady(WorkerState::Absent)
         ));
+    }
+
+    #[test]
+    fn transcribe_rejects_mismatched_response_correlation() {
+        let mut supervisor = ready_supervisor(Some("secret"));
+        if let Some(child) = supervisor.child_mut() {
+            let mut echoed = corr();
+            echoed.request_id = "other".into();
+            child.response_correlation = Some(echoed);
+        }
+        let error = supervisor
+            .transcribe(TranscribeRequest {
+                correlation: corr(),
+                pcm: vec![1, 0],
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SupervisorError::Protocol(FrameError::CorrelationMismatch)
+        ));
+        assert_eq!(supervisor.state(), WorkerState::Ready);
+        assert!(supervisor.child_mut().is_some());
+    }
+
+    #[test]
+    fn prepare_rejects_ready_with_wrong_correlation() {
+        let mut wrong = corr();
+        wrong.generation = 99;
+        let worker = FakeWorker {
+            response_correlation: Some(wrong),
+            ..FakeWorker::default()
+        };
+        let mut supervisor = WorkerSupervisor::absent();
+        supervisor.attach_ready(worker, Instant::now()).unwrap();
+        let error = supervisor.prepare(corr(), Instant::now()).unwrap_err();
+        assert!(matches!(
+            error,
+            SupervisorError::Protocol(FrameError::CorrelationMismatch)
+        ));
+        assert_eq!(supervisor.state(), WorkerState::Ready);
+        if let Some(child) = supervisor.child_mut() {
+            child.response_correlation = None;
+        }
+        supervisor.prepare(corr(), Instant::now()).unwrap();
+        assert_eq!(supervisor.state(), WorkerState::Ready);
+    }
+
+    #[test]
+    fn hung_exchange_times_out_and_reaps_without_staying_busy() {
+        let worker = FakeWorker {
+            block_for: Some(Duration::from_millis(20)),
+            scripted_text: Some("hi".into()),
+            ..FakeWorker::default()
+        };
+        let mut supervisor = WorkerSupervisor::absent();
+        supervisor.attach_ready(worker, Instant::now()).unwrap();
+        supervisor
+            .prepare_until(
+                corr(),
+                Instant::now(),
+                Instant::now() + Duration::from_millis(50),
+            )
+            .unwrap();
+        let error = supervisor
+            .transcribe_until(
+                TranscribeRequest {
+                    correlation: corr(),
+                    pcm: vec![1, 0],
+                },
+                Instant::now() + Duration::from_millis(1),
+            )
+            .unwrap_err();
+        assert!(matches!(error, SupervisorError::TimedOut));
+        assert_eq!(supervisor.state(), WorkerState::Absent);
+        assert!(supervisor.child_mut().is_none());
+        let follow = supervisor
+            .transcribe(TranscribeRequest {
+                correlation: corr(),
+                pcm: vec![1, 0],
+            })
+            .unwrap_err();
+        assert!(matches!(
+            follow,
+            SupervisorError::NotReady(WorkerState::Absent)
+        ));
+    }
+
+    #[test]
+    fn hung_prepare_times_out_and_does_not_stay_loading() {
+        let worker = FakeWorker {
+            block_for: Some(Duration::from_millis(20)),
+            ..FakeWorker::default()
+        };
+        let mut supervisor = WorkerSupervisor::absent();
+        supervisor.attach_ready(worker, Instant::now()).unwrap();
+        let error = supervisor
+            .prepare_until(
+                corr(),
+                Instant::now(),
+                Instant::now() + Duration::from_millis(1),
+            )
+            .unwrap_err();
+        assert!(matches!(error, SupervisorError::TimedOut));
+        assert_eq!(supervisor.state(), WorkerState::Absent);
+        assert!(supervisor.child_mut().is_none());
     }
 
     #[test]

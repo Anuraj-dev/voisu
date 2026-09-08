@@ -350,9 +350,7 @@ impl<C: CaptureSeam, D: DeliverySeam> FeasibilityRunner<C, D> {
         }
         for (kind, token) in &case.critical {
             let haystack = hypothesis.as_deref().unwrap_or("");
-            let normalized = tokenize(haystack);
-            let needle = tokenize(token);
-            if needle.iter().any(|word| !normalized.contains(word)) {
+            if !contains_contiguous_tokens(&tokenize(haystack), &tokenize(token)) {
                 critical_failures.push(format!("{kind:?}:{token}"));
             }
         }
@@ -634,6 +632,16 @@ pub fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Multiword critical entries must appear as a contiguous ordered sequence.
+fn contains_contiguous_tokens(haystack: &[String], needle: &[String]) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
 fn normalize_token(raw: &str) -> String {
     let mut tok = raw
         .trim_matches(|c: char| {
@@ -888,6 +896,49 @@ mod tests {
             .unwrap();
         let outcome = runner.run_case(&case).unwrap();
         assert_eq!(outcome.critical_failures, vec!["Name:raja".to_owned()]);
+    }
+
+    #[test]
+    fn critical_phrase_requires_contiguous_token_order() {
+        assert!(!contains_contiguous_tokens(
+            &tokenize("do delete, not save"),
+            &tokenize("do not delete")
+        ));
+        assert!(contains_contiguous_tokens(
+            &tokenize("please do not delete this"),
+            &tokenize("do not delete")
+        ));
+        assert!(contains_contiguous_tokens(
+            &tokenize("call raja"),
+            &tokenize("raja")
+        ));
+
+        let mut scrambled = speech_case("p", "do not delete", "do delete, not save", vec![1, 0]);
+        scrambled.critical = vec![(CriticalKind::RequiredPhrase, "do not delete".into())];
+        let mut ordered = speech_case(
+            "p2",
+            "do not delete",
+            "please do not delete this",
+            vec![1, 0],
+        );
+        ordered.critical = vec![(CriticalKind::RequiredPhrase, "do not delete".into())];
+        let mut runner = FeasibilityRunner::harness(FakeWorker::default());
+        runner
+            .prepare(Correlation {
+                daemon_nonce: "bakeoff".into(),
+                generation: 1,
+                request_id: "prep".into(),
+                recording_id: "prep".into(),
+                model_receipt_hash: "harness-no-weights".into(),
+            })
+            .unwrap();
+        let failed = runner.run_case(&scrambled).unwrap();
+        assert_eq!(
+            failed.critical_failures,
+            vec!["RequiredPhrase:do not delete".to_owned()]
+        );
+        let passed = runner.run_case(&ordered).unwrap();
+        assert!(passed.critical_failures.is_empty());
     }
 
     #[test]
