@@ -9,6 +9,7 @@ pub mod grammar_http;
 pub mod history_view;
 pub mod hyprland_bindings;
 pub mod journal;
+pub mod local_worker;
 pub mod minimal_grammar;
 pub mod overlay;
 mod process;
