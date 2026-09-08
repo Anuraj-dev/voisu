@@ -6,11 +6,12 @@
 //! read once at daemon start.
 //!
 //! Environment-configured options also live here: the rollout gates
-//! (`VOISU_ENABLE_DPR`, `VOISU_ENABLE_QWEN_FORMAT`,
-//! `VOISU_ENABLE_INTENT_RECONSTRUCTION`) and the transcription language
-//! (`VOISU_TRANSCRIPTION_LANGUAGE`, read by
+//! (`VOISU_ENABLE_DPR`, `VOISU_ENABLE_QWEN_FORMAT`) and the transcription
+//! language (`VOISU_TRANSCRIPTION_LANGUAGE`, read by
 //! [`transcription_language`] at each Recording boundary and shared by the
-//! Groq and Deepgram request builders).
+//! Groq and Deepgram request builders). Intent Reconstruction follows
+//! Writing Mode ([`intent_reconstruction_enabled`]);
+//! `VOISU_ENABLE_INTENT_RECONSTRUCTION` is only a Smart-mode force-off.
 //!
 //! The Deepgram default is **ON**: a fresh install runs the reconciled
 //! dual-Provider path for the best jargon accuracy, and the user opts into the
@@ -55,6 +56,9 @@ pub const ENABLE_DPR_ENV: &str = "VOISU_ENABLE_DPR";
 /// Tickets 1–2 can ship without enabling Qwen formatting. Only `1` or `true`
 /// switch the formatting cloud contract off #139 derivation.
 pub const ENABLE_QWEN_FORMAT_ENV: &str = "VOISU_ENABLE_QWEN_FORMAT";
+/// Emergency Smart-mode rollback for Intent Reconstruction. Unset leaves IR
+/// on when Writing Mode is Smart. Only `1` or `true` keep it on; any other
+/// present value force-off. Literal Writing Mode disables IR regardless.
 pub const ENABLE_INTENT_RECONSTRUCTION_ENV: &str = "VOISU_ENABLE_INTENT_RECONSTRUCTION";
 
 /// Environment override selecting the transcription language requested from
@@ -99,10 +103,12 @@ impl DeliveryMode {
 
 /// How Voisu turns a Validated Transcript into a Rendered Transcript.
 ///
-/// `Smart` applies Formatting and optional Minimal Grammar Correction.
+/// `Smart` applies Formatting and optional Minimal Grammar Correction, and
+/// enables Intent Reconstruction when Source Transcripts disagree.
 /// `Literal` preserves spoken wording while still honoring explicit formatting
-/// commands. The type is `Copy` so a Recording can snapshot the resolved mode
-/// before work begins and keep that snapshot stable through Delivery.
+/// commands, and leaves Intent Reconstruction off. The type is `Copy` so a
+/// Recording can snapshot the resolved mode before work begins and keep that
+/// snapshot stable through Delivery.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum WritingMode {
     /// Apply local Formatting and, when eligible, Minimal Grammar Correction.
@@ -254,12 +260,23 @@ pub fn qwen_format_enabled() -> bool {
     parse_optional_dpr_enablement(std::env::var(ENABLE_QWEN_FORMAT_ENV).ok().as_deref())
 }
 
+/// Whether Intent Reconstruction may run for this daemon process.
+///
+/// Smart Writing Mode enables it; Literal disables it. The env var is not a
+/// user switch — it only force-off Smart (`0` / `false` / any value other
+/// than `1`/`true`). Unset + Smart is the packaged default (on).
 pub fn intent_reconstruction_enabled() -> bool {
-    parse_optional_dpr_enablement(
+    resolve_intent_reconstruction(
+        writing_mode(),
         std::env::var(ENABLE_INTENT_RECONSTRUCTION_ENV)
             .ok()
             .as_deref(),
     )
+}
+
+/// Pure IR gate: Writing Mode is the user switch; env is Smart-only rollback.
+fn resolve_intent_reconstruction(mode: WritingMode, env: Option<&str>) -> bool {
+    mode == WritingMode::Smart && env.map(parse_dpr_enablement).unwrap_or(true)
 }
 
 fn parse_dpr_enablement(value: &str) -> bool {
@@ -1326,17 +1343,39 @@ other_key = 5
     }
 
     #[test]
-    fn intent_reconstruction_gate_defaults_off_and_is_independent() {
+    fn intent_reconstruction_follows_writing_mode_and_env_is_smart_only_rollback() {
         assert_eq!(
             ENABLE_INTENT_RECONSTRUCTION_ENV,
             "VOISU_ENABLE_INTENT_RECONSTRUCTION"
         );
         assert_ne!(ENABLE_INTENT_RECONSTRUCTION_ENV, ENABLE_DPR_ENV);
         assert_ne!(ENABLE_INTENT_RECONSTRUCTION_ENV, ENABLE_QWEN_FORMAT_ENV);
-        assert!(!parse_optional_dpr_enablement(None));
-        assert!(!parse_optional_dpr_enablement(Some("0")));
-        assert!(parse_optional_dpr_enablement(Some("1")));
-        assert!(parse_optional_dpr_enablement(Some("true")));
+
+        assert!(resolve_intent_reconstruction(WritingMode::Smart, None));
+        assert!(resolve_intent_reconstruction(WritingMode::Smart, Some("1")));
+        assert!(resolve_intent_reconstruction(
+            WritingMode::Smart,
+            Some("true")
+        ));
+        assert!(!resolve_intent_reconstruction(
+            WritingMode::Smart,
+            Some("0")
+        ));
+        assert!(!resolve_intent_reconstruction(
+            WritingMode::Smart,
+            Some("false")
+        ));
+        assert!(!resolve_intent_reconstruction(
+            WritingMode::Smart,
+            Some("garbage")
+        ));
+
+        for env in [None, Some("1"), Some("true"), Some("0"), Some("false")] {
+            assert!(
+                !resolve_intent_reconstruction(WritingMode::Literal, env),
+                "Literal must disable Intent Reconstruction for env {env:?}"
+            );
+        }
     }
 
     #[test]

@@ -920,26 +920,40 @@ fn delivery(mode: Option<DeliveryMode>) -> ExitCode {
     }
 }
 
-/// Reads or persists the Writing Mode. A running daemon resolves configuration
-/// only at start, so writes apply after the next restart.
+/// Reads or persists the Writing Mode. Smart enables Intent Reconstruction;
+/// Literal disables it. A running daemon resolves configuration only at start,
+/// so writes apply after the next restart.
 fn writing(mode: Option<WritingMode>) -> ExitCode {
     let Some(mode) = mode else {
+        let current = voisu_app::config::writing_mode();
         println!(
-            "writing mode: {}",
-            voisu_app::config::writing_mode().as_str()
+            "writing mode: {} ({})",
+            current.as_str(),
+            intent_reconstruction_status(current)
         );
         return ExitCode::SUCCESS;
     };
     match voisu_app::config::set_writing_mode(mode) {
         Ok(_) => {
             println!(
-                "Writing mode set to {} for new Recordings; restart the daemon to apply \
+                "Writing mode set to {} for new Recordings ({}); restart the daemon to apply \
                  (voisu service restart)",
-                mode.as_str()
+                mode.as_str(),
+                intent_reconstruction_status(mode)
             );
             ExitCode::SUCCESS
         }
         Err(message) => fail(4, &message),
+    }
+}
+
+/// IR follows the persisted Writing Mode, not this CLI process's env. A
+/// daemon unit `VOISU_ENABLE_INTENT_RECONSTRUCTION` force-off still wins
+/// after restart; say so on Smart so a host drop-in is not hidden.
+fn intent_reconstruction_status(mode: WritingMode) -> &'static str {
+    match mode {
+        WritingMode::Smart => "Intent Reconstruction on unless the daemon env forces it off",
+        WritingMode::Literal => "Intent Reconstruction off",
     }
 }
 
