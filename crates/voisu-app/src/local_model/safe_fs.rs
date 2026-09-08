@@ -109,6 +109,11 @@ fn create_owned_components(path: &Path) -> Result<(), SafeFsError> {
                     ));
                 }
                 fs::set_permissions(&built, fs::Permissions::from_mode(0o700))?;
+                if created == 0 {
+                    // Crash before these fsyncs drops the new name and 0700 mode.
+                    dir.sync_all()?;
+                    parent_dir.sync_all()?;
+                }
             }
             Err(error) => return Err(error.into()),
         }
@@ -303,10 +308,17 @@ pub fn durable_rename(from: &Path, to: &Path) -> Result<(), SafeFsError> {
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    // File contents are already synced; names in the staging directory are not.
+    sync_dir(from)?;
     fs::rename(from, to)?;
     if let Some(parent) = to.parent() {
-        File::open(parent)?.sync_all()?;
+        sync_dir(parent)?;
     }
+    Ok(())
+}
+
+fn sync_dir(path: &Path) -> Result<(), SafeFsError> {
+    open_dir(path)?.sync_all()?;
     Ok(())
 }
 
@@ -491,5 +503,56 @@ mod tests {
         assert!(source.contains("O_NOFOLLOW"));
         assert!(source.contains("RESOLVE_BENEATH"));
         assert!(source.contains("RESOLVE_NO_SYMLINKS"));
+    }
+
+    #[test]
+    fn durable_rename_publishes_after_syncing_staging() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_private_dir(root.path()).unwrap();
+        let staging = root.path().join("staging").join("s1");
+        ensure_private_dir(&staging).unwrap();
+        {
+            let mut file = create_exclusive_file(&staging, "model.bin").unwrap();
+            durable_write(&mut file, b"abc").unwrap();
+        }
+        let dest = root
+            .path()
+            .join("artifacts")
+            .join("id")
+            .join("rev")
+            .join("hash");
+        ensure_private_dir(dest.parent().unwrap()).unwrap();
+        durable_rename(&staging, &dest).unwrap();
+        assert!(!staging.exists());
+        let mut got = Vec::new();
+        open_existing_file(&dest, "model.bin")
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(got, b"abc");
+
+        let source = include_str!("safe_fs.rs");
+        let rename_fn = source
+            .split("pub fn durable_rename")
+            .nth(1)
+            .unwrap()
+            .split("fn open_path_nofollow")
+            .next()
+            .unwrap();
+        assert!(
+            rename_fn.contains("sync_dir(from)"),
+            "staging names must be durable before rename"
+        );
+        let mkdir = source
+            .split("fn create_owned_components")
+            .nth(1)
+            .unwrap()
+            .split("pub fn relative_file_name")
+            .next()
+            .unwrap();
+        assert!(
+            mkdir.contains("parent_dir.sync_all()"),
+            "new catalog/revision names must be durable in their parents"
+        );
     }
 }

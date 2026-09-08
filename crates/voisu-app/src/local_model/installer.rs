@@ -190,8 +190,8 @@ where
             .iter()
             .map(|host| (*host).to_owned())
             .collect();
-        no_progress(Instant::now())?;
-        let fetch_started = Instant::now();
+        // Idle TCP is already timed out by ProductionHttps. Transfer duration
+        // is bounded by INSTALL_DEADLINE, not NO_PROGRESS.
         let fetched = request
             .fetcher
             .fetch(&FetchRequest {
@@ -200,7 +200,7 @@ where
                 expected_bytes: file.bytes,
             })
             .map_err(map_fetch)?;
-        no_progress(fetch_started)?;
+        deadline(request.started)?;
         if u64::try_from(fetched.body.len()).unwrap_or(u64::MAX) != file.bytes {
             return Err(InstallError::Size);
         }
@@ -631,5 +631,39 @@ mod tests {
     fn symlink_in_staging_is_rejected() {
         let name = "../etc/passwd";
         assert!(safe_fs::relative_file_name(name).is_err());
+    }
+
+    #[test]
+    fn no_progress_rejects_stalled_write_not_completed_fetch() {
+        let stalled = Instant::now()
+            .checked_sub(NO_PROGRESS + Duration::from_secs(1))
+            .expect("monotonic clock covers NO_PROGRESS");
+        assert_eq!(no_progress(stalled), Err(InstallError::Deadline));
+        assert_eq!(no_progress(Instant::now()), Ok(()));
+    }
+
+    #[test]
+    fn fetch_longer_than_no_progress_still_installs() {
+        let (_temp, mut store) = open_store();
+        let entry = ci_fixture_entry();
+        let started = Instant::now()
+            .checked_sub(NO_PROGRESS + Duration::from_secs(1))
+            .expect("monotonic clock covers NO_PROGRESS");
+        let receipt = install_entry(InstallRequest {
+            store: &mut store,
+            entry,
+            fetcher: &fixture_fetcher(),
+            health: &CandidateHealth::default(),
+            maintenance: &IdleMaintenance,
+            consent: consent(entry),
+            io: InstallIo::default(),
+            started,
+        })
+        .unwrap();
+        assert_eq!(receipt.catalog_id, "l3-health-fixture");
+        assert_eq!(
+            store.load_active().unwrap().unwrap().catalog_id,
+            receipt.catalog_id
+        );
     }
 }

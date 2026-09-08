@@ -3,7 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::catalog::CatalogEntry;
 use super::receipt::{self, ActiveReceipt, ReceiptError};
@@ -127,7 +127,7 @@ impl ModelStore {
 
     pub fn remove_unleased(&self, path: &Path) -> Result<(), StoreError> {
         if let Some(lease) = &self.lease
-            && path.starts_with(&lease.artifact_dir)
+            && overlaps_protected(path, &lease.artifact_dir)
         {
             return Err(StoreError::Leased);
         }
@@ -138,13 +138,16 @@ impl ModelStore {
                 .join(&active.catalog_id)
                 .join(&active.catalog_revision)
                 .join(&active.artifact_id);
-            if path.starts_with(&active_dir) {
+            if overlaps_protected(path, &active_dir) {
                 return Err(StoreError::Leased);
             }
         }
-        if path.starts_with(&self.root) {
-            let _ = fs::remove_dir_all(path);
-        }
+        let Some(artifact) = validated_artifact_dir(&self.root, path) else {
+            return Err(StoreError::Path(
+                "cleanup target is not an artifact directory".into(),
+            ));
+        };
+        let _ = fs::remove_dir_all(artifact);
         Ok(())
     }
 
@@ -152,6 +155,24 @@ impl ModelStore {
         receipt::retain_current(&self.root).map_err(StoreError::Receipt)?;
         receipt::store_atomic(&self.root, receipt).map_err(StoreError::Receipt)
     }
+}
+
+fn overlaps_protected(target: &Path, protected: &Path) -> bool {
+    // `target.starts_with(protected)` misses ancestors: deleting the revision,
+    // catalog, or store root still recursively removes the leased/active tree.
+    target.starts_with(protected) || protected.starts_with(target)
+}
+
+fn validated_artifact_dir<'a>(root: &Path, path: &'a Path) -> Option<&'a Path> {
+    let rel = path.strip_prefix(root.join("artifacts")).ok()?;
+    let mut depth = 0;
+    for component in rel.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            _ => return None,
+        }
+    }
+    (depth == 3).then_some(path)
 }
 
 #[cfg(test)]
@@ -176,5 +197,52 @@ mod tests {
         let _held = first.lock_exclusive().unwrap();
         let second = ModelStore::open(temp.path().to_path_buf()).unwrap();
         assert!(matches!(second.lock_exclusive(), Err(StoreError::Busy)));
+    }
+
+    fn store_with_active_artifact() -> (tempfile::TempDir, ModelStore, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ModelStore::open(temp.path().to_path_buf()).unwrap();
+        let entry = crate::local_model::catalog::ci_fixture_entry();
+        let artifact_id = "cafef00d";
+        let dir = store.artifact_dir(entry, artifact_id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("model.bin"), b"keep").unwrap();
+        store
+            .commit_receipt(&receipt::from_entry(entry, artifact_id))
+            .unwrap();
+        (temp, store, dir)
+    }
+
+    #[test]
+    fn ancestor_cleanup_is_leased_while_receipt_is_active() {
+        let (_temp, store, artifact) = store_with_active_artifact();
+        let revision = artifact.parent().unwrap();
+        let catalog = revision.parent().unwrap();
+        let marker = artifact.join("model.bin");
+
+        assert_eq!(store.remove_unleased(revision), Err(StoreError::Leased));
+        assert!(marker.exists());
+        assert_eq!(store.remove_unleased(catalog), Err(StoreError::Leased));
+        assert!(marker.exists());
+        assert_eq!(store.remove_unleased(store.root()), Err(StoreError::Leased));
+        assert!(marker.exists());
+        assert_eq!(store.remove_unleased(&artifact), Err(StoreError::Leased));
+        assert!(marker.exists());
+        assert_eq!(
+            store.load_active().unwrap().unwrap().artifact_id,
+            "cafef00d"
+        );
+    }
+
+    #[test]
+    fn unleased_artifact_dir_can_be_removed() {
+        let (_temp, store, active) = store_with_active_artifact();
+        let stale = store.artifact_dir(crate::local_model::catalog::ci_fixture_entry(), "deadbeef");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("old.bin"), b"drop").unwrap();
+
+        store.remove_unleased(&stale).unwrap();
+        assert!(!stale.exists());
+        assert!(active.join("model.bin").exists());
     }
 }
