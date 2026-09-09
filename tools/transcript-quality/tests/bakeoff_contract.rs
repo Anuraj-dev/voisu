@@ -2,8 +2,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
 use transcript_quality::{
-    BAKEOFF_CONTRACT_JSON, BakeoffHashInput, align_punctuation, validate_bakeoff_manifest_text,
-    validate_bakeoff_manifest_text_for_measurement, verify_bakeoff_hash_inputs,
+    BAKEOFF_CONTRACT_JSON, BAKEOFF_PUBLIC_REPORT_SCHEMA, BakeoffHashInput, align_punctuation,
+    validate_bakeoff_manifest_text, validate_bakeoff_manifest_text_for_measurement,
+    validate_bakeoff_public_report_text, verify_bakeoff_hash_inputs,
 };
 
 const CRITICAL_CATEGORIES: [&str; 8] = [
@@ -125,6 +126,19 @@ fn valid_manifest() -> Value {
             "cpu": "synthetic-cpu",
             "accelerator": "cpu"
         }],
+        "runtime": {
+            "name": "synthetic-runtime",
+            "version": "0.0.0-test",
+            "sha256": hash(700_001)
+        },
+        "model": {
+            "id": "synthetic-model",
+            "sha256": hash(700_002)
+        },
+        "scoring_tool": {
+            "git_commit": "0".repeat(40),
+            "cargo_lock_sha256": hash(700_003)
+        },
         "clips": clips,
         "measurement_locks": []
     })
@@ -151,6 +165,16 @@ fn valid_mixed_provenance_metadata_freezes_the_r7_contract() {
     assert_eq!(
         validated.public_summary["corpus_version"],
         "real-provenance-fixture-r7-v1"
+    );
+    assert_eq!(validated.public_summary["runtime_sha256"], hash(700_001));
+    assert_eq!(validated.public_summary["model_sha256"], hash(700_002));
+    assert_eq!(
+        validated.public_summary["scoring_tool_git_commit"],
+        "0".repeat(40)
+    );
+    assert_eq!(
+        validated.public_summary["scoring_tool_cargo_lock_sha256"],
+        hash(700_003)
     );
     assert!(validated.public_summary.get("clips").is_none());
 }
@@ -305,6 +329,169 @@ fn rejects_threshold_edits_and_changes_after_measurement_starts() {
 
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[test]
+fn rejects_missing_or_mistyped_runtime_model_and_scoring_tool_provenance() {
+    let mut missing_runtime = valid_manifest();
+    missing_runtime.as_object_mut().unwrap().remove("runtime");
+    let err = validation_error(&missing_runtime);
+    assert!(err.contains("missing field"), "{err}");
+
+    let mut bad_runtime_sha = valid_manifest();
+    bad_runtime_sha["runtime"]["sha256"] = json!("not-a-hash");
+    let err = validation_error(&bad_runtime_sha);
+    assert!(err.contains("runtime sha256"), "{err}");
+
+    let mut bad_model_id = valid_manifest();
+    bad_model_id["model"]["id"] = json!("   ");
+    let err = validation_error(&bad_model_id);
+    assert!(err.contains("model id"), "{err}");
+
+    let mut bad_model_sha = valid_manifest();
+    bad_model_sha["model"]["sha256"] = json!(hash(700_002).to_uppercase());
+    let err = validation_error(&bad_model_sha);
+    assert!(err.contains("model sha256"), "{err}");
+
+    let mut short_commit = valid_manifest();
+    short_commit["scoring_tool"]["git_commit"] = json!("abc123");
+    let err = validation_error(&short_commit);
+    assert!(err.contains("git_commit"), "{err}");
+
+    let mut bad_lock_sha = valid_manifest();
+    bad_lock_sha["scoring_tool"]["cargo_lock_sha256"] = json!("xyz");
+    let err = validation_error(&bad_lock_sha);
+    assert!(err.contains("cargo_lock_sha256"), "{err}");
+}
+
+#[test]
+fn runtime_model_and_tool_edits_break_measurement_locks() {
+    let mut manifest = valid_manifest();
+    let first = validate_bakeoff_manifest_text(&serde_json::to_string(&manifest).unwrap()).unwrap();
+    manifest["measurement_locks"] = json!([{
+        "measurement_id": "synthetic-run-1",
+        "manifest_sha256": first.manifest_sha256
+    }]);
+
+    for (pointer, value) in [
+        ("/runtime/sha256", hash(800_001)),
+        ("/model/sha256", hash(800_002)),
+        ("/scoring_tool/git_commit", "f".repeat(40)),
+        ("/scoring_tool/cargo_lock_sha256", hash(800_003)),
+    ] {
+        let mut edited = manifest.clone();
+        edited
+            .pointer_mut(pointer)
+            .unwrap()
+            .clone_from(&json!(value));
+        let err = validate_bakeoff_manifest_text_for_measurement(
+            &serde_json::to_string(&edited).unwrap(),
+            &first.manifest_sha256,
+        )
+        .unwrap_err();
+        assert!(err.contains("post-measurement edit"), "{pointer}: {err}");
+    }
+}
+
+fn valid_public_report(manifest_sha256: &str) -> Value {
+    let contract: Value = serde_json::from_str(BAKEOFF_CONTRACT_JSON).unwrap();
+    let contract_sha256 = format!("{:x}", Sha256::digest(BAKEOFF_CONTRACT_JSON.as_bytes()));
+    json!({
+        "schema": BAKEOFF_PUBLIC_REPORT_SCHEMA,
+        "contract_id": contract["id"],
+        "contract_sha256": contract_sha256,
+        "manifest_sha256": manifest_sha256,
+        "corpus_version": "real-provenance-fixture-r7-v1",
+        "corpus_revision": "fixture-revision-1",
+        "host_profile_id": "synthetic-host",
+        "runtime_sha256": hash(700_001),
+        "model_sha256": hash(700_002),
+        "scoring_tool_git_commit": "0".repeat(40),
+        "scoring_tool_cargo_lock_sha256": hash(700_003),
+        "sample_counts": { "speech": 100 },
+        "gate_result": "not_measured"
+    })
+}
+
+#[test]
+fn public_report_must_match_the_frozen_schema_and_contract() {
+    let manifest = valid_manifest();
+    let validated =
+        validate_bakeoff_manifest_text(&serde_json::to_string(&manifest).unwrap()).unwrap();
+    let report = valid_public_report(&validated.manifest_sha256);
+    let parsed = validate_bakeoff_public_report_text(&serde_json::to_string(&report).unwrap())
+        .expect("valid public report");
+    assert_eq!(parsed["gate_result"], "not_measured");
+
+    let mut unknown = report.clone();
+    unknown["novelty"] = json!(1);
+    let err =
+        validate_bakeoff_public_report_text(&serde_json::to_string(&unknown).unwrap()).unwrap_err();
+    assert!(err.contains("not in the frozen report schema"), "{err}");
+
+    let mut wrong_contract = report.clone();
+    wrong_contract["contract_id"] = json!("some-other-contract");
+    let err = validate_bakeoff_public_report_text(&serde_json::to_string(&wrong_contract).unwrap())
+        .unwrap_err();
+    assert!(err.contains("contract_id"), "{err}");
+
+    let mut wrong_sha = report.clone();
+    wrong_sha["contract_sha256"] = json!(hash(900_001));
+    let err = validate_bakeoff_public_report_text(&serde_json::to_string(&wrong_sha).unwrap())
+        .unwrap_err();
+    assert!(err.contains("contract_sha256"), "{err}");
+
+    let mut missing_binding = report.clone();
+    missing_binding
+        .as_object_mut()
+        .unwrap()
+        .remove("manifest_sha256");
+    let err =
+        validate_bakeoff_public_report_text(&serde_json::to_string(&missing_binding).unwrap())
+            .unwrap_err();
+    assert!(err.contains("manifest_sha256"), "{err}");
+
+    let mut bad_manifest_sha = report.clone();
+    bad_manifest_sha["manifest_sha256"] = json!("short");
+    let err =
+        validate_bakeoff_public_report_text(&serde_json::to_string(&bad_manifest_sha).unwrap())
+            .unwrap_err();
+    assert!(err.contains("manifest_sha256"), "{err}");
+}
+
+#[test]
+fn public_report_rejects_forbidden_private_fields_anywhere() {
+    let manifest = valid_manifest();
+    let validated =
+        validate_bakeoff_manifest_text(&serde_json::to_string(&manifest).unwrap()).unwrap();
+    let report = valid_public_report(&validated.manifest_sha256);
+    let contract: Value = serde_json::from_str(BAKEOFF_CONTRACT_JSON).unwrap();
+    let forbidden = contract["public_report"]["forbidden_fields"]
+        .as_array()
+        .expect("contract lists forbidden fields");
+    assert!(
+        forbidden.len() >= 7,
+        "contract must keep naming its forbidden fields"
+    );
+
+    for field in [
+        "audio",
+        "reference_text",
+        "transcript_text",
+        "speaker_identity",
+    ] {
+        let mut leaked = report.clone();
+        leaked[field] = json!("private bytes must never ship");
+        let err = validate_bakeoff_public_report_text(&serde_json::to_string(&leaked).unwrap())
+            .unwrap_err();
+        assert!(err.contains("forbidden field"), "{field}: {err}");
+    }
+
+    let mut nested = report.clone();
+    nested["stratum_aggregates"] = json!({ "quiet": { "audio_path": "/private/clip.wav" } });
+    let err =
+        validate_bakeoff_public_report_text(&serde_json::to_string(&nested).unwrap()).unwrap_err();
+    assert!(err.contains("forbidden field"), "{err}");
 }
 
 #[test]

@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 pub const BAKEOFF_MANIFEST_SCHEMA: &str = "voisu-local-asr-bakeoff-manifest-v1";
+pub const BAKEOFF_PUBLIC_REPORT_SCHEMA: &str = "voisu-local-asr-bakeoff-public-report-v1";
 pub const BAKEOFF_CONTRACT_JSON: &str = include_str!("../bakeoff-contract-v1.json");
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -136,6 +137,9 @@ struct BakeoffManifest {
     contract: BakeoffContract,
     strata: Vec<Stratum>,
     host_profiles: Vec<HostProfile>,
+    runtime: RuntimeProvenance,
+    model: ModelProvenance,
+    scoring_tool: ScoringToolLock,
     clips: Vec<Clip>,
     measurement_locks: Vec<MeasurementLock>,
 }
@@ -341,6 +345,36 @@ struct MeasurementLock {
     manifest_sha256: String,
 }
 
+/// The measured runtime under test. Part of the frozen manifest so a runtime
+/// swap after measurement changes the manifest hash and breaks the locks.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeProvenance {
+    name: String,
+    version: String,
+    sha256: String,
+}
+
+/// The measured model weights. Part of the frozen manifest for the same
+/// post-measurement-edit reason as the runtime.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelProvenance {
+    id: String,
+    sha256: String,
+}
+
+/// The exact scoring tool that produced (or will produce) the measured
+/// report: full git commit plus the resolved dependency lock hash. Bound into
+/// the manifest hash so re-scoring with a different tool is a new revision,
+/// never a silent edit.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScoringToolLock {
+    git_commit: String,
+    cargo_lock_sha256: String,
+}
+
 #[derive(Serialize)]
 struct LockMaterial<'a> {
     schema: &'a str,
@@ -349,6 +383,9 @@ struct LockMaterial<'a> {
     contract: &'a BakeoffContract,
     strata: &'a [Stratum],
     host_profiles: &'a [HostProfile],
+    runtime: &'a RuntimeProvenance,
+    model: &'a ModelProvenance,
+    scoring_tool: &'a ScoringToolLock,
     clips: &'a [Clip],
 }
 
@@ -401,14 +438,18 @@ pub fn load_and_validate_bakeoff_manifest_for_measurement(
     validate_bakeoff_manifest_text_for_measurement(&text, expected_manifest_sha256)
 }
 
+fn frozen_contract() -> Result<BakeoffContract, String> {
+    serde_json::from_str(BAKEOFF_CONTRACT_JSON)
+        .map_err(|err| format!("built-in bakeoff contract is invalid: {err}"))
+}
+
 fn validate_bakeoff_manifest_text_with_expected_hash(
     text: &str,
     expected_manifest_sha256: Option<&str>,
 ) -> Result<ValidatedBakeoffManifest, String> {
     let manifest: BakeoffManifest =
         serde_json::from_str(text).map_err(|err| format!("bakeoff manifest JSON: {err}"))?;
-    let frozen: BakeoffContract = serde_json::from_str(BAKEOFF_CONTRACT_JSON)
-        .map_err(|err| format!("built-in bakeoff contract is invalid: {err}"))?;
+    let frozen = frozen_contract()?;
     if manifest.schema != BAKEOFF_MANIFEST_SCHEMA {
         return Err(format!(
             "bakeoff manifest schema {:?} is not {BAKEOFF_MANIFEST_SCHEMA:?}",
@@ -424,6 +465,9 @@ fn validate_bakeoff_manifest_text_with_expected_hash(
     require_text("corpus_version", &manifest.corpus_version)?;
     require_text("corpus_revision", &manifest.corpus_revision)?;
     validate_host_profiles(&manifest.host_profiles)?;
+    validate_runtime_provenance(&manifest.runtime)?;
+    validate_model_provenance(&manifest.model)?;
+    validate_scoring_tool_lock(&manifest.scoring_tool)?;
     let strata = validate_strata(&manifest.strata)?;
 
     let mut ids = BTreeSet::new();
@@ -571,6 +615,9 @@ fn validate_bakeoff_manifest_text_with_expected_hash(
         contract: &manifest.contract,
         strata: &manifest.strata,
         host_profiles: &manifest.host_profiles,
+        runtime: &manifest.runtime,
+        model: &manifest.model,
+        scoring_tool: &manifest.scoring_tool,
         clips: &manifest.clips,
     };
     let manifest_sha256 = sha256_json(&lock_material)?;
@@ -587,6 +634,10 @@ fn validate_bakeoff_manifest_text_with_expected_hash(
         "manifest_sha256": manifest_sha256,
         "corpus_version": manifest.corpus_version,
         "corpus_revision": manifest.corpus_revision,
+        "runtime_sha256": manifest.runtime.sha256,
+        "model_sha256": manifest.model.sha256,
+        "scoring_tool_git_commit": manifest.scoring_tool.git_commit,
+        "scoring_tool_cargo_lock_sha256": manifest.scoring_tool.cargo_lock_sha256,
         "sample_counts": {
             "speech": speech,
             "real_speech": real_speech,
@@ -703,6 +754,125 @@ fn sha256_file(path: &Path, kind: &str, clip_id: &str) -> Result<String, String>
     let bytes = fs::read(path)
         .map_err(|err| format!("cannot read {kind} file for clip {clip_id}: {err}"))?;
     Ok(sha256_bytes(&bytes))
+}
+
+fn validate_runtime_provenance(runtime: &RuntimeProvenance) -> Result<(), String> {
+    require_text("runtime name", &runtime.name)?;
+    require_text("runtime version", &runtime.version)?;
+    validate_hash("runtime sha256", &runtime.sha256, "runtime")?;
+    Ok(())
+}
+
+fn validate_model_provenance(model: &ModelProvenance) -> Result<(), String> {
+    require_text("model id", &model.id)?;
+    validate_hash("model sha256", &model.sha256, "model")?;
+    Ok(())
+}
+
+fn validate_scoring_tool_lock(tool: &ScoringToolLock) -> Result<(), String> {
+    validate_git_commit("scoring_tool git_commit", &tool.git_commit)?;
+    validate_hash(
+        "scoring_tool cargo_lock_sha256",
+        &tool.cargo_lock_sha256,
+        "scoring_tool",
+    )?;
+    Ok(())
+}
+
+/// A measured public report may only carry the frozen report schema's
+/// declared fields. Anything else — a private path, a Transcript, a speaker
+/// label — is a privacy or contract violation, even nested inside an
+/// aggregate object.
+pub fn validate_bakeoff_public_report_text(text: &str) -> Result<Value, String> {
+    let report: Value =
+        serde_json::from_str(text).map_err(|err| format!("bakeoff public report JSON: {err}"))?;
+    let object = report
+        .as_object()
+        .ok_or_else(|| "bakeoff public report must be a JSON object".to_owned())?;
+    let frozen = frozen_contract()?;
+    let allowed: BTreeSet<&str> = frozen
+        .public_report
+        .fields
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let forbidden: BTreeSet<&str> = frozen
+        .public_report
+        .forbidden_fields
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for key in object.keys() {
+        if forbidden.contains(key.as_str()) {
+            return Err(format!(
+                "bakeoff public report carries forbidden field {key:?}; public evidence holds hashes, counts, licenses, and aggregates only"
+            ));
+        }
+        if !allowed.contains(key.as_str()) {
+            return Err(format!(
+                "bakeoff public report field {key:?} is not in the frozen report schema {}",
+                frozen.public_report.schema
+            ));
+        }
+    }
+    reject_nested_forbidden(&report, &forbidden)?;
+    match object.get("schema").and_then(Value::as_str) {
+        Some(schema) if schema == frozen.public_report.schema.as_str() => {}
+        other => {
+            return Err(format!(
+                "bakeoff public report schema {other:?} is not {:?}",
+                frozen.public_report.schema
+            ));
+        }
+    }
+    match object.get("contract_id").and_then(Value::as_str) {
+        Some(id) if id == frozen.id.as_str() => {}
+        other => {
+            return Err(format!(
+                "bakeoff public report contract_id {other:?} is not the frozen contract {:?}",
+                frozen.id
+            ));
+        }
+    }
+    let contract_sha256 = sha256_bytes(BAKEOFF_CONTRACT_JSON.as_bytes());
+    match object.get("contract_sha256").and_then(Value::as_str) {
+        Some(sha) if sha == contract_sha256.as_str() => {}
+        other => {
+            return Err(format!(
+                "bakeoff public report contract_sha256 {other:?} does not match the frozen contract {contract_sha256}; threshold or scoring edits require a new version before measurement"
+            ));
+        }
+    }
+    match object.get("manifest_sha256").and_then(Value::as_str) {
+        Some(sha) => validate_hash("manifest_sha256", sha, "public report")?,
+        None => {
+            return Err(
+                "bakeoff public report is missing manifest_sha256 binding the measured corpus"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(report)
+}
+
+fn reject_nested_forbidden(value: &Value, forbidden: &BTreeSet<&str>) -> Result<(), String> {
+    match value {
+        Value::Object(map) => {
+            for (key, nested) in map {
+                if forbidden.contains(key.as_str()) {
+                    return Err(format!(
+                        "bakeoff public report carries forbidden field {key:?}; public evidence holds hashes, counts, licenses, and aggregates only"
+                    ));
+                }
+                reject_nested_forbidden(nested, forbidden)?;
+            }
+            Ok(())
+        }
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| reject_nested_forbidden(item, forbidden)),
+        _ => Ok(()),
+    }
 }
 
 fn validate_host_profiles(profiles: &[HostProfile]) -> Result<(), String> {
@@ -988,6 +1158,20 @@ fn require_id(field: &str, value: &str) -> Result<(), String> {
     } else {
         Err(format!(
             "{field} {value:?} must use only ASCII letters, digits, '-', '_', or '.'"
+        ))
+    }
+}
+
+fn validate_git_commit(field: &str, value: &str) -> Result<(), String> {
+    if value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "{field} must be exactly 40 lowercase hexadecimal characters (a full git commit SHA)"
         ))
     }
 }
