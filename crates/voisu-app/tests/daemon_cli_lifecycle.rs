@@ -5417,7 +5417,21 @@ fn auth_verify_checks_each_provider_without_retaining_or_printing_response_conte
     assert!(groq.status.success(), "{}", stderr(&groq));
     assert_eq!(stdout(&groq), "Groq authentication verified\n");
     assert_eq!(deepgram.status.code(), Some(4));
-    assert_eq!(stderr(&deepgram), "key invalid — run `voisu setup`\n");
+    assert!(
+        stderr(&groq).contains("Cloud credential-maintenance"),
+        "{}",
+        stderr(&groq)
+    );
+    assert!(
+        stderr(&deepgram).contains("Cloud credential-maintenance"),
+        "{}",
+        stderr(&deepgram)
+    );
+    assert!(
+        stderr(&deepgram).contains("key invalid — run `voisu setup`"),
+        "{}",
+        stderr(&deepgram)
+    );
     let combined = format!(
         "{}{}{}{}",
         stdout(&groq),
@@ -5450,7 +5464,16 @@ fn auth_verify_requires_2xx_discards_response_and_isolates_curl_environment() {
         Some(4),
         "a redirect is not an authenticated API response"
     );
-    assert_eq!(stderr(&verified), "provider unreachable (transient)\n");
+    assert!(
+        stderr(&verified).contains("Cloud credential-maintenance"),
+        "{}",
+        stderr(&verified)
+    );
+    assert!(
+        stderr(&verified).contains("provider unreachable (transient)"),
+        "{}",
+        stderr(&verified)
+    );
     assert!(!format!("{}{}", stdout(&verified), stderr(&verified)).contains("stored-credential"));
     let arguments = commands.read("curl.args");
     assert_eq!(arguments.lines().next(), Some("-q"));

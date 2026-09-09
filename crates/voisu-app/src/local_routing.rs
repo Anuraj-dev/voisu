@@ -47,6 +47,9 @@ struct Gate {
     sentinel: CloudCapabilitySentinel,
     pending_permit: Option<DeliveryPermit>,
     user_terms: Vec<String>,
+    /// Supervisor is checked out for inference; refresh must not map the
+    /// absent stand-in to Verifying/Loading.
+    inference_checked_out: bool,
 }
 
 impl Gate {
@@ -59,10 +62,14 @@ impl Gate {
             sentinel: CloudCapabilitySentinel::new(),
             pending_permit: None,
             user_terms: Vec::new(),
+            inference_checked_out: false,
         }
     }
 
     fn refresh(&mut self) -> LocalReadiness {
+        if self.inference_checked_out {
+            return self.readiness.clone();
+        }
         if test_local_ready() {
             self.ensure_test_worker();
         } else if self.supervisor.state() == WorkerState::Ready && self.receipt.is_some() {
@@ -181,6 +188,7 @@ fn take_inference_session() -> Result<InferenceSession, LocalError> {
     }
     let supervisor = std::mem::replace(&mut gate.supervisor, WorkerSupervisor::absent());
     let coordinator = std::mem::replace(&mut gate.coordinator, DeliveryCoordinator::new());
+    gate.inference_checked_out = true;
     gate.readiness = LocalReadiness::Busy;
     Ok(InferenceSession {
         receipt_hash: receipt.receipt_hash,
@@ -194,6 +202,7 @@ fn restore_inference_session(session: InferenceSession) {
     if let Ok(mut gate) = gate().lock() {
         gate.supervisor = session.supervisor;
         gate.coordinator = session.coordinator;
+        gate.inference_checked_out = false;
         if gate.supervisor.state() == WorkerState::Ready {
             gate.readiness = LocalReadiness::Ready {
                 model_identity: gate
@@ -719,6 +728,19 @@ mod tests {
         );
         authorize_and_confirm_delivery("rec-1", "hello", false).unwrap();
         assert!(sentinel_is_clean());
+    }
+
+    #[test]
+    fn status_stays_busy_while_inference_is_checked_out() {
+        let _lock = test_session();
+        inject_ready(fixture_receipt(), "hello");
+        let session = take_inference_session().unwrap();
+        assert_eq!(production_readiness(), LocalReadiness::Busy);
+        restore_inference_session(session);
+        assert!(matches!(
+            production_readiness(),
+            LocalReadiness::Ready { .. }
+        ));
     }
 
     #[test]

@@ -7,6 +7,9 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use crate::local_overlay::{self, TriggerRepeatLatch};
+use crate::overlay::OverlayView;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FeedbackBackend {
     /// Rung 1: a GTK4 Layer Shell surface (Wayland compositors that advertise
@@ -230,6 +233,27 @@ mod tests {
         assert_eq!(selection.backend, FeedbackBackend::DesktopNotification);
         assert_eq!(selection.degradation, Some(FeedbackDegradation::X11));
     }
+
+    #[test]
+    fn overlay_announcements_stay_specific_and_duplicate_triggers_are_silent() {
+        let view = crate::overlay::OverlayView::daemon_unavailable();
+        assert_eq!(announcement_for_overlay(view), view.accessible_label);
+        let mut latch = crate::local_overlay::TriggerRepeatLatch::default();
+        assert!(!duplicate_trigger(&mut latch, Some("rec-1")));
+        assert!(duplicate_trigger(&mut latch, Some("rec-1")));
+    }
+}
+
+/// Screen-reader / notification copy for Overlay state, including Local mode.
+#[must_use]
+pub fn announcement_for_overlay(view: OverlayView) -> &'static str {
+    local_overlay::screen_reader_announcement(view)
+}
+
+/// True when a Trigger Key repeat names the same live Recording.
+#[must_use]
+pub fn duplicate_trigger(latch: &mut TriggerRepeatLatch, identity: Option<&str>) -> bool {
+    !latch.observe(identity)
 }
 
 pub const OVERLAY_RESTART_LIMIT: usize = 3;
