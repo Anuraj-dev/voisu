@@ -1109,6 +1109,21 @@ mod tests {
         );
     }
 
+    fn persist_mode_through_lock_deadline(path: &Path, state: &Path, mode: AsrMode) {
+        // Eight workers share one 2s bounded flock. The production deadline is
+        // per attempt, so a queued setter can expire under the flake gate.
+        // Retry Intact deadlines so last-writer-wins is still proven.
+        let give_up = Instant::now() + Duration::from_secs(15);
+        loop {
+            match persist_asr_mode_at(path, state, mode) {
+                Ok(_) => return,
+                Err(PersistError::Intact(message))
+                    if message.contains("deadline elapsed") && Instant::now() < give_up => {}
+                Err(error) => panic!("{error:?}"),
+            }
+        }
+    }
+
     #[test]
     fn concurrent_setters_do_not_drop_updates() {
         let home = tempfile::tempdir().unwrap();
@@ -1125,7 +1140,7 @@ mod tests {
                     } else {
                         AsrMode::Cloud
                     };
-                    persist_asr_mode_at(&path, &state, mode).unwrap();
+                    persist_mode_through_lock_deadline(&path, &state, mode);
                 })
             })
             .collect::<Vec<_>>();
@@ -1151,7 +1166,7 @@ mod tests {
                 let state = state.clone();
                 std::thread::spawn(move || {
                     if index % 2 == 0 {
-                        persist_asr_mode_at(&path, &state, AsrMode::Local).unwrap();
+                        persist_mode_through_lock_deadline(&path, &state, AsrMode::Local);
                     } else {
                         crate::config::set_deepgram_enabled_at(&path, false).unwrap();
                     }
