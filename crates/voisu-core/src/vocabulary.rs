@@ -85,7 +85,7 @@ struct VocabularyTerm {
 /// caller supplies it). Words are `(word, confidence)` pairs in transcript
 /// order; the Deepgram accumulator clamps every confidence to `[0, 1]` at
 /// ingest (a word without a usable number is carried as `0.0`, i.e. unproven).
-pub(crate) fn apply_user_vocabulary(
+pub fn apply_user_vocabulary(
     text: &str,
     terms: &[String],
     word_confidences: &[(String, f64)],

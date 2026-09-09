@@ -19,6 +19,7 @@ use tokio::time::timeout;
 use voisu_app::asr_mode;
 use voisu_app::asr_mode_queue::AsrModeQueue;
 use voisu_app::audio_level::{LevelRegistry, LevelRing};
+use voisu_app::cloud_ownership;
 use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
 use voisu_app::daemon_lock::SingleInstance;
 use voisu_app::dpr_cloud::DprCloudClient;
@@ -27,7 +28,10 @@ use voisu_app::dpr_pipeline::{
     dpr_pipeline_clock_origin, dpr_protected_tokens, dpr_source_context, dpr_transform_and_deliver,
 };
 use voisu_app::focus::SharedFocusProbe;
-use voisu_app::grammar_http::GrammarHttpClient;
+use voisu_app::local_recovery;
+use voisu_app::local_routing;
+use voisu_app::local_routing::LocalStopResult;
+
 use voisu_app::hyprland_bindings::VerifiedPasteAction;
 use voisu_app::journal::{escape_journal_control, recording_journal_lines};
 use voisu_app::minimal_grammar::MinimalGrammarAdapter;
@@ -181,6 +185,8 @@ async fn run() -> Result<(), String> {
             None
         }
     };
+    local_recovery::expire_at_startup();
+    local_recovery::spawn_hourly_expiry();
 
     // An over-long VOISU_RECORDING_DEADLINE_MS is clamped to the one bounded
     // maximum. Say so once here rather than at the clamp itself, which runs on
@@ -517,37 +523,10 @@ async fn actor_loop(
     let controlled = test_mode.as_deref() == Some(std::ffi::OsStr::new("controlled"));
     let controlled_deadlines =
         controlled || test_mode.as_deref() == Some(std::ffi::OsStr::new("system-boundaries"));
-    let grammar_adapter = if controlled {
-        std::env::var("VOISU_TEST_MINIMAL_GRAMMAR_ENDPOINT")
-            .ok()
-            .and_then(|endpoint| GrammarHttpClient::with_endpoint(endpoint).ok())
-            .map(MinimalGrammarAdapter::new)
-    } else {
-        match MinimalGrammarAdapter::production() {
-            Ok(adapter) => Some(adapter),
-            Err(error) => {
-                eprintln!("Minimal Grammar unavailable: {error}");
-                None
-            }
-        }
-    };
     let dpr_enabled = voisu_app::config::dpr_enabled();
     let qwen_format_enabled = voisu_app::config::qwen_format_enabled();
-    let dpr_client = if !dpr_enabled || !qwen_format_enabled {
-        None
-    } else if controlled {
-        std::env::var("VOISU_TEST_DPR_ENDPOINT")
-            .ok()
-            .and_then(|endpoint| DprCloudClient::with_endpoint(endpoint).ok())
-    } else {
-        match DprCloudClient::groq() {
-            Ok(client) => Some(client),
-            Err(error) => {
-                eprintln!("Developer Prompt Rendering cloud unavailable: {error}");
-                None
-            }
-        }
-    };
+    let mut grammar_adapter = None;
+    let mut dpr_client = None;
     let mut capture: Option<Box<dyn AudioCapture>> = Some(if controlled {
         Box::new(ControlledCapture::from_env(levels.clone()))
     } else {
@@ -567,11 +546,8 @@ async fn actor_loop(
     // Controlled adapters are built once at daemon start with one language
     // resolution; every production Recording/replay boundary resolves its own
     // snapshot below. The controlled adapters themselves never send a request.
-    let daemon_language = voisu_app::config::transcription_language();
-    let mut deepgram: Option<Box<dyn TranscriptProvider>> = controlled
-        .then(|| build_deepgram_provider(deepgram_enabled, true, &[], &daemon_language, &reaper));
-    let mut groq: Option<Box<dyn TranscriptProvider>> =
-        controlled.then(|| build_groq_provider(true, String::new(), daemon_language, &reaper));
+    let mut deepgram: Option<Box<dyn TranscriptProvider>> = None;
+    let mut groq: Option<Box<dyn TranscriptProvider>> = None;
     // The processing supervisor cannot inspect task-local provider state after a
     // panic, so retain the providers configured for this Recording beside the
     // actor-owned adapters and pass that list into every supervised stop path.
@@ -837,8 +813,79 @@ async fn actor_loop(
                     ));
                     continue;
                 }
+                if admitted_mode == AsrMode::Cloud {
+                    let owned = cloud_ownership::construct_for_cloud(
+                        admitted_mode,
+                        controlled,
+                        dpr_enabled,
+                        qwen_format_enabled,
+                        None,
+                    );
+                    if grammar_adapter.is_none() {
+                        grammar_adapter = owned.grammar;
+                    }
+                    if dpr_client.is_none() {
+                        dpr_client = owned.dpr;
+                    }
+                } else {
+                    grammar_adapter = None;
+                    dpr_client = None;
+                    local_routing::begin_local_session();
+                }
                 match pending {
+                    PendingCapture::Replay(fixture_name) if admitted_mode == AsrMode::Local => {
+                        let id = next_id;
+                        next_id += 1;
+                        state = ActorState::Replaying(id);
+                        let replay_snapshot = voisu_app::dictionary::dictionary_snapshot();
+                        let writing_mode = voisu_app::config::writing_mode();
+                        let fixture_dir = diagnostics
+                            .as_ref()
+                            .expect("diagnostics availability checked above")
+                            .fixture_dir();
+                        let current_validator = validator.take().expect("validator is available");
+                        let fixture_name = fixture_name.into_inner();
+                        let replay = tokio::spawn(async move {
+                            let (deepgram_slot, groq_slot) = local_routing::cloud_free_slots();
+                            let response = local_routing::replay_local(
+                                &voisu_core::correlation_id(id),
+                                &fixture_name,
+                                replay_snapshot.user_terms,
+                                writing_mode,
+                                |name| {
+                                    read_fixture(&fixture_dir, name)
+                                        .map_err(|error| error.diagnostic().to_owned())
+                                },
+                            );
+                            ReplayResult {
+                                deepgram: deepgram_slot,
+                                groq: groq_slot,
+                                validator: current_validator,
+                                response,
+                            }
+                        });
+                        tokio::spawn(supervise_replay(
+                            replay,
+                            id,
+                            false,
+                            false,
+                            Arc::new(Vec::new()),
+                            Arc::new(String::new()),
+                            Arc::new(String::new()),
+                            reply,
+                            tx.clone(),
+                            reaper.clone(),
+                        ));
+                    }
                     PendingCapture::Replay(fixture_name) => {
+                        if let Some(message) = local_routing::refuse_cloud_recovery_replay(
+                            fixture_name.clone().into_inner().as_str(),
+                            admitted_mode,
+                        ) {
+                            let _ =
+                                reply.send(Response::rejected(Some(DaemonState::Idle), message));
+                            continue;
+                        }
                         let id = next_id;
                         next_id += 1;
                         state = ActorState::Replaying(id);
@@ -874,6 +921,20 @@ async fn actor_loop(
                             ));
                             groq = Some(build_groq_provider(
                                 false,
+                                replay_whisper_prompt.as_ref().clone(),
+                                replay_language.as_ref().clone(),
+                                &reaper,
+                            ));
+                        } else if deepgram.is_none() || groq.is_none() {
+                            deepgram = Some(build_deepgram_provider(
+                                deepgram_enabled,
+                                true,
+                                &replay_keyterms,
+                                &replay_language,
+                                &reaper,
+                            ));
+                            groq = Some(build_groq_provider(
+                                true,
                                 replay_whisper_prompt.as_ref().clone(),
                                 replay_language.as_ref().clone(),
                                 &reaper,
@@ -922,6 +983,14 @@ async fn actor_loop(
                         ));
                     }
                     PendingCapture::Start => {
+                        if admitted_mode == AsrMode::Local
+                            && let Err(error) =
+                                local_routing::quota_before_local_capture(local_recovery::enabled())
+                        {
+                            let _ = reply
+                                .send(Response::rejected(Some(DaemonState::Idle), error.message()));
+                            continue;
+                        }
                         let id = next_id;
                         next_id += 1;
                         // A dictionary edit becomes visible at this Recording
@@ -948,6 +1017,7 @@ async fn actor_loop(
                                 .push((Provider::Deepgram, transcription_language.clone()));
                         }
                         let languages = ResolvedRecordingLanguages::new(language_declarations);
+                        let user_terms = session_snapshot.user_terms.clone();
                         validator
                             .as_mut()
                             .expect("validator is available")
@@ -956,7 +1026,7 @@ async fn actor_loop(
                             .as_mut()
                             .expect("validator is available")
                             .set_dictionary_terms(session_terms);
-                        if !controlled {
+                        if admitted_mode != AsrMode::Local && !controlled {
                             deepgram = Some(build_deepgram_provider(
                                 deepgram_enabled,
                                 false,
@@ -970,13 +1040,33 @@ async fn actor_loop(
                                 transcription_language,
                                 &reaper,
                             ));
+                        } else if admitted_mode != AsrMode::Local
+                            && (deepgram.is_none() || groq.is_none())
+                        {
+                            deepgram = Some(build_deepgram_provider(
+                                deepgram_enabled,
+                                true,
+                                &session_keyterms,
+                                &transcription_language,
+                                &reaper,
+                            ));
+                            groq = Some(build_groq_provider(
+                                true,
+                                session_whisper_prompt,
+                                transcription_language.clone(),
+                                &reaper,
+                            ));
                         }
                         // The correlation ID exists from the moment the Recording is
                         // accepted, so startup failures and recovery evidence are
                         // correlated even though no adapter has started yet.
+                        let correlation_id = voisu_core::correlation_id(id);
+                        if admitted_mode == AsrMode::Local {
+                            local_routing::begin_live_with_terms(&correlation_id, user_terms);
+                        }
                         state = ActorState::Starting {
                             id,
-                            correlation_id: voisu_core::correlation_id(id),
+                            correlation_id,
                             asr_mode: admitted_mode,
                         };
                         if let Some(delivery) = delivery.as_mut()
@@ -989,9 +1079,15 @@ async fn actor_loop(
                         }
                         let mut current_capture =
                             capture.take().expect("capture adapter is available");
-                        let mut current_deepgram =
-                            deepgram.take().expect("Deepgram adapter is available");
-                        let mut current_groq = groq.take().expect("Groq adapter is available");
+                        let (mut current_deepgram, mut current_groq) =
+                            if admitted_mode == AsrMode::Local {
+                                local_routing::cloud_free_slots()
+                            } else {
+                                (
+                                    deepgram.take().expect("Deepgram adapter is available"),
+                                    groq.take().expect("Groq adapter is available"),
+                                )
+                            };
                         let actor = tx.clone();
                         let level_ring = levels.begin_recording();
                         tokio::task::spawn_blocking(move || {
@@ -1037,7 +1133,7 @@ async fn actor_loop(
                     reply,
                 } = *started;
                 capture = Some(returned_capture);
-                if controlled {
+                if controlled && started_asr_mode != AsrMode::Local {
                     deepgram = Some(returned_deepgram);
                     groq = Some(returned_groq);
                 } else {
@@ -1236,6 +1332,9 @@ async fn actor_loop(
                             ));
                         }
                         Err(failure) => {
+                            if started_asr_mode == AsrMode::Local {
+                                local_routing::abandon_live(&correlation);
+                            }
                             level_ring.deactivate();
                             let recovering =
                                 failure.capture.is_some() || failure.provider_stream.is_some();
@@ -1961,14 +2060,17 @@ fn build_deepgram_provider(
 ) -> Box<dyn TranscriptProvider> {
     if !deepgram_enabled {
         Box::new(DisabledProvider::new(Provider::Deepgram))
-    } else if controlled {
-        Box::new(ControlledProvider::from_env(Provider::Deepgram))
     } else {
-        Box::new(DeepgramProvider::with_keyterms_and_language(
-            reaper.clone(),
-            keyterms.to_vec(),
-            language.to_owned(),
-        ))
+        local_routing::note_cloud_capability_used();
+        if controlled {
+            Box::new(ControlledProvider::from_env(Provider::Deepgram))
+        } else {
+            Box::new(DeepgramProvider::with_keyterms_and_language(
+                reaper.clone(),
+                keyterms.to_vec(),
+                language.to_owned(),
+            ))
+        }
     }
 }
 
@@ -1980,6 +2082,7 @@ fn build_groq_provider(
     language: String,
     reaper: &ProviderReaper,
 ) -> Box<dyn TranscriptProvider> {
+    local_routing::note_cloud_capability_used();
     if controlled {
         Box::new(ControlledProvider::from_env(Provider::Groq))
     } else {
@@ -2258,7 +2361,7 @@ async fn process_recording(
         deadline_clock: _,
         writing_mode,
         rendering_policy,
-        asr_mode: _,
+        asr_mode,
         dictionary_terms,
         languages,
         mut evidence,
@@ -2351,6 +2454,49 @@ async fn process_recording(
             match store.store_debug_audio(&correlation_id, audio.pcm_s16le_mono_16khz()) {
                 Ok(record) => debug_audio = Some(record),
                 Err(error) => eprintln!("Recording {id}: debug audio capture failed: {error}"),
+            }
+        }
+        if asr_mode == AsrMode::Local {
+            let pcm = audio.pcm_s16le_mono_16khz().to_vec();
+            let _ = providers.abort().await;
+            let rec_id = correlation_id.clone();
+            let recovery = local_recovery::enabled();
+            match local_routing::finish_local_stop(&rec_id, pcm, writing_mode, recovery) {
+                Ok(LocalStopResult::NoText { reason }) => {
+                    evidence.stages.push(LifecycleStage::ValidationCompleted);
+                    return Err(BoundaryError::new(BoundaryKind::SilentRecording, reason));
+                }
+                Ok(LocalStopResult::Transcript(text)) => {
+                    evidence.stages.push(LifecycleStage::ValidationCompleted);
+                    let finalized_at = Instant::now();
+                    let mut authorized = CorrelationAuthorizedDelivery {
+                        inner: delivery.as_mut(),
+                        actor: actor.clone(),
+                        recording_id: id,
+                        correlation_id: correlation_id.clone(),
+                    };
+                    let outcome = authorized.deliver(Transcript(text.clone())).await?;
+                    local_routing::apply_local_delivery_evidence(
+                        &mut evidence,
+                        outcome,
+                        started_at,
+                        utterance_end,
+                        finalized_at,
+                    );
+                    local_routing::finish_delivery(&rec_id, &text, recovery).map_err(|error| {
+                        BoundaryError::new(BoundaryKind::Delivery, error.message())
+                    })?;
+                    final_transcript = Some(text);
+                    return Ok(());
+                }
+                Err(error) => {
+                    local_routing::mark_recovery_failed(&rec_id, recovery);
+                    local_routing::abandon_live(&rec_id);
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Validation,
+                        error.message(),
+                    ));
+                }
             }
         }
         let english_eligible =
@@ -3151,6 +3297,11 @@ fn rebuild_replay_adapters(
     // tail, which must stay panic-free and free of filesystem I/O and stray
     // stderr. A live `voisu deepgram` toggle still takes effect only after the
     // documented daemon restart.
+    if !deepgram_enabled && keyterms.is_empty() && whisper_prompt.is_empty() && language.is_empty()
+    {
+        let (deepgram, groq) = local_routing::cloud_free_slots();
+        return (deepgram, groq, Box::new(MergeResultValidator::new()));
+    }
     let deepgram =
         build_deepgram_provider(deepgram_enabled, controlled, keyterms, language, reaper);
     if controlled {

@@ -33,6 +33,7 @@ pub use installer::{
     MaintenanceError, MaintenanceKind, MaintenanceReservation, install_entry,
 };
 pub use receipt::{ActiveReceipt, ReceiptError, from_entry};
+pub use safe_fs::{SafeFsError, ensure_private_dir, relative_file_name};
 pub use store::{ModelLease, ModelStore, StoreError, StoreLock, models_dir, models_dir_from};
 pub use url_policy::{CatalogUrl, UrlPolicyError, validate_catalog_url};
 

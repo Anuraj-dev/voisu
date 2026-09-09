@@ -72,6 +72,12 @@ pub struct AsrModeStatus {
     pub local_readiness: LocalReadiness,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_error: Option<String>,
+    /// Discloses debug-capture and/or local-recovery audio retention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_retention: Option<String>,
+    /// Local path has not constructed Cloud clients, read credentials, or attempted IP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_path_clean: Option<bool>,
 }
 
 #[cfg(test)]
