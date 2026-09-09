@@ -24,12 +24,16 @@ pub use bakeoff::{
     percentile_nearest_rank,
 };
 pub use bounds::{
-    CANCEL_GRACE, IPC_MARGIN, LOAD_DEADLINE, MAX_CACHE_BYTES, MAX_CPU_CORES,
+    CANCEL_GRACE, IPC_MARGIN, LOAD_DEADLINE, LiveHostLimits, MAX_CACHE_BYTES, MAX_CPU_CORES,
     MAX_ERROR_METADATA_BYTES, MAX_JSON_DEPTH, MAX_JSON_FIELDS, MAX_JSON_FRAME_BYTES,
     MAX_MEMORY_BYTES, MAX_METADATA_BYTES, MAX_PCM_BYTES, MAX_RECORDING, MAX_RESTARTS,
     MAX_RETAINED_STDERR_BYTES, MAX_TRANSCRIPT_BYTES, MAX_VRAM_FRACTION_DEN, MAX_VRAM_FRACTION_NUM,
     MAX_WORKER_TASKS, PCM_BITS, PCM_CHANNELS, PCM_SAMPLE_RATE_HZ, REAP_OBSERVE, RESTART_WINDOW,
-    STOP_PROCESSING, local_response_deadline, worker_cpu_quota_cores, worker_memory_ceiling_bytes,
+    ResourceEvidence, STOP_PROCESSING, WorkerCgroupSpec, WorkerResourceLimits,
+    cache_usage_within_budget, cpu_max_cgroup_value, cpu_quota_per_sec_usec, cpu_quota_percent,
+    desired_cgroup_spec, host_cpu_cores, host_physical_ram_bytes, local_response_deadline,
+    record_resource_evidence, resolve_live_worker_limits, resolve_worker_limits, vram_budget_bytes,
+    worker_cpu_quota_cores, worker_memory_ceiling_bytes,
 };
 pub use lifecycle::{LocalLifecycle, production_local_admission};
 pub use protocol::{
@@ -42,9 +46,20 @@ pub use runtime::{
     refuse_production_weight_download, reject_forbidden_program, shipped_unit_candidates,
 };
 pub use sandbox::{
-    CloudCapabilitySentinel, LauncherPolicy, PackagedUnitRestrictions, RestrictionProbe,
-    ScrubbedEnvironment, landlock_allowlist, local_unavailable_if_restrictions_fail,
-    packaged_unit_restrictions, scrub_worker_environment,
+    AppliedEnvEvidence, CgroupEvidence, CloudCapabilitySentinel, CoreDumpEvidence, DeniedSyscall,
+    FdScrubEvidence, HostSandboxEvidence, LandlockEvidence, LandlockRequest, LauncherPolicy,
+    NoNewPrivsEvidence, PRODUCT_TARGET, PackagedUnitRestrictions, PreExecEvidence,
+    RestrictionProbe, SandboxCapabilities, SandboxError, SandboxReady, ScrubbedEnvironment,
+    SeccompEvidence, SyscallArch, VerifiedModel, apply_landlock_restrictions, apply_no_new_privs,
+    apply_worker_environment, build_seccomp_filter, cgroup_controllers, child_cgroup_matches,
+    cleanup_worker_cgroup, close_unrelated_fds, collect_host_evidence, core_rlimit_zero,
+    current_cgroup_path, current_host_id, default_runtime_lib_dirs, denied_syscalls,
+    detect_landlock_abi, disable_core_dumps, forbidden_env_reason, gate_local_on_sandbox,
+    install_syscall_restrictions, is_dumpable_disabled, is_no_new_privs, join_worker_cgroup,
+    landlock_allowlist, landlock_request_clean, local_unavailable_if_restrictions_fail,
+    native_syscall_arch, packaged_unit_restrictions, pre_exec_lockdown, probe_sandbox_capabilities,
+    process_cgroup_path, render_host_evidence_markdown, scope_controllers,
+    scrub_worker_environment, verify_cgroup_membership, verify_model_file, worker_scope_name,
 };
 pub use seams::{
     CaptureSeam, DeliverySeam, FakeCapture, FakeDelivery, FinalizedRecording, SeamError,
