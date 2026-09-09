@@ -5,7 +5,10 @@ mod silent;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use voisu_core::{AsrMode, DaemonState, LocalReadiness, Response, Transcript};
+use voisu_core::{
+    AsrMode, DaemonState, DeliveryOutcome, LifecycleEvidence, LifecycleStage, LocalReadiness,
+    Response, Transcript, stop_anchored_timings,
+};
 
 use crate::config::WritingMode;
 
@@ -469,6 +472,26 @@ pub fn prepare_delivery(recording_id: &str, recovery_enabled: bool) -> Result<()
     Ok(())
 }
 
+pub fn apply_local_delivery_evidence(
+    evidence: &mut LifecycleEvidence,
+    outcome: DeliveryOutcome,
+    started_at: Instant,
+    utterance_end: Instant,
+    finalized_at: Instant,
+) {
+    evidence.delivery_count = evidence.delivery_count.saturating_add(1);
+    evidence.delivery_method = Some(outcome.method);
+    evidence.delivery_fallback_reason = outcome.fallback_reason;
+    evidence.release_to_text_ms =
+        Some(u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX));
+    let delivered_at = Instant::now();
+    let timings = stop_anchored_timings(started_at, utterance_end, finalized_at, delivered_at);
+    evidence.recording_duration_ms = Some(timings.recording_duration_ms);
+    evidence.stop_to_finalized_ms = Some(timings.stop_to_finalized_ms);
+    evidence.stop_to_delivered_ms = Some(timings.stop_to_delivered_ms);
+    evidence.stages.push(LifecycleStage::DeliveryCompleted);
+}
+
 pub fn finish_delivery(
     recording_id: &str,
     text: &str,
@@ -675,6 +698,63 @@ mod tests {
         let err = complete_replay("rec-old", vec![1, 0], &[], WritingMode::Literal, true, true)
             .unwrap_err();
         assert!(matches!(err, LocalError::CloudSelected));
+    }
+
+    #[test]
+    fn clipboard_fallback_is_recorded_on_local_delivery_evidence() {
+        let started = Instant::now();
+        let utterance_end = started;
+        let finalized_at = started;
+        let mut evidence = LifecycleEvidence {
+            recording_id: 1,
+            correlation_id: "rec-1-1-1".into(),
+            stages: vec![LifecycleStage::ValidationCompleted],
+            delivery_count: 0,
+            delivery_method: None,
+            delivery_fallback_reason: None,
+            streamed_chunk_count: 0,
+            source_transcript_providers: Vec::new(),
+            first_chunk_ms: None,
+            capture_finalized_ms: None,
+            truncated_by: None,
+            provider_timings_ms: Vec::new(),
+            provider_failures: Vec::new(),
+            release_to_text_ms: None,
+            recording_duration_ms: None,
+            stop_to_finalized_ms: None,
+            stop_to_delivered_ms: None,
+            transcript_selection: None,
+            validation_reason: None,
+            fallback_reason: None,
+            reconciliation_requested: false,
+            recovery_attempted: false,
+            source_selection_diagnostic: None,
+            intent_reconstruction: None,
+            confidence_arbitration: None,
+            source_transcripts: Vec::new(),
+            final_transcript: None,
+        };
+        apply_local_delivery_evidence(
+            &mut evidence,
+            DeliveryOutcome::clipboard_fallback("compositor submit failed"),
+            started,
+            utterance_end,
+            finalized_at,
+        );
+        assert_eq!(evidence.delivery_count, 1);
+        assert_eq!(
+            evidence.delivery_method,
+            Some(voisu_core::DeliveryMethod::ClipboardFallback)
+        );
+        assert_eq!(
+            evidence.delivery_fallback_reason.as_deref(),
+            Some("compositor submit failed")
+        );
+        assert!(evidence.stop_to_delivered_ms.is_some());
+        assert_eq!(
+            evidence.stages.last(),
+            Some(&LifecycleStage::DeliveryCompleted)
+        );
     }
 
     #[test]

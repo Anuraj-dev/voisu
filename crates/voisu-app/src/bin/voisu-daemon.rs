@@ -848,7 +848,7 @@ async fn actor_loop(
                         let replay = tokio::spawn(async move {
                             let (deepgram_slot, groq_slot) = local_routing::cloud_free_slots();
                             let response = local_routing::replay_local(
-                                &format!("rec-{id}"),
+                                &voisu_core::correlation_id(id),
                                 &fixture_name,
                                 replay_snapshot.user_terms,
                                 writing_mode,
@@ -1017,12 +1017,7 @@ async fn actor_loop(
                                 .push((Provider::Deepgram, transcription_language.clone()));
                         }
                         let languages = ResolvedRecordingLanguages::new(language_declarations);
-                        if admitted_mode == AsrMode::Local {
-                            local_routing::begin_live_with_terms(
-                                &format!("rec-{id}"),
-                                session_snapshot.user_terms.clone(),
-                            );
-                        }
+                        let user_terms = session_snapshot.user_terms.clone();
                         validator
                             .as_mut()
                             .expect("validator is available")
@@ -1065,9 +1060,13 @@ async fn actor_loop(
                         // The correlation ID exists from the moment the Recording is
                         // accepted, so startup failures and recovery evidence are
                         // correlated even though no adapter has started yet.
+                        let correlation_id = voisu_core::correlation_id(id);
+                        if admitted_mode == AsrMode::Local {
+                            local_routing::begin_live_with_terms(&correlation_id, user_terms);
+                        }
                         state = ActorState::Starting {
                             id,
-                            correlation_id: voisu_core::correlation_id(id),
+                            correlation_id,
                             asr_mode: admitted_mode,
                         };
                         if let Some(delivery) = delivery.as_mut()
@@ -1334,7 +1333,7 @@ async fn actor_loop(
                         }
                         Err(failure) => {
                             if started_asr_mode == AsrMode::Local {
-                                local_routing::abandon_live(&format!("rec-{id}"));
+                                local_routing::abandon_live(&correlation);
                             }
                             level_ring.deactivate();
                             let recovering =
@@ -2460,7 +2459,7 @@ async fn process_recording(
         if asr_mode == AsrMode::Local {
             let pcm = audio.pcm_s16le_mono_16khz().to_vec();
             let _ = providers.abort().await;
-            let rec_id = format!("rec-{id}");
+            let rec_id = correlation_id.clone();
             let recovery = local_recovery::enabled();
             match local_routing::finish_local_stop(&rec_id, pcm, writing_mode, recovery) {
                 Ok(LocalStopResult::NoText { reason }) => {
@@ -2468,6 +2467,8 @@ async fn process_recording(
                     return Err(BoundaryError::new(BoundaryKind::SilentRecording, reason));
                 }
                 Ok(LocalStopResult::Transcript(text)) => {
+                    evidence.stages.push(LifecycleStage::ValidationCompleted);
+                    let finalized_at = Instant::now();
                     let mut authorized = CorrelationAuthorizedDelivery {
                         inner: delivery.as_mut(),
                         actor: actor.clone(),
@@ -2475,13 +2476,17 @@ async fn process_recording(
                         correlation_id: correlation_id.clone(),
                     };
                     let outcome = authorized.deliver(Transcript(text.clone())).await?;
-                    let _ = outcome;
+                    local_routing::apply_local_delivery_evidence(
+                        &mut evidence,
+                        outcome,
+                        started_at,
+                        utterance_end,
+                        finalized_at,
+                    );
                     local_routing::finish_delivery(&rec_id, &text, recovery).map_err(|error| {
                         BoundaryError::new(BoundaryKind::Delivery, error.message())
                     })?;
                     final_transcript = Some(text);
-                    evidence.stages.push(LifecycleStage::ValidationCompleted);
-                    evidence.stages.push(LifecycleStage::DeliveryCompleted);
                     return Ok(());
                 }
                 Err(error) => {

@@ -103,6 +103,7 @@ pub enum RecoveryError {
     Expired,
     CloudSelected,
     Unsafe,
+    Existing,
 }
 
 impl RecoveryError {
@@ -115,12 +116,16 @@ impl RecoveryError {
                 "Local-origin recovery is refused while Cloud is selected".to_owned()
             }
             Self::Unsafe => "recovery path is unsafe".to_owned(),
+            Self::Existing => {
+                "unexpired recovery artifact already exists; retained failure was not overwritten"
+                    .to_owned()
+            }
         }
     }
 
     #[must_use]
     pub fn is_storage(&self) -> bool {
-        matches!(self, Self::Storage(_))
+        matches!(self, Self::Storage(_) | Self::Existing)
     }
 }
 
@@ -212,7 +217,7 @@ impl RecoveryStore {
                 {
                     let mut updated = artifact;
                     updated.delivery_state = DeliveryState::Ambiguous;
-                    let _ = write_private_file(&path, encode_meta(&updated).as_bytes());
+                    let _ = replace_private_file(&path, encode_meta(&updated).as_bytes());
                 }
                 Ok(_) => {}
                 Err(_) => {
@@ -247,6 +252,11 @@ impl RecoveryStore {
     ) -> Result<RecoveryArtifact, RecoveryError> {
         self.expire()?;
         let name = safe_id(recording_id)?;
+        let pcm_path = self.root.join(format!("{name}.pcm"));
+        let meta_path = self.root.join(format!("{name}.meta"));
+        if dest_occupied(&pcm_path) || dest_occupied(&meta_path) {
+            return Err(RecoveryError::Existing);
+        }
         let (count, bytes) = self.usage()?;
         if count >= MAX_RECORDINGS {
             return Err(RecoveryError::Quota(
@@ -273,8 +283,6 @@ impl RecoveryStore {
             pcm_bytes: pcm.len() as u64,
         };
         write_private_file(&meta_tmp, encode_meta(&artifact).as_bytes())?;
-        let pcm_path = self.root.join(format!("{name}.pcm"));
-        let meta_path = self.root.join(format!("{name}.meta"));
         fs::rename(&pcm_tmp, &pcm_path).map_err(map_io)?;
         fs::rename(&meta_tmp, &meta_path).map_err(map_io)?;
         sync_dir(&self.root)?;
@@ -347,7 +355,7 @@ impl RecoveryStore {
         }
         let name = safe_id(recording_id)?;
         let meta = self.root.join(format!("{name}.meta"));
-        write_private_file(&meta, encode_meta(&artifact).as_bytes())
+        replace_private_file(&meta, encode_meta(&artifact).as_bytes())
     }
 
     fn load_meta(&self, path: &Path) -> Result<RecoveryArtifact, RecoveryError> {
@@ -686,6 +694,25 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), RecoveryError>
     Ok(())
 }
 
+fn replace_private_file(path: &Path, contents: &[u8]) -> Result<(), RecoveryError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| RecoveryError::Storage("recovery metadata path has no parent".into()))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| RecoveryError::Storage("recovery metadata name is unusable".into()))?;
+    let tmp = parent.join(format!(".{name}.tmp"));
+    write_private_file(&tmp, contents)?;
+    fs::rename(&tmp, path).map_err(map_io)?;
+    sync_dir(parent)?;
+    Ok(())
+}
+
+fn dest_occupied(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
 fn sync_dir(path: &Path) -> Result<(), RecoveryError> {
     File::open(path)
         .and_then(|file| file.sync_all())
@@ -873,6 +900,54 @@ mod tests {
             !store.root().join("orphan.pcm").exists(),
             "future-dated unmatched pcm must expire"
         );
+    }
+
+    #[test]
+    fn persist_does_not_clobber_an_unexpired_failed_artifact() {
+        let home = tempfile::tempdir().unwrap();
+        let store = store(&home, clock(11_000));
+        store
+            .persist_before_inference("rec-1", &[1, 0, 2, 0], "hash")
+            .unwrap();
+        store.mark_failed("rec-1").unwrap();
+        let original = fs::read(store.root().join("rec-1.pcm")).unwrap();
+        let err = store
+            .persist_before_inference("rec-1", &[9, 9, 9, 9], "other")
+            .unwrap_err();
+        assert!(matches!(err, RecoveryError::Existing), "{err:?}");
+        assert_eq!(
+            fs::read(store.root().join("rec-1.pcm")).unwrap(),
+            original,
+            "retained failed PCM must survive a reused rec-1 id"
+        );
+        let loaded = store.load("rec-1").unwrap();
+        assert_eq!(loaded.delivery_state, DeliveryState::Failed);
+        assert_eq!(loaded.pcm_bytes, 4);
+    }
+
+    #[test]
+    fn set_state_replaces_meta_atomically_and_cleans_tmp() {
+        let home = tempfile::tempdir().unwrap();
+        let store = store(&home, clock(12_000));
+        store
+            .persist_before_inference("rec-live", &[3, 0], "hash")
+            .unwrap();
+        store.mark_delivery_started("rec-live").unwrap();
+        let leftover_tmp = store.root().join(".rec-live.meta.tmp");
+        assert!(
+            !leftover_tmp.exists(),
+            "stage tmp must be renamed away after success"
+        );
+        let loaded = store.load("rec-live").unwrap();
+        assert_eq!(loaded.delivery_state, DeliveryState::DeliveryStarted);
+        for entry in fs::read_dir(store.root()).unwrap() {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.ends_with(".tmp"),
+                "no leftover tmp after atomic meta replace: {name}"
+            );
+        }
     }
 
     #[test]
