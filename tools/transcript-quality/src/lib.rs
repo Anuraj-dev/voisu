@@ -17,9 +17,10 @@ mod score;
 use std::path::PathBuf;
 
 pub use bakeoff::{
-    BAKEOFF_CONTRACT_JSON, BAKEOFF_MANIFEST_SCHEMA, BakeoffHashInput, ValidatedBakeoffManifest,
-    load_and_validate_bakeoff_manifest, load_and_validate_bakeoff_manifest_for_measurement,
-    validate_bakeoff_manifest_text, validate_bakeoff_manifest_text_for_measurement,
+    BAKEOFF_CONTRACT_JSON, BAKEOFF_MANIFEST_SCHEMA, BAKEOFF_PUBLIC_REPORT_SCHEMA, BakeoffHashInput,
+    ValidatedBakeoffManifest, load_and_validate_bakeoff_manifest,
+    load_and_validate_bakeoff_manifest_for_measurement, validate_bakeoff_manifest_text,
+    validate_bakeoff_manifest_text_for_measurement, validate_bakeoff_public_report_text,
     verify_bakeoff_hash_inputs,
 };
 pub use compare::render_compare;
@@ -56,6 +57,7 @@ USAGE:
     transcript-quality capture-result [--corpus <dir>] [--history <path>] [--id <correlation-id>]...
     transcript-quality compare <run-a.json> <run-b.json>
     transcript-quality validate-bakeoff <manifest.json> [--expected-manifest-sha256 <sha256>]
+    transcript-quality validate-bakeoff-report <report.json>
     transcript-quality --manifest <path> [--out <path>] [--deliver-scratch <path>]
 
 score-corpus          Score the audio-adjudicated eval corpus (see the README)
@@ -70,7 +72,11 @@ capture-result        Copy pipeline results from history.jsonl (or a
                       sidecars. Never copies audio.
 compare               Per-case delta table between two score-corpus JSON runs
 validate-bakeoff      Validate the frozen R7 corpus metadata and print its public summary;
-                      pass the external hash for the measured gate
+                       pass the external hash for the measured gate
+validate-bakeoff-report
+                       Check a candidate public report against the frozen
+                       schema: only declared fields, no forbidden private
+                       fields, bound to the frozen contract and manifest hash
 --manifest            Legacy manifest evaluation (unchanged)
 --help                Print this help
 ";
@@ -86,6 +92,7 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<(), String
         Some("capture-result") => run_capture_result(all.into_iter().skip(1)),
         Some("compare") => run_compare(all.into_iter().skip(1)),
         Some("validate-bakeoff") => run_validate_bakeoff(all.into_iter().skip(1)),
+        Some("validate-bakeoff-report") => run_validate_bakeoff_report(all.into_iter().skip(1)),
         _ => run_manifest(all),
     }
 }
@@ -123,6 +130,29 @@ fn run_validate_bakeoff(args: impl IntoIterator<Item = impl AsRef<str>>) -> Resu
         serde_json::to_string_pretty(&summary.public_summary)
             .map_err(|err| format!("cannot render bakeoff summary: {err}"))?
     );
+    Ok(())
+}
+
+fn run_validate_bakeoff_report(
+    args: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<(), String> {
+    let args: Vec<String> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_owned())
+        .collect();
+    if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
+        println!("USAGE:\n    transcript-quality validate-bakeoff-report <report.json>");
+        return Ok(());
+    }
+    let [report] = args.as_slice() else {
+        return Err(
+            "USAGE:\n    transcript-quality validate-bakeoff-report <report.json>".to_owned(),
+        );
+    };
+    let text = std::fs::read_to_string(report)
+        .map_err(|err| format!("cannot read bakeoff public report {report}: {err}"))?;
+    bakeoff::validate_bakeoff_public_report_text(&text)?;
+    println!("bakeoff public report {report} matches the frozen schema");
     Ok(())
 }
 
