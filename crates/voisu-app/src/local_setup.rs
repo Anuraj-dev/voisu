@@ -111,10 +111,9 @@ impl MaintenanceReservation for SetupMaintenance {
     fn acquire(&self) -> Result<MaintenanceKind, MaintenanceError> {
         match daemon_lock::try_acquire_lifetime_lock() {
             Ok(lock) => {
-                if let Some(response) = crate::system::daemon_status_response() {
-                    drop(lock);
-                    return maintenance_from_status(&response);
-                }
+                // The lock, not the socket, is proof of absence. A leftover
+                // socket must not be treated as a live daemon.
+                unlink_stale_daemon_socket();
                 *self
                     .lifetime
                     .lock()
@@ -127,6 +126,13 @@ impl MaintenanceReservation for SetupMaintenance {
             },
         }
     }
+}
+
+fn unlink_stale_daemon_socket() {
+    let Ok(path) = voisu_core::socket_path() else {
+        return;
+    };
+    let _ = std::fs::remove_file(path);
 }
 
 fn maintenance_from_status(response: &Response) -> Result<MaintenanceKind, MaintenanceError> {
@@ -228,10 +234,15 @@ fn catalog_line(entry: &CatalogEntry) -> String {
 }
 
 pub fn restore_retained_receipt() -> Result<String, String> {
-    restore_retained_receipt_in(&load_store()?)
+    let maintenance = SetupMaintenance::default();
+    restore_retained_receipt_in(&load_store()?, &maintenance)
 }
 
-fn restore_retained_receipt_in(store: &ModelStore) -> Result<String, String> {
+fn restore_retained_receipt_in(
+    store: &ModelStore,
+    maintenance: &dyn MaintenanceReservation,
+) -> Result<String, String> {
+    refuse_busy_maintenance(maintenance.acquire())?;
     let _lock = store
         .lock_exclusive()
         .map_err(|error| format!("{error:?}"))?;
@@ -267,6 +278,18 @@ fn load_retained_from(store: &ModelStore) -> Result<ActiveReceipt, String> {
         ReceiptError::Missing => "no retained model receipt".to_owned(),
         other => format!("{other:?}"),
     })
+}
+
+fn refuse_busy_maintenance(
+    acquired: Result<MaintenanceKind, MaintenanceError>,
+) -> Result<(), String> {
+    match acquired {
+        Ok(MaintenanceKind::Idle) => Ok(()),
+        Ok(MaintenanceKind::Recording) => Err("Recording active".into()),
+        Ok(MaintenanceKind::Replay) => Err("Replay active".into()),
+        Ok(MaintenanceKind::DaemonBusy) => Err("daemon is not idle".into()),
+        Err(MaintenanceError::Busy(message)) => Err(message.into()),
+    }
 }
 
 fn catalog_entry_for(receipt: &ActiveReceipt) -> Result<&'static CatalogEntry, String> {
@@ -444,6 +467,22 @@ mod tests {
         assert_eq!(consent.license_spdx, fixture.license.spdx);
     }
 
+    struct IdleReservation;
+
+    impl MaintenanceReservation for IdleReservation {
+        fn acquire(&self) -> Result<MaintenanceKind, MaintenanceError> {
+            Ok(MaintenanceKind::Idle)
+        }
+    }
+
+    struct RecordingReservation;
+
+    impl MaintenanceReservation for RecordingReservation {
+        fn acquire(&self) -> Result<MaintenanceKind, MaintenanceError> {
+            Err(MaintenanceError::Busy("Recording active"))
+        }
+    }
+
     fn write_fixture_artifact(store: &ModelStore, artifact_id: &str) {
         let fixture = ci_fixture_entry();
         let dir = store.artifact_dir(fixture, artifact_id);
@@ -467,7 +506,7 @@ mod tests {
             crate::local_model::encode_receipt(&retained),
         )
         .unwrap();
-        let id = restore_retained_receipt_in(&store).unwrap();
+        let id = restore_retained_receipt_in(&store, &IdleReservation).unwrap();
         assert_eq!(id, "l3-health-fixture");
         assert_eq!(
             store.load_active().unwrap().unwrap().artifact_id,
@@ -493,7 +532,7 @@ mod tests {
             crate::local_model::encode_receipt(&retained),
         )
         .unwrap();
-        let error = restore_retained_receipt_in(&store).unwrap_err();
+        let error = restore_retained_receipt_in(&store, &IdleReservation).unwrap_err();
         assert!(error.contains("failed verification"), "{error}");
         assert_eq!(
             store.load_active().unwrap().unwrap().artifact_id,
@@ -560,8 +599,64 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = ModelStore::open(temp.path().to_path_buf()).unwrap();
         let _held = store.lock_exclusive().unwrap();
-        let error = restore_retained_receipt_in(&store).unwrap_err();
+        let error = restore_retained_receipt_in(&store, &IdleReservation).unwrap_err();
         assert!(error.contains("Busy"), "{error}");
+    }
+
+    #[test]
+    fn restore_is_refused_while_recording() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ModelStore::open(temp.path().to_path_buf()).unwrap();
+        let error = restore_retained_receipt_in(&store, &RecordingReservation).unwrap_err();
+        assert_eq!(error, "Recording active");
+        assert!(store.load_active().unwrap().is_none());
+    }
+
+    #[test]
+    fn restore_holds_lifetime_lock_when_daemon_is_absent() {
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _guard = RuntimeGuard::set(runtime.path());
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::open(store_dir.path().to_path_buf()).unwrap();
+        let fixture = ci_fixture_entry();
+        let previous = from_entry(fixture, "old");
+        let retained = from_entry(fixture, "kept");
+        write_fixture_artifact(&store, "old");
+        write_fixture_artifact(&store, "kept");
+        store_receipt_atomic(store.root(), &previous).unwrap();
+        std::fs::write(
+            retained_receipt_path(store.root()),
+            crate::local_model::encode_receipt(&retained),
+        )
+        .unwrap();
+        let maintenance = SetupMaintenance::default();
+        let id = restore_retained_receipt_in(&store, &maintenance).unwrap();
+        assert_eq!(id, "l3-health-fixture");
+        assert!(
+            daemon_lock::try_acquire_lifetime_lock().is_err(),
+            "restore must keep the daemon from starting through verify+write"
+        );
+        drop(maintenance);
+        assert!(daemon_lock::try_acquire_lifetime_lock().is_ok());
+    }
+
+    #[test]
+    fn acquire_ignores_a_stale_socket_when_the_lifetime_lock_is_free() {
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _guard = RuntimeGuard::set(runtime.path());
+        let lock_path = daemon_lock::lock_path().unwrap();
+        daemon_lock::create_private_runtime_dirs(lock_path.parent().unwrap()).unwrap();
+        let socket = voisu_core::socket_path().unwrap();
+        let _stale = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let maintenance = SetupMaintenance::default();
+        assert_eq!(maintenance.acquire(), Ok(MaintenanceKind::Idle));
+        assert!(
+            !socket.exists(),
+            "stale socket must be unlinked after lock success"
+        );
+        assert!(daemon_lock::try_acquire_lifetime_lock().is_err());
     }
 
     #[test]
@@ -579,17 +674,29 @@ mod tests {
         assert!(daemon_lock::try_acquire_lifetime_lock().is_ok());
     }
 
+    fn runtime_env_lock() -> &'static Mutex<()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        &LOCK
+    }
+
     struct RuntimeGuard {
         previous: Option<std::ffi::OsString>,
+        _env: std::sync::MutexGuard<'static, ()>,
     }
 
     impl RuntimeGuard {
         fn set(path: &std::path::Path) -> Self {
+            let env = runtime_env_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let previous = std::env::var_os("XDG_RUNTIME_DIR");
             unsafe {
                 std::env::set_var("XDG_RUNTIME_DIR", path);
             }
-            Self { previous }
+            Self {
+                previous,
+                _env: env,
+            }
         }
     }
 
