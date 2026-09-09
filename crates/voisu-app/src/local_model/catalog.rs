@@ -228,7 +228,17 @@ const SHIPPED_ENTRIES: &[CatalogEntry] = &[
                 kind: FileKind::HealthFixture,
             },
         ],
-        allowed_hosts: &["huggingface.co", "raw.githubusercontent.com"],
+        allowed_hosts: &[
+            "huggingface.co",
+            "raw.githubusercontent.com",
+            // Pilot exception, reviewer must rule before any ship: HF `resolve`
+            // answers with a 302 to HF-operated blob CDN hosts, so a strict
+            // same-host redirect policy can never complete the download. The
+            // host below is pinned exactly and visibly; any rotation breaks
+            // loudly instead of escaping silently. A principled redirect-host
+            // policy is still open.
+            "us.aws.cdn.hf.co",
+        ],
         production_weights: true,
     },
     CatalogEntry {
@@ -369,6 +379,8 @@ mod tests {
         );
         assert!(winner.allowed_hosts.contains(&"raw.githubusercontent.com"));
         assert!(winner.required_names.contains(&"jfk.wav"));
+        // Pilot redirect exception stays exact and visible (see allowed_hosts).
+        assert!(winner.allowed_hosts.contains(&"us.aws.cdn.hf.co"));
         // small.en stays unelected without a health fixture.
         let small = catalog
             .entries

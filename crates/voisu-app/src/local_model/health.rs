@@ -250,28 +250,56 @@ fn score_known_audio<W: WorkerChild>(
     }
 }
 
-/// Extract s16le mono 16 kHz PCM from a canonical 44-byte RIFF/WAV fixture.
-/// Anything else fails closed as fixture quality, never as inference input.
+/// Extract s16le mono 16 kHz PCM from a RIFF/WAV fixture by walking its
+/// chunks. Extra informational chunks (the pinned JFK file carries a LIST
+/// chunk before `data`) are skipped; anything else fails closed as fixture
+/// quality, never as inference input.
 fn jfk_pcm(wav: &[u8]) -> Option<Vec<u8>> {
-    if wav.len() < 48 || !wav.len().is_multiple_of(2) {
+    if wav.len() < 20 || !wav.len().is_multiple_of(2) {
         return None;
     }
-    if &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" || &wav[12..16] != b"fmt " {
+    if &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
         return None;
     }
-    if u16::from_le_bytes([wav[20], wav[21]]) != 1
-        || u16::from_le_bytes([wav[22], wav[23]]) != 1
-        || u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]) != 16_000
-        || u16::from_le_bytes([wav[34], wav[35]]) != 16
-        || &wav[36..40] != b"data"
-    {
+    let mut pos = 12;
+    let mut fmt_ok = false;
+    let mut data: Option<&[u8]> = None;
+    while pos + 8 <= wav.len() {
+        let id = &wav[pos..pos + 4];
+        let size = u32::from_le_bytes(wav[pos + 4..pos + 8].try_into().ok()?) as usize;
+        let start = pos + 8;
+        let end = start.checked_add(size)?;
+        if end > wav.len() {
+            return None;
+        }
+        if id == b"fmt " {
+            if size < 16 {
+                return None;
+            }
+            if u16::from_le_bytes([wav[start], wav[start + 1]]) != 1
+                || u16::from_le_bytes([wav[start + 2], wav[start + 3]]) != 1
+                || u32::from_le_bytes(wav[start + 4..start + 8].try_into().ok()?) != 16_000
+                || u16::from_le_bytes([wav[start + 14], wav[start + 15]]) != 16
+            {
+                return None;
+            }
+            fmt_ok = true;
+        } else if id == b"data" {
+            if data.is_some() {
+                return None;
+            }
+            data = Some(&wav[start..end]);
+        }
+        pos = end + (size % 2);
+    }
+    if !fmt_ok {
         return None;
     }
-    let data_len = u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]) as usize;
-    if wav.len() != 44 + data_len {
+    let data = data?;
+    if data.is_empty() || !data.len().is_multiple_of(2) || pos != wav.len() {
         return None;
     }
-    Some(wav[44..].to_vec())
+    Some(data.to_vec())
 }
 
 pub fn verify_candidate(entry: &CatalogEntry, candidate: &Path) -> Result<(), HealthError> {
@@ -469,10 +497,45 @@ mod tests {
     }
 
     #[test]
-    fn wav_fixture_must_be_canonical_s16le_mono_16k() {
+    fn wav_fixture_must_be_s16le_mono_16k() {
         assert!(jfk_pcm(b"too short").is_none());
         let mut bad = vec![0u8; 48];
         bad[0..4].copy_from_slice(b"RIFX");
         assert!(jfk_pcm(&bad).is_none());
+    }
+
+    fn chunked_fixture(extra: &[u8]) -> Vec<u8> {
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        let pcm = [7u8, 0, 8, 0];
+        let total = 4 + (8 + 16) + extra.len() + (8 + pcm.len());
+        wav.extend_from_slice(&(total as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&16_000u32.to_le_bytes());
+        wav.extend_from_slice(&32_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(extra);
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&pcm);
+        wav
+    }
+
+    #[test]
+    fn wav_walker_skips_list_chunks_and_rejects_bad_format() {
+        let mut list = Vec::new();
+        list.extend_from_slice(b"LIST");
+        list.extend_from_slice(&26u32.to_le_bytes());
+        list.extend_from_slice(&[0u8; 26]);
+        let pcm = jfk_pcm(&chunked_fixture(&list)).expect("LIST is skipped");
+        assert_eq!(pcm, vec![7, 0, 8, 0]);
+        assert!(jfk_pcm(&chunked_fixture(&[])).is_some());
+        let mut stereo = chunked_fixture(&[]);
+        stereo[22] = 2;
+        assert!(jfk_pcm(&stereo).is_none());
     }
 }
