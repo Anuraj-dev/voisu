@@ -74,6 +74,17 @@ impl RestartBudget {
         self.starts.push(now);
         Ok(())
     }
+
+    /// True once the rolling budget is spent. Recovery never happens on its
+    /// own: the supervisor runs no restart loop, so a new start requires an
+    /// explicit Setup retry (`attach_*`) or a daemon restart (fresh
+    /// supervisor). The window sliding only permits a later explicit retry.
+    #[must_use]
+    pub fn exhausted(&mut self, now: Instant) -> bool {
+        self.starts
+            .retain(|started| now.saturating_duration_since(*started) < RESTART_WINDOW);
+        self.starts.len() >= MAX_RESTARTS
+    }
 }
 
 pub trait WorkerChild {
@@ -96,6 +107,11 @@ pub struct FakeWorker {
     pub scripted_text: Option<String>,
     /// Simulated work duration. Compared to `deadline` without sleeping.
     pub block_for: Option<Duration>,
+    /// Successful Prepare exchanges observed by the harness. Stays 1 across
+    /// repeated transcribes: the persistent worker never reloads per Recording.
+    pub prepare_count: u32,
+    /// Successful Transcribe exchanges accepted by the harness.
+    pub transcribe_count: u32,
     /// If set, the worker echoes this correlation instead of the inbound one.
     pub response_correlation: Option<Correlation>,
     /// Scripted reap result. Default is a clean exit.
@@ -126,6 +142,8 @@ impl Default for FakeWorker {
             ignore_cancel: false,
             hold_until_cancel: false,
             queued_late: None,
+            prepare_count: 0,
+            transcribe_count: 0,
         }
     }
 }
@@ -153,6 +171,7 @@ impl WorkerChild for FakeWorker {
             ControlFrame::Prepare(correlation) => {
                 let expected = self.live_correlation(&correlation);
                 correlations_match(&expected, &correlation).map_err(SupervisorError::Protocol)?;
+                self.prepare_count = self.prepare_count.saturating_add(1);
                 Ok(WorkerFrame::Ready {
                     correlation: self.outbound_correlation(correlation),
                     observed_device: self.observed_device.clone(),
@@ -186,6 +205,7 @@ impl WorkerChild for FakeWorker {
                 };
                 correlations_match(&expected, &correlation).map_err(SupervisorError::Protocol)?;
                 let correlation = self.outbound_correlation(correlation);
+                self.transcribe_count = self.transcribe_count.saturating_add(1);
                 let frame = if is_silence_pcm(pcm) {
                     WorkerFrame::NoText {
                         correlation,
@@ -285,6 +305,49 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         self.state = WorkerState::Ready;
         self.last_terminal_request = None;
         Ok(())
+    }
+
+    /// Attach a worker that still owes its load proof. The supervisor reports
+    /// `Loading` — never `Ready` — until a correlated `Prepare` carrying
+    /// first-inference health succeeds. Production attach uses this; the
+    /// `attach_ready` shortcut stays for the scripted harness only.
+    pub fn attach_pending(&mut self, child: C, now: Instant) -> Result<(), SupervisorError> {
+        if self.child.is_some() {
+            return Err(SupervisorError::Unavailable("worker still attached"));
+        }
+        self.restarts.try_register(now)?;
+        self.child = Some(child);
+        self.state = WorkerState::Loading;
+        self.last_terminal_request = None;
+        Ok(())
+    }
+
+    /// True while the rolling start budget is spent. See
+    /// `RestartBudget::exhausted`: only an explicit Setup retry or a daemon
+    /// restart can start again.
+    pub fn restart_exhausted(&mut self, now: Instant) -> bool {
+        self.restarts.exhausted(now)
+    }
+
+    /// Cloud selection drains and unloads the idle worker: detach the owned
+    /// child and go `Absent` without transcribing. Busy work is never dropped
+    /// silently — cancel it explicitly first. An unreaped child blocks the
+    /// unload instead of leaking: the caller must reap, never attach over it.
+    pub fn unload_idle(&mut self) -> Result<ReapOutcome, SupervisorError> {
+        match self.state {
+            WorkerState::Busy | WorkerState::Stopping => Err(SupervisorError::Busy),
+            WorkerState::Unavailable if self.child.is_some() => Err(SupervisorError::Unavailable(
+                "worker unreaped; reap before new work",
+            )),
+            _ => {
+                let outcome = match self.child.as_mut() {
+                    Some(child) => child.cancel_and_reap()?,
+                    None => ReapOutcome::Exited,
+                };
+                self.apply_reap(outcome);
+                Ok(outcome)
+            }
+        }
     }
 
     pub fn child_mut(&mut self) -> Option<&mut C> {
@@ -656,6 +719,184 @@ mod tests {
             budget.try_register(t0 + Duration::from_secs(1)),
             Err(SupervisorError::RestartExhausted)
         ));
+    }
+
+    #[test]
+    fn exhausted_budget_needs_an_explicit_retry_after_the_window() {
+        let mut supervisor = WorkerSupervisor::<FakeWorker>::absent();
+        let t0 = Instant::now();
+        for _ in 0..MAX_RESTARTS {
+            supervisor
+                .attach_pending(FakeWorker::default(), t0)
+                .unwrap();
+            supervisor.cancel().unwrap();
+        }
+        assert!(supervisor.restart_exhausted(t0 + Duration::from_secs(1)));
+        let error = supervisor
+            .attach_pending(FakeWorker::default(), t0 + Duration::from_secs(1))
+            .unwrap_err();
+        assert!(matches!(error, SupervisorError::RestartExhausted));
+        // Nothing self-restarts: the same explicit attach after the rolling
+        // window slides is what a Setup retry performs.
+        assert!(!supervisor.restart_exhausted(t0 + RESTART_WINDOW + Duration::from_secs(1)));
+        supervisor
+            .attach_pending(
+                FakeWorker::default(),
+                t0 + RESTART_WINDOW + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(supervisor.state(), WorkerState::Loading);
+    }
+
+    #[test]
+    fn pending_attach_is_loading_until_prepare_proves_health() {
+        let mut supervisor = WorkerSupervisor::absent();
+        supervisor
+            .attach_pending(FakeWorker::default(), Instant::now())
+            .unwrap();
+        assert_eq!(supervisor.state(), WorkerState::Loading);
+        let error = supervisor
+            .transcribe(TranscribeRequest {
+                correlation: corr(),
+                pcm: vec![1, 0],
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SupervisorError::NotReady(WorkerState::Loading)
+        ));
+        supervisor.prepare(corr(), Instant::now()).unwrap();
+        assert_eq!(supervisor.state(), WorkerState::Ready);
+    }
+
+    #[test]
+    fn repeated_inference_never_reloads_and_keeps_no_pcm_residue() {
+        let mut supervisor = ready_supervisor(Some("first"));
+        let child = supervisor.child_mut().expect("child");
+        assert_eq!(child.prepare_count, 1);
+        supervisor
+            .transcribe(TranscribeRequest {
+                correlation: corr(),
+                pcm: vec![1, 0],
+            })
+            .unwrap();
+        if let Some(child) = supervisor.child_mut() {
+            child.scripted_text = Some("second".into());
+        }
+        let mut next = corr();
+        next.request_id = "q2".into();
+        let outcome = supervisor
+            .transcribe(TranscribeRequest {
+                correlation: next,
+                pcm: vec![1, 0],
+            })
+            .unwrap();
+        assert!(matches!(outcome, WorkerOutcome::Transcript { ref text, .. } if text == "second"));
+        let child = supervisor.child_mut().expect("child");
+        assert_eq!(child.prepare_count, 1);
+        assert_eq!(child.transcribe_count, 2);
+        // Speech then silence: stale PCM must not echo the old Transcript.
+        let mut third = corr();
+        third.request_id = "q3".into();
+        let outcome = supervisor
+            .transcribe(TranscribeRequest {
+                correlation: third,
+                pcm: vec![0, 0, 0, 0],
+            })
+            .unwrap();
+        assert!(matches!(outcome, WorkerOutcome::NoText { .. }));
+        assert_eq!(supervisor.child_mut().expect("child").prepare_count, 1);
+    }
+
+    #[test]
+    fn unload_idle_drains_without_transcribing() {
+        let mut supervisor = ready_supervisor(Some("hi"));
+        assert_eq!(supervisor.unload_idle().unwrap(), ReapOutcome::Exited);
+        assert_eq!(supervisor.state(), WorkerState::Absent);
+        assert!(supervisor.child_mut().is_none());
+        // Unloading nothing is a clean no-op, not an error.
+        assert_eq!(supervisor.unload_idle().unwrap(), ReapOutcome::Exited);
+    }
+
+    #[test]
+    fn unload_idle_blocks_while_an_unreaped_child_is_held() {
+        let worker = FakeWorker {
+            hold_until_cancel: true,
+            ignore_cancel: true,
+            scripted_text: Some("late".into()),
+            ..FakeWorker::default()
+        };
+        let mut supervisor = WorkerSupervisor::absent();
+        supervisor.attach_ready(worker, Instant::now()).unwrap();
+        supervisor.prepare(corr(), Instant::now()).unwrap();
+        let in_flight = supervisor
+            .transcribe(TranscribeRequest {
+                correlation: corr(),
+                pcm: vec![1, 0],
+            })
+            .unwrap_err();
+        assert!(matches!(in_flight, SupervisorError::Busy));
+        // The in-flight refusal leaves the owned child held: unload stays
+        // blocked instead of dropping work silently.
+        assert!(matches!(
+            supervisor.unload_idle().unwrap_err(),
+            SupervisorError::Unavailable(_)
+        ));
+        // New work stays blocked until the owned child is reaped.
+        let attach = supervisor
+            .attach_ready(FakeWorker::default(), Instant::now())
+            .unwrap_err();
+        assert!(matches!(attach, SupervisorError::Unavailable(_)));
+        if let Some(child) = supervisor.child_mut() {
+            child.ignore_cancel = false;
+        }
+        // Recovery is an explicit reap, never an attach over the held child.
+        assert_eq!(supervisor.cancel().unwrap(), ReapOutcome::Exited);
+        assert_eq!(supervisor.unload_idle().unwrap(), ReapOutcome::Exited);
+        assert_eq!(supervisor.state(), WorkerState::Absent);
+    }
+
+    #[test]
+    fn unload_pending_worker_before_prepare_is_clean() {
+        let mut supervisor = WorkerSupervisor::absent();
+        supervisor
+            .attach_pending(FakeWorker::default(), Instant::now())
+            .unwrap();
+        assert_eq!(supervisor.unload_idle().unwrap(), ReapOutcome::Exited);
+        assert_eq!(supervisor.state(), WorkerState::Absent);
+    }
+
+    #[test]
+    fn unknown_worker_error_code_is_not_a_transcript() {
+        let worker = FakeWorker {
+            scripted_error: Some("weird-native-code".into()),
+            ..FakeWorker::default()
+        };
+        let mut supervisor = WorkerSupervisor::absent();
+        supervisor.attach_ready(worker, Instant::now()).unwrap();
+        let error = supervisor.prepare(corr(), Instant::now()).unwrap_err();
+        assert!(matches!(
+            error,
+            SupervisorError::Protocol(FrameError::Unsolicited)
+        ));
+        assert!(supervisor.child_mut().is_some());
+    }
+
+    #[test]
+    fn oversized_pcm_is_rejected_before_the_child_sees_it() {
+        let mut supervisor = ready_supervisor(Some("hi"));
+        let huge = crate::local_worker::MAX_PCM_BYTES + 2;
+        let error = supervisor
+            .transcribe(TranscribeRequest {
+                correlation: corr(),
+                pcm: vec![0; huge],
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SupervisorError::Protocol(FrameError::PcmTooLarge { .. })
+        ));
+        assert_eq!(supervisor.state(), WorkerState::Ready);
     }
 
     #[test]

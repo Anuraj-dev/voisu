@@ -423,4 +423,56 @@ mod tests {
             Err(FrameError::MetadataTooLarge { .. })
         ));
     }
+
+    #[test]
+    fn malformed_control_and_worker_frames_fail_closed() {
+        // Missing kind on either side is not a frame.
+        assert!(matches!(
+            parse_control(&serde_json::json!({"v": 1})),
+            Err(FrameError::InvalidJson)
+        ));
+        assert!(matches!(
+            parse_worker(&serde_json::json!({"v": 1})),
+            Err(FrameError::InvalidJson)
+        ));
+        // Unknown kinds are not frames.
+        assert!(matches!(
+            parse_control(&serde_json::json!({"v": 1, "kind": "shout"})),
+            Err(FrameError::InvalidJson)
+        ));
+        assert!(matches!(
+            parse_worker(&serde_json::json!({"v": 1, "kind": "shout"})),
+            Err(FrameError::InvalidJson)
+        ));
+        // Transcribe without a bounded byte count cannot start a transfer.
+        let mut missing = control_json();
+        missing["kind"] = serde_json::json!("transcribe");
+        assert!(matches!(
+            parse_control(&missing),
+            Err(FrameError::InvalidJson)
+        ));
+        // Cancel without an id cannot address a request.
+        assert!(matches!(
+            parse_control(&serde_json::json!({"v": 1, "kind": "cancel"})),
+            Err(FrameError::InvalidJson)
+        ));
+        // A transcript that is not a string is malformed, never empty text.
+        let mut bad_text = control_json();
+        bad_text["kind"] = serde_json::json!("transcript");
+        bad_text["text"] = serde_json::json!(42);
+        assert!(matches!(
+            parse_worker(&bad_text),
+            Err(FrameError::InvalidJson)
+        ));
+        // A truncated length prefix never yields a partial frame.
+        assert!(matches!(
+            decode_json_frame(&[3, 0]),
+            Err(FrameError::Truncated)
+        ));
+        let encoded = encode_json_frame(&control_json()).unwrap();
+        assert!(matches!(
+            decode_json_frame(&encoded[..encoded.len() - 1]),
+            Err(FrameError::Truncated)
+        ));
+    }
 }

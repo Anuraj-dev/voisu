@@ -2,17 +2,30 @@
 //!
 //! One native executable, one verified model file, no Python/CUDA/FFI/JIT.
 //! CPU-only, absolute paths, scrubbed environment, no downloader, no shell,
-//! no caller-supplied paths. Each exchange spawns at most one child, drains
+//! no caller-supplied paths. The worker is persistent across Recordings:
+//! `Prepare` verifies the artifact and runs first-inference health through the
+//! exact inference path, and repeated `Transcribe` calls reuse that proof
+//! without reloading or re-verifying. Metadata checks alone never yield
+//! `Ready`. PCM travels in a sealed memory-only file descriptor passed as
+//! `/proc/self/fd/N`; no named temporary WAV ever touches the filesystem.
+//! Each exchange spawns at most one child in its own process group, drains
 //! bounded stdout/stderr concurrently so a noisy child cannot wedge the pipe,
-//! kills the child past the deadline, and reaps inline: nothing survives the
-//! exchange, so `cancel_and_reap` is trivially clean.
+//! kills the owned group past the deadline, and reaps inline with bounded
+//! reader joins so a child-held descriptor fails closed instead of hanging
+//! the daemon.
 
-use std::io::Read;
+use std::io::{Read, Seek, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use super::bounds::{MAX_PCM_BYTES, MAX_RETAINED_STDERR_BYTES, PCM_CHANNELS, PCM_SAMPLE_RATE_HZ};
+use super::bounds::{
+    CANCEL_GRACE, MAX_PCM_BYTES, MAX_RETAINED_STDERR_BYTES, PCM_CHANNELS, PCM_SAMPLE_RATE_HZ,
+    REAP_OBSERVE,
+};
 use super::protocol::{
     ControlFrame, Correlation, FrameError, WorkerFrame, is_silence_pcm, validate_pcm,
     validate_transcript,
@@ -36,6 +49,13 @@ pub struct WhisperCppWorker {
     model: PathBuf,
     generation: u64,
     model_receipt_hash: String,
+    /// Set only by a successful first-inference health run in `Prepare`.
+    /// `Transcribe` refuses work until then, so `Ready` always means the
+    /// exact verified model loaded and inference succeeded — never a
+    /// metadata check. Stays set across Recordings: no per-Recording reload.
+    prepared: bool,
+    /// Successful health loads. Stays 1 across repeated inference.
+    health_loads: u32,
 }
 
 impl WhisperCppWorker {
@@ -56,6 +76,8 @@ impl WhisperCppWorker {
             model,
             generation,
             model_receipt_hash,
+            prepared: false,
+            health_loads: 0,
         })
     }
 
@@ -106,7 +128,7 @@ impl WhisperCppWorker {
     }
 
     fn prepare_inner(
-        &self,
+        &mut self,
         correlation: &Correlation,
         deadline: Instant,
     ) -> Result<WorkerFrame, SupervisorError> {
@@ -120,20 +142,42 @@ impl WhisperCppWorker {
             Ok(meta) if meta.is_file() && meta.len() > 0 => {}
             _ => return Err(SupervisorError::LoadAborted),
         }
-        Ok(WorkerFrame::Ready {
-            correlation: correlation.clone(),
-            observed_device: "cpu".into(),
-        })
+        // First-inference health through the exact inference path: a tiny
+        // silence WAV delivered over the same sealed memfd mechanism as real
+        // PCM. Exit 0 plus a parseable envelope proves the verified model
+        // loaded and inference ran; anything else fails closed and `Ready`
+        // is never returned from the metadata checks above alone. Byte
+        // verification of the weights lives at install/receipt time; Prepare
+        // pins the artifact-bound path plus the receipt hash in `check_correlation`.
+        let health = wav_bytes(&[0u8; HEALTH_PCM_BYTES])
+            .ok_or(SupervisorError::Unavailable("worker cache unavailable"))?;
+        let (memfd, _) = sealed_memfd_wav(&health)
+            .ok_or(SupervisorError::Unavailable("worker cache unavailable"))?;
+        let stdout = self.run_cli(&memfd, deadline)?;
+        match parse_whisper_json(&stdout) {
+            Ok(_) => {
+                self.prepared = true;
+                self.health_loads = self.health_loads.saturating_add(1);
+                Ok(WorkerFrame::Ready {
+                    correlation: correlation.clone(),
+                    observed_device: "cpu".into(),
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn transcribe_inner(
-        &self,
+        &mut self,
         correlation: &Correlation,
         pcm: &[u8],
         deadline: Instant,
     ) -> Result<WorkerFrame, SupervisorError> {
         Self::check_deadline(deadline)?;
         self.check_correlation(correlation)?;
+        if !self.prepared {
+            return Err(SupervisorError::Unavailable("worker not prepared"));
+        }
         validate_pcm(pcm, None).map_err(SupervisorError::Protocol)?;
         if is_silence_pcm(pcm) {
             return Ok(WorkerFrame::NoText {
@@ -144,11 +188,9 @@ impl WhisperCppWorker {
         let wav = wav_bytes(pcm).ok_or(SupervisorError::Protocol(FrameError::PcmTooLarge {
             bytes: pcm.len(),
         }))?;
-        let request = tempfile::NamedTempFile::new()
-            .map_err(|_| SupervisorError::Unavailable("worker cache unavailable"))?;
-        std::fs::write(request.path(), &wav)
-            .map_err(|_| SupervisorError::Unavailable("worker cache unavailable"))?;
-        let stdout = self.run_cli(request.path(), deadline)?;
+        let (memfd, _) = sealed_memfd_wav(&wav)
+            .ok_or(SupervisorError::Unavailable("worker cache unavailable"))?;
+        let stdout = self.run_cli(&memfd, deadline)?;
         match parse_whisper_json(&stdout) {
             Ok(WhisperText::Transcript(text)) => Ok(WorkerFrame::Transcript {
                 correlation: correlation.clone(),
@@ -162,14 +204,17 @@ impl WhisperCppWorker {
         }
     }
 
-    fn run_cli(&self, wav: &Path, deadline: Instant) -> Result<Vec<u8>, SupervisorError> {
+    fn run_cli(&self, wav_memfd: &OwnedFd, deadline: Instant) -> Result<Vec<u8>, SupervisorError> {
+        // The descriptor borrow outlives the exchange: the WAV bytes live
+        // only in this memfd, opened once by the child via /proc/self/fd.
+        let wav_path = format!("/proc/self/fd/{}", wav_memfd.as_raw_fd());
         let mut command = Command::new(&self.binary);
         command
             .args([
                 "--model",
                 &self.model.to_string_lossy(),
                 "--file",
-                &wav.to_string_lossy(),
+                &wav_path,
                 "--language",
                 "en",
                 "--no-gpu",
@@ -182,6 +227,11 @@ impl WhisperCppWorker {
             // PATH is dropped too: the binary path is absolute.
             .env_clear()
             .env("LANG", "C")
+            // Own process group so deadline cleanup reaps exactly the owned
+            // child tree (direct kill plus group kill) and never a daemon
+            // sibling. whisper-cli spawns no grandchildren; the group kill is
+            // the backstop if a future runtime does.
+            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -189,25 +239,37 @@ impl WhisperCppWorker {
         // the deadline and every return path joins or reaps the child, so no
         // child outlives the exchange except via a host kill -9 of ourselves.
         let mut child = command.spawn().map_err(|_| SupervisorError::LoadAborted)?;
-        let stdout_handle = child.stdout.take().map(|mut pipe| {
-            std::thread::spawn(move || read_capped(&mut pipe, MAX_CLI_STDOUT_BYTES))
-        });
-        let stderr_handle = child.stderr.take().map(|mut pipe| {
-            std::thread::spawn(move || read_capped(&mut pipe, MAX_CLI_STDERR_BYTES))
-        });
+        let pgid = child.id() as libc::pid_t;
+        let stdout_rx = child
+            .stdout
+            .take()
+            .map(|pipe| spawn_drain(pipe, MAX_CLI_STDOUT_BYTES));
+        let stderr_rx = child
+            .stderr
+            .take()
+            .map(|pipe| spawn_drain(pipe, MAX_CLI_STDERR_BYTES));
         loop {
             match child.try_wait().map_err(|_| SupervisorError::Crashed)? {
                 Some(status) => {
-                    let (stdout, _) = join_reader(stdout_handle);
-                    let (stderr, _) = join_reader(stderr_handle);
+                    // A descendant holding a pipe open must not hang the
+                    // daemon: bound the reader joins and fail closed on
+                    // partial output instead of delivering it.
+                    let Some((stdout, _)) = await_drain(stdout_rx, REAP_OBSERVE) else {
+                        return Err(SupervisorError::TimedOut);
+                    };
+                    let Some((stderr, _)) = await_drain(stderr_rx, REAP_OBSERVE) else {
+                        return Err(SupervisorError::TimedOut);
+                    };
                     return self.interpret_exit(status.code(), &stdout, &stderr);
                 }
                 None => {
                     if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        let _ = stdout_handle.map(|handle| handle.join());
-                        let _ = stderr_handle.map(|handle| handle.join());
+                        // Covers a stalled child for any reason, including
+                        // SIGSTOP suspension: SIGKILL applies to stopped
+                        // processes, then the group backstop, then reap.
+                        kill_owned_tree(&mut child, pgid);
+                        let _ = await_drain(stdout_rx, CANCEL_GRACE);
+                        let _ = await_drain(stderr_rx, CANCEL_GRACE);
                         return Err(SupervisorError::TimedOut);
                     }
                     std::thread::sleep(POLL_TICK);
@@ -222,11 +284,23 @@ impl WhisperCppWorker {
         stdout: &[u8],
         stderr: &[u8],
     ) -> Result<Vec<u8>, SupervisorError> {
+        let diagnostic = String::from_utf8_lossy(&stderr[..stderr.len().min(1024)]);
+        let lowered = diagnostic.to_ascii_lowercase();
+        if lowered.contains("out of memory")
+            || lowered.contains("bad_alloc")
+            || lowered.contains("cannot allocate")
+        {
+            return Err(SupervisorError::OutOfMemory);
+        }
+        // Our own deadline kills return `TimedOut` before exit
+        // interpretation, so 137 here means an external SIGKILL — almost
+        // always the host OOM killer — never a transcript.
+        if code == Some(137) {
+            return Err(SupervisorError::OutOfMemory);
+        }
         if code == Some(0) {
             return Ok(stdout.to_vec());
         }
-        let diagnostic = String::from_utf8_lossy(&stderr[..stderr.len().min(1024)]);
-        let lowered = diagnostic.to_ascii_lowercase();
         // Model/runtime failed to load or read its inputs: fail closed as
         // unavailable, never as a transcript. Anything else is a native crash.
         if lowered.contains("failed to load")
@@ -359,10 +433,75 @@ fn read_capped(pipe: &mut impl Read, cap: usize) -> (Vec<u8>, bool) {
     (buf, truncated)
 }
 
-fn join_reader(handle: Option<std::thread::JoinHandle<(Vec<u8>, bool)>>) -> (Vec<u8>, bool) {
-    handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default()
+/// 0.25 s of silence: small enough for a fast health run, real enough to
+/// travel the exact memfd inference path.
+const HEALTH_PCM_BYTES: usize = 8_000;
+
+/// Memory-only WAV delivery. The bytes live in a sealed memfd with no
+/// filesystem name; the child opens it once via `/proc/self/fd/N`. Returns
+/// the held descriptor (kept open until the child is reaped) plus the path
+/// argument. `None` fails closed — there is no named-tempfile fallback.
+fn sealed_memfd_wav(wav: &[u8]) -> Option<(OwnedFd, String)> {
+    // SAFETY: memfd_create with a static name; -1 is checked. Flags carry
+    // MFD_ALLOW_SEALING only, so the descriptor stays inheritable across the
+    // child exec and the path below resolves for the child.
+    let fd = unsafe {
+        libc::memfd_create(
+            c"voisu-wav".as_ptr(),
+            libc::MFD_ALLOW_SEALING as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: fd is a fresh owned descriptor from memfd_create.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if file.write_all(wav).is_err() {
+        return None;
+    }
+    if file.seek(std::io::SeekFrom::Start(0)).is_err() {
+        return None;
+    }
+    // Best-effort hardening: the child only ever reads.
+    unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            libc::F_ADD_SEALS,
+            libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE,
+        );
+    }
+    let owned: OwnedFd = file.into();
+    let path = format!("/proc/self/fd/{}", owned.as_raw_fd());
+    Some((owned, path))
+}
+
+fn spawn_drain<R: Read + Send + 'static>(pipe: R, cap: usize) -> mpsc::Receiver<(Vec<u8>, bool)> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut pipe = pipe;
+        let _ = tx.send(read_capped(&mut pipe, cap));
+    });
+    rx
+}
+
+fn await_drain(
+    rx: Option<mpsc::Receiver<(Vec<u8>, bool)>>,
+    grace: Duration,
+) -> Option<(Vec<u8>, bool)> {
+    rx.and_then(|rx| rx.recv_timeout(grace).ok())
+}
+
+/// Reap exactly the owned child tree: direct kill, group backstop for any
+/// descendant holding a descriptor, then wait. Best-effort signals are
+/// ignored — the subsequent `wait` is what reaps.
+fn kill_owned_tree(child: &mut std::process::Child, pgid: libc::pid_t) {
+    let _ = child.kill();
+    // SAFETY: pgid is our own child's group (spawned with process_group(0)),
+    // so the signal cannot reach daemon siblings.
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    let _ = child.wait();
 }
 
 #[cfg(test)]
@@ -469,32 +608,54 @@ mod tests {
 
     #[test]
     fn native_failure_mapping_is_fail_closed() {
-        // /bin/false exits 1 with no output: a native failure, never a transcript.
-        let mut failing = worker_with("/bin/false");
-        let error = failing
-            .exchange(
-                ControlFrame::Transcribe {
-                    correlation: correlation("hash"),
-                    pcm_bytes: 2,
-                },
-                Some(&[1, 0]),
-                Instant::now() + Duration::from_secs(10),
-            )
-            .unwrap_err();
-        assert!(matches!(error, SupervisorError::Crashed));
-        // /bin/true exits 0 with empty stdout: a broken runtime contract.
-        let mut empty = worker_with("/bin/true");
-        let error = empty
-            .exchange(
-                ControlFrame::Transcribe {
-                    correlation: correlation("hash"),
-                    pcm_bytes: 2,
-                },
-                Some(&[1, 0]),
-                Instant::now() + Duration::from_secs(10),
-            )
-            .unwrap_err();
-        assert!(matches!(error, SupervisorError::Crashed));
+        let worker = worker_with("/bin/false");
+        // Non-zero exit with no output: a native failure, never a transcript.
+        assert!(matches!(
+            worker.interpret_exit(Some(1), b"", b""),
+            Err(SupervisorError::Crashed)
+        ));
+        // Exit 0 with an unparseable envelope is still a broken contract,
+        // surfaced when the caller parses the returned bytes.
+        let stdout = worker.interpret_exit(Some(0), b"not json", b"").unwrap();
+        assert!(parse_whisper_json(&stdout).is_err());
+        // Missing-model diagnostics fail closed as unavailable.
+        assert!(matches!(
+            worker.interpret_exit(Some(1), b"", b"failed to load model: nope"),
+            Err(SupervisorError::LoadAborted)
+        ));
+        assert!(matches!(
+            worker.interpret_exit(Some(1), b"", b"cannot open file"),
+            Err(SupervisorError::LoadAborted)
+        ));
+    }
+
+    #[test]
+    fn oom_signatures_are_out_of_memory_never_a_transcript() {
+        let worker = worker_with("/bin/false");
+        assert!(matches!(
+            worker.interpret_exit(None, b"", b"std::bad_alloc"),
+            Err(SupervisorError::OutOfMemory)
+        ));
+        assert!(matches!(
+            worker.interpret_exit(Some(1), b"", b"ggml: out of memory"),
+            Err(SupervisorError::OutOfMemory)
+        ));
+        assert!(matches!(
+            worker.interpret_exit(Some(1), b"", b"cannot allocate memory"),
+            Err(SupervisorError::OutOfMemory)
+        ));
+        // External SIGKILL (the host OOM killer's signature). Our own
+        // deadline kills return TimedOut before exit interpretation, so 137
+        // here is never our own cleanup.
+        assert!(matches!(
+            worker.interpret_exit(Some(137), b"", b"Killed"),
+            Err(SupervisorError::OutOfMemory)
+        ));
+        // A plain signal death without an OOM signature stays a crash.
+        assert!(matches!(
+            worker.interpret_exit(None, b"", b""),
+            Err(SupervisorError::Crashed)
+        ));
     }
 
     #[test]
@@ -507,9 +668,11 @@ mod tests {
     }
 
     #[test]
-    fn silence_never_spawns() {
+    fn transcribe_before_prepare_is_unavailable_not_a_spawn() {
+        // Even the no-spawn silence path refuses work until first-inference
+        // health has proven the model: Ready is never metadata-only.
         let mut worker = worker_with("/nonexistent/whisper-cli");
-        let frame = worker
+        let error = worker
             .exchange(
                 ControlFrame::Transcribe {
                     correlation: correlation("hash"),
@@ -518,8 +681,9 @@ mod tests {
                 Some(&[0, 0, 0, 0]),
                 Instant::now() + Duration::from_secs(5),
             )
-            .unwrap();
-        assert!(matches!(frame, WorkerFrame::NoText { .. }));
+            .unwrap_err();
+        assert!(matches!(error, SupervisorError::Unavailable(_)));
+        assert!(!worker.prepared);
     }
 
     #[test]
@@ -598,5 +762,193 @@ mod tests {
     fn cancel_is_clean_without_a_persistent_child() {
         let mut worker = worker_with("/bin/true");
         assert_eq!(worker.cancel_and_reap().unwrap(), ReapOutcome::Exited);
+    }
+
+    #[test]
+    fn memfd_delivery_is_unnamed_and_roundtrips_bytes() {
+        let wav = wav_bytes(&[1, 0, 2, 0]).expect("wav");
+        let (held, path) = sealed_memfd_wav(&wav).expect("memfd");
+        assert!(path.starts_with("/proc/self/fd/"), "unnamed: {path}");
+        assert!(!path.contains("tmp"), "no temp file: {path}");
+        let back = std::fs::read(&path).expect("child-visible bytes");
+        assert_eq!(back, wav);
+        drop(held);
+    }
+
+    #[test]
+    fn read_capped_unblocks_a_blocked_writer_and_caps_noise() {
+        use std::os::unix::net::UnixStream;
+        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let flood: Vec<u8> = (0..=255u8).cycle().take(2 * 1024 * 1024).collect();
+        let producer = std::thread::spawn(move || {
+            let mut written = 0;
+            while written < flood.len() {
+                match writer.write(&flood[written..]) {
+                    Ok(0) => break,
+                    Ok(n) => written += n,
+                    Err(_) => break,
+                }
+            }
+        });
+        let mut reader = reader;
+        let started = Instant::now();
+        let (kept, truncated) = read_capped(&mut reader, 64 * 1024);
+        // 2 MiB through a 64 KiB cap must return promptly with the writer
+        // drained, never wedged on a full pipe.
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert_eq!(kept.len(), 64 * 1024);
+        assert!(truncated);
+        producer.join().expect("writer drained, not wedged");
+    }
+
+    /// Script stand-in for whisper-cli: verifies the `--file` argument opens
+    /// and starts with a RIFF header (proving the memfd path is readable),
+    /// counts invocations in a sidecar file, and emits a fixed JSON envelope.
+    fn fake_whisper_dir() -> Option<tempfile::TempDir> {
+        let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())?;
+        let dir = tempfile::tempdir().expect("test scratch");
+        let script = dir.path().join("fake-whisper");
+        std::fs::write(
+            &script,
+            format!(
+                "#!{}\nimport json, sys\nargv = sys.argv[1:]\npath = argv[argv.index('--file') + 1]\nwith open(path, 'rb') as handle:\n    magic = handle.read(4)\nif magic != b'RIFF':\n    sys.stderr.write('not a wav\\n')\n    sys.exit(3)\nwith open(sys.argv[0] + '.count', 'a') as log:\n    log.write('run\\n')\nsys.stdout.write(json.dumps({{'transcription': [{{'text': 'hello memfd'}}]}}))\n",
+                python.display()
+            ),
+        )
+        .expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod");
+        }
+        std::fs::write(dir.path().join("model.bin"), b"fixture-weights").expect("model");
+        Some(dir)
+    }
+
+    fn fake_invocations(dir: &tempfile::TempDir) -> usize {
+        let count = dir.path().join("fake-whisper.count");
+        std::fs::read_to_string(&count)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    #[test]
+    fn prepare_health_proves_inference_and_reports_cpu() {
+        let Some(dir) = fake_whisper_dir() else {
+            return;
+        };
+        let mut worker = WhisperCppWorker::new(
+            dir.path().join("fake-whisper"),
+            dir.path().join("model.bin"),
+            1,
+            "hash".into(),
+        )
+        .unwrap();
+        let frame = worker
+            .exchange(
+                ControlFrame::Prepare(correlation("hash")),
+                None,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        match frame {
+            WorkerFrame::Ready {
+                observed_device, ..
+            } => assert_eq!(observed_device, "cpu"),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert!(worker.prepared);
+        assert_eq!(worker.health_loads, 1);
+        assert_eq!(fake_invocations(&dir), 1);
+    }
+
+    #[test]
+    fn repeated_inference_reuses_health_without_reload_or_residue() {
+        let Some(dir) = fake_whisper_dir() else {
+            return;
+        };
+        let mut worker = WhisperCppWorker::new(
+            dir.path().join("fake-whisper"),
+            dir.path().join("model.bin"),
+            1,
+            "hash".into(),
+        )
+        .unwrap();
+        worker
+            .exchange(
+                ControlFrame::Prepare(correlation("hash")),
+                None,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        let speech = vec![1u8, 0]
+            .into_iter()
+            .cycle()
+            .take(200)
+            .collect::<Vec<_>>();
+        for request in ["q1", "q2"] {
+            let mut id = correlation("hash");
+            id.request_id = request.into();
+            let frame = worker
+                .exchange(
+                    ControlFrame::Transcribe {
+                        correlation: id,
+                        pcm_bytes: speech.len(),
+                    },
+                    Some(&speech),
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .unwrap();
+            assert!(
+                matches!(frame, WorkerFrame::Transcript { ref text, .. } if text == "hello memfd")
+            );
+        }
+        assert_eq!(worker.health_loads, 1);
+        assert_eq!(fake_invocations(&dir), 3);
+        // Silence after speech never spawns and never echoes old audio.
+        let mut silent = correlation("hash");
+        silent.request_id = "q3".into();
+        let frame = worker
+            .exchange(
+                ControlFrame::Transcribe {
+                    correlation: silent,
+                    pcm_bytes: 4,
+                },
+                Some(&[0, 0, 0, 0]),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        assert!(matches!(frame, WorkerFrame::NoText { .. }));
+        assert_eq!(worker.health_loads, 1);
+        assert_eq!(fake_invocations(&dir), 3);
+    }
+
+    #[test]
+    fn broken_health_contract_never_reports_ready() {
+        // /bin/true exits 0 but emits no envelope over the health run: with
+        // a real model file present, Prepare still cannot claim Ready.
+        let dir = tempfile::tempdir().expect("test scratch");
+        std::fs::write(dir.path().join("model.bin"), b"fixture-weights").expect("model");
+        let mut worker = WhisperCppWorker::new(
+            PathBuf::from("/bin/true"),
+            dir.path().join("model.bin"),
+            1,
+            "hash".into(),
+        )
+        .unwrap();
+        let error = worker
+            .exchange(
+                ControlFrame::Prepare(correlation("hash")),
+                None,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap_err();
+        assert!(matches!(error, SupervisorError::Crashed));
+        assert!(!worker.prepared);
     }
 }
