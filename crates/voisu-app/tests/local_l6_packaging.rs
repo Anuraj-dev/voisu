@@ -258,6 +258,7 @@ impl WizardIo for RestoreIo {
 
 struct RestoreActions {
     restored: bool,
+    install_attempted: bool,
 }
 
 impl LocalSetupActions for RestoreActions {
@@ -278,6 +279,7 @@ impl LocalSetupActions for RestoreActions {
         &mut self,
         _consent: voisu_app::local_model::InstallConsent,
     ) -> Result<String, String> {
+        self.install_attempted = true;
         Err("repair must not download".into())
     }
 }
@@ -288,10 +290,16 @@ fn retained_model_restore_is_explicit_setup() {
         lines: vec!["y".into()],
         out: Vec::new(),
     };
-    let mut actions = RestoreActions { restored: false };
+    let mut actions = RestoreActions {
+        restored: false,
+        install_attempted: false,
+    };
     let outcome = run_with(&mut io, &mut actions).unwrap();
     assert_eq!(outcome, LocalSetupOutcome::Restored);
     assert!(actions.restored);
+    // The restore path returns before the download entrypoint: repair
+    // restores the retained receipt and never attempts an install.
+    assert!(!actions.install_attempted);
     // Repair restores the retained receipt; it never takes the download path.
     assert!(
         actions
