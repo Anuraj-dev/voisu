@@ -14,8 +14,10 @@ use gtk4 as gtk;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use voisu_app::feedback::{
     FeedbackBackend, FeedbackCapabilities, FeedbackDegradation, FeedbackSelection,
-    OverlayRestartPolicy, SessionKind, after_surface_creation, select_feedback_backend,
+    OverlayRestartPolicy, SessionKind, after_surface_creation, announcement_for_overlay,
+    select_feedback_backend,
 };
+use voisu_app::local_overlay::TriggerRepeatLatch;
 use voisu_app::overlay::{
     BarSmoother, LIMIT_WARNING_CLASS, LevelPollAction, LevelPollLatch, LimitWarning,
     LimitWarningLatch, NoSpeechNotifyLatch, ObservedSignal, OverlayPhase, OverlayView,
@@ -241,6 +243,8 @@ const fn overlay_phase_label(phase: OverlayPhase) -> &'static str {
         OverlayPhase::Processing => "processing",
         OverlayPhase::Success => "success",
         OverlayPhase::Failure => "failure",
+        OverlayPhase::Loading => "loading",
+        OverlayPhase::Unavailable => "unavailable",
         OverlayPhase::NoSpeech => "no_speech",
     }
 }
@@ -287,9 +291,11 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     // `--supervise` policy converts that into explicit degraded behavior, never
     // a false in-process timer on a healthy compositor.
     let switched = Rc::new(Cell::new(false));
+    let status_worker = Rc::new(StatusWorker::spawn());
     window.connect_realize({
         let application = application.clone();
         let switched = Rc::clone(&switched);
+        let status_worker = Rc::clone(&status_worker);
         move |window| match window.surface() {
             Some(surface) => {
                 let empty_region = gtk::cairo::Region::create();
@@ -300,6 +306,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
                 report(effective);
                 switched.set(true);
                 window.set_visible(false);
+                status_worker.stop();
                 install_notification_feedback(&application);
             }
         }
@@ -375,6 +382,8 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
          .capsule.success .state-label, .capsule.success .meter { color: #65D6A0; font-size: 14pt; }
          .capsule.failure { border: 1px solid rgba(255, 138, 138, 0.9); box-shadow: 0 0 8px rgba(255, 138, 138, 0.35); }
          .capsule.failure .state-label, .capsule.failure .meter { color: #FF8A8A; }
+         .capsule.loading .state-label, .capsule.loading .meter { color: #8FB4FF; }
+         .capsule.unavailable .state-label, .capsule.unavailable .meter { color: #FFB454; }
          .capsule.nospeech .state-label, .capsule.nospeech .meter { color: #FFB454; }
          .capsule.limitwarn { border: 1px solid rgba(255, 138, 138, 0.9); box-shadow: 0 0 8px rgba(255, 138, 138, 0.35); }",
     );
@@ -403,6 +412,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
             rendered_bars,
             rendered,
             switched,
+            status_worker,
         },
     );
 }
@@ -421,6 +431,7 @@ struct CapsuleFeedback {
     rendered_bars: Rc<RefCell<[u8; 20]>>,
     rendered: Rc<Cell<MeterState>>,
     switched: Rc<Cell<bool>>,
+    status_worker: Rc<StatusWorker>,
 }
 
 fn install_surface_feedback(
@@ -439,6 +450,7 @@ fn install_surface_feedback(
         rendered_bars,
         rendered,
         switched,
+        status_worker,
     } = feedback;
     let controller = Rc::new(RefCell::new(PresentationController::default()));
     // Rung 2 (a plain GTK window) is skipped, so the only windowed backend that
@@ -452,7 +464,7 @@ fn install_surface_feedback(
     let limit_latch = Rc::new(RefCell::new(LimitWarningLatch::default()));
     let level_latch = Rc::new(RefCell::new(LevelPollLatch::default()));
     let level_poll = Rc::new(RefCell::new(None::<(gtk::glib::SourceId, Rc<LevelWorker>)>));
-    let status_worker = StatusWorker::spawn();
+    let trigger_latch = Rc::new(RefCell::new(TriggerRepeatLatch::default()));
     gtk::glib::timeout_add_local(STATUS_POLL_PERIOD, move || {
         if switched.get() {
             // A genuine surface-creation failure handed feedback to the
@@ -578,9 +590,10 @@ fn install_surface_feedback(
                 // Recording start with a bounded desktop notification. Failure
                 // here never breaks the overlay — send_notification cannot panic
                 // and its delivery is the compositor's concern.
-                if notify {
+                let first_identity = trigger_latch.borrow_mut().observe(identity.as_deref());
+                if notify && (identity.is_none() || first_identity) {
                     let notification = gtk::gio::Notification::new("Voisu");
-                    notification.set_body(Some(view.visible_label));
+                    notification.set_body(Some(announcement_for_overlay(view)));
                     application.send_notification(Some("overlay-recording"), &notification);
                 }
                 if notify_no_speech {
@@ -620,15 +633,19 @@ fn run_notification_feedback(selection: FeedbackSelection) -> i32 {
     let notifier = Notifier::start(selection);
     let mut controller = PresentationController::default();
     let mut previous_phase = OverlayView::HIDDEN.phase;
+    let mut previous_label = OverlayView::HIDDEN.visible_label;
     let mut no_speech_latch = NoSpeechNotifyLatch::default();
     let mut limit_latch = LimitWarningLatch::default();
+    let mut trigger_latch = TriggerRepeatLatch::default();
     loop {
         let observation = read_status();
         notification_tick(
             &mut controller,
             &mut previous_phase,
+            &mut previous_label,
             &mut no_speech_latch,
             &mut limit_latch,
+            &mut trigger_latch,
             &notifier,
             observation,
         );
@@ -653,16 +670,20 @@ fn install_notification_feedback(application: &gtk::Application) {
     let status_worker = StatusWorker::spawn();
     let controller = Rc::new(RefCell::new(PresentationController::default()));
     let previous_phase = Rc::new(RefCell::new(OverlayView::HIDDEN.phase));
+    let previous_label = Rc::new(RefCell::new(OverlayView::HIDDEN.visible_label));
     let no_speech_latch = Rc::new(RefCell::new(NoSpeechNotifyLatch::default()));
     let limit_latch = Rc::new(RefCell::new(LimitWarningLatch::default()));
+    let trigger_latch = Rc::new(RefCell::new(TriggerRepeatLatch::default()));
     gtk::glib::timeout_add_local(STATUS_POLL_PERIOD, move || {
         let _hold = &hold;
         if let Some(observation) = status_worker.take_latest() {
             notification_tick(
                 &mut controller.borrow_mut(),
                 &mut previous_phase.borrow_mut(),
+                &mut previous_label.borrow_mut(),
                 &mut no_speech_latch.borrow_mut(),
                 &mut limit_latch.borrow_mut(),
+                &mut trigger_latch.borrow_mut(),
                 &notifier,
                 observation.response,
             );
@@ -685,8 +706,10 @@ fn install_notification_feedback(application: &gtk::Application) {
 fn notification_tick(
     controller: &mut PresentationController,
     previous_phase: &mut OverlayPhase,
+    previous_label: &mut &'static str,
     no_speech_latch: &mut NoSpeechNotifyLatch,
     limit_latch: &mut LimitWarningLatch,
+    trigger_latch: &mut TriggerRepeatLatch,
     notifier: &Notifier,
     observation: Option<Response>,
 ) {
@@ -723,10 +746,17 @@ fn notification_tick(
         limit_latch.commit();
     }
     let fire_no_speech = no_speech_latch.observe(signal);
+    let first_identity = trigger_latch.observe(identity.as_deref());
     // This rung sends at most one bubble per tick; the pure chooser decides
     // which. This rung has no capsule to turn amber, so the notification is
     // the whole warning.
-    match notification_rung_choice(view, *previous_phase, limit_body.is_some(), fire_no_speech) {
+    match notification_rung_choice(
+        view,
+        *previous_phase,
+        *previous_label,
+        limit_body.is_some(),
+        fire_no_speech,
+    ) {
         Some(RungNotification::Limit) => {
             // One attempt, no retry loop: if the queue is busy with a call
             // already in flight, hand the stage back so the NEXT tick re-selects
@@ -741,14 +771,16 @@ fn notification_tick(
             }
         }
         Some(RungNotification::Label(label)) => {
-            // A transition genuinely may coalesce away; nothing depends on it.
-            let _ = notifier.notify(label);
+            if view.phase != OverlayPhase::Recording || identity.is_none() || first_identity {
+                let _ = notifier.notify(label);
+            }
         }
         None => {}
     }
     // Always advances, whichever bubble won: the transition has been observed
     // either way, and a stale previous_phase would re-announce it later.
     *previous_phase = view.phase;
+    *previous_label = view.visible_label;
 }
 
 /// The desktop-notification sink. Rung 3 talks to `org.freedesktop.Notifications`
@@ -956,6 +988,8 @@ fn render_surface(
         "processing",
         "success",
         "failure",
+        "loading",
+        "unavailable",
         "nospeech",
         LIMIT_WARNING_CLASS,
     ] {
@@ -966,6 +1000,8 @@ fn render_surface(
         OverlayPhase::Processing => "processing",
         OverlayPhase::Success => "success",
         OverlayPhase::Failure => "failure",
+        OverlayPhase::Loading => "loading",
+        OverlayPhase::Unavailable => "unavailable",
         OverlayPhase::NoSpeech => "nospeech",
         OverlayPhase::Hidden => "",
     };
@@ -997,7 +1033,7 @@ fn render_surface(
     // presentation. The capsule is visible in every non-Hidden phase, so it
     // is the one widget that can always carry the announcement.
     capsule.update_property(&[gtk::accessible::Property::Description(
-        view.accessible_label,
+        announcement_for_overlay(view),
     )]);
     meter.set_visible(matches!(
         view.phase,

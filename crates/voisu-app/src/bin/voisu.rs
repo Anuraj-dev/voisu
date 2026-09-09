@@ -1104,6 +1104,7 @@ fn credential_from_stdin() -> Result<Credential, BoundaryError> {
 }
 
 fn auth_verify(provider: Provider) -> ExitCode {
+    eprintln!("{}", voisu_app::local_doctor::CLOUD_CREDENTIAL_MAINTENANCE);
     let credential = match SecretToolStore.load(provider) {
         Ok(credential) => credential,
         Err(error) => return fail(4, error.public_message()),
@@ -1115,7 +1116,6 @@ fn auth_verify(provider: Provider) -> ExitCode {
         credential,
     )) {
         Ok(()) => {
-            eprintln!("{}", voisu_app::local_doctor::CLOUD_CREDENTIAL_MAINTENANCE);
             println!("{} authentication verified", provider.cli_label());
             ExitCode::SUCCESS
         }

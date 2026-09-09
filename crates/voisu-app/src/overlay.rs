@@ -22,6 +22,13 @@ pub enum OverlayPhase {
     Processing,
     Success,
     Failure,
+    /// Local model is loading or verifying. Distinct from Failure so the
+    /// capsule is not a red quality-failure warning, and from Unavailable so
+    /// Loading→Unavailable is a notification identity change.
+    Loading,
+    /// Local is selected but the model is not ready. Distinct from quality
+    /// Failure and from Loading.
+    Unavailable,
     /// Terminal "nothing usable was heard" — deliberately NOT Failure: the
     /// capsule shows calm amber resting bars and a gentle notification, never
     /// red. Detection stays daemon-side (parked quality-gate decision).
@@ -109,7 +116,10 @@ impl OverlayView {
             | OverlayPhase::Processing
             | OverlayPhase::Success
             | OverlayPhase::NoSpeech => "",
-            OverlayPhase::Failure | OverlayPhase::Hidden => self.visible_label,
+            OverlayPhase::Loading
+            | OverlayPhase::Unavailable
+            | OverlayPhase::Failure
+            | OverlayPhase::Hidden => self.visible_label,
         }
     }
 
@@ -127,6 +137,8 @@ pub const fn phase_glyph(phase: OverlayPhase) -> &'static str {
         OverlayPhase::Success => "✓",
         OverlayPhase::Recording
         | OverlayPhase::Processing
+        | OverlayPhase::Loading
+        | OverlayPhase::Unavailable
         | OverlayPhase::NoSpeech
         | OverlayPhase::Hidden => "",
     }
@@ -747,6 +759,7 @@ pub enum RungNotification {
 pub fn notification_rung_choice(
     view: OverlayView,
     previous_phase: OverlayPhase,
+    previous_label: &'static str,
     limit_pending: bool,
     fire_no_speech: bool,
 ) -> Option<RungNotification> {
@@ -756,10 +769,11 @@ pub fn notification_rung_choice(
     if view.phase == OverlayPhase::NoSpeech {
         return fire_no_speech.then_some(RungNotification::Label(view.visible_label));
     }
-    // Fire only on a PHASE transition into a visible phase. Comparing the whole
-    // view would re-fire on every meter/activity tick within one Recording.
-    (view.is_visible() && previous_phase != view.phase)
-        .then_some(RungNotification::Label(view.visible_label))
+    // Fire on identity change (phase or labels), not merely phase: Loading and
+    // Unavailable must announce distinctly even if a caller reused one phase.
+    // Same-phase Recording ticks share labels, so they stay silent.
+    (view.is_visible() && (previous_phase != view.phase || previous_label != view.visible_label))
+        .then_some(RungNotification::Label(view.accessible_label))
 }
 
 /// The outcome of one fallback-path poll tick, decided purely so the adapter's
@@ -874,9 +888,6 @@ pub const STATUS_POLL_PERIOD: Duration = Duration::from_millis(200);
 /// when the daemon is unreachable, the deadline elapses, or the reply is
 /// malformed — the caller renders the unreachable path either way.
 pub fn fetch_status(deadline: Instant) -> Option<Response> {
-    let _guard = crate::local_overlay::StatusPollGuard::acquire(
-        crate::local_overlay::global_status_poll_gate(),
-    )?;
     let path = socket_path().ok()?;
     let mut stream = connect_within(&path, deadline)?;
     status_round_trip(&mut stream, deadline)
@@ -1162,6 +1173,8 @@ mod tests {
         // redesign). Failure and Success keep their glyphs.
         assert_eq!(phase_glyph(OverlayPhase::Processing), "");
         assert_eq!(phase_glyph(OverlayPhase::Failure), "⚠");
+        assert_eq!(phase_glyph(OverlayPhase::Loading), "");
+        assert_eq!(phase_glyph(OverlayPhase::Unavailable), "");
         assert_eq!(phase_glyph(OverlayPhase::Recording), "");
         assert_eq!(phase_glyph(OverlayPhase::Success), "✓");
         assert_eq!(phase_glyph(OverlayPhase::Hidden), "");
@@ -1839,6 +1852,8 @@ mod tests {
             OverlayPhase::Processing,
             OverlayPhase::Success,
             OverlayPhase::Failure,
+            OverlayPhase::Loading,
+            OverlayPhase::Unavailable,
         ] {
             let mut latch = RecordingNotifyLatch::default();
             assert!(latch.observe(ObservedSignal::Reachable(OverlayPhase::Recording)));
@@ -2724,40 +2739,83 @@ mod tests {
         // The tick where the Overlay first sees an already-warning Recording:
         // a transition into Recording AND a due warning, on the same tick.
         assert_eq!(
-            notification_rung_choice(recording, OverlayPhase::Hidden, true, false),
+            notification_rung_choice(recording, OverlayPhase::Hidden, "", true, false),
             Some(RungNotification::Limit),
             "a due warning must not be dropped or painted over by the transition"
         );
-        // With no warning due, the transition is announced exactly as before.
+        // With no warning due, the transition is announced with the accessible copy.
         assert_eq!(
-            notification_rung_choice(recording, OverlayPhase::Hidden, false, false),
-            Some(RungNotification::Label("Recording"))
+            notification_rung_choice(recording, OverlayPhase::Hidden, "", false, false),
+            Some(RungNotification::Label(recording.accessible_label))
         );
         // And a repeat of the same phase stays silent.
         assert_eq!(
-            notification_rung_choice(recording, OverlayPhase::Recording, false, false),
+            notification_rung_choice(
+                recording,
+                OverlayPhase::Recording,
+                recording.visible_label,
+                false,
+                false
+            ),
             None
         );
         // No-speech keeps its latch-gated explanation, and still loses to a
         // warning if both somehow come due.
         let no_speech = OverlayView::no_speech();
         assert_eq!(
-            notification_rung_choice(no_speech, OverlayPhase::Recording, false, true),
+            notification_rung_choice(no_speech, OverlayPhase::Recording, "Recording", false, true),
             Some(RungNotification::Label(no_speech.visible_label))
         );
         assert_eq!(
-            notification_rung_choice(no_speech, OverlayPhase::Recording, false, false),
+            notification_rung_choice(
+                no_speech,
+                OverlayPhase::Recording,
+                "Recording",
+                false,
+                false
+            ),
             None,
             "an unlatched no-speech repeat stays silent"
         );
         assert_eq!(
-            notification_rung_choice(no_speech, OverlayPhase::Recording, true, true),
+            notification_rung_choice(no_speech, OverlayPhase::Recording, "Recording", true, true),
             Some(RungNotification::Limit)
         );
         // Hidden announces nothing.
         assert_eq!(
-            notification_rung_choice(OverlayView::HIDDEN, OverlayPhase::Recording, false, false),
+            notification_rung_choice(
+                OverlayView::HIDDEN,
+                OverlayPhase::Recording,
+                "Recording",
+                false,
+                false
+            ),
             None
+        );
+        let loading = OverlayView {
+            phase: OverlayPhase::Loading,
+            visible_label: "Loading",
+            accessible_label: "Local selected; model loading",
+        };
+        let unavailable = OverlayView {
+            phase: OverlayPhase::Unavailable,
+            visible_label: "Local selected; model unavailable",
+            accessible_label: "Local selected; model unavailable; Start is refused before capture",
+        };
+        assert_eq!(
+            notification_rung_choice(loading, OverlayPhase::Hidden, "", false, false),
+            Some(RungNotification::Label(loading.accessible_label))
+        );
+        assert_eq!(
+            notification_rung_choice(
+                unavailable,
+                OverlayPhase::Loading,
+                loading.visible_label,
+                false,
+                false
+            ),
+            Some(RungNotification::Label(unavailable.accessible_label)),
+            "Loading→Unavailable must announce, not share a Failure phase"
         );
     }
 
@@ -2785,9 +2843,13 @@ mod tests {
             );
             let body = chosen
                 .and_then(|warning| limit_notification_body(warning, Duration::from_secs(30)));
-            if let Some(RungNotification::Limit) =
-                notification_rung_choice(view, previous_phase, body.is_some(), false)
-                && let Some(body) = body
+            if let Some(RungNotification::Limit) = notification_rung_choice(
+                view,
+                previous_phase,
+                view.visible_label,
+                body.is_some(),
+                false,
+            ) && let Some(body) = body
             {
                 let accepted = refusals_left == 0;
                 refusals_left -= i32::from(refusals_left > 0);

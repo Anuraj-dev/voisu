@@ -1,64 +1,8 @@
 //! Overlay/feedback presentation for Local pending vs active, Loading, and stalls.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use voisu_core::{AsrMode, DaemonState, LocalReadiness, Response};
 
 use crate::overlay::{OverlayPhase, OverlayView};
-
-/// Caps OverlayStatus IPC at one in-flight round trip.
-pub struct StatusPollGate {
-    in_flight: AtomicBool,
-}
-
-impl StatusPollGate {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            in_flight: AtomicBool::new(false),
-        }
-    }
-
-    #[must_use]
-    pub fn try_begin(&self) -> bool {
-        self.in_flight
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-    }
-
-    pub fn end(&self) {
-        self.in_flight.store(false, Ordering::SeqCst);
-    }
-}
-
-impl Default for StatusPollGate {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub struct StatusPollGuard<'a> {
-    gate: &'a StatusPollGate,
-}
-
-impl<'a> StatusPollGuard<'a> {
-    #[must_use]
-    pub fn acquire(gate: &'a StatusPollGate) -> Option<Self> {
-        gate.try_begin().then_some(Self { gate })
-    }
-}
-
-impl Drop for StatusPollGuard<'_> {
-    fn drop(&mut self) {
-        self.gate.end();
-    }
-}
-
-#[must_use]
-pub fn global_status_poll_gate() -> &'static StatusPollGate {
-    static GATE: StatusPollGate = StatusPollGate::new();
-    &GATE
-}
 
 /// Duplicate Trigger Key while the same Recording is already active.
 #[derive(Debug, Default)]
@@ -148,12 +92,12 @@ fn idle_local_view(response: &Response) -> OverlayView {
     }
     match &asr.local_readiness {
         LocalReadiness::Loading | LocalReadiness::Verifying => OverlayView {
-            phase: OverlayPhase::Failure,
+            phase: OverlayPhase::Loading,
             visible_label: "Loading",
             accessible_label: "Local selected; model loading; Start is refused until ready; no deferred capture queue",
         },
         LocalReadiness::Unavailable { .. } => OverlayView {
-            phase: OverlayPhase::Failure,
+            phase: OverlayPhase::Unavailable,
             visible_label: "Local selected; model unavailable",
             accessible_label: "Local selected; model unavailable; Start is refused before capture",
         },
@@ -219,7 +163,9 @@ mod tests {
             DaemonState::Idle,
             Some(asr(AsrMode::Local, None, LocalReadiness::Loading)),
         ));
+        assert_eq!(loading.phase, OverlayPhase::Loading);
         assert_eq!(loading.visible_label, "Loading");
+        assert_ne!(loading.phase, OverlayPhase::Failure);
         assert!(
             loading
                 .accessible_label
@@ -235,6 +181,8 @@ mod tests {
                 },
             )),
         ));
+        assert_eq!(unavailable.phase, OverlayPhase::Unavailable);
+        assert_ne!(unavailable.phase, loading.phase);
         assert_eq!(
             unavailable.visible_label,
             "Local selected; model unavailable"
@@ -262,16 +210,6 @@ mod tests {
         assert!(!latch.observe(Some("rec-1")));
         assert!(latch.observe(Some("rec-2")));
         assert!(!latch.observe(None));
-    }
-
-    #[test]
-    fn status_poll_gate_admits_only_one_in_flight() {
-        let gate = StatusPollGate::new();
-        let first = StatusPollGuard::acquire(&gate);
-        assert!(first.is_some());
-        assert!(StatusPollGuard::acquire(&gate).is_none());
-        drop(first);
-        assert!(StatusPollGuard::acquire(&gate).is_some());
     }
 
     #[test]
