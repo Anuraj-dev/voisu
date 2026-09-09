@@ -1,5 +1,5 @@
-//! Production Local worker placeholder. Always unavailable until a bakeoff
-//! winner lands. No scripted text, no env seam, no weights.
+//! Production Local worker placeholder. Always unavailable while model
+//! selection is evidence-gated. No scripted text, environment seam, or weights.
 
 use std::time::Instant;
 
@@ -19,7 +19,7 @@ impl WorkerChild for UnavailableWorker {
         _deadline: Instant,
     ) -> Result<WorkerFrame, SupervisorError> {
         Err(SupervisorError::Unavailable(
-            "local worker unavailable until a bakeoff winner lands",
+            "local worker unavailable until a production model is selected",
         ))
     }
 

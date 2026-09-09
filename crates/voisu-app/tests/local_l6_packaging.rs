@@ -154,11 +154,9 @@ fn clean_install_ships_no_production_weights_and_defaults_cloud() {
             .exists()
     );
     let catalog = voisu_app::local_model::shipped_catalog();
-    // The Arch pilot winner is elected for host testing, but a clean install
-    // still ships no weights and no receipt: the model arrives only through
-    // consented Setup.
-    let winner = voisu_app::local_model::bakeoff_winner(&catalog).expect("pilot winner");
-    assert_eq!(winner.id, "whisper-cpp-ggml-base.en");
+    let candidate = voisu_app::local_model::pilot_candidate(&catalog).expect("Pilot Candidate");
+    assert_eq!(candidate.id, "whisper-cpp-ggml-base.en");
+    assert!(voisu_app::local_model::production_selection(&catalog).is_none());
     assert!(
         catalog
             .entries

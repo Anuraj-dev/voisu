@@ -1,6 +1,6 @@
 //! Health-before-activation. Never Delivery.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use crate::local_worker::{
@@ -40,17 +40,12 @@ pub trait HealthProbe {
 #[derive(Clone, Debug)]
 pub struct CandidateHealth {
     pub restrictions: RestrictionProbe,
-    /// Explicit worker binary for the real-inference path. `None` resolves to
-    /// the pilot default. Tests set a nonexistent path to prove fail-closed
-    /// without touching process-global environment.
-    pub whisper_bin: Option<PathBuf>,
 }
 
 impl Default for CandidateHealth {
     fn default() -> Self {
         Self {
             restrictions: RestrictionProbe::Available,
-            whisper_bin: None,
         }
     }
 }
@@ -181,17 +176,9 @@ impl CandidateHealth {
             return Err(HealthError::Digest(fixture.name));
         }
         let pcm = jfk_pcm(&wav).ok_or(HealthError::FixtureQuality)?;
-        let binary = self
-            .whisper_bin
-            .clone()
-            .unwrap_or_else(WhisperCppWorker::default_binary);
-        let worker = WhisperCppWorker::new(
-            binary,
-            candidate.join(model_name),
-            1,
-            format!("health-{}", entry.id),
-        )
-        .map_err(|_| HealthError::Sandbox)?;
+        let worker =
+            WhisperCppWorker::from_artifact(candidate, model_name, &format!("health-{}", entry.id))
+                .map_err(|_| HealthError::Sandbox)?;
         score_known_audio(
             worker,
             pcm,
@@ -433,7 +420,6 @@ mod tests {
         write_fixture(temp.path());
         let health = CandidateHealth {
             restrictions: RestrictionProbe::Unsupported,
-            whisper_bin: None,
         };
         assert_eq!(
             health.check(ci_fixture_entry(), temp.path()),
@@ -484,11 +470,11 @@ mod tests {
     fn tampered_production_candidate_fails_before_any_inference() {
         let temp = tempfile::tempdir().unwrap();
         let catalog = crate::local_model::shipped_catalog();
-        let winner = crate::local_model::bakeoff_winner(&catalog).expect("pilot winner");
+        let candidate = crate::local_model::pilot_candidate(&catalog).expect("Pilot Candidate");
         std::fs::write(temp.path().join("ggml-base.en.bin"), b"tampered").unwrap();
         std::fs::write(temp.path().join("jfk.wav"), b"tampered").unwrap();
         let error = CandidateHealth::default()
-            .check(winner, temp.path())
+            .check(candidate, temp.path())
             .unwrap_err();
         assert!(
             matches!(error, HealthError::Digest(_) | HealthError::MissingFile(_)),

@@ -189,13 +189,11 @@ impl<C: WorkerChild, D: DeliverySeam> LocalLifecycle<C, D> {
     }
 }
 
-/// Production Start/Replay remain refused before capture (L4 owns routing).
-/// Admission is possible only once the Arch pilot winner is elected; the
-/// per-request Gate readiness (valid receipt + prepared worker) stays the
-/// sufficient check at `admit_local`.
+/// Production Start and Replay remain refused before capture until measurement
+/// selects a catalog entry. A Pilot Candidate alone cannot open this gate.
 #[must_use]
 pub fn production_local_admission() -> bool {
-    crate::local_model::bakeoff_winner(&crate::local_model::shipped_catalog()).is_some()
+    crate::local_model::production_selection(&crate::local_model::shipped_catalog()).is_some()
 }
 
 #[cfg(test)]
@@ -228,8 +226,8 @@ mod tests {
     }
 
     #[test]
-    fn production_admission_tracks_the_pilot_winner() {
-        assert!(production_local_admission());
+    fn production_admission_ignores_the_unmeasured_pilot_candidate() {
+        assert!(!production_local_admission());
     }
 
     #[test]

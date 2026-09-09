@@ -72,8 +72,9 @@ impl Harness {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         if local_ready {
-            command.env("VOISU_TEST_LOCAL_READY", "1");
-            command.env("VOISU_TEST_LOCAL_TEXT", "hello from local");
+            command
+                .env("VOISU_TEST_LOCAL_READY", "1")
+                .env("VOISU_TEST_LOCAL_TEXT", "hello from local");
         }
         let mut child = command.spawn().expect("daemon should start");
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -151,10 +152,8 @@ fn local_without_ready_worker_still_refuses_before_capture() {
 
 #[test]
 fn local_test_env_seam_is_ignored_in_production_binary() {
-    // Behavioral proof for T1: the non-test daemon binary must ignore
-    // VOISU_TEST_LOCAL_READY/VOISU_TEST_LOCAL_TEXT. Even with the seam set
-    // via per-command env, Local stays unavailable and Start is refused
-    // before capture; no scripted "hello" is admitted or delivered.
+    // The non-test daemon ignores test readiness and worker path environment.
+    // Local stays unavailable and Start is refused before capture.
     let harness = Harness::new();
     let _daemon = harness.start_daemon(true);
     let set = harness.voisu(&["mode", "local"]);

@@ -895,7 +895,6 @@ mod tests {
         use std::thread;
 
         use crate::local_worker::protocol::{decode_json_frame, encode_json_frame};
-        use crate::local_worker::runtime::whisper_cpp_paths;
         use crate::local_worker::sandbox::scrub_worker_environment;
 
         spawn_program_allowed(std::path::Path::new("/usr/bin/true")).unwrap();
@@ -903,11 +902,6 @@ mod tests {
             std::env::var_os("VOISU_L2_SPAWN_WHISPER").is_none(),
             "CI must not spawn whisper.cpp; VOISU_L2_SPAWN_WHISPER is a host-only gate"
         );
-        assert!(
-            whisper_cpp_paths().binary.is_none() || whisper_cpp_paths().model.is_none(),
-            "CI must not inject a whisper.cpp model; production weights stay undownloaded"
-        );
-
         let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
             .into_iter()
             .map(PathBuf::from)

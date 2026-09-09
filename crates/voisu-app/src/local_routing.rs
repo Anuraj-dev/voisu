@@ -12,9 +12,9 @@ use voisu_core::{
 
 use crate::config::WritingMode;
 
-use crate::local_model::{ActiveReceipt, ModelStore, models_dir};
+use crate::local_model::ActiveReceipt;
 #[cfg(not(test))]
-use crate::local_model::{FileKind, bakeoff_winner, shipped_catalog};
+use crate::local_model::{FileKind, ModelStore, models_dir, production_selection, shipped_catalog};
 use crate::local_recovery::{RecoveryClock, RecoveryError, RecoveryStore};
 use crate::local_tail::{
     DeliveryCoordinator, DeliveryPermit, TailError, TerminalDecision, decide_replay,
@@ -81,11 +81,6 @@ impl Gate {
         if self.inference_checked_out {
             return self.readiness.clone();
         }
-        #[cfg(test)]
-        if test_local_ready() {
-            self.ensure_test_worker();
-            return self.readiness.clone();
-        }
         if self.supervisor.state() == WorkerState::Ready && self.receipt.is_some() {
             self.readiness = LocalReadiness::Ready {
                 model_identity: self
@@ -93,7 +88,23 @@ impl Gate {
                     .as_ref()
                     .map(|receipt| receipt.catalog_id.clone()),
             };
-        } else {
+            return self.readiness.clone();
+        }
+        #[cfg(test)]
+        {
+            self.readiness = LocalReadiness::Unavailable {
+                error: LOCAL_UNAVAILABLE.to_owned(),
+            };
+            self.readiness.clone()
+        }
+        #[cfg(not(test))]
+        {
+            if !crate::local_worker::production_local_admission() {
+                self.readiness = LocalReadiness::Unavailable {
+                    error: LOCAL_UNAVAILABLE.to_owned(),
+                };
+                return self.readiness.clone();
+            }
             self.load_receipt();
             if self.receipt.is_none() {
                 self.readiness = LocalReadiness::Unavailable {
@@ -101,7 +112,6 @@ impl Gate {
                 };
                 return self.readiness.clone();
             }
-            #[cfg(not(test))]
             self.ensure_production_worker();
             self.readiness = match self.supervisor.state() {
                 WorkerState::Absent | WorkerState::Verifying => LocalReadiness::Verifying,
@@ -118,10 +128,11 @@ impl Gate {
                     error: LOCAL_NOT_READY.to_owned(),
                 },
             };
+            self.readiness.clone()
         }
-        self.readiness.clone()
     }
 
+    #[cfg(not(test))]
     fn load_receipt(&mut self) {
         self.receipt = (|| {
             let dir = models_dir().ok()?;
@@ -130,10 +141,8 @@ impl Gate {
         })();
     }
 
-    /// Production attach: bind the elected pilot winner's verified artifact to
-    /// a real worker and prepare it. Every mismatch fails closed by returning
-    /// without touching the supervisor; Prepare failures leave it Unavailable.
-    /// Restart budget bounds repeated attempts; only Ready admits capture.
+    /// Bind the selected catalog entry's verified artifact to a real worker.
+    /// This remains unreachable while production selection is evidence-gated.
     #[cfg(not(test))]
     fn ensure_production_worker(&mut self) {
         if self.supervisor.state() == WorkerState::Ready || self.inference_checked_out {
@@ -151,7 +160,7 @@ impl Gate {
         if !entry.production_weights {
             return;
         }
-        if bakeoff_winner(&catalog).map(|winner| winner.id) != Some(entry.id) {
+        if production_selection(&catalog).map(|selected| selected.id) != Some(entry.id) {
             return;
         }
         if entry.runtime_abi.protocol != crate::local_worker::PROTOCOL_VERSION
@@ -206,32 +215,6 @@ impl Gate {
         }
         let prepare = correlation(&receipt.receipt_hash, "l4-prepare", "prepare");
         let _ = self.supervisor.prepare(prepare, Instant::now());
-    }
-
-    #[cfg(test)]
-    fn ensure_test_worker(&mut self) {
-        self.load_receipt();
-        if self.receipt.is_none() {
-            let receipt = crate::local_model::from_entry(
-                crate::local_model::ci_fixture_entry(),
-                "l4-test-artifact",
-            );
-            self.receipt = Some(receipt);
-        }
-        let hash = self
-            .receipt
-            .as_ref()
-            .map(|receipt| receipt.receipt_hash.clone())
-            .unwrap_or_default();
-        if self.supervisor.state() != WorkerState::Ready {
-            self.attach_ready_worker(hash, &test_local_text());
-        }
-        self.readiness = LocalReadiness::Ready {
-            model_identity: self
-                .receipt
-                .as_ref()
-                .map(|receipt| receipt.catalog_id.clone()),
-        };
     }
 
     #[cfg(test)]
@@ -355,16 +338,19 @@ fn gate() -> &'static Mutex<Gate> {
 
 #[must_use]
 pub fn production_readiness() -> LocalReadiness {
-    gate()
-        .lock()
-        .map(|mut gate| gate.refresh())
-        .unwrap_or(LocalReadiness::Unavailable {
-            error: LOCAL_UNAVAILABLE.to_owned(),
-        })
+    LocalReadiness::Unavailable {
+        error: LOCAL_UNAVAILABLE.to_owned(),
+    }
 }
 
 #[must_use]
 pub fn admit_local(kind_ready_required: bool) -> LocalAdmission {
+    #[cfg(not(test))]
+    if !crate::local_worker::production_local_admission() {
+        return LocalAdmission::Unavailable {
+            error: LOCAL_UNAVAILABLE.to_owned(),
+        };
+    }
     let Ok(mut gate) = gate().lock() else {
         return LocalAdmission::Unavailable {
             error: LOCAL_UNAVAILABLE.to_owned(),
@@ -733,17 +719,6 @@ pub fn sentinel_is_clean() -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(test)]
-fn test_local_ready() -> bool {
-    std::env::var_os("VOISU_TEST_MODE").is_some()
-        && std::env::var_os("VOISU_TEST_LOCAL_READY").is_some()
-}
-
-#[cfg(test)]
-fn test_local_text() -> String {
-    std::env::var("VOISU_TEST_LOCAL_TEXT").unwrap_or_else(|_| "hello".to_owned())
-}
-
 /// Test-only: attach a Ready worker and verified receipt without env.
 #[cfg(test)]
 pub fn inject_ready(receipt: ActiveReceipt, text: &str) {
@@ -788,10 +763,7 @@ mod tests {
         let _lock = test_session();
         match admit_local(true) {
             LocalAdmission::Unavailable { error } => {
-                assert!(
-                    error.contains("unavailable") || error.contains("refused"),
-                    "{error}"
-                );
+                assert_eq!(error, LOCAL_UNAVAILABLE);
             }
             LocalAdmission::Ready { .. } => panic!("empty gate must not admit"),
         }
@@ -829,16 +801,16 @@ mod tests {
     }
 
     #[test]
-    fn status_stays_busy_while_inference_is_checked_out() {
+    fn public_readiness_stays_unavailable_with_an_injected_test_worker() {
         let _lock = test_session();
         inject_ready(fixture_receipt(), "hello");
-        let session = take_inference_session().unwrap();
-        assert_eq!(production_readiness(), LocalReadiness::Busy);
-        restore_inference_session(session);
-        assert!(matches!(
+        assert_eq!(
             production_readiness(),
-            LocalReadiness::Ready { .. }
-        ));
+            LocalReadiness::Unavailable {
+                error: LOCAL_UNAVAILABLE.to_owned()
+            }
+        );
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
     }
 
     #[test]

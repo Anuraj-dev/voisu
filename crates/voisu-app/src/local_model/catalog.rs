@@ -19,9 +19,9 @@ const GGML_SMALL_EN_SHA: &str = "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f8
 const GGML_SMALL_EN_BYTES: u64 = 487_614_201;
 
 /// Pinned upstream whisper.cpp sample used as the non-private known-audio
-/// health fixture for the Arch pilot winner. Separate revision from the
+/// health fixture for the Pilot Candidate. Separate revision from the
 /// Hugging Face weights because it lives in the whisper.cpp git tree.
-/// Referenced by the pilot-winner test below; not used in non-test builds.
+/// Referenced by the Pilot Candidate test below; not used in non-test builds.
 #[cfg_attr(not(test), allow(dead_code))]
 const WHISPER_CPP_JFK_REV: &str = "c44b60b8053bbf2a5c1e014f11323fb3f2485177";
 const JFK_WAV_SHA: &str = "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e";
@@ -103,15 +103,20 @@ pub fn shipped_catalog() -> Catalog {
     }
 }
 
-/// Arch/Hyprland pilot winner. This is NOT a product bakeoff result under
-/// R7 (no locked 100+20 corpus, no WER/soak evidence): it exists so the pilot
-/// host can install and exercise one real runtime. Fedora product support
-/// remains evidence-gated and the pilot PR stays unmerged.
+/// Unmeasured Pilot Candidate retained for catalog and health work.
+/// This does not select a production model.
 #[must_use]
-pub fn bakeoff_winner(_catalog: &Catalog) -> Option<&'static CatalogEntry> {
-    SHIPPED_ENTRIES
+pub fn pilot_candidate(catalog: &Catalog) -> Option<&CatalogEntry> {
+    catalog
+        .entries
         .iter()
         .find(|entry| entry.id == "whisper-cpp-ggml-base.en")
+}
+
+/// Production selection remains empty until measurement evidence elects a model.
+#[must_use]
+pub fn production_selection(_catalog: &Catalog) -> Option<&CatalogEntry> {
+    None
 }
 
 #[must_use]
@@ -201,7 +206,7 @@ const SHIPPED_ENTRIES: &[CatalogEntry] = &[
         devices: &[DeviceSupport::Cpu],
         license: LicenseTerms {
             spdx: "MIT",
-            name: "whisper.cpp GGML base.en (Arch pilot winner)",
+            name: "whisper.cpp GGML base.en (Pilot Candidate)",
         },
         provenance: Provenance {
             publisher: "ggerganov/whisper.cpp",
@@ -210,7 +215,7 @@ const SHIPPED_ENTRIES: &[CatalogEntry] = &[
         },
         redistribution: Redistribution {
             allowed: true,
-            terms: "upstream whisper.cpp model card; Arch pilot winner, Fedora product support evidence-gated",
+            terms: "upstream whisper.cpp model card; Pilot Candidate, production selection evidence-gated",
         },
         files: &[
             CatalogFile {
@@ -231,7 +236,7 @@ const SHIPPED_ENTRIES: &[CatalogEntry] = &[
         allowed_hosts: &[
             "huggingface.co",
             "raw.githubusercontent.com",
-            // Pilot exception, reviewer must rule before any ship: HF `resolve`
+            // Pilot Candidate exception: HF `resolve`
             // answers with a 302 to HF-operated blob CDN hosts, so a strict
             // same-host redirect policy can never complete the download. The
             // host below is pinned exactly and visibly; any rotation breaks
@@ -321,8 +326,9 @@ mod tests {
     #[test]
     fn production_entries_pin_immutable_revisions_not_main() {
         let catalog = shipped_catalog();
-        let winner = bakeoff_winner(&catalog).expect("Arch pilot winner");
-        assert_eq!(winner.id, "whisper-cpp-ggml-base.en");
+        let candidate = pilot_candidate(&catalog).expect("Pilot Candidate");
+        assert_eq!(candidate.id, "whisper-cpp-ggml-base.en");
+        assert!(production_selection(&catalog).is_none());
         for entry in catalog.entries {
             assert_ne!(entry.runtime_abi.family, RuntimeFamily::FasterWhisper);
             assert!(!format!("{entry:?}").to_ascii_lowercase().contains("ollama"));
@@ -364,11 +370,11 @@ mod tests {
     }
 
     #[test]
-    fn pilot_winner_pins_jfk_health_fixture_to_an_immutable_rev() {
+    fn pilot_candidate_pins_jfk_health_fixture_to_an_immutable_rev() {
         let catalog = shipped_catalog();
-        let winner = bakeoff_winner(&catalog).expect("Arch pilot winner");
-        assert!(winner.production_weights);
-        let jfk = winner.file("jfk.wav").expect("pilot health fixture");
+        let candidate = pilot_candidate(&catalog).expect("Pilot Candidate");
+        assert!(candidate.production_weights);
+        let jfk = candidate.file("jfk.wav").expect("pilot health fixture");
         assert_eq!(jfk.kind, FileKind::HealthFixture);
         assert_eq!(jfk.bytes, JFK_WAV_BYTES);
         assert_eq!(jfk.sha256_hex, JFK_WAV_SHA);
@@ -377,11 +383,15 @@ mod tests {
             "health fixture must stay pinned, not floating: {}",
             jfk.url
         );
-        assert!(winner.allowed_hosts.contains(&"raw.githubusercontent.com"));
-        assert!(winner.required_names.contains(&"jfk.wav"));
+        assert!(
+            candidate
+                .allowed_hosts
+                .contains(&"raw.githubusercontent.com")
+        );
+        assert!(candidate.required_names.contains(&"jfk.wav"));
         // Pilot redirect exception stays exact and visible (see allowed_hosts).
-        assert!(winner.allowed_hosts.contains(&"us.aws.cdn.hf.co"));
-        // small.en stays unelected without a health fixture.
+        assert!(candidate.allowed_hosts.contains(&"us.aws.cdn.hf.co"));
+        // small.en remains a separate unmeasured entry without a health fixture.
         let small = catalog
             .entries
             .iter()
@@ -389,7 +399,7 @@ mod tests {
             .expect("small.en candidate");
         assert!(small.production_weights);
         assert!(small.file("jfk.wav").is_none());
-        assert_ne!(small.id, winner.id);
+        assert_ne!(small.id, candidate.id);
     }
 
     #[test]

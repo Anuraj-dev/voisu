@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use crate::local_worker::{PROTOCOL_VERSION, refuse_production_weight_download};
 
 use super::catalog::{
-    CatalogEntry, bakeoff_winner, sha256_hex, shipped_catalog, verify_file_digest,
+    CatalogEntry, production_selection, sha256_hex, shipped_catalog, verify_file_digest,
 };
 use super::fetch::{ArtifactFetcher, FetchError, FetchRequest};
 use super::health::{HealthError, HealthProbe};
@@ -190,10 +190,9 @@ where
     if request.io.abort == Some(InstallAbort::AfterLock) {
         return abort(prior);
     }
-    // Only the elected pilot winner may download production weights.
-    // Unelected entries stay refused even though they carry production bytes.
+    // Production weights remain blocked until measurement selects an entry.
     if request.entry.production_weights
-        && bakeoff_winner(&shipped_catalog()).map(|winner| winner.id) != Some(request.entry.id)
+        && production_selection(&shipped_catalog()).map(|entry| entry.id) != Some(request.entry.id)
     {
         let _ = refuse_production_weight_download();
         return Err(InstallError::ProductionWeightsForbidden);
@@ -420,16 +419,13 @@ mod tests {
     }
 
     #[test]
-    fn unelected_production_weights_are_not_downloaded() {
+    fn production_weights_are_not_downloaded_without_a_selection() {
         let (_temp, mut store) = open_store();
         let catalog = shipped_catalog();
-        let winner_id = crate::local_model::bakeoff_winner(&catalog)
-            .expect("pilot winner")
-            .id;
         let entry = catalog
             .entries
             .iter()
-            .find(|entry| entry.production_weights && entry.id != winner_id)
+            .find(|entry| entry.production_weights)
             .unwrap();
         let error = install_entry(InstallRequest {
             store: &mut store,
@@ -447,12 +443,10 @@ mod tests {
     }
 
     #[test]
-    fn elected_winner_passes_the_production_gate_before_fetch() {
-        // Scripted wrong bytes: the winner must fail on size/hash, proving
-        // the refusal gate let it through to the verified fetch path.
+    fn pilot_candidate_is_refused_before_fetch() {
         let (_temp, mut store) = open_store();
         let catalog = shipped_catalog();
-        let entry = crate::local_model::bakeoff_winner(&catalog).expect("pilot winner");
+        let entry = crate::local_model::pilot_candidate(&catalog).expect("Pilot Candidate");
         let fetcher = ScriptedFetcher::new(vec![ScriptedHop::Body(b"too small".to_vec())]);
         let error = install_entry(InstallRequest {
             store: &mut store,
@@ -465,13 +459,7 @@ mod tests {
             clock: InstallClock::default(),
         })
         .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                InstallError::Size | InstallError::Hash | InstallError::Fetch(_)
-            ),
-            "{error:?}"
-        );
+        assert_eq!(error, InstallError::ProductionWeightsForbidden);
         assert!(store.load_active().unwrap().is_none());
     }
 

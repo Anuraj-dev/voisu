@@ -997,17 +997,7 @@ mod tests {
         persist_asr_mode_at(&config, &state, AsrMode::Local).unwrap();
         match admit_recording_at(&config, &state).unwrap() {
             RecordingAdmission::LocalUnavailable { error, .. } => {
-                // Host-state dependent: a machine with no installed model
-                // reports LOCAL_UNAVAILABLE, while a pilot host with a valid
-                // receipt but no prepared test worker reports
-                // LOCAL_START_REFUSED. Both refuse capture. The exact
-                // no-model message is pinned hermetically by the
-                // isolated-IPC test instead, since this unit test reads the
-                // real model store.
-                assert!(
-                    error == LOCAL_UNAVAILABLE || error == LOCAL_START_REFUSED,
-                    "{error}"
-                );
+                assert_eq!(error, LOCAL_UNAVAILABLE);
             }
             RecordingAdmission::Cloud { .. } => panic!("Local must not admit as Cloud"),
             RecordingAdmission::Local { .. } => {

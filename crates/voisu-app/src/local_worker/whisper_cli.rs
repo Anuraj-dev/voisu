@@ -1,4 +1,4 @@
-//! Arch pilot production worker: process-wrapped `whisper-cli` (R3/R5).
+//! Non-admitted Pilot Candidate worker using process-wrapped `whisper-cli`.
 //!
 //! One native executable, one verified model file, no Python/CUDA/FFI/JIT.
 //! CPU-only, absolute paths, scrubbed environment, no downloader, no shell,
@@ -6,11 +6,6 @@
 //! bounded stdout/stderr concurrently so a noisy child cannot wedge the pipe,
 //! kills the child past the deadline, and reaps inline: nothing survives the
 //! exchange, so `cancel_and_reap` is trivially clean.
-//!
-//! Kernel-enforced Landlock/seccomp sandboxing remains future work (the pilot
-//! PR is unmerged and makes no offline-privacy proof claim); this worker's
-//! guarantees are env scrub, absolute allowlisted paths, CPU-only mode, and
-//! bounded blocking behavior with fail-closed errors.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -25,12 +20,8 @@ use super::protocol::{
 use super::runtime::reject_forbidden_program;
 use super::supervisor::{ReapOutcome, SupervisorError, WorkerChild};
 
-/// Production default on the Arch pilot host (signed `extra/whisper-cpp`).
+/// Fixed executable for the Pilot Candidate worker.
 pub const PILOT_WHISPER_CLI: &str = "/usr/bin/whisper-cli";
-
-/// Env override for tests/dev only. Must stay absolute; relative values are
-/// rejected like any other non-absolute program.
-pub const WHISPER_BIN_ENV: &str = "VOISU_WHISPER_CPP_BIN";
 
 /// Stdout cap: parsed JSON for a bounded transcript plus upstream envelope.
 const MAX_CLI_STDOUT_BYTES: usize = 2 * 1024 * 1024;
@@ -48,18 +39,7 @@ pub struct WhisperCppWorker {
 }
 
 impl WhisperCppWorker {
-    #[must_use]
-    pub fn default_binary() -> PathBuf {
-        std::env::var_os(WHISPER_BIN_ENV)
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| PathBuf::from(PILOT_WHISPER_CLI))
-    }
-
-    /// Absolute paths only. Forbidden programs (ollama) and relative paths
-    /// are rejected before anything spawns. File existence is checked at
-    /// Prepare so a deleted model fails closed instead of at construction.
-    pub fn new(
+    fn build(
         binary: PathBuf,
         model: PathBuf,
         generation: u64,
@@ -79,9 +59,21 @@ impl WhisperCppWorker {
         })
     }
 
+    /// Typed executable seam for unit tests. Production always uses the fixed
+    /// Pilot Candidate executable and a catalog-derived model name.
+    #[cfg(test)]
+    pub(crate) fn new(
+        binary: PathBuf,
+        model: PathBuf,
+        generation: u64,
+        model_receipt_hash: String,
+    ) -> Result<Self, SupervisorError> {
+        Self::build(binary, model, generation, model_receipt_hash)
+    }
+
     /// Bind to a verified artifact directory: the weights file comes from the
     /// catalog entry, never from the environment or the caller.
-    pub fn from_artifact(
+    pub(crate) fn from_artifact(
         artifact_dir: &Path,
         weights_name: &str,
         receipt_hash: &str,
@@ -89,8 +81,8 @@ impl WhisperCppWorker {
         if weights_name.is_empty() || weights_name.contains('/') || weights_name.contains('\0') {
             return Err(SupervisorError::Unavailable("unsafe weights name"));
         }
-        Self::new(
-            Self::default_binary(),
+        Self::build(
+            PathBuf::from(PILOT_WHISPER_CLI),
             artifact_dir.join(weights_name),
             1,
             receipt_hash.to_owned(),

@@ -4,7 +4,7 @@
 //! are recorded only where an exact runtime format and package stack can meet
 //! R3–R5. Ollama is not a candidate.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::sandbox::{PackagedUnitRestrictions, packaged_unit_restrictions};
 
@@ -87,21 +87,6 @@ fn faster_whisper_eligibility(unit: &PackagedUnitRestrictions) -> Eligibility {
             required_format: "CTranslate2 converted Whisper weights",
             package_stack: "non-JIT packaged worker matching R3-R5",
         }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WhisperCppPaths {
-    pub binary: Option<PathBuf>,
-    pub model: Option<PathBuf>,
-}
-
-/// Explicit env only. Never PATH-search a model. Never download.
-#[must_use]
-pub fn whisper_cpp_paths() -> WhisperCppPaths {
-    WhisperCppPaths {
-        binary: std::env::var_os("VOISU_WHISPER_CPP_BIN").map(PathBuf::from),
-        model: std::env::var_os("VOISU_WHISPER_CPP_MODEL").map(PathBuf::from),
     }
 }
 

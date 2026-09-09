@@ -1,8 +1,7 @@
 //! L3 trusted catalog, crash-safe model store, and installer (R3–R5).
 //!
-//! Packages ship the versioned catalog and runtime, not weights. Local ASR
-//! capture stays gated until L4. No bakeoff winner is selected. Ollama is not
-//! a candidate.
+//! Packages ship the versioned catalog and runtime, not weights. The catalog
+//! retains a Pilot Candidate, but production selection and capture stay gated.
 
 use std::time::Duration;
 
@@ -20,8 +19,8 @@ mod url_policy;
 
 pub use catalog::{
     Catalog, CatalogEntry, CatalogFile, DeviceSupport, FileKind, LicenseTerms, Provenance,
-    Redistribution, RuntimeAbi, SHA256_HEX_LEN, bakeoff_winner, ci_fixture_entry, sha256_hex,
-    shipped_catalog, verify_file_digest,
+    Redistribution, RuntimeAbi, SHA256_HEX_LEN, ci_fixture_entry, pilot_candidate,
+    production_selection, sha256_hex, shipped_catalog, verify_file_digest,
 };
 pub use fetch::{
     ArtifactFetcher, FetchError, FetchRequest, FetchResponse, ProductionHttps, ScriptedFetcher,
@@ -45,10 +44,9 @@ pub use url_policy::{CatalogUrl, UrlPolicyError, validate_catalog_url};
 
 use crate::local_worker::production_local_admission;
 
-/// Admission observes the store and worker gate without enabling capture.
+/// Production admission is evidence-gated and does not inspect host model state.
 #[must_use]
 pub fn observe_for_admission() -> bool {
-    let _ = models_dir();
     let _ = (INSTALL_DEADLINE, NO_PROGRESS);
     production_local_admission()
 }
@@ -58,10 +56,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn arch_pilot_elects_exactly_one_winner() {
+    fn catalog_retains_one_unmeasured_pilot_candidate() {
         let catalog = shipped_catalog();
-        let winner = bakeoff_winner(&catalog).expect("Arch pilot winner");
-        assert_eq!(winner.id, "whisper-cpp-ggml-base.en");
+        let candidate = pilot_candidate(&catalog).expect("Pilot Candidate");
+        assert_eq!(candidate.id, "whisper-cpp-ggml-base.en");
+        assert!(production_selection(&catalog).is_none());
         assert!(catalog.entries.len() >= 2);
         assert!(
             catalog
@@ -72,7 +71,7 @@ mod tests {
     }
 
     #[test]
-    fn production_admission_tracks_the_pilot_winner() {
-        assert!(observe_for_admission());
+    fn production_admission_stays_closed_before_measurement() {
+        assert!(!observe_for_admission());
     }
 }

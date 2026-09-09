@@ -240,7 +240,7 @@ pub fn models_live_under_state(models: &Path, state_root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::local_model::bakeoff_winner;
+    use crate::local_model::{pilot_candidate, production_selection};
     use crate::local_worker::{GateVerdict, evaluate_report};
     use std::fs;
     use voisu_core::AsrMode;
@@ -306,11 +306,10 @@ mod tests {
             false,
         );
         assert_eq!(report.verdict, GateVerdict::PendingEvidence);
-        // The Arch pilot winner is elected for host testing, but the locked
-        // English bakeoff defect still blocks any Local ship claim.
-        let winner =
-            bakeoff_winner(&crate::local_model::shipped_catalog()).expect("Arch pilot winner");
-        assert_eq!(winner.id, "whisper-cpp-ggml-base.en");
+        let catalog = crate::local_model::shipped_catalog();
+        let candidate = pilot_candidate(&catalog).expect("Pilot Candidate");
+        assert_eq!(candidate.id, "whisper-cpp-ggml-base.en");
+        assert!(production_selection(&catalog).is_none());
         assert!(
             defects
                 .iter()
