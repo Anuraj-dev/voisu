@@ -5,7 +5,7 @@ mod silent;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use voisu_core::{AsrMode, LocalReadiness, Transcript};
+use voisu_core::{AsrMode, DaemonState, LocalReadiness, Response, Transcript};
 
 use crate::config::WritingMode;
 
@@ -43,6 +43,7 @@ struct Gate {
     coordinator: DeliveryCoordinator,
     sentinel: CloudCapabilitySentinel,
     pending_permit: Option<DeliveryPermit>,
+    user_terms: Vec<String>,
 }
 
 impl Gate {
@@ -54,6 +55,7 @@ impl Gate {
             coordinator: DeliveryCoordinator::new(),
             sentinel: CloudCapabilitySentinel::new(),
             pending_permit: None,
+            user_terms: Vec::new(),
         }
     }
 
@@ -234,8 +236,27 @@ pub fn admit_local(kind_ready_required: bool) -> LocalAdmission {
 }
 
 pub fn begin_live(recording_id: &str) {
+    begin_live_with_terms(recording_id, Vec::new());
+}
+
+pub fn begin_live_with_terms(recording_id: &str, user_terms: Vec<String>) {
     if let Ok(mut gate) = gate().lock() {
         gate.coordinator.begin_live(recording_id);
+        gate.user_terms = user_terms;
+        gate.pending_permit = None;
+        gate.sentinel = CloudCapabilitySentinel::new();
+    }
+}
+
+pub fn begin_local_session() {
+    if let Ok(mut gate) = gate().lock() {
+        gate.sentinel = CloudCapabilitySentinel::new();
+    }
+}
+
+pub fn note_cloud_capability_used() {
+    if let Ok(mut gate) = gate().lock() {
+        gate.sentinel.construct_cloud_client();
     }
 }
 
@@ -348,6 +369,91 @@ pub fn complete_replay(
     .map_err(LocalError::Tail)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalStopResult {
+    Transcript(String),
+    NoText { reason: String },
+}
+
+pub fn finish_local_stop(
+    recording_id: &str,
+    pcm: Vec<u8>,
+    writing_mode: WritingMode,
+    recovery_enabled: bool,
+) -> Result<LocalStopResult, LocalError> {
+    let user_terms = gate()
+        .lock()
+        .map(|gate| gate.user_terms.clone())
+        .unwrap_or_default();
+    let completion = complete_recording(
+        recording_id,
+        pcm,
+        &user_terms,
+        writing_mode,
+        recovery_enabled,
+        false,
+    )?;
+    match completion.decision {
+        TerminalDecision::NoText { reason } => {
+            abandon_live(recording_id);
+            Ok(LocalStopResult::NoText { reason })
+        }
+        TerminalDecision::Transcript(text) => {
+            prepare_delivery(recording_id, recovery_enabled)?;
+            Ok(LocalStopResult::Transcript(text))
+        }
+    }
+}
+
+pub fn replay_local(
+    recording_id: &str,
+    fixture_name: &str,
+    user_terms: Vec<String>,
+    writing_mode: WritingMode,
+    load_diagnostic: impl FnOnce(&str) -> Result<Vec<u8>, String>,
+) -> Response {
+    begin_local_session();
+    let from_recovery = crate::local_recovery::is_local_origin(fixture_name);
+    let bytes = if from_recovery {
+        match crate::local_recovery::read_pcm(fixture_name) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return Response::rejected(Some(DaemonState::Idle), error.message());
+            }
+        }
+    } else {
+        match load_diagnostic(fixture_name) {
+            Ok(bytes) => bytes,
+            Err(error) => return Response::rejected(Some(DaemonState::Idle), error),
+        }
+    };
+    match complete_replay(
+        recording_id,
+        bytes,
+        &user_terms,
+        writing_mode,
+        false,
+        from_recovery,
+    ) {
+        Ok(TerminalDecision::Transcript(text)) => {
+            Response::success(DaemonState::Idle, format!("Replay completed: {text}"))
+        }
+        Ok(TerminalDecision::NoText { reason }) => Response::success(
+            DaemonState::Idle,
+            format!("Replay completed: no text ({reason})"),
+        ),
+        Err(error) => Response::rejected(Some(DaemonState::Idle), error.message()),
+    }
+}
+
+pub fn refuse_cloud_recovery_replay(name: &str, mode: AsrMode) -> Option<String> {
+    if mode == AsrMode::Cloud && crate::local_recovery::is_local_origin(name) {
+        Some(RecoveryError::CloudSelected.message())
+    } else {
+        None
+    }
+}
+
 pub fn prepare_delivery(recording_id: &str, recovery_enabled: bool) -> Result<(), LocalError> {
     let mut gate = gate().lock().map_err(|_| LocalError::Unavailable)?;
     let permit = gate
@@ -455,12 +561,6 @@ pub fn sentinel_is_clean() -> bool {
         .unwrap_or(false)
 }
 
-pub fn note_cloud_capability_used() {
-    if let Ok(mut gate) = gate().lock() {
-        gate.sentinel.construct_cloud_client();
-    }
-}
-
 fn test_local_ready() -> bool {
     std::env::var_os("VOISU_TEST_MODE").is_some()
         && std::env::var_os("VOISU_TEST_LOCAL_READY").is_some()
@@ -483,6 +583,7 @@ pub fn inject_ready(receipt: ActiveReceipt, text: &str) {
     gate.sentinel = CloudCapabilitySentinel::new();
     gate.coordinator = DeliveryCoordinator::new();
     gate.pending_permit = None;
+    gate.user_terms = Vec::new();
 }
 
 #[cfg(test)]

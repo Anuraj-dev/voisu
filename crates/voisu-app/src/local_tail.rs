@@ -33,6 +33,7 @@ pub struct DeliveryPermit {
 #[derive(Clone, Debug, Default)]
 pub struct DeliveryCoordinator {
     live: Option<String>,
+    authorized: BTreeSet<String>,
     spent: BTreeSet<String>,
     decided: BTreeSet<String>,
 }
@@ -54,15 +55,19 @@ impl DeliveryCoordinator {
     }
 
     pub fn authorize_live(&mut self, recording_id: &str) -> Result<DeliveryPermit, TailError> {
-        if self.spent.contains(recording_id) {
+        if self.spent.contains(recording_id) || self.authorized.contains(recording_id) {
             return Err(TailError::DuplicateDelivery);
         }
-        if self.live.as_deref() != Some(recording_id) {
-            return Err(TailError::UnauthorizedDelivery);
+        match self.live.take() {
+            Some(id) if id == recording_id => {
+                self.authorized.insert(id.clone());
+                Ok(DeliveryPermit { recording_id: id })
+            }
+            other => {
+                self.live = other;
+                Err(TailError::UnauthorizedDelivery)
+            }
         }
-        Ok(DeliveryPermit {
-            recording_id: recording_id.to_owned(),
-        })
     }
 
     pub fn confirm_delivery(
@@ -73,11 +78,10 @@ impl DeliveryCoordinator {
         if self.spent.contains(&permit.recording_id) {
             return Err(TailError::DuplicateDelivery);
         }
-        if self.live.as_deref() != Some(permit.recording_id.as_str()) {
+        if !self.authorized.remove(&permit.recording_id) {
             return Err(TailError::UnauthorizedDelivery);
         }
         self.spent.insert(permit.recording_id);
-        self.live = None;
         Ok(())
     }
 
@@ -270,6 +274,17 @@ mod tests {
             coordinator.confirm_delivery(permit, &Transcript("hi".into())),
             Err(TailError::DuplicateDelivery)
         );
+        assert_eq!(
+            coordinator.authorize_live("rec-1"),
+            Err(TailError::DuplicateDelivery)
+        );
+    }
+
+    #[test]
+    fn second_authorize_before_confirm_is_rejected() {
+        let mut coordinator = DeliveryCoordinator::new();
+        coordinator.begin_live("rec-1");
+        let _permit = coordinator.authorize_live("rec-1").unwrap();
         assert_eq!(
             coordinator.authorize_live("rec-1"),
             Err(TailError::DuplicateDelivery)

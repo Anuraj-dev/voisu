@@ -162,7 +162,23 @@ fn local_ready_worker_starts_without_cloud_clients() {
     assert!(started.status.success(), "{}", stderr(&started));
     let printed = stdout(&harness.voisu(&["status"]));
     assert!(printed.contains("asr mode active: local"), "{printed}");
-    let _ = harness.voisu(&["stop"]);
+    let during = ipc(&harness.socket(), r#"{"version":1,"command":"status"}"#);
+    assert_eq!(during["asr_mode"]["local_path_clean"], true, "{during}");
+    let stopped = harness.voisu(&["stop"]);
+    assert!(
+        stopped.status.success() || stopped.status.code() == Some(4),
+        "{}",
+        stderr(&stopped)
+    );
+    let after = ipc(&harness.socket(), r#"{"version":1,"command":"status"}"#);
+    assert_eq!(after["asr_mode"]["local_path_clean"], true, "{after}");
+    let replayed = harness.voisu(&["replay", "missing-fixture"]);
+    assert!(!replayed.status.success(), "{replayed:?}");
+    let replay_status = ipc(&harness.socket(), r#"{"version":1,"command":"status"}"#);
+    assert_eq!(
+        replay_status["asr_mode"]["local_path_clean"], true,
+        "{replay_status}"
+    );
 }
 
 #[test]

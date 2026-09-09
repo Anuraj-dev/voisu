@@ -37,6 +37,7 @@ pub fn construct_for_cloud(
     if mode != AsrMode::Cloud {
         return CloudOwnedResources::empty();
     }
+    crate::local_routing::note_cloud_capability_used();
     if let Some(sentinel) = sentinel {
         sentinel.construct_cloud_client();
     }

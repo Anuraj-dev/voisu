@@ -142,16 +142,34 @@ impl RecoveryStore {
         Self::open(recovery_dir()?, clock)
     }
 
+    pub fn open_existing(root: PathBuf, clock: RecoveryClock) -> Result<Self, RecoveryError> {
+        reject_symlink(&root)?;
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.is_dir() => Ok(Self { root, clock }),
+            Ok(_) => Err(RecoveryError::Unsafe),
+            Err(error) if error.kind() == ErrorKind::NotFound => Err(RecoveryError::Disabled),
+            Err(error) => Err(map_io(error)),
+        }
+    }
+
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
     pub fn expire(&self) -> Result<(), RecoveryError> {
-        self.expire_with(self.clock)
+        self.expire_with(self.clock, false)
     }
 
-    pub fn expire_with(&self, clock: RecoveryClock) -> Result<(), RecoveryError> {
+    pub fn expire_leftovers(&self) -> Result<(), RecoveryError> {
+        self.expire_with(self.clock, true)
+    }
+
+    pub fn expire_with(
+        &self,
+        clock: RecoveryClock,
+        promote_started: bool,
+    ) -> Result<(), RecoveryError> {
         let previous = self.read_last_wall()?;
         if let Some(previous) = previous
             && clock.wall_unix_ms < previous
@@ -162,13 +180,21 @@ impl RecoveryStore {
         }
         self.write_last_wall(clock.wall_unix_ms)?;
         for path in self.entries()? {
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with('.'))
-            {
-                // Crash-left temps share expiry and quota.
-                if self.should_expire_temp(&path, clock) {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name == CLOCK_NAME {
+                continue;
+            }
+            if name.starts_with('.') || name.ends_with(".tmp") {
+                if self.should_expire_orphan(&path, clock) {
+                    let _ = fs::remove_file(&path);
+                }
+                continue;
+            }
+            if let Some(stem) = name.strip_suffix(".pcm") {
+                let meta = self.root.join(format!("{stem}.meta"));
+                if !meta.exists() && self.should_expire_orphan(&path, clock) {
                     let _ = fs::remove_file(&path);
                 }
                 continue;
@@ -179,6 +205,14 @@ impl RecoveryStore {
             match self.load_meta(&path) {
                 Ok(artifact) if artifact_expired(&artifact, clock) => {
                     self.delete_artifact(&artifact.recording_id)?;
+                }
+                Ok(artifact)
+                    if promote_started
+                        && artifact.delivery_state == DeliveryState::DeliveryStarted =>
+                {
+                    let mut updated = artifact;
+                    updated.delivery_state = DeliveryState::Ambiguous;
+                    let _ = write_private_file(&path, encode_meta(&updated).as_bytes());
                 }
                 Ok(_) => {}
                 Err(_) => {
@@ -362,7 +396,7 @@ impl RecoveryStore {
         Ok((recordings, bytes))
     }
 
-    fn should_expire_temp(&self, path: &Path, clock: RecoveryClock) -> bool {
+    fn should_expire_orphan(&self, path: &Path, clock: RecoveryClock) -> bool {
         let Ok(metadata) = fs::symlink_metadata(path) else {
             return true;
         };
@@ -479,11 +513,7 @@ pub fn spawn_hourly_expiry() {
         .name("voisu-local-recovery".to_owned())
         .spawn(|| {
             loop {
-                if enabled()
-                    && let Ok(store) = RecoveryStore::open_default(RecoveryClock::system())
-                {
-                    let _ = store.expire();
-                }
+                expire_if_present();
                 std::thread::sleep(HOURLY);
             }
         })
@@ -491,12 +521,35 @@ pub fn spawn_hourly_expiry() {
 }
 
 pub fn expire_at_startup() {
-    if !enabled() {
+    expire_if_present();
+}
+
+/// Expiry is independent of `local_recovery_enabled`. Missing dirs stay missing.
+pub fn expire_if_present() {
+    let Ok(dir) = recovery_dir() else {
         return;
+    };
+    if let Ok(store) = RecoveryStore::open_existing(dir, RecoveryClock::system()) {
+        let _ = store.expire_leftovers();
     }
-    if let Ok(store) = RecoveryStore::open_default(RecoveryClock::system()) {
-        let _ = store.expire();
-    }
+}
+
+pub fn is_local_origin(recording_id: &str) -> bool {
+    let Ok(dir) = recovery_dir() else {
+        return false;
+    };
+    let Ok(store) = RecoveryStore::open_existing(dir, RecoveryClock::system()) else {
+        return false;
+    };
+    matches!(store.load(recording_id), Ok(artifact) if artifact.origin == Origin::Local)
+}
+
+pub fn read_pcm(recording_id: &str) -> Result<Vec<u8>, RecoveryError> {
+    let dir = recovery_dir()?;
+    let store = RecoveryStore::open_existing(dir, RecoveryClock::system())?;
+    let path = store.pcm_path(recording_id)?;
+    reject_symlink(&path)?;
+    fs::read(&path).map_err(map_io)
 }
 
 fn upsert_bool_key(existing: &str, enabled: bool) -> String {
@@ -750,7 +803,7 @@ mod tests {
             clock(1_000 + MAX_AGE.as_millis() as u64 + 1),
         )
         .unwrap();
-        later.expire().unwrap();
+        later.expire_leftovers().unwrap();
         later.quota_before_capture().unwrap();
 
         let future = RecoveryStore::open(store.root().to_path_buf(), clock(50)).unwrap();
@@ -801,10 +854,25 @@ mod tests {
             .persist_before_inference("rec-x", &[1, 0], "hash")
             .unwrap();
         store.mark_delivery_started("rec-x").unwrap();
-        store.set_state("rec-x", DeliveryState::Ambiguous).unwrap();
+        store.expire_leftovers().unwrap();
         let loaded = store.load("rec-x").unwrap();
         assert_eq!(loaded.delivery_state, DeliveryState::Ambiguous);
         store.refuse_if_cloud_selected(true).unwrap_err();
+    }
+
+    #[test]
+    fn unmatched_pcm_expires_as_crash_left() {
+        let home = tempfile::tempdir().unwrap();
+        let store = store(&home, clock(5_000));
+        fs::write(store.root().join("orphan.pcm"), vec![0u8; 64]).unwrap();
+        let (count, bytes) = store.usage().unwrap();
+        assert_eq!(count, 1);
+        assert!(bytes >= 64);
+        store.expire_with(clock(5_000), true).unwrap();
+        assert!(
+            !store.root().join("orphan.pcm").exists(),
+            "future-dated unmatched pcm must expire"
+        );
     }
 
     #[test]

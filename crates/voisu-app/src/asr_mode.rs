@@ -495,6 +495,8 @@ pub fn status_report_at(
                 std::env::var_os("VOISU_DEBUG_CAPTURE").is_some(),
                 crate::local_recovery::enabled(),
             )),
+            local_path_clean: (mode == AsrMode::Local)
+                .then(crate::local_routing::sentinel_is_clean),
         },
         Err(error) => blocked_status(active, error.message()),
     }
@@ -511,6 +513,7 @@ fn blocked_status(active: Option<AsrMode>, error: impl Into<String>) -> AsrModeS
         },
         admission_error: Some(error),
         audio_retention: None,
+        local_path_clean: None,
     }
 }
 
