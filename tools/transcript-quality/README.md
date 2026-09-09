@@ -51,11 +51,30 @@ Local callers can use `verify_bakeoff_hash_inputs` to hash exact audio and
 reference files. It returns aggregate metadata only; private paths and bytes
 stay with the caller.
 
+A candidate public report (hashes, counts, and aggregates only) can be checked
+against the frozen report schema with:
+
+```sh
+cargo run --manifest-path tools/transcript-quality/Cargo.toml -- \
+  validate-bakeoff-report /path/to/public-report.json
+```
+
+The check accepts only the contract's declared report fields, rejects every
+forbidden private field (`audio`, `audio_path`, `reference_text`,
+`transcript_text`, `speaker_identity`, `private_notes`, `local_file_path`)
+even nested inside an aggregate, and requires the report to name the frozen
+contract id, contract hash, and measured manifest hash.
+
 The frozen contract requires at least 100 speech clips whose provenance is a
 licensed public dataset or an explicitly consented private Recording. Synthetic
 speech is supplemental and never counts toward that real-speech minimum. A
 valid manifest must include both a public licensed speech source and a private
-metadata-only speech source. The public summary reports counts and hashes only.
+metadata-only speech source. The manifest also freezes the measured
+`runtime` (name, version, content hash), the measured `model` (id, weight
+hash), and the `scoring_tool` lock (full git commit plus the resolved
+`Cargo.lock` hash); all three sit inside the manifest hash, so swapping the
+runtime, model, or scorer after measurement breaks every measurement lock.
+The public summary reports counts and hashes only.
 
 ## Manifest
 
