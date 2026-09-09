@@ -632,23 +632,10 @@ fn install_surface_feedback(
 fn run_notification_feedback(selection: FeedbackSelection) -> i32 {
     let notifier = Notifier::start(selection);
     let mut controller = PresentationController::default();
-    let mut previous_phase = OverlayView::HIDDEN.phase;
-    let mut previous_label = OverlayView::HIDDEN.visible_label;
-    let mut no_speech_latch = NoSpeechNotifyLatch::default();
-    let mut limit_latch = LimitWarningLatch::default();
-    let mut trigger_latch = TriggerRepeatLatch::default();
+    let mut tick = NotificationTickState::default();
     loop {
         let observation = read_status();
-        notification_tick(
-            &mut controller,
-            &mut previous_phase,
-            &mut previous_label,
-            &mut no_speech_latch,
-            &mut limit_latch,
-            &mut trigger_latch,
-            &notifier,
-            observation,
-        );
+        notification_tick(&mut controller, &mut tick, &notifier, observation);
         std::thread::sleep(Duration::from_millis(200));
     }
 }
@@ -669,21 +656,13 @@ fn install_notification_feedback(application: &gtk::Application) {
     });
     let status_worker = StatusWorker::spawn();
     let controller = Rc::new(RefCell::new(PresentationController::default()));
-    let previous_phase = Rc::new(RefCell::new(OverlayView::HIDDEN.phase));
-    let previous_label = Rc::new(RefCell::new(OverlayView::HIDDEN.visible_label));
-    let no_speech_latch = Rc::new(RefCell::new(NoSpeechNotifyLatch::default()));
-    let limit_latch = Rc::new(RefCell::new(LimitWarningLatch::default()));
-    let trigger_latch = Rc::new(RefCell::new(TriggerRepeatLatch::default()));
+    let tick = Rc::new(RefCell::new(NotificationTickState::default()));
     gtk::glib::timeout_add_local(STATUS_POLL_PERIOD, move || {
         let _hold = &hold;
         if let Some(observation) = status_worker.take_latest() {
             notification_tick(
                 &mut controller.borrow_mut(),
-                &mut previous_phase.borrow_mut(),
-                &mut previous_label.borrow_mut(),
-                &mut no_speech_latch.borrow_mut(),
-                &mut limit_latch.borrow_mut(),
-                &mut trigger_latch.borrow_mut(),
+                &mut tick.borrow_mut(),
                 &notifier,
                 observation.response,
             );
@@ -703,13 +682,29 @@ fn install_notification_feedback(application: &gtk::Application) {
 /// separate transitions into NoSpeech and fire a duplicate notification for
 /// one episode. The latch fires once per episode and does not re-arm on an
 /// `Unreachable` observation.
+struct NotificationTickState {
+    previous_phase: OverlayPhase,
+    previous_label: &'static str,
+    no_speech_latch: NoSpeechNotifyLatch,
+    limit_latch: LimitWarningLatch,
+    trigger_latch: TriggerRepeatLatch,
+}
+
+impl Default for NotificationTickState {
+    fn default() -> Self {
+        Self {
+            previous_phase: OverlayView::HIDDEN.phase,
+            previous_label: OverlayView::HIDDEN.visible_label,
+            no_speech_latch: NoSpeechNotifyLatch::default(),
+            limit_latch: LimitWarningLatch::default(),
+            trigger_latch: TriggerRepeatLatch::default(),
+        }
+    }
+}
+
 fn notification_tick(
     controller: &mut PresentationController,
-    previous_phase: &mut OverlayPhase,
-    previous_label: &mut &'static str,
-    no_speech_latch: &mut NoSpeechNotifyLatch,
-    limit_latch: &mut LimitWarningLatch,
-    trigger_latch: &mut TriggerRepeatLatch,
+    tick: &mut NotificationTickState,
     notifier: &Notifier,
     observation: Option<Response>,
 ) {
@@ -735,7 +730,9 @@ fn notification_tick(
     };
     // Both latches observe every tick: they are state machines, not senders,
     // and skipping one would corrupt the next tick's decision.
-    let announced = limit_latch.observe(signal, identity.as_deref(), warning);
+    let announced = tick
+        .limit_latch
+        .observe(signal, identity.as_deref(), warning);
     let limit_body = announced
         .zip(remaining)
         .and_then(|(warning, left)| limit_notification_body(warning, left));
@@ -743,17 +740,17 @@ fn notification_tick(
         // Deliberately suppressed (no headroom left to report): the stage is
         // spent on purpose, not lost, so settle it rather than leaving it
         // outstanding.
-        limit_latch.commit();
+        tick.limit_latch.commit();
     }
-    let fire_no_speech = no_speech_latch.observe(signal);
-    let first_identity = trigger_latch.observe(identity.as_deref());
+    let fire_no_speech = tick.no_speech_latch.observe(signal);
+    let first_identity = tick.trigger_latch.observe(identity.as_deref());
     // This rung sends at most one bubble per tick; the pure chooser decides
     // which. This rung has no capsule to turn amber, so the notification is
     // the whole warning.
     match notification_rung_choice(
         view,
-        *previous_phase,
-        *previous_label,
+        tick.previous_phase,
+        tick.previous_label,
         limit_body.is_some(),
         fire_no_speech,
     ) {
@@ -764,23 +761,23 @@ fn notification_tick(
             // the rest of the Recording.
             if let Some(body) = limit_body {
                 if notifier.notify(&body) {
-                    limit_latch.commit();
+                    tick.limit_latch.commit();
                 } else {
-                    limit_latch.rollback();
+                    tick.limit_latch.rollback();
                 }
             }
         }
-        Some(RungNotification::Label(label)) => {
-            if view.phase != OverlayPhase::Recording || identity.is_none() || first_identity {
-                let _ = notifier.notify(label);
-            }
+        Some(RungNotification::Label(label))
+            if view.phase != OverlayPhase::Recording || identity.is_none() || first_identity =>
+        {
+            let _ = notifier.notify(label);
         }
-        None => {}
+        Some(RungNotification::Label(_)) | None => {}
     }
     // Always advances, whichever bubble won: the transition has been observed
     // either way, and a stale previous_phase would re-announce it later.
-    *previous_phase = view.phase;
-    *previous_label = view.visible_label;
+    tick.previous_phase = view.phase;
+    tick.previous_label = view.visible_label;
 }
 
 /// The desktop-notification sink. Rung 3 talks to `org.freedesktop.Notifications`
