@@ -162,6 +162,7 @@ mod tests {
             aggregate: Aggregate {
                 cases_total: case_rows.len(),
                 corpus_wer,
+                corpus_punctuation_error: None,
                 delivered: 0,
                 delivery_denominator: 0,
                 delivery_rate: None,
@@ -176,6 +177,10 @@ mod tests {
                 total_insertions: 0,
                 total_reference_tokens: 0,
                 total_substitutions: 0,
+                total_punctuation_deletions: 0,
+                total_punctuation_insertions: 0,
+                total_punctuation_reference_marks: 0,
+                total_punctuation_substitutions: 0,
             },
             cases: case_rows,
         }
@@ -195,7 +200,9 @@ mod tests {
                 reference_tokens: 4,
                 substitutions: s,
             }),
+            punctuation: None,
             source_wer: None,
+            source_punctuation: None,
             selected_source: None,
             delivery: "delivered".to_owned(),
             delivery_method: None,

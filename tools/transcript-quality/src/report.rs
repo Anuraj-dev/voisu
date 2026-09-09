@@ -6,7 +6,7 @@ use std::process::Command;
 use serde::Serialize;
 use voisu_core::text_sha256_fingerprint;
 
-use crate::metrics::{CriticalError, SectionLoss, WordError};
+use crate::metrics::{CriticalError, PunctuationError, SectionLoss, WordError};
 
 pub const SCHEMA: &str = "voisu-private-transcript-quality-v1";
 
@@ -37,6 +37,7 @@ pub enum ArmResult {
     Scored {
         critical_semantic_errors: Vec<CriticalError>,
         hypothesis: String,
+        punctuation_error: PunctuationError,
         section_loss: SectionLoss,
         selected_source: Option<String>,
         word_error: WordError,
@@ -68,10 +69,15 @@ pub struct RecordingReport {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ArmAggregate {
     pub corpus_word_error: Option<f64>,
+    pub corpus_punctuation_error: Option<f64>,
     pub critical_error_recordings: usize,
     pub missing: usize,
     pub scored: usize,
     pub section_loss_recordings: usize,
+    pub total_punctuation_deletions: usize,
+    pub total_punctuation_insertions: usize,
+    pub total_punctuation_reference_marks: usize,
+    pub total_punctuation_substitutions: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -326,17 +332,19 @@ fn format_arm(arm: &ArmResult) -> String {
         ArmResult::Scored {
             word_error,
             critical_semantic_errors,
+            punctuation_error,
             section_loss,
             selected_source,
             ..
         } => {
             let source = selected_source.as_deref().unwrap_or("-");
             format!(
-                "scored wer={:.4} I={} D={} S={} critical={} section_loss={} selected={source}",
+                "scored wer={:.4} I={} D={} S={} punctuation={:.4} critical={} section_loss={} selected={source}",
                 word_error.error_rate,
                 word_error.insertions,
                 word_error.deletions,
                 word_error.substitutions,
+                punctuation_error.error_rate,
                 critical_semantic_errors.len(),
                 section_loss.any()
             )
@@ -356,12 +364,18 @@ pub fn aggregate(recordings: &[RecordingReport]) -> BTreeMap<String, ArmAggregat
         let mut missing = 0usize;
         let mut error_ops = 0usize;
         let mut reference_tokens = 0usize;
+        let mut punctuation_error_ops = 0usize;
+        let mut punctuation_reference_marks = 0usize;
+        let mut total_punctuation_deletions = 0usize;
+        let mut total_punctuation_insertions = 0usize;
+        let mut total_punctuation_substitutions = 0usize;
         let mut section_loss_recordings = 0usize;
         let mut critical_error_recordings = 0usize;
         for recording in recordings {
             match recording.arms.get(name) {
                 Some(ArmResult::Scored {
                     word_error,
+                    punctuation_error,
                     section_loss,
                     critical_semantic_errors,
                     ..
@@ -370,6 +384,13 @@ pub fn aggregate(recordings: &[RecordingReport]) -> BTreeMap<String, ArmAggregat
                     error_ops +=
                         word_error.insertions + word_error.deletions + word_error.substitutions;
                     reference_tokens += word_error.reference_tokens;
+                    punctuation_error_ops += punctuation_error.insertions
+                        + punctuation_error.deletions
+                        + punctuation_error.substitutions;
+                    punctuation_reference_marks += punctuation_error.reference_marks;
+                    total_punctuation_deletions += punctuation_error.deletions;
+                    total_punctuation_insertions += punctuation_error.insertions;
+                    total_punctuation_substitutions += punctuation_error.substitutions;
                     if section_loss.any() {
                         section_loss_recordings += 1;
                     }
@@ -387,14 +408,26 @@ pub fn aggregate(recordings: &[RecordingReport]) -> BTreeMap<String, ArmAggregat
         } else {
             Some(error_ops as f64 / reference_tokens as f64)
         };
+        let corpus_punctuation_error = if scored == 0 {
+            None
+        } else if punctuation_reference_marks == 0 {
+            Some(0.0)
+        } else {
+            Some(punctuation_error_ops as f64 / punctuation_reference_marks as f64)
+        };
         out.insert(
             name.to_owned(),
             ArmAggregate {
                 corpus_word_error,
+                corpus_punctuation_error,
                 critical_error_recordings,
                 missing,
                 scored,
                 section_loss_recordings,
+                total_punctuation_deletions,
+                total_punctuation_insertions,
+                total_punctuation_reference_marks: punctuation_reference_marks,
+                total_punctuation_substitutions,
             },
         );
     }
@@ -404,12 +437,19 @@ pub fn aggregate(recordings: &[RecordingReport]) -> BTreeMap<String, ArmAggregat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::WordError;
+    use crate::metrics::{PunctuationError, WordError};
 
     fn scored(word_error: WordError) -> ArmResult {
         ArmResult::Scored {
             critical_semantic_errors: Vec::new(),
             hypothesis: "h".to_owned(),
+            punctuation_error: PunctuationError {
+                deletions: 0,
+                error_rate: 0.5,
+                insertions: 0,
+                reference_marks: 2,
+                substitutions: 1,
+            },
             section_loss: SectionLoss {
                 body: false,
                 prefix: false,
@@ -479,6 +519,9 @@ mod tests {
             "short recording must not outweigh the long one: {rate}"
         );
         assert_eq!(completeness.scored, 2);
+        assert_eq!(completeness.corpus_punctuation_error, Some(0.5));
+        assert_eq!(completeness.total_punctuation_reference_marks, 4);
+        assert_eq!(completeness.total_punctuation_substitutions, 2);
     }
 
     #[test]

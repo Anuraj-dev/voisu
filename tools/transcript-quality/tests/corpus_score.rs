@@ -372,6 +372,38 @@ fn corpus_example_scores_to_expected_numbers() {
 // --- JSON schema stability ---
 
 #[test]
+fn scoring_reports_punctuation_separately_from_wer() {
+    let (_root, corpus) = corpus_with("punctuation");
+    write_case(
+        &corpus,
+        "punctuation",
+        "Deploy now.",
+        None,
+        Some(sidecar(
+            "punctuation",
+            Some("deploy now!"),
+            &[],
+            Some(true),
+            None,
+        )),
+    );
+    let cases = load_corpus(&corpus).unwrap();
+    let run = score_corpus(&cases, &corpus, no_replay()).unwrap();
+    let row = &run.cases[0];
+    assert_eq!(row.wer.as_ref().unwrap().error_rate, 0.0);
+    let punctuation = row.punctuation.as_ref().expect("punctuation score");
+    assert_eq!(punctuation.reference_marks, 1);
+    assert_eq!(punctuation.substitutions, 1);
+    assert_eq!(punctuation.error_rate, 1.0);
+    assert_eq!(run.aggregate.total_punctuation_reference_marks, 1);
+    assert_eq!(run.aggregate.total_punctuation_substitutions, 1);
+    assert_eq!(run.aggregate.corpus_punctuation_error, Some(1.0));
+    let json = serde_json::to_string(&run).unwrap();
+    assert!(json.contains("\"punctuation\""), "{json}");
+    assert!(json.contains("\"corpus_punctuation_error\""), "{json}");
+}
+
+#[test]
 fn run_json_field_order_and_schema_are_stable() {
     let (_root, corpus) = corpus_with("schema-order");
     write_case(
@@ -407,7 +439,9 @@ fn run_json_field_order_and_schema_are_stable() {
         "\"status\"",
         "\"reason\"",
         "\"wer\"",
+        "\"punctuation\"",
         "\"source_wer\"",
+        "\"source_punctuation\"",
         "\"selected_source\"",
         "\"delivery\"",
         "\"delivery_method\"",

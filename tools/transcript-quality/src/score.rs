@@ -17,7 +17,10 @@ use voisu_core::text_sha256_fingerprint;
 
 use crate::completeness::select_completeness_aware;
 use crate::corpus::{CorpusCase, FIXTURE_FILE};
-use crate::metrics::{WordError, align_words, detect_critical_errors, detect_section_loss};
+use crate::metrics::{
+    PunctuationError, WordError, align_punctuation, align_words, detect_critical_errors,
+    detect_section_loss,
+};
 use crate::report::ensure_report_path_writable;
 
 pub const RUN_SCHEMA: &str = "voisu-private-score-corpus-v1";
@@ -66,9 +69,13 @@ pub struct CaseRow {
     /// No-final reason or skip reason; null for scored cases.
     pub reason: Option<String>,
     pub wer: Option<WordError>,
+    #[serde(default)]
+    pub punctuation: Option<PunctuationError>,
     /// Completeness-selected Source Transcript vs the reference (evaluator
     /// heuristic, not product behavior).
     pub source_wer: Option<WordError>,
+    #[serde(default)]
+    pub source_punctuation: Option<PunctuationError>,
     pub selected_source: Option<String>,
     /// `delivered` | `not_delivered` | `unknown`.
     pub delivery: String,
@@ -83,6 +90,8 @@ pub struct CaseRow {
 pub struct Aggregate {
     pub cases_total: usize,
     pub corpus_wer: Option<f64>,
+    #[serde(default)]
+    pub corpus_punctuation_error: Option<f64>,
     pub delivered: usize,
     pub delivery_denominator: usize,
     pub delivery_rate: Option<f64>,
@@ -97,6 +106,14 @@ pub struct Aggregate {
     pub total_insertions: usize,
     pub total_reference_tokens: usize,
     pub total_substitutions: usize,
+    #[serde(default)]
+    pub total_punctuation_deletions: usize,
+    #[serde(default)]
+    pub total_punctuation_insertions: usize,
+    #[serde(default)]
+    pub total_punctuation_reference_marks: usize,
+    #[serde(default)]
+    pub total_punctuation_substitutions: usize,
 }
 
 /// A scored corpus run. Field order is the stable JSON schema; see the README.
@@ -128,7 +145,9 @@ pub fn score_corpus(
                 status: CaseStatus::Skipped,
                 reason: Some(REPLAY_NO_RESULT.to_owned()),
                 wer: None,
+                punctuation: None,
                 source_wer: None,
+                source_punctuation: None,
                 selected_source: None,
                 delivery: "unknown".to_owned(),
                 delivery_method: None,
@@ -158,7 +177,9 @@ fn score_result(case: &CorpusCase, result: &crate::corpus::CaseResult) -> CaseRo
         status: CaseStatus::Scored,
         reason: None,
         wer: None,
+        punctuation: None,
         source_wer: None,
+        source_punctuation: None,
         selected_source: None,
         delivery: delivery_outcome(result),
         delivery_method: result
@@ -194,24 +215,29 @@ fn score_result(case: &CorpusCase, result: &crate::corpus::CaseResult) -> CaseRo
         };
     };
     let wer = align_words(&case.reference, final_text);
+    let punctuation = align_punctuation(&case.reference, final_text);
     let critical_error_count = detect_critical_errors(&case.reference, final_text).len();
     let section_loss = detect_section_loss(&case.reference, final_text, final_text).any();
     let groq = source_text(result, "groq");
     let deepgram = source_text(result, "deepgram");
-    let (source_wer, selected_source) = if groq.is_some() || deepgram.is_some() {
+    let (source_wer, source_punctuation, selected_source) = if groq.is_some() || deepgram.is_some()
+    {
         match select_completeness_aware(groq.as_deref(), deepgram.as_deref()) {
             crate::completeness::CompletenessChoice::Selected { provider, text } => (
                 Some(align_words(&case.reference, &text)),
+                Some(align_punctuation(&case.reference, &text)),
                 Some(provider.as_str().to_owned()),
             ),
-            crate::completeness::CompletenessChoice::Missing { .. } => (None, None),
+            crate::completeness::CompletenessChoice::Missing { .. } => (None, None, None),
         }
     } else {
-        (None, None)
+        (None, None, None)
     };
     CaseRow {
         wer: Some(wer),
+        punctuation: Some(punctuation),
         source_wer,
+        source_punctuation,
         selected_source,
         critical_error_count: Some(critical_error_count),
         section_loss: Some(section_loss),
@@ -248,7 +274,9 @@ fn run_replay_case(case: &CorpusCase, config: &ReplayConfig) -> CaseRow {
         status: CaseStatus::Skipped,
         reason: Some(reason.to_owned()),
         wer: None,
+        punctuation: None,
         source_wer: None,
+        source_punctuation: None,
         selected_source: None,
         delivery: "unknown".to_owned(),
         delivery_method: None,
@@ -350,6 +378,7 @@ pub fn aggregate(rows: &[CaseRow]) -> Aggregate {
     let mut aggregate = Aggregate {
         cases_total: rows.len(),
         corpus_wer: None,
+        corpus_punctuation_error: None,
         delivered: 0,
         delivery_denominator: 0,
         delivery_rate: None,
@@ -364,12 +393,18 @@ pub fn aggregate(rows: &[CaseRow]) -> Aggregate {
         total_insertions: 0,
         total_reference_tokens: 0,
         total_substitutions: 0,
+        total_punctuation_deletions: 0,
+        total_punctuation_insertions: 0,
+        total_punctuation_reference_marks: 0,
+        total_punctuation_substitutions: 0,
     };
     let mut error_ops = 0usize;
     let mut reference_tokens = 0usize;
     let mut source_error_ops = 0usize;
     let mut source_reference_tokens = 0usize;
     let mut source_scored = 0usize;
+    let mut punctuation_error_ops = 0usize;
+    let mut punctuation_reference_marks = 0usize;
     let mut delivered_values = Vec::new();
     for row in rows {
         match row.status {
@@ -385,6 +420,15 @@ pub fn aggregate(rows: &[CaseRow]) -> Aggregate {
             source_scored += 1;
             source_error_ops += wer.insertions + wer.deletions + wer.substitutions;
             source_reference_tokens += wer.reference_tokens;
+        }
+        if let Some(punctuation) = &row.punctuation {
+            aggregate.total_punctuation_deletions += punctuation.deletions;
+            aggregate.total_punctuation_insertions += punctuation.insertions;
+            aggregate.total_punctuation_reference_marks += punctuation.reference_marks;
+            aggregate.total_punctuation_substitutions += punctuation.substitutions;
+            punctuation_error_ops +=
+                punctuation.insertions + punctuation.deletions + punctuation.substitutions;
+            punctuation_reference_marks += punctuation.reference_marks;
         }
         match row.delivery.as_str() {
             "delivered" => {
@@ -411,6 +455,11 @@ pub fn aggregate(rows: &[CaseRow]) -> Aggregate {
             .filter_map(|row| row.wer.as_ref().map(|wer| wer.error_rate))
             .collect();
         aggregate.mean_case_wer = Some(rates.iter().sum::<f64>() / rates.len() as f64);
+        aggregate.corpus_punctuation_error = Some(if punctuation_reference_marks == 0 {
+            0.0
+        } else {
+            punctuation_error_ops as f64 / punctuation_reference_marks as f64
+        });
     }
     if source_scored > 0 {
         aggregate.source_corpus_wer = Some(if source_reference_tokens == 0 {
@@ -466,9 +515,10 @@ pub fn render_human(run: &ScoreRun) -> String {
         .max(4);
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<width$}  {:>8}  {:>4}  {:>4}  {:>4}  {:>13}  {:>8}  notes\n",
+        "{:<width$}  {:>8}  {:>8}  {:>4}  {:>4}  {:>4}  {:>13}  {:>8}  notes\n",
         "case",
         "WER",
+        "PUNCT",
         "I",
         "D",
         "S",
@@ -491,15 +541,21 @@ pub fn render_human(run: &ScoreRun) -> String {
                 "-".to_owned(),
             ),
         };
+        let punctuation = row
+            .punctuation
+            .as_ref()
+            .map(|value| format!("{:.4}", value.error_rate))
+            .unwrap_or_else(|| "-".to_owned());
         let delivery = match (&row.status, row.reason.as_deref()) {
             (CaseStatus::Skipped, Some(reason)) => format!("skip: {reason}"),
             (CaseStatus::NoFinal, Some(reason)) => format!("no_final: {reason}"),
             _ => row.delivery.clone(),
         };
         out.push_str(&format!(
-            "{:<width$}  {:>8}  {:>4}  {:>4}  {:>4}  {:>13}  {:>8}  {}\n",
+            "{:<width$}  {:>8}  {:>8}  {:>4}  {:>4}  {:>4}  {:>13}  {:>8}  {}\n",
             row.id,
             wer,
+            punctuation,
             i,
             d,
             s,
@@ -510,12 +566,13 @@ pub fn render_human(run: &ScoreRun) -> String {
         ));
     }
     out.push_str(&format!(
-        "aggregate: cases={} scored={} no_final={} skipped={} corpus_wer={} mean_case_wer={} source_corpus_wer={} delivery={}/{} ({}) median_stop_to_delivered_ms={} fingerprint={}\n",
+        "aggregate: cases={} scored={} no_final={} skipped={} corpus_wer={} corpus_punctuation_error={} mean_case_wer={} source_corpus_wer={} delivery={}/{} ({}) median_stop_to_delivered_ms={} fingerprint={}\n",
         run.aggregate.cases_total,
         run.aggregate.scored,
         run.aggregate.no_final,
         run.aggregate.skipped,
         format_option(run.aggregate.corpus_wer, 4),
+        format_option(run.aggregate.corpus_punctuation_error, 4),
         format_option(run.aggregate.mean_case_wer, 4),
         format_option(run.aggregate.source_corpus_wer, 4),
         run.aggregate.delivered,
@@ -588,7 +645,9 @@ mod tests {
             status,
             reason: None,
             wer,
+            punctuation: None,
             source_wer: None,
+            source_punctuation: None,
             selected_source: None,
             delivery: delivery.to_owned(),
             delivery_method: None,

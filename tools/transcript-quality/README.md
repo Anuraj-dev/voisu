@@ -31,6 +31,32 @@ focused application.
 
 `--help` prints usage.
 
+The frozen Local ASR bakeoff metadata can be checked with:
+
+```sh
+cargo run --manifest-path tools/transcript-quality/Cargo.toml -- \
+  validate-bakeoff /path/to/bakeoff-manifest.json
+```
+
+The measured gate must also receive the expected manifest hash from the
+external run record:
+
+```sh
+cargo run --manifest-path tools/transcript-quality/Cargo.toml -- \
+  validate-bakeoff /path/to/bakeoff-manifest.json \
+  --expected-manifest-sha256 <sha256>
+```
+
+Local callers can use `verify_bakeoff_hash_inputs` to hash exact audio and
+reference files. It returns aggregate metadata only; private paths and bytes
+stay with the caller.
+
+The frozen contract requires at least 100 speech clips whose provenance is a
+licensed public dataset or an explicitly consented private Recording. Synthetic
+speech is supplemental and never counts toward that real-speech minimum. A
+valid manifest must include both a public licensed speech source and a private
+metadata-only speech source. The public summary reports counts and hashes only.
+
 ## Manifest
 
 JSON object `{ "recordings": [ ... ] }`, a JSON array, a single recording
@@ -85,11 +111,11 @@ per-Recording rows.
 
 Each scored arm reports strict word error (insertions, deletions,
 substitutions), critical semantic errors (negation, numbers, units, names,
-commands, paths, URLs, code tokens, missing clauses), and section loss
+commands, paths, URLs, and omitted phrases), punctuation edits, and section loss
 (prefix or body deleted relative to the reference). The saved pipeline is not
 compared against the completeness-selected source. Aggregates use
-corpus-weighted WER (sum of edits over sum of reference tokens) and keep every
-per-Recording row.
+corpus-weighted WER and punctuation error (each sums edits over its own
+reference count) and keep every per-Recording row.
 
 The JSON has a `stable` object (sorted keys, no wall-clock) and a `volatile`
 object for evaluator scoring time (not pipeline execution latency). Identical
@@ -252,19 +278,20 @@ cargo run --manifest-path tools/transcript-quality/Cargo.toml -- \
   score-corpus ~/.local/state/voisu/eval-corpus --json /tmp/run-a.json
 ```
 
-Prints a per-case table (case, WER, I/D/S, delivery, notes) and one aggregate
-line — `corpus_wer` (total edits / total reference tokens), `mean_case_wer`
-(unweighted mean of per-case rates), `source_corpus_wer` (the evaluator's
+Prints a per-case table (case, WER, punctuation, I/D/S, delivery, notes) and
+one aggregate line — `corpus_wer` (total edits / total reference tokens),
+`corpus_punctuation_error` (punctuation edits / reference marks),
+`mean_case_wer` (unweighted mean of per-case rates), `source_corpus_wer` (the evaluator's
 completeness-selected Source Transcript arm), `delivery` rate, the median
 `stop_to_delivered_ms`, and the run fingerprint. `--json` writes the
 machine-readable run (below); the output path goes through the same
 git-tracked-path refusal as `--out`.
 
-Per case: strict word error from `align_words` (I/D/S breakdown),
-`critical_error_count` (negation/number/name/code/... — count only, tokens
-stay private), `section_loss`, the optional completeness arm
-(`source_wer` + `selected_source`), the delivery outcome, and the telemetry
-trio. Aggregates never replace per-case rows.
+Per case: strict word error from `align_words` (I/D/S breakdown), punctuation
+error from `align_punctuation` (I/D/S/rate), `critical_error_count`
+(count only, tokens stay private), `section_loss`, the optional completeness
+arm (`source_wer` + `source_punctuation` + `selected_source`), the delivery
+outcome, and the telemetry trio. Aggregates never replace per-case rows.
 
 ### Run JSON schema — `voisu-private-score-corpus-v1`
 
@@ -283,7 +310,10 @@ Field order below is fixed and tested (`run_json_field_order_and_schema_are_stab
       "reason": null,
       "wer": { "error_rate": 0.2, "insertions": 0, "deletions": 1,
                "substitutions": 0, "reference_tokens": 5 },
+      "punctuation": { "error_rate": 0.0, "insertions": 0, "deletions": 0,
+                       "substitutions": 0, "reference_marks": 1 },
       "source_wer": null,
+      "source_punctuation": null,
       "selected_source": null,
       "delivery": "delivered | not_delivered | unknown",
       "delivery_method": "clipboard_fallback | compositor_submitted | null",
@@ -300,7 +330,10 @@ Field order below is fixed and tested (`run_json_field_order_and_schema_are_stab
     "no_final": 0, "scored": 3, "skipped": 0,
     "source_corpus_wer": 0.0455, "source_mean_case_wer": 0.0476,
     "total_deletions": 2, "total_insertions": 0,
-    "total_reference_tokens": 22, "total_substitutions": 1
+    "total_reference_tokens": 22, "total_substitutions": 1,
+    "corpus_punctuation_error": 0.25,
+    "total_punctuation_deletions": 1, "total_punctuation_insertions": 0,
+    "total_punctuation_reference_marks": 4, "total_punctuation_substitutions": 0
   },
   "run_fingerprint": "sha256:... (hash of everything except corpus_dir)"
 }
