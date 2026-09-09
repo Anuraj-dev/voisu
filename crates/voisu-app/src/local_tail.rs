@@ -160,20 +160,9 @@ pub fn decide_replay(
     Ok(decision)
 }
 
-/// Case-insensitive whole-token replacement using user dictionary terms only.
+/// User-vocabulary replacements via the Cloud span-aware matcher, ungated.
 pub fn apply_local_dictionary(text: &str, user_terms: &[String]) -> String {
-    if user_terms.is_empty() || text.is_empty() {
-        return text.to_owned();
-    }
-    let tokens: Vec<&str> = text.split(' ').collect();
-    let mut out = Vec::with_capacity(tokens.len());
-    for token in tokens {
-        let replaced = user_terms
-            .iter()
-            .find(|term| !term.is_empty() && term.eq_ignore_ascii_case(token));
-        out.push(replaced.map(String::as_str).unwrap_or(token).to_owned());
-    }
-    out.join(" ")
+    voisu_core::vocabulary::apply_user_vocabulary(text, user_terms, &[])
 }
 
 #[cfg(test)]
@@ -237,8 +226,8 @@ mod tests {
         let decision = decide_transcript(
             "rec-1",
             &pcm,
-            outcome("voisu hello"),
-            &["Voisu".to_owned()],
+            outcome("run the daemon reload now"),
+            &["daemon-reload".to_owned()],
             WritingMode::Literal,
             &mut coordinator,
             &CloudCapabilitySentinel::new(),
@@ -246,7 +235,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             decision,
-            TerminalDecision::Transcript("Voisu hello".to_owned())
+            TerminalDecision::Transcript("run the daemon-reload now".to_owned())
         );
         assert_eq!(
             decide_transcript(
@@ -259,6 +248,22 @@ mod tests {
                 &CloudCapabilitySentinel::new(),
             ),
             Err(TailError::DuplicateDecision)
+        );
+    }
+
+    #[test]
+    fn dictionary_matches_hyphenated_multiword_and_punctuated_terms() {
+        assert_eq!(
+            apply_local_dictionary("run the daemon reload job", &["daemon-reload".to_owned()]),
+            "run the daemon-reload job"
+        );
+        assert_eq!(
+            apply_local_dictionary("open Node js docs", &["Node.js".to_owned()]),
+            "open Node.js docs"
+        );
+        assert_eq!(
+            apply_local_dictionary("open Claude code please", &["Claude Code".to_owned()]),
+            "open Claude Code please"
         );
     }
 

@@ -161,21 +161,68 @@ impl Gate {
             };
         }
     }
+}
 
-    fn infer(
-        &mut self,
-        recording_id: &str,
-        request_id: &str,
-        pcm: Vec<u8>,
-    ) -> Result<WorkerOutcome, LocalError> {
-        let hash = self
-            .receipt
-            .as_ref()
-            .map(|receipt| receipt.receipt_hash.clone())
-            .unwrap_or_default();
-        let correlation = correlation(&hash, recording_id, request_id);
-        transcribe_through_supervisor(&mut self.supervisor, correlation, pcm, &self.sentinel)
-            .map_err(|error| LocalError::Inference(format!("{error:?}")))
+struct InferenceSession {
+    receipt_hash: String,
+    sentinel: CloudCapabilitySentinel,
+    supervisor: WorkerSupervisor<FakeWorker>,
+    coordinator: DeliveryCoordinator,
+}
+
+fn take_inference_session() -> Result<InferenceSession, LocalError> {
+    let mut gate = gate().lock().map_err(|_| LocalError::Unavailable)?;
+    if !gate.sentinel.local_path_clean() {
+        return Err(LocalError::CloudCapability);
+    }
+    let receipt = gate.receipt.clone().ok_or(LocalError::Unavailable)?;
+    if gate.supervisor.state() != WorkerState::Ready {
+        return Err(LocalError::Unavailable);
+    }
+    let supervisor = std::mem::replace(&mut gate.supervisor, WorkerSupervisor::absent());
+    let coordinator = std::mem::replace(&mut gate.coordinator, DeliveryCoordinator::new());
+    gate.readiness = LocalReadiness::Busy;
+    Ok(InferenceSession {
+        receipt_hash: receipt.receipt_hash,
+        sentinel: gate.sentinel.clone(),
+        supervisor,
+        coordinator,
+    })
+}
+
+fn restore_inference_session(session: InferenceSession) {
+    if let Ok(mut gate) = gate().lock() {
+        gate.supervisor = session.supervisor;
+        gate.coordinator = session.coordinator;
+        if gate.supervisor.state() == WorkerState::Ready {
+            gate.readiness = LocalReadiness::Ready {
+                model_identity: gate
+                    .receipt
+                    .as_ref()
+                    .map(|receipt| receipt.catalog_id.clone()),
+            };
+        }
+    }
+}
+
+fn infer_unlocked(
+    session: &mut InferenceSession,
+    recording_id: &str,
+    request_id: &str,
+    pcm: Vec<u8>,
+) -> Result<WorkerOutcome, LocalError> {
+    let correlation = correlation(&session.receipt_hash, recording_id, request_id);
+    transcribe_through_supervisor(&mut session.supervisor, correlation, pcm, &session.sentinel)
+        .map_err(|error| LocalError::Inference(format!("{error:?}")))
+}
+
+fn assert_gate_unlocked() {
+    #[cfg(test)]
+    {
+        assert!(
+            gate().try_lock().is_ok(),
+            "gate lock must not be held across persist/inference/tail"
+        );
     }
 }
 
@@ -291,30 +338,26 @@ pub fn complete_recording(
     if cloud_selected {
         return Err(LocalError::CloudSelected);
     }
-    let mut gate = gate().lock().map_err(|_| LocalError::Unavailable)?;
-    if !gate.sentinel.local_path_clean() {
-        return Err(LocalError::CloudCapability);
-    }
-    let receipt = gate.receipt.clone().ok_or(LocalError::Unavailable)?;
-    if gate.supervisor.state() != WorkerState::Ready {
-        return Err(LocalError::Unavailable);
-    }
+    let mut session = take_inference_session()?;
+    assert_gate_unlocked();
     if recovery_enabled {
-        let store =
-            RecoveryStore::open_default(RecoveryClock::system()).map_err(LocalError::Recovery)?;
-        store
-            .persist_before_inference(recording_id, &pcm, &receipt.receipt_hash)
-            .map_err(LocalError::Recovery)?;
+        let persist = RecoveryStore::open_default(RecoveryClock::system()).and_then(|store| {
+            store.persist_before_inference(recording_id, &pcm, &session.receipt_hash)
+        });
+        if let Err(error) = persist {
+            restore_inference_session(session);
+            return Err(LocalError::Recovery(error));
+        }
     }
     let request_id = format!("{recording_id}-asr");
-    let sentinel = gate.sentinel.clone();
-    let outcome = match gate.infer(recording_id, &request_id, pcm.clone()) {
+    let outcome = match infer_unlocked(&mut session, recording_id, &request_id, pcm.clone()) {
         Ok(outcome) => outcome,
         Err(_) if is_silence_pcm(&pcm) => WorkerOutcome::NoText {
             reason: "silence".to_owned(),
             observed_device: "cpu".to_owned(),
         },
         Err(error) => {
+            restore_inference_session(session);
             if recovery_enabled {
                 let _ = RecoveryStore::open_default(RecoveryClock::system())
                     .and_then(|store| store.mark_failed(recording_id));
@@ -328,12 +371,12 @@ pub fn complete_recording(
         outcome,
         user_terms,
         core_writing_mode(writing_mode),
-        &mut gate.coordinator,
-        &sentinel,
-    )
-    .map_err(LocalError::Tail)?;
+        &mut session.coordinator,
+        &session.sentinel,
+    );
+    restore_inference_session(session);
     Ok(LocalCompletion {
-        decision,
+        decision: decision.map_err(LocalError::Tail)?,
         recovery_enabled,
         recording_id: recording_id.to_owned(),
     })
@@ -350,26 +393,27 @@ pub fn complete_replay(
     if cloud_selected && from_recovery {
         return Err(LocalError::CloudSelected);
     }
-    let mut gate = gate().lock().map_err(|_| LocalError::Unavailable)?;
-    if !gate.sentinel.local_path_clean() {
-        return Err(LocalError::CloudCapability);
-    }
-    if gate.supervisor.state() != WorkerState::Ready {
-        return Err(LocalError::Unavailable);
-    }
+    let mut session = take_inference_session()?;
+    assert_gate_unlocked();
     let request_id = format!("{recording_id}-replay");
-    let sentinel = gate.sentinel.clone();
-    let outcome = gate.infer(recording_id, &request_id, pcm.clone())?;
-    decide_replay(
+    let outcome = match infer_unlocked(&mut session, recording_id, &request_id, pcm.clone()) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            restore_inference_session(session);
+            return Err(error);
+        }
+    };
+    let decision = decide_replay(
         recording_id,
         &pcm,
         outcome,
         user_terms,
         core_writing_mode(writing_mode),
-        &mut gate.coordinator,
-        &sentinel,
-    )
-    .map_err(LocalError::Tail)
+        &mut session.coordinator,
+        &session.sentinel,
+    );
+    restore_inference_session(session);
+    decision.map_err(LocalError::Tail)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

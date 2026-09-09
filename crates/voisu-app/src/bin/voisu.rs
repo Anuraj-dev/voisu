@@ -6,8 +6,7 @@ use std::time::{Duration, Instant};
 use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
 use voisu_app::service::{UserServiceAction, manage_user_service};
 use voisu_app::system::{
-    DIAGNOSTIC_RESPONSE_DEADLINE, FedoraReadiness, PROCESSING_RESPONSE_DEADLINE,
-    ProviderHttpClient, SecretToolStore,
+    DIAGNOSTIC_RESPONSE_DEADLINE, FedoraReadiness, ProviderHttpClient, SecretToolStore,
 };
 use voisu_core::{
     AsrMode, BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, DaemonReadiness,
@@ -121,7 +120,9 @@ fn send_command(command: Command) -> Result<Response, ExitCode> {
     // shares the longer processing budget. `history` and `export` read the
     // bounded diagnostic store instead, which has its own budget.
     let response_deadline = match &command {
-        Command::Stop | Command::Toggle | Command::Replay(_) => PROCESSING_RESPONSE_DEADLINE,
+        Command::Stop | Command::Toggle | Command::Replay(_) => {
+            voisu_app::asr_mode::processing_response_deadline()
+        }
         Command::History | Command::Export(_) => DIAGNOSTIC_RESPONSE_DEADLINE,
         _ => IO_DEADLINE,
     };

@@ -1,8 +1,8 @@
 //! Opt-in Local recovery audio. Off by default; separate from debug capture.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -208,8 +208,11 @@ impl RecoveryStore {
                 continue;
             }
             match self.load_meta(&path) {
-                Ok(artifact) if artifact_expired(&artifact, clock) => {
-                    self.delete_artifact(&artifact.recording_id)?;
+                Ok(artifact)
+                    if artifact_expired(&artifact, clock)
+                        || artifact.delivery_state == DeliveryState::Delivered =>
+                {
+                    let _ = self.delete_artifact(&artifact.recording_id);
                 }
                 Ok(artifact)
                     if promote_started
@@ -221,6 +224,9 @@ impl RecoveryStore {
                 }
                 Ok(_) => {}
                 Err(_) => {
+                    if let Some(stem) = name.strip_suffix(".meta") {
+                        let _ = fs::remove_file(self.root.join(format!("{stem}.pcm")));
+                    }
                     let _ = fs::remove_file(&path);
                 }
             }
@@ -320,6 +326,12 @@ impl RecoveryStore {
         Ok(self.root.join(format!("{name}.pcm")))
     }
 
+    pub fn read_pcm(&self, recording_id: &str) -> Result<Vec<u8>, RecoveryError> {
+        let artifact = self.load(recording_id)?;
+        let name = safe_id(&artifact.recording_id)?;
+        read_bounded_pcm(self.root(), &format!("{name}.pcm"), artifact.pcm_bytes)
+    }
+
     pub fn refuse_if_cloud_selected(&self, cloud_selected: bool) -> Result<(), RecoveryError> {
         if cloud_selected {
             Err(RecoveryError::CloudSelected)
@@ -330,13 +342,20 @@ impl RecoveryStore {
 
     pub fn delete_artifact(&self, recording_id: &str) -> Result<(), RecoveryError> {
         let name = safe_id(recording_id)?;
+        let mut unlink_error = None;
         for suffix in ["pcm", "meta"] {
             let path = self.root.join(format!("{name}.{suffix}"));
             match fs::remove_file(&path) {
-                Ok(()) | Err(_) => {}
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => unlink_error = Some(error),
             }
         }
-        Ok(())
+        sync_dir(&self.root)?;
+        match unlink_error {
+            Some(error) => Err(map_io(error)),
+            None => Ok(()),
+        }
     }
 
     fn set_state(&self, recording_id: &str, state: DeliveryState) -> Result<(), RecoveryError> {
@@ -555,9 +574,42 @@ pub fn is_local_origin(recording_id: &str) -> bool {
 pub fn read_pcm(recording_id: &str) -> Result<Vec<u8>, RecoveryError> {
     let dir = recovery_dir()?;
     let store = RecoveryStore::open_existing(dir, RecoveryClock::system())?;
-    let path = store.pcm_path(recording_id)?;
+    store.read_pcm(recording_id)
+}
+
+fn read_bounded_pcm(dir: &Path, name: &str, declared: u64) -> Result<Vec<u8>, RecoveryError> {
+    relative_file_name(name).map_err(|_| RecoveryError::Unsafe)?;
+    if declared > crate::local_worker::MAX_PCM_BYTES as u64 {
+        return Err(RecoveryError::Storage(
+            "recovery pcm exceeds the Recording bound".into(),
+        ));
+    }
+    let path = dir.join(name);
     reject_symlink(&path)?;
-    fs::read(&path).map_err(map_io)
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(map_io)?;
+    let metadata = file.metadata().map_err(map_io)?;
+    if metadata.file_type().is_fifo()
+        || metadata.file_type().is_socket()
+        || metadata.file_type().is_block_device()
+        || metadata.file_type().is_char_device()
+        || !metadata.is_file()
+    {
+        return Err(RecoveryError::Unsafe);
+    }
+    if metadata.len() != declared {
+        return Err(RecoveryError::Storage(
+            "recovery pcm size does not match metadata".into(),
+        ));
+    }
+    let mut buf = vec![0_u8; declared as usize];
+    if declared > 0 {
+        file.read_exact(&mut buf).map_err(map_io)?;
+    }
+    Ok(buf)
 }
 
 fn upsert_bool_key(existing: &str, enabled: bool) -> String {
@@ -948,6 +1000,62 @@ mod tests {
                 "no leftover tmp after atomic meta replace: {name}"
             );
         }
+    }
+
+    #[test]
+    fn invalid_meta_deletes_paired_pcm_immediately() {
+        let home = tempfile::tempdir().unwrap();
+        let store = store(&home, clock(13_000));
+        fs::write(store.root().join("broken.pcm"), vec![1, 0, 2, 0]).unwrap();
+        fs::write(store.root().join("broken.meta"), "not-a-recovery-meta\n").unwrap();
+        store.expire().unwrap();
+        assert!(!store.root().join("broken.meta").exists());
+        assert!(
+            !store.root().join("broken.pcm").exists(),
+            "invalid metadata must drop the paired PCM immediately"
+        );
+    }
+
+    #[test]
+    fn read_pcm_rejects_size_mismatch_and_fifo() {
+        let home = tempfile::tempdir().unwrap();
+        let store = store(&home, clock(14_000));
+        store
+            .persist_before_inference("rec-pcm", &[1, 0, 2, 0], "hash")
+            .unwrap();
+        fs::write(store.root().join("rec-pcm.pcm"), vec![9_u8; 64]).unwrap();
+        let err = store.read_pcm("rec-pcm").unwrap_err();
+        assert!(
+            err.message().contains("size"),
+            "oversized pcm must fail: {}",
+            err.message()
+        );
+
+        store
+            .persist_before_inference("rec-fifo", &[3, 0], "hash")
+            .unwrap();
+        let fifo = store.root().join("rec-fifo.pcm");
+        fs::remove_file(&fifo).unwrap();
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        let mkfifo = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(mkfifo, 0, "mkfifo");
+        let err = store.read_pcm("rec-fifo").unwrap_err();
+        assert!(matches!(err, RecoveryError::Unsafe), "{err:?}");
+    }
+
+    #[test]
+    fn delete_artifact_reports_unlink_failures() {
+        let home = tempfile::tempdir().unwrap();
+        let store = store(&home, clock(15_000));
+        store
+            .persist_before_inference("rec-del", &[1, 0], "hash")
+            .unwrap();
+        let pcm = store.root().join("rec-del.pcm");
+        fs::remove_file(&pcm).unwrap();
+        fs::create_dir(&pcm).unwrap();
+        let err = store.delete_artifact("rec-del").unwrap_err();
+        assert!(err.is_storage(), "{err:?}");
+        fs::remove_dir(&pcm).unwrap();
     }
 
     #[test]

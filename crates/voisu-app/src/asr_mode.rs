@@ -597,6 +597,27 @@ pub fn admit_capture(
     }
 }
 
+/// Stop/Replay CLI budget: Local uses the worker processing deadline, Cloud stays
+/// on the existing provider budget.
+#[must_use]
+pub fn processing_response_deadline() -> Duration {
+    processing_response_deadline_at(
+        &config::config_path(),
+        voisu_core::state_dir().ok().as_deref(),
+    )
+}
+
+#[must_use]
+pub fn processing_response_deadline_at(config_path: &Path, state_dir: Option<&Path>) -> Duration {
+    let Some(state_dir) = state_dir else {
+        return crate::system::PROCESSING_RESPONSE_DEADLINE;
+    };
+    match load_mode(config_path, state_dir) {
+        Ok((AsrMode::Local, _)) => crate::local_worker::local_response_deadline(),
+        _ => crate::system::PROCESSING_RESPONSE_DEADLINE,
+    }
+}
+
 /// Historic name: Cloud-only until L4. Delegates to [`admit_capture`].
 pub fn admit_cloud_capture(
     kind: CaptureKind,
@@ -987,6 +1008,20 @@ mod tests {
     fn malformed_toml_blocks_admission() {
         let error = parse_asr_mode_document("not toml\n").unwrap_err();
         assert!(error.message().contains("malformed"));
+    }
+
+    #[test]
+    fn local_stop_replay_deadline_is_the_local_budget() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config.toml");
+        let state = home.path().join("state");
+        persist_asr_mode_at(&config, &state, AsrMode::Local).unwrap();
+        let local = processing_response_deadline_at(&config, Some(&state));
+        assert_eq!(local, crate::local_worker::local_response_deadline());
+        persist_asr_mode_at(&config, &state, AsrMode::Cloud).unwrap();
+        let cloud = processing_response_deadline_at(&config, Some(&state));
+        assert_eq!(cloud, crate::system::PROCESSING_RESPONSE_DEADLINE);
+        assert_ne!(local, cloud);
     }
 
     #[test]
