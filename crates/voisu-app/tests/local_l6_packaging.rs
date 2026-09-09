@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use voisu_app::local_model::{
-    ci_fixture_entry, encode_receipt, from_entry, retained_receipt_path, store_receipt_atomic,
+    InstallConsent, ci_fixture_entry, encode_receipt, from_entry, retained_receipt_path,
+    store_receipt_atomic,
 };
 use voisu_app::local_packaging::{
     BinaryIdentity, BinaryRollbackError, USER_OWNED_HINT, binary_rollback, package_may_remove,
@@ -139,7 +140,11 @@ fn clean_install_ships_no_production_weights_and_defaults_cloud() {
     assert!(status.status.success(), "{}", stdout(&status));
     let printed = stdout(&status);
     assert!(
-        printed.contains("asr mode") || printed.contains("idle"),
+        printed.contains("asr mode pending:") || printed.contains("idle"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("local readiness:") || printed.contains("idle"),
         "{printed}"
     );
     assert!(
@@ -154,7 +159,6 @@ fn clean_install_ships_no_production_weights_and_defaults_cloud() {
         catalog
             .entries
             .iter()
-            .filter(|entry| entry.production_weights)
             .all(|entry| !entry.id.to_ascii_lowercase().contains("ollama"))
     );
 }
@@ -288,6 +292,15 @@ fn retained_model_restore_is_explicit_setup() {
     let outcome = run_with(&mut io, &mut actions).unwrap();
     assert_eq!(outcome, LocalSetupOutcome::Restored);
     assert!(actions.restored);
+    // Repair restores the retained receipt; it never takes the download path.
+    assert!(
+        actions
+            .install_fixture(InstallConsent {
+                bytes: 0,
+                license_spdx: "MIT".into(),
+            })
+            .is_err()
+    );
     let transcript = io.out.join("\n");
     assert!(transcript.contains("without network"));
     assert!(!transcript.to_ascii_lowercase().contains("ollama"));
@@ -363,8 +376,10 @@ fn uninstall_file_lists_omit_user_owned_trees() {
     let aur = fs::read_to_string(root.join("packaging/aur/voisu/voisu.install")).unwrap();
     for body in [&postrm, &aur] {
         assert!(body.contains("untouched"), "{body}");
+        assert!(body.contains(".config/voisu"), "{body}");
         assert!(body.contains(".local/state/voisu"), "{body}");
-        assert!(body.contains("models"), "{body}");
+        assert!(body.contains(".local/share/voisu"), "{body}");
+        assert!(body.contains("leased"), "{body}");
     }
     assert!(USER_OWNED_HINT.contains("leased artifacts"));
 }

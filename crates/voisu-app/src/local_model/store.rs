@@ -45,7 +45,35 @@ pub struct ModelStore {
 }
 
 pub fn models_dir() -> Result<PathBuf, StoreError> {
-    models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+    let state =
+        models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))?;
+    let legacy = models_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME")).ok();
+    Ok(resolve_models_root(&state, legacy.as_deref()))
+}
+
+/// Pre-L6 installs live under `$XDG_DATA_HOME/voisu/models`. New writes go to
+/// StateDirectory; the legacy root stays readable until the user installs or
+/// restores under the state root. Upgrade/uninstall never deletes it.
+pub fn legacy_models_dir() -> Result<PathBuf, StoreError> {
+    models_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+}
+
+/// Pure root preference so tests never mutate process-global environment:
+/// the state root wins when it holds an active receipt or when the legacy
+/// root has nothing to preserve; otherwise the legacy receipt stays live.
+#[must_use]
+pub fn resolve_models_root(state: &Path, legacy: Option<&Path>) -> PathBuf {
+    let legacy = legacy.filter(|path| **path != *state);
+    match legacy {
+        Some(legacy) if !has_active_receipt(state) && has_active_receipt(legacy) => {
+            legacy.to_path_buf()
+        }
+        _ => state.to_path_buf(),
+    }
+}
+
+fn has_active_receipt(root: &Path) -> bool {
+    receipt::load(root).is_ok()
 }
 
 /// Legacy XDG data layout. Production writes StateDirectory models.
@@ -217,6 +245,44 @@ mod tests {
             state_fallback,
             PathBuf::from("/home/raja/.local/state/voisu/models")
         );
+    }
+
+    #[test]
+    fn state_root_wins_unless_only_legacy_holds_a_receipt() {
+        let state_temp = tempfile::tempdir().unwrap();
+        let legacy_temp = tempfile::tempdir().unwrap();
+        let state_root = state_temp.path().join("voisu").join("models");
+        let legacy_root = legacy_temp.path().join("voisu").join("models");
+        // Neither holds a receipt: fresh installs go to the state root.
+        assert_eq!(
+            resolve_models_root(&state_root, Some(&legacy_root)),
+            state_root
+        );
+        // Legacy-only receipt stays live: pre-L6 upgrades are not orphaned.
+        let legacy_store = ModelStore::open(legacy_root.clone()).unwrap();
+        legacy_store
+            .commit_receipt(&receipt::from_entry(
+                crate::local_model::catalog::ci_fixture_entry(),
+                "legacy1",
+            ))
+            .unwrap();
+        assert_eq!(
+            resolve_models_root(&state_root, Some(&legacy_root)),
+            legacy_root
+        );
+        // Once the state root holds a receipt, it wins.
+        let state_store = ModelStore::open(state_root.clone()).unwrap();
+        state_store
+            .commit_receipt(&receipt::from_entry(
+                crate::local_model::catalog::ci_fixture_entry(),
+                "state1",
+            ))
+            .unwrap();
+        assert_eq!(
+            resolve_models_root(&state_root, Some(&legacy_root)),
+            state_root
+        );
+        assert_eq!(resolve_models_root(&state_root, None), state_root);
     }
 
     #[test]

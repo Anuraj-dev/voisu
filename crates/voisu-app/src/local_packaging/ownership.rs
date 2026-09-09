@@ -1,6 +1,38 @@
 //! Upgrade/uninstall must not take user-owned Local artifacts.
 
-use std::path::Path;
+use std::path::{Component, Path};
+
+/// User-owned trees as trailing path components, so the check holds for
+/// `/home/*`, `/root`, `/var/home/*` (Silverblue), and any other `$HOME`.
+const USER_OWNED_TAILS: [&[&str]; 3] = [
+    &[".config", "voisu"],
+    &[".local", "state", "voisu"],
+    &[".local", "share", "voisu"],
+];
+
+fn ends_with_components(path: &Path, tail: &[&str]) -> bool {
+    let owned: Vec<&str> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect();
+    owned.len() >= tail.len() && owned[owned.len() - tail.len()..] == *tail
+}
+
+fn under_user_owned_tree(path: &Path) -> bool {
+    if USER_OWNED_TAILS
+        .iter()
+        .any(|tail| ends_with_components(path, tail))
+    {
+        return true;
+    }
+    path.starts_with("/home")
+        || path.starts_with("/var/home")
+        || path == Path::new("/root")
+        || path.starts_with("/root/")
+}
 
 /// Printed by package scriptlets so uninstall does not look like a wipe.
 pub const USER_OWNED_HINT: &str = "\
@@ -33,14 +65,15 @@ pub fn user_owned_trees() -> &'static [UserOwnedTree] {
     ]
 }
 
-/// Packaged files are under /usr. Home trees are user-owned.
+/// Packaged payloads live under /usr. Anything user-owned — by tree suffix
+/// or by home-root prefix — is never removed. Fail-closed: non-absolute and
+/// unknown roots (e.g. /opt) are not package-removable either.
 #[must_use]
 pub fn package_may_remove(path: &Path) -> bool {
-    let text = path.to_string_lossy();
-    if text.contains("/home/") || text.contains(".config/voisu") || text.contains(".local/") {
+    if under_user_owned_tree(path) {
         return false;
     }
-    text.starts_with("/usr/")
+    path.starts_with("/usr/")
 }
 
 #[must_use]
@@ -74,6 +107,16 @@ mod tests {
         assert!(user_tree_survives(&PathBuf::from(
             "/home/raja/.local/state/voisu/models"
         )));
+        // Non-/home roots and sneaky payloads stay user-owned (fail-closed).
+        assert!(!package_may_remove(Path::new(
+            "/root/.config/voisu/config.toml"
+        )));
+        assert!(!package_may_remove(Path::new(
+            "/var/home/raja/.local/state/voisu/models/private/active.receipt"
+        )));
+        assert!(!package_may_remove(Path::new("/usr/.config/voisu")));
+        assert!(!package_may_remove(Path::new("/opt/voisu/voisu")));
+        assert!(!package_may_remove(Path::new("relative/voisu")));
         assert!(USER_OWNED_HINT.contains("left untouched"));
         assert!(user_owned_trees().len() >= 3);
     }

@@ -293,7 +293,10 @@ mod tests {
         assert!(defects.iter().any(|d| d.id == "trigger-key-uniqueness"));
         assert!(defects.iter().any(|d| d.id == "locked-english-bakeoff"));
         assert!(defects.iter().all(|d| !d.waived && d.blocks_local_ship));
-        assert!(!workspace_root().join("rust-toolchain.toml").is_file());
+        // The rust-toolchain defect is named above and pinned via the
+        // dtolnay needle in `repository_ci_keeps_locked_fmt_clippy_doc_msrv_and_quality`;
+        // do not assert on rust-toolchain.toml absence here so fixing the
+        // defect does not break this test.
         let report = evaluate_report(
             crate::local_worker::RuntimeFamily::WhisperCppProcess,
             &[],
