@@ -58,9 +58,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn l3_does_not_select_a_bakeoff_winner() {
+    fn arch_pilot_elects_exactly_one_winner() {
         let catalog = shipped_catalog();
-        assert!(bakeoff_winner(&catalog).is_none());
+        let winner = bakeoff_winner(&catalog).expect("Arch pilot winner");
+        assert_eq!(winner.id, "whisper-cpp-ggml-base.en");
         assert!(catalog.entries.len() >= 2);
         assert!(
             catalog
@@ -71,7 +72,7 @@ mod tests {
     }
 
     #[test]
-    fn production_admission_stays_gated() {
-        assert!(!observe_for_admission());
+    fn production_admission_tracks_the_pilot_winner() {
+        assert!(observe_for_admission());
     }
 }

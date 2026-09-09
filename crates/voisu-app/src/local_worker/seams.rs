@@ -11,7 +11,7 @@ use voisu_core::Transcript;
 use super::protocol::Correlation;
 use super::sandbox::CloudCapabilitySentinel;
 use super::supervisor::{
-    FakeWorker, SupervisorError, TranscribeRequest, WorkerOutcome, WorkerState, WorkerSupervisor,
+    SupervisorError, TranscribeRequest, WorkerChild, WorkerOutcome, WorkerState, WorkerSupervisor,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,8 +104,8 @@ impl DeliverySeam for FakeDelivery {
     }
 }
 
-pub fn transcribe_through_supervisor(
-    supervisor: &mut WorkerSupervisor<FakeWorker>,
+pub fn transcribe_through_supervisor<C: WorkerChild>(
+    supervisor: &mut WorkerSupervisor<C>,
     correlation: Correlation,
     pcm: Vec<u8>,
     sentinel: &CloudCapabilitySentinel,

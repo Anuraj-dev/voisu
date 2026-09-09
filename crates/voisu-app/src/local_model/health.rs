@@ -1,11 +1,12 @@
 //! Health-before-activation. Never Delivery.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::local_worker::{
     Correlation, FakeWorker, LauncherPolicy, RestrictionProbe, SupervisorError, TranscribeRequest,
-    WorkerOutcome, WorkerSupervisor, landlock_allowlist, local_unavailable_if_restrictions_fail,
+    WhisperCppWorker, WorkerChild, WorkerOutcome, WorkerSupervisor, landlock_allowlist,
+    local_unavailable_if_restrictions_fail,
 };
 
 use super::catalog::{CatalogEntry, FileKind, sha256_hex, verify_file_digest};
@@ -39,12 +40,17 @@ pub trait HealthProbe {
 #[derive(Clone, Debug)]
 pub struct CandidateHealth {
     pub restrictions: RestrictionProbe,
+    /// Explicit worker binary for the real-inference path. `None` resolves to
+    /// the pilot default. Tests set a nonexistent path to prove fail-closed
+    /// without touching process-global environment.
+    pub whisper_bin: Option<PathBuf>,
 }
 
 impl Default for CandidateHealth {
     fn default() -> Self {
         Self {
             restrictions: RestrictionProbe::Available,
+            whisper_bin: None,
         }
     }
 }
@@ -68,6 +74,9 @@ impl HealthProbe for CandidateHealth {
         let allow = landlock_allowlist(candidate.join(model_name), candidate.join("cache"));
         if !allow.iter().any(|path| path.ends_with(model_name)) {
             return Err(HealthError::Sandbox);
+        }
+        if entry.production_weights {
+            return self.check_production_inference(entry, candidate, model_name);
         }
         let pcm_file = entry
             .files
@@ -141,6 +150,128 @@ impl HealthProbe for CandidateHealth {
             Err(error) => Err(HealthError::Worker(format!("{error:?}"))),
         }
     }
+}
+
+impl CandidateHealth {
+    /// Real first-inference health for production entries: load the candidate
+    /// model in a real worker and transcribe the packaged known-audio
+    /// fixture through the same supervisor deadlines as inference. Never
+    /// Delivery. The JFK fixture must come back as the known sentence; any
+    /// other outcome fails closed.
+    fn check_production_inference(
+        &self,
+        entry: &CatalogEntry,
+        candidate: &Path,
+        model_name: &str,
+    ) -> Result<HealthReport, HealthError> {
+        let fixture = entry
+            .files
+            .iter()
+            .find(|file| file.kind == FileKind::HealthFixture)
+            .ok_or(HealthError::MissingFile("health fixture"))?;
+        let wav = safe_fs::read_existing_file(candidate, fixture.name, fixture.bytes).map_err(
+            |error| match error {
+                SafeFsError::NotFound | SafeFsError::UnsafeName => {
+                    HealthError::MissingFile(fixture.name)
+                }
+                other => HealthError::Tree(other),
+            },
+        )?;
+        if !verify_file_digest(&wav, fixture.sha256_hex, fixture.bytes) {
+            return Err(HealthError::Digest(fixture.name));
+        }
+        let pcm = jfk_pcm(&wav).ok_or(HealthError::FixtureQuality)?;
+        let binary = self
+            .whisper_bin
+            .clone()
+            .unwrap_or_else(WhisperCppWorker::default_binary);
+        let worker = WhisperCppWorker::new(
+            binary,
+            candidate.join(model_name),
+            1,
+            format!("health-{}", entry.id),
+        )
+        .map_err(|_| HealthError::Sandbox)?;
+        score_known_audio(
+            worker,
+            pcm,
+            &format!("health-{}", entry.id),
+            "fellow americans",
+        )
+    }
+}
+
+/// Drive one Prepare + Transcribe health exchange through any worker. The
+/// known-audio fixture must produce its sentence; silence, wrong text, or a
+/// worker failure fails closed. Generic over `WorkerChild` so tests score the
+/// gate with a scripted worker and never need the native runtime.
+fn score_known_audio<W: WorkerChild>(
+    worker: W,
+    pcm: Vec<u8>,
+    receipt_hash: &str,
+    expected_phrase: &str,
+) -> Result<HealthReport, HealthError> {
+    let correlation = Correlation {
+        daemon_nonce: "health".into(),
+        generation: 1,
+        request_id: "health".into(),
+        recording_id: "health".into(),
+        model_receipt_hash: receipt_hash.to_owned(),
+    };
+    let mut supervisor = WorkerSupervisor::absent();
+    supervisor
+        .attach_ready(worker, Instant::now())
+        .map_err(|error| HealthError::Worker(format!("{error:?}")))?;
+    supervisor
+        .prepare(correlation.clone(), Instant::now())
+        .map_err(|error| match error {
+            SupervisorError::LoadAborted => HealthError::LoadAbort,
+            SupervisorError::TimedOut => HealthError::Worker("health deadline".into()),
+            other => HealthError::Worker(format!("{other:?}")),
+        })?;
+    match supervisor.transcribe(TranscribeRequest { correlation, pcm }) {
+        Ok(WorkerOutcome::Transcript {
+            text,
+            observed_device,
+        }) => {
+            if text.to_ascii_lowercase().contains(expected_phrase) {
+                Ok(HealthReport {
+                    observed_device,
+                    outcome: "transcript".into(),
+                })
+            } else {
+                Err(HealthError::FixtureQuality)
+            }
+        }
+        Ok(WorkerOutcome::NoText { .. }) => Err(HealthError::FixtureQuality),
+        Err(SupervisorError::LoadAborted) => Err(HealthError::LoadAbort),
+        Err(SupervisorError::TimedOut) => Err(HealthError::Worker("health deadline".into())),
+        Err(error) => Err(HealthError::Worker(format!("{error:?}"))),
+    }
+}
+
+/// Extract s16le mono 16 kHz PCM from a canonical 44-byte RIFF/WAV fixture.
+/// Anything else fails closed as fixture quality, never as inference input.
+fn jfk_pcm(wav: &[u8]) -> Option<Vec<u8>> {
+    if wav.len() < 48 || !wav.len().is_multiple_of(2) {
+        return None;
+    }
+    if &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" || &wav[12..16] != b"fmt " {
+        return None;
+    }
+    if u16::from_le_bytes([wav[20], wav[21]]) != 1
+        || u16::from_le_bytes([wav[22], wav[23]]) != 1
+        || u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]) != 16_000
+        || u16::from_le_bytes([wav[34], wav[35]]) != 16
+        || &wav[36..40] != b"data"
+    {
+        return None;
+    }
+    let data_len = u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]) as usize;
+    if wav.len() != 44 + data_len {
+        return None;
+    }
+    Some(wav[44..].to_vec())
 }
 
 pub fn verify_candidate(entry: &CatalogEntry, candidate: &Path) -> Result<(), HealthError> {
@@ -274,10 +405,74 @@ mod tests {
         write_fixture(temp.path());
         let health = CandidateHealth {
             restrictions: RestrictionProbe::Unsupported,
+            whisper_bin: None,
         };
         assert_eq!(
             health.check(ci_fixture_entry(), temp.path()),
             Err(HealthError::Sandbox)
         );
+    }
+
+    fn known_audio_worker(text: Option<&str>) -> FakeWorker {
+        FakeWorker {
+            generation: 1,
+            model_receipt_hash: "health-fixture".into(),
+            scripted_text: text.map(ToOwned::to_owned),
+            ..FakeWorker::default()
+        }
+    }
+
+    #[test]
+    fn known_audio_gate_passes_only_on_the_expected_sentence() {
+        let pcm = vec![1, 0, 2, 0];
+        let report = score_known_audio(
+            known_audio_worker(Some("And so my fellow Americans, ask not")),
+            pcm.clone(),
+            "health-fixture",
+            "fellow americans",
+        )
+        .unwrap();
+        assert_eq!(report.outcome, "transcript");
+        assert_eq!(report.observed_device, "cpu");
+        let wrong = score_known_audio(
+            known_audio_worker(Some("something entirely different")),
+            pcm.clone(),
+            "health-fixture",
+            "fellow americans",
+        )
+        .unwrap_err();
+        assert_eq!(wrong, HealthError::FixtureQuality);
+        let silent = score_known_audio(
+            known_audio_worker(None),
+            pcm,
+            "health-fixture",
+            "fellow americans",
+        )
+        .unwrap_err();
+        assert_eq!(silent, HealthError::FixtureQuality);
+    }
+
+    #[test]
+    fn tampered_production_candidate_fails_before_any_inference() {
+        let temp = tempfile::tempdir().unwrap();
+        let catalog = crate::local_model::shipped_catalog();
+        let winner = crate::local_model::bakeoff_winner(&catalog).expect("pilot winner");
+        std::fs::write(temp.path().join("ggml-base.en.bin"), b"tampered").unwrap();
+        std::fs::write(temp.path().join("jfk.wav"), b"tampered").unwrap();
+        let error = CandidateHealth::default()
+            .check(winner, temp.path())
+            .unwrap_err();
+        assert!(
+            matches!(error, HealthError::Digest(_) | HealthError::MissingFile(_)),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn wav_fixture_must_be_canonical_s16le_mono_16k() {
+        assert!(jfk_pcm(b"too short").is_none());
+        let mut bad = vec![0u8; 48];
+        bad[0..4].copy_from_slice(b"RIFX");
+        assert!(jfk_pcm(&bad).is_none());
     }
 }

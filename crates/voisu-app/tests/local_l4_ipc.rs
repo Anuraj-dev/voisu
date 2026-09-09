@@ -1,4 +1,4 @@
-//! L4 Local routing IPC: refuse without Ready, admit with test worker, Cloud regressions.
+//! L4 Local routing IPC: refuse without Ready, ignore test env seam, Cloud regressions.
 #![allow(clippy::zombie_processes)]
 
 use std::fs;
@@ -150,35 +150,41 @@ fn local_without_ready_worker_still_refuses_before_capture() {
 }
 
 #[test]
-fn local_ready_worker_starts_without_cloud_clients() {
+fn local_test_env_seam_is_ignored_in_production_binary() {
+    // Behavioral proof for T1: the non-test daemon binary must ignore
+    // VOISU_TEST_LOCAL_READY/VOISU_TEST_LOCAL_TEXT. Even with the seam set
+    // via per-command env, Local stays unavailable and Start is refused
+    // before capture; no scripted "hello" is admitted or delivered.
     let harness = Harness::new();
     let _daemon = harness.start_daemon(true);
     let set = harness.voisu(&["mode", "local"]);
     assert!(set.status.success(), "{}", stderr(&set));
     let status = ipc(&harness.socket(), r#"{"version":1,"command":"status"}"#);
     assert_eq!(status["asr_mode"]["pending"], "local");
-    assert_eq!(status["asr_mode"]["local_readiness"]["state"], "ready");
+    let state = status["asr_mode"]["local_readiness"]["state"]
+        .as_str()
+        .unwrap_or_default();
+    assert_ne!(state, "ready", "{status}");
+    assert_eq!(state, "unavailable", "{status}");
     let started = harness.voisu(&["start"]);
-    assert!(started.status.success(), "{}", stderr(&started));
-    let printed = stdout(&harness.voisu(&["status"]));
-    assert!(printed.contains("asr mode active: local"), "{printed}");
+    assert_eq!(started.status.code(), Some(4), "{started:?}");
+    let diagnostics = stderr(&started);
+    assert!(
+        diagnostics.contains("refused before capture") || diagnostics.contains("unavailable"),
+        "{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("hello from local"),
+        "scripted text must never reach Delivery: {diagnostics}"
+    );
+    assert!(
+        !stdout(&started).contains("hello from local"),
+        "scripted text must never reach Delivery"
+    );
     let during = ipc(&harness.socket(), r#"{"version":1,"command":"status"}"#);
     assert_eq!(during["asr_mode"]["local_path_clean"], true, "{during}");
-    let stopped = harness.voisu(&["stop"]);
-    assert!(
-        stopped.status.success() || stopped.status.code() == Some(4),
-        "{}",
-        stderr(&stopped)
-    );
     let after = ipc(&harness.socket(), r#"{"version":1,"command":"status"}"#);
     assert_eq!(after["asr_mode"]["local_path_clean"], true, "{after}");
-    let replayed = harness.voisu(&["replay", "missing-fixture"]);
-    assert!(!replayed.status.success(), "{replayed:?}");
-    let replay_status = ipc(&harness.socket(), r#"{"version":1,"command":"status"}"#);
-    assert_eq!(
-        replay_status["asr_mode"]["local_path_clean"], true,
-        "{replay_status}"
-    );
 }
 
 #[test]

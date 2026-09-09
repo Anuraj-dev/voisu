@@ -10,11 +10,13 @@
 mod bakeoff;
 mod bounds;
 mod lifecycle;
+mod production;
 mod protocol;
 mod runtime;
 mod sandbox;
 mod seams;
 mod supervisor;
+mod whisper_cli;
 
 pub use bakeoff::{
     BakeoffCase, BakeoffReport, COLD_READY_MAX_MS, CORPUS_CONTRACT_ID, CORPUS_VERSION, CaseKind,
@@ -31,6 +33,7 @@ pub use bounds::{
     STOP_PROCESSING, local_response_deadline, worker_cpu_quota_cores, worker_memory_ceiling_bytes,
 };
 pub use lifecycle::{LocalLifecycle, production_local_admission};
+pub use production::UnavailableWorker;
 pub use protocol::{
     ControlFrame, Correlation, FrameError, PROTOCOL_VERSION, ProtocolVersion, WorkerFrame,
     decode_json_frame, encode_json_frame, is_silence_pcm, parse_control, parse_worker,
@@ -55,6 +58,7 @@ pub use supervisor::{
     WorkerOutcome, WorkerState, WorkerSupervisor, control_frame_from_json, spawn_program_allowed,
     worker_frame_from_json,
 };
+pub use whisper_cli::{PILOT_WHISPER_CLI, WHISPER_BIN_ENV, WhisperCppWorker};
 
 #[cfg(test)]
 mod product_unavailable_tests {

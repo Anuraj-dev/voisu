@@ -18,6 +18,15 @@ const GGML_BASE_EN_BYTES: u64 = 147_964_211;
 const GGML_SMALL_EN_SHA: &str = "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d";
 const GGML_SMALL_EN_BYTES: u64 = 487_614_201;
 
+/// Pinned upstream whisper.cpp sample used as the non-private known-audio
+/// health fixture for the Arch pilot winner. Separate revision from the
+/// Hugging Face weights because it lives in the whisper.cpp git tree.
+/// Referenced by the pilot-winner test below; not used in non-test builds.
+#[cfg_attr(not(test), allow(dead_code))]
+const WHISPER_CPP_JFK_REV: &str = "c44b60b8053bbf2a5c1e014f11323fb3f2485177";
+const JFK_WAV_SHA: &str = "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e";
+const JFK_WAV_BYTES: u64 = 352_078;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileKind {
     Weights,
@@ -94,10 +103,15 @@ pub fn shipped_catalog() -> Catalog {
     }
 }
 
-/// Milestone one pins exactly one winner after L2 evidence. None is selected.
+/// Arch/Hyprland pilot winner. This is NOT a product bakeoff result under
+/// R7 (no locked 100+20 corpus, no WER/soak evidence): it exists so the pilot
+/// host can install and exercise one real runtime. Fedora product support
+/// remains evidence-gated and the pilot PR stays unmerged.
 #[must_use]
 pub fn bakeoff_winner(_catalog: &Catalog) -> Option<&'static CatalogEntry> {
-    None
+    SHIPPED_ENTRIES
+        .iter()
+        .find(|entry| entry.id == "whisper-cpp-ggml-base.en")
 }
 
 #[must_use]
@@ -182,12 +196,12 @@ const SHIPPED_ENTRIES: &[CatalogEntry] = &[
         id: "whisper-cpp-ggml-base.en",
         revision: WHISPER_CPP_HF_REV,
         language: "en",
-        required_names: &["ggml-base.en.bin"],
+        required_names: &["ggml-base.en.bin", "jfk.wav"],
         runtime_abi: WHISPER_ABI,
         devices: &[DeviceSupport::Cpu],
         license: LicenseTerms {
             spdx: "MIT",
-            name: "whisper.cpp GGML base.en (unelected)",
+            name: "whisper.cpp GGML base.en (Arch pilot winner)",
         },
         provenance: Provenance {
             publisher: "ggerganov/whisper.cpp",
@@ -196,16 +210,25 @@ const SHIPPED_ENTRIES: &[CatalogEntry] = &[
         },
         redistribution: Redistribution {
             allowed: true,
-            terms: "upstream whisper.cpp model card; not selected",
+            terms: "upstream whisper.cpp model card; Arch pilot winner, Fedora product support evidence-gated",
         },
-        files: &[CatalogFile {
-            name: "ggml-base.en.bin",
-            sha256_hex: GGML_BASE_EN_SHA,
-            bytes: GGML_BASE_EN_BYTES,
-            url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/80da2d8bfee42b0e836fc3a9890373e5defc00a6/ggml-base.en.bin",
-            kind: FileKind::Weights,
-        }],
-        allowed_hosts: &["huggingface.co"],
+        files: &[
+            CatalogFile {
+                name: "ggml-base.en.bin",
+                sha256_hex: GGML_BASE_EN_SHA,
+                bytes: GGML_BASE_EN_BYTES,
+                url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/80da2d8bfee42b0e836fc3a9890373e5defc00a6/ggml-base.en.bin",
+                kind: FileKind::Weights,
+            },
+            CatalogFile {
+                name: "jfk.wav",
+                sha256_hex: JFK_WAV_SHA,
+                bytes: JFK_WAV_BYTES,
+                url: "https://raw.githubusercontent.com/ggml-org/whisper.cpp/c44b60b8053bbf2a5c1e014f11323fb3f2485177/samples/jfk.wav",
+                kind: FileKind::HealthFixture,
+            },
+        ],
+        allowed_hosts: &["huggingface.co", "raw.githubusercontent.com"],
         production_weights: true,
     },
     CatalogEntry {
@@ -288,7 +311,8 @@ mod tests {
     #[test]
     fn production_entries_pin_immutable_revisions_not_main() {
         let catalog = shipped_catalog();
-        assert!(bakeoff_winner(&catalog).is_none());
+        let winner = bakeoff_winner(&catalog).expect("Arch pilot winner");
+        assert_eq!(winner.id, "whisper-cpp-ggml-base.en");
         for entry in catalog.entries {
             assert_ne!(entry.runtime_abi.family, RuntimeFamily::FasterWhisper);
             assert!(!format!("{entry:?}").to_ascii_lowercase().contains("ollama"));
@@ -327,6 +351,33 @@ mod tests {
             production[1].file("ggml-small.en.bin").unwrap().sha256_hex,
             GGML_SMALL_EN_SHA
         );
+    }
+
+    #[test]
+    fn pilot_winner_pins_jfk_health_fixture_to_an_immutable_rev() {
+        let catalog = shipped_catalog();
+        let winner = bakeoff_winner(&catalog).expect("Arch pilot winner");
+        assert!(winner.production_weights);
+        let jfk = winner.file("jfk.wav").expect("pilot health fixture");
+        assert_eq!(jfk.kind, FileKind::HealthFixture);
+        assert_eq!(jfk.bytes, JFK_WAV_BYTES);
+        assert_eq!(jfk.sha256_hex, JFK_WAV_SHA);
+        assert!(
+            jfk.url.contains(WHISPER_CPP_JFK_REV),
+            "health fixture must stay pinned, not floating: {}",
+            jfk.url
+        );
+        assert!(winner.allowed_hosts.contains(&"raw.githubusercontent.com"));
+        assert!(winner.required_names.contains(&"jfk.wav"));
+        // small.en stays unelected without a health fixture.
+        let small = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "whisper-cpp-ggml-small.en")
+            .expect("small.en candidate");
+        assert!(small.production_weights);
+        assert!(small.file("jfk.wav").is_none());
+        assert_ne!(small.id, winner.id);
     }
 
     #[test]

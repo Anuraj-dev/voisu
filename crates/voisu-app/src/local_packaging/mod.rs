@@ -306,7 +306,16 @@ mod tests {
             false,
         );
         assert_eq!(report.verdict, GateVerdict::PendingEvidence);
-        assert!(bakeoff_winner(&crate::local_model::shipped_catalog()).is_none());
+        // The Arch pilot winner is elected for host testing, but the locked
+        // English bakeoff defect still blocks any Local ship claim.
+        let winner =
+            bakeoff_winner(&crate::local_model::shipped_catalog()).expect("Arch pilot winner");
+        assert_eq!(winner.id, "whisper-cpp-ggml-base.en");
+        assert!(
+            defects
+                .iter()
+                .any(|d| d.id == "locked-english-bakeoff" && d.blocks_local_ship && !d.waived)
+        );
     }
 
     #[test]

@@ -40,9 +40,14 @@ pub trait LocalSetupActions {
     fn retained_identity(&self) -> Option<String>;
     fn restore_retained(&mut self) -> Result<String, String>;
     fn install_fixture(&mut self, consent: InstallConsent) -> Result<String, String>;
-    /// Production has no selected download. Tests may offer a consented fixture.
+    /// Production offers the elected pilot winner for consented download.
+    /// Tests may offer a consented fixture instead.
     fn consented_install(&self) -> Option<InstallConsent> {
-        None
+        let winner = bakeoff_winner(&shipped_catalog())?;
+        Some(InstallConsent {
+            bytes: winner.total_bytes(),
+            license_spdx: winner.license.spdx.to_owned(),
+        })
     }
 }
 
@@ -71,9 +76,7 @@ impl LocalSetupActions for ProductionLocalSetup {
     }
 
     fn install_fixture(&mut self, consent: InstallConsent) -> Result<String, String> {
-        let Some(entry) =
-            bakeoff_winner(&shipped_catalog()).filter(|entry| !entry.production_weights)
-        else {
+        let Some(entry) = bakeoff_winner(&shipped_catalog()) else {
             return Err(NO_PRODUCTION_DOWNLOAD.into());
         };
         if consent.bytes != entry.total_bytes() || consent.license_spdx != entry.license.spdx {
@@ -170,7 +173,13 @@ pub fn run_with(
     );
     io.writeln("Downloads stay consented Setup-only. Nothing is auto-downloaded.");
     io.writeln("");
-    io.writeln("Catalog (no bakeoff winner is selected):");
+    match bakeoff_winner(&shipped_catalog()) {
+        Some(winner) => io.writeln(&format!(
+            "Catalog (Arch pilot winner: {}; Fedora product support remains evidence-gated):",
+            winner.id
+        )),
+        None => io.writeln("Catalog (no bakeoff winner is selected):"),
+    }
     for line in actions.catalog_lines() {
         io.writeln(&format!("  {line}"));
     }
@@ -220,7 +229,9 @@ pub fn catalog_presentation() -> Vec<String> {
 }
 
 fn catalog_line(entry: &CatalogEntry) -> String {
-    let kind = if entry.production_weights {
+    let kind = if Some(entry.id) == bakeoff_winner(&shipped_catalog()).map(|winner| winner.id) {
+        "Arch pilot winner; explicit-consent download"
+    } else if entry.production_weights {
         "unelected production weights; not downloaded"
     } else {
         "test fixture; not a production download"
@@ -423,8 +434,9 @@ mod tests {
         let transcript = io.transcript();
         assert!(transcript.contains("never run from Local setup"));
         assert!(transcript.contains("Nothing is auto-downloaded"));
-        assert!(transcript.contains("no bakeoff winner"));
+        assert!(transcript.contains("Arch pilot winner"));
         assert!(transcript.contains("unelected production weights"));
+        assert!(!transcript.contains("no bakeoff winner"));
         assert!(!transcript.to_ascii_lowercase().contains("ollama"));
     }
 
@@ -541,28 +553,27 @@ mod tests {
     }
 
     #[test]
-    fn production_run_does_not_offer_the_ci_fixture_download() {
+    fn production_run_offers_the_pilot_winner_for_consent() {
         let mut io = FakeIo::new(vec![]);
         let mut actions = ProductionLocalSetup;
         let outcome = run_with(&mut io, &mut actions).unwrap();
         assert_eq!(outcome, LocalSetupOutcome::Skipped);
         let transcript = io.transcript();
-        assert!(transcript.contains(NO_PRODUCTION_DOWNLOAD), "{transcript}");
+        let winner = bakeoff_winner(&shipped_catalog()).expect("pilot winner");
+        assert!(transcript.contains(winner.id), "{transcript}");
+        assert!(transcript.contains("No download"), "{transcript}");
         assert!(
             !transcript.contains("Download and install the catalog fixture"),
             "{transcript}"
         );
-        assert!(
-            transcript.contains("unelected production weights"),
-            "{transcript}"
-        );
-        assert!(actions.consented_install().is_none());
+        let consent = actions.consented_install().expect("pilot consent");
+        assert_eq!(consent.bytes, winner.total_bytes());
+        assert_eq!(consent.license_spdx, winner.license.spdx);
         assert!(CLOUD_CREDENTIAL_MAINTENANCE.contains("Cloud credential-maintenance"));
-        assert!(bakeoff_winner(&shipped_catalog()).is_none());
     }
 
     #[test]
-    fn production_adapter_refuses_to_download_without_a_winner() {
+    fn production_adapter_refuses_mismatched_consent() {
         let mut actions = ProductionLocalSetup;
         let error = actions
             .install_fixture(InstallConsent {
@@ -570,7 +581,7 @@ mod tests {
                 license_spdx: "MIT".into(),
             })
             .unwrap_err();
-        assert!(error.contains(NO_PRODUCTION_DOWNLOAD), "{error}");
+        assert!(error.contains("consent does not match"), "{error}");
     }
 
     #[test]
