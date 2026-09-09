@@ -524,48 +524,7 @@ pub fn attach_status(response: &mut Response, active: Option<AsrMode>) {
 
 /// Historic first line, then pending/active/revision/readiness when advertised.
 pub fn write_cli_status(message: &str, asr: Option<&AsrModeStatus>) {
-    println!("{message}");
-    let Some(asr) = asr else {
-        return;
-    };
-    match asr.pending {
-        Some(mode) => println!("asr mode pending: {}", mode.as_str()),
-        None => println!("asr mode pending: unknown"),
-    }
-    if let Some(active) = asr.active {
-        println!("asr mode active: {}", active.as_str());
-    }
-    match asr.revision {
-        Some(revision) => println!("config revision: {revision}"),
-        None => println!("config revision: unknown"),
-    }
-    println!(
-        "local readiness: {}",
-        format_local_readiness(&asr.local_readiness)
-    );
-    if let Some(error) = &asr.admission_error {
-        println!("asr admission: {error}");
-    }
-    if let Some(retention) = &asr.audio_retention {
-        println!("audio retention: {retention}");
-    }
-}
-
-fn format_local_readiness(readiness: &LocalReadiness) -> String {
-    match readiness {
-        LocalReadiness::Absent => "absent".to_owned(),
-        LocalReadiness::Verifying => "verifying".to_owned(),
-        LocalReadiness::Loading => "loading".to_owned(),
-        LocalReadiness::Ready {
-            model_identity: None,
-        } => "ready".to_owned(),
-        LocalReadiness::Ready {
-            model_identity: Some(identity),
-        } => format!("ready ({identity})"),
-        LocalReadiness::Busy => "busy".to_owned(),
-        LocalReadiness::Stopping => "stopping".to_owned(),
-        LocalReadiness::Unavailable { error } => format!("unavailable ({error})"),
-    }
+    crate::local_status::write_cli_status(message, asr);
 }
 
 /// Snapshot admission, then Cloud or Local resources, or a rejection before capture.

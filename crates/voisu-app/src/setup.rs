@@ -148,6 +148,11 @@ impl HyprlandSetupActions for LiveHyprlandSetupActions<'_> {
 
 /// Runs the interactive wizard to completion and reports what became of each
 /// key. Deepgram is configured first (it is on by default), then Groq.
+/// Local model install/repair. Never probes Cloud keys or auto-downloads.
+pub fn run_consented_local_setup(io: &mut dyn WizardIo) -> Result<(), String> {
+    crate::local_setup::run(io).map(|_| ())
+}
+
 pub fn run_setup(
     io: &mut dyn WizardIo,
     store: &mut dyn SecretStore,

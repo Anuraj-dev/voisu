@@ -43,22 +43,7 @@ impl OverlayView {
     };
 
     pub fn from_response(response: &Response) -> Self {
-        if !response.ok {
-            return Self::failure();
-        }
-        match response.state {
-            Some(DaemonState::Recording) => Self {
-                phase: OverlayPhase::Recording,
-                visible_label: "Recording",
-                accessible_label: "Recording; voice activity visible",
-            },
-            Some(DaemonState::Processing) => Self {
-                phase: OverlayPhase::Processing,
-                visible_label: "Processing",
-                accessible_label: "Processing Recording",
-            },
-            Some(DaemonState::Idle) | None => Self::HIDDEN,
-        }
+        crate::local_overlay::view_from_response(response)
     }
 
     pub const fn from_terminal_event(event: &OverlayEvent) -> Self {
@@ -200,7 +185,7 @@ impl PresentationController {
                 .unwrap_or(OverlayView::HIDDEN);
         }
         self.terminal_until = None;
-        OverlayView::HIDDEN
+        OverlayView::from_response(response)
     }
 
     /// Routes an unreachable daemon through the same terminal-cap mechanism as
@@ -889,6 +874,9 @@ pub const STATUS_POLL_PERIOD: Duration = Duration::from_millis(200);
 /// when the daemon is unreachable, the deadline elapses, or the reply is
 /// malformed — the caller renders the unreachable path either way.
 pub fn fetch_status(deadline: Instant) -> Option<Response> {
+    let _guard = crate::local_overlay::StatusPollGuard::acquire(
+        crate::local_overlay::global_status_poll_gate(),
+    )?;
     let path = socket_path().ok()?;
     let mut stream = connect_within(&path, deadline)?;
     status_round_trip(&mut stream, deadline)
@@ -1297,6 +1285,29 @@ mod tests {
         let taken = worker.take_latest().unwrap();
         assert_eq!(taken.response.unwrap().state, Some(DaemonState::Recording));
         assert!(worker.take_latest().is_none());
+    }
+
+    #[test]
+    fn take_latest_does_not_wait_on_a_stuck_status_round_trip() {
+        let block = Arc::new(AtomicBool::new(true));
+        let worker = StatusWorker::spawn_with({
+            let block = Arc::clone(&block);
+            move || {
+                while block.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                None
+            }
+        });
+        let started = Instant::now();
+        let _ = worker.take_latest();
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "GTK-thread take_latest stalled {:?}",
+            started.elapsed()
+        );
+        block.store(false, Ordering::Relaxed);
+        worker.stop();
     }
 
     #[test]

@@ -452,7 +452,8 @@ fn install_surface_feedback(
     let limit_latch = Rc::new(RefCell::new(LimitWarningLatch::default()));
     let level_latch = Rc::new(RefCell::new(LevelPollLatch::default()));
     let level_poll = Rc::new(RefCell::new(None::<(gtk::glib::SourceId, Rc<LevelWorker>)>));
-    gtk::glib::timeout_add_local(Duration::from_millis(200), move || {
+    let status_worker = StatusWorker::spawn();
+    gtk::glib::timeout_add_local(STATUS_POLL_PERIOD, move || {
         if switched.get() {
             // A genuine surface-creation failure handed feedback to the
             // notification backend; stop driving the retired window.
@@ -460,14 +461,19 @@ fn install_surface_feedback(
                 source.remove();
                 worker.stop();
             }
+            status_worker.stop();
             return gtk::glib::ControlFlow::Break;
         }
+        let Some(observation) = status_worker.take_latest() else {
+            if rendered.get().phase == OverlayPhase::Processing {
+                meter.queue_draw();
+            }
+            return gtk::glib::ControlFlow::Continue;
+        };
         let now = Instant::now();
-        // The notify edge is driven by the OBSERVED daemon signal, kept separate
-        // from the rendered phase: a failed status read renders an unavailable
-        // capsule but is not a reachable observation, so it must not disturb the
-        // Recording notification latch.
-        let (view, signal, warning, identity, remaining) = match read_status() {
+        // Status I/O runs on StatusWorker. The GTK tick only takes the newest
+        // finished round trip, so a stalled daemon cannot freeze the loop.
+        let (view, signal, warning, identity, remaining) = match observation.response {
             Some(response) => {
                 let view = controller.borrow_mut().observe(&response, now);
                 // Headroom and identity are read off the same reply the phase

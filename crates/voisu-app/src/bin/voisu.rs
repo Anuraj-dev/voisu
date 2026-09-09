@@ -365,14 +365,31 @@ fn doctor(verbose: bool) -> ExitCode {
         rows.extend(daemon_readiness_rows(readiness));
     }
 
+    if let Some(asr) = inspector
+        .daemon_status()
+        .and_then(|response| response.asr_mode.as_ref())
+    {
+        rows.extend(
+            voisu_app::local_doctor::rows_from_status(asr)
+                .into_iter()
+                .map(local_doctor_row),
+        );
+    }
+
     // The live key checks reach the network; a test that pins other doctor
     // output opts out with VOISU_TEST_SKIP_DOCTOR_KEYS and covers the key
-    // classification through dedicated seams instead.
-    if std::env::var_os("VOISU_TEST_SKIP_DOCTOR_KEYS").is_none()
-        && !voisu_app::local_routing::skip_cloud_doctor_probes()
-        && let Some(runtime) = runtime.as_ref()
-    {
-        rows.extend(provider_key_rows(runtime));
+    // classification through dedicated seams instead. Local doctor skips Cloud
+    // probes with explicit SKIP rows rather than hiding them.
+    if std::env::var_os("VOISU_TEST_SKIP_DOCTOR_KEYS").is_none() {
+        if voisu_app::local_doctor::skip_cloud_probes() {
+            rows.extend(
+                voisu_app::local_doctor::skipped_cloud_key_rows()
+                    .into_iter()
+                    .map(local_doctor_row),
+            );
+        } else if let Some(runtime) = runtime.as_ref() {
+            rows.extend(provider_key_rows(runtime));
+        }
     }
 
     let has_failure = rows.iter().any(|row| row.status == ReadinessStatus::Fail);
@@ -394,6 +411,17 @@ const DOCTOR_VALUE_WIDTH: usize = 20;
 /// Print every doctor check as one terse line. A runnable action prints on its
 /// own indented line only on FAIL; WARN and SKIP keep to one line, with any
 /// guidance behind --verbose.
+fn local_doctor_row(check: voisu_app::local_doctor::DoctorCheck) -> DoctorRow {
+    let mut row = DoctorRow::new(check.label, check.status, check.detail);
+    if !check.value.is_empty() {
+        row = row.value(check.value);
+    }
+    if let Some(action) = check.action {
+        row = row.action(action);
+    }
+    row
+}
+
 fn print_doctor_rows(rows: &[DoctorRow], verbose: bool) {
     for row in rows {
         let value = row.value.as_deref().unwrap_or("");
@@ -807,26 +835,50 @@ fn provider_key_rows(runtime: &tokio::runtime::Runtime) -> Vec<DoctorRow> {
 fn setup() -> ExitCode {
     use voisu_app::setup::{
         LiveHyprlandSetupActions, LiveKeyValidator, ProviderOutcome, SETUP_COMPLETE_MESSAGE,
-        StdioWizard, run_hyprland_setup, run_setup,
+        StdioWizard, run_consented_local_setup, run_hyprland_setup, run_setup,
     };
     use voisu_app::setup_profile::{HyprlandConfig, discover_setup_profile, live_setup_facts};
 
+    // Integration tests can isolate the wizard while exercising the real CLI;
+    // production never sets this seam.
+    let wizard_only = std::env::var_os("VOISU_TEST_SETUP_WIZARD_ONLY").is_some();
+    let mut wizard = StdioWizard;
+    if voisu_app::local_setup::is_local_mode() {
+        if let Err(error) = run_consented_local_setup(&mut wizard) {
+            return fail(4, &error);
+        }
+        if wizard_only {
+            println!("{SETUP_COMPLETE_MESSAGE}");
+            return ExitCode::SUCCESS;
+        }
+    }
     let discovery = match discover_setup_profile(&live_setup_facts()) {
         Ok(discovery) => discovery,
         Err(error) => return fail(4, &error.message()),
     };
     println!("Detected {} Setup Profile.", discovery.profile.as_str());
     let hyprland_config = discovery.hyprland_config;
-    // Integration tests can isolate the credential wizard while exercising
-    // the real CLI; production never sets this seam.
-    let wizard_only = std::env::var_os("VOISU_TEST_SETUP_WIZARD_ONLY").is_some();
     if hyprland_config.is_some()
         && !wizard_only
         && let Err(error) = voisu_app::service::hyprland_overlay_preflight()
     {
         return fail(4, &error);
     }
-    let mut wizard = StdioWizard;
+    if voisu_app::local_setup::is_local_mode() {
+        if let Some(HyprlandConfig::CurrentLua(config)) = hyprland_config {
+            let mut actions = LiveHyprlandSetupActions { io: &mut wizard };
+            if let Err(error) = run_hyprland_setup(&config, &mut actions) {
+                return fail(
+                    4,
+                    &format!(
+                        "Hyprland setup incomplete: {error}; recovery: run `voisu setup` after fixing this step"
+                    ),
+                );
+            }
+        }
+        println!("{SETUP_COMPLETE_MESSAGE}");
+        return ExitCode::SUCCESS;
+    }
     let outcome = run_setup(&mut wizard, &mut SecretToolStore, &mut LiveKeyValidator);
     // A run that stored/kept no usable key (every provider skipped or its store
     // failed) did not accomplish setup's job, so it must not report success.
@@ -1063,6 +1115,7 @@ fn auth_verify(provider: Provider) -> ExitCode {
         credential,
     )) {
         Ok(()) => {
+            eprintln!("{}", voisu_app::local_doctor::CLOUD_CREDENTIAL_MAINTENANCE);
             println!("{} authentication verified", provider.cli_label());
             ExitCode::SUCCESS
         }
