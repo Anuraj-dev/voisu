@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::completeness::{CompletenessChoice, select_completeness_aware};
 use crate::manifest::{self, EvidencePresence, LoadedRecording};
-use crate::metrics::{align_words, detect_critical_errors, detect_section_loss};
+use crate::metrics::{align_punctuation, align_words, detect_critical_errors, detect_section_loss};
 use crate::report::{
     ArmName, ArmResult, EvaluationReport, RecordingReport, SCHEMA, StableReport, VolatileReport,
     aggregate, fingerprint_stable,
@@ -230,11 +230,13 @@ fn score_or_missing(
         };
     };
     let word_error = align_words(reference, hypothesis);
+    let punctuation_error = align_punctuation(reference, hypothesis);
     let critical_semantic_errors = detect_critical_errors(reference, hypothesis);
     let section_loss = detect_section_loss(reference, source_fed, hypothesis);
     ArmResult::Scored {
         critical_semantic_errors,
         hypothesis: hypothesis.to_owned(),
+        punctuation_error,
         section_loss,
         selected_source: selected_source.map(str::to_owned),
         word_error,

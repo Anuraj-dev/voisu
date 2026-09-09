@@ -1,0 +1,109 @@
+{
+  "schema": "voisu-local-asr-bakeoff-contract-v1",
+  "id": "voisu-r7-local-asr-v1",
+  "corpus_requirements": {
+    "speech_clips_min": 100,
+    "real_speech_clips_min": 100,
+    "negative_clips_min": 20,
+    "tuning_speech_clips_exact": 20,
+    "held_out_speech_clips_min": 80,
+    "longest_band_speech_clips_min": 5,
+    "duration_bands": [
+      { "id": "one_to_ten_seconds", "min_ms_inclusive": 1000, "max_ms_inclusive": 10000 },
+      { "id": "ten_to_thirty_seconds", "min_ms_inclusive": 10001, "max_ms_inclusive": 30000 },
+      { "id": "thirty_to_one_twenty_seconds", "min_ms_inclusive": 30001, "max_ms_inclusive": 120000 },
+      { "id": "one_twenty_to_six_hundred_seconds", "min_ms_inclusive": 120001, "max_ms_inclusive": 600000 }
+    ],
+    "negative_kinds": ["silence", "noise", "non_speech"],
+    "required_coverage": ["technical_vocabulary", "self_correction", "deterministic_formatting"],
+    "critical_content_categories": ["number", "name", "negation", "command", "path", "url", "unit", "omitted_phrase"]
+  },
+  "scoring": {
+    "wer_normalization": {
+      "id": "voisu-wer-ascii-v1",
+      "tokenization": "unicode_whitespace",
+      "case_folding": "ascii_lowercase",
+      "unicode_normalization": "none",
+      "boundary_marks_removed": ["double_quote", "apostrophe", "backtick", "parentheses", "brackets", "braces", "comma", "semicolon", "exclamation", "question"],
+      "terminal_period_rule": "remove_one_terminal_period_except_url_or_numeric_token"
+    },
+    "word_alignment": "levenshtein_insertions_deletions_substitutions_v1",
+    "punctuation_scoring": {
+      "id": "voisu-punctuation-edit-v1",
+      "marks": [".", ",", "?", "!", ":", ";"],
+      "alignment": "levenshtein_insertions_deletions_substitutions_v1"
+    },
+    "semantic_error_scoring": {
+      "id": "voisu-critical-content-v1",
+      "categories": ["number", "name", "negation", "command", "path", "url", "unit", "omitted_phrase"],
+      "aggregation": "count_by_category_and_total",
+      "separate_from_wer": true
+    }
+  },
+  "latency_measurement": {
+    "clock": "monotonic",
+    "warm_start": "recording_stop_or_utterance_end",
+    "warm_end": "delivery_confirmed_or_terminal_failure",
+    "cold_start": "worker_process_start",
+    "cold_end": "first_inference_ready",
+    "percentiles": ["p50", "p95", "max"],
+    "raw_local_timings_required": true,
+    "averaged_totals_forbidden": true,
+    "stages": ["capture_finalization", "recovery_fsync", "model_load", "inference", "formatting", "delivery"]
+  },
+  "thresholds": {
+    "held_out_overall_wer_max": 0.10,
+    "held_out_stratum_wer_max": 0.15,
+    "critical_content_errors_max": 0,
+    "negative_fixture_insertions_max": 0,
+    "warm_p95_up_to_30_seconds_ms": 3000,
+    "warm_p95_up_to_120_seconds_ms": 15000,
+    "accepted_clip_stop_to_delivery_max_ms": 45000,
+    "cold_readiness_max_ms": 60000,
+    "soak_duration_min_ms": 7200000,
+    "soak_recordings_min": 200,
+    "soak_warmup_recordings": 20,
+    "rss_growth_max_bytes": 134217728,
+    "crashes_max": 0,
+    "duplicate_deliveries_max": 0,
+    "stale_responses_max": 0,
+    "unexpected_network_attempts_max": 0,
+    "unreaped_children_max": 0,
+    "full_length_completion_required": true,
+    "packaged_runtime_required": true
+  },
+  "public_report": {
+    "schema": "voisu-local-asr-bakeoff-public-report-v1",
+    "fields": [
+      "schema",
+      "contract_id",
+      "contract_sha256",
+      "manifest_sha256",
+      "corpus_version",
+      "corpus_revision",
+      "host_profile_id",
+      "runtime_sha256",
+      "model_sha256",
+      "scoring_tool_git_commit",
+      "scoring_tool_cargo_lock_sha256",
+      "sample_counts",
+      "duration_band_aggregates",
+      "stratum_aggregates",
+      "wer_counts_and_rates",
+      "punctuation_counts_and_rates",
+      "semantic_error_counts",
+      "warm_latency_p50_ms",
+      "warm_latency_p95_ms",
+      "warm_latency_max_ms",
+      "cold_latency_p50_ms",
+      "cold_latency_p95_ms",
+      "cold_latency_max_ms",
+      "soak_counts",
+      "rss_growth_bytes",
+      "negative_fixture_insertions",
+      "packaged_runtime_passed",
+      "gate_result"
+    ],
+    "forbidden_fields": ["audio", "audio_path", "reference_text", "transcript_text", "speaker_identity", "private_notes", "local_file_path"]
+  }
+}

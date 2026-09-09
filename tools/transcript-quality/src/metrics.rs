@@ -10,6 +10,16 @@ pub struct WordError {
     pub substitutions: usize,
 }
 
+/// Character-level punctuation alignment, reported separately from WER.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PunctuationError {
+    pub deletions: usize,
+    pub error_rate: f64,
+    pub insertions: usize,
+    pub reference_marks: usize,
+    pub substitutions: usize,
+}
+
 /// One critical meaning mismatch.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CriticalError {
@@ -49,12 +59,23 @@ fn normalize_token(raw: &str) -> String {
         .to_owned();
     if tok.ends_with('.')
         && !tok.contains("://")
-        && tok.matches('.').count() == 1
-        && !tok.chars().any(|c| c.is_ascii_digit())
+        && !is_numeric_token(tok.strip_suffix('.').unwrap_or(&tok))
     {
         tok.pop();
     }
     tok.to_ascii_lowercase()
+}
+
+fn is_numeric_token(token: &str) -> bool {
+    let mut digits = 0;
+    for character in token.chars() {
+        if character.is_ascii_digit() {
+            digits += 1;
+        } else if !matches!(character, '+' | '-' | ',' | '.') {
+            return false;
+        }
+    }
+    digits > 0
 }
 
 pub fn align_words(reference: &str, hypothesis: &str) -> WordError {
@@ -80,6 +101,40 @@ pub fn align_words(reference: &str, hypothesis: &str) -> WordError {
         reference_tokens: n,
         substitutions,
     }
+}
+
+/// Scores `. , ? ! : ;` in sequence. Apostrophes and hyphens remain lexical
+/// characters under the frozen WER normalization and are not scored here.
+pub fn align_punctuation(reference: &str, hypothesis: &str) -> PunctuationError {
+    let reference_marks = punctuation_marks(reference);
+    let hypothesis_marks = punctuation_marks(hypothesis);
+    let reference_tokens: Vec<String> = reference_marks.iter().map(char::to_string).collect();
+    let hypothesis_tokens: Vec<String> = hypothesis_marks.iter().map(char::to_string).collect();
+    let (insertions, deletions, substitutions) =
+        levenshtein_ops(&reference_tokens, &hypothesis_tokens);
+    let errors = insertions + deletions + substitutions;
+    let error_rate = if reference_marks.is_empty() {
+        if hypothesis_marks.is_empty() {
+            0.0
+        } else {
+            1.0
+        }
+    } else {
+        errors as f64 / reference_marks.len() as f64
+    };
+    PunctuationError {
+        deletions,
+        error_rate,
+        insertions,
+        reference_marks: reference_marks.len(),
+        substitutions,
+    }
+}
+
+fn punctuation_marks(text: &str) -> Vec<char> {
+    text.chars()
+        .filter(|ch| matches!(ch, '.' | ',' | '?' | '!' | ':' | ';'))
+        .collect()
 }
 
 fn levenshtein_ops(reference: &[String], hypothesis: &[String]) -> (usize, usize, usize) {
@@ -260,11 +315,9 @@ pub fn detect_critical_errors(reference: &str, hypothesis: &str) -> Vec<Critical
     push_missing_category(&mut out, "command", command_tokens(reference), &hyp_set);
     push_missing_category(&mut out, "path", path_tokens(&ref_tokens), &hyp_set);
     push_missing_category(&mut out, "url", url_tokens(&ref_tokens), &hyp_set);
-    push_missing_category(&mut out, "code", code_tokens(reference), &hyp_set);
-
     for clause in missing_clauses(reference, hypothesis) {
         out.push(CriticalError {
-            category: "missing_clause".to_owned(),
+            category: "omitted_phrase".to_owned(),
             reference_token: clause,
         });
     }
@@ -443,39 +496,6 @@ fn url_tokens(tokens: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn code_tokens(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .filter_map(|raw| {
-            let cleaned = raw.trim_matches(|c: char| {
-                !c.is_ascii_alphanumeric() && c != '_' && c != ':' && c != '-'
-            });
-            if cleaned.is_empty() {
-                return None;
-            }
-            if cleaned.contains('_')
-                || cleaned.contains("::")
-                || has_internal_lower_to_upper(cleaned)
-                || cleaned.starts_with("--")
-            {
-                Some(cleaned.to_ascii_lowercase())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn has_internal_lower_to_upper(token: &str) -> bool {
-    let mut prev_lower = false;
-    for c in token.chars() {
-        if prev_lower && c.is_ascii_uppercase() {
-            return true;
-        }
-        prev_lower = c.is_ascii_lowercase();
-    }
-    false
-}
-
 fn missing_clauses(reference: &str, hypothesis: &str) -> Vec<String> {
     let hyp = tokenize(hypothesis);
     let hyp_set: std::collections::BTreeSet<&str> = hyp.iter().map(String::as_str).collect();
@@ -522,39 +542,27 @@ mod tests {
     }
 
     #[test]
-    fn camel_case_identifiers_count_as_code_token_errors() {
+    fn undeclared_code_tokens_are_not_critical_categories() {
         let errors = detect_critical_errors(
             "call formatValidated then runTool",
             "call format validated then run tool",
         );
         assert!(
-            errors
-                .iter()
-                .any(|err| err.category == "code" && err.reference_token == "formatvalidated"),
-            "formatValidated should be a code-token error, got {errors:?}"
-        );
-        assert!(
-            errors
-                .iter()
-                .any(|err| err.category == "code" && err.reference_token == "runtool"),
-            "runTool should be a code-token error, got {errors:?}"
+            errors.iter().all(|err| err.category != "code"),
+            "{errors:?}"
         );
     }
 
     #[test]
-    fn sentence_initial_please_is_not_a_code_token() {
-        let errors = detect_critical_errors("Please call formatValidated", "call format validated");
+    fn omitted_phrase_is_the_declared_missing_clause_category() {
+        let errors = detect_critical_errors("call the deployment service now", "call");
         assert!(
-            !errors
-                .iter()
-                .any(|err| err.category == "code" && err.reference_token == "please"),
-            "sentence-initial Please must not be a code error, got {errors:?}"
+            errors.iter().all(|err| err.category != "code"),
+            "{errors:?}"
         );
         assert!(
-            errors
-                .iter()
-                .any(|err| err.category == "code" && err.reference_token == "formatvalidated"),
-            "formatValidated should still be a code-token error, got {errors:?}"
+            errors.iter().any(|err| err.category == "omitted_phrase"),
+            "expected declared omitted_phrase category, got {errors:?}"
         );
     }
 
@@ -580,6 +588,14 @@ mod tests {
         assert_eq!(wer.insertions, 2);
         assert_eq!(wer.substitutions, 0);
         assert_eq!(wer.deletions, 0);
+    }
+
+    #[test]
+    fn terminal_period_rule_handles_digit_words_but_preserves_numbers_and_urls() {
+        assert_eq!(tokenize("build1."), ["build1"]);
+        assert_eq!(tokenize("foo.bar."), ["foo.bar"]);
+        assert_eq!(tokenize("42."), ["42."]);
+        assert_eq!(tokenize("https://example.test."), ["https://example.test."]);
     }
 
     const CORPUS_VOCABULARY: [&str; 5] = ["alpha", "beta", "gamma", "delta", "epsilon"];
