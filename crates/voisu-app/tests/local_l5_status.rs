@@ -197,7 +197,7 @@ fn local_setup_does_not_prompt_for_cloud_keys() {
         "{combined}"
     );
     assert!(
-        combined.contains("no bakeoff winner; production weights are not downloaded"),
+        combined.contains("Nothing is auto-downloaded."),
         "{combined}"
     );
 }
