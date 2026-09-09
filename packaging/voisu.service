@@ -30,6 +30,9 @@ NoNewPrivileges=yes
 # (status=226/NAMESPACE) the way an explicit ReadWritePaths=%h/.config/voisu did.
 # For a --user unit they resolve to $XDG_CONFIG_HOME/voisu (~/.config/voisu) and
 # $XDG_STATE_HOME/voisu (~/.local/state/voisu), matching config_dir()/state_root().
+# Local model artifacts and recovery audio also live under StateDirectory.
+# systemd user units have no DataDirectory, and ReadWritePaths=%h fails
+# namespace setup on a fresh home (status=226/NAMESPACE).
 ProtectSystem=strict
 ConfigurationDirectory=voisu
 StateDirectory=voisu

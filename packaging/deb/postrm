@@ -16,8 +16,10 @@ user with:
     systemctl --user disable --now voisu-overlay.service
     systemctl --user daemon-reload
 
-Your Voisu configuration and state under ~/.config/voisu and
-~/.local/state/voisu are left untouched.
+Your Voisu configuration, Local models, recovery/debug audio, and credentials
+under ~/.config/voisu, ~/.local/state/voisu, and ~/.local/share/voisu are left
+untouched. Uninstall does not remove unrelated models, user debug audio, or
+active leased artifacts.
 
 EOF
         ;;
