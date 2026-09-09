@@ -105,7 +105,8 @@ pub use intent_routing::{
     route_intent,
 };
 
-pub mod vocabulary;
+mod vocabulary;
+pub use vocabulary::apply_user_vocabulary;
 
 mod compose_gate;
 pub use compose_gate::{

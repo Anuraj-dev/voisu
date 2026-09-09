@@ -162,7 +162,7 @@ pub fn decide_replay(
 
 /// User-vocabulary replacements via the Cloud span-aware matcher, ungated.
 pub fn apply_local_dictionary(text: &str, user_terms: &[String]) -> String {
-    voisu_core::vocabulary::apply_user_vocabulary(text, user_terms, &[])
+    voisu_core::apply_user_vocabulary(text, user_terms, &[])
 }
 
 #[cfg(test)]
