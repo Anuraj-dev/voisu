@@ -1,14 +1,19 @@
 //! Consented Local model install/repair. Never auto-downloads. Never probes Cloud keys.
 
-use voisu_core::AsrMode;
+use std::sync::Mutex;
 
+use voisu_core::{AsrMode, DaemonState, LocalReadiness, Response};
+
+use crate::daemon_lock::{self, SingleInstance};
 use crate::local_model::{
     ActiveReceipt, CandidateHealth, CatalogEntry, InstallClock, InstallConsent, InstallIo,
     InstallRequest, MaintenanceError, MaintenanceKind, MaintenanceReservation, ModelStore,
-    ProductionHttps, ReceiptError, ci_fixture_entry, install_entry, models_dir, parse_receipt,
-    retained_receipt_path, shipped_catalog, store_receipt_atomic,
+    ProductionHttps, ReceiptError, bakeoff_winner, install_entry, models_dir, parse_receipt,
+    retained_receipt_path, shipped_catalog, store_receipt_atomic, verify_candidate,
 };
 use crate::setup::WizardIo;
+
+const NO_PRODUCTION_DOWNLOAD: &str = "no bakeoff winner; production weights are not downloaded";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalSetupOutcome {
@@ -35,6 +40,10 @@ pub trait LocalSetupActions {
     fn retained_identity(&self) -> Option<String>;
     fn restore_retained(&mut self) -> Result<String, String>;
     fn install_fixture(&mut self, consent: InstallConsent) -> Result<String, String>;
+    /// Production has no selected download. Tests may offer a consented fixture.
+    fn consented_install(&self) -> Option<InstallConsent> {
+        None
+    }
 }
 
 pub struct ProductionLocalSetup;
@@ -62,12 +71,13 @@ impl LocalSetupActions for ProductionLocalSetup {
     }
 
     fn install_fixture(&mut self, consent: InstallConsent) -> Result<String, String> {
-        let entry = ci_fixture_entry();
-        if entry.production_weights {
-            return Err("no bakeoff winner; production weights are not downloaded".into());
-        }
+        let Some(entry) =
+            bakeoff_winner(&shipped_catalog()).filter(|entry| !entry.production_weights)
+        else {
+            return Err(NO_PRODUCTION_DOWNLOAD.into());
+        };
         if consent.bytes != entry.total_bytes() || consent.license_spdx != entry.license.spdx {
-            return Err("consent does not match the catalog fixture".into());
+            return Err("consent does not match the catalog entry".into());
         }
         let mut store = load_store()?;
         install_entry(InstallRequest {
@@ -75,7 +85,7 @@ impl LocalSetupActions for ProductionLocalSetup {
             entry,
             fetcher: &ProductionHttps,
             health: &CandidateHealth::default(),
-            maintenance: &SetupMaintenance,
+            maintenance: &SetupMaintenance::default(),
             consent,
             io: InstallIo::default(),
             clock: InstallClock::default(),
@@ -85,11 +95,58 @@ impl LocalSetupActions for ProductionLocalSetup {
     }
 }
 
-struct SetupMaintenance;
+struct SetupMaintenance {
+    lifetime: Mutex<Option<SingleInstance>>,
+}
+
+impl Default for SetupMaintenance {
+    fn default() -> Self {
+        Self {
+            lifetime: Mutex::new(None),
+        }
+    }
+}
 
 impl MaintenanceReservation for SetupMaintenance {
     fn acquire(&self) -> Result<MaintenanceKind, MaintenanceError> {
-        Ok(MaintenanceKind::Idle)
+        match daemon_lock::try_acquire_lifetime_lock() {
+            Ok(lock) => {
+                if let Some(response) = crate::system::daemon_status_response() {
+                    drop(lock);
+                    return maintenance_from_status(&response);
+                }
+                *self
+                    .lifetime
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lock);
+                Ok(MaintenanceKind::Idle)
+            }
+            Err(_) => match crate::system::daemon_status_response() {
+                Some(response) => maintenance_from_status(&response),
+                None => Err(MaintenanceError::Busy("daemon is not idle")),
+            },
+        }
+    }
+}
+
+fn maintenance_from_status(response: &Response) -> Result<MaintenanceKind, MaintenanceError> {
+    match response.state {
+        Some(DaemonState::Recording) => Err(MaintenanceError::Busy("Recording active")),
+        Some(DaemonState::Processing)
+            if response.message.to_ascii_lowercase().contains("replay") =>
+        {
+            Err(MaintenanceError::Busy("Replay active"))
+        }
+        Some(DaemonState::Processing) => Err(MaintenanceError::Busy("daemon is not idle")),
+        _ => match response.asr_mode.as_ref().map(|asr| &asr.local_readiness) {
+            Some(LocalReadiness::Busy | LocalReadiness::Stopping) => {
+                Err(MaintenanceError::Busy("Replay active"))
+            }
+            Some(LocalReadiness::Loading | LocalReadiness::Verifying) => {
+                Err(MaintenanceError::Busy("daemon is not idle"))
+            }
+            _ => Ok(MaintenanceKind::Idle),
+        },
     }
 }
 
@@ -130,25 +187,22 @@ pub fn run_with(
         io.writeln(&format!("Restored retained model {id} without network."));
         return Ok(LocalSetupOutcome::Restored);
     }
-    let fixture = ci_fixture_entry();
+    let Some(consent) = actions.consented_install() else {
+        io.writeln(NO_PRODUCTION_DOWNLOAD);
+        return Ok(LocalSetupOutcome::Skipped);
+    };
     io.writeln(&format!(
-        "Fixture {} is {} bytes, license {}.",
-        fixture.id,
-        fixture.total_bytes(),
-        fixture.license.spdx
+        "Candidate is {} bytes, license {}.",
+        consent.bytes, consent.license_spdx
     ));
     if !ask_yes_no(
         io,
-        "Download and install the catalog fixture? Type yes to consent.",
+        "Download and install this catalog entry? Type yes to consent.",
         false,
     ) {
         io.writeln("No download. Setup did not install a model.");
         return Ok(LocalSetupOutcome::Skipped);
     }
-    let consent = InstallConsent {
-        bytes: fixture.total_bytes(),
-        license_spdx: fixture.license.spdx.to_owned(),
-    };
     let id = actions.install_fixture(consent)?;
     io.writeln(&format!("Installed {id} after explicit consent."));
     Ok(LocalSetupOutcome::Installed)
@@ -163,7 +217,7 @@ fn catalog_line(entry: &CatalogEntry) -> String {
     let kind = if entry.production_weights {
         "unelected production weights; not downloaded"
     } else {
-        "installable with consent"
+        "test fixture; not a production download"
     };
     format!(
         "{}  {} bytes  {}  {kind}",
@@ -174,8 +228,24 @@ fn catalog_line(entry: &CatalogEntry) -> String {
 }
 
 pub fn restore_retained_receipt() -> Result<String, String> {
-    let store = load_store().map_err(|error| error.to_string())?;
-    let receipt = load_retained()?;
+    restore_retained_receipt_in(&load_store()?)
+}
+
+fn restore_retained_receipt_in(store: &ModelStore) -> Result<String, String> {
+    let _lock = store
+        .lock_exclusive()
+        .map_err(|error| format!("{error:?}"))?;
+    let receipt = load_retained_from(store)?;
+    let entry = catalog_entry_for(&receipt)?;
+    if receipt.runtime_abi != entry.runtime_abi.abi_id
+        || receipt.protocol != entry.runtime_abi.protocol
+    {
+        return Err("retained model ABI does not match the catalog".into());
+    }
+    let artifact = store.artifact_dir(entry, &receipt.artifact_id);
+    if let Err(error) = verify_candidate(entry, &artifact) {
+        return Err(format!("retained model failed verification: {error:?}"));
+    }
     store_receipt_atomic(store.root(), &receipt).map_err(|error| format!("{error:?}"))?;
     Ok(receipt.catalog_id)
 }
@@ -186,7 +256,10 @@ fn load_store() -> Result<ModelStore, String> {
 }
 
 fn load_retained() -> Result<ActiveReceipt, String> {
-    let store = load_store()?;
+    load_retained_from(&load_store()?)
+}
+
+fn load_retained_from(store: &ModelStore) -> Result<ActiveReceipt, String> {
     let path = retained_receipt_path(store.root());
     let text =
         std::fs::read_to_string(&path).map_err(|_| "no retained model receipt".to_owned())?;
@@ -194,6 +267,14 @@ fn load_retained() -> Result<ActiveReceipt, String> {
         ReceiptError::Missing => "no retained model receipt".to_owned(),
         other => format!("{other:?}"),
     })
+}
+
+fn catalog_entry_for(receipt: &ActiveReceipt) -> Result<&'static CatalogEntry, String> {
+    shipped_catalog()
+        .entries
+        .iter()
+        .find(|entry| entry.id == receipt.catalog_id && entry.revision == receipt.catalog_revision)
+        .ok_or_else(|| "retained receipt is not in the shipped catalog".to_owned())
 }
 
 fn ask_yes_no(io: &mut dyn WizardIo, question: &str, default_yes: bool) -> bool {
@@ -215,7 +296,8 @@ fn ask_yes_no(io: &mut dyn WizardIo, question: &str, default_yes: bool) -> bool 
 mod tests {
     use super::*;
     use crate::local_doctor::CLOUD_CREDENTIAL_MAINTENANCE;
-    use crate::local_model::{bakeoff_winner, from_entry};
+    use crate::local_model::{bakeoff_winner, ci_fixture_entry, from_entry};
+    use std::os::unix::fs::PermissionsExt;
 
     struct FakeIo {
         lines: Vec<Option<String>>,
@@ -289,6 +371,14 @@ mod tests {
             self.installed_consent = Some(consent);
             self.install.clone()
         }
+
+        fn consented_install(&self) -> Option<InstallConsent> {
+            let fixture = ci_fixture_entry();
+            Some(InstallConsent {
+                bytes: fixture.total_bytes(),
+                license_spdx: fixture.license.spdx.to_owned(),
+            })
+        }
     }
 
     #[test]
@@ -354,21 +444,30 @@ mod tests {
         assert_eq!(consent.license_spdx, fixture.license.spdx);
     }
 
+    fn write_fixture_artifact(store: &ModelStore, artifact_id: &str) {
+        let fixture = ci_fixture_entry();
+        let dir = store.artifact_dir(fixture, artifact_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.bin"), CatalogEntry::fixture_model_bytes()).unwrap();
+        std::fs::write(dir.join("health.pcm"), CatalogEntry::fixture_pcm_bytes()).unwrap();
+    }
+
     #[test]
     fn restore_retained_receipt_rewrites_active_without_fetch() {
         let temp = tempfile::tempdir().unwrap();
-        let _guard = StoreHomeGuard::set(temp.path());
-        let store = ModelStore::open(models_dir().unwrap()).unwrap();
+        let store = ModelStore::open(temp.path().to_path_buf()).unwrap();
         let fixture = ci_fixture_entry();
         let previous = from_entry(fixture, "old");
         let retained = from_entry(fixture, "kept");
+        write_fixture_artifact(&store, "old");
+        write_fixture_artifact(&store, "kept");
         store_receipt_atomic(store.root(), &previous).unwrap();
         std::fs::write(
             retained_receipt_path(store.root()),
             crate::local_model::encode_receipt(&retained),
         )
         .unwrap();
-        let id = restore_retained_receipt().unwrap();
+        let id = restore_retained_receipt_in(&store).unwrap();
         assert_eq!(id, "l3-health-fixture");
         assert_eq!(
             store.load_active().unwrap().unwrap().artifact_id,
@@ -377,7 +476,54 @@ mod tests {
     }
 
     #[test]
-    fn production_adapter_rejects_mismatched_consent_without_downloading() {
+    fn restore_leaves_active_receipt_when_retained_artifact_is_corrupt() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ModelStore::open(temp.path().to_path_buf()).unwrap();
+        let fixture = ci_fixture_entry();
+        let previous = from_entry(fixture, "old");
+        let retained = from_entry(fixture, "kept");
+        write_fixture_artifact(&store, "old");
+        let bad = store.artifact_dir(fixture, "kept");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("model.bin"), b"corrupt-bytes").unwrap();
+        std::fs::write(bad.join("health.pcm"), CatalogEntry::fixture_pcm_bytes()).unwrap();
+        store_receipt_atomic(store.root(), &previous).unwrap();
+        std::fs::write(
+            retained_receipt_path(store.root()),
+            crate::local_model::encode_receipt(&retained),
+        )
+        .unwrap();
+        let error = restore_retained_receipt_in(&store).unwrap_err();
+        assert!(error.contains("failed verification"), "{error}");
+        assert_eq!(
+            store.load_active().unwrap().unwrap().artifact_id,
+            previous.artifact_id
+        );
+    }
+
+    #[test]
+    fn production_run_does_not_offer_the_ci_fixture_download() {
+        let mut io = FakeIo::new(vec![]);
+        let mut actions = ProductionLocalSetup;
+        let outcome = run_with(&mut io, &mut actions).unwrap();
+        assert_eq!(outcome, LocalSetupOutcome::Skipped);
+        let transcript = io.transcript();
+        assert!(transcript.contains(NO_PRODUCTION_DOWNLOAD), "{transcript}");
+        assert!(
+            !transcript.contains("Download and install the catalog fixture"),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("unelected production weights"),
+            "{transcript}"
+        );
+        assert!(actions.consented_install().is_none());
+        assert!(CLOUD_CREDENTIAL_MAINTENANCE.contains("Cloud credential-maintenance"));
+        assert!(bakeoff_winner(&shipped_catalog()).is_none());
+    }
+
+    #[test]
+    fn production_adapter_refuses_to_download_without_a_winner() {
         let mut actions = ProductionLocalSetup;
         let error = actions
             .install_fixture(InstallConsent {
@@ -385,41 +531,74 @@ mod tests {
                 license_spdx: "MIT".into(),
             })
             .unwrap_err();
-        assert!(error.contains("consent does not match"), "{error}");
-        assert!(CLOUD_CREDENTIAL_MAINTENANCE.contains("Cloud credential-maintenance"));
-        assert!(bakeoff_winner(&shipped_catalog()).is_none());
+        assert!(error.contains(NO_PRODUCTION_DOWNLOAD), "{error}");
     }
 
-    struct StoreHomeGuard {
-        previous_data: Option<std::ffi::OsString>,
-        previous_home: Option<std::ffi::OsString>,
+    #[test]
+    fn maintenance_rejects_recording_replay_and_busy_daemon() {
+        let recording = Response::success(DaemonState::Recording, "Recording");
+        assert_eq!(
+            maintenance_from_status(&recording),
+            Err(MaintenanceError::Busy("Recording active"))
+        );
+        let replay = Response::success(DaemonState::Processing, "Replay in progress");
+        assert_eq!(
+            maintenance_from_status(&replay),
+            Err(MaintenanceError::Busy("Replay active"))
+        );
+        let busy = Response::success(DaemonState::Processing, "processing");
+        assert_eq!(
+            maintenance_from_status(&busy),
+            Err(MaintenanceError::Busy("daemon is not idle"))
+        );
+        let idle = Response::success(DaemonState::Idle, "idle");
+        assert_eq!(maintenance_from_status(&idle), Ok(MaintenanceKind::Idle));
     }
 
-    impl StoreHomeGuard {
+    #[test]
+    fn restore_fails_closed_when_the_store_lock_is_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ModelStore::open(temp.path().to_path_buf()).unwrap();
+        let _held = store.lock_exclusive().unwrap();
+        let error = restore_retained_receipt_in(&store).unwrap_err();
+        assert!(error.contains("Busy"), "{error}");
+    }
+
+    #[test]
+    fn setup_maintenance_holds_the_lifetime_lock_when_the_daemon_is_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _guard = RuntimeGuard::set(temp.path());
+        let maintenance = SetupMaintenance::default();
+        assert_eq!(maintenance.acquire(), Ok(MaintenanceKind::Idle));
+        assert!(
+            daemon_lock::try_acquire_lifetime_lock().is_err(),
+            "install must keep the daemon from starting"
+        );
+        drop(maintenance);
+        assert!(daemon_lock::try_acquire_lifetime_lock().is_ok());
+    }
+
+    struct RuntimeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl RuntimeGuard {
         fn set(path: &std::path::Path) -> Self {
-            let previous_data = std::env::var_os("XDG_DATA_HOME");
-            let previous_home = std::env::var_os("HOME");
+            let previous = std::env::var_os("XDG_RUNTIME_DIR");
             unsafe {
-                std::env::set_var("XDG_DATA_HOME", path);
-                std::env::set_var("HOME", path);
+                std::env::set_var("XDG_RUNTIME_DIR", path);
             }
-            Self {
-                previous_data,
-                previous_home,
-            }
+            Self { previous }
         }
     }
 
-    impl Drop for StoreHomeGuard {
+    impl Drop for RuntimeGuard {
         fn drop(&mut self) {
             unsafe {
-                match &self.previous_data {
-                    Some(value) => std::env::set_var("XDG_DATA_HOME", value),
-                    None => std::env::remove_var("XDG_DATA_HOME"),
-                }
-                match &self.previous_home {
-                    Some(value) => std::env::set_var("HOME", value),
-                    None => std::env::remove_var("HOME"),
+                match &self.previous {
+                    Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
                 }
             }
         }
