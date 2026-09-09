@@ -202,4 +202,16 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, SupervisorError::Unavailable(_)));
     }
+
+    #[test]
+    fn local_path_refuses_work_before_the_worker_is_ready() {
+        let sentinel = CloudCapabilitySentinel::new();
+        let mut supervisor = WorkerSupervisor::<FakeWorker>::absent();
+        let error = transcribe_through_supervisor(&mut supervisor, corr(), vec![1, 0], &sentinel)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SupervisorError::NotReady(WorkerState::Absent)
+        ));
+    }
 }
