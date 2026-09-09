@@ -17,6 +17,7 @@ pub mod local_doctor;
 pub mod local_model;
 pub mod local_offline;
 pub mod local_overlay;
+pub mod local_packaging;
 pub mod local_recovery;
 pub mod local_routing;
 pub mod local_setup;

@@ -1,4 +1,8 @@
-//! `$XDG_DATA_HOME/voisu/models` with version/hash directories and leases.
+//! `$XDG_STATE_HOME/voisu/models` with version/hash directories and leases.
+//!
+//! systemd user units provision StateDirectory, not a DataDirectory.
+//! `ProtectSystem=strict` plus `ReadWritePaths=%h` fails namespace setup on a
+//! fresh home, so Local artifacts stay under StateDirectory=voisu.
 
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
@@ -41,9 +45,10 @@ pub struct ModelStore {
 }
 
 pub fn models_dir() -> Result<PathBuf, StoreError> {
-    models_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+    models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
 }
 
+/// Legacy XDG data layout. Production writes StateDirectory models.
 pub fn models_dir_from(
     xdg_data: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
@@ -57,6 +62,22 @@ pub fn models_dir_from(
                 .map(|home| home.join(".local/share"))
         })
         .ok_or_else(|| StoreError::Path("neither XDG_DATA_HOME nor HOME is absolute".into()))?;
+    Ok(base.join("voisu").join("models"))
+}
+
+pub fn models_dir_from_state(
+    xdg_state: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf, StoreError> {
+    let base = xdg_state
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".local/state"))
+        })
+        .ok_or_else(|| StoreError::Path("neither XDG_STATE_HOME nor HOME is absolute".into()))?;
     Ok(base.join("voisu").join("models"))
 }
 
@@ -187,6 +208,14 @@ mod tests {
         assert_eq!(
             fallback,
             PathBuf::from("/home/raja/.local/share/voisu/models")
+        );
+        let state = models_dir_from_state(Some("/tmp/xdg-state".into()), Some("/home/raja".into()))
+            .unwrap();
+        assert_eq!(state, PathBuf::from("/tmp/xdg-state/voisu/models"));
+        let state_fallback = models_dir_from_state(None, Some("/home/raja".into())).unwrap();
+        assert_eq!(
+            state_fallback,
+            PathBuf::from("/home/raja/.local/state/voisu/models")
         );
     }
 

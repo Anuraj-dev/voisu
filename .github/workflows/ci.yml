@@ -39,6 +39,8 @@ jobs:
         run: cargo test --manifest-path tools/transcript-quality/Cargo.toml --locked
       - name: Hyprland release-gate shell suite
         run: bash packaging/tests/hyprland-release-gate.sh
+      - name: Local ASR packaging-gate shell suite
+        run: bash packaging/tests/local-asr-release-gate.sh
       - name: Flake gate — 3 consecutive parallel voisu-app runs
         run: |
           for i in 1 2 3; do

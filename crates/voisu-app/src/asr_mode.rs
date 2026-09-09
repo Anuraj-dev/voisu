@@ -605,7 +605,10 @@ pub fn set_asr_mode_response(
         Ok(commit) => {
             let mut response = Response::success(
                 daemon_state,
-                format!("ASR mode set to {}", commit.mode.as_str()),
+                crate::local_packaging::annotate_mode_message(
+                    commit.mode,
+                    format!("ASR mode set to {}", commit.mode.as_str()),
+                ),
             );
             attach_status(&mut response, active);
             if let Some(status) = response.asr_mode.as_mut() {
@@ -668,9 +671,12 @@ fn set_mode_offline(mode: AsrMode) -> Result<String, CliModeError> {
             Err(_) => {
                 let commit = persist_asr_mode(mode)
                     .map_err(|error| CliModeError::new(4, error.message().to_owned()))?;
-                Ok(format!(
-                    "ASR mode set to {}; it applies at the next supported daemon start",
-                    commit.mode.as_str()
+                Ok(crate::local_packaging::annotate_mode_message(
+                    commit.mode,
+                    format!(
+                        "ASR mode set to {}; it applies at the next supported daemon start",
+                        commit.mode.as_str()
+                    ),
                 ))
             }
         },

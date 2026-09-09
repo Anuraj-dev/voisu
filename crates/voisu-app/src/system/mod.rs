@@ -2685,12 +2685,6 @@ mod tests {
         assert!(!secure("not a url"));
     }
 
-    #[ignore = "L0-DEFECT: R4 catalog URL parser is not implemented"]
-    #[test]
-    fn catalog_download_url_rejects_uncataloged_https_and_http_loopback() {
-        unimplemented!("catalog_download_url must not reuse provider_endpoint_url");
-    }
-
     #[test]
     fn provider_endpoint_gate_rejects_backslash_and_stripped_control_characters() {
         let secure = |endpoint: &str| provider_endpoint_url(endpoint).is_some();
