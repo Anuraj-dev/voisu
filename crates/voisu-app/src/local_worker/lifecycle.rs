@@ -189,10 +189,11 @@ impl<C: WorkerChild, D: DeliverySeam> LocalLifecycle<C, D> {
     }
 }
 
-/// Production Start/Replay remain refused before capture (L4 owns routing).
+/// Production Start and Replay remain refused before capture until measurement
+/// selects a catalog entry. A Pilot Candidate alone cannot open this gate.
 #[must_use]
 pub fn production_local_admission() -> bool {
-    false
+    crate::local_model::production_selection(&crate::local_model::shipped_catalog()).is_some()
 }
 
 #[cfg(test)]
@@ -225,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn production_admission_is_closed() {
+    fn production_admission_ignores_the_unmeasured_pilot_candidate() {
         assert!(!production_local_admission());
     }
 

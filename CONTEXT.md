@@ -18,6 +18,18 @@ _Avoid_: Output, message, transcription result
 The degree to which a Transcript preserves the meaning and complete content of the Recording. It outranks presentation polish and latency; uncertain text may remain unformatted but must not be silently deleted, invented, or reinterpreted.
 _Avoid_: Output quality, prettiness, model quality
 
+**Pilot Candidate**:
+A runtime and model pair exercised on a limited host to learn whether a broader
+evaluation is worthwhile. Pilot success is evidence, but does not authorize
+product selection or a supported-platform claim.
+_Avoid_: Winner, selected model, supported runtime
+
+**Bakeoff Winner**:
+A Pilot Candidate that passes the frozen quality, privacy, performance,
+reliability, packaging, and host acceptance gates. If no candidate passes every
+required gate, there is no Bakeoff Winner.
+_Avoid_: Pilot winner, provisional winner, hardcoded winner
+
 **Source Transcript**:
 Text returned independently by Groq or Deepgram before reconciliation and
 quality validation.

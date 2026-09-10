@@ -240,7 +240,7 @@ pub fn models_live_under_state(models: &Path, state_root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::local_model::bakeoff_winner;
+    use crate::local_model::{pilot_candidate, production_selection};
     use crate::local_worker::{GateVerdict, evaluate_report};
     use std::fs;
     use voisu_core::AsrMode;
@@ -306,7 +306,15 @@ mod tests {
             false,
         );
         assert_eq!(report.verdict, GateVerdict::PendingEvidence);
-        assert!(bakeoff_winner(&crate::local_model::shipped_catalog()).is_none());
+        let catalog = crate::local_model::shipped_catalog();
+        let candidate = pilot_candidate(&catalog).expect("Pilot Candidate");
+        assert_eq!(candidate.id, "whisper-cpp-ggml-base.en");
+        assert!(production_selection(&catalog).is_none());
+        assert!(
+            defects
+                .iter()
+                .any(|d| d.id == "locked-english-bakeoff" && d.blocks_local_ship && !d.waived)
+        );
     }
 
     #[test]

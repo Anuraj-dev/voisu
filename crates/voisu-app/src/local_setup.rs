@@ -6,14 +6,14 @@ use voisu_core::{AsrMode, DaemonState, LocalReadiness, Response};
 
 use crate::daemon_lock::{self, SingleInstance};
 use crate::local_model::{
-    ActiveReceipt, CandidateHealth, CatalogEntry, InstallClock, InstallConsent, InstallIo,
-    InstallRequest, MaintenanceError, MaintenanceKind, MaintenanceReservation, ModelStore,
-    ProductionHttps, ReceiptError, bakeoff_winner, install_entry, models_dir, parse_receipt,
+    ActiveReceipt, CatalogEntry, InstallConsent, MaintenanceError, MaintenanceKind,
+    MaintenanceReservation, ModelStore, ReceiptError, models_dir, parse_receipt, pilot_candidate,
     retained_receipt_path, shipped_catalog, store_receipt_atomic, verify_candidate,
 };
 use crate::setup::WizardIo;
 
-const NO_PRODUCTION_DOWNLOAD: &str = "no bakeoff winner; production weights are not downloaded";
+const NO_PRODUCTION_DOWNLOAD: &str =
+    "Pilot Candidate is evidence-gated; production weights are not downloaded.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalSetupOutcome {
@@ -40,7 +40,8 @@ pub trait LocalSetupActions {
     fn retained_identity(&self) -> Option<String>;
     fn restore_retained(&mut self) -> Result<String, String>;
     fn install_fixture(&mut self, consent: InstallConsent) -> Result<String, String>;
-    /// Production has no selected download. Tests may offer a consented fixture.
+    /// Typed test actions may inject a hermetic fixture selection.
+    /// Production returns `None` while model selection is evidence-gated.
     fn consented_install(&self) -> Option<InstallConsent> {
         None
     }
@@ -70,28 +71,8 @@ impl LocalSetupActions for ProductionLocalSetup {
         restore_retained_receipt()
     }
 
-    fn install_fixture(&mut self, consent: InstallConsent) -> Result<String, String> {
-        let Some(entry) =
-            bakeoff_winner(&shipped_catalog()).filter(|entry| !entry.production_weights)
-        else {
-            return Err(NO_PRODUCTION_DOWNLOAD.into());
-        };
-        if consent.bytes != entry.total_bytes() || consent.license_spdx != entry.license.spdx {
-            return Err("consent does not match the catalog entry".into());
-        }
-        let mut store = load_store()?;
-        install_entry(InstallRequest {
-            store: &mut store,
-            entry,
-            fetcher: &ProductionHttps,
-            health: &CandidateHealth::default(),
-            maintenance: &SetupMaintenance::default(),
-            consent,
-            io: InstallIo::default(),
-            clock: InstallClock::default(),
-        })
-        .map(|receipt| receipt.catalog_id)
-        .map_err(|error| format!("{error:?}"))
+    fn install_fixture(&mut self, _consent: InstallConsent) -> Result<String, String> {
+        Err(NO_PRODUCTION_DOWNLOAD.into())
     }
 }
 
@@ -164,13 +145,19 @@ pub fn run_with(
     io: &mut dyn WizardIo,
     actions: &mut dyn LocalSetupActions,
 ) -> Result<LocalSetupOutcome, String> {
-    io.writeln("Voisu Local Setup — explicit model install and repair.");
+    io.writeln("Voisu Local Setup: model status and retained-model repair.");
     io.writeln(
         "Cloud credential-maintenance is `voisu auth verify` and is never run from Local setup.",
     );
-    io.writeln("Downloads stay consented Setup-only. Nothing is auto-downloaded.");
+    io.writeln("Production model downloads are evidence-gated. Nothing is auto-downloaded.");
     io.writeln("");
-    io.writeln("Catalog (no bakeoff winner is selected):");
+    match pilot_candidate(&shipped_catalog()) {
+        Some(candidate) => io.writeln(&format!(
+            "Catalog (Pilot Candidate: {}; not selected for production):",
+            candidate.id
+        )),
+        None => io.writeln("Catalog (no Pilot Candidate):"),
+    }
     for line in actions.catalog_lines() {
         io.writeln(&format!("  {line}"));
     }
@@ -220,8 +207,10 @@ pub fn catalog_presentation() -> Vec<String> {
 }
 
 fn catalog_line(entry: &CatalogEntry) -> String {
-    let kind = if entry.production_weights {
-        "unelected production weights; not downloaded"
+    let kind = if Some(entry.id) == pilot_candidate(&shipped_catalog()).map(|entry| entry.id) {
+        "Pilot Candidate; evidence-gated, not downloadable"
+    } else if entry.production_weights {
+        "unmeasured candidate; not downloadable"
     } else {
         "test fixture; not a production download"
     };
@@ -319,7 +308,7 @@ fn ask_yes_no(io: &mut dyn WizardIo, question: &str, default_yes: bool) -> bool 
 mod tests {
     use super::*;
     use crate::local_doctor::CLOUD_CREDENTIAL_MAINTENANCE;
-    use crate::local_model::{bakeoff_winner, ci_fixture_entry, from_entry};
+    use crate::local_model::{ci_fixture_entry, from_entry, pilot_candidate};
     use std::os::unix::fs::PermissionsExt;
 
     struct FakeIo {
@@ -423,8 +412,8 @@ mod tests {
         let transcript = io.transcript();
         assert!(transcript.contains("never run from Local setup"));
         assert!(transcript.contains("Nothing is auto-downloaded"));
-        assert!(transcript.contains("no bakeoff winner"));
-        assert!(transcript.contains("unelected production weights"));
+        assert!(transcript.contains("Pilot Candidate"));
+        assert!(transcript.contains("unmeasured candidate"));
         assert!(!transcript.to_ascii_lowercase().contains("ollama"));
     }
 
@@ -541,36 +530,22 @@ mod tests {
     }
 
     #[test]
-    fn production_run_does_not_offer_the_ci_fixture_download() {
-        let mut io = FakeIo::new(vec![]);
+    fn production_actions_show_but_cannot_install_the_pilot_candidate() {
         let mut actions = ProductionLocalSetup;
-        let outcome = run_with(&mut io, &mut actions).unwrap();
-        assert_eq!(outcome, LocalSetupOutcome::Skipped);
-        let transcript = io.transcript();
-        assert!(transcript.contains(NO_PRODUCTION_DOWNLOAD), "{transcript}");
-        assert!(
-            !transcript.contains("Download and install the catalog fixture"),
-            "{transcript}"
-        );
-        assert!(
-            transcript.contains("unelected production weights"),
-            "{transcript}"
-        );
+        let presentation = actions.catalog_lines().join("\n");
+        let catalog = shipped_catalog();
+        let candidate = pilot_candidate(&catalog).expect("Pilot Candidate");
+        assert!(presentation.contains(candidate.id), "{presentation}");
+        assert!(presentation.contains("not downloadable"), "{presentation}");
         assert!(actions.consented_install().is_none());
-        assert!(CLOUD_CREDENTIAL_MAINTENANCE.contains("Cloud credential-maintenance"));
-        assert!(bakeoff_winner(&shipped_catalog()).is_none());
-    }
-
-    #[test]
-    fn production_adapter_refuses_to_download_without_a_winner() {
-        let mut actions = ProductionLocalSetup;
         let error = actions
             .install_fixture(InstallConsent {
-                bytes: 1,
-                license_spdx: "MIT".into(),
+                bytes: candidate.total_bytes(),
+                license_spdx: candidate.license.spdx.into(),
             })
             .unwrap_err();
-        assert!(error.contains(NO_PRODUCTION_DOWNLOAD), "{error}");
+        assert_eq!(error, NO_PRODUCTION_DOWNLOAD);
+        assert!(CLOUD_CREDENTIAL_MAINTENANCE.contains("Cloud credential-maintenance"));
     }
 
     #[test]

@@ -18,6 +18,15 @@ const GGML_BASE_EN_BYTES: u64 = 147_964_211;
 const GGML_SMALL_EN_SHA: &str = "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d";
 const GGML_SMALL_EN_BYTES: u64 = 487_614_201;
 
+/// Pinned upstream whisper.cpp sample used as the non-private known-audio
+/// health fixture for the Pilot Candidate. Separate revision from the
+/// Hugging Face weights because it lives in the whisper.cpp git tree.
+/// Referenced by the Pilot Candidate test below; not used in non-test builds.
+#[cfg_attr(not(test), allow(dead_code))]
+const WHISPER_CPP_JFK_REV: &str = "c44b60b8053bbf2a5c1e014f11323fb3f2485177";
+const JFK_WAV_SHA: &str = "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e";
+const JFK_WAV_BYTES: u64 = 352_078;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileKind {
     Weights,
@@ -94,9 +103,19 @@ pub fn shipped_catalog() -> Catalog {
     }
 }
 
-/// Milestone one pins exactly one winner after L2 evidence. None is selected.
+/// Unmeasured Pilot Candidate retained for catalog and health work.
+/// This does not select a production model.
 #[must_use]
-pub fn bakeoff_winner(_catalog: &Catalog) -> Option<&'static CatalogEntry> {
+pub fn pilot_candidate(catalog: &Catalog) -> Option<&CatalogEntry> {
+    catalog
+        .entries
+        .iter()
+        .find(|entry| entry.id == "whisper-cpp-ggml-base.en")
+}
+
+/// Production selection remains empty until measurement evidence elects a model.
+#[must_use]
+pub fn production_selection(_catalog: &Catalog) -> Option<&CatalogEntry> {
     None
 }
 
@@ -182,12 +201,12 @@ const SHIPPED_ENTRIES: &[CatalogEntry] = &[
         id: "whisper-cpp-ggml-base.en",
         revision: WHISPER_CPP_HF_REV,
         language: "en",
-        required_names: &["ggml-base.en.bin"],
+        required_names: &["ggml-base.en.bin", "jfk.wav"],
         runtime_abi: WHISPER_ABI,
         devices: &[DeviceSupport::Cpu],
         license: LicenseTerms {
             spdx: "MIT",
-            name: "whisper.cpp GGML base.en (unelected)",
+            name: "whisper.cpp GGML base.en (Pilot Candidate)",
         },
         provenance: Provenance {
             publisher: "ggerganov/whisper.cpp",
@@ -196,16 +215,35 @@ const SHIPPED_ENTRIES: &[CatalogEntry] = &[
         },
         redistribution: Redistribution {
             allowed: true,
-            terms: "upstream whisper.cpp model card; not selected",
+            terms: "upstream whisper.cpp model card; Pilot Candidate, production selection evidence-gated",
         },
-        files: &[CatalogFile {
-            name: "ggml-base.en.bin",
-            sha256_hex: GGML_BASE_EN_SHA,
-            bytes: GGML_BASE_EN_BYTES,
-            url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/80da2d8bfee42b0e836fc3a9890373e5defc00a6/ggml-base.en.bin",
-            kind: FileKind::Weights,
-        }],
-        allowed_hosts: &["huggingface.co"],
+        files: &[
+            CatalogFile {
+                name: "ggml-base.en.bin",
+                sha256_hex: GGML_BASE_EN_SHA,
+                bytes: GGML_BASE_EN_BYTES,
+                url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/80da2d8bfee42b0e836fc3a9890373e5defc00a6/ggml-base.en.bin",
+                kind: FileKind::Weights,
+            },
+            CatalogFile {
+                name: "jfk.wav",
+                sha256_hex: JFK_WAV_SHA,
+                bytes: JFK_WAV_BYTES,
+                url: "https://raw.githubusercontent.com/ggml-org/whisper.cpp/c44b60b8053bbf2a5c1e014f11323fb3f2485177/samples/jfk.wav",
+                kind: FileKind::HealthFixture,
+            },
+        ],
+        allowed_hosts: &[
+            "huggingface.co",
+            "raw.githubusercontent.com",
+            // Pilot Candidate exception: HF `resolve`
+            // answers with a 302 to HF-operated blob CDN hosts, so a strict
+            // same-host redirect policy can never complete the download. The
+            // host below is pinned exactly and visibly; any rotation breaks
+            // loudly instead of escaping silently. A principled redirect-host
+            // policy is still open.
+            "us.aws.cdn.hf.co",
+        ],
         production_weights: true,
     },
     CatalogEntry {
@@ -288,7 +326,9 @@ mod tests {
     #[test]
     fn production_entries_pin_immutable_revisions_not_main() {
         let catalog = shipped_catalog();
-        assert!(bakeoff_winner(&catalog).is_none());
+        let candidate = pilot_candidate(&catalog).expect("Pilot Candidate");
+        assert_eq!(candidate.id, "whisper-cpp-ggml-base.en");
+        assert!(production_selection(&catalog).is_none());
         for entry in catalog.entries {
             assert_ne!(entry.runtime_abi.family, RuntimeFamily::FasterWhisper);
             assert!(!format!("{entry:?}").to_ascii_lowercase().contains("ollama"));
@@ -327,6 +367,39 @@ mod tests {
             production[1].file("ggml-small.en.bin").unwrap().sha256_hex,
             GGML_SMALL_EN_SHA
         );
+    }
+
+    #[test]
+    fn pilot_candidate_pins_jfk_health_fixture_to_an_immutable_rev() {
+        let catalog = shipped_catalog();
+        let candidate = pilot_candidate(&catalog).expect("Pilot Candidate");
+        assert!(candidate.production_weights);
+        let jfk = candidate.file("jfk.wav").expect("pilot health fixture");
+        assert_eq!(jfk.kind, FileKind::HealthFixture);
+        assert_eq!(jfk.bytes, JFK_WAV_BYTES);
+        assert_eq!(jfk.sha256_hex, JFK_WAV_SHA);
+        assert!(
+            jfk.url.contains(WHISPER_CPP_JFK_REV),
+            "health fixture must stay pinned, not floating: {}",
+            jfk.url
+        );
+        assert!(
+            candidate
+                .allowed_hosts
+                .contains(&"raw.githubusercontent.com")
+        );
+        assert!(candidate.required_names.contains(&"jfk.wav"));
+        // Pilot redirect exception stays exact and visible (see allowed_hosts).
+        assert!(candidate.allowed_hosts.contains(&"us.aws.cdn.hf.co"));
+        // small.en remains a separate unmeasured entry without a health fixture.
+        let small = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "whisper-cpp-ggml-small.en")
+            .expect("small.en candidate");
+        assert!(small.production_weights);
+        assert!(small.file("jfk.wav").is_none());
+        assert_ne!(small.id, candidate.id);
     }
 
     #[test]

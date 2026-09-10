@@ -7,7 +7,7 @@ use voisu_app::local_worker::{
     BakeoffCase, CaseKind, CriticalKind, DurationBand, Eligibility, FakeWorker, FeasibilityRunner,
     GateVerdict, RuntimeFamily, Split, WorkerState, WorkerSupervisor, evaluate_report,
     evaluation_order, locked_host_profiles, packaged_unit_restrictions,
-    refuse_production_weight_download, whisper_cpp_paths,
+    refuse_production_weight_download,
 };
 use voisu_app::local_worker::{Correlation, TranscribeRequest};
 
@@ -31,11 +31,8 @@ fn whisper_cpp_is_first_and_ci_never_downloads_weights() {
         Eligibility::EvaluateFirst { .. }
     ));
     assert!(refuse_production_weight_download().is_err());
-    let paths = whisper_cpp_paths();
-    assert!(
-        paths.model.is_none(),
-        "CI must not inject production weights via VOISU_WHISPER_CPP_MODEL"
-    );
+    let catalog = voisu_app::local_model::shipped_catalog();
+    assert!(voisu_app::local_model::production_selection(&catalog).is_none());
 }
 
 #[test]

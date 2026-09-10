@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use crate::local_worker::{PROTOCOL_VERSION, refuse_production_weight_download};
 
-use super::catalog::{CatalogEntry, sha256_hex, verify_file_digest};
+use super::catalog::{
+    CatalogEntry, production_selection, sha256_hex, shipped_catalog, verify_file_digest,
+};
 use super::fetch::{ArtifactFetcher, FetchError, FetchRequest};
 use super::health::{HealthError, HealthProbe};
 use super::receipt::{self, ActiveReceipt};
@@ -188,7 +190,10 @@ where
     if request.io.abort == Some(InstallAbort::AfterLock) {
         return abort(prior);
     }
-    if request.entry.production_weights {
+    // Production weights remain blocked until measurement selects an entry.
+    if request.entry.production_weights
+        && production_selection(&shipped_catalog()).map(|entry| entry.id) != Some(request.entry.id)
+    {
         let _ = refuse_production_weight_download();
         return Err(InstallError::ProductionWeightsForbidden);
     }
@@ -414,9 +419,10 @@ mod tests {
     }
 
     #[test]
-    fn production_weights_are_not_downloaded() {
+    fn production_weights_are_not_downloaded_without_a_selection() {
         let (_temp, mut store) = open_store();
-        let entry = shipped_catalog()
+        let catalog = shipped_catalog();
+        let entry = catalog
             .entries
             .iter()
             .find(|entry| entry.production_weights)
@@ -425,6 +431,27 @@ mod tests {
             store: &mut store,
             entry,
             fetcher: &fixture_fetcher(),
+            health: &CandidateHealth::default(),
+            maintenance: &IdleMaintenance,
+            consent: consent(entry),
+            io: InstallIo::default(),
+            clock: InstallClock::default(),
+        })
+        .unwrap_err();
+        assert_eq!(error, InstallError::ProductionWeightsForbidden);
+        assert!(store.load_active().unwrap().is_none());
+    }
+
+    #[test]
+    fn pilot_candidate_is_refused_before_fetch() {
+        let (_temp, mut store) = open_store();
+        let catalog = shipped_catalog();
+        let entry = crate::local_model::pilot_candidate(&catalog).expect("Pilot Candidate");
+        let fetcher = ScriptedFetcher::new(vec![ScriptedHop::Body(b"too small".to_vec())]);
+        let error = install_entry(InstallRequest {
+            store: &mut store,
+            entry,
+            fetcher: &fetcher,
             health: &CandidateHealth::default(),
             maintenance: &IdleMaintenance,
             consent: consent(entry),

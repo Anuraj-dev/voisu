@@ -15,6 +15,7 @@ mod runtime;
 mod sandbox;
 mod seams;
 mod supervisor;
+mod whisper_cli;
 
 pub use bakeoff::{
     BakeoffCase, BakeoffReport, COLD_READY_MAX_MS, CORPUS_CONTRACT_ID, CORPUS_VERSION, CaseKind,
@@ -39,7 +40,6 @@ pub use protocol::{
 pub use runtime::{
     Eligibility, RuntimeCandidate, RuntimeError, RuntimeFamily, evaluation_order,
     refuse_production_weight_download, reject_forbidden_program, shipped_unit_candidates,
-    whisper_cpp_paths,
 };
 pub use sandbox::{
     CloudCapabilitySentinel, LauncherPolicy, PackagedUnitRestrictions, RestrictionProbe,
@@ -55,6 +55,7 @@ pub use supervisor::{
     WorkerOutcome, WorkerState, WorkerSupervisor, control_frame_from_json, spawn_program_allowed,
     worker_frame_from_json,
 };
+pub use whisper_cli::{PILOT_WHISPER_CLI, WhisperCppWorker};
 
 #[cfg(test)]
 mod product_unavailable_tests {

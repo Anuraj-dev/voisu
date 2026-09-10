@@ -154,7 +154,9 @@ fn clean_install_ships_no_production_weights_and_defaults_cloud() {
             .exists()
     );
     let catalog = voisu_app::local_model::shipped_catalog();
-    assert!(voisu_app::local_model::bakeoff_winner(&catalog).is_none());
+    let candidate = voisu_app::local_model::pilot_candidate(&catalog).expect("Pilot Candidate");
+    assert_eq!(candidate.id, "whisper-cpp-ggml-base.en");
+    assert!(voisu_app::local_model::production_selection(&catalog).is_none());
     assert!(
         catalog
             .entries
