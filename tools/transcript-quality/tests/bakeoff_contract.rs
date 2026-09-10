@@ -408,7 +408,57 @@ fn valid_public_report(manifest_sha256: &str) -> Value {
         "model_sha256": hash(700_002),
         "scoring_tool_git_commit": "0".repeat(40),
         "scoring_tool_cargo_lock_sha256": hash(700_003),
-        "sample_counts": { "speech": 100 },
+        "license_evidence": [
+            { "dataset_id": "public-dataset", "license_id": "CC0-1.0" }
+        ],
+        "sample_counts": {
+            "speech": 100,
+            "real_speech": 100,
+            "public_dataset_speech": 80,
+            "private_recording_speech": 20,
+            "synthetic_speech": 0,
+            "negative": 20,
+            "tuning_speech": 20,
+            "held_out_speech": 80
+        },
+        "duration_band_aggregates": [
+            { "duration_band": "one_to_ten_seconds", "sample_count": 100, "audio_duration_ms": 500000 }
+        ],
+        "stratum_aggregates": [
+            { "stratum_id": "quiet", "sample_count": 80, "word_errors": 8, "reference_words": 1000, "wer": 0.008 }
+        ],
+        "wer_counts_and_rates": {
+            "insertions": 1, "deletions": 2, "substitutions": 5,
+            "reference_words": 1000, "wer": 0.008
+        },
+        "punctuation_counts_and_rates": {
+            "insertions": 1, "deletions": 1, "substitutions": 1,
+            "reference_marks": 100, "error_rate": 0.03
+        },
+        "semantic_error_counts": {
+            "number": 0, "name": 0, "negation": 0, "command": 0,
+            "path": 0, "url": 0, "unit": 0, "omitted_phrase": 0, "total": 0
+        },
+        "warm_latency_p50_ms": 1000,
+        "warm_latency_p95_ms": 2000,
+        "warm_latency_max_ms": 2500,
+        "cold_latency_p50_ms": 20000,
+        "cold_latency_p95_ms": 30000,
+        "cold_latency_max_ms": 40000,
+        "soak_counts": {
+            "duration_ms": 7200000,
+            "recordings": 200,
+            "warmup_recordings": 20,
+            "crashes": 0,
+            "duplicate_deliveries": 0,
+            "stale_responses": 0,
+            "unexpected_network_attempts": 0,
+            "unreaped_children": 0,
+            "full_length_completed": true
+        },
+        "rss_growth_bytes": 0,
+        "negative_fixture_insertions": 0,
+        "packaged_runtime_passed": true,
         "gate_result": "not_measured"
     })
 }
@@ -460,6 +510,78 @@ fn public_report_must_match_the_frozen_schema_and_contract() {
 }
 
 #[test]
+fn public_report_requires_every_frozen_field() {
+    let report = valid_public_report(&hash(42));
+    let contract: Value = serde_json::from_str(BAKEOFF_CONTRACT_JSON).unwrap();
+    let fields = contract["public_report"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    for field in fields {
+        let mut missing = report.clone();
+        missing.as_object_mut().unwrap().remove(&field);
+        let err = validate_bakeoff_public_report_text(&serde_json::to_string(&missing).unwrap())
+            .unwrap_err();
+        assert!(err.contains(&field), "{field}: {err}");
+    }
+}
+
+#[test]
+fn public_report_rejects_wrong_types_and_domains() {
+    let report = valid_public_report(&hash(42));
+    for (pointer, invalid) in [
+        ("/corpus_version", json!(7)),
+        ("/runtime_sha256", json!("short")),
+        ("/scoring_tool_git_commit", json!("abc")),
+        ("/warm_latency_p95_ms", json!(-1)),
+        ("/packaged_runtime_passed", json!("yes")),
+        ("/gate_result", json!("probably")),
+        ("/wer_counts_and_rates/wer", json!(1.1)),
+    ] {
+        let mut invalid_report = report.clone();
+        invalid_report
+            .pointer_mut(pointer)
+            .unwrap()
+            .clone_from(&invalid);
+        let err =
+            validate_bakeoff_public_report_text(&serde_json::to_string(&invalid_report).unwrap())
+                .unwrap_err();
+        assert!(
+            err.contains(pointer.rsplit('/').next().unwrap()),
+            "{pointer}: {err}"
+        );
+    }
+}
+
+#[test]
+fn public_report_requires_safe_license_evidence() {
+    let report = valid_public_report(&hash(42));
+    validate_bakeoff_public_report_text(&serde_json::to_string(&report).unwrap()).unwrap();
+    let contract: Value = serde_json::from_str(BAKEOFF_CONTRACT_JSON).unwrap();
+    assert!(
+        contract["public_report"]["fields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("license_evidence"))
+    );
+
+    let mut missing = report.clone();
+    missing["license_evidence"] = json!([]);
+    let err =
+        validate_bakeoff_public_report_text(&serde_json::to_string(&missing).unwrap()).unwrap_err();
+    assert!(err.contains("license_evidence"), "{err}");
+
+    let mut unsafe_license = report;
+    unsafe_license["license_evidence"][0]["license_text"] =
+        json!("arbitrary license or private Transcript text");
+    let err = validate_bakeoff_public_report_text(&serde_json::to_string(&unsafe_license).unwrap())
+        .unwrap_err();
+    assert!(err.contains("license_text"), "{err}");
+}
+
+#[test]
 fn public_report_rejects_forbidden_private_fields_anywhere() {
     let manifest = valid_manifest();
     let validated =
@@ -488,10 +610,10 @@ fn public_report_rejects_forbidden_private_fields_anywhere() {
     }
 
     let mut nested = report.clone();
-    nested["stratum_aggregates"] = json!({ "quiet": { "audio_path": "/private/clip.wav" } });
+    nested["stratum_aggregates"][0]["transcript"] = json!("private words");
     let err =
         validate_bakeoff_public_report_text(&serde_json::to_string(&nested).unwrap()).unwrap_err();
-    assert!(err.contains("forbidden field"), "{err}");
+    assert!(err.contains("transcript"), "{err}");
 }
 
 #[test]

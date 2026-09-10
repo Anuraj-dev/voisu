@@ -59,11 +59,20 @@ cargo run --manifest-path tools/transcript-quality/Cargo.toml -- \
   validate-bakeoff-report /path/to/public-report.json
 ```
 
-The check accepts only the contract's declared report fields, rejects every
-forbidden private field (`audio`, `audio_path`, `reference_text`,
-`transcript_text`, `speaker_identity`, `private_notes`, `local_file_path`)
-even nested inside an aggregate, and requires the report to name the frozen
-contract id, contract hash, and measured manifest hash.
+The check requires every declared field and rejects extras. It validates the
+frozen contract id and exact contract hash, the measured manifest hash,
+runtime/model/scorer provenance, non-negative latency and soak measurements,
+ordered percentiles, booleans, rates, count relationships, and the frozen
+`passed`/`failed`/`not_measured` gate-result domain.
+
+Public evidence uses fixed metadata-only shapes. `license_evidence` is a
+non-empty array of unique `{ "dataset_id", "license_id" }` objects.
+`sample_counts`, WER/punctuation counts, semantic counts, and `soak_counts`
+have fixed numeric/boolean members. Duration-band and stratum aggregates are
+arrays of fixed objects with identifiers plus numeric values. Arbitrary nested
+keys or string values, including a `transcript` key under an aggregate, fail
+validation. Audio, paths, reference text, Transcript text, speaker identities,
+and private notes have no place in the public schema.
 
 The frozen contract requires at least 100 speech clips whose provenance is a
 licensed public dataset or an explicitly consented private Recording. Synthetic
@@ -75,6 +84,10 @@ hash), and the `scoring_tool` lock (full git commit plus the resolved
 `Cargo.lock` hash); all three sit inside the manifest hash, so swapping the
 runtime, model, or scorer after measurement breaks every measurement lock.
 The public summary reports counts and hashes only.
+
+`bakeoff-corpus-attestation-v1.json` records the reviewed pre-measurement
+corpus counts, coverage, provenance, and hashes. It contains no audio,
+references, Transcripts, local paths, speaker identity, or measurements.
 
 ## Manifest
 
