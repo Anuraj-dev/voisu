@@ -10,7 +10,6 @@
 mod bakeoff;
 mod bounds;
 mod lifecycle;
-mod production;
 mod protocol;
 mod runtime;
 mod sandbox;
@@ -33,7 +32,6 @@ pub use bounds::{
     STOP_PROCESSING, local_response_deadline, worker_cpu_quota_cores, worker_memory_ceiling_bytes,
 };
 pub use lifecycle::{LocalLifecycle, production_local_admission};
-pub use production::UnavailableWorker;
 pub use protocol::{
     ControlFrame, Correlation, FrameError, PROTOCOL_VERSION, ProtocolVersion, WorkerFrame,
     decode_json_frame, encode_json_frame, is_silence_pcm, parse_control, parse_worker,
