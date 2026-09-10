@@ -1,0 +1,65 @@
+{
+  "schema": "voisu-local-asr-bakeoff-corpus-attestation-v1",
+  "corpus_version": "1",
+  "corpus_revision": "2026-09-10-r1",
+  "contract_id": "voisu-r7-local-asr-v1",
+  "contract_sha256": "d735c35ec4faf20af71e4399725e78801ea9f8cb5f562c5744c459d55d2e03e6",
+  "manifest_sha256": "49c34183683a58987a047789b186b4ca65dc2a8db0b3a5c642d98e6a720e88fe",
+  "measurement_status": "locked_not_measured",
+  "sample_counts": {
+    "speech": 100,
+    "real_speech": 100,
+    "public_dataset_speech": 90,
+    "private_recording_speech": 10,
+    "synthetic_speech": 0,
+    "negative": 20,
+    "tuning_speech": 20,
+    "held_out_speech": 80
+  },
+  "duration_band_aggregates": [
+    { "duration_band": "one_to_ten_seconds", "sample_count": 54, "audio_duration_ms": 310820 },
+    { "duration_band": "ten_to_thirty_seconds", "sample_count": 35, "audio_duration_ms": 515382 },
+    { "duration_band": "thirty_to_one_twenty_seconds", "sample_count": 6, "audio_duration_ms": 301441 },
+    { "duration_band": "one_twenty_to_six_hundred_seconds", "sample_count": 5, "audio_duration_ms": 638110 }
+  ],
+  "stratum_aggregates": [
+    { "stratum_id": "librispeech_test_clean_english", "sample_count": 90 },
+    { "stratum_id": "consented_indian_english", "sample_count": 10 },
+    { "stratum_id": "librispeech_test_clean", "sample_count": 90 },
+    { "stratum_id": "controlled_read_room", "sample_count": 10 }
+  ],
+  "held_out_coverage": [
+    { "category": "technical_vocabulary", "clip_count": 8 },
+    { "category": "self_correction", "clip_count": 4 },
+    { "category": "deterministic_formatting", "clip_count": 8 }
+  ],
+  "held_out_critical_content": [
+    { "category": "number", "clip_count": 10 },
+    { "category": "name", "clip_count": 6 },
+    { "category": "negation", "clip_count": 9 },
+    { "category": "command", "clip_count": 3 },
+    { "category": "path", "clip_count": 2 },
+    { "category": "url", "clip_count": 2 },
+    { "category": "unit", "clip_count": 4 },
+    { "category": "omitted_phrase", "clip_count": 7 }
+  ],
+  "negative_kind_counts": [
+    { "negative_kind": "silence", "sample_count": 7 },
+    { "negative_kind": "noise", "sample_count": 7 },
+    { "negative_kind": "non_speech", "sample_count": 6 }
+  ],
+  "license_evidence": [
+    { "dataset_id": "OpenSLR SLR12", "license_id": "CC-BY-4.0" }
+  ],
+  "provenance_counts": [
+    { "source_kind": "public_dataset", "sample_count": 90 },
+    { "source_kind": "private_recording", "sample_count": 10 },
+    { "source_kind": "synthetic_negative", "sample_count": 20 }
+  ],
+  "public_source_archive_sha256": "39fde525e59672dc6d1551919b1478f724438a95aa55f874b576be21967e6c23",
+  "public_source_manifest_sha256": "169db83b95c8826407abfb7f9758c5ece4dd24a180f9d609e2743a5720bb9816",
+  "runtime_sha256": "5fc66a04c54a5e9a5ff24f103dfce0435af9af6f25e6dc5a8550e809c8c6cd37",
+  "model_sha256": "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+  "scoring_tool_git_commit": "aca6e069172ad1b754060c285cf9ddec910686c2",
+  "scoring_tool_cargo_lock_sha256": "8a5f0c8b4efe6f68ffa91247de34337b8fae7b6581f678e05e5d5e9fa35d9fb1"
+}
