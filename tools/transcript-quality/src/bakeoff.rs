@@ -125,7 +125,128 @@ struct Thresholds {
 struct PublicReportContract {
     schema: String,
     fields: Vec<String>,
+    gate_results: Vec<String>,
     forbidden_fields: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicReport {
+    schema: String,
+    contract_id: String,
+    contract_sha256: String,
+    manifest_sha256: String,
+    corpus_version: String,
+    corpus_revision: String,
+    host_profile_id: String,
+    runtime_sha256: String,
+    model_sha256: String,
+    scoring_tool_git_commit: String,
+    scoring_tool_cargo_lock_sha256: String,
+    license_evidence: Vec<LicenseEvidence>,
+    sample_counts: PublicSampleCounts,
+    duration_band_aggregates: Vec<DurationBandAggregate>,
+    stratum_aggregates: Vec<StratumAggregate>,
+    wer_counts_and_rates: WerCountsAndRates,
+    punctuation_counts_and_rates: PunctuationCountsAndRates,
+    semantic_error_counts: SemanticErrorCounts,
+    warm_latency_p50_ms: u64,
+    warm_latency_p95_ms: u64,
+    warm_latency_max_ms: u64,
+    cold_latency_p50_ms: u64,
+    cold_latency_p95_ms: u64,
+    cold_latency_max_ms: u64,
+    soak_counts: SoakCounts,
+    rss_growth_bytes: u64,
+    negative_fixture_insertions: u64,
+    packaged_runtime_passed: bool,
+    gate_result: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LicenseEvidence {
+    dataset_id: String,
+    license_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicSampleCounts {
+    speech: u64,
+    real_speech: u64,
+    public_dataset_speech: u64,
+    private_recording_speech: u64,
+    synthetic_speech: u64,
+    negative: u64,
+    tuning_speech: u64,
+    held_out_speech: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurationBandAggregate {
+    duration_band: DurationBand,
+    sample_count: u64,
+    audio_duration_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StratumAggregate {
+    stratum_id: String,
+    sample_count: u64,
+    word_errors: u64,
+    reference_words: u64,
+    wer: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WerCountsAndRates {
+    insertions: u64,
+    deletions: u64,
+    substitutions: u64,
+    reference_words: u64,
+    wer: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PunctuationCountsAndRates {
+    insertions: u64,
+    deletions: u64,
+    substitutions: u64,
+    reference_marks: u64,
+    error_rate: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SemanticErrorCounts {
+    number: u64,
+    name: u64,
+    negation: u64,
+    command: u64,
+    path: u64,
+    url: u64,
+    unit: u64,
+    omitted_phrase: u64,
+    total: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SoakCounts {
+    duration_ms: u64,
+    recordings: u64,
+    warmup_recordings: u64,
+    crashes: u64,
+    duplicate_deliveries: u64,
+    stale_responses: u64,
+    unexpected_network_attempts: u64,
+    unreaped_children: u64,
+    full_length_completed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -779,10 +900,7 @@ fn validate_scoring_tool_lock(tool: &ScoringToolLock) -> Result<(), String> {
     Ok(())
 }
 
-/// A measured public report may only carry the frozen report schema's
-/// declared fields. Anything else — a private path, a Transcript, a speaker
-/// label — is a privacy or contract violation, even nested inside an
-/// aggregate object.
+/// A measured public report must match the frozen, metadata-only schema.
 pub fn validate_bakeoff_public_report_text(text: &str) -> Result<Value, String> {
     let report: Value =
         serde_json::from_str(text).map_err(|err| format!("bakeoff public report JSON: {err}"))?;
@@ -805,7 +923,7 @@ pub fn validate_bakeoff_public_report_text(text: &str) -> Result<Value, String> 
     for key in object.keys() {
         if forbidden.contains(key.as_str()) {
             return Err(format!(
-                "bakeoff public report carries forbidden field {key:?}; public evidence holds hashes, counts, licenses, and aggregates only"
+                "bakeoff public report carries forbidden field {key:?}; public evidence holds typed metadata only"
             ));
         }
         if !allowed.contains(key.as_str()) {
@@ -815,63 +933,292 @@ pub fn validate_bakeoff_public_report_text(text: &str) -> Result<Value, String> 
             ));
         }
     }
-    reject_nested_forbidden(&report, &forbidden)?;
-    match object.get("schema").and_then(Value::as_str) {
-        Some(schema) if schema == frozen.public_report.schema.as_str() => {}
-        other => {
+    for field in &frozen.public_report.fields {
+        if !object.contains_key(field) {
             return Err(format!(
-                "bakeoff public report schema {other:?} is not {:?}",
-                frozen.public_report.schema
+                "bakeoff public report is missing required field {field:?}"
             ));
         }
     }
-    match object.get("contract_id").and_then(Value::as_str) {
-        Some(id) if id == frozen.id.as_str() => {}
-        other => {
+    if object.len() != frozen.public_report.fields.len() {
+        return Err(
+            "bakeoff public report fields do not exactly match the frozen schema".to_owned(),
+        );
+    }
+    for field in [
+        "schema",
+        "contract_id",
+        "contract_sha256",
+        "manifest_sha256",
+        "corpus_version",
+        "corpus_revision",
+        "host_profile_id",
+        "runtime_sha256",
+        "model_sha256",
+        "scoring_tool_git_commit",
+        "scoring_tool_cargo_lock_sha256",
+        "gate_result",
+    ] {
+        if !object[field].is_string() {
             return Err(format!(
-                "bakeoff public report contract_id {other:?} is not the frozen contract {:?}",
-                frozen.id
+                "bakeoff public report field {field} must be a string"
             ));
         }
+    }
+    for field in [
+        "warm_latency_p50_ms",
+        "warm_latency_p95_ms",
+        "warm_latency_max_ms",
+        "cold_latency_p50_ms",
+        "cold_latency_p95_ms",
+        "cold_latency_max_ms",
+        "rss_growth_bytes",
+        "negative_fixture_insertions",
+    ] {
+        if object[field].as_u64().is_none() {
+            return Err(format!(
+                "bakeoff public report field {field} must be a non-negative integer"
+            ));
+        }
+    }
+    if !object["packaged_runtime_passed"].is_boolean() {
+        return Err(
+            "bakeoff public report field packaged_runtime_passed must be a boolean".to_owned(),
+        );
+    }
+
+    let parsed: PublicReport = serde_json::from_value(report.clone())
+        .map_err(|err| format!("bakeoff public report field type or shape: {err}"))?;
+    if parsed.schema != frozen.public_report.schema {
+        return Err(format!(
+            "bakeoff public report schema {:?} is not {:?}",
+            parsed.schema, frozen.public_report.schema
+        ));
+    }
+    if parsed.contract_id != frozen.id {
+        return Err(format!(
+            "bakeoff public report contract_id {:?} is not the frozen contract {:?}",
+            parsed.contract_id, frozen.id
+        ));
     }
     let contract_sha256 = sha256_bytes(BAKEOFF_CONTRACT_JSON.as_bytes());
-    match object.get("contract_sha256").and_then(Value::as_str) {
-        Some(sha) if sha == contract_sha256.as_str() => {}
-        other => {
+    if parsed.contract_sha256 != contract_sha256 {
+        return Err(format!(
+            "bakeoff public report contract_sha256 {:?} does not match the frozen contract {contract_sha256}; threshold or scoring edits require a new version before measurement",
+            parsed.contract_sha256
+        ));
+    }
+    validate_hash("manifest_sha256", &parsed.manifest_sha256, "public report")?;
+    for (field, value) in [
+        ("corpus_version", &parsed.corpus_version),
+        ("corpus_revision", &parsed.corpus_revision),
+        ("host_profile_id", &parsed.host_profile_id),
+    ] {
+        require_id(&format!("public report {field}"), value)?;
+    }
+    validate_hash("runtime_sha256", &parsed.runtime_sha256, "public report")?;
+    validate_hash("model_sha256", &parsed.model_sha256, "public report")?;
+    validate_git_commit(
+        "public report scoring_tool_git_commit",
+        &parsed.scoring_tool_git_commit,
+    )?;
+    validate_hash(
+        "scoring_tool_cargo_lock_sha256",
+        &parsed.scoring_tool_cargo_lock_sha256,
+        "public report",
+    )?;
+
+    if parsed.license_evidence.is_empty() {
+        return Err(
+            "public report license_evidence must name at least one public dataset license"
+                .to_owned(),
+        );
+    }
+    let mut licensed_datasets = BTreeSet::new();
+    for license in &parsed.license_evidence {
+        require_id(
+            "public report license_evidence dataset_id",
+            &license.dataset_id,
+        )?;
+        require_id(
+            "public report license_evidence license_id",
+            &license.license_id,
+        )?;
+        if !licensed_datasets.insert(license.dataset_id.as_str()) {
             return Err(format!(
-                "bakeoff public report contract_sha256 {other:?} does not match the frozen contract {contract_sha256}; threshold or scoring edits require a new version before measurement"
+                "public report license_evidence repeats dataset_id {:?}",
+                license.dataset_id
             ));
         }
     }
-    match object.get("manifest_sha256").and_then(Value::as_str) {
-        Some(sha) => validate_hash("manifest_sha256", sha, "public report")?,
-        None => {
-            return Err(
-                "bakeoff public report is missing manifest_sha256 binding the measured corpus"
-                    .to_owned(),
-            );
-        }
+
+    validate_public_sample_counts(&parsed.sample_counts)?;
+    validate_duration_band_aggregates(&parsed.duration_band_aggregates)?;
+    validate_stratum_aggregates(&parsed.stratum_aggregates)?;
+    validate_rate("wer", parsed.wer_counts_and_rates.wer)?;
+    if parsed.wer_counts_and_rates.reference_words == 0 {
+        return Err(
+            "public report wer_counts_and_rates reference_words must be positive".to_owned(),
+        );
+    }
+    let _word_errors = parsed.wer_counts_and_rates.insertions
+        + parsed.wer_counts_and_rates.deletions
+        + parsed.wer_counts_and_rates.substitutions;
+    validate_rate(
+        "punctuation_counts_and_rates error_rate",
+        parsed.punctuation_counts_and_rates.error_rate,
+    )?;
+    let punctuation_errors = parsed.punctuation_counts_and_rates.insertions
+        + parsed.punctuation_counts_and_rates.deletions
+        + parsed.punctuation_counts_and_rates.substitutions;
+    if parsed.punctuation_counts_and_rates.reference_marks == 0 && punctuation_errors != 0 {
+        return Err(
+            "public report punctuation counts require reference_marks when errors are nonzero"
+                .to_owned(),
+        );
+    }
+    validate_semantic_error_counts(&parsed.semantic_error_counts)?;
+    validate_percentiles(
+        "warm_latency",
+        parsed.warm_latency_p50_ms,
+        parsed.warm_latency_p95_ms,
+        parsed.warm_latency_max_ms,
+    )?;
+    validate_percentiles(
+        "cold_latency",
+        parsed.cold_latency_p50_ms,
+        parsed.cold_latency_p95_ms,
+        parsed.cold_latency_max_ms,
+    )?;
+    let _soak_observations = (
+        parsed.soak_counts.duration_ms,
+        parsed.soak_counts.recordings,
+        parsed.soak_counts.warmup_recordings,
+        parsed.soak_counts.crashes,
+        parsed.soak_counts.duplicate_deliveries,
+        parsed.soak_counts.stale_responses,
+        parsed.soak_counts.unexpected_network_attempts,
+        parsed.soak_counts.unreaped_children,
+        parsed.soak_counts.full_length_completed,
+        parsed.rss_growth_bytes,
+        parsed.negative_fixture_insertions,
+        parsed.packaged_runtime_passed,
+    );
+    if parsed.soak_counts.warmup_recordings > parsed.soak_counts.recordings {
+        return Err("public report soak_counts warmup_recordings exceeds recordings".to_owned());
+    }
+    if !frozen
+        .public_report
+        .gate_results
+        .contains(&parsed.gate_result)
+    {
+        return Err(format!(
+            "public report gate_result {:?} is not in the frozen domain {:?}",
+            parsed.gate_result, frozen.public_report.gate_results
+        ));
     }
     Ok(report)
 }
 
-fn reject_nested_forbidden(value: &Value, forbidden: &BTreeSet<&str>) -> Result<(), String> {
-    match value {
-        Value::Object(map) => {
-            for (key, nested) in map {
-                if forbidden.contains(key.as_str()) {
-                    return Err(format!(
-                        "bakeoff public report carries forbidden field {key:?}; public evidence holds hashes, counts, licenses, and aggregates only"
-                    ));
-                }
-                reject_nested_forbidden(nested, forbidden)?;
-            }
-            Ok(())
+fn validate_public_sample_counts(counts: &PublicSampleCounts) -> Result<(), String> {
+    if counts.real_speech != counts.public_dataset_speech + counts.private_recording_speech {
+        return Err("public report sample_counts real_speech must equal public_dataset_speech plus private_recording_speech".to_owned());
+    }
+    if counts.speech != counts.real_speech + counts.synthetic_speech {
+        return Err(
+            "public report sample_counts speech must equal real_speech plus synthetic_speech"
+                .to_owned(),
+        );
+    }
+    if counts.speech != counts.tuning_speech + counts.held_out_speech {
+        return Err(
+            "public report sample_counts speech must equal tuning_speech plus held_out_speech"
+                .to_owned(),
+        );
+    }
+    let _negative = counts.negative;
+    Ok(())
+}
+
+fn validate_duration_band_aggregates(aggregates: &[DurationBandAggregate]) -> Result<(), String> {
+    if aggregates.is_empty() {
+        return Err("public report duration_band_aggregates must not be empty".to_owned());
+    }
+    let mut bands = BTreeSet::new();
+    for aggregate in aggregates {
+        if !bands.insert(aggregate.duration_band) {
+            return Err(format!(
+                "public report repeats duration band {:?}",
+                aggregate.duration_band
+            ));
         }
-        Value::Array(items) => items
-            .iter()
-            .try_for_each(|item| reject_nested_forbidden(item, forbidden)),
-        _ => Ok(()),
+        if aggregate.sample_count == 0 || aggregate.audio_duration_ms == 0 {
+            return Err(
+                "public report duration band sample_count and audio_duration_ms must be positive"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_stratum_aggregates(aggregates: &[StratumAggregate]) -> Result<(), String> {
+    if aggregates.is_empty() {
+        return Err("public report stratum_aggregates must not be empty".to_owned());
+    }
+    let mut strata = BTreeSet::new();
+    for aggregate in aggregates {
+        require_id("public report stratum_id", &aggregate.stratum_id)?;
+        if !strata.insert(aggregate.stratum_id.as_str()) {
+            return Err(format!(
+                "public report repeats stratum_id {:?}",
+                aggregate.stratum_id
+            ));
+        }
+        if aggregate.sample_count == 0 || aggregate.reference_words == 0 {
+            return Err(
+                "public report stratum sample_count and reference_words must be positive"
+                    .to_owned(),
+            );
+        }
+        let _word_errors = aggregate.word_errors;
+        validate_rate("stratum wer", aggregate.wer)?;
+    }
+    Ok(())
+}
+
+fn validate_semantic_error_counts(counts: &SemanticErrorCounts) -> Result<(), String> {
+    let sum = counts.number
+        + counts.name
+        + counts.negation
+        + counts.command
+        + counts.path
+        + counts.url
+        + counts.unit
+        + counts.omitted_phrase;
+    if counts.total != sum {
+        return Err(
+            "public report semantic_error_counts total must equal the category sum".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_rate(field: &str, rate: f64) -> Result<(), String> {
+    if rate.is_finite() && (0.0..=1.0).contains(&rate) {
+        Ok(())
+    } else {
+        Err(format!("public report {field} must be between 0 and 1"))
+    }
+}
+
+fn validate_percentiles(field: &str, p50: u64, p95: u64, max: u64) -> Result<(), String> {
+    if p50 <= p95 && p95 <= max {
+        Ok(())
+    } else {
+        Err(format!(
+            "public report {field} must satisfy p50 <= p95 <= max"
+        ))
     }
 }
 
