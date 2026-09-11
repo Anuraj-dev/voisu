@@ -1286,7 +1286,7 @@ pub fn join_worker_cgroup(spec: &WorkerCgroupSpec) -> Result<CgroupEvidence, San
             .collect();
         if !missing.is_empty() {
             return Err(SandboxError::Unavailable(format!(
-                "worker scope cannot delegate controllers: missing {}",
+                "cgroup delegation unavailable: worker scope cannot delegate controllers: missing {}",
                 missing.join(",")
             )));
         }
@@ -1334,6 +1334,68 @@ pub fn cleanup_worker_cgroup(scope_dir: &Path) -> io::Result<()> {
     fs::remove_dir(scope_dir)
 }
 
+/// Probe cgroup delegability with a real but non-attaching placement: create a
+/// throwaway leaf scope under the current user-owned cgroup, require
+/// cpu/memory/pids to be visible inside it, then remove it while still empty.
+///
+/// Controller *visibility* at the cgroup root is not *delegability*: a scope
+/// can list controllers the user manager never delegated into this tree, so
+/// `join_worker_cgroup` would still fail. This probe exercises the same
+/// filesystem path a real placement takes (create leaf under the current
+/// cgroup, read its inherited `cgroup.controllers`) minus the self-attach, so
+/// the gate fails closed exactly when placement would fail — and passes with
+/// no residue on hosts where delegation works.
+fn probe_worker_cgroup_delegation() -> Result<(), SandboxError> {
+    let current = current_cgroup_path()
+        .ok_or_else(|| SandboxError::Unsupported("no cgroup v2 membership is visible".into()))?;
+    if !current.starts_with("/user.slice/") {
+        return Err(SandboxError::Unsupported(format!(
+            "worker cgroup requires a user-manager-owned tree; current cgroup is {current}"
+        )));
+    }
+    // Distinct name: the probe never collides with (or is mistaken for) a real
+    // worker scope, and no process is ever attached to it, so the caller's own
+    // cgroup membership is untouched.
+    let probe_dir = PathBuf::from("/sys/fs/cgroup")
+        .join(current.trim_start_matches('/'))
+        .join(format!(
+            "voisu-delegation-probe-{}.scope",
+            std::process::id()
+        ));
+    fs::create_dir_all(&probe_dir).map_err(|error| {
+        SandboxError::Unavailable(format!(
+            "cgroup delegation unavailable: cannot create probe scope {}: {error}",
+            probe_dir.display()
+        ))
+    })?;
+    // A fresh leaf lists exactly the controllers its parent delegated into it:
+    // the same visibility `join_worker_cgroup` requires (its subtree_control
+    // write is best-effort), so this check is exactly as strict as placement.
+    let visible = scope_controllers(&probe_dir);
+    let missing: Vec<&str> = ["cpu", "memory", "pids"]
+        .into_iter()
+        .filter(|need| !visible.iter().any(|have| have == need))
+        .collect();
+    // The probe scope is empty (nothing was attached), so it must always
+    // remove cleanly; leaving it behind would leak into the user's cgroup
+    // tree on every gate run, and cleanup errors surface rather than pretend
+    // nothing happened.
+    let cleanup_error = cleanup_worker_cgroup(&probe_dir).err();
+    if !missing.is_empty() {
+        return Err(SandboxError::Unavailable(format!(
+            "cgroup delegation unavailable: worker scope cannot delegate controllers: missing {}",
+            missing.join(",")
+        )));
+    }
+    if let Some(error) = cleanup_error {
+        return Err(SandboxError::Unavailable(format!(
+            "cgroup delegation probe scope {} could not be removed: {error}",
+            probe_dir.display()
+        )));
+    }
+    Ok(())
+}
+
 // --- fail-closed gate + host evidence ------------------------------------------
 
 /// Probed capabilities. Recorded, never asserted: absence becomes
@@ -1372,8 +1434,10 @@ pub struct SandboxReady {
 
 /// Fail Local closed unless the kernel and user manager can enforce the full
 /// envelope: validated syscall arch, Landlock ABI ≥ 1, a user-owned tree, and
-/// cpu/memory/pids controllers available. The launcher calls this before
-/// spawning the worker; `Err` means Local stays unavailable.
+/// cpu/memory/pids controllers both visible and actually delegable into a
+/// fresh worker scope (verified with a real, empty, non-attaching probe
+/// placement). The launcher calls this before spawning the worker; `Err`
+/// means Local stays unavailable.
 pub fn gate_local_on_sandbox() -> Result<SandboxReady, SandboxError> {
     let caps = probe_sandbox_capabilities();
     let arch = caps.syscall_arch.ok_or_else(|| {
@@ -1403,6 +1467,11 @@ pub fn gate_local_on_sandbox() -> Result<SandboxReady, SandboxError> {
             )));
         }
     }
+    // Controllers listed at the cgroup root are not enough: placement fails
+    // unless the user manager delegated them into this scope. Probe a real
+    // (empty, non-attaching) leaf so the gate fails closed exactly when
+    // `join_worker_cgroup` would.
+    probe_worker_cgroup_delegation()?;
     Ok(SandboxReady {
         arch,
         landlock_abi: caps.landlock_abi,
