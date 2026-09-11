@@ -984,6 +984,162 @@ mod clipboard_recovery_tests {
         assert!(!outcome.success);
         assert_eq!(calls, 1);
     }
+
+    #[test]
+    fn failed_clear_leaves_the_first_failed_outcome_unmasked() {
+        // The clear failure is injected as Err(ProcessError::Unavailable); a
+        // success=false clear outcome takes the same branch, so one variant
+        // pins the behaviour.
+        let mut calls = Vec::new();
+        let outcome = clipboard_write_candidate_with(
+            ClipboardTool::WlClipboard,
+            b"Transcript",
+            Duration::from_secs(4),
+            |program, arguments, input, _| {
+                calls.push((program.to_owned(), arguments.join(" "), input.is_some()));
+                if arguments == ["--clear"] {
+                    return Err(ProcessError::Unavailable);
+                }
+                Ok(ProcessOutcome {
+                    success: false,
+                    stdout: b"stale".to_vec(),
+                    stderr: b"first write failed".to_vec(),
+                })
+            },
+        );
+
+        let Ok(outcome) = outcome else {
+            panic!("a failed clear must return the first outcome, not the clear error")
+        };
+
+        // The caller sees the FIRST write's failed outcome byte for byte, so
+        // the failed write carries through and a regression that swapped in
+        // the clear error or an empty success cannot mask it.
+        assert!(!outcome.success);
+        assert_eq!(outcome.stdout, b"stale".to_vec());
+        assert_eq!(outcome.stderr, b"first write failed".to_vec());
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "wl-copy".to_owned(),
+                    "--type text/plain;charset=utf-8 --".to_owned(),
+                    true,
+                ),
+                ("wl-copy".to_owned(), "--clear".to_owned(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_retry_outcome_becomes_the_result() {
+        let mut calls = Vec::new();
+        let outcome = clipboard_write_candidate_with(
+            ClipboardTool::WlClipboard,
+            b"Transcript",
+            Duration::from_secs(4),
+            |program, arguments, input, _| {
+                calls.push((program.to_owned(), arguments.join(" "), input.is_some()));
+                if arguments == ["--clear"] {
+                    return Ok(ProcessOutcome {
+                        success: true,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    });
+                }
+                let attempt = if calls.len() == 1 { "first" } else { "retry" };
+                Ok(ProcessOutcome {
+                    success: false,
+                    stdout: attempt.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                })
+            },
+        );
+
+        let Ok(outcome) = outcome else {
+            panic!("a failed retry must remain a process outcome")
+        };
+
+        // The retry's own failure is what the caller sees — not the first
+        // write's outcome and not a success — so the failed retry write also
+        // carries through instead of being masked.
+        assert!(!outcome.success);
+        assert_eq!(outcome.stdout, b"retry".to_vec());
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "wl-copy".to_owned(),
+                    "--type text/plain;charset=utf-8 --".to_owned(),
+                    true,
+                ),
+                ("wl-copy".to_owned(), "--clear".to_owned(), false),
+                (
+                    "wl-copy".to_owned(),
+                    "--type text/plain;charset=utf-8 --".to_owned(),
+                    true,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn deadline_budget_is_partitioned_across_write_clear_and_retry() {
+        // Timing model: without a production clock seam the only elapsed-time
+        // control is real time, so the first write sleeps 300ms of the 400ms
+        // deadline — the same 4000/3000 -> 500/500ms partition production
+        // uses, scaled down to keep the suite fast. `thread::sleep` only
+        // guarantees at-least, so the bounds are one-sided where the clock
+        // can only move a budget down: at most 100ms remains at the clear,
+        // the clear gets half of that (<= 50ms, and the > 25ms floor merely
+        // tolerates scheduler jitter on the 300ms sleep), and the retry keeps
+        // the rest of that remainder because the clear call itself does not
+        // measurably advance the clock.
+        let mut calls = Vec::new();
+        let outcome = clipboard_write_candidate_with(
+            ClipboardTool::WlClipboard,
+            b"Transcript",
+            Duration::from_millis(400),
+            |program, arguments, input, budget| {
+                if calls.is_empty() {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                calls.push((
+                    program.to_owned(),
+                    arguments.join(" "),
+                    input.is_some(),
+                    budget,
+                ));
+                if arguments == ["--clear"] {
+                    return Ok(ProcessOutcome {
+                        success: true,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    });
+                }
+                Ok(ProcessOutcome {
+                    success: false,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            },
+        );
+
+        let Ok(outcome) = outcome else {
+            panic!("partitioned budgets must still return an outcome")
+        };
+        assert!(!outcome.success);
+
+        assert_eq!(calls.len(), 3);
+        // First write: the full deadline, unpartitioned.
+        assert_eq!(calls[0].3, Duration::from_millis(400));
+        // Clear: half of the remaining budget.
+        assert!(calls[1].3 <= Duration::from_millis(50));
+        assert!(calls[1].3 > Duration::from_millis(25));
+        // Retry: the remainder, still far more than another half-slice.
+        assert!(calls[2].3 <= Duration::from_millis(100));
+        assert!(calls[2].3 > calls[1].3 * 3 / 2);
+    }
 }
 
 impl ClipboardBoundary for WlClipboard {
