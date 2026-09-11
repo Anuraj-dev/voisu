@@ -198,6 +198,11 @@ fn forbidden_reason_os(key: &OsString) -> Option<&'static str> {
 }
 
 /// Worker environment: no credentials, proxy, preload, or session-bus address.
+/// Locale plus `HOME` are kept: the worker's Landlock request needs the home
+/// reference for its rejection checks and its post-install effectiveness
+/// probe (the domain itself denies every home access), so both scrub paths —
+/// this spawn-time scrub and [`apply_worker_environment`] — agree on keeping
+/// it instead of one silently skipping the home checks.
 #[must_use]
 pub fn scrub_worker_environment<I>(inherited: I) -> ScrubbedEnvironment
 where
@@ -215,7 +220,7 @@ where
         };
         // Absolute worker exec + ld.so (DT_RPATH/ldconfig) resolve libraries.
         // PATH is not retained so a descendant cannot exec an unexpected binary.
-        if name == "LANG" || name == "LC_ALL" {
+        if name == "LANG" || name == "LC_ALL" || name == "HOME" {
             retained.insert(name.to_owned(), value);
         }
     }
@@ -406,9 +411,11 @@ const AUDIT_ARCH_X86_64: u32 = 62 | 0x8000_0000 | 0x4000_0000;
 // `EM_AARCH64 | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE`.
 const AUDIT_ARCH_AARCH64: u32 = 183 | 0x8000_0000 | 0x4000_0000;
 
-// BPF_LD|BPF_W|BPF_ABS, BPF_JMP|BPF_JEQ|BPF_K, BPF_RET|BPF_K.
+// BPF_LD|BPF_W|BPF_ABS, BPF_JMP|BPF_JEQ|BPF_K, BPF_JMP|BPF_JGT|BPF_K,
+// BPF_RET|BPF_K.
 const BPF_STMT_LD_W_ABS: u16 = 0x20;
 const BPF_JUMP_JEQ_K: u16 = 0x15;
+const BPF_JUMP_JGT_K: u16 = 0x35;
 const BPF_STMT_RET_K: u16 = 0x06;
 
 // struct seccomp_data offsets: int nr @0, __u32 arch @4.
@@ -418,6 +425,12 @@ const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
 // Linux errno values (arch-independent for these two).
 const ERRNO_EPERM: u32 = 1;
 const ERRNO_ENOSYS: u32 = 38;
+
+// Highest syscall number a native ABI can use. x32 syscalls carry the native
+// `AUDIT_ARCH_X86_64` in seccomp_data.arch but set `__X32_SYSCALL_BIT`
+// (0x40000000) in nr, so on x86_64 any nr above this ceiling is an x32
+// number, never a native one — and the nr comparisons below must never see it.
+const X32_NR_CEILING: u32 = 0x3FFF_FFFF;
 
 /// Native syscall architecture the denylist below is validated for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -567,14 +580,22 @@ fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
     libc::sock_filter { code, jt, jf, k }
 }
 
-/// Build the BPF program: non-native arch → `ENOSYS` (kills compat/x32
-/// bypasses, matching `native_syscall_arch_only`), denied nr → `EPERM`,
-/// everything else → allow. Pure constructor so tests inspect the exact
-/// program without installing anything.
+/// Build the BPF program: non-native arch → `ENOSYS` (kills compat bypasses,
+/// matching `native_syscall_arch_only`), x32-numbered syscalls → `ENOSYS`
+/// (x32 shares `AUDIT_ARCH_X86_64`, so only the `__X32_SYSCALL_BIT` range in
+/// nr separates it from native — without this guard every x32 variant would
+/// miss the native nr comparisons and fall through to allow), denied nr →
+/// `EPERM`, everything else → allow. Pure constructor so tests inspect the
+/// exact program without installing anything.
 #[must_use]
 pub fn build_seccomp_filter(arch: SyscallArch) -> Vec<libc::sock_filter> {
     let denied = denied_syscalls(arch);
-    let mut filter = Vec::with_capacity(denied.len() + 6);
+    // Arch gate (load + jeq + ENOSYS return), nr load, denied comparisons,
+    // allow/EPERM tail; x86_64 adds the x32-range guard and its own ENOSYS
+    // return (BPF jumps are forward-only, so the guard cannot reuse the arch
+    // gate's return).
+    let x32_guard = arch == SyscallArch::X86_64;
+    let mut filter = Vec::with_capacity(denied.len() + if x32_guard { 8 } else { 7 });
     filter.push(bpf_stmt(BPF_STMT_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET));
     filter.push(bpf_jump(BPF_JUMP_JEQ_K, arch.audit_arch(), 1, 0));
     filter.push(bpf_stmt(
@@ -582,6 +603,12 @@ pub fn build_seccomp_filter(arch: SyscallArch) -> Vec<libc::sock_filter> {
         libc::SECCOMP_RET_ERRNO | ERRNO_ENOSYS,
     ));
     filter.push(bpf_stmt(BPF_STMT_LD_W_ABS, SECCOMP_DATA_NR_OFFSET));
+    let guard_index = if x32_guard {
+        filter.push(bpf_jump(BPF_JUMP_JGT_K, X32_NR_CEILING, 0, 0));
+        Some(filter.len() - 1)
+    } else {
+        None
+    };
     for entry in &denied {
         filter.push(bpf_jump(BPF_JUMP_JEQ_K, entry.nr as u32, 0, 0));
     }
@@ -592,10 +619,27 @@ pub fn build_seccomp_filter(arch: SyscallArch) -> Vec<libc::sock_filter> {
         BPF_STMT_RET_K,
         libc::SECCOMP_RET_ERRNO | ERRNO_EPERM,
     ));
+    let x32_deny_index = if x32_guard {
+        // Forward-only BPF: the guard cannot reuse the arch gate's ENOSYS
+        // return, so the x86_64 program carries its own. Other arches have no
+        // x32 numbering, so no dead return is emitted.
+        let index = filter.len();
+        filter.push(bpf_stmt(
+            BPF_STMT_RET_K,
+            libc::SECCOMP_RET_ERRNO | ERRNO_ENOSYS,
+        ));
+        Some(index)
+    } else {
+        None
+    };
     // Patch each nr comparison to jump forward to the shared deny tail.
     for (offset, _) in denied.iter().enumerate() {
         let index = allow_index - denied.len() + offset;
         filter[index].jt = (deny_index - index - 1) as u8;
+    }
+    if let Some(guard_index) = guard_index {
+        let x32_deny_index = x32_deny_index.expect("guard implies its ENOSYS return");
+        filter[guard_index].jt = (x32_deny_index - guard_index - 1) as u8;
     }
     filter
 }
@@ -605,6 +649,10 @@ pub fn build_seccomp_filter(arch: SyscallArch) -> Vec<libc::sock_filter> {
 pub struct SeccompEvidence {
     pub arch: SyscallArch,
     pub denied: Vec<String>,
+    /// Positive kernel probe: `socket(2)` — the first denylist entry on every
+    /// arch — failed with `EPERM` after install, so the filter bites at
+    /// runtime rather than only recording intent.
+    pub inet_socket_denied: bool,
 }
 
 /// Install the denylist filter in the calling worker process. Requires
@@ -636,12 +684,33 @@ pub fn install_syscall_restrictions() -> Result<SeccompEvidence, SandboxError> {
     if installed != 0 {
         return Err(last_os_error("PR_SET_SECCOMP(SECCOMP_MODE_FILTER) failed"));
     }
+    // Runtime self-probe: a live filter makes even one inet socket fail with
+    // EPERM (socket is denied on every arch). An ineffective filter would
+    // otherwise record intended denials as if they were enforcement.
+    // SAFETY: probe socket with inert arguments; a denied call returns -1.
+    let probe = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if probe >= 0 {
+        // SAFETY: fd came from the successful socket above.
+        unsafe {
+            libc::close(probe);
+        }
+        return Err(SandboxError::VerificationFailed(
+            "seccomp denylist is ineffective: socket(AF_INET) still succeeds after install".into(),
+        ));
+    }
+    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
+        return Err(SandboxError::VerificationFailed(format!(
+            "seccomp denylist probe did not deny socket(AF_INET) with EPERM: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
     Ok(SeccompEvidence {
         arch,
         denied: denied_syscalls(arch)
             .iter()
             .map(|entry| entry.name.to_owned())
             .collect(),
+        inet_socket_denied: true,
     })
 }
 
@@ -711,6 +780,16 @@ pub struct LandlockRequest {
     /// Explicitly approved GPU device nodes only. Empty on CPU-only hosts:
     /// no GPU access is granted without a measured GPU profile.
     pub gpu_devices: Vec<PathBuf>,
+    /// Home tree reference used by the rejection checks and the post-install
+    /// effectiveness probe: everything under it must stay denied, and the
+    /// probe must be able to open it. Explicit, not read from the environment
+    /// at install time — a scrubbed worker env would otherwise skip the home
+    /// checks entirely, and a missing reference would make the probe vacuous.
+    /// Required: an empty or relative reference fails the request closed.
+    pub home_dir: PathBuf,
+    /// Config tree reference (usually the home `.config`) that must stay
+    /// denied. Required for the same reason.
+    pub config_dir: PathBuf,
 }
 
 /// Default system runtime library trees. Missing trees are skipped at install
@@ -725,13 +804,28 @@ pub fn default_runtime_lib_dirs() -> Vec<PathBuf> {
     ]
 }
 
-/// Reject requests that would punch holes in the sandbox: anything under home
-/// or config trees, anything in a diagnostics tree, relative paths, the
-/// filesystem root, or GPU nodes outside `/dev`. Pure so tests prove the deny
-/// rules without touching the kernel.
+/// Reject requests that would punch holes in the sandbox: anything under the
+/// home or config reference trees, anything in a diagnostics tree, relative
+/// paths, the filesystem root, or GPU nodes outside `/dev`. The home/config
+/// references come from the request, never the environment, so a scrubbed
+/// worker cannot silently skip the checks; a request without them fails
+/// closed. Pure so tests prove the deny rules without touching the kernel.
 pub fn landlock_request_clean(request: &LandlockRequest) -> Result<(), SandboxError> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let config = home.as_ref().map(|dir| dir.join(".config"));
+    let home = &request.home_dir;
+    let config = &request.config_dir;
+    for (kind, path) in [("home reference", home), ("config reference", config)] {
+        if path.as_os_str().is_empty() {
+            return Err(SandboxError::VerificationFailed(format!(
+                "{kind} is required: without it the rejection checks would be skipped, not passed"
+            )));
+        }
+        if !path.is_absolute() {
+            return Err(SandboxError::VerificationFailed(format!(
+                "{kind} must be absolute, got {}",
+                path.display()
+            )));
+        }
+    }
     let mut candidates: Vec<(&str, &Path)> = Vec::new();
     for dir in &request.runtime_lib_dirs {
         candidates.push(("runtime lib dir", dir));
@@ -760,17 +854,13 @@ pub fn landlock_request_clean(request: &LandlockRequest) -> Result<(), SandboxEr
                 path.display()
             )));
         }
-        if let Some(home) = &home
-            && (path == home || path.starts_with(home))
-        {
+        if path == home || path.starts_with(home) {
             return Err(SandboxError::VerificationFailed(format!(
                 "{kind} must not live under home: {}",
                 path.display()
             )));
         }
-        if let Some(config) = &config
-            && (path == config || path.starts_with(config))
-        {
+        if path == config || path.starts_with(config) {
             return Err(SandboxError::VerificationFailed(format!(
                 "{kind} must not live under the config tree: {}",
                 path.display()
@@ -844,6 +934,9 @@ pub struct LandlockEvidence {
     pub abi: i32,
     pub fs_mask: u64,
     pub allowed: Vec<PathBuf>,
+    /// Positive kernel probe: opening the home reference after
+    /// `landlock_restrict_self` failed (the domain bites at runtime).
+    pub home_denied: bool,
 }
 
 fn landlock_candidate_masks(abi: i32) -> Vec<u64> {
@@ -948,6 +1041,15 @@ pub fn apply_landlock_restrictions(
         )));
     }
     landlock_request_clean(request)?;
+    // The post-install probe must open a reference that exists, or a missing
+    // path would make the effectiveness check vacuous (ENOENT reads as
+    // "denied" without the domain doing anything). Fail closed instead.
+    if fs::metadata(&request.home_dir).is_err() {
+        return Err(SandboxError::Unavailable(format!(
+            "home reference path {} does not exist; Landlock effectiveness cannot be verified",
+            request.home_dir.display()
+        )));
+    }
     fs::create_dir_all(&request.cache_dir)
         .map_err(|error| SandboxError::Unavailable(format!("cache dir unreachable: {error}")))?;
     let mut ruleset: Option<RawFd> = None;
@@ -1029,12 +1131,11 @@ pub fn apply_landlock_restrictions(
         return Err(error);
     }
     cleanup(ruleset);
-    // Verify the domain bites: the home tree (rejected from every request by
-    // construction) must now be unreadable. A readable home means the
-    // restriction is ineffective — fail closed.
-    let probe = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/root"));
+    // Verify the domain bites: the home reference (rejected from every request
+    // by construction, and guaranteed to exist above) must now be unreadable
+    // by the calling user — a denial here cannot come from plain DAC, so a
+    // readable reference means the restriction is ineffective. Fail closed.
+    let probe = &request.home_dir;
     let probe_c = CString::new(probe.as_os_str().as_bytes())
         .map_err(|_| SandboxError::VerificationFailed("home path is not NUL-safe".into()))?;
     // SAFETY: probe_c is live; O_DIRECTORY keeps the probe to a metadata open.
@@ -1064,6 +1165,7 @@ pub fn apply_landlock_restrictions(
         abi,
         fs_mask: chosen_mask,
         allowed,
+        home_denied: true,
     })
 }
 
@@ -1179,7 +1281,8 @@ pub struct CgroupEvidence {
     pub scope_dir: PathBuf,
     /// `/proc/self/cgroup` confirms membership after attach.
     pub member: bool,
-    /// Controllers visible for descendant inheritance.
+    /// Controllers delegated into the scope: the enforcement surface the
+    /// envelope binds (verified present after attach).
     pub controllers: Vec<String>,
 }
 
@@ -1252,11 +1355,19 @@ pub fn child_cgroup_matches(child_pid: u32, expected_fragment: &str) -> bool {
     process_cgroup_path(child_pid).is_some_and(|path| path.contains(expected_fragment))
 }
 
-/// Create the user-manager-owned leaf scope, enforce the envelope from
-/// `spec`, attach the calling worker, and verify membership plus descendant
-/// controller inheritance. Only joins trees under `/user.slice/`: the daemon
+/// Create the user-manager-owned leaf scope, attach the calling worker, and
+/// enforce the envelope from `spec`, then verify membership plus delegated
+/// controller visibility. Only joins trees under `/user.slice/`: the daemon
 /// runs as a user unit on product hosts, so anything else (root slice, system
 /// slice, container root) is refused rather than mis-attributed.
+///
+/// The worker scope stays a leaf: nothing creates child cgroups below it, its
+/// own limit files only need the controllers the user manager delegated into
+/// the *parent*, and `cgroup.subtree_control` therefore stays empty. Enabling
+/// controllers in the scope's own subtree_control would trip cgroup v2's
+/// no-internal-process constraint and make the self-attach fail with EBUSY.
+/// The attach happens before the limits so migration never races a `pids.max`
+/// the caller's task count could not fit.
 pub fn join_worker_cgroup(spec: &WorkerCgroupSpec) -> Result<CgroupEvidence, SandboxError> {
     use super::bounds::cpu_max_cgroup_value;
     let current = current_cgroup_path()
@@ -1275,49 +1386,95 @@ pub fn join_worker_cgroup(spec: &WorkerCgroupSpec) -> Result<CgroupEvidence, San
             scope_dir.display()
         ))
     })?;
-    // Enable delegation for descendants; a scope that cannot enable
-    // cpu/memory/pids cannot enforce them on the model child.
-    let subtree = scope_dir.join("cgroup.subtree_control");
-    if fs::write(&subtree, "+cpu +memory +pids").is_err() {
-        let visible = scope_controllers(&scope_dir);
-        let missing: Vec<&str> = ["cpu", "memory", "pids"]
-            .into_iter()
-            .filter(|need| !visible.iter().any(|have| have == need))
-            .collect();
-        if !missing.is_empty() {
-            return Err(SandboxError::Unavailable(format!(
+    let parent_procs = PathBuf::from("/sys/fs/cgroup")
+        .join(current.trim_start_matches('/'))
+        .join("cgroup.procs");
+    // A fresh leaf lists exactly the controllers the parent delegated into
+    // this tree: without them the limit files do not exist and no envelope
+    // can be enforced, so fail before touching cgroup.procs. The scope is
+    // still empty here, so it must not leak.
+    let visible = scope_controllers(&scope_dir);
+    let missing: Vec<&str> = ["cpu", "memory", "pids"]
+        .into_iter()
+        .filter(|need| !visible.iter().any(|have| have == need))
+        .collect();
+    if !missing.is_empty() {
+        let residue = match cleanup_worker_cgroup(&scope_dir) {
+            Ok(()) => String::new(),
+            Err(error) => format!(
+                "; empty scope {} could not be removed: {error}",
+                scope_dir.display()
+            ),
+        };
+        return Err(with_residue(
+            SandboxError::Unavailable(format!(
                 "cgroup delegation unavailable: worker scope cannot delegate controllers: missing {}",
                 missing.join(",")
-            )));
-        }
+            )),
+            &residue,
+        ));
     }
-    let write_limit = |name: &str, value: &str| -> Result<(), SandboxError> {
-        fs::write(scope_dir.join(name), value).map_err(|error| {
-            SandboxError::Unavailable(format!(
-                "cannot enforce {name}={value} in {}: {error}",
+    // Attach self first: the scope is empty (its subtree_control is empty), so
+    // the no-internal-process constraint cannot refuse the migration, and no
+    // limit can reject a PID that has not been counted yet.
+    let pid = std::process::id();
+    if let Err(error) = fs::write(scope_dir.join("cgroup.procs"), pid.to_string()) {
+        let residue = match cleanup_worker_cgroup(&scope_dir) {
+            Ok(()) => String::new(),
+            Err(error) => format!(
+                "; empty scope {} could not be removed: {error}",
                 scope_dir.display()
-            ))
-        })
-    };
-    write_limit("memory.max", &spec.memory_max_bytes.to_string())?;
-    write_limit("cpu.max", &cpu_max_cgroup_value(spec.cpu_quota_cores))?;
-    write_limit("pids.max", &spec.tasks_max.to_string())?;
-    // Attach self: writing our PID moves the worker (and its future children)
-    // under the envelope.
-    let pid = std::process::id().to_string();
-    write_limit("cgroup.procs", &pid)?;
+            ),
+        };
+        return Err(with_residue(
+            SandboxError::Unavailable(format!(
+                "cannot attach worker PID {pid} to {}: {error}",
+                scope_dir.display()
+            )),
+            &residue,
+        ));
+    }
     if !verify_cgroup_membership(&spec.scope_name) {
-        return Err(SandboxError::VerificationFailed(format!(
-            "cgroup.procs accepted PID {pid} but membership does not read back under {}",
-            spec.scope_name
-        )));
+        let residue = unattach_best_effort(&scope_dir, &parent_procs, pid);
+        return Err(with_residue(
+            SandboxError::VerificationFailed(format!(
+                "cgroup.procs accepted PID {pid} but membership does not read back under {}",
+                spec.scope_name
+            )),
+            &residue,
+        ));
+    }
+    // Enforce the envelope from inside the scope: the parent delegated the
+    // controllers, so the limit files exist, and binding them after the attach
+    // can never hit the no-internal-process constraint.
+    let enforce = |scope_dir: &Path| -> Result<(), SandboxError> {
+        let write_limit = |name: &str, value: &str| -> Result<(), SandboxError> {
+            fs::write(scope_dir.join(name), value).map_err(|error| {
+                SandboxError::Unavailable(format!(
+                    "cannot enforce {name}={value} in {}: {error}",
+                    scope_dir.display()
+                ))
+            })
+        };
+        write_limit("memory.max", &spec.memory_max_bytes.to_string())?;
+        write_limit("cpu.max", &cpu_max_cgroup_value(spec.cpu_quota_cores))?;
+        write_limit("pids.max", &spec.tasks_max.to_string())?;
+        Ok(())
+    };
+    if let Err(error) = enforce(&scope_dir) {
+        let residue = unattach_best_effort(&scope_dir, &parent_procs, pid);
+        return Err(with_residue(error, &residue));
     }
     let controllers = scope_controllers(&scope_dir);
     for need in ["cpu", "memory", "pids"] {
         if !controllers.iter().any(|have| have == need) {
-            return Err(SandboxError::VerificationFailed(format!(
-                "worker scope is missing inheritable controller {need}"
-            )));
+            let residue = unattach_best_effort(&scope_dir, &parent_procs, pid);
+            return Err(with_residue(
+                SandboxError::VerificationFailed(format!(
+                    "worker scope is missing inheritable controller {need}"
+                )),
+                &residue,
+            ));
         }
     }
     Ok(CgroupEvidence {
@@ -1334,18 +1491,63 @@ pub fn cleanup_worker_cgroup(scope_dir: &Path) -> io::Result<()> {
     fs::remove_dir(scope_dir)
 }
 
-/// Probe cgroup delegability with a real but non-attaching placement: create a
-/// throwaway leaf scope under the current user-owned cgroup, require
-/// cpu/memory/pids to be visible inside it, then remove it while still empty.
+/// Append best-effort retreat context to a join error without masking the
+/// primary failure: `residue` is empty when nothing leaked.
+fn with_residue(error: SandboxError, residue: &str) -> SandboxError {
+    if residue.is_empty() {
+        return error;
+    }
+    match error {
+        SandboxError::Unavailable(message) => {
+            SandboxError::Unavailable(format!("{message}; {residue}"))
+        }
+        SandboxError::Unsupported(message) => {
+            SandboxError::Unsupported(format!("{message}; {residue}"))
+        }
+        SandboxError::VerificationFailed(message) => {
+            SandboxError::VerificationFailed(format!("{message}; {residue}"))
+        }
+    }
+}
+
+/// Best-effort retreat after a failed post-attach join step: move the worker
+/// PID back to the parent cgroup so the scope empties, then remove it. Failed
+/// joins leave nothing behind; when the retreat itself fails, the leftover is
+/// reported as residue context instead of masking the primary error.
+fn unattach_best_effort(scope_dir: &Path, parent_procs: &Path, pid: u32) -> String {
+    if fs::write(parent_procs, pid.to_string()).is_err() {
+        return format!(
+            "worker PID {pid} could not be moved back to {} and scope {} remains occupied",
+            parent_procs.display(),
+            scope_dir.display()
+        );
+    }
+    match cleanup_worker_cgroup(scope_dir) {
+        Ok(()) => String::new(),
+        Err(error) => format!(
+            "emptied scope {} could not be removed: {error}",
+            scope_dir.display()
+        ),
+    }
+}
+
+/// Probe cgroup delegability with a real but non-attaching placement that
+/// models `join_worker_cgroup` step for step: create a throwaway leaf scope
+/// under the current user-owned cgroup, require cpu/memory/pids to be visible
+/// inside it (a fresh leaf lists exactly what the parent delegated), then bind
+/// the same resolved envelope placement binds, and remove the still-empty
+/// scope afterwards.
 ///
 /// Controller *visibility* at the cgroup root is not *delegability*: a scope
-/// can list controllers the user manager never delegated into this tree, so
-/// `join_worker_cgroup` would still fail. This probe exercises the same
-/// filesystem path a real placement takes (create leaf under the current
-/// cgroup, read its inherited `cgroup.controllers`) minus the self-attach, so
-/// the gate fails closed exactly when placement would fail — and passes with
-/// no residue on hosts where delegation works.
+/// can list controllers the user manager never delegated into this tree, and
+/// the limit files the envelope needs would not exist. The one placement step
+/// the probe does not mirror is the self-attach — it needs no delegation (an
+/// empty scope, empty subtree_control, no `pids.max` yet cannot refuse a
+/// migration), and the probe never moves the caller's own cgroup membership.
 fn probe_worker_cgroup_delegation() -> Result<(), SandboxError> {
+    use super::bounds::{
+        cpu_max_cgroup_value, desired_cgroup_spec, host_cpu_cores, host_physical_ram_bytes,
+    };
     let current = current_cgroup_path()
         .ok_or_else(|| SandboxError::Unsupported("no cgroup v2 membership is visible".into()))?;
     if !current.starts_with("/user.slice/") {
@@ -1368,25 +1570,45 @@ fn probe_worker_cgroup_delegation() -> Result<(), SandboxError> {
             probe_dir.display()
         ))
     })?;
-    // A fresh leaf lists exactly the controllers its parent delegated into it:
-    // the same visibility `join_worker_cgroup` requires (its subtree_control
-    // write is best-effort), so this check is exactly as strict as placement.
-    let visible = scope_controllers(&probe_dir);
-    let missing: Vec<&str> = ["cpu", "memory", "pids"]
-        .into_iter()
-        .filter(|need| !visible.iter().any(|have| have == need))
-        .collect();
+    let placement = (|| -> Result<(), SandboxError> {
+        let visible = scope_controllers(&probe_dir);
+        let missing: Vec<&str> = ["cpu", "memory", "pids"]
+            .into_iter()
+            .filter(|need| !visible.iter().any(|have| have == need))
+            .collect();
+        if !missing.is_empty() {
+            return Err(SandboxError::Unavailable(format!(
+                "cgroup delegation unavailable: worker scope cannot delegate controllers: missing {}",
+                missing.join(",")
+            )));
+        }
+        // The delegated controllers make the limit files exist: bind exactly
+        // what a real placement binds, so the probe fails precisely when a
+        // join would.
+        let spec = desired_cgroup_spec(
+            host_physical_ram_bytes().unwrap_or(8 * 1024 * 1024 * 1024),
+            host_cpu_cores(),
+            std::process::id(),
+        );
+        let write_limit = |name: &str, value: &str| -> Result<(), SandboxError> {
+            fs::write(probe_dir.join(name), value).map_err(|error| {
+                SandboxError::Unavailable(format!(
+                    "cannot enforce {name}={value} in probe scope {}: {error}",
+                    probe_dir.display()
+                ))
+            })
+        };
+        write_limit("memory.max", &spec.memory_max_bytes.to_string())?;
+        write_limit("cpu.max", &cpu_max_cgroup_value(spec.cpu_quota_cores))?;
+        write_limit("pids.max", &spec.tasks_max.to_string())?;
+        Ok(())
+    })();
     // The probe scope is empty (nothing was attached), so it must always
     // remove cleanly; leaving it behind would leak into the user's cgroup
     // tree on every gate run, and cleanup errors surface rather than pretend
     // nothing happened.
     let cleanup_error = cleanup_worker_cgroup(&probe_dir).err();
-    if !missing.is_empty() {
-        return Err(SandboxError::Unavailable(format!(
-            "cgroup delegation unavailable: worker scope cannot delegate controllers: missing {}",
-            missing.join(",")
-        )));
-    }
+    placement?;
     if let Some(error) = cleanup_error {
         return Err(SandboxError::Unavailable(format!(
             "cgroup delegation probe scope {} could not be removed: {error}",
@@ -1434,10 +1656,12 @@ pub struct SandboxReady {
 
 /// Fail Local closed unless the kernel and user manager can enforce the full
 /// envelope: validated syscall arch, Landlock ABI ≥ 1, a user-owned tree, and
-/// cpu/memory/pids controllers both visible and actually delegable into a
-/// fresh worker scope (verified with a real, empty, non-attaching probe
-/// placement). The launcher calls this before spawning the worker; `Err`
-/// means Local stays unavailable.
+/// cpu/memory/pids controllers delegated deep enough that a real worker scope
+/// exists, shows them, and accepts the resolved envelope's limit files. The
+/// delegation probe models `join_worker_cgroup` without attaching anything:
+/// fresh-leaf controller visibility plus the same limit writes, in a
+/// throwaway scope that is removed afterwards. The launcher calls this before
+/// spawning the worker; `Err` means Local stays unavailable.
 pub fn gate_local_on_sandbox() -> Result<SandboxReady, SandboxError> {
     let caps = probe_sandbox_capabilities();
     let arch = caps.syscall_arch.ok_or_else(|| {
