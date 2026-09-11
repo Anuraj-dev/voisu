@@ -808,8 +808,7 @@ fn clipboard_write(text: &[u8]) -> Result<ClipboardTool, ProcessError> {
             last_error = ProcessError::TimedOut;
             break;
         }
-        let (program, arguments) = tool.write_command();
-        match run_restricted_serving_within(program, arguments, Some(text), slice) {
+        match clipboard_write_candidate(*tool, text, slice) {
             Ok(outcome) if outcome.success => return Ok(*tool),
             // Every backend-specific failure — a wrong session, a missing tool,
             // even a timeout — falls through to the next candidate rather than
@@ -819,6 +818,172 @@ fn clipboard_write(text: &[u8]) -> Result<ClipboardTool, ProcessError> {
         }
     }
     Err(last_error)
+}
+
+/// Writes one clipboard candidate, repairing a stale Wayland selection once.
+///
+/// Hyprland clipboard-history readers can leave the data-control selection in a
+/// state where the next `wl-copy` exits immediately. A separate writer clears
+/// that state, which is why restarting Voisu appeared to fix every later
+/// Recording. Keep the normal path single-shot; only an observed Wayland
+/// failure clears the stale selection and retries under the original budget.
+fn clipboard_write_candidate(
+    tool: ClipboardTool,
+    text: &[u8],
+    deadline: Duration,
+) -> Result<ProcessOutcome, ProcessError> {
+    clipboard_write_candidate_with(tool, text, deadline, run_restricted_serving_within)
+}
+
+fn clipboard_write_candidate_with<F>(
+    tool: ClipboardTool,
+    text: &[u8],
+    deadline: Duration,
+    mut run: F,
+) -> Result<ProcessOutcome, ProcessError>
+where
+    F: FnMut(&str, &[&str], Option<&[u8]>, Duration) -> Result<ProcessOutcome, ProcessError>,
+{
+    let started = Instant::now();
+    let (program, default_arguments) = tool.write_command();
+    let arguments: &[&str] = match tool {
+        // A Transcript is always UTF-8 text. Declaring that contract avoids
+        // wl-copy's content sniffing, which can classify ordinary prose as a
+        // non-text file format and make GUI paste targets reject it.
+        ClipboardTool::WlClipboard => &["--type", "text/plain;charset=utf-8", "--"],
+        ClipboardTool::Xclip => default_arguments,
+    };
+    let first = run(program, arguments, Some(text), deadline);
+    if matches!(&first, Ok(outcome) if outcome.success) || tool != ClipboardTool::WlClipboard {
+        return first;
+    }
+
+    let remaining = deadline.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return first;
+    }
+    let clear_budget = remaining / 2;
+    if clear_budget.is_zero()
+        || !matches!(
+            run("wl-copy", &["--clear"], None, clear_budget),
+            Ok(outcome) if outcome.success
+        )
+    {
+        return first;
+    }
+    let retry_budget = deadline.saturating_sub(started.elapsed());
+    if retry_budget.is_zero() {
+        return first;
+    }
+    run(program, arguments, Some(text), retry_budget)
+}
+
+#[cfg(test)]
+mod clipboard_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn stale_wayland_selection_is_cleared_and_second_write_recovers() {
+        let mut calls = Vec::new();
+        let mut stale = true;
+
+        let outcome = clipboard_write_candidate_with(
+            ClipboardTool::WlClipboard,
+            b"second Transcript",
+            Duration::from_secs(4),
+            |program, arguments, input, _| {
+                calls.push((program.to_owned(), arguments.join(" "), input.is_some()));
+                if arguments == ["--clear"] {
+                    stale = false;
+                    return Ok(ProcessOutcome {
+                        success: true,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    });
+                }
+                Ok(ProcessOutcome {
+                    success: !stale,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            },
+        );
+
+        let Ok(outcome) = outcome else {
+            panic!("Wayland recovery must return an outcome")
+        };
+
+        assert!(outcome.success);
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "wl-copy".to_owned(),
+                    "--type text/plain;charset=utf-8 --".to_owned(),
+                    true,
+                ),
+                ("wl-copy".to_owned(), "--clear".to_owned(), false),
+                (
+                    "wl-copy".to_owned(),
+                    "--type text/plain;charset=utf-8 --".to_owned(),
+                    true,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn successful_wayland_write_does_not_clear_or_retry() {
+        let mut calls = 0;
+        let outcome = clipboard_write_candidate_with(
+            ClipboardTool::WlClipboard,
+            b"Transcript",
+            Duration::from_secs(4),
+            |_, arguments, _, _| {
+                calls += 1;
+                assert_eq!(arguments, ["--type", "text/plain;charset=utf-8", "--"]);
+                Ok(ProcessOutcome {
+                    success: true,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            },
+        );
+
+        let Ok(outcome) = outcome else {
+            panic!("successful Wayland write must return an outcome")
+        };
+
+        assert!(outcome.success);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn xclip_failure_is_not_repaired_with_wayland_commands() {
+        let mut calls = 0;
+        let outcome = clipboard_write_candidate_with(
+            ClipboardTool::Xclip,
+            b"Transcript",
+            Duration::from_secs(4),
+            |program, arguments, _, _| {
+                calls += 1;
+                assert_eq!(program, "xclip");
+                assert_eq!(arguments, ["-selection", "clipboard", "-in"]);
+                Ok(ProcessOutcome {
+                    success: false,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            },
+        );
+
+        let Ok(outcome) = outcome else {
+            panic!("xclip status failure must remain a process outcome")
+        };
+
+        assert!(!outcome.success);
+        assert_eq!(calls, 1);
+    }
 }
 
 impl ClipboardBoundary for WlClipboard {
