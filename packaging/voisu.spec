@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.60.1
+Version:        0.61.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,10 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Fri Sep 11 2026 Voisu maintainers <voisu@example.invalid> - 0.61.0-1
+- test(worker): assert read_capped contract instead of exact kept length
+- feat(local-worker): truthful persistent Local worker (#265)
+
 * Fri Sep 11 2026 Voisu maintainers <voisu@example.invalid> - 0.60.1-1
 - docs(bakeoff): attest frozen corpus metadata
 - fix(bakeoff): require complete privacy-safe reports
