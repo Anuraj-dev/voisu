@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.62.1
+Version:        0.62.2
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,9 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Sat Sep 19 2026 Voisu maintainers <voisu@example.invalid> - 0.62.2-1
+- fix(ir): point Groq reconciliation at qwen/qwen3.8-27b (#275)
+
 * Fri Sep 11 2026 Voisu maintainers <voisu@example.invalid> - 0.62.1-1
 - test(delivery): pin clipboard recovery failure and budget semantics
 - fix(delivery): recover a stale Wayland selection once, then retry
