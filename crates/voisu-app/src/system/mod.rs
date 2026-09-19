@@ -119,7 +119,7 @@ const RECONCILIATION_PROCESS_DEADLINE: Duration = Duration::from_secs(2);
 /// Default Groq chat-completions model for Transcript reconciliation.
 /// Exact id only — no family-wide Qwen rule. Co-lands with the #98
 /// `reasoning_effort: "none"` body field for this same exact id.
-pub const DEFAULT_GROQ_RECONCILIATION_MODEL: &str = "qwen/qwen3.6-27b";
+pub const DEFAULT_GROQ_RECONCILIATION_MODEL: &str = "qwen/qwen3.8-27b";
 
 const MIN_RECORDING_BYTES: usize = PCM_CHUNK_BYTES;
 
@@ -3426,7 +3426,7 @@ mod tests {
     /// #98: the default reconciliation model is the exact selected Qwen id.
     #[test]
     fn default_groq_reconciliation_model_is_exact_qwen_id() {
-        assert_eq!(DEFAULT_GROQ_RECONCILIATION_MODEL, "qwen/qwen3.6-27b");
+        assert_eq!(DEFAULT_GROQ_RECONCILIATION_MODEL, "qwen/qwen3.8-27b");
     }
 
     /// #98: only the exact selected model gets `reasoning_effort: "none"`.
@@ -3438,7 +3438,7 @@ mod tests {
         );
         assert_eq!(
             body.get("model").and_then(|value| value.as_str()),
-            Some("qwen/qwen3.6-27b")
+            Some("qwen/qwen3.8-27b")
         );
         assert_eq!(
             body.get("reasoning_effort")
@@ -3466,7 +3466,7 @@ mod tests {
             ],
             dictionary_terms: vec!["Voisu".to_owned()],
         });
-        assert_eq!(body["model"], "qwen/qwen3.6-27b");
+        assert_eq!(body["model"], "qwen/qwen3.8-27b");
         assert_eq!(body["reasoning_effort"], "none");
         assert_eq!(
             body["response_format"],
@@ -3490,7 +3490,7 @@ mod tests {
         let overrides = [
             "openai/gpt-oss-120b",
             "llama-3.3-70b-versatile",
-            "qwen/qwen3-32b",
+            "qwen/qwen3.6-27b",
             "configured-model",
         ];
         for model in overrides {

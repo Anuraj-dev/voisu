@@ -6260,7 +6260,7 @@ fn enabled_intent_reconstruction_records_lifecycle_and_delivers_once() {
     let intent = &stopped["evidence"]["intent_reconstruction"];
     assert_eq!(intent["eligibility"], "material_disagreement", "{stopped}");
     assert_eq!(intent["outcome"], "accepted", "{stopped}");
-    assert_eq!(intent["model"], "qwen/qwen3.6-27b", "{stopped}");
+    assert_eq!(intent["model"], "qwen/qwen3.8-27b", "{stopped}");
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     assert_eq!(
@@ -6803,7 +6803,7 @@ rm -f "$config"
     assert_eq!(stopped["evidence"]["transcript_selection"], "reconciled");
     let config = fs::read_to_string(commands.path().join("reconciliation.config")).unwrap();
     assert!(
-        config.contains("qwen/qwen3.6-27b"),
+        config.contains("qwen/qwen3.8-27b"),
         "default model must be exact selected Qwen id: {config}"
     );
     assert!(
@@ -10591,7 +10591,7 @@ fn replay_exposes_intent_reconstruction_evidence() {
     );
     assert_eq!(
         replayed["evidence"]["intent_reconstruction"]["model"],
-        "qwen/qwen3.6-27b"
+        "qwen/qwen3.8-27b"
     );
 }
 
@@ -12795,7 +12795,7 @@ fn flagged_dpr_real_wiring_routes_composes_and_delivers_once() {
 
     let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
-    assert_eq!(request["model"], "qwen/qwen3.6-27b");
+    assert_eq!(request["model"], "qwen/qwen3.8-27b");
     assert_eq!(request["reasoning_effort"], "none");
     assert_eq!(request["response_format"]["type"], "json_object");
     let user: Value =
