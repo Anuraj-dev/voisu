@@ -373,7 +373,7 @@ fn request_groq_reconciliation(
 /// Build the Groq chat-completions JSON body for reconciliation.
 ///
 /// `reasoning_effort: "none"` is attached only when `model` is exactly the
-/// selected default id (`qwen/qwen3.6-27b`). Every other override — including
+/// selected default id (`qwen/qwen3.8-27b`). Every other override — including
 /// other `qwen/…` ids and GPT-OSS — omits the field unless separately supported
 /// later. Attaching `none` to GPT-OSS or Llama returns HTTP 400.
 pub(super) fn groq_reconciliation_request_body(model: &str, task: &str) -> serde_json::Value {

@@ -27,7 +27,7 @@ use crate::system::{
 /// Preferred in-budget candidate from the approved #140 matrix.
 pub const DPR_GROQ_MODEL: &str = "openai/gpt-oss-20b";
 pub const DPR_GROQ_REASONING_EFFORT: &str = "low";
-pub const DPR_FORMAT_GROQ_MODEL: &str = "qwen/qwen3.6-27b";
+pub const DPR_FORMAT_GROQ_MODEL: &str = "qwen/qwen3.8-27b";
 pub const DPR_FORMAT_GROQ_REASONING_EFFORT: &str = "none";
 pub const DPR_FORMAT_GROQ_REASONING_FORMAT: &str = "hidden";
 pub const DPR_GROQ_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
@@ -1024,7 +1024,7 @@ mod tests {
     fn model_policy_matches_approved_constants_without_claiming_a_default() {
         assert_eq!(DPR_GROQ_MODEL, "openai/gpt-oss-20b");
         assert_eq!(DPR_GROQ_REASONING_EFFORT, "low");
-        assert_eq!(DPR_FORMAT_GROQ_MODEL, "qwen/qwen3.6-27b");
+        assert_eq!(DPR_FORMAT_GROQ_MODEL, "qwen/qwen3.8-27b");
         assert_eq!(DPR_FORMAT_GROQ_REASONING_EFFORT, "none");
         assert_eq!(DPR_FORMAT_GROQ_REASONING_FORMAT, "hidden");
         assert_eq!(DPR_GEMINI_FLASH_LITE_MODEL, "gemini-3.5-flash-lite");
