@@ -99,7 +99,7 @@ systemd-analyze verify /usr/lib/systemd/user/voisu-overlay.service
 # per-user manager when Ubuntu restricts unprivileged user namespaces.
 for unit in voisu.service voisu-overlay.service; do
     unit_path="/usr/lib/systemd/user/$unit"
-    if grep -Eq '^(ProtectKernelModules|ProtectKernelLogs|ProtectClock|ProtectHostname)=' "$unit_path"; then
+    if grep -Eq '^[[:space:]]*(ProtectKernelModules|ProtectKernelLogs|ProtectClock|ProtectHostname)[[:space:]]*=' "$unit_path"; then
         echo "FAIL: $unit contains a user-service-incompatible protection directive"
         exit 1
     fi

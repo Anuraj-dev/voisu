@@ -225,6 +225,8 @@ fn setup_discovers_the_profile_before_local_prompts() {
         .env("DISPLAY", ":0")
         .env_remove("WAYLAND_DISPLAY")
         .env_remove("HYPRLAND_INSTANCE_SIGNATURE")
+        .env_remove("XDG_CURRENT_DESKTOP")
+        .env_remove("XDG_SESSION_DESKTOP")
         .stdin(Stdio::null())
         .output()
         .expect("setup");
@@ -249,6 +251,8 @@ fn setup_discovers_the_profile_before_cloud_prompts() {
         .env("DISPLAY", ":0")
         .env_remove("WAYLAND_DISPLAY")
         .env_remove("HYPRLAND_INSTANCE_SIGNATURE")
+        .env_remove("XDG_CURRENT_DESKTOP")
+        .env_remove("XDG_SESSION_DESKTOP")
         .stdin(Stdio::null())
         .output()
         .expect("setup");
