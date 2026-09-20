@@ -175,9 +175,19 @@ fn local_doctor_skips_cloud_probes_with_explicit_skip_rows() {
 fn local_setup_does_not_prompt_for_cloud_keys() {
     let harness = Harness::new();
     assert!(harness.voisu(&["mode", "local"]).status.success());
+    fs::create_dir_all(harness.config.path().join("hypr")).unwrap();
+    fs::write(
+        harness.config.path().join("hypr/hyprland.lua"),
+        "-- current Lua configuration for setup profile discovery\n",
+    )
+    .unwrap();
     let setup = harness
         .command(env!("CARGO_BIN_EXE_voisu"))
         .args(["setup"])
+        .env("XDG_SESSION_TYPE", "wayland")
+        .env("WAYLAND_DISPLAY", "wayland-test")
+        .env("XDG_CURRENT_DESKTOP", "Hyprland")
+        .env("HYPRLAND_INSTANCE_SIGNATURE", "setup-test-instance")
         .env("VOISU_TEST_SETUP_WIZARD_ONLY", "1")
         .stdin(Stdio::null())
         .output()
@@ -201,4 +211,57 @@ fn local_setup_does_not_prompt_for_cloud_keys() {
         "{combined}"
     );
     assert!(!combined.contains("Download and install"), "{combined}");
+}
+
+#[test]
+fn setup_discovers_the_profile_before_local_prompts() {
+    let harness = Harness::new();
+    assert!(harness.voisu(&["mode", "local"]).status.success());
+
+    let setup = harness
+        .command(env!("CARGO_BIN_EXE_voisu"))
+        .args(["setup"])
+        .env("XDG_SESSION_TYPE", "x11")
+        .env("DISPLAY", ":0")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("HYPRLAND_INSTANCE_SIGNATURE")
+        .stdin(Stdio::null())
+        .output()
+        .expect("setup");
+
+    let combined = format!("{}{}", stdout(&setup), stderr(&setup));
+    assert_eq!(setup.status.code(), Some(4), "{combined}");
+    assert!(
+        combined.contains("unsupported setup session: X11"),
+        "{combined}"
+    );
+    assert!(!combined.contains("Local Setup"), "{combined}");
+}
+
+#[test]
+fn setup_discovers_the_profile_before_cloud_prompts() {
+    let harness = Harness::new();
+
+    let setup = harness
+        .command(env!("CARGO_BIN_EXE_voisu"))
+        .args(["setup"])
+        .env("XDG_SESSION_TYPE", "x11")
+        .env("DISPLAY", ":0")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("HYPRLAND_INSTANCE_SIGNATURE")
+        .stdin(Stdio::null())
+        .output()
+        .expect("setup");
+
+    let combined = format!("{}{}", stdout(&setup), stderr(&setup));
+    assert_eq!(setup.status.code(), Some(4), "{combined}");
+    assert!(
+        combined.contains("unsupported setup session: X11"),
+        "{combined}"
+    );
+    assert!(
+        !combined.contains("Enter your Deepgram API key"),
+        "{combined}"
+    );
+    assert!(!combined.contains("Enter your Groq API key"), "{combined}");
 }

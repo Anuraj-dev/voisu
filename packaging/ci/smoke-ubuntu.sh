@@ -95,6 +95,17 @@ echo "== systemd-analyze verify (both user units) =="
 systemd-analyze verify /usr/lib/systemd/user/voisu.service
 systemd-analyze verify /usr/lib/systemd/user/voisu-overlay.service
 
+# These directives can require capability or namespace setup unavailable to a
+# per-user manager when Ubuntu restricts unprivileged user namespaces.
+for unit in voisu.service voisu-overlay.service; do
+    unit_path="/usr/lib/systemd/user/$unit"
+    if grep -Eq '^(ProtectKernelModules|ProtectKernelLogs|ProtectClock|ProtectHostname)=' "$unit_path"; then
+        echo "FAIL: $unit contains a user-service-incompatible protection directive"
+        exit 1
+    fi
+done
+echo "[evidence] both user units omit capability-dropping protection directives"
+
 # --- assertion: a fresh home cannot break namespace setup ---
 echo "== fresh-home safety: the unit provisions its own config/state dirs =="
 # A fresh home that never created ~/.config/voisu or ~/.local/state/voisu must

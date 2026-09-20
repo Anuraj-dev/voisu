@@ -843,6 +843,11 @@ fn setup() -> ExitCode {
     // production never sets this seam.
     let wizard_only = std::env::var_os("VOISU_TEST_SETUP_WIZARD_ONLY").is_some();
     let mut wizard = StdioWizard;
+    let discovery = match discover_setup_profile(&live_setup_facts()) {
+        Ok(discovery) => discovery,
+        Err(error) => return fail(4, &error.message()),
+    };
+    println!("Detected {} Setup Profile.", discovery.profile.as_str());
     if voisu_app::local_setup::is_local_mode() {
         if let Err(error) = run_consented_local_setup(&mut wizard) {
             return fail(4, &error);
@@ -852,11 +857,6 @@ fn setup() -> ExitCode {
             return ExitCode::SUCCESS;
         }
     }
-    let discovery = match discover_setup_profile(&live_setup_facts()) {
-        Ok(discovery) => discovery,
-        Err(error) => return fail(4, &error.message()),
-    };
-    println!("Detected {} Setup Profile.", discovery.profile.as_str());
     let hyprland_config = discovery.hyprland_config;
     if hyprland_config.is_some()
         && !wizard_only

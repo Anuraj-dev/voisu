@@ -14,6 +14,8 @@ use voisu_core::{SessionKind, resolve_session};
 pub enum SetupProfile {
     /// Fedora KDE or GNOME running on Wayland.
     FedoraWayland,
+    /// Ubuntu GNOME running on Wayland.
+    UbuntuWayland,
     /// Hyprland, including an Omarchy session.
     Hyprland,
 }
@@ -22,6 +24,7 @@ impl SetupProfile {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::FedoraWayland => "fedora-wayland",
+            Self::UbuntuWayland => "ubuntu-wayland",
             Self::Hyprland => "hyprland",
         }
     }
@@ -81,7 +84,7 @@ impl SetupDiscoveryError {
     pub fn message(&self) -> String {
         match self {
             Self::UnknownSession => {
-                "cannot determine the desktop session; run `voisu setup` from Fedora KDE/GNOME Wayland or Hyprland (including Omarchy)".to_owned()
+                "cannot determine the desktop session; run `voisu setup` from Fedora KDE/GNOME Wayland, Ubuntu GNOME Wayland, or Hyprland (including Omarchy)".to_owned()
             }
             Self::UnsupportedSession { session, desktop } => {
                 let session = match session {
@@ -161,6 +164,16 @@ pub fn discover_setup_profile(
         });
     }
 
+    if session.session == SessionKind::Wayland
+        && is_ubuntu(facts.distro_id.as_deref())
+        && has_gnome_desktop(desktop)
+    {
+        return Ok(SetupProfileDiscovery {
+            profile: SetupProfile::UbuntuWayland,
+            hyprland_config: None,
+        });
+    }
+
     Err(SetupDiscoveryError::UnsupportedSession {
         session: session.session,
         desktop: desktop.map(str::to_owned),
@@ -217,14 +230,24 @@ fn is_fedora(value: Option<&str>) -> bool {
     value.is_some_and(|value| value.eq_ignore_ascii_case("fedora"))
 }
 
+fn is_ubuntu(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("ubuntu"))
+}
+
+fn has_gnome_desktop(value: Option<&str>) -> bool {
+    has_desktop_label(value, |label| label.eq_ignore_ascii_case("gnome"))
+}
+
 fn has_supported_desktop(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        value.split([':', ';', ',']).map(str::trim).any(|label| {
-            label.eq_ignore_ascii_case("kde")
-                || label.eq_ignore_ascii_case("kde plasma")
-                || label.eq_ignore_ascii_case("gnome")
-        })
+    has_desktop_label(value, |label| {
+        label.eq_ignore_ascii_case("kde")
+            || label.eq_ignore_ascii_case("kde plasma")
+            || label.eq_ignore_ascii_case("gnome")
     })
+}
+
+fn has_desktop_label(value: Option<&str>, matches: impl Fn(&str) -> bool) -> bool {
+    value.is_some_and(|value| value.split([':', ';', ',']).map(str::trim).any(matches))
 }
 
 #[cfg(test)]
@@ -329,6 +352,68 @@ mod tests {
                 SetupProfile::FedoraWayland
             );
         }
+    }
+
+    #[test]
+    fn ubuntu_gnome_wayland_resolves_to_the_ubuntu_profile() {
+        for desktop in ["ubuntu:GNOME", "GNOME"] {
+            let facts = SetupDiscoveryFacts {
+                wayland_display: Some("wayland-0".to_owned()),
+                session_type: Some("wayland".to_owned()),
+                current_desktop: Some(desktop.to_owned()),
+                distro_id: Some("Ubuntu".to_owned()),
+                ..SetupDiscoveryFacts::default()
+            };
+
+            assert_eq!(
+                discover_setup_profile(&facts).unwrap().profile,
+                SetupProfile::UbuntuWayland
+            );
+        }
+    }
+
+    #[test]
+    fn ubuntu_x11_and_other_ubuntu_or_gnome_combinations_remain_unsupported() {
+        for facts in [
+            SetupDiscoveryFacts {
+                x11_display: Some(":0".to_owned()),
+                session_type: Some("x11".to_owned()),
+                current_desktop: Some("ubuntu:GNOME".to_owned()),
+                distro_id: Some("ubuntu".to_owned()),
+                ..SetupDiscoveryFacts::default()
+            },
+            SetupDiscoveryFacts {
+                wayland_display: Some("wayland-0".to_owned()),
+                session_type: Some("wayland".to_owned()),
+                current_desktop: Some("GNOME".to_owned()),
+                distro_id: Some("debian".to_owned()),
+                ..SetupDiscoveryFacts::default()
+            },
+            SetupDiscoveryFacts {
+                wayland_display: Some("wayland-0".to_owned()),
+                session_type: Some("wayland".to_owned()),
+                current_desktop: Some("KDE".to_owned()),
+                distro_id: Some("ubuntu".to_owned()),
+                ..SetupDiscoveryFacts::default()
+            },
+        ] {
+            assert!(matches!(
+                discover_setup_profile(&facts),
+                Err(SetupDiscoveryError::UnsupportedSession { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn live_hyprland_evidence_takes_priority_over_ubuntu_labels() {
+        let mut facts = hyprland_facts();
+        facts.current_desktop = Some("ubuntu:GNOME".to_owned());
+        facts.distro_id = Some("ubuntu".to_owned());
+
+        assert_eq!(
+            discover_setup_profile(&facts).unwrap().profile,
+            SetupProfile::Hyprland
+        );
     }
 
     #[test]

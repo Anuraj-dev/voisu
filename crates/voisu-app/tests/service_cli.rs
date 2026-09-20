@@ -440,11 +440,7 @@ fn assert_packaged_daemon_runtime_contract(unit: &str) {
             "AF_UNIX AF_INET AF_INET6 AF_NETLINK",
         ),
         ("ProtectKernelTunables=", "yes"),
-        ("ProtectKernelModules=", "yes"),
-        ("ProtectKernelLogs=", "yes"),
         ("ProtectControlGroups=", "yes"),
-        ("ProtectClock=", "yes"),
-        ("ProtectHostname=", "yes"),
         ("RestrictRealtime=", "yes"),
         ("RestrictSUIDSGID=", "yes"),
         ("LockPersonality=", "yes"),
@@ -453,6 +449,14 @@ fn assert_packaged_daemon_runtime_contract(unit: &str) {
         ("MemoryDenyWriteExecute=", "yes"),
     ] {
         assert_unit_assignment("voisu.service", unit, assignment, expected);
+    }
+    for assignment in [
+        "ProtectKernelModules=",
+        "ProtectKernelLogs=",
+        "ProtectClock=",
+        "ProtectHostname=",
+    ] {
+        assert_unit_assignment_absent("voisu.service", unit, assignment);
     }
 }
 
@@ -465,11 +469,7 @@ fn assert_packaged_overlay_runtime_contract(unit: &str) {
         ("PrivateTmp=", "yes"),
         ("RestrictAddressFamilies=", "AF_UNIX"),
         ("ProtectKernelTunables=", "yes"),
-        ("ProtectKernelModules=", "yes"),
-        ("ProtectKernelLogs=", "yes"),
         ("ProtectControlGroups=", "yes"),
-        ("ProtectClock=", "yes"),
-        ("ProtectHostname=", "yes"),
         ("RestrictRealtime=", "yes"),
         ("RestrictSUIDSGID=", "yes"),
         ("LockPersonality=", "yes"),
@@ -477,6 +477,14 @@ fn assert_packaged_overlay_runtime_contract(unit: &str) {
         ("SystemCallArchitectures=", "native"),
     ] {
         assert_unit_assignment("voisu-overlay.service", unit, assignment, expected);
+    }
+    for assignment in [
+        "ProtectKernelModules=",
+        "ProtectKernelLogs=",
+        "ProtectClock=",
+        "ProtectHostname=",
+    ] {
+        assert_unit_assignment_absent("voisu-overlay.service", unit, assignment);
     }
 }
 
