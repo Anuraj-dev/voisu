@@ -192,10 +192,17 @@
   .fp b { color: var(--ink-dim); font-weight: 600; letter-spacing: .02em; }
 
   /* ---- after install ---- */
-  .after { padding: 40px 0 0; }
-  .after p {
-    font-family: var(--mono); font-size: .84rem; color: var(--ink-dim);
-    margin: 0 0 12px;
+  .after {
+    margin: 28px 0 0; padding: 20px 0 0;
+    border-top: 1px solid var(--line-soft);
+  }
+  .after-title {
+    font-family: var(--mono); font-size: .88rem; font-weight: 600;
+    color: var(--ink); margin: 0 0 6px;
+  }
+  .after-note {
+    max-width: 62ch; font-family: var(--sans); font-size: .9rem;
+    line-height: 1.55; color: var(--ink-dim); margin: 0 0 12px;
   }
 
   /* ---- footer ---- */
@@ -243,6 +250,21 @@
 <span class="c"># optional on-screen overlay:</span>
 <span class="p">$ </span>sudo dnf install voisu-overlay</pre>
         </div>
+        <div class="after">
+          <p class="after-title">Finish setup</p>
+          <p class="after-note">On Fedora KDE or GNOME, enable the user daemon, then add your API keys.</p>
+          <div class="code">
+            <button class="copy" type="button">copy</button>
+<pre><span class="p">$ </span>systemctl --user daemon-reload
+<span class="p">$ </span>systemctl --user enable --now voisu.service
+<span class="p">$ </span>voisu setup</pre>
+          </div>
+          <p class="after-note">Optional GTK overlay (install <code>voisu-overlay</code> first):</p>
+          <div class="code">
+            <button class="copy" type="button">copy</button>
+<pre><span class="p">$ </span>systemctl --user enable --now voisu-overlay.service</pre>
+          </div>
+        </div>
       </div>
 
       <!-- Arch -->
@@ -252,6 +274,14 @@
 <pre><span class="p">$ </span>yay -S voisu-bin</pre>
         </div>
         <p class="alt">Build from source instead: <code>yay -S voisu</code></p>
+        <div class="after">
+          <p class="after-title">Finish setup</p>
+          <p class="after-note">On Hyprland, setup saves your API keys, writes the trigger binding, and starts Voisu services.</p>
+          <div class="code">
+            <button class="copy" type="button">copy</button>
+<pre><span class="p">$ </span>voisu setup</pre>
+          </div>
+        </div>
       </div>
 
       <!-- Debian / Ubuntu -->
@@ -284,28 +314,15 @@
 <span class="c"># The printed fingerprint must equal $EXPECT before you add the key above.</span></pre>
           </div>
         </details>
+        <div class="after">
+          <p class="after-title">Finish setup</p>
+          <p class="after-note">Setup asks for API keys, enables the daemon and native GNOME capsule, and uses Ctrl+Space by default. If asked, log out and back in or reboot.</p>
+          <div class="code">
+            <button class="copy" type="button">copy</button>
+<pre><span class="p">$ </span>voisu setup</pre>
+          </div>
+        </div>
       </div>
-    </div>
-  </section>
-
-  <section class="after">
-    <p>Finish setup for your desktop:</p>
-    <p class="meta">Ubuntu 26.04 GNOME Wayland</p>
-    <div class="code">
-      <button class="copy" type="button">copy</button>
-<pre><span class="p">$ </span>voisu setup
-<span class="c"># Setup asks for API keys, then enables the daemon and native GNOME capsule.</span>
-<span class="c"># Default trigger: Ctrl+Space toggles Voisu.</span>
-<span class="c"># If setup says restart required, log out and back in or reboot.</span></pre>
-    </div>
-    <p class="meta">Fedora / Hyprland</p>
-    <div class="code">
-      <button class="copy" type="button">copy</button>
-<pre><span class="p">$ </span>systemctl --user daemon-reload
-<span class="p">$ </span>systemctl --user enable --now voisu.service
-<span class="p">$ </span>voisu setup
-<span class="c"># Optional GTK status overlay (Fedora: install voisu-overlay first):</span>
-<span class="p">$ </span>systemctl --user enable --now voisu-overlay.service</pre>
     </div>
   </section>
 
