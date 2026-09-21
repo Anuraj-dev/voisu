@@ -256,7 +256,7 @@
 
       <!-- Debian / Ubuntu -->
       <div class="panel" data-d="debian">
-        <p class="meta">Ubuntu 26.04 LTS · amd64</p>
+        <p class="meta">Ubuntu 26.04 LTS · GNOME Wayland · amd64</p>
         <div class="code">
           <button class="copy" type="button">copy</button>
 <pre><span class="c"># 1. Add Voisu's signing key.</span>
@@ -289,12 +289,22 @@
   </section>
 
   <section class="after">
-    <p>Then enable it for your user:</p>
+    <p>Finish setup for your desktop:</p>
+    <p class="meta">Ubuntu 26.04 GNOME Wayland</p>
     <div class="code">
       <button class="copy" type="button">copy</button>
-<pre><span class="p">$ </span>systemctl --user enable --now voisu.service
+<pre><span class="p">$ </span>voisu setup
+<span class="c"># Setup asks for API keys, then enables the daemon and native GNOME capsule.</span>
+<span class="c"># Default trigger: Ctrl+Space toggles Voisu.</span>
+<span class="c"># If setup says restart required, log out and back in or reboot.</span></pre>
+    </div>
+    <p class="meta">Fedora / Hyprland</p>
+    <div class="code">
+      <button class="copy" type="button">copy</button>
+<pre><span class="p">$ </span>systemctl --user daemon-reload
+<span class="p">$ </span>systemctl --user enable --now voisu.service
 <span class="p">$ </span>voisu setup
-<span class="c"># optional on-screen overlay (Fedora: install voisu-overlay first):</span>
+<span class="c"># Optional GTK status overlay (Fedora: install voisu-overlay first):</span>
 <span class="p">$ </span>systemctl --user enable --now voisu-overlay.service</pre>
     </div>
   </section>
