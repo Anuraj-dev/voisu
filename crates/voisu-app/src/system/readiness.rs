@@ -15,29 +15,38 @@ impl FedoraReadiness {
     pub fn daemon_status(&self) -> Option<&Response> {
         self.daemon_status.as_ref()
     }
-}
 
-impl ReadinessInspector for FedoraReadiness {
-    fn inspect(&mut self) -> Vec<ReadinessFinding> {
+    /// Inspect shared desktop capabilities while omitting the GlobalShortcuts
+    /// probe when another desktop component owns the Trigger Key.
+    pub fn inspect_with_global_shortcuts(&mut self, use_portal: bool) -> Vec<ReadinessFinding> {
         self.daemon_status = daemon_status_response();
         if let Some(value) = std::env::var_os("VOISU_TEST_READINESS") {
-            return controlled_readiness(&value.to_string_lossy(), self.daemon_status.as_ref());
+            let mut findings =
+                controlled_readiness(&value.to_string_lossy(), self.daemon_status.as_ref());
+            if !use_portal {
+                findings.retain(|finding| finding.capability != ReadinessCapability::Portals);
+            }
+            return findings;
         }
-        let mut findings = vec![
-            session_finding(),
-            pipewire_finding(),
-            microphone_finding(),
-            portals_finding(),
+        let mut findings = vec![session_finding(), pipewire_finding(), microphone_finding()];
+        if use_portal {
+            findings.push(portals_finding());
+        }
+        findings.extend([
             clipboard_finding(),
             secret_service_finding(),
             daemon_finding(self.daemon_status.as_ref()),
-        ];
-        // Appended only when it can demonstrate a problem, so the common case
-        // stays quiet and the golden table is unaffected.
+        ]);
         if let Some(finding) = service_display_env_finding() {
             findings.push(finding);
         }
         findings
+    }
+}
+
+impl ReadinessInspector for FedoraReadiness {
+    fn inspect(&mut self) -> Vec<ReadinessFinding> {
+        self.inspect_with_global_shortcuts(true)
     }
 }
 

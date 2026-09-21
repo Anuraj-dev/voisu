@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="app.voisu.shell-overlay" path="/app/voisu/shell-overlay/">
+    <key name="voisu-trigger-key" type="as">
+      <default>['&lt;Control&gt;space']</default>
+      <summary>Voisu Trigger Key</summary>
+    </key>
+    <key name="trigger-active" type="b">
+      <default>false</default>
+      <summary>Whether GNOME accepted the Trigger Key</summary>
+    </key>
+  </schema>
+</schemalist>

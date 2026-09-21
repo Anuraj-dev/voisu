@@ -11,9 +11,9 @@ use voisu_app::system::{
 use voisu_core::{
     AsrMode, BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, DaemonReadiness,
     ExportCorrelationId, KeyDiagnosis, KeyLocation, PROTOCOL_VERSION, PasteActionState,
-    PasteBackend, Provider, ProviderAuthenticator, ProviderKeyStatus, ReadinessInspector,
-    ReadinessStatus, ReplayFixturePath, Request, Response, SecretStore, SessionKind,
-    VersionEnvelope, provider_free_tier_hint, resolve_session, socket_path,
+    PasteBackend, Provider, ProviderAuthenticator, ProviderKeyStatus, ReadinessStatus,
+    ReplayFixturePath, Request, Response, SecretStore, SessionKind, VersionEnvelope,
+    provider_free_tier_hint, resolve_session, socket_path,
 };
 
 /// The most response the CLI will buffer — per transport frame, and in total
@@ -329,9 +329,13 @@ impl DoctorRow {
 }
 
 fn doctor(verbose: bool) -> ExitCode {
+    use voisu_app::setup_profile::{TriggerIntegration, live_setup_facts, trigger_integration};
+
+    let trigger_integration = trigger_integration(&live_setup_facts());
+    let ubuntu_gnome = trigger_integration == TriggerIntegration::GnomeShellExtension;
     let mut inspector = FedoraReadiness::default();
     let mut rows: Vec<DoctorRow> = inspector
-        .inspect()
+        .inspect_with_global_shortcuts(!ubuntu_gnome)
         .into_iter()
         .map(|finding| DoctorRow {
             label: finding.capability.cli_label().to_owned(),
@@ -353,6 +357,62 @@ fn doctor(verbose: bool) -> ExitCode {
         .map(|runtime| runtime.block_on(voisu_app::focus::detect_focus_backend()))
         .unwrap_or(voisu_app::focus::FocusBackendKind::None);
     rows.push(focus_guard_row(focus_backend));
+
+    if ubuntu_gnome {
+        use voisu_app::ubuntu_gnome::{LiveState, TriggerState};
+        let state = voisu_app::ubuntu_gnome::doctor_state();
+        rows.push(match state.overlay {
+            LiveState::Active => DoctorRow::new(
+                "Overlay",
+                ReadinessStatus::Pass,
+                "Ubuntu native GNOME Shell Overlay is active",
+            )
+            .value("active"),
+            LiveState::RestartRequired => DoctorRow::new(
+                "Overlay",
+                ReadinessStatus::Warn,
+                "GNOME persisted the native Overlay but needs a logout/login or reboot to load it",
+            )
+            .value("restart required"),
+            LiveState::Unavailable => DoctorRow::new(
+                "Overlay",
+                ReadinessStatus::Fail,
+                state
+                    .detail
+                    .as_deref()
+                    .unwrap_or("Ubuntu native GNOME Shell Overlay is missing, disabled, or broken"),
+            )
+            .value("unavailable")
+            .action("run `voisu setup`"),
+        });
+        rows.push(match state.trigger {
+            TriggerState::Active => DoctorRow::new(
+                "Trigger Key",
+                ReadinessStatus::Pass,
+                "GNOME accepted the extension-owned Trigger Key",
+            )
+            .value(state.trigger_key.as_deref().unwrap_or("configured")),
+            TriggerState::RestartRequired => DoctorRow::new(
+                "Trigger Key",
+                ReadinessStatus::Warn,
+                "Trigger Key will be attempted when GNOME loads the extension",
+            )
+            .value(format!(
+                "{} / restart required",
+                state.trigger_key.as_deref().unwrap_or("configured")
+            )),
+            TriggerState::NotInstalled => DoctorRow::new(
+                "Trigger Key",
+                ReadinessStatus::Warn,
+                "GNOME could not install the configured Trigger Key",
+            )
+            .value(format!(
+                "{} / not installed",
+                state.trigger_key.as_deref().unwrap_or("configured")
+            ))
+            .action("use `voisu toggle`"),
+        });
+    }
 
     // The CLI's own probes remain useful, but they cannot prove that the
     // already-running service inherited the same display endpoint. Newer
@@ -837,7 +897,9 @@ fn setup() -> ExitCode {
         LiveHyprlandSetupActions, LiveKeyValidator, ProviderOutcome, SETUP_COMPLETE_MESSAGE,
         StdioWizard, run_consented_local_setup, run_hyprland_setup, run_setup,
     };
-    use voisu_app::setup_profile::{HyprlandConfig, discover_setup_profile, live_setup_facts};
+    use voisu_app::setup_profile::{
+        HyprlandConfig, SetupProfile, discover_setup_profile, live_setup_facts,
+    };
 
     // Integration tests can isolate the wizard while exercising the real CLI;
     // production never sets this seam.
@@ -876,6 +938,9 @@ fn setup() -> ExitCode {
                 );
             }
         }
+        if discovery.profile == SetupProfile::UbuntuWayland {
+            return finish_ubuntu_setup(SETUP_COMPLETE_MESSAGE);
+        }
         println!("{SETUP_COMPLETE_MESSAGE}");
         return ExitCode::SUCCESS;
     }
@@ -913,6 +978,8 @@ fn setup() -> ExitCode {
                         ),
                     ),
                 }
+            } else if discovery.profile == SetupProfile::UbuntuWayland {
+                finish_ubuntu_setup(SETUP_COMPLETE_MESSAGE)
             } else {
                 println!("{SETUP_COMPLETE_MESSAGE}");
                 ExitCode::SUCCESS
@@ -923,6 +990,52 @@ fn setup() -> ExitCode {
         }
     } else {
         ExitCode::from(4)
+    }
+}
+
+fn finish_ubuntu_setup(complete_message: &str) -> ExitCode {
+    use voisu_app::ubuntu_gnome::{LiveState, TriggerState};
+    match voisu_app::ubuntu_gnome::setup() {
+        Ok(result) => {
+            println!("{complete_message}");
+            match result.overlay {
+                LiveState::Active => println!("Overlay: active (native GNOME capsule)."),
+                LiveState::RestartRequired => {
+                    println!("Overlay: enabled; restart required (log out and back in, or reboot).")
+                }
+                LiveState::Unavailable => println!("Overlay: unavailable."),
+            }
+            match result.trigger {
+                TriggerState::Active => println!(
+                    "Trigger Key: {}.",
+                    result.trigger_key.as_deref().unwrap_or("configured")
+                ),
+                TriggerState::RestartRequired => {
+                    println!(
+                        "Trigger Key: {}; restart required before GNOME can install it.",
+                        result.trigger_key.as_deref().unwrap_or("configured")
+                    )
+                }
+                TriggerState::NotInstalled => {
+                    println!(
+                        "Trigger Key: not installed; configured binding {}; use `voisu toggle`.",
+                        result.trigger_key.as_deref().unwrap_or("configured")
+                    )
+                }
+            }
+            if result.daemon_restart_required {
+                println!("Daemon: enabled; restart required before it can start.");
+            } else {
+                println!("Daemon: enabled and active.");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(
+            4,
+            &format!(
+                "Ubuntu setup incomplete: {error}; recovery: run `voisu setup` after fixing this step"
+            ),
+        ),
     }
 }
 

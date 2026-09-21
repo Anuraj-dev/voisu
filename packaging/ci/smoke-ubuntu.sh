@@ -87,6 +87,11 @@ echo "== binaries =="
 test -x /usr/bin/voisu
 test -x /usr/bin/voisu-daemon
 test -x /usr/bin/voisu-overlay
+test -f /usr/share/gnome-shell/extensions/overlay@voisu.app/extension.js
+test -f /usr/share/gnome-shell/extensions/overlay@voisu.app/metadata.json
+test -f /usr/share/glib-2.0/schemas/app.voisu.shell-overlay.gschema.xml
+grep -Fq '"shell-version": ["50"]' /usr/share/gnome-shell/extensions/overlay@voisu.app/metadata.json
+gsettings list-keys app.voisu.shell-overlay | grep -qx 'voisu-trigger-key'
 voisu --version
 voisu-daemon --help >/dev/null
 

@@ -84,6 +84,7 @@ impl ServiceFixture {
             .env("VOISU_DISABLE_DIRECT_DELIVERY", "1")
             .env("VOISU_TEST_MODE", "controlled")
             .env_remove("HYPRLAND_INSTANCE_SIGNATURE");
+        command.env_remove("XDG_SESSION_DESKTOP");
         command
     }
 

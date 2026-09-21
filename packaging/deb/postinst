@@ -9,6 +9,9 @@ set -e
 
 case "$1" in
     configure)
+        if command -v glib-compile-schemas >/dev/null 2>&1; then
+            glib-compile-schemas /usr/share/glib-2.0/schemas
+        fi
         cat <<'EOF'
 
 Voisu is installed. Its dictation daemon and Overlay run as systemd *user*
@@ -17,10 +20,12 @@ services and are NOT enabled automatically. To start Voisu for your user, run:
     systemctl --user daemon-reload
     systemctl --user enable --now voisu.service
 
-To also run the optional Overlay -- the on-screen status surface that reflects
-daemon state -- run:
+On Fedora/Hyprland, to also run the optional GTK Overlay, run:
 
     systemctl --user enable --now voisu-overlay.service
+
+On Ubuntu 26.04 GNOME Wayland, run `voisu setup`; it enables the packaged
+native GNOME Shell Overlay and keeps the GTK notification observer disabled.
 
 EOF
         ;;

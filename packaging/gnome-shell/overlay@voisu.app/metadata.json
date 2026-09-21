@@ -1,0 +1,8 @@
+{
+  "uuid": "overlay@voisu.app",
+  "name": "Voisu Overlay",
+  "description": "Native Recording status capsule and Trigger Key for Voisu",
+  "shell-version": ["50"],
+  "settings-schema": "app.voisu.shell-overlay",
+  "version": 1
+}
