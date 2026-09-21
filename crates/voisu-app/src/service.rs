@@ -191,6 +191,45 @@ pub fn hyprland_overlay_readiness() -> Result<OverlayReadiness, String> {
     Ok(OverlayReadiness { enabled, active })
 }
 
+/// Stops the notification-only GTK observer before Ubuntu enables its native
+/// GNOME Shell Overlay. Success means systemd confirmed both lifecycle states.
+pub fn disable_ubuntu_gtk_overlay() -> Result<(), String> {
+    let disable = systemctl(&["disable", "--now", OVERLAY_UNIT_NAME]);
+    let load_state = systemctl(&["show", OVERLAY_UNIT_NAME, "--property=LoadState", "--value"])?
+        .stdout
+        .trim()
+        .to_owned();
+    let active_state = systemctl(&["is-active", OVERLAY_UNIT_NAME])?
+        .stdout
+        .trim()
+        .to_owned();
+    let enabled_state = systemctl(&["is-enabled", OVERLAY_UNIT_NAME])?
+        .stdout
+        .trim()
+        .to_owned();
+
+    if ubuntu_overlay_is_stopped(&load_state, &active_state, &enabled_state) {
+        return Ok(());
+    }
+
+    let disable_detail = match disable {
+        Ok(output) if output.success => "disable command succeeded".to_owned(),
+        Ok(_) => "disable command failed".to_owned(),
+        Err(error) => format!("disable command could not run: {error}"),
+    };
+    Err(format!(
+        "could not stop the GTK notification observer: {disable_detail}; systemd reports load={load_state}, active={active_state}, enabled={enabled_state}; run `systemctl --user disable --now {OVERLAY_UNIT_NAME}` and retry"
+    ))
+}
+
+fn ubuntu_overlay_is_stopped(load: &str, active: &str, enabled: &str) -> bool {
+    match load {
+        "loaded" => active == "inactive" && enabled == "disabled",
+        "not-found" => active == "inactive" && matches!(enabled, "disabled" | "not-found"),
+        _ => false,
+    }
+}
+
 pub fn hyprland_overlay_install_command() -> String {
     hyprland_overlay_install_command_on_path(std::env::var_os("PATH").as_deref())
 }
@@ -273,6 +312,12 @@ fn overlay_state(operation: &str) -> Result<String, String> {
 }
 
 fn manage_optional_overlay(action: OptionalOverlayAction) -> Option<OptionalOverlayReport> {
+    // GNOME Shell owns Ubuntu's native capsule. Starting the GTK observer here
+    // would degrade to duplicate desktop notifications because GNOME has no
+    // layer-shell protocol.
+    if crate::setup_profile::is_live_ubuntu_wayland() {
+        return None;
+    }
     if !packaged_overlay_unit_exists() {
         return None;
     }
@@ -504,6 +549,9 @@ fn import_session_environment() -> Result<(), String> {
         "XDG_SESSION_TYPE",
         "XDG_CURRENT_DESKTOP",
     ];
+    if std::env::var_os("XDG_SESSION_DESKTOP").is_some_and(|value| !value.is_empty()) {
+        arguments.push("XDG_SESSION_DESKTOP");
+    }
     if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|value| !value.is_empty()) {
         arguments.push("HYPRLAND_INSTANCE_SIGNATURE");
     }
@@ -1328,6 +1376,28 @@ mod tests {
             panic!("a required Overlay warning must fail Hyprland setup");
         };
         assert!(error.contains("optional Overlay service was not enabled"));
+    }
+
+    #[test]
+    fn ubuntu_gtk_overlay_requires_inactive_and_disabled_or_confirmed_absent() {
+        assert!(ubuntu_overlay_is_stopped("loaded", "inactive", "disabled"));
+        assert!(ubuntu_overlay_is_stopped(
+            "not-found",
+            "inactive",
+            "not-found"
+        ));
+        assert!(!ubuntu_overlay_is_stopped("loaded", "active", "disabled"));
+        assert!(!ubuntu_overlay_is_stopped("loaded", "inactive", "enabled"));
+        assert!(!ubuntu_overlay_is_stopped(
+            "not-found",
+            "active",
+            "not-found"
+        ));
+        assert!(!ubuntu_overlay_is_stopped(
+            "not-found",
+            "unknown",
+            "not-found"
+        ));
     }
 
     #[test]

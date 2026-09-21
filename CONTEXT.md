@@ -58,7 +58,9 @@ preservation as the fallback.
 _Avoid_: Paste, output
 
 **Overlay**:
-The optional, separate on-screen status surface that reflects daemon state.
+The separate on-screen status surface that reflects daemon state. A Setup
+Profile may require an Overlay when visible Recording feedback is part of that
+desktop's supported experience.
 _Avoid_: Popup, HUD
 
 **Recording Deadline**:

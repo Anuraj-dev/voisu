@@ -239,7 +239,11 @@ async fn run() -> Result<(), String> {
     // serialization so repeated or concurrent activations cannot overlap.
     // Disabling it (VOISU_DISABLE_SHORTCUTS) keeps the daemon usable in
     // sessions or tests that have no desktop portal.
-    if std::env::var_os("VOISU_DISABLE_SHORTCUTS").is_none() {
+    let portal_owns_trigger = voisu_app::setup_profile::trigger_integration(
+        &voisu_app::setup_profile::live_setup_facts(),
+    )
+        == voisu_app::setup_profile::TriggerIntegration::GlobalShortcutsPortal;
+    if portal_owns_trigger && std::env::var_os("VOISU_DISABLE_SHORTCUTS").is_none() {
         tokio::spawn(shortcut_listener(actor_tx.clone()));
     }
     let connections = std::sync::Arc::new(Semaphore::new(MAX_CONNECTIONS));

@@ -1,0 +1,14 @@
+.voisu-capsule {
+  background-color: rgba(20, 20, 24, 0.96);
+  border-radius: 24px;
+  border: 2px solid rgba(255, 255, 255, 0.22);
+  color: white;
+  padding: 10px 22px;
+  min-width: 128px;
+  font-weight: 600;
+}
+.voisu-recording { border-color: #ff4b55; }
+.voisu-processing { border-color: #8ba7ff; }
+.voisu-success { border-color: #55d58a; }
+.voisu-failure { border-color: #ffb454; }
+.voisu-nospeech { border-color: #ffcf66; }

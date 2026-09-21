@@ -7,6 +7,9 @@ set -e
 
 case "$1" in
     remove|purge)
+        if command -v glib-compile-schemas >/dev/null 2>&1; then
+            glib-compile-schemas /usr/share/glib-2.0/schemas
+        fi
         cat <<'EOF'
 
 Voisu has been removed. If you enabled its user services, disable them for your

@@ -18,11 +18,9 @@ PrivateTmp=yes
 # AF_UNIX: daemon socket, Wayland, D-Bus. No network.
 RestrictAddressFamilies=AF_UNIX
 ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
 ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
+# ProtectKernelModules, ProtectKernelLogs, ProtectClock, and ProtectHostname are
+# omitted: restricted user namespaces can make user units fail at CAPABILITIES.
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes

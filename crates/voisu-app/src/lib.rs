@@ -33,3 +33,4 @@ pub mod setup;
 pub mod setup_profile;
 pub mod smart_writing;
 pub mod system;
+pub mod ubuntu_gnome;

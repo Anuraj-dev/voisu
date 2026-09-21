@@ -84,7 +84,7 @@ not-yet-published channel.
 
 | Leg | Script | Path exercised | Asserts |
 |-----|--------|----------------|---------|
-| ubuntu:26.04 | `packaging/ci/smoke-ubuntu.sh` | publishes the built `.deb` into a local apt repo signed with an **ephemeral** key, serves it over local HTTP, adds the repo the documented friend way (fingerprint-pin → `signed-by`), `apt install voisu` with signatures enforced | `voisu --version`, `voisu-daemon --help`, `systemd-analyze verify` on both user units, `lintian` clean-enough |
+| ubuntu:26.04 | `packaging/ci/smoke-ubuntu.sh` | publishes the built `.deb` into a local apt repo signed with an **ephemeral** key, serves it over local HTTP, adds the repo the documented friend way (fingerprint-pin → `signed-by`), `apt install voisu` with signatures enforced | `voisu --version`, `voisu-daemon --help`, `systemd-analyze verify` on both user units, rejects user-service-incompatible capability protections, `lintian` clean-enough |
 | fedora:latest | `packaging/ci/smoke-fedora.sh` | `build-rpm.sh` (non-root) builds the RPM, `dnf install` the main + Overlay subpackage | binaries run, `systemd-analyze verify` both units, `rpm --requires`/file-list checks |
 | archlinux (arch) | `packaging/ci/smoke-arch.sh` | `makepkg -si` the **source** PKGBUILD pointed at the tag | `namcap` clean (errors only), binaries run, `systemd-analyze verify` both units |
 | archlinux (arch-bin) | `packaging/ci/smoke-arch-bin.sh` | stages voisu-bin exactly as `aur-publish.sh` will (pkgver/sha256/.SRCINFO) but sources the **locally built release tarball**, then `makepkg -si` | proves the tarball layout matches the PKGBUILD's install steps; `namcap` clean, binaries run, `systemd-analyze verify` both units |

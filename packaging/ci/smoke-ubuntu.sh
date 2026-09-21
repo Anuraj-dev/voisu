@@ -87,6 +87,11 @@ echo "== binaries =="
 test -x /usr/bin/voisu
 test -x /usr/bin/voisu-daemon
 test -x /usr/bin/voisu-overlay
+test -f /usr/share/gnome-shell/extensions/overlay@voisu.app/extension.js
+test -f /usr/share/gnome-shell/extensions/overlay@voisu.app/metadata.json
+test -f /usr/share/glib-2.0/schemas/app.voisu.shell-overlay.gschema.xml
+grep -Fq '"shell-version": ["50"]' /usr/share/gnome-shell/extensions/overlay@voisu.app/metadata.json
+gsettings list-keys app.voisu.shell-overlay | grep -qx 'voisu-trigger-key'
 voisu --version
 voisu-daemon --help >/dev/null
 
@@ -94,6 +99,17 @@ voisu-daemon --help >/dev/null
 echo "== systemd-analyze verify (both user units) =="
 systemd-analyze verify /usr/lib/systemd/user/voisu.service
 systemd-analyze verify /usr/lib/systemd/user/voisu-overlay.service
+
+# These directives can require capability or namespace setup unavailable to a
+# per-user manager when Ubuntu restricts unprivileged user namespaces.
+for unit in voisu.service voisu-overlay.service; do
+    unit_path="/usr/lib/systemd/user/$unit"
+    if grep -Eq '^[[:space:]]*(ProtectKernelModules|ProtectKernelLogs|ProtectClock|ProtectHostname)[[:space:]]*=' "$unit_path"; then
+        echo "FAIL: $unit contains a user-service-incompatible protection directive"
+        exit 1
+    fi
+done
+echo "[evidence] both user units omit capability-dropping protection directives"
 
 # --- assertion: a fresh home cannot break namespace setup ---
 echo "== fresh-home safety: the unit provisions its own config/state dirs =="

@@ -14,14 +14,24 @@ use voisu_core::{SessionKind, resolve_session};
 pub enum SetupProfile {
     /// Fedora KDE or GNOME running on Wayland.
     FedoraWayland,
+    /// Ubuntu GNOME running on Wayland.
+    UbuntuWayland,
     /// Hyprland, including an Omarchy session.
     Hyprland,
+}
+
+/// The desktop component that owns Voisu's Trigger Key in this login.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TriggerIntegration {
+    GlobalShortcutsPortal,
+    GnomeShellExtension,
 }
 
 impl SetupProfile {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::FedoraWayland => "fedora-wayland",
+            Self::UbuntuWayland => "ubuntu-wayland",
             Self::Hyprland => "hyprland",
         }
     }
@@ -53,6 +63,7 @@ pub struct SetupDiscoveryFacts {
     pub current_desktop: Option<String>,
     pub session_desktop: Option<String>,
     pub distro_id: Option<String>,
+    pub distro_version_id: Option<String>,
     /// Presence of this compositor-owned session variable is the live
     /// Hyprland evidence. A desktop label alone is never sufficient.
     pub hyprland_instance_signature: Option<String>,
@@ -81,7 +92,7 @@ impl SetupDiscoveryError {
     pub fn message(&self) -> String {
         match self {
             Self::UnknownSession => {
-                "cannot determine the desktop session; run `voisu setup` from Fedora KDE/GNOME Wayland or Hyprland (including Omarchy)".to_owned()
+                "cannot determine the desktop session; run `voisu setup` from Fedora KDE/GNOME Wayland, Ubuntu GNOME Wayland, or Hyprland (including Omarchy)".to_owned()
             }
             Self::UnsupportedSession { session, desktop } => {
                 let session = match session {
@@ -161,6 +172,17 @@ pub fn discover_setup_profile(
         });
     }
 
+    if session.session == SessionKind::Wayland
+        && is_ubuntu(facts.distro_id.as_deref())
+        && is_ubuntu_26_04(facts.distro_version_id.as_deref())
+        && has_gnome_desktop(desktop)
+    {
+        return Ok(SetupProfileDiscovery {
+            profile: SetupProfile::UbuntuWayland,
+            hyprland_config: None,
+        });
+    }
+
     Err(SetupDiscoveryError::UnsupportedSession {
         session: session.session,
         desktop: desktop.map(str::to_owned),
@@ -183,10 +205,29 @@ pub fn live_setup_facts() -> SetupDiscoveryFacts {
         session_type: std::env::var("XDG_SESSION_TYPE").ok(),
         current_desktop: std::env::var("XDG_CURRENT_DESKTOP").ok(),
         session_desktop: std::env::var("XDG_SESSION_DESKTOP").ok(),
-        distro_id: read_os_release_id(),
+        distro_id: read_os_release_value("ID"),
+        distro_version_id: read_os_release_value("VERSION_ID"),
         hyprland_instance_signature: std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok(),
         current_lua_config: existing_file(current_lua),
         legacy_config: existing_file(legacy_config),
+    }
+}
+
+/// True only for the exact Ubuntu GNOME Wayland Setup Profile. Service
+/// lifecycle code uses the same resolver as setup so desktop-label fallbacks
+/// and supported-release boundaries cannot drift.
+pub fn is_live_ubuntu_wayland() -> bool {
+    trigger_integration(&live_setup_facts()) == TriggerIntegration::GnomeShellExtension
+}
+
+/// Resolve Trigger Key ownership from the same injected facts as setup.
+pub fn trigger_integration(facts: &SetupDiscoveryFacts) -> TriggerIntegration {
+    if discover_setup_profile(facts)
+        .is_ok_and(|discovery| discovery.profile == SetupProfile::UbuntuWayland)
+    {
+        TriggerIntegration::GnomeShellExtension
+    } else {
+        TriggerIntegration::GlobalShortcutsPortal
     }
 }
 
@@ -194,11 +235,11 @@ fn existing_file(path: PathBuf) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-fn read_os_release_id() -> Option<String> {
+fn read_os_release_value(name: &str) -> Option<String> {
     let contents = std::fs::read_to_string("/etc/os-release").ok()?;
     contents.lines().find_map(|line| {
         let value = line
-            .strip_prefix("ID=")?
+            .strip_prefix(&format!("{name}="))?
             .trim_matches('"')
             .trim_matches('\'');
         (!value.is_empty()).then(|| value.to_owned())
@@ -217,14 +258,28 @@ fn is_fedora(value: Option<&str>) -> bool {
     value.is_some_and(|value| value.eq_ignore_ascii_case("fedora"))
 }
 
+fn is_ubuntu(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("ubuntu"))
+}
+
+fn is_ubuntu_26_04(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "26.04")
+}
+
+fn has_gnome_desktop(value: Option<&str>) -> bool {
+    has_desktop_label(value, |label| label.eq_ignore_ascii_case("gnome"))
+}
+
 fn has_supported_desktop(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        value.split([':', ';', ',']).map(str::trim).any(|label| {
-            label.eq_ignore_ascii_case("kde")
-                || label.eq_ignore_ascii_case("kde plasma")
-                || label.eq_ignore_ascii_case("gnome")
-        })
+    has_desktop_label(value, |label| {
+        label.eq_ignore_ascii_case("kde")
+            || label.eq_ignore_ascii_case("kde plasma")
+            || label.eq_ignore_ascii_case("gnome")
     })
+}
+
+fn has_desktop_label(value: Option<&str>, matches: impl Fn(&str) -> bool) -> bool {
+    value.is_some_and(|value| value.split([':', ';', ',']).map(str::trim).any(matches))
 }
 
 #[cfg(test)]
@@ -332,8 +387,80 @@ mod tests {
     }
 
     #[test]
+    fn ubuntu_gnome_wayland_resolves_to_the_ubuntu_profile() {
+        for desktop in ["ubuntu:GNOME", "GNOME"] {
+            let facts = SetupDiscoveryFacts {
+                wayland_display: Some("wayland-0".to_owned()),
+                session_type: Some("wayland".to_owned()),
+                current_desktop: Some(desktop.to_owned()),
+                distro_id: Some("Ubuntu".to_owned()),
+                distro_version_id: Some("26.04".to_owned()),
+                ..SetupDiscoveryFacts::default()
+            };
+
+            assert_eq!(
+                discover_setup_profile(&facts).unwrap().profile,
+                SetupProfile::UbuntuWayland
+            );
+        }
+    }
+
+    #[test]
+    fn ubuntu_x11_and_other_ubuntu_or_gnome_combinations_remain_unsupported() {
+        for facts in [
+            SetupDiscoveryFacts {
+                x11_display: Some(":0".to_owned()),
+                session_type: Some("x11".to_owned()),
+                current_desktop: Some("ubuntu:GNOME".to_owned()),
+                distro_id: Some("ubuntu".to_owned()),
+                ..SetupDiscoveryFacts::default()
+            },
+            SetupDiscoveryFacts {
+                wayland_display: Some("wayland-0".to_owned()),
+                session_type: Some("wayland".to_owned()),
+                current_desktop: Some("GNOME".to_owned()),
+                distro_id: Some("debian".to_owned()),
+                ..SetupDiscoveryFacts::default()
+            },
+            SetupDiscoveryFacts {
+                wayland_display: Some("wayland-0".to_owned()),
+                session_type: Some("wayland".to_owned()),
+                current_desktop: Some("KDE".to_owned()),
+                distro_id: Some("ubuntu".to_owned()),
+                distro_version_id: Some("26.04".to_owned()),
+                ..SetupDiscoveryFacts::default()
+            },
+            SetupDiscoveryFacts {
+                wayland_display: Some("wayland-0".to_owned()),
+                session_type: Some("wayland".to_owned()),
+                current_desktop: Some("GNOME".to_owned()),
+                distro_id: Some("ubuntu".to_owned()),
+                distro_version_id: Some("24.04".to_owned()),
+                ..SetupDiscoveryFacts::default()
+            },
+        ] {
+            assert!(matches!(
+                discover_setup_profile(&facts),
+                Err(SetupDiscoveryError::UnsupportedSession { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn live_hyprland_evidence_takes_priority_over_ubuntu_labels() {
+        let mut facts = hyprland_facts();
+        facts.current_desktop = Some("ubuntu:GNOME".to_owned());
+        facts.distro_id = Some("ubuntu".to_owned());
+
+        assert_eq!(
+            discover_setup_profile(&facts).unwrap().profile,
+            SetupProfile::Hyprland
+        );
+    }
+
+    #[test]
     fn empty_current_desktop_uses_the_session_desktop_fallback() {
-        let facts = SetupDiscoveryFacts {
+        let fedora = SetupDiscoveryFacts {
             wayland_display: Some("wayland-0".to_owned()),
             session_type: Some("wayland".to_owned()),
             current_desktop: Some("  ".to_owned()),
@@ -343,8 +470,53 @@ mod tests {
         };
 
         assert_eq!(
-            discover_setup_profile(&facts).unwrap().profile,
+            discover_setup_profile(&fedora).unwrap().profile,
             SetupProfile::FedoraWayland
+        );
+
+        let ubuntu = SetupDiscoveryFacts {
+            wayland_display: Some("wayland-0".to_owned()),
+            session_type: Some("wayland".to_owned()),
+            current_desktop: Some("  ".to_owned()),
+            session_desktop: Some("ubuntu:GNOME".to_owned()),
+            distro_id: Some("ubuntu".to_owned()),
+            distro_version_id: Some("26.04".to_owned()),
+            ..SetupDiscoveryFacts::default()
+        };
+        assert_eq!(
+            discover_setup_profile(&ubuntu).unwrap().profile,
+            SetupProfile::UbuntuWayland
+        );
+    }
+
+    #[test]
+    fn only_exact_ubuntu_profile_gives_trigger_ownership_to_gnome_shell() {
+        let ubuntu_fallback = SetupDiscoveryFacts {
+            wayland_display: Some("wayland-0".to_owned()),
+            session_type: Some("wayland".to_owned()),
+            current_desktop: Some(" ".to_owned()),
+            session_desktop: Some("ubuntu:GNOME".to_owned()),
+            distro_id: Some("ubuntu".to_owned()),
+            distro_version_id: Some("26.04".to_owned()),
+            ..SetupDiscoveryFacts::default()
+        };
+        assert_eq!(
+            trigger_integration(&ubuntu_fallback),
+            TriggerIntegration::GnomeShellExtension
+        );
+
+        let mut fedora = ubuntu_fallback.clone();
+        fedora.distro_id = Some("fedora".to_owned());
+        assert_eq!(
+            trigger_integration(&fedora),
+            TriggerIntegration::GlobalShortcutsPortal
+        );
+
+        let mut hyprland = ubuntu_fallback;
+        hyprland.hyprland_instance_signature = Some("instance".to_owned());
+        assert_eq!(
+            trigger_integration(&hyprland),
+            TriggerIntegration::GlobalShortcutsPortal
         );
     }
 

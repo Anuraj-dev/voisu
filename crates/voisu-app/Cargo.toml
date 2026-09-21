@@ -41,7 +41,7 @@ Trigger Key and Delivery use desktop portals."""
 #                                                 wl-clipboard only.)
 #   /usr/bin/secret-tool -> libsecret-tools      (secret-tool binary)
 #   curl                 -> curl                 (provider HTTPS/WSS)
-depends = "$auto, xdg-desktop-portal, pipewire-bin, wireplumber, wl-clipboard | xclip, libsecret-tools, curl"
+depends = "$auto, xdg-desktop-portal, pipewire-bin, wireplumber, wl-clipboard | xclip, libsecret-tools, curl, gnome-shell (>= 50), gnome-shell (<< 51)"
 # libei is dlopen()'d by SONAME at runtime (an optional auto-type capability),
 # never linked -- so it is Recommends, mirroring the RPM `Recommends: libei`.
 recommends = "libei1"
@@ -67,6 +67,11 @@ assets = [
     ["../../packaging/voisu.service", "usr/lib/systemd/user/", "644"],
     ["../../packaging/voisu-overlay.service", "usr/lib/systemd/user/", "644"],
     ["../../packaging/voisu.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/gnome-shell/overlay@voisu.app/metadata.json", "usr/share/gnome-shell/extensions/overlay@voisu.app/metadata.json", "644"],
+    ["../../packaging/gnome-shell/overlay@voisu.app/extension.js", "usr/share/gnome-shell/extensions/overlay@voisu.app/extension.js", "644"],
+    ["../../packaging/gnome-shell/overlay@voisu.app/state.mjs", "usr/share/gnome-shell/extensions/overlay@voisu.app/state.mjs", "644"],
+    ["../../packaging/gnome-shell/overlay@voisu.app/stylesheet.css", "usr/share/gnome-shell/extensions/overlay@voisu.app/stylesheet.css", "644"],
+    ["../../packaging/gnome-shell/overlay@voisu.app/schemas/app.voisu.shell-overlay.gschema.xml", "usr/share/glib-2.0/schemas/app.voisu.shell-overlay.gschema.xml", "644"],
     ["../../packaging/deb/lintian-overrides", "usr/share/lintian/overrides/voisu", "644"],
     ["../../packaging/deb/copyright", "usr/share/doc/voisu/copyright", "644"],
     ["../../packaging/deb/ring/LICENSE", "usr/share/doc/voisu/ring/LICENSE", "644"],

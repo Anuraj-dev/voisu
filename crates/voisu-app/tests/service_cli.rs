@@ -84,6 +84,7 @@ impl ServiceFixture {
             .env("VOISU_DISABLE_DIRECT_DELIVERY", "1")
             .env("VOISU_TEST_MODE", "controlled")
             .env_remove("HYPRLAND_INSTANCE_SIGNATURE");
+        command.env_remove("XDG_SESSION_DESKTOP");
         command
     }
 
@@ -383,10 +384,29 @@ fn assert_unit_assignment(unit_name: &str, unit: &str, assignment: &str, expecte
 }
 
 fn assert_unit_assignment_absent(unit_name: &str, unit: &str, assignment: &str) {
+    let key = assignment
+        .strip_suffix('=')
+        .expect("assignment contract must end with =");
     assert!(
-        !unit.lines().any(|line| line.starts_with(assignment)),
+        !unit.lines().any(|line| {
+            line.split_once('=')
+                .is_some_and(|(candidate, _)| candidate.trim() == key)
+        }),
         "{unit_name} must not contain a {assignment} assignment"
     );
+}
+
+#[test]
+fn unit_assignment_absence_rejects_whitespace_valid_assignment() {
+    let result = std::panic::catch_unwind(|| {
+        assert_unit_assignment_absent(
+            "fixture.service",
+            "  ProtectHostname = yes\n",
+            "ProtectHostname=",
+        );
+    });
+
+    assert!(result.is_err(), "whitespace cannot hide a valid assignment");
 }
 
 fn assert_graphical_session_unit_shape(
@@ -440,11 +460,7 @@ fn assert_packaged_daemon_runtime_contract(unit: &str) {
             "AF_UNIX AF_INET AF_INET6 AF_NETLINK",
         ),
         ("ProtectKernelTunables=", "yes"),
-        ("ProtectKernelModules=", "yes"),
-        ("ProtectKernelLogs=", "yes"),
         ("ProtectControlGroups=", "yes"),
-        ("ProtectClock=", "yes"),
-        ("ProtectHostname=", "yes"),
         ("RestrictRealtime=", "yes"),
         ("RestrictSUIDSGID=", "yes"),
         ("LockPersonality=", "yes"),
@@ -453,6 +469,14 @@ fn assert_packaged_daemon_runtime_contract(unit: &str) {
         ("MemoryDenyWriteExecute=", "yes"),
     ] {
         assert_unit_assignment("voisu.service", unit, assignment, expected);
+    }
+    for assignment in [
+        "ProtectKernelModules=",
+        "ProtectKernelLogs=",
+        "ProtectClock=",
+        "ProtectHostname=",
+    ] {
+        assert_unit_assignment_absent("voisu.service", unit, assignment);
     }
 }
 
@@ -465,11 +489,7 @@ fn assert_packaged_overlay_runtime_contract(unit: &str) {
         ("PrivateTmp=", "yes"),
         ("RestrictAddressFamilies=", "AF_UNIX"),
         ("ProtectKernelTunables=", "yes"),
-        ("ProtectKernelModules=", "yes"),
-        ("ProtectKernelLogs=", "yes"),
         ("ProtectControlGroups=", "yes"),
-        ("ProtectClock=", "yes"),
-        ("ProtectHostname=", "yes"),
         ("RestrictRealtime=", "yes"),
         ("RestrictSUIDSGID=", "yes"),
         ("LockPersonality=", "yes"),
@@ -477,6 +497,14 @@ fn assert_packaged_overlay_runtime_contract(unit: &str) {
         ("SystemCallArchitectures=", "native"),
     ] {
         assert_unit_assignment("voisu-overlay.service", unit, assignment, expected);
+    }
+    for assignment in [
+        "ProtectKernelModules=",
+        "ProtectKernelLogs=",
+        "ProtectClock=",
+        "ProtectHostname=",
+    ] {
+        assert_unit_assignment_absent("voisu-overlay.service", unit, assignment);
     }
 }
 

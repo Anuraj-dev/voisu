@@ -152,6 +152,11 @@ Both user units carry systemd hardening directives (`NoNewPrivileges`,
 protections, `SystemCallArchitectures=native`) so a compromised dependency gets
 a confined process. The deliberate exceptions:
 
+- `ProtectKernelModules`, `ProtectKernelLogs`, `ProtectClock`, and
+  `ProtectHostname` are omitted. On systems that restrict unprivileged user
+  namespaces, these can make a per-user service fail before `ExecStart` with
+  `status=218/CAPABILITIES`.
+
 - Daemon `ReadWritePaths=%t %h/.config/voisu %h/.local/state/voisu` — control
   socket and capture scratch, config/dictionary, history/diagnostics.
 - Daemon keeps `AF_INET`/`AF_INET6` (provider HTTPS/WSS via curl) and
