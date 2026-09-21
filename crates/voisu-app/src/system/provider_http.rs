@@ -35,16 +35,20 @@ impl ProviderHttpClient {
     }
 
     /// The endpoint used for the cheapest authenticated round trip per provider.
-    fn probe_request(provider: Provider) -> ProviderHttpRequest {
+    /// `None` for a provider that exposes no authenticated HTTP endpoint to
+    /// probe: its credential is exercised only by a live streaming session, so
+    /// there is no key verdict to classify here.
+    fn probe_request(provider: Provider) -> Option<ProviderHttpRequest> {
         match provider {
-            Provider::Groq => ProviderHttpRequest {
+            Provider::Groq => Some(ProviderHttpRequest {
                 url: "https://api.groq.com/openai/v1/models",
                 authorization_scheme: "Bearer",
-            },
-            Provider::Deepgram => ProviderHttpRequest {
+            }),
+            Provider::Deepgram => Some(ProviderHttpRequest {
                 url: "https://api.deepgram.com/v1/projects",
                 authorization_scheme: "Token",
-            },
+            }),
+            Provider::Narilabs => None,
         }
     }
 
@@ -53,17 +57,23 @@ impl ProviderHttpClient {
     /// transient `Unreachable`, never a wrong-key verdict. Tests bypass the
     /// network via `VOISU_TEST_AUTH_{GROQ,DEEPGRAM}` (see `controlled_key_status`).
     pub async fn check(&self, provider: Provider, credential: Credential) -> ProviderKeyStatus {
+        let Some(request) = Self::probe_request(provider) else {
+            // No HTTP probe exists for this provider: reporting anything else
+            // would invent a verdict. Never a pass, never a wrong-key failure —
+            // `verify` surfaces the unsupported headline instead.
+            return ProviderKeyStatus::VerificationUnsupported;
+        };
         let controlled = match provider {
             Provider::Groq => std::env::var_os("VOISU_TEST_AUTH_GROQ"),
             Provider::Deepgram => std::env::var_os("VOISU_TEST_AUTH_DEEPGRAM"),
+            // Unreachable: the missing probe returned above. Exhaustive arms
+            // keep the seam explicit per provider.
+            Provider::Narilabs => None,
         };
         if let Some(mode) = controlled {
             return controlled_key_status(&mode.to_string_lossy());
         }
-        match self
-            .authenticated_status(credential, Self::probe_request(provider))
-            .await
-        {
+        match self.authenticated_status(credential, request).await {
             Ok(probe) => ProviderKeyStatus::classify(probe.status, probe.retry_after),
             Err(_) => ProviderKeyStatus::Unreachable,
         }

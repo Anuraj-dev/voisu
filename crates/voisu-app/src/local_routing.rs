@@ -778,9 +778,10 @@ mod tests {
     fn local_path_never_uses_cloud_slots_or_sentinels() {
         let _lock = test_session();
         inject_ready(fixture_receipt(), "hello");
-        let (left, right) = cloud_free_slots();
+        let (left, right, extra) = cloud_free_slots();
         drop(left);
         drop(right);
+        drop(extra);
         assert!(sentinel_is_clean());
         begin_live("rec-1");
         let completion = complete_recording(

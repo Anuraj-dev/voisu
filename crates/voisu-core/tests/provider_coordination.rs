@@ -122,9 +122,10 @@ fn stream(
 // Paused time: the runtime advances virtual time to the abort deadline instead
 // of racing wall-clock ceilings, so the bound is asserted deterministically.
 #[tokio::test(start_paused = true)]
-async fn coordinator_abort_is_bounded_and_attempts_both_provider_streams() {
+async fn coordinator_abort_is_bounded_and_attempts_all_provider_streams() {
     let deepgram_aborts = Arc::new(AtomicUsize::new(0));
     let groq_aborts = Arc::new(AtomicUsize::new(0));
+    let narilabs_aborts = Arc::new(AtomicUsize::new(0));
     let controlled = |provider, aborts| {
         Box::new(ControlledStream {
             provider,
@@ -141,6 +142,7 @@ async fn coordinator_abort_is_bounded_and_attempts_both_provider_streams() {
         ProviderStreams {
             deepgram: controlled(Provider::Deepgram, Arc::clone(&deepgram_aborts)),
             groq: controlled(Provider::Groq, Arc::clone(&groq_aborts)),
+            narilabs: controlled(Provider::Narilabs, Arc::clone(&narilabs_aborts)),
         },
     );
 
@@ -155,14 +157,17 @@ async fn coordinator_abort_is_bounded_and_attempts_both_provider_streams() {
     assert_eq!(error.diagnostic(), "provider abort deadline elapsed");
     assert_eq!(deepgram_aborts.load(Ordering::SeqCst), 1);
     assert_eq!(groq_aborts.load(Ordering::SeqCst), 1);
+    assert_eq!(narilabs_aborts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn coordinator_starts_both_completions_once_and_orders_attributed_sources() {
+async fn coordinator_starts_each_completion_once_and_orders_attributed_sources() {
     let deepgram = Arc::new(AtomicUsize::new(0));
     let groq = Arc::new(AtomicUsize::new(0));
+    let narilabs = Arc::new(AtomicUsize::new(0));
     let deepgram_chunks = Arc::new(AtomicUsize::new(0));
     let groq_chunks = Arc::new(AtomicUsize::new(0));
+    let narilabs_chunks = Arc::new(AtomicUsize::new(0));
     let mut coordinator = ProviderCoordinator::start(
         Duration::from_secs(1),
         Duration::from_secs(1),
@@ -179,6 +184,12 @@ async fn coordinator_starts_both_completions_once_and_orders_attributed_sources(
                 Arc::clone(&groq),
                 Arc::clone(&groq_chunks),
             ),
+            narilabs: stream(
+                Provider::Narilabs,
+                Duration::from_millis(10),
+                Arc::clone(&narilabs),
+                Arc::clone(&narilabs_chunks),
+            ),
         },
     );
     coordinator
@@ -189,14 +200,16 @@ async fn coordinator_starts_both_completions_once_and_orders_attributed_sources(
 
     assert_eq!(deepgram.load(Ordering::SeqCst), 1);
     assert_eq!(groq.load(Ordering::SeqCst), 1);
+    assert_eq!(narilabs.load(Ordering::SeqCst), 1);
     assert_eq!(deepgram_chunks.load(Ordering::SeqCst), 1);
     assert_eq!(groq_chunks.load(Ordering::SeqCst), 1);
+    assert_eq!(narilabs_chunks.load(Ordering::SeqCst), 1);
     assert_eq!(
         sources
             .iter()
             .map(|source| source.provider)
             .collect::<Vec<_>>(),
-        vec![Provider::Deepgram, Provider::Groq]
+        vec![Provider::Deepgram, Provider::Groq, Provider::Narilabs]
     );
 }
 
@@ -218,6 +231,12 @@ async fn provider_deadline_returns_the_valid_source_already_available() {
                 Provider::Groq,
                 Duration::from_secs(1),
                 Arc::clone(&groq),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            narilabs: stream(
+                Provider::Narilabs,
+                Duration::from_secs(1),
+                Arc::new(AtomicUsize::new(0)),
                 Arc::new(AtomicUsize::new(0)),
             ),
         },
@@ -263,6 +282,12 @@ async fn provider_deadline_awaits_the_losing_stream_abort_before_returning() {
                 Duration::from_millis(25),
                 Arc::clone(&groq_aborts),
             ),
+            narilabs: controlled(
+                Provider::Narilabs,
+                Duration::from_secs(30),
+                Duration::ZERO,
+                Arc::new(AtomicUsize::new(0)),
+            ),
         },
     )
     .complete(CapturedAudio::empty())
@@ -285,6 +310,7 @@ async fn ready_sources_at_the_deadline_instant_are_not_discarded() {
     let deadline = Duration::from_millis(50);
     let deepgram = Arc::new(AtomicUsize::new(0));
     let groq = Arc::new(AtomicUsize::new(0));
+    let narilabs = Arc::new(AtomicUsize::new(0));
     let sources = ProviderCoordinator::start(
         deadline,
         Duration::from_secs(1),
@@ -301,6 +327,12 @@ async fn ready_sources_at_the_deadline_instant_are_not_discarded() {
                 Arc::clone(&groq),
                 Arc::new(AtomicUsize::new(0)),
             ),
+            narilabs: stream(
+                Provider::Narilabs,
+                deadline,
+                Arc::clone(&narilabs),
+                Arc::new(AtomicUsize::new(0)),
+            ),
         },
     )
     .complete(CapturedAudio::empty())
@@ -312,14 +344,14 @@ async fn ready_sources_at_the_deadline_instant_are_not_discarded() {
             .iter()
             .map(|source| source.provider)
             .collect::<Vec<_>>(),
-        vec![Provider::Deepgram, Provider::Groq]
+        vec![Provider::Deepgram, Provider::Groq, Provider::Narilabs]
     );
 }
 
 #[tokio::test]
-async fn a_failed_provider_is_recorded_while_the_other_succeeds() {
-    // The silent-absence bug: one provider fails at completion while the other
-    // succeeds. The failure must be recorded (provider, stage, diagnostic), not
+async fn a_failed_provider_is_recorded_while_the_others_succeed() {
+    // The silent-absence bug: one provider fails at completion while the others
+    // succeed. The failure must be recorded (provider, stage, diagnostic), not
     // dropped just because a usable Source Transcript is available.
     let groq = Arc::new(AtomicUsize::new(0));
     let completion = ProviderCoordinator::start(
@@ -337,14 +369,21 @@ async fn a_failed_provider_is_recorded_while_the_other_succeeds() {
                 Arc::clone(&groq),
                 Arc::new(AtomicUsize::new(0)),
             ),
+            narilabs: stream(
+                Provider::Narilabs,
+                Duration::from_millis(1),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
         },
     )
     .complete_with_timings(CapturedAudio::empty())
     .await
     .unwrap();
 
-    assert_eq!(completion.sources.len(), 1);
+    assert_eq!(completion.sources.len(), 2);
     assert_eq!(completion.sources[0].provider, Provider::Groq);
+    assert_eq!(completion.sources[1].provider, Provider::Narilabs);
     assert_eq!(completion.provider_failures.len(), 1);
     let failure = &completion.provider_failures[0];
     assert_eq!(failure.provider, Provider::Deepgram);
@@ -371,6 +410,11 @@ async fn all_providers_failing_attaches_failures_to_the_error() {
                 diagnostic: "groq completion failed",
                 aborts: Arc::new(AtomicUsize::new(0)),
             }),
+            narilabs: Box::new(FailingStream {
+                provider: Provider::Narilabs,
+                diagnostic: "narilabs completion failed",
+                aborts: Arc::new(AtomicUsize::new(0)),
+            }),
         },
     )
     .complete_with_timings(CapturedAudio::empty())
@@ -381,8 +425,8 @@ async fn all_providers_failing_attaches_failures_to_the_error() {
     let failures = error.provider_failures();
     assert_eq!(
         failures.len(),
-        2,
-        "both providers' failures must ride on the error"
+        3,
+        "every provider's failure must ride on the error"
     );
     assert!(
         failures
@@ -394,6 +438,12 @@ async fn all_providers_failing_attaches_failures_to_the_error() {
         failures
             .iter()
             .any(|failure| failure.provider == Provider::Groq
+                && failure.stage == ProviderFailureStage::Completion)
+    );
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.provider == Provider::Narilabs
                 && failure.stage == ProviderFailureStage::Completion)
     );
 }
@@ -413,6 +463,12 @@ async fn stream_audio_attributes_a_streaming_failure_to_the_failing_provider() {
             }),
             groq: stream(
                 Provider::Groq,
+                Duration::from_millis(1),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            narilabs: stream(
+                Provider::Narilabs,
                 Duration::from_millis(1),
                 Arc::new(AtomicUsize::new(0)),
                 Arc::new(AtomicUsize::new(0)),
@@ -457,13 +513,19 @@ async fn a_loser_cleanup_failure_does_not_erase_the_winner_transcript() {
                 aborts: Arc::new(AtomicUsize::new(0)),
                 abort_delay: Duration::from_secs(30),
             }),
+            narilabs: stream(
+                Provider::Narilabs,
+                Duration::from_millis(1),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
         },
     )
     .complete_with_timings(CapturedAudio::empty())
     .await
     .expect("a winner must survive a loser's cleanup failure");
 
-    assert_eq!(completion.sources.len(), 1);
+    assert_eq!(completion.sources.len(), 2);
     assert_eq!(completion.sources[0].provider, Provider::Deepgram);
     assert_eq!(completion.provider_failures.len(), 1);
     let failure = &completion.provider_failures[0];
@@ -477,7 +539,7 @@ async fn a_loser_cleanup_failure_does_not_erase_the_winner_transcript() {
 }
 
 #[tokio::test]
-async fn both_providers_succeeding_records_no_failures() {
+async fn all_providers_succeeding_records_no_failures() {
     let completion = ProviderCoordinator::start(
         Duration::from_secs(1),
         Duration::from_secs(1),
@@ -494,23 +556,30 @@ async fn both_providers_succeeding_records_no_failures() {
                 Arc::new(AtomicUsize::new(0)),
                 Arc::new(AtomicUsize::new(0)),
             ),
+            narilabs: stream(
+                Provider::Narilabs,
+                Duration::from_millis(1),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
         },
     )
     .complete_with_timings(CapturedAudio::empty())
     .await
     .unwrap();
 
-    assert_eq!(completion.sources.len(), 2);
+    assert_eq!(completion.sources.len(), 3);
     assert!(
         completion.provider_failures.is_empty(),
-        "no failures when both providers contribute a Source Transcript"
+        "no failures when every provider contributes a Source Transcript"
     );
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_provider_missing_the_deadline_is_recorded_as_absent() {
-    // Groq never finishes before the Provider Deadline. Deepgram carries the
-    // Recording, but Groq's absence must be visible, attributed to the deadline.
+    // Groq never finishes before the Provider Deadline. Deepgram and Narilabs
+    // carry the Recording, but Groq's absence must be visible, attributed to
+    // the deadline.
     let completion = ProviderCoordinator::start(
         Duration::from_millis(50),
         Duration::from_secs(1),
@@ -527,13 +596,19 @@ async fn a_provider_missing_the_deadline_is_recorded_as_absent() {
                 Arc::new(AtomicUsize::new(0)),
                 Arc::new(AtomicUsize::new(0)),
             ),
+            narilabs: stream(
+                Provider::Narilabs,
+                Duration::from_millis(1),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
         },
     )
     .complete_with_timings(CapturedAudio::empty())
     .await
     .unwrap();
 
-    assert_eq!(completion.sources.len(), 1);
+    assert_eq!(completion.sources.len(), 2);
     assert_eq!(completion.sources[0].provider, Provider::Deepgram);
     assert_eq!(completion.provider_failures.len(), 1);
     let failure = &completion.provider_failures[0];
@@ -603,6 +678,12 @@ async fn provider_completion_carries_each_providers_own_word_evidence() {
                 ("deploy".to_owned(), 0.95),
                 ("cache".to_owned(), 0.2),
             ],
+        }),
+        // Narilabs retains no word evidence, so it is absent from the
+        // coordinator's evidence list.
+        narilabs: Box::new(ConfidentStream {
+            provider: Provider::Narilabs,
+            words: Vec::new(),
         }),
     };
     let completion =

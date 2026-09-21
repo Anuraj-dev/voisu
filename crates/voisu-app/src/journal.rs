@@ -141,6 +141,7 @@ fn provider_key(provider: Provider) -> &'static str {
     match provider {
         Provider::Deepgram => "deepgram",
         Provider::Groq => "groq",
+        Provider::Narilabs => "narilabs",
     }
 }
 

@@ -866,11 +866,12 @@ async fn hyprland_unusable_active_window_keeps_clipboard_without_keys() {
 }
 
 #[tokio::test]
-async fn hyprland_live_revalidation_mismatch_keeps_clipboard() {
+async fn hyprland_live_revalidation_semantic_mismatch_keeps_clipboard() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let action = verified_paste_action();
     let mut stale = action.clone();
-    stale.live_binding_identity = "other-binding".to_owned();
+    stale.shortcut.binding = "CTRL + ALT + P".to_owned();
+    stale.description = "Attacker paste".to_owned();
     let mut delivery = hyprland_delivery(
         Arc::clone(&events),
         action,
@@ -894,6 +895,38 @@ async fn hyprland_live_revalidation_mismatch_keeps_clipboard() {
     assert_eq!(
         events.lock().unwrap().as_slice(),
         ["clipboard:stale binding"]
+    );
+}
+
+#[tokio::test]
+async fn hyprland_live_revalidation_identity_rotation_still_pastes() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let action = verified_paste_action();
+    let mut rotated = action.clone();
+    rotated.live_binding_identity = "7".to_owned();
+    let mut delivery = hyprland_delivery(
+        Arc::clone(&events),
+        action,
+        Box::new(UnusedWindow),
+        Some(rotated),
+        None,
+    );
+
+    for text in ["rotated binding", "second transcript"] {
+        let outcome = delivery.deliver(Transcript(text.to_owned())).await.unwrap();
+
+        assert_eq!(outcome.method, DeliveryMethod::CompositorSubmitted);
+    }
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [
+            "clipboard:rotated binding",
+            "send_key_state:CTRL + SHIFT:P:down",
+            "send_key_state:CTRL + SHIFT:P:up",
+            "clipboard:second transcript",
+            "send_key_state:CTRL + SHIFT:P:down",
+            "send_key_state:CTRL + SHIFT:P:up",
+        ]
     );
 }
 

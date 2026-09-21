@@ -252,6 +252,7 @@ pub fn dpr_source_context(
                 }
                 Provider::Groq => TranscriptSelection::SourceGroq,
                 Provider::Deepgram => TranscriptSelection::SourceDeepgram,
+                Provider::Narilabs => TranscriptSelection::SourceNarilabs,
             }
         },
     })

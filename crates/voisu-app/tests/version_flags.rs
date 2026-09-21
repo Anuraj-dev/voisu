@@ -20,9 +20,11 @@ commands:
   export <correlation-id>
   replay [--json] <fixture-name>
   doctor [--verbose|-v]
-  auth set <groq|deepgram>
-  auth verify <groq|deepgram>
+  auth set <groq|deepgram|narilabs>
+  auth verify <groq|deepgram|narilabs>
   deepgram <on|off>
+  groq <on|off>
+  narilabs <on|off>
   mode <local|cloud>
   delivery [type|clipboard|guarded]
   writing [smart|literal]

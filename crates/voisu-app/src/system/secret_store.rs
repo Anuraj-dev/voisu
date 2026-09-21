@@ -6,6 +6,17 @@ use super::*;
 
 pub struct SecretToolStore;
 
+/// Whether a usable credential for `provider` can be loaded right now — from
+/// the environment override, the desktop keyring, or the plaintext fallback
+/// file. The Narilabs Provider builder probes this at Recording time so a
+/// missing key disables that provider with a warning instead of failing the
+/// whole Recording start; the live adapter still loads the credential itself
+/// at `start` (through the process-wide credential cache), so a key that
+/// disappears mid-session surfaces through the normal start-failure semantics.
+pub fn provider_key_is_available(provider: Provider) -> bool {
+    SecretStore::load(&mut SecretToolStore, provider).is_ok()
+}
+
 /// Why the desktop Secret Service could not serve a request. It selects the
 /// fallback warning wording — ticket 06 established that an unowned/activatable
 /// name is a distinct failure from an owned-but-locked collection, and a missing
@@ -317,6 +328,7 @@ fn load_primary(provider: Provider) -> LoadPrimary {
             let name = match provider {
                 Provider::Groq => "VOISU_TEST_STORED_GROQ_CREDENTIAL",
                 Provider::Deepgram => "VOISU_TEST_STORED_DEEPGRAM_CREDENTIAL",
+                Provider::Narilabs => "VOISU_TEST_STORED_NARILABS_CREDENTIAL",
             };
             return match std::env::var(name)
                 .ok()

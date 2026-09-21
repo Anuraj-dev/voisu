@@ -4826,3 +4826,107 @@ async fn an_intent_reconstruction_fallback_is_never_arbitrated() {
     );
     assert!(decision.confidence_arbitration.is_none());
 }
+
+// ─── Third Provider: the pipeline stays source-count agnostic ────────────────
+
+#[tokio::test]
+async fn a_lone_narilabs_source_is_selected_and_labeled() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![SourceTranscript {
+            provider: Provider::Narilabs,
+            text: "Only Narilabs heard this utterance.".to_owned(),
+        }])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.transcript.0, "Only Narilabs heard this utterance.");
+    assert_eq!(decision.selection, TranscriptSelection::SourceNarilabs);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn three_sources_decide_on_the_deepgram_groq_pair_without_losing_narilabs() {
+    // Deepgram and Groq are near-identical, so the pair gate selects without a
+    // model call; the third source rides along in the evidence and in every
+    // source-count diagnostic.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Voisu preserves every spoken word before delivery.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "voisu preserves every spoken word before delivery.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Narilabs,
+                text: "different words".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        decision.transcript.0,
+        "Voisu preserves every spoken word before delivery."
+    );
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(decision.source_selection_diagnostic.sources.len(), 3);
+}
+
+#[tokio::test]
+async fn three_divergent_sources_are_reconciled_together() {
+    // The Deepgram/Groq pair materially disagrees and the third source is
+    // nothing like either: the merge request carries ALL of them, and a
+    // guardrail-passing merge that only uses source words delivers.
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        SuccessfulModel {
+            kinds: Arc::new(Mutex::new(Vec::new())),
+            text: "Schedule the cache migration before Friday and cancel the cash meeting after Thursday."
+                .to_owned(),
+        },
+        Duration::from_secs(5),
+    );
+
+    let decision = pipeline
+        .decide(vec![
+            SourceTranscript {
+                provider: Provider::Deepgram,
+                text: "Schedule the cache migration before Friday.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Groq,
+                text: "Cancel the cash meeting after Thursday.".to_owned(),
+            },
+            SourceTranscript {
+                provider: Provider::Narilabs,
+                text: "Cancel the cash meeting after Thursday and confirm the venue.".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(decision.selection, TranscriptSelection::Reconciled);
+    assert_eq!(
+        decision.transcript.0,
+        "Schedule the cache migration before Friday and cancel the cash meeting after Thursday."
+    );
+}

@@ -405,6 +405,7 @@ fn selection_label(selection: Option<&str>) -> &'static str {
         Some("near_identical_groq") => "Groq",
         Some("source_groq") => "Groq",
         Some("source_deepgram") => "Deepgram",
+        Some("source_narilabs") => "Narilabs",
         Some("reconciled") => "Reconciled (merged)",
         Some("repaired") => "Repaired (merged)",
         _ => "delivered",

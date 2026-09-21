@@ -1,0 +1,77 @@
+# Voisu dev rig — Narilabs third-provider test instance (NOT shipped, NOT committed).
+# Runs the worktree-built daemon with namespaced XDG dirs so it cannot touch the
+# managed install's config/state. Shares the control socket namespace with
+# voisu.service, so Conflicts= makes the two mutually exclusive: starting this
+# unit stops voisu.service, and your existing `voisu toggle` hotkey then reaches
+# this daemon (same socket path, same protocol).
+#
+# Env parity with the installed 0.62.1 unit plus Raja's current drop-ins
+# (98-debug-audio.conf, 99-issue205-intent.conf, 99-qwen-format.conf), plus the
+# test-only provider comparison log. Delete the QWEN_FORMAT line to A/B the
+# formatter independently of this ticket.
+#
+# Do not `systemctl --user enable` this unit unless the dev instance should win
+# every login; it is meant to be started/stopped by hand.
+
+[Unit]
+Description=Voisu dictation daemon (dev rig — Narilabs third-provider test)
+Conflicts=voisu.service
+After=wayland-session-waitenv.service dbus.socket pipewire.service
+Wants=dbus.socket pipewire.service
+PartOf=graphical-session.target
+ConditionEnvironment=|WAYLAND_DISPLAY
+ConditionEnvironment=|DISPLAY
+StartLimitIntervalSec=30s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/home/raja/Anuraj-dev/voisu-narilabs-test/target/release/voisu-daemon --systemd
+
+# Namespaced XDG dirs: config/state/data resolve under *-dev, so config.toml,
+# credentials fallback file, history.jsonl, and recordings are all separate
+# from the managed install. XDG_RUNTIME_DIR stays real — PipeWire, portals,
+# D-Bus, and the control socket live there.
+Environment=XDG_CONFIG_HOME=%h/.config/voisu-dev
+Environment=XDG_STATE_HOME=%h/.local/state/voisu-dev
+Environment=XDG_DATA_HOME=%h/.local/share/voisu-dev
+
+# Parity with the packaged unit's product flag.
+Environment=VOISU_ENABLE_DPR=1
+# Parity with Raja's current voisu.service.d drop-ins.
+Environment=VOISU_DEBUG_CAPTURE=1
+Environment=VOISU_DEBUG_AUDIO_TTL_SECS=604800
+Environment=VOISU_ENABLE_INTENT_RECONSTRUCTION=1
+Environment=VOISU_ENABLE_QWEN_FORMAT=1
+# Test-rig comparison log: one journal line per provider (label, ok/failure,
+# full transcript text, timing) after each Recording completes.
+Environment=VOISU_DEBUG_PROVIDER_TRANSCRIPTS=1
+
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=60s
+
+# Sandboxing copied from packaging/voisu.service 0.62.1, with two adjustments
+# for the rig: ConfigurationDirectory/StateDirectory are dropped (they resolve
+# against the user manager's XDG dirs, not the per-unit Environment= overrides
+# above) and their write surfaces are granted explicitly instead. dev-rig/install.sh
+# pre-creates those directories so the namespace setup cannot hit status=226.
+ProtectSystem=strict
+ReadWritePaths=%t %h/.config/voisu-dev %h/.local/state/voisu-dev
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=graphical-session.target

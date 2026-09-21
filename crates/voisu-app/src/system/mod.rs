@@ -175,6 +175,31 @@ const DEEPGRAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// the accumulated prefix would deliver a plausible but truncated Transcript.
 const DEEPGRAM_CLOSE_GRACE: Duration = Duration::from_secs(10);
 
+/// Bounded app-level redials for the Narilabs streaming websocket, mirroring
+/// the Deepgram budget: ONLY failed dials and connections that dropped before
+/// any audio was delivered on them. Once audio has been accepted by a socket a
+/// drop is unrecoverable (unfinalized audio cannot be replayed), so the stored
+/// failure surfaces through `complete()` with whatever utterances already
+/// completed.
+const NARILABS_RECONNECT_ATTEMPTS: usize = 2;
+
+const NARILABS_RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Whole-handshake bound (DNS + TCP + TLS + websocket upgrade) for one dial
+/// of the streaming endpoint, so a black-holing network cannot pin the I/O
+/// task past the Provider Deadline.
+const NARILABS_CONNECT_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Poll cadence at which the streaming I/O task observes `CancelRegistry`
+/// (a poll-style flag, matching the subprocess poll-bound discipline).
+const NARILABS_CANCEL_POLL: Duration = Duration::from_millis(100);
+
+/// After the end-of-input commit is sent, bounded wait for the end
+/// acknowledgement and every completed utterance. Unlike Deepgram's
+/// unconfirmed-close failure, the Narilabs contract finishes with whatever
+/// utterances completed (or the last partials) when the grace elapses.
+const NARILABS_CLOSE_GRACE: Duration = Duration::from_secs(10);
+
 // Subsystem modules. `pub use <module>::*;` keeps every existing
 // `voisu_app::system::Item` path working after the split (pure move).
 mod capture;
@@ -184,6 +209,7 @@ mod delivery;
 mod grammar;
 mod groq;
 mod libei_delivery;
+mod narilabs;
 mod portal_shortcuts;
 mod provider_http;
 mod readiness;
@@ -197,6 +223,7 @@ pub use delivery::*;
 pub use grammar::*;
 pub use groq::*;
 pub use libei_delivery::*;
+pub use narilabs::*;
 pub use portal_shortcuts::*;
 pub use provider_http::*;
 pub use readiness::*;
@@ -1744,6 +1771,32 @@ mod tests {
         release: std::sync::mpsc::Sender<()>,
     }
 
+    /// An inert Narilabs stream for coordinator tests that do not exercise it.
+    struct InertNarilabsStream;
+
+    impl ProviderStream for InertNarilabsStream {
+        fn provider(&self) -> Provider {
+            Provider::Narilabs
+        }
+
+        fn send_audio(&mut self, _chunk: AudioChunk) -> BoundaryFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn complete(&mut self, _audio: CapturedAudio) -> BoundaryFuture<'_, SourceTranscript> {
+            Box::pin(async {
+                Err(BoundaryError::new(
+                    BoundaryKind::Provider,
+                    "inert Narilabs stream",
+                ))
+            })
+        }
+    }
+
     fn spawn_blocking_backed_chunk(
         cancel: Arc<CancelRegistry>,
     ) -> (
@@ -1828,6 +1881,9 @@ mod tests {
                 reaper: reaper.clone(),
                 word_confidence_evidence: Vec::new(),
             }),
+            // Inert third slot: this test exercises the Deepgram/Groq cleanup
+            // ownership, so Narilabs contributes no live work.
+            narilabs: Box::new(InertNarilabsStream),
         };
 
         // Both blocking requests must actually be executing inside spawn_blocking
@@ -3175,10 +3231,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paste_action_rejects_a_cached_binding_after_live_revalidation_changes() {
+    async fn paste_action_adopts_a_live_revalidation_that_only_renumbers_the_identity() {
         let cached = test_paste_action();
         let live = VerifiedPasteAction {
             live_binding_identity: "92".to_owned(),
+            ..cached.clone()
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut paste = PortalPasteAction::with_test_revalidation(
+            cached.clone(),
+            Box::new(DisabledRemoteDesktopPortal),
+            live,
+        );
+        paste.session = Some(Box::new(RecordingShortcutSession(Arc::clone(&events))));
+
+        tokio::time::timeout(Duration::from_secs(1), paste.invoke(&cached))
+            .await
+            .expect("live verification should complete")
+            .expect("an identity-only rotation must recover by adopting the fresh action");
+        assert_eq!(paste.action.live_binding_identity, "92");
+        assert_eq!(events.lock().unwrap().as_slice(), ["shortcut:SUPER + V"]);
+
+        // Recovery is durable: the outer delivery keeps invoking with the
+        // startup-cached action, so a second invoke with the stale identity
+        // must still paste instead of tripping the anti-swap check.
+        tokio::time::timeout(Duration::from_secs(1), paste.invoke(&cached))
+            .await
+            .expect("live verification should complete")
+            .expect("a second invoke with the stale identity must still paste");
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["shortcut:SUPER + V", "shortcut:SUPER + V"]
+        );
+    }
+
+    #[tokio::test]
+    async fn paste_action_rejects_a_live_revalidation_that_changes_the_binding() {
+        let cached = test_paste_action();
+        let live = VerifiedPasteAction {
+            shortcut: crate::hyprland_bindings::PasteShortcut {
+                binding: "CTRL + ALT + P".to_owned(),
+            },
+            description: "Attacker paste".to_owned(),
             ..cached.clone()
         };
         let mut paste = PortalPasteAction::with_test_revalidation(
@@ -3190,7 +3284,7 @@ mod tests {
         let error = tokio::time::timeout(Duration::from_secs(1), paste.invoke(&cached))
             .await
             .expect("live verification should complete")
-            .expect_err("a stale cached action must fail closed");
+            .expect_err("a semantically changed action must fail closed");
         assert_eq!(
             error.diagnostic(),
             "verified Paste Action is no longer active"

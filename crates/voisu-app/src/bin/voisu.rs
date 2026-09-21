@@ -46,6 +46,8 @@ enum CliAction {
     AuthSet(Provider),
     AuthVerify(Provider),
     SetDeepgram(bool),
+    SetGroq(bool),
+    SetNarilabs(bool),
     SetAsrMode(AsrMode),
     Delivery(Option<DeliveryMode>),
     Writing(Option<WritingMode>),
@@ -71,6 +73,12 @@ fn main() -> ExitCode {
         },
         Ok(CliAction::AuthVerify(provider)) => auth_verify(provider),
         Ok(CliAction::SetDeepgram(enabled)) => set_deepgram(enabled),
+        Ok(CliAction::SetGroq(enabled)) => {
+            set_provider_toggle("Groq", enabled, voisu_app::config::set_groq_enabled)
+        }
+        Ok(CliAction::SetNarilabs(enabled)) => {
+            set_provider_toggle("Narilabs", enabled, voisu_app::config::set_narilabs_enabled)
+        }
         Ok(CliAction::SetAsrMode(mode)) => set_asr_mode(mode),
         Ok(CliAction::Delivery(mode)) => delivery(mode),
         Ok(CliAction::Writing(mode)) => writing(mode),
@@ -761,6 +769,7 @@ fn provider_key_rows(runtime: &tokio::runtime::Runtime) -> Vec<DoctorRow> {
                     ProviderKeyStatus::RateLimited => "rate-limited",
                     ProviderKeyStatus::QuotaExhausted => "quota exhausted",
                     ProviderKeyStatus::Unreachable => "unreachable",
+                    ProviderKeyStatus::VerificationUnsupported => "no live probe",
                 };
                 let mut detail = format!("{}{}", status.headline(), location_note);
                 let mut row = DoctorRow::new(label, status.readiness(), String::new()).value(value);
@@ -950,10 +959,21 @@ fn set_asr_mode(mode: AsrMode) -> ExitCode {
 }
 
 fn set_deepgram(enabled: bool) -> ExitCode {
-    match voisu_app::config::set_deepgram_enabled(enabled) {
+    set_provider_toggle("Deepgram", enabled, voisu_app::config::set_deepgram_enabled)
+}
+
+/// Persists a Provider on/off toggle to the local config file. The daemon
+/// reads the toggles at start, so a change takes effect on the next daemon
+/// start; the message reminds the user to restart a running daemon.
+fn set_provider_toggle(
+    label: &str,
+    enabled: bool,
+    persist: fn(bool) -> Result<std::path::PathBuf, String>,
+) -> ExitCode {
+    match persist(enabled) {
         Ok(_) => {
             println!(
-                "Deepgram {} for new Recordings; restart the daemon to apply \
+                "{label} {} for new Recordings; restart the daemon to apply \
                  (voisu service restart)",
                 if enabled { "enabled" } else { "disabled" }
             );
@@ -1305,7 +1325,13 @@ fn parse_command() -> Result<CliAction, String> {
             Ok(CliAction::AuthVerify(parse_provider(provider)?))
         }
         [command, state] if command == "deepgram" => {
-            Ok(CliAction::SetDeepgram(parse_toggle(state)?))
+            Ok(CliAction::SetDeepgram(parse_toggle("deepgram", state)?))
+        }
+        [command, state] if command == "groq" => {
+            Ok(CliAction::SetGroq(parse_toggle("groq", state)?))
+        }
+        [command, state] if command == "narilabs" => {
+            Ok(CliAction::SetNarilabs(parse_toggle("narilabs", state)?))
         }
         [command, mode] if command == "mode" => Ok(CliAction::SetAsrMode(parse_asr_mode(mode)?)),
         [command] if command == "delivery" => Ok(CliAction::Delivery(None)),
@@ -1359,11 +1385,11 @@ fn parse_asr_mode(value: &str) -> Result<AsrMode, String> {
     AsrMode::parse(value).ok_or_else(|| "mode must be local or cloud".to_owned())
 }
 
-fn parse_toggle(value: &str) -> Result<bool, String> {
+fn parse_toggle(provider: &str, value: &str) -> Result<bool, String> {
     match value {
         "on" => Ok(true),
         "off" => Ok(false),
-        _ => Err("deepgram must be on or off".to_owned()),
+        _ => Err(format!("{provider} must be on or off")),
     }
 }
 
@@ -1393,7 +1419,8 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
     match value {
         "groq" => Ok(Provider::Groq),
         "deepgram" => Ok(Provider::Deepgram),
-        _ => Err("provider must be groq or deepgram".to_owned()),
+        "narilabs" => Ok(Provider::Narilabs),
+        _ => Err("provider must be groq, deepgram, or narilabs".to_owned()),
     }
 }
 
@@ -1411,9 +1438,11 @@ commands:
   export <correlation-id>
   replay [--json] <fixture-name>
   doctor [--verbose|-v]
-  auth set <groq|deepgram>
-  auth verify <groq|deepgram>
+  auth set <groq|deepgram|narilabs>
+  auth verify <groq|deepgram|narilabs>
   deepgram <on|off>
+  groq <on|off>
+  narilabs <on|off>
   mode <local|cloud>
   delivery [type|clipboard|guarded]
   writing [smart|literal]

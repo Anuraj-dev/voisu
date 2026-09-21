@@ -42,10 +42,10 @@ use voisu_app::smart_writing::{
 use voisu_app::system::{
     CAPTURE_FINALIZE_DEADLINE, CredentialPreparationOwner, DIAGNOSTIC_RESPONSE_DEADLINE,
     DeepgramProvider, DesktopNotifier, FedoraShortcutPortal, GrammarCapability, GroqProvider,
-    GuardedDelivery, INTENT_RECONSTRUCTION_DEADLINE, MergeResultValidator,
+    GuardedDelivery, INTENT_RECONSTRUCTION_DEADLINE, MergeResultValidator, NarilabsProvider,
     PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture,
     PortalClipboardDelivery, ProviderReaper, RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
-    WlClipboard, clipboard_backend_display_reachable,
+    WlClipboard, clipboard_backend_display_reachable, provider_key_is_available,
 };
 use voisu_core::{
     ActiveCapture, AsrMode, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
@@ -77,6 +77,14 @@ const PROVIDER_DEADLINE: Duration = PROVIDER_COMPLETION_DEADLINE;
 /// disabled for a Recording. Surfaced in history so a single-Provider Recording
 /// records *why* only one source ran, never a silent absence.
 const DEEPGRAM_DISABLED_DIAGNOSTIC: &str = "Deepgram disabled for this Recording";
+
+/// The canonical diagnostic recorded for the Narilabs Provider when it is
+/// disabled for this daemon (the default) or built without a usable key.
+const NARILABS_DISABLED_DIAGNOSTIC: &str = "Narilabs disabled for this Recording";
+
+/// The canonical diagnostic recorded for the Groq Provider when it is disabled
+/// for this daemon.
+const GROQ_DISABLED_DIAGNOSTIC: &str = "Groq disabled for this Recording";
 static CONTROLLED_DELIVERY_PANICKED: AtomicBool = AtomicBool::new(false);
 
 /// A one- or two-line description of the daemon for `--help`. It is normally
@@ -383,6 +391,7 @@ struct ReplayCompletion {
     id: u64,
     deepgram: Box<dyn TranscriptProvider>,
     groq: Box<dyn TranscriptProvider>,
+    narilabs: Box<dyn TranscriptProvider>,
     validator: Box<dyn TranscriptValidator>,
     reply: oneshot::Sender<Response>,
     response: Response,
@@ -393,6 +402,7 @@ struct StartupCompletion {
     capture: Box<dyn AudioCapture>,
     deepgram: Box<dyn TranscriptProvider>,
     groq: Box<dyn TranscriptProvider>,
+    narilabs: Box<dyn TranscriptProvider>,
     result: Result<(Box<dyn ActiveCapture>, ProviderStreams), StartFailure>,
     level_ring: Arc<LevelRing>,
     writing_mode: WritingMode,
@@ -408,7 +418,9 @@ struct StartupCompletion {
 struct StartFailure {
     error: BoundaryError,
     capture: Option<Box<dyn ActiveCapture>>,
-    provider_stream: Option<Box<dyn ProviderStream>>,
+    /// The provider streams that DID start before the failure; each is torn
+    /// down without a Source Transcript, so history accounts it as Aborted.
+    provider_streams: Vec<Box<dyn ProviderStream>>,
     /// The provider whose `start()` failed, if the failure was a provider (not a
     /// capture) start. Recorded as a NotStarted ProviderFailure so a provider
     /// that never began is visible in history rather than a bare generic error.
@@ -532,12 +544,39 @@ async fn actor_loop(
     } else {
         Box::new(PipeWireCapture::new(reaper.clone(), levels.clone()))
     });
-    // The persisted (or env-overridden) Deepgram toggle, resolved once at daemon
-    // start. Default ON puts the daemon on the reconciled dual-Provider path;
-    // when OFF (via `voisu deepgram off` or VOISU_DISABLE_DEEPGRAM) the Deepgram
-    // adapter is a no-network stand-in so `begin_recording` never opens a Deepgram
-    // stream and the completion barrier waits on Groq alone.
+    // The persisted (or env-overridden) Provider toggles, resolved once at
+    // daemon start. Deepgram default ON puts the daemon on the reconciled
+    // dual-Provider path; when OFF (via `voisu deepgram off` or
+    // VOISU_DISABLE_DEEPGRAM) the Deepgram adapter is a no-network stand-in so
+    // `begin_recording` never opens a Deepgram stream and the completion
+    // barrier waits on Groq alone. Narilabs (the third, opt-in Provider of this
+    // evaluation build) defaults OFF; when enabled without a usable key its
+    // adapter is the same no-network stand-in and never aborts a Recording.
     let deepgram_enabled = voisu_app::config::deepgram_enabled();
+    let groq_enabled = voisu_app::config::groq_enabled();
+    let narilabs_enabled = voisu_app::config::narilabs_enabled();
+    // The Narilabs key is probed ONCE here, like the persisted toggles: a key
+    // stored later takes effect at the next daemon restart. Enabled without a
+    // usable key logs the warning once and the Recording runs without
+    // Narilabs — a missing key never aborts a Recording. Controlled mode
+    // never needs a key (its adapters send nothing). The precomputed decision
+    // is what every builder path receives, so the replay tail performs no
+    // keyring I/O and no stderr.
+    let narilabs_key_available =
+        narilabs_enabled && (controlled || provider_key_is_available(Provider::Narilabs));
+    if narilabs_enabled && !narilabs_key_available {
+        eprintln!(
+            "Narilabs is enabled but no key is available; run \
+             `voisu auth set narilabs` — continuing without Narilabs"
+        );
+    }
+    // Comparison logging for the multi-Provider evaluation: one line per
+    // provider source after transcripts complete. Read once at start, like
+    // VOISU_TEST_MODE; unset keeps the daemon silent.
+    let debug_provider_transcripts = std::env::var("VOISU_DEBUG_PROVIDER_TRANSCRIPTS")
+        .ok()
+        .as_deref()
+        == Some("1");
     // Delivery mode and any guarded focus probe were resolved once before the
     // actor started. A running daemon keeps those choices until its next restart.
     // Production adapters are built only at a Recording or replay boundary,
@@ -548,10 +587,14 @@ async fn actor_loop(
     // snapshot below. The controlled adapters themselves never send a request.
     let mut deepgram: Option<Box<dyn TranscriptProvider>> = None;
     let mut groq: Option<Box<dyn TranscriptProvider>> = None;
+    let mut narilabs: Option<Box<dyn TranscriptProvider>> = None;
     // The processing supervisor cannot inspect task-local provider state after a
     // panic, so retain the providers configured for this Recording beside the
     // actor-owned adapters and pass that list into every supervised stop path.
-    let configured_providers = vec![Provider::Deepgram, Provider::Groq];
+    let mut configured_providers = vec![Provider::Deepgram, Provider::Groq];
+    if narilabs_enabled {
+        configured_providers.push(Provider::Narilabs);
+    }
     let intent_reconstruction = voisu_app::config::intent_reconstruction_enabled();
     let mut validator: Option<Box<dyn TranscriptValidator>> = if controlled {
         Some(Box::new(ControlledValidator::from_env(
@@ -744,6 +787,9 @@ async fn actor_loop(
                                 debug_capture,
                                 controlled,
                                 deepgram_enabled,
+                                groq_enabled,
+                                narilabs_enabled,
+                                debug_provider_transcripts,
                                 delivery_mode,
                                 focus_probe.clone(),
                                 configured_providers.clone(),
@@ -846,7 +892,8 @@ async fn actor_loop(
                         let current_validator = validator.take().expect("validator is available");
                         let fixture_name = fixture_name.into_inner();
                         let replay = tokio::spawn(async move {
-                            let (deepgram_slot, groq_slot) = local_routing::cloud_free_slots();
+                            let (deepgram_slot, groq_slot, narilabs_slot) =
+                                local_routing::cloud_free_slots();
                             let response = local_routing::replay_local(
                                 &voisu_core::correlation_id(id),
                                 &fixture_name,
@@ -860,6 +907,7 @@ async fn actor_loop(
                             ReplayResult {
                                 deepgram: deepgram_slot,
                                 groq: groq_slot,
+                                narilabs: narilabs_slot,
                                 validator: current_validator,
                                 response,
                             }
@@ -867,6 +915,8 @@ async fn actor_loop(
                         tokio::spawn(supervise_replay(
                             replay,
                             id,
+                            false,
+                            false,
                             false,
                             false,
                             Arc::new(Vec::new()),
@@ -920,12 +970,20 @@ async fn actor_loop(
                                 &reaper,
                             ));
                             groq = Some(build_groq_provider(
+                                groq_enabled,
                                 false,
                                 replay_whisper_prompt.as_ref().clone(),
                                 replay_language.as_ref().clone(),
                                 &reaper,
                             ));
-                        } else if deepgram.is_none() || groq.is_none() {
+                            narilabs = Some(build_narilabs_provider(
+                                narilabs_key_available,
+                                false,
+                                replay_whisper_prompt.as_ref().clone(),
+                                &replay_language,
+                                &reaper,
+                            ));
+                        } else if deepgram.is_none() || groq.is_none() || narilabs.is_none() {
                             deepgram = Some(build_deepgram_provider(
                                 deepgram_enabled,
                                 true,
@@ -934,15 +992,25 @@ async fn actor_loop(
                                 &reaper,
                             ));
                             groq = Some(build_groq_provider(
+                                groq_enabled,
                                 true,
                                 replay_whisper_prompt.as_ref().clone(),
                                 replay_language.as_ref().clone(),
+                                &reaper,
+                            ));
+                            narilabs = Some(build_narilabs_provider(
+                                narilabs_key_available,
+                                true,
+                                replay_whisper_prompt.as_ref().clone(),
+                                &replay_language,
                                 &reaper,
                             ));
                         }
                         let current_deepgram =
                             deepgram.take().expect("Deepgram adapter is available");
                         let current_groq = groq.take().expect("Groq adapter is available");
+                        let current_narilabs =
+                            narilabs.take().expect("Narilabs adapter is available");
                         let current_validator = validator.take().expect("validator is available");
                         let provider_deadline = if controlled_deadlines
                             && std::env::var_os("VOISU_TEST_PROVIDER_DEADLINE_MS").is_some()
@@ -965,15 +1033,21 @@ async fn actor_loop(
                                 .fixture_dir(),
                             current_deepgram,
                             current_groq,
+                            current_narilabs,
                             current_validator,
                             provider_deadline,
                             deepgram_enabled,
+                            groq_enabled,
+                            narilabs_enabled,
+                            debug_provider_transcripts,
                         ));
                         tokio::spawn(supervise_replay(
                             replay,
                             id,
                             controlled,
                             deepgram_enabled,
+                            groq_enabled,
+                            narilabs_key_available,
                             replay_keyterms,
                             replay_whisper_prompt,
                             replay_language,
@@ -1010,11 +1084,18 @@ async fn actor_loop(
                         // EnglishEligibility reads exactly what the requests send)
                         // and handed to both request builders.
                         let transcription_language = voisu_app::config::transcription_language();
-                        let mut language_declarations =
-                            vec![(Provider::Groq, transcription_language.clone())];
+                        let mut language_declarations = Vec::new();
+                        if groq_enabled {
+                            language_declarations
+                                .push((Provider::Groq, transcription_language.clone()));
+                        }
                         if deepgram_enabled {
                             language_declarations
                                 .push((Provider::Deepgram, transcription_language.clone()));
+                        }
+                        if narilabs_enabled {
+                            language_declarations
+                                .push((Provider::Narilabs, transcription_language.clone()));
                         }
                         let languages = ResolvedRecordingLanguages::new(language_declarations);
                         let user_terms = session_snapshot.user_terms.clone();
@@ -1035,13 +1116,21 @@ async fn actor_loop(
                                 &reaper,
                             ));
                             groq = Some(build_groq_provider(
+                                groq_enabled,
+                                false,
+                                session_whisper_prompt.clone(),
+                                transcription_language.clone(),
+                                &reaper,
+                            ));
+                            narilabs = Some(build_narilabs_provider(
+                                narilabs_key_available,
                                 false,
                                 session_whisper_prompt,
-                                transcription_language,
+                                &transcription_language,
                                 &reaper,
                             ));
                         } else if admitted_mode != AsrMode::Local
-                            && (deepgram.is_none() || groq.is_none())
+                            && (deepgram.is_none() || groq.is_none() || narilabs.is_none())
                         {
                             deepgram = Some(build_deepgram_provider(
                                 deepgram_enabled,
@@ -1051,9 +1140,17 @@ async fn actor_loop(
                                 &reaper,
                             ));
                             groq = Some(build_groq_provider(
+                                groq_enabled,
+                                true,
+                                session_whisper_prompt.clone(),
+                                transcription_language.clone(),
+                                &reaper,
+                            ));
+                            narilabs = Some(build_narilabs_provider(
+                                narilabs_key_available,
                                 true,
                                 session_whisper_prompt,
-                                transcription_language.clone(),
+                                &transcription_language,
                                 &reaper,
                             ));
                         }
@@ -1079,13 +1176,14 @@ async fn actor_loop(
                         }
                         let mut current_capture =
                             capture.take().expect("capture adapter is available");
-                        let (mut current_deepgram, mut current_groq) =
+                        let (mut current_deepgram, mut current_groq, mut current_narilabs) =
                             if admitted_mode == AsrMode::Local {
                                 local_routing::cloud_free_slots()
                             } else {
                                 (
                                     deepgram.take().expect("Deepgram adapter is available"),
                                     groq.take().expect("Groq adapter is available"),
+                                    narilabs.take().expect("Narilabs adapter is available"),
                                 )
                             };
                         let actor = tx.clone();
@@ -1095,6 +1193,7 @@ async fn actor_loop(
                                 &mut current_capture,
                                 &mut current_deepgram,
                                 &mut current_groq,
+                                &mut current_narilabs,
                                 id,
                             );
                             let _ = actor.blocking_send(ActorMessage::Started(Box::new(
@@ -1103,6 +1202,7 @@ async fn actor_loop(
                                     capture: current_capture,
                                     deepgram: current_deepgram,
                                     groq: current_groq,
+                                    narilabs: current_narilabs,
                                     result,
                                     level_ring,
                                     writing_mode,
@@ -1123,6 +1223,7 @@ async fn actor_loop(
                     capture: returned_capture,
                     deepgram: returned_deepgram,
                     groq: returned_groq,
+                    narilabs: returned_narilabs,
                     result,
                     level_ring,
                     writing_mode,
@@ -1136,11 +1237,13 @@ async fn actor_loop(
                 if controlled && started_asr_mode != AsrMode::Local {
                     deepgram = Some(returned_deepgram);
                     groq = Some(returned_groq);
+                    narilabs = Some(returned_narilabs);
                 } else {
                     // The next production Recording/replay builds fresh
                     // providers from its own dictionary snapshot.
                     drop(returned_deepgram);
                     drop(returned_groq);
+                    drop(returned_narilabs);
                 }
                 let correlation = match &state {
                     ActorState::Starting {
@@ -1176,6 +1279,12 @@ async fn actor_loop(
                             if !deepgram_enabled {
                                 normalize_disabled_deepgram(&mut record.provider_failures);
                             }
+                            if !groq_enabled {
+                                normalize_disabled_groq(&mut record.provider_failures);
+                            }
+                            if !narilabs_enabled {
+                                normalize_disabled_narilabs(&mut record.provider_failures);
+                            }
                             if let Some(store) = diagnostics.as_ref()
                                 && let Err(error) = store.record(record)
                             {
@@ -1209,16 +1318,22 @@ async fn actor_loop(
                             let actor = tx.clone();
                             let shutdown_reaper = reaper.clone();
                             tokio::spawn(async move {
-                                let ProviderStreams { deepgram, groq } = streams;
-                                let (capture_result, deepgram_result, groq_result) = tokio::join!(
+                                let ProviderStreams {
+                                    deepgram,
+                                    groq,
+                                    narilabs,
+                                } = streams;
+                                let (capture_result, deepgram_result, groq_result, narilabs_result) = tokio::join!(
                                     timeout(RECOVERY_ABORT_DEADLINE, active_capture.abort()),
                                     timeout(RECOVERY_ABORT_DEADLINE, deepgram.abort()),
                                     timeout(RECOVERY_ABORT_DEADLINE, groq.abort()),
+                                    timeout(RECOVERY_ABORT_DEADLINE, narilabs.abort()),
                                 );
                                 for (label, result) in [
                                     ("capture", capture_result),
                                     ("Deepgram", deepgram_result),
                                     ("Groq", groq_result),
+                                    ("Narilabs", narilabs_result),
                                 ] {
                                     match result {
                                         Ok(Ok(())) => {}
@@ -1337,7 +1452,7 @@ async fn actor_loop(
                             }
                             level_ring.deactivate();
                             let recovering =
-                                failure.capture.is_some() || failure.provider_stream.is_some();
+                                failure.capture.is_some() || !failure.provider_streams.is_empty();
                             let mut evidence = base_evidence(id, correlation.clone(), Vec::new());
                             evidence.recovery_attempted = recovering;
                             let journal = recording_journal_lines(
@@ -1373,11 +1488,13 @@ async fn actor_loop(
                                     failure.error.diagnostic().to_owned(),
                                 ));
                             }
-                            let started_provider = failure
-                                .provider_stream
-                                .as_ref()
-                                .map(|stream| stream.provider());
-                            for provider in [Provider::Deepgram, Provider::Groq] {
+                            let started_providers: Vec<Provider> = failure
+                                .provider_streams
+                                .iter()
+                                .map(|stream| stream.provider())
+                                .collect();
+                            for provider in [Provider::Deepgram, Provider::Groq, Provider::Narilabs]
+                            {
                                 if record
                                     .provider_failures
                                     .iter()
@@ -1385,7 +1502,7 @@ async fn actor_loop(
                                 {
                                     continue;
                                 }
-                                let (stage, diagnostic) = if started_provider == Some(provider) {
+                                let (stage, diagnostic) = if started_providers.contains(&provider) {
                                     (
                                         ProviderFailureStage::Aborted,
                                         "provider stream started but the Recording was aborted during startup",
@@ -1402,6 +1519,12 @@ async fn actor_loop(
                             }
                             if !deepgram_enabled {
                                 normalize_disabled_deepgram(&mut record.provider_failures);
+                            }
+                            if !groq_enabled {
+                                normalize_disabled_groq(&mut record.provider_failures);
+                            }
+                            if !narilabs_enabled {
+                                normalize_disabled_narilabs(&mut record.provider_failures);
                             }
                             if let Some(store) = diagnostics.as_ref()
                                 && let Err(error) = store.record(record)
@@ -1458,6 +1581,7 @@ async fn actor_loop(
                     id,
                     deepgram: returned_deepgram,
                     groq: returned_groq,
+                    narilabs: returned_narilabs,
                     validator: returned_validator,
                     reply,
                     response,
@@ -1465,11 +1589,13 @@ async fn actor_loop(
                 if controlled {
                     deepgram = Some(returned_deepgram);
                     groq = Some(returned_groq);
+                    narilabs = Some(returned_narilabs);
                 } else {
                     // Replay's next production invocation resolves and builds
                     // its own snapshot; retaining these adapters would be stale.
                     drop(returned_deepgram);
                     drop(returned_groq);
+                    drop(returned_narilabs);
                 }
                 validator = Some(returned_validator);
                 // `supervise_replay` drained the provider reaper before this
@@ -1492,6 +1618,9 @@ async fn actor_loop(
                         debug_capture,
                         controlled,
                         deepgram_enabled,
+                        groq_enabled,
+                        narilabs_enabled,
+                        debug_provider_transcripts,
                         delivery_mode,
                         focus_probe.clone(),
                         configured_providers.clone(),
@@ -1639,6 +1768,9 @@ async fn actor_loop(
                             debug_capture,
                             controlled,
                             deepgram_enabled,
+                            groq_enabled,
+                            narilabs_enabled,
+                            debug_provider_transcripts,
                             delivery_mode,
                             focus_probe.clone(),
                             configured_providers.clone(),
@@ -1690,6 +1822,9 @@ fn spawn_recording_processing(
     debug_capture: bool,
     controlled: bool,
     deepgram_enabled: bool,
+    groq_enabled: bool,
+    narilabs_enabled: bool,
+    debug_provider_transcripts: bool,
     delivery_mode: DeliveryMode,
     focus_probe: Option<SharedFocusProbe>,
     configured_providers: Vec<Provider>,
@@ -1729,6 +1864,9 @@ fn spawn_recording_processing(
         diagnostics.clone(),
         debug_capture,
         deepgram_enabled,
+        groq_enabled,
+        narilabs_enabled,
+        debug_provider_transcripts,
         reaper.clone(),
         grammar_adapter,
         dpr_enabled,
@@ -1739,6 +1877,8 @@ fn spawn_recording_processing(
         processing,
         controlled,
         deepgram_enabled,
+        groq_enabled,
+        narilabs_enabled,
         delivery_mode,
         focus_probe,
         configured_providers,
@@ -2076,31 +2216,85 @@ fn build_deepgram_provider(
 
 /// Builds Groq from the same pre-resolved snapshot as Deepgram. Controlled
 /// tests do not issue Whisper requests, so their provider has no prompt.
+/// When Groq is disabled (`voisu groq off`), a [`DisabledProvider`] stands in
+/// exactly as for Deepgram.
 fn build_groq_provider(
+    groq_enabled: bool,
     controlled: bool,
     whisper_prompt: String,
     language: String,
     reaper: &ProviderReaper,
 ) -> Box<dyn TranscriptProvider> {
+    if !groq_enabled {
+        Box::new(DisabledProvider::new(Provider::Groq))
+    } else {
+        local_routing::note_cloud_capability_used();
+        if controlled {
+            Box::new(ControlledProvider::from_env(Provider::Groq))
+        } else {
+            Box::new(GroqProvider::with_prompt_and_language(
+                reaper.clone(),
+                whisper_prompt,
+                language,
+            ))
+        }
+    }
+}
+
+/// Builds the Narilabs Provider adapter for this daemon, mirroring
+/// [`build_deepgram_provider`]. `prompt` is the Recording's pre-resolved
+/// dictionary snapshot — the same glossary string Groq's Whisper prompt
+/// carries. When Narilabs is disabled (the default), a
+/// [`DisabledProvider`] stands in: it opens no network, so `begin_recording`
+/// skips the real start entirely. When enabled but NO key is available, the
+/// same stand-in is built with a warning — a missing key must never abort a
+/// Recording; the Recording runs on the remaining providers. With a key
+/// present, the live adapter's `start` failure semantics are exactly
+/// Deepgram's: a failed start fails the Recording start with
+/// `failed_provider: Some(Provider::Narilabs)` and the already-started
+/// streams handed back for the bounded abort.
+///
+/// The Narilabs key decision is PRECOMPUTED at daemon start (see the startup
+/// block): this builder performs no keyring I/O and no stderr, so the
+/// panic-free replay tail can call it freely. Enabled without a usable key
+/// builds the same [`DisabledProvider`] stand-in as a disabled Provider.
+/// With a usable key, the live adapter's `start` failure semantics are
+/// exactly Deepgram's: a failed start fails the Recording start with
+/// `failed_provider: Some(Provider::Narilabs)` and the already-started
+/// streams handed back for the bounded abort. The live adapter still loads
+/// the credential itself at `start` (through the process-wide credential
+/// cache), so a key that disappears mid-session surfaces through those
+/// start-failure semantics, not silently.
+fn build_narilabs_provider(
+    narilabs_key_available: bool,
+    controlled: bool,
+    prompt: String,
+    language: &str,
+    reaper: &ProviderReaper,
+) -> Box<dyn TranscriptProvider> {
+    if !narilabs_key_available {
+        return Box::new(DisabledProvider::new(Provider::Narilabs));
+    }
     local_routing::note_cloud_capability_used();
     if controlled {
-        Box::new(ControlledProvider::from_env(Provider::Groq))
-    } else {
-        Box::new(GroqProvider::with_prompt_and_language(
-            reaper.clone(),
-            whisper_prompt,
-            language,
-        ))
+        return Box::new(ControlledProvider::from_env(Provider::Narilabs));
     }
+    Box::new(NarilabsProvider::with_prompt_and_language(
+        reaper.clone(),
+        prompt,
+        language.to_owned(),
+    ))
 }
 
 /// Starts a Recording. If a later step of the start sequence fails, everything
 /// already started is handed back in the failure so the actor can run the
 /// aborts off its loop and only become reusable once they acknowledge.
+#[allow(clippy::result_large_err)] // the StartFailure carries every started stream, like each boundary path
 fn begin_recording(
     capture: &mut Box<dyn AudioCapture>,
     deepgram: &mut Box<dyn TranscriptProvider>,
     groq: &mut Box<dyn TranscriptProvider>,
+    narilabs: &mut Box<dyn TranscriptProvider>,
     id: u64,
 ) -> Result<(Box<dyn ActiveCapture>, ProviderStreams), StartFailure> {
     let active_capture = match capture.begin(id) {
@@ -2109,7 +2303,7 @@ fn begin_recording(
             return Err(StartFailure {
                 error,
                 capture: None,
-                provider_stream: None,
+                provider_streams: Vec::new(),
                 failed_provider: None,
             });
         }
@@ -2120,7 +2314,7 @@ fn begin_recording(
             return Err(StartFailure {
                 error,
                 capture: Some(active_capture),
-                provider_stream: None,
+                provider_streams: Vec::new(),
                 failed_provider: Some(Provider::Deepgram),
             });
         }
@@ -2131,8 +2325,19 @@ fn begin_recording(
             return Err(StartFailure {
                 error,
                 capture: Some(active_capture),
-                provider_stream: Some(deepgram_stream),
+                provider_streams: vec![deepgram_stream],
                 failed_provider: Some(Provider::Groq),
+            });
+        }
+    };
+    let narilabs_stream = match narilabs.start(id) {
+        Ok(stream) => stream,
+        Err(error) => {
+            return Err(StartFailure {
+                error,
+                capture: Some(active_capture),
+                provider_streams: vec![deepgram_stream, groq_stream],
+                failed_provider: Some(Provider::Narilabs),
             });
         }
     };
@@ -2141,6 +2346,7 @@ fn begin_recording(
         ProviderStreams {
             deepgram: deepgram_stream,
             groq: groq_stream,
+            narilabs: narilabs_stream,
         },
     ))
 }
@@ -2157,7 +2363,7 @@ async fn recover_failed_start(
 ) {
     let StartFailure {
         capture,
-        provider_stream,
+        provider_streams,
         ..
     } = failure;
     let correlation = correlation.as_str();
@@ -2178,7 +2384,7 @@ async fn recover_failed_start(
         }
     };
     let provider_abort = async {
-        if let Some(stream) = provider_stream {
+        for stream in provider_streams {
             match timeout(RECOVERY_ABORT_DEADLINE, stream.abort()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -2343,6 +2549,9 @@ async fn process_recording(
     diagnostics: Option<Arc<DiagnosticStore>>,
     debug_capture: bool,
     deepgram_enabled: bool,
+    groq_enabled: bool,
+    narilabs_enabled: bool,
+    debug_provider_transcripts: bool,
     reaper: ProviderReaper,
     grammar_adapter: Option<MinimalGrammarAdapter>,
     dpr_enabled: bool,
@@ -2397,6 +2606,12 @@ async fn process_recording(
             if !deepgram_enabled {
                 normalize_disabled_deepgram(&mut provider_failures);
             }
+            if !groq_enabled {
+                normalize_disabled_groq(&mut provider_failures);
+            }
+            if !narilabs_enabled {
+                normalize_disabled_narilabs(&mut provider_failures);
+            }
             let record = diagnostic_record(
                 &evidence,
                 Vec::new(),
@@ -2430,6 +2645,17 @@ async fn process_recording(
     let mut smart_writing: Option<SmartWritingDiagnostic> = None;
     let mut dpr: Option<DprDiagnostic> = None;
     let mut debug_audio = None;
+    // Providers intentionally off for this daemon. The comparison log skips
+    // them so it agrees with history's normalized not_started bookkeeping.
+    let disabled_providers: Vec<Provider> = [
+        (deepgram_enabled, Provider::Deepgram),
+        (groq_enabled, Provider::Groq),
+        (narilabs_enabled, Provider::Narilabs),
+    ]
+    .into_iter()
+    .filter(|(enabled, _)| !enabled)
+    .map(|(_, provider)| provider)
+    .collect();
 
     let result = async {
         if let Some(error) = stream_error {
@@ -2517,6 +2743,15 @@ async fn process_recording(
                 &reaper,
             )
             .await?;
+        if debug_provider_transcripts {
+            log_provider_comparison(
+                id,
+                &completed.sources,
+                &completed.timings_ms,
+                &completed.provider_failures,
+                &disabled_providers,
+            );
+        }
         provider_failures = completed.provider_failures;
         evidence.provider_timings_ms = completed.timings_ms;
         // Hand the validator the word-level confidence evidence the providers
@@ -2714,16 +2949,25 @@ async fn process_recording(
         // the provider(s) that merely got torn down have neither yet, so record
         // them as Aborted — no silent absence on any exit path.
         account_for_missing_providers(&source_records, &mut provider_failures, error.diagnostic());
+        if debug_provider_transcripts {
+            log_provider_failure_comparison(id, &provider_failures, &disabled_providers);
+        }
     }
 
-    // Deepgram was disabled for this Recording: whatever the completion, abort,
-    // or torn-down accounting recorded above (Completion when the barrier
-    // resolved instantly, Aborted on a capture/streaming failure that never
-    // reached the barrier), collapse it to the single canonical NotStarted
-    // record on EVERY exit path — success or failure — so a Groq-only Recording
-    // always shows why only one source ran.
+    // A provider was disabled for this Recording: whatever the completion,
+    // abort, or torn-down accounting recorded above (Completion when the
+    // barrier resolved instantly, Aborted on a capture/streaming failure that
+    // never reached the barrier), collapse it to the single canonical
+    // NotStarted record on EVERY exit path — success or failure — so a
+    // Recording always shows why a configured source did not run.
     if !deepgram_enabled {
         normalize_disabled_deepgram(&mut provider_failures);
+    }
+    if !groq_enabled {
+        normalize_disabled_groq(&mut provider_failures);
+    }
+    if !narilabs_enabled {
+        normalize_disabled_narilabs(&mut provider_failures);
     }
 
     let record = diagnostic_record(
@@ -2893,6 +3137,8 @@ async fn supervise_recording(
     processing: JoinHandle<RecordingResult>,
     controlled: bool,
     deepgram_enabled: bool,
+    groq_enabled: bool,
+    narilabs_enabled: bool,
     delivery_mode: DeliveryMode,
     focus_probe: Option<SharedFocusProbe>,
     configured_providers: Vec<Provider>,
@@ -2925,10 +3171,17 @@ async fn supervise_recording(
                     )
                 })
                 .collect();
-            // A disabled Deepgram never ran, so even when processing panicked its
-            // history entry must read as the canonical NotStarted, not Aborted.
+            // A disabled provider never ran, so even when processing panicked
+            // its history entry must read as the canonical NotStarted, not
+            // Aborted.
             if !deepgram_enabled {
                 normalize_disabled_deepgram(&mut provider_failures);
+            }
+            if !groq_enabled {
+                normalize_disabled_groq(&mut provider_failures);
+            }
+            if !narilabs_enabled {
+                normalize_disabled_narilabs(&mut provider_failures);
             }
             let record = diagnostic_record(
                 &panic_evidence,
@@ -2982,6 +3235,62 @@ async fn supervise_recording(
 fn log_best_effort(message: std::fmt::Arguments<'_>) {
     use std::io::Write;
     let _ = writeln!(std::io::stderr().lock(), "{message}");
+}
+
+/// Comparison logging for the multi-Provider evaluation build (enabled by
+/// `VOISU_DEBUG_PROVIDER_TRANSCRIPTS=1`, read once at daemon start): one local
+/// stderr line per provider source — label, ok with the FULL transcript text,
+/// or failure with its stage and diagnostic — plus the completion timing.
+/// Providers in `disabled` (intentionally off for this daemon) are skipped, so
+/// the log agrees with history's normalized not_started bookkeeping instead of
+/// showing them as failures. Local-only, like every diagnostic; unset env
+/// keeps the daemon silent.
+fn log_provider_comparison(
+    id: u64,
+    sources: &[SourceTranscript],
+    timings_ms: &[voisu_core::ProviderTiming],
+    failures: &[ProviderFailure],
+    disabled: &[Provider],
+) {
+    for source in sources {
+        let timing = timings_ms
+            .iter()
+            .find(|timing| timing.provider == source.provider)
+            .map(|timing| format!("completed at {}ms", timing.completed_ms))
+            .unwrap_or_else(|| "no completion timing".to_owned());
+        eprintln!(
+            "Recording {id}: provider comparison {} ok: {:?} ({})",
+            source.provider.cli_label(),
+            source.text,
+            timing
+        );
+    }
+    log_provider_failure_comparison(id, failures, disabled);
+}
+
+/// The failure half of the comparison log: one line per provider that did NOT
+/// contribute a Source Transcript, with the stage it failed at. Disabled
+/// providers are skipped — history normalizes their entries to the canonical
+/// not_started bookkeeping, and the log must not disagree.
+fn log_provider_failure_comparison(id: u64, failures: &[ProviderFailure], disabled: &[Provider]) {
+    for failure in failures.iter().filter(|f| !disabled.contains(&f.provider)) {
+        eprintln!(
+            "Recording {id}: provider comparison {} failure ({}): {}",
+            failure.provider.cli_label(),
+            provider_failure_stage_label(failure.stage),
+            failure.diagnostic
+        );
+    }
+}
+
+fn provider_failure_stage_label(stage: ProviderFailureStage) -> &'static str {
+    match stage {
+        ProviderFailureStage::NotStarted => "not_started",
+        ProviderFailureStage::Streaming => "streaming",
+        ProviderFailureStage::Completion => "completion",
+        ProviderFailureStage::ProviderDeadline => "provider_deadline",
+        ProviderFailureStage::Aborted => "aborted",
+    }
 }
 
 fn rebuild_recording_adapters(
@@ -3126,11 +3435,38 @@ fn paste_action_selection() -> (PasteActionState, Option<VerifiedPasteAction>) {
 /// emitted while unaware the Provider was intentionally skipped. Sorted by
 /// Provider to match the coordinator's ordering convention.
 fn normalize_disabled_deepgram(provider_failures: &mut Vec<ProviderFailure>) {
-    provider_failures.retain(|failure| failure.provider != Provider::Deepgram);
-    provider_failures.push(ProviderFailure::new(
+    normalize_disabled_provider(
+        provider_failures,
         Provider::Deepgram,
-        ProviderFailureStage::NotStarted,
         DEEPGRAM_DISABLED_DIAGNOSTIC,
+    );
+}
+
+fn normalize_disabled_groq(provider_failures: &mut Vec<ProviderFailure>) {
+    normalize_disabled_provider(provider_failures, Provider::Groq, GROQ_DISABLED_DIAGNOSTIC);
+}
+
+fn normalize_disabled_narilabs(provider_failures: &mut Vec<ProviderFailure>) {
+    normalize_disabled_provider(
+        provider_failures,
+        Provider::Narilabs,
+        NARILABS_DISABLED_DIAGNOSTIC,
+    );
+}
+
+/// Collapses whatever failure the pipeline recorded for one disabled Provider
+/// into the single canonical NotStarted entry, then re-sorts by Provider to
+/// match the coordinator's ordering convention.
+fn normalize_disabled_provider(
+    provider_failures: &mut Vec<ProviderFailure>,
+    provider: Provider,
+    diagnostic: &str,
+) {
+    provider_failures.retain(|failure| failure.provider != provider);
+    provider_failures.push(ProviderFailure::new(
+        provider,
+        ProviderFailureStage::NotStarted,
+        diagnostic,
     ));
     provider_failures.sort_by_key(|failure| failure.provider);
 }
@@ -3140,7 +3476,7 @@ fn account_for_missing_providers(
     provider_failures: &mut Vec<ProviderFailure>,
     diagnostic: &str,
 ) {
-    for provider in [Provider::Deepgram, Provider::Groq] {
+    for provider in [Provider::Deepgram, Provider::Groq, Provider::Narilabs] {
         let has_source = source_records
             .iter()
             .any(|source| source.provider == provider);
@@ -3214,6 +3550,7 @@ fn diagnostic_record(
 struct ReplayResult {
     deepgram: Box<dyn TranscriptProvider>,
     groq: Box<dyn TranscriptProvider>,
+    narilabs: Box<dyn TranscriptProvider>,
     validator: Box<dyn TranscriptValidator>,
     response: Response,
 }
@@ -3223,11 +3560,14 @@ struct ReplayResult {
 /// it, so the supervisor rebuilds fresh ones (the adapters are stateless
 /// constructors) and completes with an error — the daemon must never wedge in
 /// Replaying.
+#[allow(clippy::too_many_arguments)]
 async fn supervise_replay(
     replay: JoinHandle<ReplayResult>,
     id: u64,
     controlled: bool,
     deepgram_enabled: bool,
+    groq_enabled: bool,
+    narilabs_key_available: bool,
     keyterms: Arc<Vec<String>>,
     whisper_prompt: Arc<String>,
     language: Arc<String>,
@@ -3240,6 +3580,7 @@ async fn supervise_replay(
             id,
             deepgram: result.deepgram,
             groq: result.groq,
+            narilabs: result.narilabs,
             validator: result.validator,
             reply,
             response: result.response,
@@ -3248,9 +3589,11 @@ async fn supervise_replay(
             log_best_effort(format_args!(
                 "Replay {id}: replay task failed: {join_error}"
             ));
-            let (deepgram, groq, validator) = rebuild_replay_adapters(
+            let (deepgram, groq, narilabs, validator) = rebuild_replay_adapters(
                 controlled,
                 deepgram_enabled,
+                groq_enabled,
+                narilabs_key_available,
                 &keyterms,
                 whisper_prompt.as_ref(),
                 &language,
@@ -3260,6 +3603,7 @@ async fn supervise_replay(
                 id,
                 deepgram,
                 groq,
+                narilabs,
                 validator,
                 reply,
                 response: Response::rejected(Some(DaemonState::Idle), "fixture replay failed"),
@@ -3276,58 +3620,74 @@ async fn supervise_replay(
         .await;
 }
 
+/// The Provider/validator adapters a replay (or its panic-repair tail) hands
+/// back to the actor: one slot per Provider plus the validator.
+type ReplayAdapters = (
+    Box<dyn TranscriptProvider>,
+    Box<dyn TranscriptProvider>,
+    Box<dyn TranscriptProvider>,
+    Box<dyn TranscriptValidator>,
+);
+
 /// Rebuilds the provider and validation adapters after a replay panic dropped
 /// the originals. Mirrors the actor's startup construction. `language` is the
 /// replay's already-resolved language snapshot, so the tail needs no
 /// environment read and can emit no stray stderr.
+#[allow(clippy::too_many_arguments)]
 fn rebuild_replay_adapters(
     controlled: bool,
     deepgram_enabled: bool,
+    groq_enabled: bool,
+    narilabs_key_available: bool,
     keyterms: &[String],
     whisper_prompt: &str,
     language: &str,
     reaper: &ProviderReaper,
-) -> (
-    Box<dyn TranscriptProvider>,
-    Box<dyn TranscriptProvider>,
-    Box<dyn TranscriptValidator>,
-) {
-    // Use the daemon-start toggle and captured provider snapshots, never a
+) -> ReplayAdapters {
+    // Use the daemon-start toggles and captured provider snapshots, never a
     // fresh config or dictionary read: this runs inside the supervised replay
     // tail, which must stay panic-free and free of filesystem I/O and stray
     // stderr. A live `voisu deepgram` toggle still takes effect only after the
-    // documented daemon restart.
+    // documented daemon restart. The Narilabs key decision is precomputed at
+    // daemon start for the same reason (see the startup block). The third
+    // slot exists so every replay tail hands the actor the same three-Provider
+    // shape it borrowed, Narilabs included.
     if !deepgram_enabled && keyterms.is_empty() && whisper_prompt.is_empty() && language.is_empty()
     {
-        let (deepgram, groq) = local_routing::cloud_free_slots();
-        return (deepgram, groq, Box::new(MergeResultValidator::new()));
+        let (deepgram, groq, narilabs) = local_routing::cloud_free_slots();
+        return (
+            deepgram,
+            groq,
+            narilabs,
+            Box::new(MergeResultValidator::new()),
+        );
     }
     let deepgram =
         build_deepgram_provider(deepgram_enabled, controlled, keyterms, language, reaper);
-    if controlled {
-        (
-            deepgram,
-            Box::new(ControlledProvider::from_env(Provider::Groq)),
-            Box::new(ControlledValidator::from_env(
-                voisu_app::config::intent_reconstruction_enabled(),
-            )),
-        )
+    let groq = build_groq_provider(
+        groq_enabled,
+        controlled,
+        whisper_prompt.to_owned(),
+        language.to_owned(),
+        reaper,
+    );
+    let narilabs = build_narilabs_provider(
+        narilabs_key_available,
+        controlled,
+        whisper_prompt.to_owned(),
+        language,
+        reaper,
+    );
+    let validator: Box<dyn TranscriptValidator> = if controlled {
+        Box::new(ControlledValidator::from_env(
+            voisu_app::config::intent_reconstruction_enabled(),
+        ))
+    } else if voisu_app::config::intent_reconstruction_enabled() {
+        Box::new(MergeResultValidator::intent_reconstruction(reaper.clone()))
     } else {
-        (
-            deepgram,
-            build_groq_provider(
-                false,
-                whisper_prompt.to_owned(),
-                language.to_owned(),
-                reaper,
-            ),
-            if voisu_app::config::intent_reconstruction_enabled() {
-                Box::new(MergeResultValidator::intent_reconstruction(reaper.clone()))
-            } else {
-                Box::new(MergeResultValidator::new())
-            },
-        )
-    }
+        Box::new(MergeResultValidator::new())
+    };
+    (deepgram, groq, narilabs, validator)
 }
 
 /// Replays a fixed captured fixture named `fixture_name` — which must live
@@ -3341,9 +3701,13 @@ async fn replay_recording(
     fixture_dir: PathBuf,
     mut deepgram: Box<dyn TranscriptProvider>,
     mut groq: Box<dyn TranscriptProvider>,
+    mut narilabs: Box<dyn TranscriptProvider>,
     mut validator: Box<dyn TranscriptValidator>,
     provider_deadline: Duration,
     deepgram_enabled: bool,
+    groq_enabled: bool,
+    narilabs_enabled: bool,
+    debug_provider_transcripts: bool,
 ) -> ReplayResult {
     let response = match run_replay(
         &fixture_name,
@@ -3351,9 +3715,13 @@ async fn replay_recording(
         id,
         &mut deepgram,
         &mut groq,
+        &mut narilabs,
         validator.as_mut(),
         provider_deadline,
         deepgram_enabled,
+        groq_enabled,
+        narilabs_enabled,
+        debug_provider_transcripts,
     )
     .await
     {
@@ -3418,6 +3786,7 @@ async fn replay_recording(
     ReplayResult {
         deepgram,
         groq,
+        narilabs,
         validator,
         response,
     }
@@ -3510,43 +3879,96 @@ async fn run_replay(
     id: u64,
     deepgram: &mut Box<dyn TranscriptProvider>,
     groq: &mut Box<dyn TranscriptProvider>,
+    narilabs: &mut Box<dyn TranscriptProvider>,
     validator: &mut dyn TranscriptValidator,
     provider_deadline: Duration,
     deepgram_enabled: bool,
+    groq_enabled: bool,
+    narilabs_enabled: bool,
+    debug_provider_transcripts: bool,
 ) -> Result<ReplayOutcome, BoundaryError> {
     let bytes = read_fixture(fixture_dir, fixture_name)?;
-    let deepgram_stream = deepgram.start(id)?;
+    let mut started_streams: Vec<Box<dyn ProviderStream>> = Vec::new();
+    let deepgram_stream = match deepgram.start(id) {
+        Ok(stream) => stream,
+        Err(error) => return Err(error),
+    };
+    started_streams.push(deepgram_stream);
     let groq_stream = match groq.start(id) {
         Ok(stream) => stream,
         Err(error) => {
-            // A partial start must not detach the already-started stream: abort
-            // it and await the abort under the bounded recovery deadline before
-            // the failure becomes observable — the same ownership discipline as
-            // the dictation start path.
-            match timeout(RECOVERY_ABORT_DEADLINE, deepgram_stream.abort()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(abort_error)) => eprintln!(
-                    "Replay {id}: provider abort failed: {}",
-                    abort_error.diagnostic()
-                ),
-                Err(_) => eprintln!("Replay {id}: provider abort timed out"),
-            }
+            // A partial start must not detach the already-started streams: abort
+            // them and await the aborts under the bounded recovery deadline
+            // before the failure becomes observable — the same ownership
+            // discipline as the dictation start path.
+            abort_started_streams(id, started_streams).await;
             return Err(error);
         }
     };
+    started_streams.push(groq_stream);
+    let narilabs_stream = match narilabs.start(id) {
+        Ok(stream) => stream,
+        Err(error) => {
+            abort_started_streams(id, started_streams).await;
+            return Err(error);
+        }
+    };
+    started_streams.push(narilabs_stream);
+    // Order matters: the streams were started deepgram, groq, narilabs.
+    let mut streams = started_streams.into_iter();
     let coordinator = ProviderCoordinator::start(
         provider_deadline,
         RECOVERY_ABORT_DEADLINE,
         ProviderStreams {
-            deepgram: deepgram_stream,
-            groq: groq_stream,
+            deepgram: streams.next().expect("Deepgram stream was started"),
+            groq: streams.next().expect("Groq stream was started"),
+            narilabs: streams.next().expect("Narilabs stream was started"),
         },
     );
     let mut outcome = replay_capture(CapturedAudio::new(bytes), coordinator, validator).await?;
+    if debug_provider_transcripts {
+        let disabled_providers: Vec<Provider> = [
+            (deepgram_enabled, Provider::Deepgram),
+            (groq_enabled, Provider::Groq),
+            (narilabs_enabled, Provider::Narilabs),
+        ]
+        .into_iter()
+        .filter(|(enabled, _)| !enabled)
+        .map(|(_, provider)| provider)
+        .collect();
+        log_provider_comparison(
+            id,
+            &outcome.source_transcripts,
+            &outcome.timings_ms,
+            &outcome.provider_failures,
+            &disabled_providers,
+        );
+    }
     if !deepgram_enabled {
         normalize_disabled_deepgram(&mut outcome.provider_failures);
     }
+    if !groq_enabled {
+        normalize_disabled_groq(&mut outcome.provider_failures);
+    }
+    if !narilabs_enabled {
+        normalize_disabled_narilabs(&mut outcome.provider_failures);
+    }
     Ok(outcome)
+}
+
+/// Aborts the streams a partial replay start already opened, each under the
+/// bounded recovery deadline, mirroring `recover_failed_start`'s discipline.
+async fn abort_started_streams(id: u64, streams: Vec<Box<dyn ProviderStream>>) {
+    for stream in streams {
+        match timeout(RECOVERY_ABORT_DEADLINE, stream.abort()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(abort_error)) => eprintln!(
+                "Replay {id}: provider abort failed: {}",
+                abort_error.diagnostic()
+            ),
+            Err(_) => eprintln!("Replay {id}: provider abort timed out"),
+        }
+    }
 }
 
 /// Upper bound the listener waits for the actor's reply to one Toggle before
@@ -4223,12 +4645,22 @@ impl ProviderStream for DisabledStream {
     }
 
     fn complete(&mut self, _audio: CapturedAudio) -> BoundaryFuture<'_, SourceTranscript> {
-        Box::pin(async {
+        Box::pin(async move {
             Err(BoundaryError::new(
                 BoundaryKind::Provider,
-                DEEPGRAM_DISABLED_DIAGNOSTIC,
+                disabled_diagnostic(self.provider),
             ))
         })
+    }
+}
+
+/// The canonical diagnostic a disabled Provider's stream completes with, so
+/// the recorded failure names the PROVIDER that was skipped, not a default.
+fn disabled_diagnostic(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Deepgram => DEEPGRAM_DISABLED_DIAGNOSTIC,
+        Provider::Groq => GROQ_DISABLED_DIAGNOSTIC,
+        Provider::Narilabs => NARILABS_DISABLED_DIAGNOSTIC,
     }
 }
 
@@ -4253,6 +4685,7 @@ impl ControlledProvider {
         let provider_delay_name = match provider {
             Provider::Deepgram => "VOISU_TEST_DEEPGRAM_DELAY_MS",
             Provider::Groq => "VOISU_TEST_GROQ_DELAY_MS",
+            Provider::Narilabs => "VOISU_TEST_NARILABS_DELAY_MS",
         };
         let delay = if std::env::var_os(provider_delay_name).is_some() {
             env_millis(provider_delay_name)
@@ -4280,6 +4713,7 @@ impl ControlledProvider {
         let transcript_name = match provider {
             Provider::Deepgram => "VOISU_TEST_DEEPGRAM_TRANSCRIPT",
             Provider::Groq => "VOISU_TEST_GROQ_TRANSCRIPT",
+            Provider::Narilabs => "VOISU_TEST_NARILABS_TRANSCRIPT",
         };
         let text = std::env::var(transcript_name)
             .unwrap_or_else(|_| "controlled Source Transcript".to_owned());
@@ -4630,6 +5064,8 @@ mod tests {
 
         supervise_recording(
             processing,
+            true,
+            true,
             true,
             true,
             DeliveryMode::Type,

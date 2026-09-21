@@ -269,7 +269,11 @@ impl PasteBoundary for PortalPasteAction {
         let expected = self.action.clone();
         let requested = action.clone();
         Box::pin(async move {
-            if expected != requested {
+            // Semantic comparison keeps id-rotation recovery durable: the
+            // outer delivery retains the startup-cached action, so after one
+            // adoption the next invoke still arrives with the stale identity.
+            // Any real swap still fails closed here.
+            if expected != requested && !expected.semantic_eq(&requested) {
                 return Err(BoundaryError::new(
                     BoundaryKind::Delivery,
                     "verified Paste Action changed during Delivery",
@@ -286,10 +290,23 @@ impl PasteBoundary for PortalPasteAction {
                     .ok()
                     .flatten();
                 if live_action.as_ref() != Some(&requested) {
-                    return Err(BoundaryError::new(
-                        BoundaryKind::Delivery,
-                        "verified Paste Action is no longer active",
-                    ));
+                    // Hyprland renumbers `__lua` registry ids across
+                    // compositor reloads without changing the binding. Adopt
+                    // the fresh identity and proceed; any semantic change
+                    // still fails closed below.
+                    let Some(live) = live_action else {
+                        return Err(BoundaryError::new(
+                            BoundaryKind::Delivery,
+                            "verified Paste Action is no longer active",
+                        ));
+                    };
+                    if !live.semantic_eq(&requested) {
+                        return Err(BoundaryError::new(
+                            BoundaryKind::Delivery,
+                            "verified Paste Action is no longer active",
+                        ));
+                    }
+                    self.action = live;
                 }
             }
             if self.session.is_none() {
@@ -548,7 +565,11 @@ impl PasteBoundary for HyprlandPasteAction {
         let expected = self.action.clone();
         let requested = action.clone();
         Box::pin(async move {
-            if expected != requested {
+            // Semantic comparison keeps id-rotation recovery durable: the
+            // outer delivery retains the startup-cached action, so after one
+            // adoption the next invoke still arrives with the stale identity.
+            // Any real swap still fails closed here.
+            if expected != requested && !expected.semantic_eq(&requested) {
                 return Err(BoundaryError::new(
                     BoundaryKind::Delivery,
                     "verified Paste Action changed during Delivery",
@@ -560,10 +581,23 @@ impl PasteBoundary for HyprlandPasteAction {
                     .ok()
                     .flatten();
                 if live_action.as_ref() != Some(&requested) {
-                    return Err(BoundaryError::new(
-                        BoundaryKind::Delivery,
-                        "verified Paste Action is no longer active",
-                    ));
+                    // Hyprland renumbers `__lua` registry ids across
+                    // compositor reloads without changing the binding. Adopt
+                    // the fresh identity and proceed; any semantic change
+                    // still fails closed below.
+                    let Some(live) = live_action else {
+                        return Err(BoundaryError::new(
+                            BoundaryKind::Delivery,
+                            "verified Paste Action is no longer active",
+                        ));
+                    };
+                    if !live.semantic_eq(&requested) {
+                        return Err(BoundaryError::new(
+                            BoundaryKind::Delivery,
+                            "verified Paste Action is no longer active",
+                        ));
+                    }
+                    self.action = live;
                 }
             }
             let chord = match &requested.behavior {

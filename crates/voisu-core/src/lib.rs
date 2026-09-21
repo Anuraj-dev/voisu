@@ -847,6 +847,7 @@ impl CapturedAudio {
 pub enum Provider {
     Deepgram,
     Groq,
+    Narilabs,
 }
 
 impl Provider {
@@ -854,6 +855,7 @@ impl Provider {
         match self {
             Self::Deepgram => "Deepgram",
             Self::Groq => "Groq",
+            Self::Narilabs => "Narilabs",
         }
     }
 
@@ -861,6 +863,7 @@ impl Provider {
         match self {
             Self::Deepgram => "VOISU_DEEPGRAM_API_KEY",
             Self::Groq => "VOISU_GROQ_API_KEY",
+            Self::Narilabs => "VOISU_NARILABS_API_KEY",
         }
     }
 
@@ -868,6 +871,7 @@ impl Provider {
         match self {
             Self::Deepgram => "deepgram",
             Self::Groq => "groq",
+            Self::Narilabs => "narilabs",
         }
     }
 }
@@ -1096,6 +1100,11 @@ pub enum ProviderKeyStatus {
     /// The provider could not be reached or returned another status (network
     /// failure, 5xx, timeout). Transient and not the key's fault.
     Unreachable,
+    /// The provider exposes no authenticated HTTP probe, so no live key verdict
+    /// exists (Narilabs' public beta is streaming-only). Never a pass and never
+    /// a wrong-key verdict: the credential is exercised on the first live
+    /// Recording instead.
+    VerificationUnsupported,
 }
 
 impl ProviderKeyStatus {
@@ -1132,6 +1141,7 @@ impl ProviderKeyStatus {
             Self::Valid => ReadinessStatus::Pass,
             Self::InvalidKey => ReadinessStatus::Fail,
             Self::RateLimited | Self::QuotaExhausted | Self::Unreachable => ReadinessStatus::Warn,
+            Self::VerificationUnsupported => ReadinessStatus::Skip,
         }
     }
 
@@ -1144,6 +1154,7 @@ impl ProviderKeyStatus {
             Self::RateLimited => "rate-limited (transient — try again shortly)",
             Self::QuotaExhausted => "free-tier quota exhausted",
             Self::Unreachable => "provider unreachable (transient)",
+            Self::VerificationUnsupported => "verification not supported for this provider",
         }
     }
 }
@@ -1158,6 +1169,9 @@ pub fn provider_free_tier_hint(provider: Provider) -> &'static str {
         }
         Provider::Groq => {
             "Groq's free tier covers ~2000 requests and 28,800 audio-seconds per day — ample for daily dictation; create a key at https://console.groq.com/keys"
+        }
+        Provider::Narilabs => {
+            "Narilabs' qwen3-asr public beta is free while it lasts; create a key at https://docs.narilabs.com"
         }
     }
 }
@@ -1309,6 +1323,7 @@ pub enum TranscriptSelection {
     IntentReconstructed,
     SourceDeepgram,
     SourceGroq,
+    SourceNarilabs,
 }
 
 #[derive(Clone, Debug)]
@@ -1822,6 +1837,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                     selection: match selected.provider {
                         Provider::Deepgram => TranscriptSelection::SourceDeepgram,
                         Provider::Groq => TranscriptSelection::NearIdenticalGroq,
+                        Provider::Narilabs => TranscriptSelection::SourceNarilabs,
                     },
                     validation_reason: format!(
                         "near-identical Source Transcripts passed validation; {evidence}"
@@ -1860,10 +1876,11 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 if non_contraction_quality_failure_reason(&winner.text, &sources).is_none() {
                     return Ok(TranscriptDecision {
                         transcript: Transcript(winner.text.trim().to_owned()),
-                        selection: match winner.provider {
-                            Provider::Deepgram => TranscriptSelection::SourceDeepgram,
-                            Provider::Groq => TranscriptSelection::SourceGroq,
-                        },
+                            selection: match winner.provider {
+                                Provider::Deepgram => TranscriptSelection::SourceDeepgram,
+                                Provider::Groq => TranscriptSelection::SourceGroq,
+                                Provider::Narilabs => TranscriptSelection::SourceNarilabs,
+                            },
                         validation_reason:
                             "catastrophically divergent Source Transcripts; selected the better source without merging"
                                 .to_owned(),
@@ -1976,6 +1993,7 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
             selection: match source.provider {
                 Provider::Deepgram => TranscriptSelection::SourceDeepgram,
                 Provider::Groq => TranscriptSelection::SourceGroq,
+                Provider::Narilabs => TranscriptSelection::SourceNarilabs,
             },
             validation_reason: "Source Transcript passed validation".to_owned(),
             fallback_reason: None,
@@ -2154,6 +2172,7 @@ fn contraction_source_fallback(
         selection: match source.provider {
             Provider::Deepgram => TranscriptSelection::SourceDeepgram,
             Provider::Groq => TranscriptSelection::SourceGroq,
+            Provider::Narilabs => TranscriptSelection::SourceNarilabs,
         },
         validation_reason: "fuller safe Source Transcript delivered after a rejected contraction"
             .to_owned(),
@@ -2227,6 +2246,7 @@ fn safe_source_fallback(
         selection: match source.provider {
             Provider::Deepgram => TranscriptSelection::SourceDeepgram,
             Provider::Groq => TranscriptSelection::SourceGroq,
+            Provider::Narilabs => TranscriptSelection::SourceNarilabs,
         },
         validation_reason: "safe Source Transcript selected by existing evidence tiers".to_owned(),
         fallback_reason: Some(reason),
@@ -2298,6 +2318,7 @@ fn source_fallback_decision(
         selection: match source.provider {
             Provider::Deepgram => TranscriptSelection::SourceDeepgram,
             Provider::Groq => TranscriptSelection::SourceGroq,
+            Provider::Narilabs => TranscriptSelection::SourceNarilabs,
         },
         validation_reason,
         fallback_reason: Some(reason),
@@ -3965,6 +3986,7 @@ pub struct ProviderWordConfidences {
 pub struct ProviderStreams {
     pub deepgram: Box<dyn ProviderStream>,
     pub groq: Box<dyn ProviderStream>,
+    pub narilabs: Box<dyn ProviderStream>,
 }
 
 pub struct ProviderCoordinator {
@@ -4000,15 +4022,20 @@ impl ProviderCoordinator {
 
     pub async fn stream_audio(&mut self, chunk: AudioChunk) -> Result<(), BoundaryError> {
         let deepgram = self.streams.deepgram.send_audio(chunk.clone());
-        let groq = self.streams.groq.send_audio(chunk);
-        let (deepgram, groq) = tokio::join!(deepgram, groq);
+        let groq = self.streams.groq.send_audio(chunk.clone());
+        let narilabs = self.streams.narilabs.send_audio(chunk);
+        let (deepgram, groq, narilabs) = tokio::join!(deepgram, groq, narilabs);
         // A live streaming failure aborts the Recording. Attribute it to the
         // failing provider(s) as a Streaming-stage ProviderFailure so the
         // abort path can carry it into history instead of losing which provider
         // broke and where.
         let mut failures = Vec::new();
         let mut first_error: Option<BoundaryError> = None;
-        for (provider, result) in [(Provider::Deepgram, deepgram), (Provider::Groq, groq)] {
+        for (provider, result) in [
+            (Provider::Deepgram, deepgram),
+            (Provider::Groq, groq),
+            (Provider::Narilabs, narilabs),
+        ] {
             if let Err(error) = result {
                 failures.push(ProviderFailure::new(
                     provider,
@@ -4029,10 +4056,12 @@ impl ProviderCoordinator {
     pub async fn abort(self) -> Result<(), BoundaryError> {
         let deepgram = self.streams.deepgram.abort();
         let groq = self.streams.groq.abort();
+        let narilabs = self.streams.narilabs.abort();
         tokio::time::timeout(self.deadline, async move {
-            let (deepgram, groq) = tokio::join!(deepgram, groq);
+            let (deepgram, groq, narilabs) = tokio::join!(deepgram, groq, narilabs);
             deepgram?;
-            groq
+            groq?;
+            narilabs
         })
         .await
         .map_err(|_| {
@@ -4055,9 +4084,11 @@ impl ProviderCoordinator {
         let ProviderStreams {
             mut deepgram,
             mut groq,
+            mut narilabs,
         } = self.streams;
         let mut deepgram_done = false;
         let mut groq_done = false;
+        let mut narilabs_done = false;
         let mut deadline_elapsed = false;
         let mut transcripts = Vec::new();
         let mut timings_ms = Vec::new();
@@ -4069,12 +4100,13 @@ impl ProviderCoordinator {
 
         {
             let deepgram_completion = deepgram.complete(audio.clone());
-            let groq_completion = groq.complete(audio);
-            tokio::pin!(deepgram_completion, groq_completion);
+            let groq_completion = groq.complete(audio.clone());
+            let narilabs_completion = narilabs.complete(audio);
+            tokio::pin!(deepgram_completion, groq_completion, narilabs_completion);
             let deadline = tokio::time::sleep(self.deadline);
             tokio::pin!(deadline);
 
-            while !deepgram_done || !groq_done {
+            while !deepgram_done || !groq_done || !narilabs_done {
                 tokio::select! {
                     // Bias toward provider results: if a valid Source Transcript is
                     // ready in the same poll as the Provider Deadline, honor the
@@ -4114,6 +4146,23 @@ impl ProviderCoordinator {
                             )),
                         }
                     }
+                    result = &mut narilabs_completion, if !narilabs_done => {
+                        narilabs_done = true;
+                        match result {
+                            Ok(source) => {
+                                timings_ms.push(ProviderTiming {
+                                    provider: source.provider,
+                                    completed_ms: duration_millis(started.elapsed()),
+                                });
+                                transcripts.push(source);
+                            }
+                            Err(error) => provider_failures.push(ProviderFailure::new(
+                                Provider::Narilabs,
+                                ProviderFailureStage::Completion,
+                                error.diagnostic().to_owned(),
+                            )),
+                        }
+                    }
                     _ = &mut deadline => {
                         deadline_elapsed = true;
                         break;
@@ -4130,6 +4179,7 @@ impl ProviderCoordinator {
         // and reports none.
         let deepgram_word_confidences = deepgram.word_confidences();
         let groq_word_confidences = groq.word_confidences();
+        let narilabs_word_confidences = narilabs.word_confidences();
 
         if deadline_elapsed {
             // A provider that never produced a Source Transcript before the
@@ -4149,6 +4199,13 @@ impl ProviderCoordinator {
                     "Provider Deadline elapsed before completion",
                 ));
             }
+            if !narilabs_done {
+                provider_failures.push(ProviderFailure::new(
+                    Provider::Narilabs,
+                    ProviderFailureStage::ProviderDeadline,
+                    "Provider Deadline elapsed before completion",
+                ));
+            }
             let abort_pending = async move {
                 let deepgram_abort = async move {
                     if deepgram_done {
@@ -4164,9 +4221,18 @@ impl ProviderCoordinator {
                         groq.abort().await
                     }
                 };
-                let (deepgram_result, groq_result) = tokio::join!(deepgram_abort, groq_abort);
+                let narilabs_abort = async move {
+                    if narilabs_done {
+                        Ok(())
+                    } else {
+                        narilabs.abort().await
+                    }
+                };
+                let (deepgram_result, groq_result, narilabs_result) =
+                    tokio::join!(deepgram_abort, groq_abort, narilabs_abort);
                 deepgram_result?;
-                groq_result
+                groq_result?;
+                narilabs_result
             };
             cleanup_error = match tokio::time::timeout(self.abort_deadline, abort_pending).await {
                 Ok(inner) => inner.err(),
@@ -4223,7 +4289,8 @@ impl ProviderCoordinator {
                 provider_failures,
                 word_confidences: {
                     // One provider-tagged evidence entry per provider that
-                    // retained words, in Provider order (Deepgram, Groq).
+                    // retained words, in Provider order (Deepgram, Groq,
+                    // Narilabs).
                     let mut word_confidences = Vec::new();
                     if !deepgram_word_confidences.is_empty() {
                         word_confidences.push(ProviderWordConfidences {
@@ -4235,6 +4302,12 @@ impl ProviderCoordinator {
                         word_confidences.push(ProviderWordConfidences {
                             provider: Provider::Groq,
                             words: groq_word_confidences,
+                        });
+                    }
+                    if !narilabs_word_confidences.is_empty() {
+                        word_confidences.push(ProviderWordConfidences {
+                            provider: Provider::Narilabs,
+                            words: narilabs_word_confidences,
                         });
                     }
                     word_confidences

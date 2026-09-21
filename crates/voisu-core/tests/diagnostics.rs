@@ -897,6 +897,10 @@ async fn replay_runs_a_fixed_fixture_through_provider_and_validation_boundaries(
             provider: Provider::Groq,
             text: "replayed dictation".to_owned(),
         }),
+        narilabs: Box::new(FixtureStream {
+            provider: Provider::Narilabs,
+            text: "replayed dictation".to_owned(),
+        }),
     };
     let coordinator =
         ProviderCoordinator::start(Duration::from_secs(5), Duration::from_secs(1), streams);
@@ -910,8 +914,8 @@ async fn replay_runs_a_fixed_fixture_through_provider_and_validation_boundaries(
     .expect("replay succeeds");
     assert_eq!(
         outcome.source_transcripts.len(),
-        2,
-        "both providers replayed the fixture"
+        3,
+        "every provider replayed the fixture"
     );
     assert_eq!(outcome.decision.transcript.0, "replayed dictation");
 }
@@ -925,6 +929,10 @@ async fn replay_reconstruction_clock_excludes_preparation() {
         }),
         groq: Box::new(FixtureStream {
             provider: Provider::Groq,
+            text: "replayed dictation".to_owned(),
+        }),
+        narilabs: Box::new(FixtureStream {
+            provider: Provider::Narilabs,
             text: "replayed dictation".to_owned(),
         }),
     };

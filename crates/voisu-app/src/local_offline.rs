@@ -31,9 +31,10 @@ mod tests {
         let owned = construct_for_cloud(AsrMode::Local, true, true, true, Some(&mut sentinel));
         assert!(owned.grammar.is_none());
         assert!(owned.dpr.is_none());
-        let (deepgram, groq) = cloud_free_slots();
+        let (deepgram, groq, narilabs) = cloud_free_slots();
         drop(deepgram);
         drop(groq);
+        drop(narilabs);
         let _ = admit_local(true);
         assert!(local_session_is_offline(&sentinel));
         assert!(sentinel_is_clean());

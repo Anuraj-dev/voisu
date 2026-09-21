@@ -110,6 +110,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # on raw endpoint strings is bypassable, so the transport checks parse first.
 url = "2"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# Base64 PCM framing for the Narilabs realtime `input_audio_buffer.append`
+# JSON messages (already in the tree transitively via rustls/reqwest).
+base64 = "0.22"
 voisu-core = { path = "../voisu-core" }
 sha2 = "0.10"
 webpki-roots = "1"

@@ -1,6 +1,7 @@
 //! Minimal persisted daemon configuration.
 //!
-//! Today this holds the Deepgram Provider switch, Delivery mode, Writing Mode,
+//! Today this holds the Provider switches (Deepgram, Groq, Narilabs), Delivery
+//! mode, Writing Mode,
 //! Developer Prompt Rendering policy, and ASR mode. It is persisted as TOML at
 //! `$XDG_CONFIG_HOME/voisu/config.toml` (default `~/.config/voisu/config.toml`).
 //! `asr_mode` is re-read at Start/Replay admission under the shared config lock.
@@ -43,6 +44,12 @@ pub use voisu_core::{AsrMode, RenderingPolicy};
 
 /// The single configuration key: whether the Deepgram Provider is enabled.
 const DEEPGRAM_ENABLED_KEY: &str = "deepgram_enabled";
+
+/// The single configuration key: whether the Groq Provider is enabled.
+const GROQ_ENABLED_KEY: &str = "groq_enabled";
+
+/// The single configuration key: whether the Narilabs Provider is enabled.
+const NARILABS_ENABLED_KEY: &str = "narilabs_enabled";
 
 /// The root configuration key selecting how a final Transcript is delivered.
 const DELIVERY_MODE_KEY: &str = "delivery_mode";
@@ -177,6 +184,14 @@ const DISABLE_DEEPGRAM_ENV: &str = "VOISU_DISABLE_DEEPGRAM";
 /// `voisu deepgram off`.
 pub const DEFAULT_DEEPGRAM_ENABLED: bool = true;
 
+/// Groq is ON by default, matching Deepgram: the reconciled dual-Provider
+/// path is the fresh-install default until the user runs `voisu groq off`.
+pub const DEFAULT_GROQ_ENABLED: bool = true;
+
+/// Narilabs is OFF by default so the third Provider is strictly opt-in for
+/// the evaluation build until the user runs `voisu narilabs on`.
+pub const DEFAULT_NARILABS_ENABLED: bool = false;
+
 /// Writing Mode defaults to Smart so a fresh install gets Formatting (and
 /// optional Minimal Grammar when eligible). Unreadable or invalid config fails
 /// closed to Literal instead — see `resolve_writing_mode`.
@@ -205,7 +220,7 @@ pub const DEFAULT_QWEN_FORMAT_ENABLED: bool = false;
 pub fn deepgram_enabled() -> bool {
     resolve(
         std::env::var_os(DISABLE_DEEPGRAM_ENV).is_some(),
-        read_setting(&config_path()),
+        read_setting(&config_path(), DEEPGRAM_ENABLED_KEY),
     )
 }
 
@@ -218,7 +233,51 @@ pub fn set_deepgram_enabled(enabled: bool) -> Result<PathBuf, String> {
 /// Path-scoped Deepgram setter so concurrent lock tests do not touch process env.
 pub(crate) fn set_deepgram_enabled_at(path: &Path, enabled: bool) -> Result<PathBuf, String> {
     let _lock = ConfigLock::acquire(path)?;
-    write_setting(path, enabled)?;
+    write_provider_toggle(path, DEEPGRAM_ENABLED_KEY, enabled)?;
+    Ok(path.to_path_buf())
+}
+
+/// Whether the Groq Provider is enabled for Recordings.
+///
+/// The persisted `config.toml` decides, defaulting to
+/// [`DEFAULT_GROQ_ENABLED`] (ON) when the file is absent, unreadable, or does
+/// not carry the key.
+pub fn groq_enabled() -> bool {
+    read_setting(&config_path(), GROQ_ENABLED_KEY).unwrap_or(DEFAULT_GROQ_ENABLED)
+}
+
+/// Persists the Groq toggle, creating the `voisu` config directory if needed,
+/// and returns the path written so the CLI can report it.
+pub fn set_groq_enabled(enabled: bool) -> Result<PathBuf, String> {
+    set_groq_enabled_at(&config_path(), enabled)
+}
+
+/// Path-scoped Groq setter so concurrent lock tests do not touch process env.
+pub(crate) fn set_groq_enabled_at(path: &Path, enabled: bool) -> Result<PathBuf, String> {
+    let _lock = ConfigLock::acquire(path)?;
+    write_provider_toggle(path, GROQ_ENABLED_KEY, enabled)?;
+    Ok(path.to_path_buf())
+}
+
+/// Whether the Narilabs Provider is enabled for Recordings.
+///
+/// The persisted `config.toml` decides, defaulting to
+/// [`DEFAULT_NARILABS_ENABLED`] (OFF) when the file is absent, unreadable, or
+/// does not carry the key — the third Provider is opt-in.
+pub fn narilabs_enabled() -> bool {
+    read_setting(&config_path(), NARILABS_ENABLED_KEY).unwrap_or(DEFAULT_NARILABS_ENABLED)
+}
+
+/// Persists the Narilabs toggle, creating the `voisu` config directory if
+/// needed, and returns the path written so the CLI can report it.
+pub fn set_narilabs_enabled(enabled: bool) -> Result<PathBuf, String> {
+    set_narilabs_enabled_at(&config_path(), enabled)
+}
+
+/// Path-scoped Narilabs setter so concurrent lock tests do not touch process env.
+pub(crate) fn set_narilabs_enabled_at(path: &Path, enabled: bool) -> Result<PathBuf, String> {
+    let _lock = ConfigLock::acquire(path)?;
+    write_provider_toggle(path, NARILABS_ENABLED_KEY, enabled)?;
     Ok(path.to_path_buf())
 }
 
@@ -546,12 +605,13 @@ fn config_lock_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Reads the persisted Deepgram setting. A missing file yields `None` (the
-/// caller applies the default); a genuine read failure surfaces a local
-/// diagnostic and also yields `None` rather than masquerading as a set value.
-fn read_setting(path: &Path) -> Option<bool> {
+/// Reads one persisted root-scope boolean setting. A missing file yields
+/// `None` (the caller applies the default); a genuine read failure surfaces a
+/// local diagnostic and also yields `None` rather than masquerading as a set
+/// value.
+fn read_setting(path: &Path, key: &str) -> Option<bool> {
     match std::fs::read_to_string(path) {
-        Ok(contents) => parse_deepgram_enabled(&contents),
+        Ok(contents) => parse_root_bool(&contents, key),
         Err(error) if error.kind() == ErrorKind::NotFound => None,
         Err(error) => {
             eprintln!(
@@ -614,15 +674,16 @@ fn read_rendering_policy(path: &Path) -> RenderingPolicyLoad {
     }
 }
 
-/// Parses the root-scope `deepgram_enabled` boolean from a minimal TOML
-/// document. Comments (`#`), blank lines, surrounding whitespace, and unrelated
-/// keys are ignored. Only the root table is honored: once a `[table]` (or
-/// `[[array]]`) header is seen the key belongs to that table, never the root
-/// toggle, so `[other]\ndeepgram_enabled = false` is ignored and the root
-/// setting still decides (falling back to the default when absent). A
-/// missing key or an unrecognised value yields `None` so the caller falls back
-/// to the default instead of failing on a hand-edited file.
-fn parse_deepgram_enabled(contents: &str) -> Option<bool> {
+/// Parses a root-scope boolean setting (`deepgram_enabled`, `groq_enabled`,
+/// `narilabs_enabled`) from a minimal TOML document. Comments (`#`), blank
+/// lines, surrounding whitespace, and unrelated keys are ignored. Only the
+/// root table is honored: once a `[table]` (or `[[array]]`) header is seen the
+/// key belongs to that table, never the root toggle, so
+/// `[other]\ndeepgram_enabled = false` is ignored and the root setting still
+/// decides (falling back to the default when absent). A missing key or an
+/// unrecognised value yields `None` so the caller falls back to the default
+/// instead of failing on a hand-edited file.
+fn parse_root_bool(contents: &str, key: &str) -> Option<bool> {
     for line in contents.lines() {
         let line = strip_comment(line).trim();
         if line.is_empty() {
@@ -633,10 +694,10 @@ fn parse_deepgram_enabled(contents: &str) -> Option<bool> {
             // already returned above or absent from the root.
             return None;
         }
-        let Some((key, value)) = line.split_once('=') else {
+        let Some((line_key, value)) = line.split_once('=') else {
             continue;
         };
-        if key.trim() != DEEPGRAM_ENABLED_KEY {
+        if line_key.trim() != key {
             continue;
         }
         return match value.trim() {
@@ -649,7 +710,7 @@ fn parse_deepgram_enabled(contents: &str) -> Option<bool> {
 }
 
 /// Parses the root-scope `delivery_mode` string from the minimal TOML document.
-/// Its tolerance and table scoping deliberately mirror [`parse_deepgram_enabled`].
+/// Its tolerance and table scoping deliberately mirror the Deepgram toggle's parser.
 fn parse_delivery_mode(contents: &str) -> Option<DeliveryMode> {
     for line in contents.lines() {
         let line = strip_comment(line).trim();
@@ -760,13 +821,13 @@ fn strip_comment(line: &str) -> &str {
 const MANAGED_LINES: [&str; 3] = [
     "# Voisu daemon configuration.",
     "# ASR mode is re-read at Start/Replay; other keys may be snapshotted at daemon start.",
-    "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, `voisu rendering`, and `voisu mode` commands.",
+    "# Managed by the `voisu deepgram`, `voisu groq`, `voisu narilabs`, `voisu delivery`, `voisu writing`, `voisu rendering`, and `voisu mode` commands.",
 ];
 
 /// Managed header lines emitted by earlier releases. Stripped alongside
 /// [`MANAGED_LINES`] so upgrading an existing config never strands stale
 /// headers above the rewritten block.
-const LEGACY_MANAGED_LINES: [&str; 9] = [
+const LEGACY_MANAGED_LINES: [&str; 10] = [
     "# Whether the Deepgram Provider participates in a Recording.",
     "# Managed by `voisu deepgram on|off`; read once at daemon start.",
     // Pre-Writing-Mode managed body lines (delivery-only era).
@@ -779,34 +840,93 @@ const LEGACY_MANAGED_LINES: [&str; 9] = [
     "# Recording Provider, Delivery, Writing Mode, and Rendering Policy settings; read once at daemon start.",
     "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, and `voisu rendering` commands.",
     "# Recording Provider, Delivery, Writing Mode, Rendering Policy, and ASR mode settings; read once at daemon start.",
+    // Pre-Groq/Narilabs-toggle managed header line (dual-Provider era).
+    "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, `voisu rendering`, and `voisu mode` commands.",
 ];
 
-/// Persists the toggle, creating the parent `voisu` directory if needed and
-/// preserving any unrelated content already in the file. The write is atomic: a
-/// same-directory temp file is fully written then renamed into place, so an
-/// interrupted write never leaves a partially written config.
-fn write_setting(path: &Path, enabled: bool) -> Result<(), String> {
-    write_config(path, Some(enabled), None, None, None, None)
+/// The managed Provider on/off toggles. `None` leaves a toggle's persisted
+/// value untouched.
+#[derive(Default)]
+struct ProviderToggles {
+    deepgram: Option<bool>,
+    groq: Option<bool>,
+    narilabs: Option<bool>,
+}
+
+/// The Provider toggle keys, in render order.
+const PROVIDER_TOGGLE_KEYS: [&str; 3] =
+    [DEEPGRAM_ENABLED_KEY, GROQ_ENABLED_KEY, NARILABS_ENABLED_KEY];
+
+impl ProviderToggles {
+    fn setting(&self, key: &str) -> Option<bool> {
+        match key {
+            DEEPGRAM_ENABLED_KEY => self.deepgram,
+            GROQ_ENABLED_KEY => self.groq,
+            NARILABS_ENABLED_KEY => self.narilabs,
+            _ => None,
+        }
+    }
+}
+
+/// Persists one Provider toggle, creating the parent `voisu` directory if
+/// needed and preserving any unrelated content already in the file. The write
+/// is atomic: a same-directory temp file is fully written then renamed into
+/// place, so an interrupted write never leaves a partially written config.
+fn write_provider_toggle(path: &Path, key: &str, enabled: bool) -> Result<(), String> {
+    let toggles = ProviderToggles {
+        deepgram: (key == DEEPGRAM_ENABLED_KEY).then_some(enabled),
+        groq: (key == GROQ_ENABLED_KEY).then_some(enabled),
+        narilabs: (key == NARILABS_ENABLED_KEY).then_some(enabled),
+    };
+    write_config(path, toggles, None, None, None, None)
 }
 
 /// Persists the Delivery mode without discarding the other managed root keys.
 fn write_delivery_mode(path: &Path, mode: DeliveryMode) -> Result<(), String> {
-    write_config(path, None, Some(mode), None, None, None)
+    write_config(
+        path,
+        ProviderToggles::default(),
+        Some(mode),
+        None,
+        None,
+        None,
+    )
 }
 
 /// Persists the Writing Mode without discarding the other managed root keys.
 fn write_writing_mode(path: &Path, mode: WritingMode) -> Result<(), String> {
-    write_config(path, None, None, Some(mode), None, None)
+    write_config(
+        path,
+        ProviderToggles::default(),
+        None,
+        Some(mode),
+        None,
+        None,
+    )
 }
 
 /// Persists the Rendering Policy without discarding the other managed root keys.
 fn write_rendering_policy(path: &Path, policy: RenderingPolicy) -> Result<(), String> {
-    write_config(path, None, None, None, Some(policy), None)
+    write_config(
+        path,
+        ProviderToggles::default(),
+        None,
+        None,
+        Some(policy),
+        None,
+    )
 }
 
 /// Persists ASR mode. Caller must already hold [`ConfigLock`].
 pub(crate) fn write_asr_mode_unlocked(path: &Path, mode: AsrMode) -> Result<(), String> {
-    write_config(path, None, None, None, None, Some(mode))
+    write_config(
+        path,
+        ProviderToggles::default(),
+        None,
+        None,
+        None,
+        Some(mode),
+    )
 }
 
 /// Rewrites managed root settings while preserving every other line. Only the
@@ -814,7 +934,7 @@ pub(crate) fn write_asr_mode_unlocked(path: &Path, mode: AsrMode) -> Result<(), 
 /// in the preserved body, so the public setters never discard one another.
 fn write_config(
     path: &Path,
-    deepgram_enabled: Option<bool>,
+    toggles: ProviderToggles,
     delivery_mode: Option<DeliveryMode>,
     writing_mode: Option<WritingMode>,
     rendering_policy: Option<RenderingPolicy>,
@@ -847,7 +967,7 @@ fn write_config(
         parent,
         &merge_content(
             &existing,
-            deepgram_enabled,
+            toggles,
             delivery_mode,
             writing_mode,
             rendering_policy,
@@ -896,7 +1016,7 @@ fn write_atomic(path: &Path, parent: &Path, contents: &str) -> Result<(), String
 /// root keys and keys under a `[table]` are preserved untouched.
 fn merge_content(
     existing: &str,
-    deepgram_enabled: Option<bool>,
+    toggles: ProviderToggles,
     delivery_mode: Option<DeliveryMode>,
     writing_mode: Option<WritingMode>,
     rendering_policy: Option<RenderingPolicy>,
@@ -911,11 +1031,13 @@ fn merge_content(
         }
         let is_managed_comment =
             MANAGED_LINES.contains(&line.trim()) || LEGACY_MANAGED_LINES.contains(&line.trim());
-        let is_root_deepgram_enabled = deepgram_enabled.is_some()
-            && in_root
-            && trimmed
-                .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == DEEPGRAM_ENABLED_KEY);
+        let is_root_provider_toggle = in_root
+            && trimmed.split_once('=').is_some_and(|(key, value)| {
+                let key = key.trim();
+                PROVIDER_TOGGLE_KEYS.contains(&key)
+                    && toggles.setting(key).is_some()
+                    && matches!(value.trim(), "true" | "false")
+            });
         let is_root_delivery_mode = delivery_mode.is_some()
             && in_root
             && trimmed
@@ -937,7 +1059,7 @@ fn merge_content(
                 .split_once('=')
                 .is_some_and(|(key, _)| is_asr_mode_key(key.trim()));
         if is_managed_comment
-            || is_root_deepgram_enabled
+            || is_root_provider_toggle
             || is_root_delivery_mode
             || is_root_writing_mode
             || is_root_rendering_policy
@@ -948,7 +1070,7 @@ fn merge_content(
         preserved.push(line);
     }
     let mut out = render(
-        deepgram_enabled,
+        toggles,
         delivery_mode,
         writing_mode,
         rendering_policy,
@@ -966,7 +1088,7 @@ fn merge_content(
 
 /// Renders the managed block: the header comments and the supplied root keys.
 fn render(
-    deepgram_enabled: Option<bool>,
+    toggles: ProviderToggles,
     delivery_mode: Option<DeliveryMode>,
     writing_mode: Option<WritingMode>,
     rendering_policy: Option<RenderingPolicy>,
@@ -977,8 +1099,14 @@ fn render(
         out.push_str(line);
         out.push('\n');
     }
-    if let Some(enabled) = deepgram_enabled {
-        out.push_str(&format!("{DEEPGRAM_ENABLED_KEY} = {enabled}\n"));
+    for (key, enabled) in [
+        (DEEPGRAM_ENABLED_KEY, toggles.deepgram),
+        (GROQ_ENABLED_KEY, toggles.groq),
+        (NARILABS_ENABLED_KEY, toggles.narilabs),
+    ] {
+        if let Some(enabled) = enabled {
+            out.push_str(&format!("{key} = {enabled}\n"));
+        }
     }
     if let Some(mode) = delivery_mode {
         out.push_str(&format!("{DELIVERY_MODE_KEY} = \"{}\"\n", mode.as_str()));
@@ -1005,6 +1133,52 @@ mod tests {
     #[test]
     fn the_default_is_on_when_nothing_is_persisted() {
         assert!(resolve(false, None));
+    }
+
+    #[test]
+    fn groq_defaults_on_and_narilabs_defaults_off_when_nothing_is_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voisu").join("config.toml");
+        // Nothing persisted yet: the pure defaults decide.
+        assert!(parse_root_bool("", GROQ_ENABLED_KEY).is_none());
+        assert_eq!(
+            parse_root_bool("", GROQ_ENABLED_KEY).unwrap_or(DEFAULT_GROQ_ENABLED),
+            DEFAULT_GROQ_ENABLED
+        );
+        assert_eq!(
+            parse_root_bool("", NARILABS_ENABLED_KEY).unwrap_or(DEFAULT_NARILABS_ENABLED),
+            DEFAULT_NARILABS_ENABLED
+        );
+        // A config file carrying unrelated keys still resolves the defaults.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "delivery_mode = \"type\"\n").unwrap();
+        assert!(read_setting(&path, GROQ_ENABLED_KEY).unwrap_or(DEFAULT_GROQ_ENABLED));
+        assert!(!read_setting(&path, NARILABS_ENABLED_KEY).unwrap_or(DEFAULT_NARILABS_ENABLED));
+    }
+
+    #[test]
+    fn groq_and_narilabs_toggles_round_trip_and_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voisu").join("config.toml");
+        set_groq_enabled_at(&path, false).unwrap();
+        set_narilabs_enabled_at(&path, true).unwrap();
+        assert_eq!(read_setting(&path, GROQ_ENABLED_KEY), Some(false));
+        assert_eq!(read_setting(&path, NARILABS_ENABLED_KEY), Some(true));
+        // The setters never discard one another (or the Deepgram default's
+        // absence): every managed key survives the rewrite.
+        set_groq_enabled_at(&path, true).unwrap();
+        assert_eq!(read_setting(&path, GROQ_ENABLED_KEY), Some(true));
+        assert_eq!(read_setting(&path, NARILABS_ENABLED_KEY), Some(true));
+        set_narilabs_enabled_at(&path, false).unwrap();
+        assert_eq!(read_setting(&path, GROQ_ENABLED_KEY), Some(true));
+        assert_eq!(read_setting(&path, NARILABS_ENABLED_KEY), Some(false));
+    }
+
+    #[test]
+    fn a_table_scoped_toggle_key_is_ignored_like_the_deepgram_key() {
+        let contents = "[other]\nnarilabs_enabled = true\n";
+        assert_eq!(parse_root_bool(contents, NARILABS_ENABLED_KEY), None);
+        assert_eq!(parse_root_bool(contents, GROQ_ENABLED_KEY), None);
     }
 
     // ─── Slice B6: the transcription language surface ────────────────────────
@@ -1111,7 +1285,10 @@ mod tests {
     #[test]
     fn a_missing_config_file_reads_as_none() {
         assert_eq!(
-            read_setting(Path::new("/nonexistent/voisu/config.toml")),
+            read_setting(
+                Path::new("/nonexistent/voisu/config.toml"),
+                DEEPGRAM_ENABLED_KEY,
+            ),
             None
         );
     }
@@ -1120,11 +1297,11 @@ mod tests {
     fn writing_then_reading_round_trips_and_survives_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("voisu").join("config.toml");
-        write_setting(&path, true).unwrap();
+        write_provider_toggle(&path, DEEPGRAM_ENABLED_KEY, true).unwrap();
         // A second daemon start re-reads the same file (a "restart").
-        assert_eq!(read_setting(&path), Some(true));
-        write_setting(&path, false).unwrap();
-        assert_eq!(read_setting(&path), Some(false));
+        assert_eq!(read_setting(&path, DEEPGRAM_ENABLED_KEY), Some(true));
+        write_provider_toggle(&path, DEEPGRAM_ENABLED_KEY, false).unwrap();
+        assert_eq!(read_setting(&path, DEEPGRAM_ENABLED_KEY), Some(false));
     }
 
     #[test]
@@ -1132,10 +1309,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("voisu").join("config.toml");
 
-        write_setting(&path, false).unwrap();
+        write_provider_toggle(&path, DEEPGRAM_ENABLED_KEY, false).unwrap();
         write_delivery_mode(&path, DeliveryMode::Clipboard).unwrap();
 
-        assert_eq!(read_setting(&path), Some(false));
+        assert_eq!(read_setting(&path, DEEPGRAM_ENABLED_KEY), Some(false));
         assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Clipboard));
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
@@ -1151,13 +1328,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("voisu").join("config.toml");
 
-        write_setting(&path, false).unwrap();
+        write_provider_toggle(&path, DEEPGRAM_ENABLED_KEY, false).unwrap();
         write_delivery_mode(&path, DeliveryMode::Clipboard).unwrap();
         write_writing_mode(&path, WritingMode::Literal).unwrap();
 
         // Rewrite each key once more; the other two must survive every write.
-        write_setting(&path, true).unwrap();
-        assert_eq!(read_setting(&path), Some(true));
+        write_provider_toggle(&path, DEEPGRAM_ENABLED_KEY, true).unwrap();
+        assert_eq!(read_setting(&path, DEEPGRAM_ENABLED_KEY), Some(true));
         assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Clipboard));
         assert_eq!(
             read_writing_mode(&path),
@@ -1165,7 +1342,7 @@ mod tests {
         );
 
         write_delivery_mode(&path, DeliveryMode::Guarded).unwrap();
-        assert_eq!(read_setting(&path), Some(true));
+        assert_eq!(read_setting(&path, DEEPGRAM_ENABLED_KEY), Some(true));
         assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Guarded));
         assert_eq!(
             read_writing_mode(&path),
@@ -1173,7 +1350,7 @@ mod tests {
         );
 
         write_writing_mode(&path, WritingMode::Smart).unwrap();
-        assert_eq!(read_setting(&path), Some(true));
+        assert_eq!(read_setting(&path, DEEPGRAM_ENABLED_KEY), Some(true));
         assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Guarded));
         assert_eq!(
             read_writing_mode(&path),
@@ -1195,7 +1372,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("voisu").join("config.toml");
         assert!(!path.parent().unwrap().exists());
-        write_setting(&path, true).unwrap();
+        write_provider_toggle(&path, DEEPGRAM_ENABLED_KEY, true).unwrap();
         assert!(path.exists());
     }
 
@@ -1207,17 +1384,23 @@ mod tests {
   deepgram_enabled = true   # inline comment
 other_key = 5
 ";
-        assert_eq!(parse_deepgram_enabled(contents), Some(true));
+        assert_eq!(parse_root_bool(contents, DEEPGRAM_ENABLED_KEY), Some(true));
     }
 
     #[test]
     fn a_missing_key_parses_as_none() {
-        assert_eq!(parse_deepgram_enabled("other_key = true\n"), None);
+        assert_eq!(
+            parse_root_bool("other_key = true\n", DEEPGRAM_ENABLED_KEY),
+            None
+        );
     }
 
     #[test]
     fn a_malformed_value_parses_as_none_so_the_default_applies() {
-        assert_eq!(parse_deepgram_enabled("deepgram_enabled = maybe\n"), None);
+        assert_eq!(
+            parse_root_bool("deepgram_enabled = maybe\n", DEEPGRAM_ENABLED_KEY),
+            None
+        );
     }
 
     #[test]
@@ -1271,31 +1454,67 @@ other_key = 5
         for line in LEGACY_MANAGED_LINES {
             assert!(!contents.contains(line), "{contents}");
         }
-        assert_eq!(read_setting(&path), Some(false));
+        assert_eq!(read_setting(&path, DEEPGRAM_ENABLED_KEY), Some(false));
         assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Clipboard));
     }
 
     #[test]
     fn a_rendered_file_round_trips_through_the_parser() {
         assert_eq!(
-            parse_deepgram_enabled(&render(Some(true), None, None, None, None)),
+            parse_root_bool(
+                &render(
+                    ProviderToggles {
+                        deepgram: Some(true),
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                DEEPGRAM_ENABLED_KEY,
+            ),
             Some(true)
         );
         assert_eq!(
-            parse_deepgram_enabled(&render(Some(false), None, None, None, None)),
+            parse_root_bool(
+                &render(
+                    ProviderToggles {
+                        deepgram: Some(false),
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                DEEPGRAM_ENABLED_KEY,
+            ),
             Some(false)
         );
         assert_eq!(
-            parse_writing_mode(&render(None, None, Some(WritingMode::Literal), None, None)),
+            parse_writing_mode(&render(
+                ProviderToggles::default(),
+                None,
+                Some(WritingMode::Literal),
+                None,
+                None
+            )),
             WritingModeLoad::Known(WritingMode::Literal)
         );
         assert_eq!(
-            parse_writing_mode(&render(None, None, Some(WritingMode::Smart), None, None)),
+            parse_writing_mode(&render(
+                ProviderToggles::default(),
+                None,
+                Some(WritingMode::Smart),
+                None,
+                None
+            )),
             WritingModeLoad::Known(WritingMode::Smart)
         );
         assert_eq!(
             parse_rendering_policy(&render(
-                None,
+                ProviderToggles::default(),
                 None,
                 None,
                 Some(RenderingPolicy::Structured),
@@ -1305,7 +1524,7 @@ other_key = 5
         );
         assert_eq!(
             parse_rendering_policy(&render(
-                None,
+                ProviderToggles::default(),
                 None,
                 None,
                 Some(RenderingPolicy::Adaptive),
@@ -1714,13 +1933,13 @@ other_key = 5
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("voisu").join("config.toml");
 
-        write_setting(&path, false).unwrap();
+        write_provider_toggle(&path, DEEPGRAM_ENABLED_KEY, false).unwrap();
         write_delivery_mode(&path, DeliveryMode::Clipboard).unwrap();
         write_writing_mode(&path, WritingMode::Literal).unwrap();
         write_rendering_policy(&path, RenderingPolicy::Structured).unwrap();
 
         write_rendering_policy(&path, RenderingPolicy::Natural).unwrap();
-        assert_eq!(read_setting(&path), Some(false));
+        assert_eq!(read_setting(&path, DEEPGRAM_ENABLED_KEY), Some(false));
         assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Clipboard));
         assert_eq!(
             read_writing_mode(&path),
@@ -1731,8 +1950,8 @@ other_key = 5
             RenderingPolicyLoad::Known(RenderingPolicy::Natural)
         );
 
-        write_setting(&path, true).unwrap();
-        assert_eq!(read_setting(&path), Some(true));
+        write_provider_toggle(&path, DEEPGRAM_ENABLED_KEY, true).unwrap();
+        assert_eq!(read_setting(&path, DEEPGRAM_ENABLED_KEY), Some(true));
         assert_eq!(
             read_rendering_policy(&path),
             RenderingPolicyLoad::Known(RenderingPolicy::Natural)
@@ -1756,7 +1975,14 @@ other_key = 5
     #[test]
     fn writing_asr_mode_replaces_quoted_and_bare_keys() {
         let existing = "\"asr_mode\" = \"local\"\n'asr_mode' = \"local\"\ncustom = 1\n";
-        let out = merge_content(existing, None, None, None, None, Some(AsrMode::Cloud));
+        let out = merge_content(
+            existing,
+            ProviderToggles::default(),
+            None,
+            None,
+            None,
+            Some(AsrMode::Cloud),
+        );
         assert_eq!(out.matches("asr_mode").count(), 1, "{out}");
         assert!(out.contains("asr_mode = \"cloud\""), "{out}");
         assert!(!out.contains("\"asr_mode\""), "{out}");
@@ -1769,7 +1995,7 @@ other_key = 5
         // Real TOML scopes this key to `[other]`, so it must NOT be read as the
         // root toggle: a table-scoped key never decides the Provider.
         assert_eq!(
-            parse_deepgram_enabled("[other]\ndeepgram_enabled = true\n"),
+            parse_root_bool("[other]\ndeepgram_enabled = true\n", DEEPGRAM_ENABLED_KEY),
             None
         );
     }
@@ -1777,7 +2003,10 @@ other_key = 5
     #[test]
     fn a_root_toggle_before_a_table_is_honoured() {
         assert_eq!(
-            parse_deepgram_enabled("deepgram_enabled = true\n[other]\nx = 1\n"),
+            parse_root_bool(
+                "deepgram_enabled = true\n[other]\nx = 1\n",
+                DEEPGRAM_ENABLED_KEY,
+            ),
             Some(true)
         );
     }
@@ -1785,7 +2014,10 @@ other_key = 5
     #[test]
     fn a_duplicate_root_toggle_takes_the_first_value() {
         assert_eq!(
-            parse_deepgram_enabled("deepgram_enabled = false\ndeepgram_enabled = true\n"),
+            parse_root_bool(
+                "deepgram_enabled = false\ndeepgram_enabled = true\n",
+                DEEPGRAM_ENABLED_KEY,
+            ),
             Some(false)
         );
     }
@@ -1799,10 +2031,10 @@ other_key = 5
             "# a user's own note\ndeepgram_enabled = true\n[keyterms]\nboost = 5\n",
         )
         .unwrap();
-        write_setting(&path, false).unwrap();
+        write_provider_toggle(&path, DEEPGRAM_ENABLED_KEY, false).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         // The toggle now reads false, exactly once, at the root.
-        assert_eq!(read_setting(&path), Some(false));
+        assert_eq!(read_setting(&path, DEEPGRAM_ENABLED_KEY), Some(false));
         assert_eq!(
             contents.matches("deepgram_enabled").count(),
             1,
@@ -1824,7 +2056,7 @@ other_key = 5
         let original = [0xff, 0xfe, 0x00, 0x42];
         std::fs::write(&path, original).unwrap();
         assert!(
-            write_setting(&path, true).is_err(),
+            write_provider_toggle(&path, DEEPGRAM_ENABLED_KEY, true).is_err(),
             "an unreadable existing config must abort the write"
         );
         assert_eq!(
@@ -1838,15 +2070,15 @@ other_key = 5
     fn repeated_writes_do_not_accumulate_managed_headers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        write_setting(&path, true).unwrap();
-        write_setting(&path, false).unwrap();
-        write_setting(&path, true).unwrap();
+        write_provider_toggle(&path, DEEPGRAM_ENABLED_KEY, true).unwrap();
+        write_provider_toggle(&path, DEEPGRAM_ENABLED_KEY, false).unwrap();
+        write_provider_toggle(&path, DEEPGRAM_ENABLED_KEY, true).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             contents.matches(MANAGED_LINES[0]).count(),
             1,
             "the managed header appears exactly once: {contents}"
         );
-        assert_eq!(read_setting(&path), Some(true));
+        assert_eq!(read_setting(&path, DEEPGRAM_ENABLED_KEY), Some(true));
     }
 }

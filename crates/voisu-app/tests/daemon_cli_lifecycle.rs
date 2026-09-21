@@ -2682,9 +2682,16 @@ fn capture_pump_panic_fails_the_recording_and_the_next_recording_succeeds() {
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let failures = history["history"][0]["provider_failures"]
         .as_array()
-        .expect("pump panic must account for both providers");
-    assert_eq!(failures.len(), 2, "{history}");
-    assert!(failures.iter().all(|failure| failure["stage"] == "aborted"));
+        .expect("pump panic must account for every provider");
+    assert_eq!(failures.len(), 3, "{history}");
+    assert!(failures.iter().all(|failure| {
+        if failure["provider"] == "narilabs" {
+            // Disabled by default in this build: the canonical not_started.
+            failure["stage"] == "not_started"
+        } else {
+            failure["stage"] == "aborted"
+        }
+    }));
 
     let recovered = voisu(runtime.path(), "stop");
     assert!(recovered.status.success(), "{}", stderr(&recovered));
@@ -2716,11 +2723,16 @@ fn processing_task_panic_records_aborted_unknown_outcomes_and_rebuilds_adapters(
         "{history}"
     );
     let failures = record["provider_failures"].as_array().unwrap();
-    assert_eq!(failures.len(), 2, "{history}");
+    assert_eq!(failures.len(), 3, "{history}");
     assert!(failures.iter().all(|failure| {
-        failure["stage"] == "aborted"
-            && failure["diagnostic"]
-                == "provider outcome is unknown: the Recording processing task failed"
+        if failure["provider"] == "narilabs" {
+            // Disabled by default in this build: the canonical not_started.
+            failure["stage"] == "not_started"
+        } else {
+            failure["stage"] == "aborted"
+                && failure["diagnostic"]
+                    == "provider outcome is unknown: the Recording processing task failed"
+        }
     }));
 
     assert!(voisu(runtime.path(), "start").status.success());
@@ -11609,11 +11621,13 @@ fn partial_provider_completion_failure_is_recorded_in_history() {
         .expect("a failed provider must be recorded even when the other succeeds");
     assert_eq!(
         failures.len(),
-        1,
-        "exactly the failed provider is recorded: {record}"
+        2,
+        "the failed provider and the disabled Narilabs are recorded: {record}"
     );
     assert_eq!(failures[0]["provider"], "groq");
     assert_eq!(failures[0]["stage"], "completion");
+    assert_eq!(failures[1]["provider"], "narilabs");
+    assert_eq!(failures[1]["stage"], "not_started");
     assert!(
         failures[0]["diagnostic"].is_string(),
         "the boundary diagnostic is retained"
@@ -11645,19 +11659,26 @@ fn all_providers_failing_records_every_failure_in_history() {
     let failures = record["provider_failures"]
         .as_array()
         .expect("both providers' failures must be recorded even with no source");
-    assert_eq!(failures.len(), 2, "{record}");
+    assert_eq!(failures.len(), 3, "{record}");
     let providers: Vec<&str> = failures
         .iter()
         .map(|failure| failure["provider"].as_str().unwrap())
         .collect();
     assert!(
-        providers.contains(&"deepgram") && providers.contains(&"groq"),
+        providers.contains(&"deepgram")
+            && providers.contains(&"groq")
+            && providers.contains(&"narilabs"),
         "{record}"
     );
     assert!(
-        failures
-            .iter()
-            .all(|failure| failure["stage"] == "completion"),
+        failures.iter().all(|failure| {
+            if failure["provider"] == "narilabs" {
+                // Disabled by default in this build: the canonical not_started.
+                failure["stage"] == "not_started"
+            } else {
+                failure["stage"] == "completion"
+            }
+        }),
         "{record}"
     );
 
@@ -11725,8 +11746,8 @@ fn capture_begin_failure_records_every_provider_as_not_started() {
             record["provider_failures"]
                 .as_array()
                 .is_some_and(|failures| {
-                    failures.len() == 2
-                        && ["deepgram", "groq"].iter().all(|provider| {
+                    failures.len() == 3
+                        && ["deepgram", "groq", "narilabs"].iter().all(|provider| {
                             failures.iter().any(|failure| {
                                 failure["provider"] == *provider
                                     && failure["stage"] == "not_started"
@@ -11817,7 +11838,14 @@ fn capture_finalization_failure_records_all_providers_in_history() {
         "{record}"
     );
     assert!(
-        failures.iter().all(|failure| failure["stage"] == "aborted"),
+        failures.iter().all(|failure| {
+            if failure["provider"] == "narilabs" {
+                // Disabled by default in this build: the canonical not_started.
+                failure["stage"] == "not_started"
+            } else {
+                failure["stage"] == "aborted"
+            }
+        }),
         "{record}"
     );
 

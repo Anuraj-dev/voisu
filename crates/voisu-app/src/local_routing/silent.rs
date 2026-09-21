@@ -51,10 +51,15 @@ impl ProviderStream for CloudFreeStream {
 }
 
 #[must_use]
-pub fn cloud_free_slots() -> (Box<dyn TranscriptProvider>, Box<dyn TranscriptProvider>) {
+pub fn cloud_free_slots() -> (
+    Box<dyn TranscriptProvider>,
+    Box<dyn TranscriptProvider>,
+    Box<dyn TranscriptProvider>,
+) {
     (
         Box::new(CloudFreeProvider::slot(Provider::Deepgram)),
         Box::new(CloudFreeProvider::slot(Provider::Groq)),
+        Box::new(CloudFreeProvider::slot(Provider::Narilabs)),
     )
 }
 
@@ -66,9 +71,10 @@ mod tests {
     #[test]
     fn slots_do_not_touch_the_cloud_sentinel() {
         let sentinel = CloudCapabilitySentinel::new();
-        let (deepgram, groq) = cloud_free_slots();
+        let (deepgram, groq, narilabs) = cloud_free_slots();
         drop(deepgram);
         drop(groq);
+        drop(narilabs);
         assert!(sentinel.local_path_clean());
     }
 }

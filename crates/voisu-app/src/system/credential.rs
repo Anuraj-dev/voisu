@@ -41,13 +41,13 @@ struct CachedCredential {
 /// or logged, and `Credential` has no `Debug`, so a value cannot leak through it.
 pub(super) struct CredentialCache {
     /// One slot per provider, indexed by [`CredentialCache::slot`].
-    slots: Mutex<[Option<CachedCredential>; 2]>,
+    slots: Mutex<[Option<CachedCredential>; 3]>,
 }
 
 impl CredentialCache {
     pub(super) const fn new() -> Self {
         Self {
-            slots: Mutex::new([None, None]),
+            slots: Mutex::new([None, None, None]),
         }
     }
 
@@ -55,6 +55,7 @@ impl CredentialCache {
         match provider {
             Provider::Deepgram => 0,
             Provider::Groq => 1,
+            Provider::Narilabs => 2,
         }
     }
 
@@ -856,6 +857,7 @@ async fn drive_credential_work(
                 let name = match provider {
                     Provider::Groq => "VOISU_TEST_STORED_GROQ_CREDENTIAL",
                     Provider::Deepgram => "VOISU_TEST_STORED_DEEPGRAM_CREDENTIAL",
+                    Provider::Narilabs => "VOISU_TEST_STORED_NARILABS_CREDENTIAL",
                 };
                 match std::env::var(name)
                     .ok()

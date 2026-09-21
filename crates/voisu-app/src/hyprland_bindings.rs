@@ -46,6 +46,19 @@ pub struct VerifiedPasteAction {
     pub behavior: PasteBehavior,
 }
 
+impl VerifiedPasteAction {
+    /// Semantic equality for per-delivery live revalidation. Hyprland
+    /// renumbers `__lua` registry ids across compositor reloads without
+    /// changing the binding, so an identity-only drift must recover by
+    /// adopting the fresh action rather than failing closed. Any change to
+    /// the binding, description, or behavior still fails closed via `==`.
+    pub fn semantic_eq(&self, other: &Self) -> bool {
+        self.shortcut.binding == other.shortcut.binding
+            && self.description == other.description
+            && self.behavior == other.behavior
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TriggerKey {
     pub label: &'static str,
@@ -3699,6 +3712,51 @@ o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V",
         let second = discover_paste_action(&[OMARCHY_PASTE_SOURCE], &second).unwrap();
         assert_ne!(first, second);
         assert_eq!(second.live_binding_identity, "92");
+    }
+
+    #[test]
+    fn semantic_eq_ignores_only_the_live_binding_identity() {
+        let first = VerifiedPasteAction {
+            shortcut: PasteShortcut {
+                binding: "SUPER + V".to_owned(),
+            },
+            description: "Universal paste".to_owned(),
+            live_binding_identity: "62".to_owned(),
+            behavior: PasteBehavior::Simple,
+        };
+        let rotated = VerifiedPasteAction {
+            live_binding_identity: "7".to_owned(),
+            ..first.clone()
+        };
+        assert!(first.semantic_eq(&rotated));
+        assert_ne!(first, rotated);
+
+        let rebound = VerifiedPasteAction {
+            shortcut: PasteShortcut {
+                binding: "CTRL + ALT + P".to_owned(),
+            },
+            ..first.clone()
+        };
+        assert!(!first.semantic_eq(&rebound));
+
+        let renamed = VerifiedPasteAction {
+            description: "Paste transcript".to_owned(),
+            ..first.clone()
+        };
+        assert!(!first.semantic_eq(&renamed));
+
+        let reshaped = VerifiedPasteAction {
+            behavior: PasteBehavior::OmarchyUniversal {
+                normal: PasteShortcut {
+                    binding: "CTRL + V".to_owned(),
+                },
+                terminal: PasteShortcut {
+                    binding: "SHIFT + Insert".to_owned(),
+                },
+            },
+            ..first.clone()
+        };
+        assert!(!first.semantic_eq(&reshaped));
     }
 
     #[test]

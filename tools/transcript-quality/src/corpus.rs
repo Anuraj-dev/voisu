@@ -413,6 +413,7 @@ fn provider_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Deepgram => "deepgram",
         Provider::Groq => "groq",
+        Provider::Narilabs => "narilabs",
     }
 }
 
