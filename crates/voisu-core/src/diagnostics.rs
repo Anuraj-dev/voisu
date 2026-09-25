@@ -271,6 +271,78 @@ pub struct IntentReconstructionDiagnostic {
     pub candidate: Option<String>,
 }
 
+/// Closed Local ASR terminal for one Recording. Distinct from cloud Provider
+/// identity so a Qwen or Parakeet dictation is not recorded as Groq/Deepgram.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalAsrOutcome {
+    Transcript,
+    NoText,
+    Error,
+}
+
+/// Per-Recording Local ASR metrics retained in history. Optional fields stay
+/// absent when a runtime does not report them, so Whisper CPU, Python CUDA,
+/// and native GGUF workers share one shape.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LocalAsrDiagnostic {
+    pub model_id: String,
+    pub outcome: LocalAsrOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_host_ram_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_gpu_memory_bytes: Option<u64>,
+}
+
+impl LocalAsrDiagnostic {
+    /// Re-applies diagnostic clamps. Public fields can be mutated after
+    /// construction; call this at persist and export so byte budgets stay
+    /// invariants.
+    pub fn normalize(&mut self) {
+        self.model_id = clamp_utf8_bytes(&self.model_id, MAX_MODEL_ID_UTF8_BYTES);
+        self.runtime = clamp_optional_utf8(self.runtime.take(), MAX_MODEL_ID_UTF8_BYTES);
+        self.backend = clamp_optional_utf8(self.backend.take(), MAX_MODEL_ID_UTF8_BYTES);
+        self.language = clamp_optional_utf8(self.language.take(), MAX_MODEL_ID_UTF8_BYTES);
+        self.requested_device =
+            clamp_optional_utf8(self.requested_device.take(), MAX_MODEL_ID_UTF8_BYTES);
+        self.observed_device =
+            clamp_optional_utf8(self.observed_device.take(), MAX_MODEL_ID_UTF8_BYTES);
+        self.manifest_hash =
+            clamp_optional_utf8(self.manifest_hash.take(), MAX_MODEL_ID_UTF8_BYTES);
+        self.reason =
+            clamp_optional_utf8(self.reason.take(), MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES);
+    }
+}
+
+fn clamp_optional_utf8(value: Option<String>, max_bytes: usize) -> Option<String> {
+    value.and_then(|text| {
+        let clamped = clamp_utf8_bytes(&text, max_bytes);
+        if clamped.is_empty() {
+            None
+        } else {
+            Some(clamped)
+        }
+    })
+}
+
 /// Bound on the recorded rejection list so a pathological recording cannot
 /// grow a history line without bound; regions past the cap still count in
 /// `regions_considered`, only their per-region reason entries are dropped.
@@ -797,6 +869,12 @@ pub struct DiagnosticRecord {
     /// arbitration did not run, so pre-B4 lines stay deserializable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence_arbitration: Option<ConfidenceArbitrationDiagnostic>,
+    /// Additive Local ASR identity and resource metrics. Absent on Cloud
+    /// dual-provider records so old history lines stay deserializable without
+    /// a telemetry schema bump. Closed cloud `Provider` values stay Groq and
+    /// Deepgram; this block names the selected local model instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_asr: Option<LocalAsrDiagnostic>,
 }
 
 impl DiagnosticRecord {
@@ -838,6 +916,7 @@ impl DiagnosticRecord {
             dpr: None,
             intent_reconstruction: None,
             confidence_arbitration: None,
+            local_asr: None,
         }
     }
 
@@ -1223,6 +1302,9 @@ pub fn export_record(
             .map(|candidate| scrub_free_text(&candidate, &secrets));
         intent.normalize();
     }
+    if let Some(local) = record.local_asr.as_mut() {
+        scrub_local_asr_diagnostic(local, &secrets);
+    }
     DiagnosticExport {
         record,
         environment: redacted_environment(vars),
@@ -1240,6 +1322,39 @@ pub fn export_record(
 /// [`REDACTED`] can expand a field past its byte budget, and public mutation can
 /// leave oversized text/edits or invalid fingerprints on the in-memory record
 /// before export.
+fn scrub_local_asr_diagnostic(local: &mut LocalAsrDiagnostic, secrets: &[String]) {
+    local.model_id = scrub_free_text(&local.model_id, secrets);
+    local.runtime = local
+        .runtime
+        .as_ref()
+        .map(|text| scrub_free_text(text, secrets));
+    local.backend = local
+        .backend
+        .as_ref()
+        .map(|text| scrub_free_text(text, secrets));
+    local.language = local
+        .language
+        .as_ref()
+        .map(|text| scrub_free_text(text, secrets));
+    local.requested_device = local
+        .requested_device
+        .as_ref()
+        .map(|text| scrub_free_text(text, secrets));
+    local.observed_device = local
+        .observed_device
+        .as_ref()
+        .map(|text| scrub_free_text(text, secrets));
+    local.manifest_hash = local
+        .manifest_hash
+        .as_ref()
+        .map(|text| scrub_free_text(text, secrets));
+    local.reason = local
+        .reason
+        .as_ref()
+        .map(|text| scrub_free_text(text, secrets));
+    local.normalize();
+}
+
 fn scrub_smart_writing_diagnostic(smart: &mut SmartWritingDiagnostic, secrets: &[String]) {
     smart.formatter_contract_id = scrub_free_text(&smart.formatter_contract_id, secrets);
     smart.validated_before = scrub_free_text(&smart.validated_before, secrets);

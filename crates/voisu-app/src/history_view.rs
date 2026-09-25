@@ -215,7 +215,14 @@ fn render_record(index: usize, record: &Value, style: &RenderStyle) -> String {
     let final_transcript = str_field(record, "final_transcript");
     match final_transcript {
         Some(text) if !text.is_empty() => {
-            let selection = selection_label(str_field(record, "selection"));
+            let local_model = record
+                .get("local_asr")
+                .and_then(|value| value.get("model_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let selection = local_model
+                .as_deref()
+                .unwrap_or_else(|| selection_label(str_field(record, "selection")));
             let shown = truncate_inline(text, style.transcript_width);
             lines.push_str(&format!(
                 "   {}: {}\n",
@@ -244,6 +251,9 @@ fn render_record(index: usize, record: &Value, style: &RenderStyle) -> String {
 /// Renders each Provider referenced by this Recording with its outcome and
 /// timing, joined into one scannable line.
 fn render_providers(record: &Value, style: &RenderStyle) -> String {
+    if let Some(local) = record.get("local_asr").filter(|value| !value.is_null()) {
+        return render_local_asr(local, style);
+    }
     let timings = record.get("provider_timings_ms").and_then(Value::as_array);
     let failures = record.get("provider_failures").and_then(Value::as_array);
     let sources = record.get("source_transcripts").and_then(Value::as_array);
@@ -419,6 +429,67 @@ fn stage_human(stage: &str) -> &str {
         "provider_deadline" => "missed deadline",
         "aborted" => "aborted",
         other => other,
+    }
+}
+
+fn render_local_asr(local: &Value, style: &RenderStyle) -> String {
+    let model = str_field(local, "model_id").unwrap_or("local");
+    let outcome = str_field(local, "outcome").unwrap_or("");
+    let inference = u64_field(local, "inference_ms");
+    let device = str_field(local, "observed_device");
+    let backend = str_field(local, "backend");
+    let ram = u64_field(local, "peak_host_ram_bytes");
+    let gpu = u64_field(local, "peak_gpu_memory_bytes");
+    let reason = str_field(local, "reason");
+
+    let status = match outcome {
+        "transcript" => match inference {
+            Some(ms) => style.paint(&format!("ok {ms}ms"), Ansi::Green),
+            None => style.paint("ok", Ansi::Green),
+        },
+        "no_text" => {
+            let detail = reason
+                .map(|text| format!("no text ({text})"))
+                .unwrap_or_else(|| "no text".to_owned());
+            style.paint(&detail, Ansi::Yellow)
+        }
+        "error" => {
+            let detail = reason
+                .map(|text| format!("failed: {text}"))
+                .unwrap_or_else(|| "failed".to_owned());
+            style.paint(&truncate_inline(&detail, 48), Ansi::Red)
+        }
+        _ => style.paint(outcome, Ansi::Dim),
+    };
+
+    let mut parts = vec![format!("{} {status}", style.paint(model, Ansi::Bold))];
+    if let Some(device) = device {
+        parts.push(style.paint(device, Ansi::Dim));
+    }
+    if let Some(backend) = backend {
+        parts.push(style.paint(backend, Ansi::Dim));
+    }
+    if let Some(ram) = ram {
+        parts.push(style.paint(&format!("ram {}", format_bytes(ram)), Ansi::Dim));
+    }
+    if let Some(gpu) = gpu {
+        parts.push(style.paint(&format!("gpu {}", format_bytes(gpu)), Ansi::Dim));
+    }
+    parts.join("  ·  ")
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if bytes >= GIB {
+        format!("{:.1}GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{}MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{}KiB", bytes / KIB)
+    } else {
+        format!("{bytes}B")
     }
 }
 
@@ -922,5 +993,36 @@ mod tests {
         assert!(!out.contains("tail 0ms"), "{out}");
         // The release value is still surfaced as recorded.
         assert!(out.contains("release 1620ms"), "{out}");
+    }
+
+    #[test]
+    fn local_asr_record_names_the_model_and_metrics() {
+        let out = render_one(json!({
+            "recorded_at_unix_ms": NOW - 1000,
+            "final_transcript": "ask not what your country can do",
+            "telemetry_schema": 2,
+            "stop_to_delivered_ms": 480,
+            "stop_to_finalized_ms": 410,
+            "recording_duration_ms": 2200,
+            "delivery_count": 1,
+            "local_asr": {
+                "model_id": "qwen3-asr-0.6b",
+                "outcome": "transcript",
+                "backend": "transformers",
+                "observed_device": "cuda:0",
+                "inference_ms": 412,
+                "peak_host_ram_bytes": 2147483648u64,
+                "peak_gpu_memory_bytes": 891289600u64
+            }
+        }));
+        assert!(out.contains("qwen3-asr-0.6b:"), "{out}");
+        assert!(out.contains("qwen3-asr-0.6b ok 412ms"), "{out}");
+        assert!(out.contains("cuda:0"), "{out}");
+        assert!(out.contains("transformers"), "{out}");
+        assert!(out.contains("ram 2.0GiB"), "{out}");
+        assert!(out.contains("gpu 850MiB"), "{out}");
+        assert!(!out.contains("no Provider results"), "{out}");
+        assert!(!out.contains("Deepgram"), "{out}");
+        assert!(!out.contains("Groq"), "{out}");
     }
 }

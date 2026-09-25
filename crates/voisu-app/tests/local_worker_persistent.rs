@@ -1,6 +1,6 @@
 //! Persistent Local worker integration proof (#265) through public interfaces.
 //!
-//! No production admission: [`production_local_admission`] stays closed, so
+//! No production admission: [`local_runtime_admission`] stays closed, so
 //! these tests drive the scripted harness worker through the same public
 //! supervisor/lifecycle seams the daemon will use. They prove the #265
 //! acceptance shape end to end:
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use voisu_app::local_worker::{
     Correlation, FakeDelivery, FakeWorker, LocalLifecycle, RESTART_WINDOW, ReapOutcome,
     SupervisorError, TranscribeRequest, WorkerOutcome, WorkerState, WorkerSupervisor,
-    production_local_admission,
+    local_runtime_admission,
 };
 
 fn correlation(generation: u64, request: &str) -> Correlation {
@@ -48,7 +48,7 @@ fn ready_harness(text: &str) -> WorkerSupervisor<FakeWorker> {
 #[test]
 fn production_admission_stays_closed() {
     assert!(
-        !production_local_admission(),
+        !local_runtime_admission(),
         "Gate A keeps production Local unavailable: no capture path opens here"
     );
 }
@@ -85,6 +85,7 @@ fn repeated_inference_without_reload_or_residue() {
         WorkerOutcome::Transcript {
             text,
             observed_device,
+            ..
         } => {
             assert_eq!(text, "first");
             assert_eq!(observed_device, "cpu");

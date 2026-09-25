@@ -6,15 +6,18 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use voisu_core::{
-    AsrMode, DaemonState, DeliveryOutcome, LifecycleEvidence, LifecycleStage, LocalReadiness,
-    Response, Transcript, stop_anchored_timings,
+    AsrMode, DaemonState, DeliveryOutcome, LifecycleEvidence, LifecycleStage, LocalAsrDiagnostic,
+    LocalAsrOutcome, LocalReadiness, Response, Transcript, stop_anchored_timings,
 };
 
 use crate::config::WritingMode;
 
 use crate::local_model::ActiveReceipt;
 #[cfg(not(test))]
-use crate::local_model::{FileKind, ModelStore, models_dir, production_selection, shipped_catalog};
+use crate::local_model::{
+    DevelopmentStore, FileKind, ModelStore, development_local_enabled, development_receipt,
+    models_dir, runtime_selection, shipped_catalog,
+};
 use crate::local_recovery::{RecoveryClock, RecoveryError, RecoveryStore};
 use crate::local_tail::{
     DeliveryCoordinator, DeliveryPermit, TailError, TerminalDecision, decide_replay,
@@ -22,12 +25,12 @@ use crate::local_tail::{
 };
 #[cfg(test)]
 use crate::local_worker::FakeWorker;
-#[cfg(not(test))]
-use crate::local_worker::WhisperCppWorker;
 use crate::local_worker::{
-    CloudCapabilitySentinel, Correlation, WorkerOutcome, WorkerState, WorkerSupervisor,
-    is_silence_pcm, transcribe_through_supervisor,
+    CloudCapabilitySentinel, Correlation, FakeDelivery, InferenceMetrics, LocalLifecycle,
+    WorkerOutcome, WorkerState, WorkerSupervisor, is_silence_pcm, transcribe_through_supervisor,
 };
+#[cfg(not(test))]
+use crate::local_worker::{RuntimeWorker, WhisperCppWorker};
 
 pub use silent::{CloudFreeProvider, cloud_free_slots};
 
@@ -37,7 +40,7 @@ const LOCAL_NOT_READY: &str = "Local ASR is unavailable; Start refused before ca
 #[cfg(test)]
 type GateWorker = FakeWorker;
 #[cfg(not(test))]
-type GateWorker = WhisperCppWorker;
+type GateWorker = RuntimeWorker;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalAdmission {
@@ -53,7 +56,7 @@ pub enum LocalAdmission {
 struct Gate {
     readiness: LocalReadiness,
     receipt: Option<ActiveReceipt>,
-    supervisor: WorkerSupervisor<GateWorker>,
+    lifecycle: LocalLifecycle<GateWorker, FakeDelivery>,
     coordinator: DeliveryCoordinator,
     sentinel: CloudCapabilitySentinel,
     pending_permit: Option<DeliveryPermit>,
@@ -61,6 +64,14 @@ struct Gate {
     /// Supervisor is checked out for inference; refresh must not map the
     /// absent stand-in to Verifying/Loading.
     inference_checked_out: bool,
+    runtime: Option<String>,
+    requested_device: Option<String>,
+    #[cfg(test)]
+    test_selected: Option<ActiveReceipt>,
+    #[cfg(test)]
+    test_next_worker: Option<FakeWorker>,
+    #[cfg(test)]
+    launch_count: u32,
 }
 
 impl Gate {
@@ -68,12 +79,20 @@ impl Gate {
         Self {
             readiness: LocalReadiness::Absent,
             receipt: None,
-            supervisor: WorkerSupervisor::absent(),
+            lifecycle: LocalLifecycle::new(FakeDelivery::default()),
             coordinator: DeliveryCoordinator::new(),
             sentinel: CloudCapabilitySentinel::new(),
             pending_permit: None,
             user_terms: Vec::new(),
             inference_checked_out: false,
+            runtime: None,
+            requested_device: None,
+            #[cfg(test)]
+            test_selected: None,
+            #[cfg(test)]
+            test_next_worker: None,
+            #[cfg(test)]
+            launch_count: 0,
         }
     }
 
@@ -81,7 +100,61 @@ impl Gate {
         if self.inference_checked_out {
             return self.readiness.clone();
         }
-        if self.supervisor.state() == WorkerState::Ready && self.receipt.is_some() {
+        #[cfg(not(test))]
+        if !crate::local_worker::local_runtime_admission() {
+            self.readiness = LocalReadiness::Unavailable {
+                error: LOCAL_UNAVAILABLE.to_owned(),
+            };
+            return self.readiness.clone();
+        }
+        match self.lifecycle.state() {
+            WorkerState::Busy => {
+                self.readiness = LocalReadiness::Busy;
+                return self.readiness.clone();
+            }
+            WorkerState::Stopping => {
+                self.readiness = LocalReadiness::Stopping;
+                return self.readiness.clone();
+            }
+            _ => {}
+        }
+        let Some(selected) = self.peek_selected_receipt() else {
+            self.readiness = LocalReadiness::Unavailable {
+                error: LOCAL_UNAVAILABLE.to_owned(),
+            };
+            return self.readiness.clone();
+        };
+        let changed = development_model_changed(
+            self.receipt
+                .as_ref()
+                .map(|receipt| receipt.catalog_id.as_str()),
+            self.receipt
+                .as_ref()
+                .map(|receipt| receipt.artifact_id.as_str()),
+            &selected.catalog_id,
+            &selected.artifact_id,
+        );
+        if changed {
+            // Keep the previous receipt until the replacement is Ready so a
+            // failed drain cannot retarget launch at the new model.
+            if self.lifecycle.begin_idle_switch().is_err()
+                || !self.lifecycle.can_launch_replacement()
+            {
+                self.lifecycle.mark_unavailable();
+                self.readiness = LocalReadiness::Unavailable {
+                    error: LOCAL_NOT_READY.to_owned(),
+                };
+                return self.readiness.clone();
+            }
+            if !self.install_selected_worker(&selected) {
+                self.lifecycle.mark_unavailable();
+                self.readiness = LocalReadiness::Unavailable {
+                    error: LOCAL_NOT_READY.to_owned(),
+                };
+                return self.readiness.clone();
+            }
+            self.receipt = Some(selected);
+        } else if self.lifecycle.state() == WorkerState::Ready && self.receipt.is_some() {
             self.readiness = LocalReadiness::Ready {
                 model_identity: self
                     .receipt
@@ -89,168 +162,236 @@ impl Gate {
                     .map(|receipt| receipt.catalog_id.clone()),
             };
             return self.readiness.clone();
+        } else if self.lifecycle.has_child() {
+            self.lifecycle.mark_unavailable();
+            self.readiness = LocalReadiness::Unavailable {
+                error: LOCAL_NOT_READY.to_owned(),
+            };
+            return self.readiness.clone();
+        } else if self.lifecycle.can_launch_replacement() {
+            if self.install_selected_worker(&selected) {
+                self.receipt = Some(selected);
+            } else {
+                self.lifecycle.mark_unavailable();
+            }
         }
+        self.readiness = match self.lifecycle.state() {
+            WorkerState::Absent | WorkerState::Verifying => LocalReadiness::Verifying,
+            WorkerState::Loading => LocalReadiness::Loading,
+            WorkerState::Ready => LocalReadiness::Ready {
+                model_identity: self
+                    .receipt
+                    .as_ref()
+                    .map(|receipt| receipt.catalog_id.clone()),
+            },
+            WorkerState::Busy => LocalReadiness::Busy,
+            WorkerState::Stopping => LocalReadiness::Stopping,
+            WorkerState::Unavailable => LocalReadiness::Unavailable {
+                error: LOCAL_NOT_READY.to_owned(),
+            },
+        };
+        self.readiness.clone()
+    }
+
+    fn peek_selected_receipt(&self) -> Option<ActiveReceipt> {
         #[cfg(test)]
         {
-            self.readiness = LocalReadiness::Unavailable {
-                error: LOCAL_UNAVAILABLE.to_owned(),
-            };
-            self.readiness.clone()
+            return self.test_selected.clone().or_else(|| self.receipt.clone());
         }
         #[cfg(not(test))]
         {
-            if !crate::local_worker::production_local_admission() {
-                self.readiness = LocalReadiness::Unavailable {
-                    error: LOCAL_UNAVAILABLE.to_owned(),
-                };
-                return self.readiness.clone();
+            if crate::local_model::development_local_enabled() {
+                match DevelopmentStore::open_default() {
+                    Ok(store) => match store.selected() {
+                        Ok((manifest, handle)) => {
+                            return Some(development_receipt(&manifest, &handle.manifest_hash));
+                        }
+                        Err(crate::local_model::DevelopmentError::MissingSelection) => {}
+                        Err(_) => return None,
+                    },
+                    Err(_) => return None,
+                }
             }
-            self.load_receipt();
-            if self.receipt.is_none() {
-                self.readiness = LocalReadiness::Unavailable {
-                    error: LOCAL_UNAVAILABLE.to_owned(),
-                };
-                return self.readiness.clone();
-            }
-            self.ensure_production_worker();
-            self.readiness = match self.supervisor.state() {
-                WorkerState::Absent | WorkerState::Verifying => LocalReadiness::Verifying,
-                WorkerState::Loading => LocalReadiness::Loading,
-                WorkerState::Ready => LocalReadiness::Ready {
-                    model_identity: self
-                        .receipt
-                        .as_ref()
-                        .map(|receipt| receipt.catalog_id.clone()),
-                },
-                WorkerState::Busy => LocalReadiness::Busy,
-                WorkerState::Stopping => LocalReadiness::Stopping,
-                WorkerState::Unavailable => LocalReadiness::Unavailable {
-                    error: LOCAL_NOT_READY.to_owned(),
-                },
-            };
-            self.readiness.clone()
+            (|| {
+                let dir = models_dir().ok()?;
+                let store = ModelStore::open(dir).ok()?;
+                store.load_active().ok().flatten()
+            })()
         }
     }
 
-    #[cfg(not(test))]
-    fn load_receipt(&mut self) {
-        self.receipt = (|| {
-            let dir = models_dir().ok()?;
-            let store = ModelStore::open(dir).ok()?;
-            store.load_active().ok().flatten()
-        })();
-    }
-
-    /// Bind the selected catalog entry's verified artifact to a real worker.
-    /// This remains unreachable while production selection is evidence-gated.
-    #[cfg(not(test))]
-    fn ensure_production_worker(&mut self) {
-        if self.supervisor.state() == WorkerState::Ready || self.inference_checked_out {
-            return;
+    fn install_selected_worker(&mut self, selected: &ActiveReceipt) -> bool {
+        if !self.lifecycle.can_launch_replacement() {
+            return false;
         }
-        let Some(receipt) = self.receipt.clone() else {
-            return;
+        let Some(worker) = self.spawn_worker(selected) else {
+            return false;
         };
-        let catalog = shipped_catalog();
-        let Some(entry) = catalog.entries.iter().find(|entry| {
-            entry.id == receipt.catalog_id && entry.revision == receipt.catalog_revision
-        }) else {
-            return;
-        };
-        if !entry.production_weights {
-            return;
-        }
-        if production_selection(&catalog).map(|selected| selected.id) != Some(entry.id) {
-            return;
-        }
-        if entry.runtime_abi.protocol != crate::local_worker::PROTOCOL_VERSION
-            || receipt.runtime_abi != entry.runtime_abi.abi_id
-            || receipt.protocol != entry.runtime_abi.protocol
-        {
-            return;
-        }
-        for file in entry.files {
-            match receipt.files.get(file.name) {
-                Some(pin) if pin.sha256_hex == file.sha256_hex && pin.bytes == file.bytes => {}
-                _ => return,
-            }
-        }
-        let Some(weights) = entry
-            .files
-            .iter()
-            .find(|file| file.kind == FileKind::Weights)
-            .map(|file| file.name)
-        else {
-            return;
-        };
-        let artifact = (|| {
-            let dir = models_dir().ok()?;
-            let store = ModelStore::open(dir).ok()?;
-            Some(
-                store
-                    .root()
-                    .join("artifacts")
-                    .join(entry.id)
-                    .join(entry.revision)
-                    .join(&receipt.artifact_id),
-            )
-        })();
-        let Some(artifact) = artifact else {
-            return;
-        };
-        if !artifact.join(weights).is_file() {
-            return;
-        }
-        let worker =
-            match WhisperCppWorker::from_artifact(&artifact, weights, &receipt.receipt_hash) {
-                Ok(worker) => worker,
-                Err(_) => return,
-            };
+        self.lifecycle
+            .pin_model_receipt_hash(selected.receipt_hash.clone());
         if self
-            .supervisor
-            .attach_ready(worker, Instant::now())
+            .lifecycle
+            .attach_replacement(worker, Instant::now())
             .is_err()
         {
-            return;
+            return false;
         }
-        let prepare = correlation(&receipt.receipt_hash, "l4-prepare", "prepare");
-        let _ = self.supervisor.prepare(prepare, Instant::now());
+        #[cfg(test)]
+        {
+            let generation = self.lifecycle.generation();
+            let hash = selected.receipt_hash.clone();
+            if let Some(child) = self.lifecycle.child_mut() {
+                child.generation = generation;
+                child.model_receipt_hash = hash;
+            }
+        }
+        let ready = self.lifecycle.prepare("l4-prepare", Instant::now()).is_ok()
+            && self.lifecycle.state() == WorkerState::Ready;
+        if ready {
+            self.capture_runtime_identity(selected);
+        }
+        ready
+    }
+
+    fn capture_runtime_identity(&mut self, selected: &ActiveReceipt) {
+        self.runtime = Some(selected.runtime_abi.clone());
+        #[cfg(test)]
+        {
+            let _ = selected;
+            self.requested_device = Some("cpu".into());
+        }
+        #[cfg(not(test))]
+        {
+            if development_local_enabled()
+                && let Ok((manifest, handle)) =
+                    DevelopmentStore::open_default().and_then(|store| store.selected())
+                && selected.catalog_id == manifest.model_id
+                && selected.artifact_id == handle.manifest_hash
+            {
+                self.requested_device = Some(manifest.device.clone());
+                if let Some(entry) =
+                    crate::local_model::development_catalog_entry(&manifest.model_id)
+                {
+                    self.runtime = Some(entry.runtime.as_str().to_owned());
+                }
+            } else {
+                self.requested_device = Some("cpu".into());
+            }
+        }
+    }
+
+    fn spawn_worker(&mut self, selected: &ActiveReceipt) -> Option<GateWorker> {
+        if !self.lifecycle.can_launch_replacement() {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            let _ = selected;
+            self.launch_count = self.launch_count.saturating_add(1);
+            return self.test_next_worker.take();
+        }
+        #[cfg(not(test))]
+        {
+            if development_local_enabled()
+                && let Ok((manifest, handle)) =
+                    DevelopmentStore::open_default().and_then(|store| store.selected())
+                && selected.catalog_id == manifest.model_id
+                && selected.artifact_id == handle.manifest_hash
+            {
+                return crate::local_worker::DevWorker::launch(
+                    manifest,
+                    handle.manifest_hash,
+                    &handle.path,
+                )
+                .ok()
+                .map(RuntimeWorker::Development);
+            }
+            let catalog = shipped_catalog();
+            let entry = catalog.entries.iter().find(|entry| {
+                entry.id == selected.catalog_id && entry.revision == selected.catalog_revision
+            })?;
+            if !entry.production_weights {
+                return None;
+            }
+            if runtime_selection(&catalog).map(|chosen| chosen.id) != Some(entry.id) {
+                return None;
+            }
+            if entry.runtime_abi.protocol != crate::local_worker::PROTOCOL_VERSION
+                || selected.runtime_abi != entry.runtime_abi.abi_id
+                || selected.protocol != entry.runtime_abi.protocol
+            {
+                return None;
+            }
+            for file in entry.files {
+                match selected.files.get(file.name) {
+                    Some(pin) if pin.sha256_hex == file.sha256_hex && pin.bytes == file.bytes => {}
+                    _ => return None,
+                }
+            }
+            let weights = entry
+                .files
+                .iter()
+                .find(|file| file.kind == FileKind::Weights)
+                .map(|file| file.name)?;
+            let artifact = (|| {
+                let dir = models_dir().ok()?;
+                let store = ModelStore::open(dir).ok()?;
+                Some(
+                    store
+                        .root()
+                        .join("artifacts")
+                        .join(entry.id)
+                        .join(entry.revision)
+                        .join(&selected.artifact_id),
+                )
+            })()?;
+            if !artifact.join(weights).is_file() {
+                return None;
+            }
+            WhisperCppWorker::from_artifact(&artifact, weights, &selected.receipt_hash)
+                .ok()
+                .map(RuntimeWorker::Whisper)
+        }
     }
 
     #[cfg(test)]
     fn attach_ready_worker(&mut self, hash: String, text: &str) {
-        self.supervisor = WorkerSupervisor::absent();
+        let mut supervisor = WorkerSupervisor::absent();
         let worker = FakeWorker {
             scripted_text: Some(text.to_owned()),
             generation: 1,
             model_receipt_hash: hash.clone(),
             ..FakeWorker::default()
         };
-        if self
-            .supervisor
-            .attach_ready(worker, Instant::now())
-            .is_err()
-        {
+        if supervisor.attach_ready(worker, Instant::now()).is_err() {
             self.readiness = LocalReadiness::Unavailable {
                 error: LOCAL_NOT_READY.to_owned(),
             };
             return;
         }
         let correlation = correlation(&hash, "l4-prepare", "prepare");
-        if self
-            .supervisor
-            .prepare(correlation, Instant::now())
-            .is_err()
-        {
+        if supervisor.prepare(correlation, Instant::now()).is_err() {
             self.readiness = LocalReadiness::Unavailable {
                 error: LOCAL_NOT_READY.to_owned(),
             };
+            return;
         }
+        self.lifecycle.restore_supervisor(supervisor);
+        self.lifecycle.pin_model_receipt_hash(hash);
+        self.runtime = self
+            .receipt
+            .as_ref()
+            .map(|receipt| receipt.runtime_abi.clone());
+        self.requested_device = Some("cpu".into());
     }
 }
 
 struct InferenceSession {
     receipt_hash: String,
+    catalog_id: String,
+    language: String,
+    runtime: Option<String>,
+    requested_device: Option<String>,
     sentinel: CloudCapabilitySentinel,
     supervisor: WorkerSupervisor<GateWorker>,
     coordinator: DeliveryCoordinator,
@@ -262,15 +403,19 @@ fn take_inference_session() -> Result<InferenceSession, LocalError> {
         return Err(LocalError::CloudCapability);
     }
     let receipt = gate.receipt.clone().ok_or(LocalError::Unavailable)?;
-    if gate.supervisor.state() != WorkerState::Ready {
+    if gate.lifecycle.state() != WorkerState::Ready {
         return Err(LocalError::Unavailable);
     }
-    let supervisor = std::mem::replace(&mut gate.supervisor, WorkerSupervisor::absent());
+    let supervisor = gate.lifecycle.take_supervisor();
     let coordinator = std::mem::replace(&mut gate.coordinator, DeliveryCoordinator::new());
     gate.inference_checked_out = true;
     gate.readiness = LocalReadiness::Busy;
     Ok(InferenceSession {
         receipt_hash: receipt.receipt_hash,
+        catalog_id: receipt.catalog_id,
+        language: receipt.language,
+        runtime: gate.runtime.clone(),
+        requested_device: gate.requested_device.clone(),
         sentinel: gate.sentinel.clone(),
         supervisor,
         coordinator,
@@ -279,10 +424,10 @@ fn take_inference_session() -> Result<InferenceSession, LocalError> {
 
 fn restore_inference_session(session: InferenceSession) {
     if let Ok(mut gate) = gate().lock() {
-        gate.supervisor = session.supervisor;
+        gate.lifecycle.restore_supervisor(session.supervisor);
         gate.coordinator = session.coordinator;
         gate.inference_checked_out = false;
-        if gate.supervisor.state() == WorkerState::Ready {
+        if gate.lifecycle.state() == WorkerState::Ready {
             gate.readiness = LocalReadiness::Ready {
                 model_identity: gate
                     .receipt
@@ -293,6 +438,19 @@ fn restore_inference_session(session: InferenceSession) {
     }
 }
 
+fn silence_outcome(observed_device: &str) -> Result<WorkerOutcome, LocalError> {
+    if observed_device.is_empty() || observed_device == "unknown" {
+        return Err(LocalError::Inference(
+            "silence inference lacked an observed device".into(),
+        ));
+    }
+    Ok(WorkerOutcome::NoText {
+        reason: "silence".to_owned(),
+        observed_device: observed_device.to_owned(),
+        metrics: crate::local_worker::InferenceMetrics::default(),
+    })
+}
+
 fn infer_unlocked(
     session: &mut InferenceSession,
     recording_id: &str,
@@ -301,7 +459,7 @@ fn infer_unlocked(
 ) -> Result<WorkerOutcome, LocalError> {
     let correlation = correlation(&session.receipt_hash, recording_id, request_id);
     transcribe_through_supervisor(&mut session.supervisor, correlation, pcm, &session.sentinel)
-        .map_err(|error| LocalError::Inference(format!("{error:?}")))
+        .map_err(|error| LocalError::Inference(error.to_string()))
 }
 
 fn assert_gate_unlocked() {
@@ -331,22 +489,51 @@ fn correlation(hash: &str, recording_id: &str, request_id: &str) -> Correlation 
     }
 }
 
+fn development_model_changed(
+    previous_id: Option<&str>,
+    previous_hash: Option<&str>,
+    selected_id: &str,
+    selected_hash: &str,
+) -> bool {
+    match (previous_id, previous_hash) {
+        (Some(id), Some(hash)) => id != selected_id || hash != selected_hash,
+        _ => false,
+    }
+}
+
 fn gate() -> &'static Mutex<Gate> {
     static GATE: OnceLock<Mutex<Gate>> = OnceLock::new();
     GATE.get_or_init(|| Mutex::new(Gate::new()))
 }
 
 #[must_use]
-pub fn production_readiness() -> LocalReadiness {
-    LocalReadiness::Unavailable {
-        error: LOCAL_UNAVAILABLE.to_owned(),
+pub fn runtime_readiness() -> LocalReadiness {
+    #[cfg(test)]
+    {
+        return LocalReadiness::Unavailable {
+            error: LOCAL_UNAVAILABLE.to_owned(),
+        };
+    }
+    #[cfg(not(test))]
+    {
+        if !crate::local_worker::local_runtime_admission() {
+            return LocalReadiness::Unavailable {
+                error: LOCAL_UNAVAILABLE.to_owned(),
+            };
+        }
+        let Ok(mut gate) = gate().lock() else {
+            return LocalReadiness::Unavailable {
+                error: LOCAL_NOT_READY.to_owned(),
+            };
+        };
+        gate.refresh()
     }
 }
 
 #[must_use]
 pub fn admit_local(kind_ready_required: bool) -> LocalAdmission {
     #[cfg(not(test))]
-    if !crate::local_worker::production_local_admission() {
+    if !crate::local_worker::local_runtime_admission() {
         return LocalAdmission::Unavailable {
             error: LOCAL_UNAVAILABLE.to_owned(),
         };
@@ -443,10 +630,19 @@ pub fn complete_recording(
     let request_id = format!("{recording_id}-asr");
     let outcome = match infer_unlocked(&mut session, recording_id, &request_id, pcm.clone()) {
         Ok(outcome) => outcome,
-        Err(_) if is_silence_pcm(&pcm) => WorkerOutcome::NoText {
-            reason: "silence".to_owned(),
-            observed_device: "cpu".to_owned(),
-        },
+        Err(_) if is_silence_pcm(&pcm) => {
+            match silence_outcome(session.supervisor.observed_device()) {
+                Ok(outcome) => outcome,
+                Err(silence_error) => {
+                    restore_inference_session(session);
+                    if recovery_enabled {
+                        let _ = RecoveryStore::open_default(RecoveryClock::system())
+                            .and_then(|store| store.mark_failed(recording_id));
+                    }
+                    return Err(silence_error);
+                }
+            }
+        }
         Err(error) => {
             restore_inference_session(session);
             if recovery_enabled {
@@ -456,6 +652,7 @@ pub fn complete_recording(
             return Err(error);
         }
     };
+    let local_asr = local_asr_from_session(&session, &outcome);
     let decision = decide_transcript(
         recording_id,
         &pcm,
@@ -470,6 +667,7 @@ pub fn complete_recording(
         decision: decision.map_err(LocalError::Tail)?,
         recovery_enabled,
         recording_id: recording_id.to_owned(),
+        local_asr,
     })
 }
 
@@ -509,8 +707,14 @@ pub fn complete_replay(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalStopResult {
-    Transcript(String),
-    NoText { reason: String },
+    Transcript {
+        text: String,
+        local_asr: LocalAsrDiagnostic,
+    },
+    NoText {
+        reason: String,
+        local_asr: LocalAsrDiagnostic,
+    },
 }
 
 pub fn finish_local_stop(
@@ -534,11 +738,17 @@ pub fn finish_local_stop(
     match completion.decision {
         TerminalDecision::NoText { reason } => {
             abandon_live(recording_id);
-            Ok(LocalStopResult::NoText { reason })
+            Ok(LocalStopResult::NoText {
+                reason,
+                local_asr: completion.local_asr,
+            })
         }
         TerminalDecision::Transcript(text) => {
             prepare_delivery(recording_id, recovery_enabled)?;
-            Ok(LocalStopResult::Transcript(text))
+            Ok(LocalStopResult::Transcript {
+                text,
+                local_asr: completion.local_asr,
+            })
         }
     }
 }
@@ -669,6 +879,92 @@ pub struct LocalCompletion {
     pub decision: TerminalDecision,
     pub recovery_enabled: bool,
     pub recording_id: String,
+    pub local_asr: LocalAsrDiagnostic,
+}
+
+/// Identity-only snapshot when inference never produced an outcome (capture
+/// abort, supervisor error). Callers still persist a Local ASR record so the
+/// selected model is visible in history.
+pub fn current_local_asr_error(reason: &str) -> Option<LocalAsrDiagnostic> {
+    let gate = gate().lock().ok()?;
+    let receipt = gate.receipt.as_ref()?;
+    let mut diagnostic = LocalAsrDiagnostic {
+        model_id: receipt.catalog_id.clone(),
+        outcome: LocalAsrOutcome::Error,
+        runtime: gate.runtime.clone(),
+        backend: None,
+        language: nonempty_owned(&receipt.language),
+        requested_device: gate.requested_device.clone(),
+        observed_device: None,
+        resident: None,
+        manifest_hash: nonempty_owned(&receipt.receipt_hash),
+        reason: nonempty_owned(reason),
+        inference_ms: None,
+        peak_host_ram_bytes: None,
+        peak_gpu_memory_bytes: None,
+    };
+    diagnostic.normalize();
+    Some(diagnostic)
+}
+
+fn local_asr_from_session(
+    session: &InferenceSession,
+    outcome: &WorkerOutcome,
+) -> LocalAsrDiagnostic {
+    let (kind, observed, reason, metrics) = match outcome {
+        WorkerOutcome::Transcript {
+            observed_device,
+            metrics,
+            ..
+        } => (
+            LocalAsrOutcome::Transcript,
+            observed_device.as_str(),
+            None,
+            metrics.clone(),
+        ),
+        WorkerOutcome::NoText {
+            reason,
+            observed_device,
+            metrics,
+        } => (
+            LocalAsrOutcome::NoText,
+            observed_device.as_str(),
+            Some(reason.clone()),
+            metrics.clone(),
+        ),
+    };
+    let InferenceMetrics {
+        backend,
+        resident,
+        inference_ms,
+        peak_host_ram_bytes,
+        peak_gpu_memory_bytes,
+    } = metrics;
+    let mut diagnostic = LocalAsrDiagnostic {
+        model_id: session.catalog_id.clone(),
+        outcome: kind,
+        runtime: session.runtime.clone(),
+        backend,
+        language: nonempty_owned(&session.language),
+        requested_device: session.requested_device.clone(),
+        observed_device: nonempty_owned(observed),
+        resident,
+        manifest_hash: nonempty_owned(&session.receipt_hash),
+        reason,
+        inference_ms,
+        peak_host_ram_bytes,
+        peak_gpu_memory_bytes,
+    };
+    diagnostic.normalize();
+    diagnostic
+}
+
+fn nonempty_owned(value: &str) -> Option<String> {
+    if value.is_empty() || value == "unknown" {
+        None
+    } else {
+        Some(value.to_owned())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -796,6 +1092,12 @@ mod tests {
             completion.decision,
             TerminalDecision::Transcript("hello".to_owned())
         );
+        assert_eq!(completion.local_asr.model_id, fixture_receipt().catalog_id);
+        assert_eq!(
+            completion.local_asr.outcome,
+            voisu_core::LocalAsrOutcome::Transcript
+        );
+        assert_eq!(completion.local_asr.observed_device.as_deref(), Some("cpu"));
         authorize_and_confirm_delivery("rec-1", "hello", false).unwrap();
         assert!(sentinel_is_clean());
     }
@@ -805,12 +1107,35 @@ mod tests {
         let _lock = test_session();
         inject_ready(fixture_receipt(), "hello");
         assert_eq!(
-            production_readiness(),
+            runtime_readiness(),
             LocalReadiness::Unavailable {
                 error: LOCAL_UNAVAILABLE.to_owned()
             }
         );
         assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+    }
+
+    #[test]
+    fn silence_outcome_keeps_prepared_device_and_rejects_unknown() {
+        match silence_outcome("cuda:0").unwrap() {
+            WorkerOutcome::NoText {
+                reason,
+                observed_device,
+                ..
+            } => {
+                assert_eq!(reason, "silence");
+                assert_eq!(observed_device, "cuda:0");
+            }
+            WorkerOutcome::Transcript { .. } => panic!("silence must stay NoText"),
+        }
+        match silence_outcome("cpu").unwrap() {
+            WorkerOutcome::NoText {
+                observed_device, ..
+            } => assert_eq!(observed_device, "cpu"),
+            WorkerOutcome::Transcript { .. } => panic!("silence must stay NoText"),
+        }
+        assert!(silence_outcome("unknown").is_err());
+        assert!(silence_outcome("").is_err());
     }
 
     #[test]
@@ -869,6 +1194,7 @@ mod tests {
             confidence_arbitration: None,
             source_transcripts: Vec::new(),
             final_transcript: None,
+            local_asr: None,
         };
         apply_local_delivery_evidence(
             &mut evidence,
@@ -891,6 +1217,167 @@ mod tests {
             evidence.stages.last(),
             Some(&LifecycleStage::DeliveryCompleted)
         );
+    }
+
+    #[test]
+    fn idle_switch_is_detected_only_when_a_previous_model_is_loaded() {
+        assert!(!development_model_changed(
+            None,
+            None,
+            "parakeet-tdt-0.6b-v3",
+            "b".repeat(64).as_str()
+        ));
+        assert!(!development_model_changed(
+            Some("parakeet-tdt-0.6b-v3"),
+            Some("aa"),
+            "parakeet-tdt-0.6b-v3",
+            "aa"
+        ));
+        assert!(development_model_changed(
+            Some("nemotron-3.5-0.6b"),
+            Some("aa"),
+            "parakeet-tdt-0.6b-v3",
+            "aa"
+        ));
+        assert!(development_model_changed(
+            Some("parakeet-tdt-0.6b-v3"),
+            Some("aa"),
+            "parakeet-tdt-0.6b-v3",
+            "bb"
+        ));
+    }
+
+    fn parakeet_receipt() -> ActiveReceipt {
+        let mut receipt = fixture_receipt();
+        receipt.catalog_id = "parakeet-tdt-0.6b-v3".into();
+        receipt.artifact_id = "parakeet-artifact".into();
+        receipt
+    }
+
+    #[test]
+    fn failed_idle_switch_keeps_the_previous_receipt_and_does_not_spawn() {
+        let _lock = test_session();
+        inject_ready(fixture_receipt(), "nemotron");
+        {
+            let mut gate = gate().lock().expect("gate");
+            if let Some(child) = gate.lifecycle.child_mut() {
+                child.ignore_cancel = true;
+                child.reap = crate::local_worker::ReapOutcome::Unreaped;
+            }
+            let _ = gate.lifecycle.cancel();
+            gate.test_selected = Some(parakeet_receipt());
+            gate.test_next_worker = Some(FakeWorker {
+                scripted_text: Some("parakeet".into()),
+                model_receipt_hash: parakeet_receipt().receipt_hash,
+                ..FakeWorker::default()
+            });
+        }
+        match admit_local(true) {
+            LocalAdmission::Unavailable { .. } => {}
+            LocalAdmission::Ready { .. } => panic!("unreaped switch must not admit"),
+        }
+        {
+            let held = gate().lock().expect("gate");
+            assert_eq!(held.launch_count, 0);
+            assert_eq!(
+                held.receipt
+                    .as_ref()
+                    .map(|receipt| receipt.catalog_id.as_str()),
+                Some("l3-health-fixture")
+            );
+            assert!(held.lifecycle.has_child());
+            assert!(!held.lifecycle.can_launch_replacement());
+        }
+        let _ = admit_local(true);
+        let held = gate().lock().expect("gate");
+        assert_eq!(held.launch_count, 0, "later polls must not spawn Parakeet");
+        assert!(held.lifecycle.has_child());
+    }
+
+    #[test]
+    fn failed_prepare_does_not_replace_receipt_or_spawn_a_second_model() {
+        let _lock = test_session();
+        inject_ready(fixture_receipt(), "nemotron");
+        let parakeet = parakeet_receipt();
+        {
+            let mut gate = gate().lock().expect("gate");
+            gate.test_selected = Some(parakeet.clone());
+            gate.test_next_worker = Some(FakeWorker {
+                scripted_error: Some("weird-native-code".into()),
+                model_receipt_hash: parakeet.receipt_hash.clone(),
+                ..FakeWorker::default()
+            });
+        }
+        match admit_local(true) {
+            LocalAdmission::Unavailable { .. } => {}
+            LocalAdmission::Ready { .. } => panic!("failed prepare must not admit"),
+        }
+        {
+            let mut gate = gate().lock().expect("gate");
+            assert_eq!(gate.launch_count, 1);
+            assert_eq!(
+                gate.receipt
+                    .as_ref()
+                    .map(|receipt| receipt.catalog_id.as_str()),
+                Some("l3-health-fixture")
+            );
+            assert!(gate.lifecycle.has_child());
+            gate.test_next_worker = Some(FakeWorker {
+                scripted_text: Some("second-parakeet".into()),
+                model_receipt_hash: parakeet.receipt_hash,
+                ..FakeWorker::default()
+            });
+        }
+        let _ = admit_local(true);
+        let gate = gate().lock().expect("gate");
+        assert_eq!(
+            gate.launch_count, 1,
+            "held child must block a second launch"
+        );
+        assert_eq!(
+            gate.receipt
+                .as_ref()
+                .map(|receipt| receipt.catalog_id.as_str()),
+            Some("l3-health-fixture")
+        );
+        assert!(gate.lifecycle.has_child());
+    }
+
+    #[test]
+    fn successful_idle_switch_replaces_receipt_only_after_ready() {
+        let _lock = test_session();
+        inject_ready(fixture_receipt(), "nemotron");
+        let parakeet = parakeet_receipt();
+        {
+            let mut gate = gate().lock().expect("gate");
+            gate.test_selected = Some(parakeet.clone());
+            gate.test_next_worker = Some(FakeWorker {
+                scripted_text: Some("parakeet".into()),
+                model_receipt_hash: parakeet.receipt_hash.clone(),
+                observed_device: "cpu".into(),
+                ..FakeWorker::default()
+            });
+        }
+        match admit_local(true) {
+            LocalAdmission::Ready {
+                model_identity,
+                receipt,
+            } => {
+                assert_eq!(model_identity, "parakeet-tdt-0.6b-v3");
+                assert_eq!(receipt.catalog_id, "parakeet-tdt-0.6b-v3");
+            }
+            other => panic!("expected Ready after switch, got {other:?}"),
+        }
+        let gate = gate().lock().expect("gate");
+        assert_eq!(gate.launch_count, 1);
+        assert_eq!(
+            gate.receipt
+                .as_ref()
+                .map(|receipt| receipt.catalog_id.as_str()),
+            Some("parakeet-tdt-0.6b-v3")
+        );
+        assert_eq!(gate.lifecycle.state(), WorkerState::Ready);
+        assert!(gate.lifecycle.has_child());
     }
 
     #[test]

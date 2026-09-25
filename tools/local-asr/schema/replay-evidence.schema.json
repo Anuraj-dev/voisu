@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voisu.local/schemas/local-asr-replay-evidence-v1.json",
+  "title": "Voisu protected replay evidence",
+  "type": "object",
+  "required": ["schema_version", "kind", "run_id", "corpus_manifest_sha256", "records", "evidence_sha256"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "replay_evidence"},
+    "run_id": {"type": "string", "minLength": 1},
+    "corpus_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "records": {"type": "array", "items": {"$ref": "#/$defs/result"}}
+  },
+  "$defs": {
+    "result": {
+      "type": "object",
+      "required": ["schema_version", "run_id", "record_id", "audio_sha256", "corpus_manifest_sha256", "model_id", "language", "split", "execution_seam", "protected_execution", "evidence_class", "raw_response"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "run_id": {"type": "string"},
+        "record_id": {"type": "string"},
+        "audio_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "corpus_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "model_id": {"type": "string"},
+        "language": {"enum": ["english", "hinglish", "negative"]},
+        "split": {"enum": ["development", "heldout"]},
+        "execution_seam": {"enum": ["rust-protected", "fixture"]},
+        "protected_execution": {"type": "boolean"},
+        "evidence_class": {"enum": ["real", "fixture", "unverified"]},
+        "raw_text": {"type": ["string", "null"]},
+        "delivered_text": {"type": ["string", "null"]},
+        "raw_response": {"type": "object"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

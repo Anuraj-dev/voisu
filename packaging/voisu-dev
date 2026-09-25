@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    printf '%s\n' \
+        'usage: voisu-dev on|off|status' \
+        '  on      stop production, start the Local pilot, and select Local' \
+        '  off     stop the Local pilot, start production, and select Cloud' \
+        '  status  show both service states and daemon status'
+}
+
+case "${1:-}" in
+    on)
+        systemctl --user daemon-reload
+        systemctl --user stop voisu.service
+        if ! systemctl --user start voisu-dev.service; then
+            systemctl --user start voisu.service || true
+            exit 1
+        fi
+        systemctl --user disable voisu.service >/dev/null 2>&1 || true
+        systemctl --user enable voisu-dev.service >/dev/null 2>&1 || true
+        voisu mode local
+        ;;
+    off)
+        systemctl --user stop voisu-dev.service
+        if ! systemctl --user start voisu.service; then
+            systemctl --user start voisu-dev.service || true
+            exit 1
+        fi
+        systemctl --user disable voisu-dev.service >/dev/null 2>&1 || true
+        systemctl --user enable voisu.service >/dev/null 2>&1 || true
+        voisu mode cloud
+        ;;
+    status)
+        systemctl --user --no-pager --full status voisu-dev.service || true
+        systemctl --user --no-pager --full status voisu.service || true
+        voisu status
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

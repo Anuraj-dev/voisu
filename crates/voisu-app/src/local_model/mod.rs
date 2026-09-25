@@ -9,6 +9,7 @@ pub const INSTALL_DEADLINE: Duration = Duration::from_secs(30 * 60);
 pub const NO_PROGRESS: Duration = Duration::from_secs(30);
 
 mod catalog;
+mod development;
 mod fetch;
 mod health;
 mod installer;
@@ -19,8 +20,14 @@ mod url_policy;
 
 pub use catalog::{
     Catalog, CatalogEntry, CatalogFile, DeviceSupport, FileKind, LicenseTerms, Provenance,
-    Redistribution, RuntimeAbi, SHA256_HEX_LEN, ci_fixture_entry, pilot_candidate,
-    production_selection, sha256_hex, shipped_catalog, verify_file_digest,
+    Redistribution, RuntimeAbi, SHA256_HEX_LEN, ci_fixture_entry, development_selection,
+    pilot_candidate, production_selection, sha256_hex, shipped_catalog, verify_file_digest,
+};
+pub use development::{
+    DEV_MODEL_IDS, DEVELOPMENT_MANIFEST_VERSION, DEVELOPMENT_ROOT_NAME, DevCatalogEntry, DevDevice,
+    DevFilePin, DevLanguage, DevLimits, DevManifest, DevManifestHandle, DevModelStatus,
+    DevRuntimeKind, DevRuntimeManifest, DevelopmentError, DevelopmentStore, development_catalog,
+    development_catalog_entry, development_receipt,
 };
 pub use fetch::{
     ArtifactFetcher, FetchError, FetchRequest, FetchResponse, ProductionHttps, ScriptedFetcher,
@@ -42,13 +49,34 @@ pub use store::{
 };
 pub use url_policy::{CatalogUrl, UrlPolicyError, validate_catalog_url};
 
-use crate::local_worker::production_local_admission;
+use crate::local_worker::local_runtime_admission;
 
-/// Production admission is evidence-gated and does not inspect host model state.
+pub const LOCAL_PILOT_ENV: &str = "VOISU_ENABLE_LOCAL_PILOT";
+
+/// Whether this daemon was explicitly launched as the developer Local pilot.
+#[must_use]
+pub fn development_local_enabled() -> bool {
+    std::env::var(LOCAL_PILOT_ENV)
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+}
+
+/// Select the runtime model without changing the production catalog decision.
+#[must_use]
+pub fn runtime_selection(catalog: &Catalog) -> Option<&CatalogEntry> {
+    if development_local_enabled() {
+        development_selection(catalog)
+    } else {
+        production_selection(catalog)
+    }
+}
+
+/// Runtime admission stays production-gated unless the explicitly host-only
+/// developer Local pilot flag is present.
 #[must_use]
 pub fn observe_for_admission() -> bool {
     let _ = (INSTALL_DEADLINE, NO_PROGRESS);
-    production_local_admission()
+    local_runtime_admission()
 }
 
 #[cfg(test)]
@@ -73,5 +101,15 @@ mod tests {
     #[test]
     fn production_admission_stays_closed_before_measurement() {
         assert!(!observe_for_admission());
+    }
+
+    #[test]
+    fn development_selection_is_scoped_to_the_pilot_candidate() {
+        let catalog = shipped_catalog();
+        assert_eq!(
+            development_selection(&catalog).map(|entry| entry.id),
+            Some("whisper-cpp-ggml-base.en")
+        );
+        assert!(production_selection(&catalog).is_none());
     }
 }

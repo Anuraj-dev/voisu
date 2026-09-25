@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voisu.local/schemas/local-asr-frozen-corpus-v1.json",
+  "title": "Voisu private frozen local ASR corpus",
+  "type": "object",
+  "required": ["schema_version", "kind", "corpus_id", "seed", "records", "manifest_sha256"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "frozen_corpus"},
+    "corpus_id": {"type": "string", "minLength": 1},
+    "seed": {"type": "string", "minLength": 1},
+    "source_inventory_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "heldout_fraction": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1},
+    "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "records": {"type": "array", "minItems": 1, "items": {"$ref": "inventory.schema.json#/$defs/record"}}
+  },
+  "additionalProperties": true
+}

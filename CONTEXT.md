@@ -24,6 +24,14 @@ evaluation is worthwhile. Pilot success is evidence, but does not authorize
 product selection or a supported-platform claim.
 _Avoid_: Winner, selected model, supported runtime
 
+**Hinglish Transcript**:
+A Transcript of Hindi and English speech that writes Hindi words in Latin letters while preserving the spoken language and meaning. It is not an English translation of Hindi speech.
+_Avoid_: Hindi translation, English translation
+
+**Model Recommendation**:
+A measured suggestion for a user's speech requirements and computer, based on Transcript Fidelity, latency, and resource use. Availability for development testing alone does not establish a recommendation.
+_Avoid_: Universal best model, benchmark winner
+
 **Bakeoff Winner**:
 A Pilot Candidate that passes the frozen quality, privacy, performance,
 reliability, packaging, and host acceptance gates. If no candidate passes every

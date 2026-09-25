@@ -1,0 +1,6 @@
+{
+  "consent_id": "<local-consent-receipt-id>",
+  "purpose": "private local ASR evaluation",
+  "retention": "local-only",
+  "created_at": "<UTC timestamp>"
+}

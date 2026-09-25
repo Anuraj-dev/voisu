@@ -32,3 +32,4 @@ _copr_srpm/
 # but only because this exact path is gitignored. corpus.example/ stays
 # tracked: it is synthetic and ships no audio.
 /tools/transcript-quality/corpus/
+__pycache__/

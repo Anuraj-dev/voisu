@@ -1,0 +1,9 @@
+{
+  "README-placeholder.wav": {
+    "language": "english",
+    "reference": "<adjudicated reference kept in the private evaluation directory>",
+    "consent_id": "<local-consent-receipt-id>",
+    "tags": ["commands"],
+    "critical_tokens": ["<critical-token>"]
+  }
+}

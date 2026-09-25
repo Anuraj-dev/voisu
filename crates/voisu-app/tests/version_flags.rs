@@ -31,6 +31,7 @@ commands:
   dictionary remove <term>
   dictionary list [--json]
   service <install|start|stop|restart|status|uninstall>
+  local-dev register|select|status|replay
 
 options:
   -h, --help, help

@@ -13,6 +13,7 @@ pub mod grammar_http;
 pub mod history_view;
 pub mod hyprland_bindings;
 pub mod journal;
+pub mod local_dev_cli;
 pub mod local_doctor;
 pub mod local_model;
 pub mod local_offline;

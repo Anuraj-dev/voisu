@@ -335,6 +335,7 @@ impl<C: CaptureSeam, D: DeliverySeam> FeasibilityRunner<C, D> {
             WorkerOutcome::Transcript {
                 text,
                 observed_device,
+                ..
             } => (Some(text), observed_device, false),
             WorkerOutcome::NoText {
                 observed_device, ..

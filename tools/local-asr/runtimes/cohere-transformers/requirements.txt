@@ -1,0 +1,11 @@
+# Isolated Cohere Transcribe 03-2026 Transformers runtime. English-only here.
+# Upstream lists 14 languages and does not include Hindi. The Hugging Face
+# repo is gated (gated=auto). This host has no accepted token; do not treat
+# a missing snapshot as a quality ranking.
+# Intended install after access is granted, matching the Qwen CUDA pin:
+#   uv pip install --python $VENV/bin/python --index-url https://download.pytorch.org/whl/cu128 \
+#     --index-strategy unsafe-best-match torch==2.9.1+cu128
+#   uv pip install --python $VENV/bin/python transformers==5.17.0 soundfile==0.13.1
+torch==2.9.1+cu128
+transformers==5.17.0
+soundfile==0.13.1

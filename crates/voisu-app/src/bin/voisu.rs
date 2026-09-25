@@ -54,6 +54,7 @@ enum CliAction {
     DictionaryRemove(String),
     DictionaryList { json: bool },
     Service(UserServiceAction),
+    LocalDev(Vec<String>),
     Help,
     Version,
 }
@@ -85,6 +86,7 @@ fn main() -> ExitCode {
             }
             Err(message) => fail(4, &message),
         },
+        Ok(CliAction::LocalDev(args)) => ExitCode::from(voisu_app::local_dev_cli::run(&args)),
         Ok(CliAction::Help) => {
             println!("{}", usage());
             ExitCode::SUCCESS
@@ -1450,6 +1452,7 @@ fn parse_command() -> Result<CliAction, String> {
         [service, action] if service == "service" => {
             Ok(CliAction::Service(parse_service_action(action)?))
         }
+        [command, rest @ ..] if command == "local-dev" => Ok(CliAction::LocalDev(rest.to_vec())),
         _ => Err(usage().to_owned()),
     }
 }
@@ -1535,6 +1538,7 @@ commands:
   dictionary remove <term>
   dictionary list [--json]
   service <install|start|stop|restart|status|uninstall>
+  local-dev register|select|status|replay
 
 options:
   -h, --help, help

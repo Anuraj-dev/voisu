@@ -173,6 +173,7 @@ mod tests {
         WorkerOutcome::Transcript {
             text: text.to_owned(),
             observed_device: "cpu".to_owned(),
+            metrics: crate::local_worker::InferenceMetrics::default(),
         }
     }
 

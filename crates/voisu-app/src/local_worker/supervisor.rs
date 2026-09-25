@@ -34,10 +34,40 @@ pub enum SupervisorError {
     LoadAborted,
 }
 
+impl std::fmt::Display for SupervisorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotReady(state) => write!(f, "worker not ready ({state:?})"),
+            Self::RestartExhausted => write!(f, "worker restart budget exhausted"),
+            Self::TimedOut => write!(f, "worker timed out"),
+            Self::Protocol(error) => write!(f, "worker protocol error: {error:?}"),
+            Self::Runtime(error) => write!(f, "worker runtime error: {error:?}"),
+            Self::Busy => write!(f, "worker is busy"),
+            Self::Unavailable(message) => f.write_str(message),
+            Self::Crashed => write!(f, "worker crashed"),
+            Self::OutOfMemory => write!(f, "worker out of memory"),
+            Self::LoadAborted => write!(f, "worker load aborted"),
+        }
+    }
+}
+
+impl std::error::Error for SupervisorError {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscribeRequest {
     pub correlation: Correlation,
     pub pcm: Vec<u8>,
+}
+
+/// Runtime-reported resource numbers for one inference. Absent fields stay
+/// unset so Whisper CPU, Python CUDA, and native GGUF workers share one shape.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InferenceMetrics {
+    pub backend: Option<String>,
+    pub resident: Option<bool>,
+    pub inference_ms: Option<u64>,
+    pub peak_host_ram_bytes: Option<u64>,
+    pub peak_gpu_memory_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,10 +75,12 @@ pub enum WorkerOutcome {
     Transcript {
         text: String,
         observed_device: String,
+        metrics: InferenceMetrics,
     },
     NoText {
         reason: String,
         observed_device: String,
+        metrics: InferenceMetrics,
     },
 }
 
@@ -96,6 +128,11 @@ pub trait WorkerChild {
         deadline: Instant,
     ) -> Result<WorkerFrame, SupervisorError>;
     fn cancel_and_reap(&mut self) -> Result<ReapOutcome, SupervisorError>;
+    /// Last inference metrics the worker reported. Default is empty: scripted
+    /// harnesses and Whisper CLI only fill what they actually measured.
+    fn last_inference_metrics(&self) -> InferenceMetrics {
+        InferenceMetrics::default()
+    }
 }
 
 /// In-memory worker used by the L2 harness. Does not load production weights.
@@ -296,6 +333,11 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         self.state
     }
 
+    #[must_use]
+    pub fn observed_device(&self) -> &str {
+        &self.observed_device
+    }
+
     pub fn attach_ready(&mut self, child: C, now: Instant) -> Result<(), SupervisorError> {
         if self.child.is_some() {
             return Err(SupervisorError::Unavailable("worker still attached"));
@@ -352,6 +394,52 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
 
     pub fn child_mut(&mut self) -> Option<&mut C> {
         self.child.as_mut()
+    }
+
+    #[must_use]
+    pub fn has_child(&self) -> bool {
+        self.child.is_some()
+    }
+
+    /// True after the owned child is gone and no in-flight work remains.
+    /// Busy/Stopping still hold the previous model even if a reap is pending.
+    #[must_use]
+    pub fn released(&self) -> bool {
+        self.child.is_none() && !matches!(self.state, WorkerState::Busy | WorkerState::Stopping)
+    }
+
+    /// A replacement process may start only when nothing is still loaded.
+    #[must_use]
+    pub fn can_launch_replacement(&self) -> bool {
+        self.released() && !self.has_child()
+    }
+
+    pub fn mark_unavailable(&mut self) {
+        self.last_terminal_request = None;
+        self.state = WorkerState::Unavailable;
+    }
+
+    /// Idle-only model switch: drain and reap the current worker, then confirm
+    /// it is gone. A replacement may be attached only after this returns. A
+    /// failed drain leaves Local unavailable and never keeps two large models.
+    pub fn drain_for_switch(&mut self) -> Result<ReapOutcome, SupervisorError> {
+        match self.state {
+            WorkerState::Busy | WorkerState::Stopping => return Err(SupervisorError::Busy),
+            WorkerState::Unavailable if self.child.is_some() => {
+                return Err(SupervisorError::Unavailable(
+                    "worker unreaped; reap before new work",
+                ));
+            }
+            _ => {}
+        }
+        let outcome = self.unload_idle()?;
+        if self.child.is_some() {
+            self.state = WorkerState::Unavailable;
+            return Err(SupervisorError::Unavailable(
+                "previous worker unreaped; Local unavailable",
+            ));
+        }
+        Ok(outcome)
     }
 
     fn conclude_exchange(
@@ -522,6 +610,11 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
             deadline,
         );
         let frame = self.conclude_exchange(exchanged, deadline, WorkerState::Ready)?;
+        let metrics = self
+            .child
+            .as_ref()
+            .map(WorkerChild::last_inference_metrics)
+            .unwrap_or_default();
         match frame {
             WorkerFrame::Transcript { text, correlation } => {
                 if let Err(err) = correlations_match(&expected, &correlation) {
@@ -533,11 +626,13 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
                     Ok(WorkerOutcome::NoText {
                         reason: "empty".into(),
                         observed_device: self.observed_device.clone(),
+                        metrics,
                     })
                 } else {
                     Ok(WorkerOutcome::Transcript {
                         text,
                         observed_device: self.observed_device.clone(),
+                        metrics,
                     })
                 }
             }
@@ -553,6 +648,7 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
                 Ok(WorkerOutcome::NoText {
                     reason,
                     observed_device: self.observed_device.clone(),
+                    metrics,
                 })
             }
             WorkerFrame::Error { code, .. } => {
@@ -640,6 +736,7 @@ mod tests {
             WorkerOutcome::Transcript {
                 text,
                 observed_device,
+                ..
             } => {
                 assert_eq!(text, "hello raja");
                 assert_eq!(observed_device, "cpu");
@@ -1126,6 +1223,55 @@ mod tests {
         assert!(matches!(error, SupervisorError::TimedOut));
         assert_eq!(supervisor.state(), WorkerState::Absent);
         assert!(supervisor.child_mut().is_none());
+    }
+
+    #[test]
+    fn idle_switch_reaps_the_old_worker_before_a_replacement_attaches() {
+        let mut supervisor = ready_supervisor(Some("nemotron"));
+        assert_eq!(supervisor.drain_for_switch().unwrap(), ReapOutcome::Exited);
+        assert!(supervisor.released());
+        assert!(!supervisor.has_child());
+        supervisor
+            .attach_pending(FakeWorker::default(), Instant::now())
+            .unwrap();
+        assert_eq!(supervisor.state(), WorkerState::Loading);
+        assert!(supervisor.has_child());
+        supervisor.prepare(corr(), Instant::now()).unwrap();
+        assert_eq!(supervisor.state(), WorkerState::Ready);
+    }
+
+    #[test]
+    fn idle_switch_refuses_busy_and_unreaped_workers() {
+        let mut supervisor = ready_supervisor(Some("nemotron"));
+        if let Some(child) = supervisor.child_mut() {
+            child.hold_until_cancel = true;
+        }
+        let busy = supervisor
+            .transcribe(TranscribeRequest {
+                correlation: corr(),
+                pcm: vec![1, 0],
+            })
+            .unwrap_err();
+        assert!(matches!(busy, SupervisorError::Busy));
+        assert!(supervisor.has_child());
+        assert!(matches!(
+            supervisor.drain_for_switch().unwrap_err(),
+            SupervisorError::Busy | SupervisorError::Unavailable(_)
+        ));
+        assert!(supervisor.has_child());
+        let attach = supervisor
+            .attach_pending(FakeWorker::default(), Instant::now())
+            .unwrap_err();
+        assert!(matches!(attach, SupervisorError::Unavailable(_)));
+        if let Some(child) = supervisor.child_mut() {
+            child.ignore_cancel = true;
+        }
+        assert_eq!(supervisor.cancel().unwrap(), ReapOutcome::Unreaped);
+        assert!(matches!(
+            supervisor.drain_for_switch().unwrap_err(),
+            SupervisorError::Unavailable(_)
+        ));
+        assert!(supervisor.has_child());
     }
 
     #[test]

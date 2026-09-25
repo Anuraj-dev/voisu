@@ -452,14 +452,14 @@ pub fn select_resources(mode: AsrMode) -> AsrPathResources {
     match mode {
         AsrMode::Cloud => AsrPathResources::Cloud,
         AsrMode::Local => AsrPathResources::Local {
-            readiness: production_local_readiness(),
+            readiness: runtime_local_readiness(),
         },
     }
 }
 
-fn production_local_readiness() -> LocalReadiness {
+fn runtime_local_readiness() -> LocalReadiness {
     let _ = crate::local_model::observe_for_admission();
-    crate::local_routing::production_readiness()
+    crate::local_routing::runtime_readiness()
 }
 
 pub fn status_report(active: Option<AsrMode>) -> AsrModeStatus {
@@ -488,7 +488,7 @@ pub fn status_report_at(
             revision: Some(revision),
             local_readiness: match mode {
                 AsrMode::Cloud => LocalReadiness::Absent,
-                AsrMode::Local => production_local_readiness(),
+                AsrMode::Local => runtime_local_readiness(),
             },
             admission_error: None,
             audio_retention: Some(crate::local_recovery::audio_retention_label(

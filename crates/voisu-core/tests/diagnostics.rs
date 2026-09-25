@@ -6,14 +6,15 @@ use voisu_core::{
     ConfidenceArbitrationRejection, DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS, DebugAudioRecord,
     DiagnosticRecord, DiagnosticStore, EnglishEligibilityOutcome, IntentReconstructionDiagnostic,
     IntentReconstructionEligibility, IntentReconstructionEvidence, IntentReconstructionOutcome,
-    LifecycleStage, MAX_MODEL_ID_UTF8_BYTES, MAX_SMART_WRITING_DIAGNOSTIC_EDITS,
-    MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES, MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES,
-    MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES, PreparedTranscriptDecision, Provider,
-    ProviderCoordinator, ProviderFailure, ProviderFailureStage, ProviderStream, ProviderStreams,
-    REDACTED, RetentionPolicy, SMART_WRITING_DIAGNOSTIC_VERSION, SmartWritingDiagnostic,
-    SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode,
-    SourceTranscript, TEXT_SHA256_FINGERPRINT_LEN, Transcript, TranscriptDecision,
-    TranscriptSelection, TranscriptValidator, clamp_utf8_bytes, correlation_id, export_record,
+    LifecycleStage, LocalAsrDiagnostic, LocalAsrOutcome, MAX_MODEL_ID_UTF8_BYTES,
+    MAX_SMART_WRITING_DIAGNOSTIC_EDITS, MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES,
+    MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES, MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES,
+    PreparedTranscriptDecision, Provider, ProviderCoordinator, ProviderFailure,
+    ProviderFailureStage, ProviderStream, ProviderStreams, REDACTED, RetentionPolicy,
+    SMART_WRITING_DIAGNOSTIC_VERSION, SmartWritingDiagnostic, SmartWritingEditEvidence,
+    SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode, SourceTranscript,
+    TEXT_SHA256_FINGERPRINT_LEN, Transcript, TranscriptDecision, TranscriptSelection,
+    TranscriptValidator, clamp_utf8_bytes, correlation_id, export_record,
     is_text_sha256_fingerprint, replay_capture, text_sha256_fingerprint, unix_millis_now,
 };
 
@@ -1956,4 +1957,73 @@ fn confidence_arbitration_diagnostic_is_additive_on_the_record_wire() {
             ConfidenceArbitrationRejection::MeaningInvertingTokens,
         ]
     );
+}
+
+#[test]
+fn local_asr_diagnostic_is_additive_on_the_record_wire() {
+    let pre_local = r#"{
+        "correlation_id": "rec-1-8-1",
+        "recording_id": 8,
+        "recorded_at_unix_ms": 1
+    }"#;
+    let decoded: DiagnosticRecord = serde_json::from_str(pre_local).unwrap();
+    assert!(decoded.local_asr.is_none());
+
+    let mut record = DiagnosticRecord::new("rec-2-8-1".to_owned(), 8);
+    record.local_asr = Some(LocalAsrDiagnostic {
+        model_id: "qwen3-asr-0.6b".into(),
+        outcome: LocalAsrOutcome::Transcript,
+        runtime: Some("python".into()),
+        backend: Some("transformers".into()),
+        language: Some("auto".into()),
+        requested_device: Some("cuda:0".into()),
+        observed_device: Some("cuda:0".into()),
+        resident: Some(true),
+        manifest_hash: Some("ab".repeat(32)),
+        reason: None,
+        inference_ms: Some(412),
+        peak_host_ram_bytes: Some(1_048_576),
+        peak_gpu_memory_bytes: Some(891_289_600),
+    });
+    let encoded = serde_json::to_string(&record).unwrap();
+    assert!(encoded.contains("\"local_asr\""));
+    assert!(encoded.contains("qwen3-asr-0.6b"));
+    assert!(encoded.contains("\"inference_ms\":412"));
+    let decoded: DiagnosticRecord = serde_json::from_str(&encoded).unwrap();
+    let local = decoded.local_asr.expect("round-trips");
+    assert_eq!(local.model_id, "qwen3-asr-0.6b");
+    assert_eq!(local.outcome, LocalAsrOutcome::Transcript);
+    assert_eq!(local.inference_ms, Some(412));
+    assert_eq!(local.peak_gpu_memory_bytes, Some(891_289_600));
+}
+
+#[test]
+fn export_scrubs_secrets_from_local_asr_fields() {
+    let secret = "sk-local-secret";
+    let mut record = DiagnosticRecord::new("corr-local-export".to_owned(), 9);
+    record.local_asr = Some(LocalAsrDiagnostic {
+        model_id: format!("model-{secret}"),
+        outcome: LocalAsrOutcome::Error,
+        runtime: Some(format!("runtime-{secret}")),
+        backend: None,
+        language: None,
+        requested_device: None,
+        observed_device: Some(format!("cuda:{secret}")),
+        resident: Some(false),
+        manifest_hash: None,
+        reason: Some(format!("failed {secret}")),
+        inference_ms: None,
+        peak_host_ram_bytes: None,
+        peak_gpu_memory_bytes: None,
+    });
+    let export = export_record(
+        record,
+        vec![("VOISU_GROQ_API_KEY".to_owned(), secret.to_owned())],
+    );
+    let encoded = serde_json::to_string(&export).unwrap();
+    assert!(
+        !encoded.contains(secret),
+        "local_asr must not leak a secret: {encoded}"
+    );
+    assert!(encoded.contains(REDACTED), "{encoded}");
 }
