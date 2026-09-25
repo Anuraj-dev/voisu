@@ -28,6 +28,7 @@ const SYSTEMD_RUN: &str = "systemd-run";
 const SYSTEMCTL: &str = "systemctl";
 const MAX_REPLY_BYTES: usize = MAX_JSON_FRAME_BYTES;
 const MAX_ERROR_MESSAGE_BYTES: usize = 512;
+const DEV_WORKER_UNITS: &str = "voisu-dev-worker-*";
 static NEXT_UNIT: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
@@ -44,14 +45,21 @@ pub struct DevWorker {
     backend: Option<String>,
     peak_host_ram_bytes: Option<u64>,
     peak_gpu_memory_bytes: Option<u64>,
+    /// Set only once the unit is observed stopped and the wrapper reaped.
+    /// Until then `Drop` retries the stop, so an `Unreaped` cancel is not
+    /// forgotten.
+    unit_stopped: bool,
 }
 
 /// Runtime factory output used by the existing Caps Lock Local path.  The
 /// production Whisper adapter remains available, while an explicit private
 /// development manifest selects the supervised development adapter.
 pub fn refuse_if_development_worker_loaded() -> Result<(), SupervisorError> {
-    let units = active_development_worker_units()?;
-    if units.is_empty() {
+    refuse_if_units_live(DEV_WORKER_UNITS)
+}
+
+fn refuse_if_units_live(pattern: &str) -> Result<(), SupervisorError> {
+    if live_units(pattern)?.is_empty() {
         Ok(())
     } else {
         Err(SupervisorError::Busy)
@@ -105,6 +113,9 @@ impl DevWorker {
         {
             return Err(SupervisorError::Protocol(FrameError::CorrelationMismatch));
         }
+        // Only one development worker may hold the model/GPU at a time,
+        // including one that is still starting or being stopped.
+        refuse_if_development_worker_loaded()?;
         let unit = format!(
             "voisu-dev-worker-{}-{}",
             std::process::id(),
@@ -135,6 +146,7 @@ impl DevWorker {
             backend: None,
             peak_host_ram_bytes: None,
             peak_gpu_memory_bytes: None,
+            unit_stopped: false,
         })
     }
 
@@ -153,6 +165,8 @@ impl DevWorker {
             backend: None,
             peak_host_ram_bytes: None,
             peak_gpu_memory_bytes: None,
+            // Nothing was launched, so there is nothing for `Drop` to stop.
+            unit_stopped: true,
         }
     }
 
@@ -338,52 +352,63 @@ impl DevWorker {
         }
     }
 
-    fn unit_is_active(&self) -> bool {
-        Command::new(SYSTEMCTL)
-            .args(["--user", "is-active", "--quiet", &self.unit])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(true)
-    }
-
+    /// Stops the unit within `REAP_OBSERVE + CANCEL_GRACE`.  Liveness is
+    /// decided from the unit's `ActiveState` and the `systemd-run` wrapper,
+    /// never from `systemctl stop`'s exit status: a `--collect` unit whose
+    /// worker already exited is gone, and stopping it fails harmlessly.
     fn unit_stop(&mut self) -> ReapOutcome {
-        let stop_ok = Command::new(SYSTEMCTL)
-            .args(["--user", "stop", &self.unit])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        let Some(mut child) = self.child.take() else {
-            self.stdin.take();
-            self.stdout.take();
-            if !stop_ok || self.unit_is_active() {
-                return ReapOutcome::Unreaped;
-            }
-            return ReapOutcome::Exited;
-        };
+        // Closing the pipes lets a healthy worker see EOF and exit by itself.
         self.stdin.take();
         self.stdout.take();
-        let started = Instant::now();
-        while started.elapsed() < REAP_OBSERVE {
-            if child.try_wait().ok().flatten().is_some() {
-                if !stop_ok || self.unit_is_active() {
-                    return ReapOutcome::Unreaped;
-                }
-                return ReapOutcome::Exited;
-            }
-            std::thread::sleep(Duration::from_millis(5));
+        let observe = Instant::now() + REAP_OBSERVE;
+        // A blocking `stop` waits for the unit's whole TimeoutStopSec.
+        let _ = systemctl_until(&["stop", "--no-block", &self.unit], observe);
+        if self.wait_stopped(observe) {
+            return self.confirm_stopped(ReapOutcome::Exited);
         }
-        let _ = child.kill();
-        let deadline = Instant::now() + CANCEL_GRACE;
-        while Instant::now() < deadline {
-            if child.try_wait().ok().flatten().is_some() {
-                if !stop_ok || self.unit_is_active() {
-                    return ReapOutcome::Unreaped;
-                }
-                return ReapOutcome::Killed;
-            }
-            std::thread::sleep(Duration::from_millis(5));
+        let grace = Instant::now() + CANCEL_GRACE;
+        let _ = systemctl_until(&["kill", "--signal=SIGKILL", &self.unit], grace);
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
+        if self.wait_stopped(grace) {
+            return self.confirm_stopped(ReapOutcome::Killed);
         }
         ReapOutcome::Unreaped
+    }
+
+    fn wait_stopped(&mut self, deadline: Instant) -> bool {
+        loop {
+            if self.is_stopped(deadline) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn is_stopped(&mut self, deadline: Instant) -> bool {
+        let wrapper_exited = self
+            .child
+            .as_mut()
+            .is_none_or(|child| matches!(child.try_wait(), Ok(Some(_))));
+        wrapper_exited
+            && systemctl_until(
+                &["show", "--property=ActiveState", "--value", &self.unit],
+                deadline,
+            )
+            .is_some_and(|output| {
+                output.status.success()
+                    && state_is_stopped(String::from_utf8_lossy(&output.stdout).trim())
+            })
+    }
+
+    fn confirm_stopped(&mut self, outcome: ReapOutcome) -> ReapOutcome {
+        self.child = None;
+        self.unit_stopped = true;
+        outcome
     }
 }
 
@@ -457,10 +482,43 @@ impl WorkerChild for DevWorker {
 
 impl Drop for DevWorker {
     fn drop(&mut self) {
-        if self.child.is_some() {
+        if !self.unit_stopped {
             let _ = self.unit_stop();
         }
     }
+}
+
+/// Runs `systemctl --user` but gives up (and kills it) at `deadline`, so a
+/// slow user manager cannot stretch cancellation.  Only for short outputs.
+fn systemctl_until(args: &[&str], deadline: Instant) -> Option<std::process::Output> {
+    let mut child = Command::new(SYSTEMCTL)
+        .arg("--user")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// `inactive` and `failed` units have no processes left; every other state
+/// (`active`, `activating`, `deactivating`, `reloading`, ...) may still hold
+/// the worker.
+fn state_is_stopped(state: &str) -> bool {
+    matches!(state, "inactive" | "failed")
 }
 
 fn write_until(
@@ -468,12 +526,13 @@ fn write_until(
     bytes: &[u8],
     deadline: Instant,
 ) -> Result<(), SupervisorError> {
+    // POLLOUT only promises some free pipe space; a blocking write of a
+    // larger frame would then wait on the reader past the deadline.  With
+    // O_NONBLOCK the write takes what fits and returns EAGAIN otherwise.
+    set_nonblocking(writer.as_raw_fd())?;
     let mut offset = 0;
     while offset < bytes.len() {
         wait_fd(writer.as_raw_fd(), libc::POLLOUT, deadline)?;
-        // The poll above prevents a full pipe from making the daemon block;
-        // use the raw descriptor so the write remains bounded even when a
-        // frame is larger than the pipe buffer.
         let result = unsafe {
             libc::write(
                 writer.as_raw_fd(),
@@ -487,14 +546,23 @@ fn write_until(
             return Err(SupervisorError::Crashed);
         } else {
             let error = std::io::Error::last_os_error();
-            if error.kind() != ErrorKind::Interrupted {
-                return Err(if error.kind() == ErrorKind::WouldBlock {
-                    SupervisorError::TimedOut
-                } else {
-                    SupervisorError::Crashed
-                });
+            if !matches!(error.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) {
+                return Err(SupervisorError::Crashed);
             }
         }
+    }
+    Ok(())
+}
+
+fn set_nonblocking(fd: std::os::fd::RawFd) -> Result<(), SupervisorError> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(SupervisorError::Crashed);
+    }
+    if flags & libc::O_NONBLOCK == 0
+        && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(SupervisorError::Crashed);
     }
     Ok(())
 }
@@ -533,17 +601,18 @@ fn read_until(
 }
 
 fn wait_fd(fd: std::os::fd::RawFd, events: i16, deadline: Instant) -> Result<(), SupervisorError> {
-    let timeout = deadline.saturating_duration_since(Instant::now());
-    if timeout.is_zero() {
-        return Err(SupervisorError::TimedOut);
-    }
-    let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
     let mut pollfd = libc::pollfd {
         fd,
         events,
         revents: 0,
     };
     loop {
+        // Recomputed per attempt so EINTR retries cannot extend the deadline.
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return Err(SupervisorError::TimedOut);
+        }
+        let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
         let result = unsafe { libc::poll(&mut pollfd, 1, millis) };
         if result > 0 && pollfd.revents & (libc::POLLIN | libc::POLLOUT) != 0 {
             return Ok(());
@@ -602,16 +671,17 @@ fn default_cache_path(model_path: &Path) -> PathBuf {
     }
 }
 
-fn active_development_worker_units() -> Result<Vec<String>, SupervisorError> {
+/// Loaded units matching `pattern` that may still hold a worker.
+fn live_units(pattern: &str) -> Result<Vec<String>, SupervisorError> {
     let output = Command::new(SYSTEMCTL)
         .args([
             "--user",
             "list-units",
+            "--all",
             "--type=service",
-            "--state=active",
             "--plain",
             "--no-legend",
-            "voisu-dev-worker-*",
+            pattern,
         ])
         .output()
         .map_err(|_| SupervisorError::Unavailable("cannot list development worker units"))?;
@@ -620,15 +690,19 @@ fn active_development_worker_units() -> Result<Vec<String>, SupervisorError> {
             "cannot list development worker units",
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout
+    Ok(parse_live_units(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Parses `list-units --plain --no-legend` rows (`UNIT LOAD ACTIVE SUB ...`).
+fn parse_live_units(listing: &str) -> Vec<String> {
+    listing
         .lines()
         .filter_map(|line| {
-            let name = line.split_whitespace().next()?;
-            name.starts_with("voisu-dev-worker-")
-                .then(|| name.trim().to_owned())
+            let mut columns = line.split_whitespace().skip_while(|column| *column == "●");
+            let (name, load, active) = (columns.next()?, columns.next()?, columns.next()?);
+            (load == "loaded" && !state_is_stopped(active)).then(|| name.to_owned())
         })
-        .collect())
+        .collect()
 }
 
 fn systemd_run_args(
@@ -1010,5 +1084,243 @@ mod tests {
             error,
             SupervisorError::Protocol(FrameError::InvalidJson)
         ));
+    }
+
+    #[test]
+    fn write_until_times_out_on_a_stalled_reader() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let frame = vec![0u8; MAX_PCM_BYTES];
+        let started = Instant::now();
+        let result = write_until(&mut stdin, &frame, started + Duration::from_millis(200));
+        let elapsed = started.elapsed();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(result, Err(SupervisorError::TimedOut));
+        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn write_until_delivers_every_byte_to_a_healthy_reader() {
+        let mut child = Command::new("wc")
+            .arg("-c")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let frame: Vec<u8> = (0..MAX_PCM_BYTES).map(|i| i as u8).collect();
+        write_until(&mut stdin, &frame, Instant::now() + Duration::from_secs(30)).unwrap();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            MAX_PCM_BYTES.to_string()
+        );
+    }
+
+    #[test]
+    fn live_units_ignore_stopped_and_unloaded_rows() {
+        let listing = "\
+voisu-dev-worker-1-1.service loaded active running [systemd-run] python
+voisu-dev-worker-1-2.service loaded activating start [systemd-run] python
+voisu-dev-worker-1-3.service loaded deactivating stop-sigterm [systemd-run] python
+voisu-dev-worker-1-4.service loaded inactive dead [systemd-run] python
+\u{25cf} voisu-dev-worker-1-5.service loaded failed failed [systemd-run] python
+voisu-dev-worker-1-6.service not-found inactive dead voisu-dev-worker-1-6.service
+";
+        assert_eq!(
+            parse_live_units(listing),
+            [
+                "voisu-dev-worker-1-1.service",
+                "voisu-dev-worker-1-2.service",
+                "voisu-dev-worker-1-3.service",
+            ]
+        );
+    }
+
+    /// Transient user unit owned by one test.  Its names never match
+    /// `voisu-dev-worker-*`, so the live development service is unaffected.
+    struct TestUnit(String);
+
+    impl TestUnit {
+        fn name(tag: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            Self(format!(
+                "voisu-test-{tag}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ))
+        }
+
+        /// With `wait`, returns the running `systemd-run --wait` wrapper, as
+        /// `launch` does; otherwise waits for the unit to be started.
+        fn run(&self, wait: bool, extra: &[&str], command: &[&str]) -> Option<Child> {
+            let mut run = Command::new(SYSTEMD_RUN);
+            run.args(["--user", "--quiet", "--collect"])
+                .args(wait.then_some("--wait"))
+                .arg(format!("--unit={}", self.0))
+                .args(extra)
+                .arg("--")
+                .args(command)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if wait {
+                return Some(run.spawn().unwrap());
+            }
+            assert!(run.status().unwrap().success());
+            None
+        }
+
+        fn state(&self) -> String {
+            let output = Command::new(SYSTEMCTL)
+                .args([
+                    "--user",
+                    "show",
+                    "--property=ActiveState",
+                    "--value",
+                    &self.0,
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        fn wait_for_state(&self, state: &str) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if self.state() == state {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        }
+
+        fn worker(&self, child: Option<Child>) -> DevWorker {
+            let mut worker = DevWorker::for_test(test_manifest("cpu"), "h");
+            worker.unit = self.0.clone();
+            worker.child = child;
+            worker.unit_stopped = false;
+            worker
+        }
+    }
+
+    impl Drop for TestUnit {
+        fn drop(&mut self) {
+            for args in [
+                ["kill", "--signal=SIGKILL", self.0.as_str()],
+                ["stop", "--no-block", self.0.as_str()],
+            ] {
+                let _ = Command::new(SYSTEMCTL)
+                    .arg("--user")
+                    .args(args)
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let _ = Command::new(SYSTEMCTL)
+                .args(["--user", "reset-failed", &self.0])
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    fn user_manager_available() -> bool {
+        let available = Command::new(SYSTEMCTL)
+            .args(["--user", "show-environment"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !available {
+            eprintln!("skipping: no systemd user manager");
+        }
+        available
+    }
+
+    #[test]
+    fn cancel_is_bounded_when_the_unit_ignores_its_stop_signal() {
+        if !user_manager_available() {
+            return;
+        }
+        let unit = TestUnit::name("slow-stop");
+        // SIGCONT as the stop signal makes `systemctl stop` wait the full
+        // 90 s TimeoutStopSec, like a worker stuck in a CUDA call.
+        let wrapper = unit
+            .run(
+                true,
+                &[
+                    "--property=KillSignal=SIGCONT",
+                    "--property=TimeoutStopSec=90",
+                ],
+                &["/bin/sleep", "60"],
+            )
+            .unwrap();
+        assert!(unit.wait_for_state("active"));
+        let mut worker = unit.worker(Some(wrapper));
+        let started = Instant::now();
+        let outcome = worker.unit_stop();
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, ReapOutcome::Killed);
+        assert!(
+            elapsed < REAP_OBSERVE + CANCEL_GRACE + Duration::from_secs(1),
+            "took {elapsed:?}"
+        );
+        assert!(state_is_stopped(&unit.state()));
+        assert!(worker.unit_stopped);
+    }
+
+    #[test]
+    fn cancel_after_the_collected_unit_exited_reports_exited() {
+        if !user_manager_available() {
+            return;
+        }
+        let unit = TestUnit::name("gone");
+        let mut wrapper = unit.run(true, &[], &["/bin/true"]).unwrap();
+        wrapper.wait().unwrap();
+        let mut worker = unit.worker(Some(wrapper));
+        assert_eq!(worker.unit_stop(), ReapOutcome::Exited);
+        assert!(worker.unit_stopped);
+    }
+
+    #[test]
+    fn drop_stops_a_unit_that_was_never_confirmed_stopped() {
+        if !user_manager_available() {
+            return;
+        }
+        let unit = TestUnit::name("drop");
+        assert!(unit.run(false, &[], &["/bin/sleep", "60"]).is_none());
+        assert!(unit.wait_for_state("active"));
+        // No wrapper left, as after an earlier cancel that took it.
+        drop(unit.worker(None));
+        assert!(state_is_stopped(&unit.state()));
+    }
+
+    #[test]
+    fn busy_while_a_matching_unit_is_still_activating() {
+        if !user_manager_available() {
+            return;
+        }
+        let unit = TestUnit::name("busy");
+        let pattern = format!("{}*", unit.0);
+        assert_eq!(refuse_if_units_live(&pattern), Ok(()));
+        assert!(
+            unit.run(
+                false,
+                &["--no-block", "--property=Type=oneshot"],
+                &["/bin/sleep", "60"],
+            )
+            .is_none()
+        );
+        assert!(unit.wait_for_state("activating"));
+        assert_eq!(refuse_if_units_live(&pattern), Err(SupervisorError::Busy));
+        let mut worker = unit.worker(None);
+        assert_ne!(worker.unit_stop(), ReapOutcome::Unreaped);
+        assert_eq!(refuse_if_units_live(&pattern), Ok(()));
     }
 }
