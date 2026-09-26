@@ -1,10 +1,10 @@
 # Local GPU development and ASR evaluation
 
-This is a private development workflow for the seven local ASR candidates. It does not select a production model, alter the frozen #267 corpus, or upload audio and transcript text. Keep every output path in a private local directory; the JSON files contain absolute audio paths, adjudicated references, and raw model text.
+This is a private development workflow for the local ASR candidates. It does not select a production model, alter the frozen #267 corpus, or upload audio and transcript text. Keep every output path in a private local directory; the JSON files contain absolute audio paths, adjudicated references, and raw model text.
 
 The benchmark treats English and Latin-script Hinglish as separate languages. A Hinglish reference preserves Hindi words written in Latin letters; it is not an English translation. Strict WER uses Unicode normalization, case folding, punctuation removal, and tokenization only. It never transliterates or asks an LLM to rewrite text. An optional versioned token map produces a second spelling-normalized measure beside strict WER.
 
-The seven model IDs are:
+The original seven model IDs are (six low-VRAM candidates are listed under *Low-VRAM candidates*):
 
 ```text
 nemotron-3.5-0.6b
@@ -144,6 +144,38 @@ These three stay in the development catalog even if another candidate scores bet
 - `fun-asr-nano-2512` is Fun-ASR-Nano-2512 only. Fun-ASR-MLT-Nano is a different checkpoint and is rejected. The native CPU profile is the documented llama.cpp encoder (`funasr-encoder-f16.gguf`) plus Qwen3-0.6B decoder GGUF from `FunAudioLLM/Fun-ASR-Nano-GGUF` revision `46e849502a867080d66d351b8dfb1018b607e509`, runtime `runtime-llamacpp-v0.2.6` (`funasr-llamacpp-linux-x64-avx2`). Linux llama.cpp packages have no Fun-ASR-Nano CUDA backend (CUDA zips are Windows-only); a CUDA request uses `FunAudioLLM/Fun-ASR-Nano-2512-hf` revision `d93b302ee7fd505e1b3576120fc142fc6f7820e1` through Transformers 5.17.0 rather than CPU spill.
 - `moonshine-streaming-medium` is CPU-first English. Official moonshine-voice Medium Streaming artifacts from `https://download.moonshine.ai/model/medium-streaming-en/quantized` are `encoder.ort`, `adapter.ort`, `cross_kv.ort`, `decoder_kv.ort`, `frontend.ort`, `streaming_config.json`, and `tokenizer.bin` with `model_arch=MEDIUM_STREAMING`. The Hugging Face Transformers safetensors checkpoint is not this adapter. The older non-streaming `encoder_model.ort` / `decoder_model_merged.ort` names 404 for this model.
 - `cohere-transcribe-03-2026` is English-only here. Upstream lists 14 languages and does not include Hindi. Hugging Face revision `b1eacc2686a3d08ceaae5f24a88b1d519620bc09` is gated (`gated=auto`); a 2026-09-22 fetch of `config.json` returned HTTP 401 `x-error-code: GatedRepo`. Inference still requires local artifacts and no network.
+
+## Low-VRAM candidates
+
+Six more development models target a 4 GB VRAM floor and CPU-only hosts. Each keeps one model resident in the worker. Identity pins (revision, weights SHA-256, size) live in `tools/local-asr/voisu_asr/candidates.py` and `CANDIDATE_PINS` in `crates/voisu-app/src/local_model/development.rs`; install notes are under `tools/local-asr/runtimes/{whisper-cpp,faster-whisper,granite-transformers}/`.
+
+| Model ID | Runtime | Languages | Source |
+|---|---|---|---|
+| `whisper-cpp-large-v3-turbo-q5-0` | whisper.cpp 1.8.5 via pywhispercpp 1.5.1 (CUDA 13.3 build, sm_120) | en, auto | `ggerganov/whisper.cpp` `ggml-large-v3-turbo-q5_0.bin` |
+| `whisper-cpp-small-q8-0` | same | en, auto | `ggerganov/whisper.cpp` `ggml-small-q8_0.bin` |
+| `faster-whisper-large-v3-turbo-int8` | CTranslate2 4.8.2 via faster-whisper 1.2.1 | en, auto | `mobiuslabsgmbh/faster-whisper-large-v3-turbo` (now `dropbox-dash/…`) |
+| `whisper-hindi2hinglish-apex-int8` | same | en, hi | `Oriserve/Whisper-Hindi2Hinglish-Apex`, converted with `ct2-transformers-converter` |
+| `distil-large-v3.5-int8` | same | en | `distil-whisper/distil-large-v3.5-ct2` |
+| `granite-speech-5.0-470m-turboctc` | Transformers 5.17.0 + torch 2.9.1+cu128 | en | `ibm-granite/granite-speech-5.0-470m-turboctc` |
+
+`hi` on the Hinglish model means Latin-script Hinglish; the model writes it under Whisper's English token, so both languages decode with `en`. Vanilla Whisper `hi` would write Devanagari, so the other Whisper candidates do not advertise it. Granite output has no casing or punctuation (CTC). All licenses are MIT or Apache-2.0 and none of the repositories is gated.
+
+Decoding is fixed and repeatable: temperature 0.0 with no temperature fallback. CTranslate2 uses beam 5 / best-of 5. whisper.cpp 1.8.5 decodes greedily with flash attention off, because its beam search gave a different transcript on each of three runs of one clip (CUDA and CPU), and greedy with flash attention looped into repeated text. Each model runs only at its measured precision (CTranslate2 `int8_float16` on CUDA, `int8` on CPU; Granite `bfloat16` / `float32`), and a CUDA manifest may not set `vram_bytes` below the measured peak. Every file a loader reads (weights, config, tokenizer, preprocessor, vocabulary) is pinned by SHA-256 and size.
+
+Measured on the RTX 5050 Laptop host on 2026-09-26 through `voisu local-dev replay` (protected worker, `PrivateNetwork=yes`), CUDA: the JFK health clip (11 s), then one 62 s private clip twice. Both 62 s runs returned identical text for every model.
+
+| Model ID | Load ms (spawn + health) | JFK ms | 62 s ms | Peak VRAM MiB | Worker cgroup peak |
+|---|---|---|---|---|---|
+| `whisper-cpp-large-v3-turbo-q5-0` | 1508 | 407 | 1638 | 1186 | 529 MiB |
+| `whisper-cpp-small-q8-0` | 773 | 175 | 559 | 786 | 407 MiB |
+| `faster-whisper-large-v3-turbo-int8` | 3156 | 301 | 1184 | 1152 | 1.8 GiB |
+| `whisper-hindi2hinglish-apex-int8` | 2802 | 302 | 899 | 1154 | 1.7 GiB |
+| `distil-large-v3.5-int8` | 2698 | 288 | 894 | 1088 | 1.6 GiB |
+| `granite-speech-5.0-470m-turboctc` | 5399 | 29 | 113 | 1114 | 2.3 GiB |
+
+CPU (4 threads, same clips, scratch driver): 62 s clip in 6.7 s (whisper.cpp small, greedy), 18 s (faster-whisper turbo), about 10 s (Apex, distil, beam 5, before the decoding change), 1.9 s (Granite; peak RAM 3.6 GiB). Install footprint, excluding the shared 105 MB CPython: whisper.cpp venv 820 MB (715 MB of it CUDA libraries), faster-whisper venv 2.3 GB (1.9 GB CUDA libraries), Granite venv 7.2 GB (torch and CUDA libraries). Weights: 574 MB, 264 MB, 1.62 GB, 1.62 GB, 1.52 GB, 947 MB in table order.
+
+These are timing and memory measurements, not quality. Without temperature fallback nothing retries a repetition loop: faster-whisper turbo on CPU (`int8`) and on CUDA `float16` repeats one segment past the end of the 62 s clip (145 words), while CUDA `int8_float16` stops cleanly at 64 words but transcribes far less of the 28–43 s window than CPU `float32`. Quality needs the adjudicated corpus.
 
 ## Current blockers
 

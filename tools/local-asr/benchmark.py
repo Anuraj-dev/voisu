@@ -41,6 +41,12 @@ EXPECTED_MODELS = (
     "fun-asr-nano-2512",
     "moonshine-streaming-medium",
     "cohere-transcribe-03-2026",
+    "whisper-cpp-large-v3-turbo-q5-0",
+    "whisper-cpp-small-q8-0",
+    "faster-whisper-large-v3-turbo-int8",
+    "whisper-hindi2hinglish-apex-int8",
+    "distil-large-v3.5-int8",
+    "granite-speech-5.0-470m-turboctc",
 )
 MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,96}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")

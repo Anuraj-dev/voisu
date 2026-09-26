@@ -1,0 +1,12 @@
+# Isolated Transformers runtime for granite-speech-5.0-470m-turboctc
+# (English only). Transformers >=5.16 supports the model natively
+# (model_type granite_speech5_ctc); no remote code is executed. The feature
+# extractor needs torchaudio.
+# Install with:
+#   uv pip install --python $VENV/bin/python --index-url https://download.pytorch.org/whl/cu128 \
+#     --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match \
+#     torch==2.9.1+cu128 torchaudio==2.9.1+cu128 transformers==5.17.0 numpy
+# A native alternative (transcribe.cpp GGUF) exists upstream but was not built.
+torch==2.9.1+cu128
+torchaudio==2.9.1+cu128
+transformers==5.17.0

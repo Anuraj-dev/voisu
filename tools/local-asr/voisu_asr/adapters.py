@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 from .audio import pcm_to_float32, write_pcm16_wav
+from .candidates import CANDIDATES
 from .manifest import (
     COHERE_HF_REV,
     FUN_ASR_DECODER_Q8_NAME,
@@ -1620,6 +1621,17 @@ ADAPTER_LOADERS: dict[str, AdapterLoader] = {
     "moonshine-streaming-medium": MoonshineAdapter,
     "cohere-transcribe-03-2026": CohereTransformersAdapter,
 }
+
+
+def _candidate_adapter(manifest: Manifest) -> BaseAdapter:
+    # Low-VRAM candidates (whisper.cpp, CTranslate2, Granite CTC) live in their
+    # own module, which imports this one; load it on first use.
+    from .candidate_adapters import create_candidate_adapter
+
+    return create_candidate_adapter(manifest)
+
+
+ADAPTER_LOADERS.update({model_id: _candidate_adapter for model_id in CANDIDATES})
 
 
 def create_adapter(manifest: Manifest, loaders: dict[str, AdapterLoader] | None = None) -> BaseAdapter:

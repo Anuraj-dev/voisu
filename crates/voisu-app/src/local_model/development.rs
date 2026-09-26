@@ -25,7 +25,7 @@ pub const DEVELOPMENT_RUNTIME_REVISION_MAX_BYTES: usize = 256;
 
 /// IDs are fixed here so a malformed or unreviewed manifest cannot introduce
 /// an arbitrary executable model into the selector.
-pub const DEV_MODEL_IDS: [&str; 7] = [
+pub const DEV_MODEL_IDS: [&str; 13] = [
     "nemotron-3.5-0.6b",
     "parakeet-tdt-0.6b-v3",
     "qwen3-asr-0.6b",
@@ -33,6 +33,12 @@ pub const DEV_MODEL_IDS: [&str; 7] = [
     "fun-asr-nano-2512",
     "moonshine-streaming-medium",
     "cohere-transcribe-03-2026",
+    "whisper-cpp-large-v3-turbo-q5-0",
+    "whisper-cpp-small-q8-0",
+    "faster-whisper-large-v3-turbo-int8",
+    "whisper-hindi2hinglish-apex-int8",
+    "distil-large-v3.5-int8",
+    "granite-speech-5.0-470m-turboctc",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +68,11 @@ pub struct DevCatalogEntry {
 
 const EN: &[&str] = &["en"];
 const EN_HI_AUTO: &[&str] = &["en", "hi", "auto"];
+const EN_AUTO: &[&str] = &["en", "auto"];
+/// `hi` is Latin-script Hinglish, which this model writes under Whisper's `en` token.
+const EN_HINGLISH: &[&str] = &["en", "hi"];
+// Candidate limits below are the measured RTX 5050 peaks (2026-09-26, clips up
+// to 62 s) plus margin; see the registered manifests.
 const CPU_CUDA: &[&str] = &["cpu", "cuda:0"];
 const CPU_ONLY: &[&str] = &["cpu"];
 
@@ -122,6 +133,54 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
         memory_bytes: 8 * 1024 * 1024 * 1024,
         vram_bytes: 4 * 1024 * 1024 * 1024,
     },
+    DevCatalogEntry {
+        model_id: "whisper-cpp-large-v3-turbo-q5-0",
+        runtime: DevRuntimeKind::Native,
+        languages: EN_AUTO,
+        devices: CPU_CUDA,
+        memory_bytes: 2048 * 1024 * 1024,
+        vram_bytes: 1536 * 1024 * 1024,
+    },
+    DevCatalogEntry {
+        model_id: "whisper-cpp-small-q8-0",
+        runtime: DevRuntimeKind::Native,
+        languages: EN_AUTO,
+        devices: CPU_CUDA,
+        memory_bytes: 2048 * 1024 * 1024,
+        vram_bytes: 1280 * 1024 * 1024,
+    },
+    DevCatalogEntry {
+        model_id: "faster-whisper-large-v3-turbo-int8",
+        runtime: DevRuntimeKind::Native,
+        languages: EN_AUTO,
+        devices: CPU_CUDA,
+        memory_bytes: 3072 * 1024 * 1024,
+        vram_bytes: 2048 * 1024 * 1024,
+    },
+    DevCatalogEntry {
+        model_id: "whisper-hindi2hinglish-apex-int8",
+        runtime: DevRuntimeKind::Native,
+        languages: EN_HINGLISH,
+        devices: CPU_CUDA,
+        memory_bytes: 3072 * 1024 * 1024,
+        vram_bytes: 2048 * 1024 * 1024,
+    },
+    DevCatalogEntry {
+        model_id: "distil-large-v3.5-int8",
+        runtime: DevRuntimeKind::Native,
+        languages: EN,
+        devices: CPU_CUDA,
+        memory_bytes: 3072 * 1024 * 1024,
+        vram_bytes: 2048 * 1024 * 1024,
+    },
+    DevCatalogEntry {
+        model_id: "granite-speech-5.0-470m-turboctc",
+        runtime: DevRuntimeKind::Python,
+        languages: EN,
+        devices: CPU_CUDA,
+        memory_bytes: 4096 * 1024 * 1024,
+        vram_bytes: 1792 * 1024 * 1024,
+    },
 ];
 
 /// Requested Fun-ASR Nano checkpoint. Fun-ASR-MLT-Nano is a different model.
@@ -152,6 +211,218 @@ pub const QWEN_REQUIRED_FILES: [&str; 6] = [
     "tokenizer_config.json",
 ];
 pub const MOONSHINE_MEDIUM_ARCH: &str = "MEDIUM_STREAMING";
+
+/// Low-VRAM candidate identity: the upstream revision, every file the loader
+/// reads (name under the model root, SHA-256, size), the peak VRAM measured on
+/// the RTX 5050 (a CUDA manifest may not admit less), and the precision option
+/// it was measured at. Mirrors `tools/local-asr/voisu_asr/candidates.py`.
+#[derive(Clone, Copy, Debug)]
+pub struct CandidatePin {
+    pub model_id: &'static str,
+    pub revision: &'static str,
+    /// The file the runtime loads as the model; whisper.cpp names it as model_path.
+    pub weights: &'static str,
+    pub files: &'static [(&'static str, &'static str, u64)],
+    pub min_vram_bytes: u64,
+    /// (option key, CUDA value, CPU value); any other value was never measured.
+    pub precision: Option<(&'static str, &'static str, &'static str)>,
+}
+
+/// Whisper-Hindi2Hinglish-Apex has no published CTranslate2 build; its files
+/// are the reproducible float16 `ct2-transformers-converter` output of the
+/// pinned revision (see `tools/local-asr/runtimes/faster-whisper`).
+pub static CANDIDATE_PINS: &[CandidatePin] = &[
+    CandidatePin {
+        model_id: "whisper-cpp-large-v3-turbo-q5-0",
+        revision: "5359861c739e955e79d9a303bcbc70fb988958b1",
+        weights: "ggml-large-v3-turbo-q5_0.bin",
+        files: &[(
+            "ggml-large-v3-turbo-q5_0.bin",
+            "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+            574_041_195,
+        )],
+        min_vram_bytes: 1186 * 1024 * 1024,
+        precision: None,
+    },
+    CandidatePin {
+        model_id: "whisper-cpp-small-q8-0",
+        revision: "5359861c739e955e79d9a303bcbc70fb988958b1",
+        weights: "ggml-small-q8_0.bin",
+        files: &[(
+            "ggml-small-q8_0.bin",
+            "49c8fb02b65e6049d5fa6c04f81f53b867b5ec9540406812c643f177317f779f",
+            264_464_607,
+        )],
+        min_vram_bytes: 786 * 1024 * 1024,
+        precision: None,
+    },
+    CandidatePin {
+        model_id: "faster-whisper-large-v3-turbo-int8",
+        revision: "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
+        weights: "model.bin",
+        files: &[
+            (
+                "config.json",
+                "b0253ea6c0d3bea6b1e19e91a02acfd3b53f4467362efcb5a3e6b16c9b3a9b7e",
+                2_263,
+            ),
+            (
+                "model.bin",
+                "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da",
+                1_617_884_929,
+            ),
+            (
+                "preprocessor_config.json",
+                "7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711",
+                340,
+            ),
+            (
+                "tokenizer.json",
+                "297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd",
+                2_710_337,
+            ),
+            (
+                "vocabulary.json",
+                "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1",
+                1_068_114,
+            ),
+        ],
+        min_vram_bytes: 1280 * 1024 * 1024,
+        precision: Some(("compute_type", "int8_float16", "int8")),
+    },
+    CandidatePin {
+        model_id: "whisper-hindi2hinglish-apex-int8",
+        revision: "f3214eed20b4e4d4144e739982d911f87b9cb223",
+        weights: "model.bin",
+        files: &[
+            (
+                "config.json",
+                "a0feddc18de0c285ed147e5483c8d1bc911bd45e23104ae0726d79594e7a6b1d",
+                3_300,
+            ),
+            (
+                "model.bin",
+                "1a47e83dbb61709cb703159c4ca16dae4f2d33bffab1f21d7615c4d0b46786b2",
+                1_617_884_929,
+            ),
+            (
+                "preprocessor_config.json",
+                "654cf18d3e163b948ceaf9766da56ce0b52de265d58673cf61c9376f126bd499",
+                357,
+            ),
+            (
+                "tokenizer.json",
+                "5c1bf30c9e716e1477bedef846b01be0013daecb89e9e3ef7ab89b23c178df1b",
+                3_930_645,
+            ),
+            (
+                "vocabulary.json",
+                "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1",
+                1_068_114,
+            ),
+        ],
+        min_vram_bytes: 1314 * 1024 * 1024,
+        precision: Some(("compute_type", "int8_float16", "int8")),
+    },
+    CandidatePin {
+        model_id: "distil-large-v3.5-int8",
+        revision: "9793ccc07920e0f830e1dba0343efcdf0ef8c903",
+        weights: "model.bin",
+        files: &[
+            (
+                "config.json",
+                "90c55f775cc4e0bb17293d0bf12f96557a486f20dea886fabd8e6075a3588b21",
+                2_690,
+            ),
+            (
+                "model.bin",
+                "c58b88b8585ffcd2135fddaaf421ce72cb223b32edea70d156aed1dea319a119",
+                1_512_927_867,
+            ),
+            (
+                "preprocessor_config.json",
+                "7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711",
+                340,
+            ),
+            (
+                "tokenizer.json",
+                "b3c8202bbf06d8ee4232c5984baa563784ac4737e2e7fdc42fa180200d3cfcdb",
+                2_480_645,
+            ),
+            (
+                "vocabulary.json",
+                "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1",
+                1_068_114,
+            ),
+        ],
+        min_vram_bytes: 1248 * 1024 * 1024,
+        precision: Some(("compute_type", "int8_float16", "int8")),
+    },
+    CandidatePin {
+        model_id: "granite-speech-5.0-470m-turboctc",
+        revision: "286456107c8ba1161f5c22dfe85466402c88333b",
+        weights: "model.safetensors",
+        files: &[
+            (
+                "config.json",
+                "41b72a7596bebe5106573f9e0f64c6b0acdac145373386946e7d1ef277fe0c9f",
+                926,
+            ),
+            (
+                "generation_config.json",
+                "e9eef52b79e24b329889157f75e02aea236c429552a4a986dd5fffb349809208",
+                158,
+            ),
+            (
+                "model.safetensors",
+                "8b98a8c34fd5fcb081caef719638eded31bb6d197d62053eefc5c1703aaf1ad4",
+                946_180_704,
+            ),
+            (
+                "preprocessor_config.json",
+                "4ff826570a74cd33092d467b16eb1c5c22c46c6f1b78a35aed1decdf90f4a3fe",
+                327,
+            ),
+            (
+                "processor_config.json",
+                "3d7c14d3ed7a5218b2fd6797eaa5b3aa615c681938bd1734a510d7a6f8c1b9fb",
+                430,
+            ),
+            (
+                "tokenizer.json",
+                "3ee80b02f0119a040a70eb909c20fac8271c173d7e71d195a3b35f77780061e6",
+                1_137_492,
+            ),
+            (
+                "tokenizer_config.json",
+                "5c7ddc8d2a6b0f6b009e0a7629af67f5d29a98d5e722fe435cf1be2da84c778f",
+                222,
+            ),
+        ],
+        min_vram_bytes: 1114 * 1024 * 1024,
+        precision: Some(("dtype", "bfloat16", "float32")),
+    },
+];
+
+#[cfg(test)]
+thread_local! {
+    /// Lets a test stand in a candidate identity whose digests are real bytes.
+    static CANDIDATE_PIN_OVERRIDE: std::cell::Cell<Option<CandidatePin>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn candidate_pin(model_id: &str) -> Option<CandidatePin> {
+    #[cfg(test)]
+    if let Some(pin) = CANDIDATE_PIN_OVERRIDE.get()
+        && pin.model_id == model_id
+    {
+        return Some(pin);
+    }
+    CANDIDATE_PINS
+        .iter()
+        .find(|pin| pin.model_id == model_id)
+        .copied()
+}
 pub const MOONSHINE_MEDIUM_PINS: [(&str, &str, u64); 7] = [
     (
         "encoder.ort",
@@ -604,6 +875,11 @@ impl DevManifest {
                     ));
                 }
             }
+            model_id if candidate_pin(model_id).is_some() => {
+                if let Some(pin) = candidate_pin(model_id) {
+                    self.validate_candidate_identity(&pin)?;
+                }
+            }
             "cohere-transcribe-03-2026" => {
                 match self
                     .options
@@ -624,6 +900,41 @@ impl DevManifest {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn validate_candidate_identity(&self, pin: &CandidatePin) -> Result<(), DevelopmentError> {
+        let model_id = pin.model_id;
+        let option = |key: &str| self.options.get(key).and_then(serde_json::Value::as_str);
+        if option("revision") != Some(pin.revision) {
+            return Err(DevelopmentError::Invalid(format!(
+                "{model_id} requires revision {}",
+                pin.revision
+            )));
+        }
+        let path = Path::new(&self.model_path);
+        if path.is_file() && path.file_name() != Some(pin.weights.as_ref()) {
+            return Err(DevelopmentError::Invalid(format!(
+                "{model_id} model_path must be {}",
+                pin.weights
+            )));
+        }
+        let cuda = self.device.starts_with("cuda:");
+        if let Some((key, on_cuda, on_cpu)) = pin.precision {
+            let measured = if cuda { on_cuda } else { on_cpu };
+            if self.options.contains_key(key) && option(key) != Some(measured) {
+                return Err(DevelopmentError::Invalid(format!(
+                    "{model_id} on {} was measured only at {key}={measured}",
+                    self.device
+                )));
+            }
+        }
+        if cuda && self.limits.vram_bytes < pin.min_vram_bytes {
+            return Err(DevelopmentError::Invalid(format!(
+                "{model_id} vram_bytes {} is below its measured peak {}",
+                self.limits.vram_bytes, pin.min_vram_bytes
+            )));
         }
         Ok(())
     }
@@ -720,7 +1031,14 @@ impl DevManifest {
                     self.require_published_path_pin(&root.join(name), sha, bytes, name)?;
                 }
             }
-            _ => {}
+            model_id => {
+                if let Some(pin) = candidate_pin(model_id) {
+                    let root = model_artifact_root(&self.model_path);
+                    for &(name, sha, bytes) in pin.files {
+                        self.require_published_path_pin(&root.join(name), sha, bytes, name)?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1198,8 +1516,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_contains_exactly_the_seven_requested_models() {
-        assert_eq!(development_catalog().len(), 7);
+    fn catalog_contains_exactly_the_requested_models() {
+        assert_eq!(development_catalog().len(), DEV_MODEL_IDS.len());
         assert_eq!(
             development_catalog()
                 .iter()
@@ -1207,6 +1525,149 @@ mod tests {
                 .collect::<Vec<_>>(),
             DEV_MODEL_IDS
         );
+    }
+
+    #[test]
+    fn candidate_published_pins_are_well_formed() {
+        let hex = |text: &str, len| {
+            text.len() == len
+                && text
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        };
+        for pin in CANDIDATE_PINS {
+            let entry = development_catalog_entry(pin.model_id).unwrap();
+            assert!(hex(pin.revision, 40), "{}", pin.model_id);
+            assert!(pin.files.iter().any(|file| file.0 == pin.weights));
+            let mut names: Vec<_> = pin.files.iter().map(|file| file.0).collect();
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(names.len(), pin.files.len(), "{}", pin.model_id);
+            for &(name, sha, bytes) in pin.files {
+                assert!(hex(sha, 64) && bytes > 0, "{} {name}", pin.model_id);
+            }
+            assert!(pin.min_vram_bytes > 0);
+            assert!(pin.min_vram_bytes <= entry.vram_bytes, "{}", pin.model_id);
+            assert!(entry.vram_bytes < 8151u64 * 1024 * 1024 * 75 / 100);
+        }
+        let ct2 = candidate_pin("distil-large-v3.5-int8").unwrap();
+        assert_eq!(
+            ct2.precision,
+            Some(("compute_type", "int8_float16", "int8"))
+        );
+        let languages = |id| development_catalog_entry(id).unwrap().languages;
+        assert_eq!(languages("whisper-hindi2hinglish-apex-int8"), &["en", "hi"]);
+        assert_eq!(
+            languages("whisper-cpp-large-v3-turbo-q5-0"),
+            &["en", "auto"]
+        );
+        assert_eq!(languages("distil-large-v3.5-int8"), &["en"]);
+        assert_eq!(languages("granite-speech-5.0-470m-turboctc"), &["en"]);
+    }
+
+    /// Writes real files for every name the published pin lists, pins their
+    /// real digests, and stands in an identity with those digests for this
+    /// test thread.
+    fn real_candidate(dir: &Path, model_id: &str, device: &str) -> DevManifest {
+        let published = CANDIDATE_PINS
+            .iter()
+            .find(|pin| pin.model_id == model_id)
+            .unwrap();
+        let mut value = manifest(dir, model_id);
+        let model_dir = dir.join("candidate");
+        fs::create_dir_all(&model_dir).unwrap();
+        let mut files = Vec::new();
+        for &(name, _, _) in published.files {
+            let path = model_dir.join(name);
+            let bytes = format!("{model_id}/{name}").into_bytes();
+            fs::write(&path, &bytes).unwrap();
+            let sha: &'static str = Box::leak(sha256_hex(&bytes).into_boxed_str());
+            files.push((name, sha, bytes.len() as u64));
+            value.files.push(DevFilePin {
+                path: path.to_string_lossy().into_owned(),
+                sha256: sha.into(),
+                bytes: bytes.len() as u64,
+            });
+        }
+        CANDIDATE_PIN_OVERRIDE.set(Some(CandidatePin {
+            files: Box::leak(files.into_boxed_slice()),
+            ..*published
+        }));
+        value.model_path = model_dir.to_string_lossy().into_owned();
+        value.device = device.into();
+        if device == "cuda:0" {
+            value.limits.vram_bytes = published.min_vram_bytes;
+        }
+        value.options.insert(
+            "revision".into(),
+            serde_json::Value::from(published.revision),
+        );
+        value
+    }
+
+    #[test]
+    fn candidate_with_real_bytes_registers_and_detects_mutation() {
+        for pin in CANDIDATE_PINS {
+            let dir = TempDir::new().unwrap();
+            let value = real_candidate(dir.path(), pin.model_id, "cuda:0");
+            assert!(value.validate().is_ok(), "{}", pin.model_id);
+            let store = DevelopmentStore::open(dir.path().join("local-dev")).unwrap();
+            store.register(&value).unwrap();
+            assert!(value.verify_pins().is_ok());
+            let weights = Path::new(&value.model_path).join(pin.weights);
+            fs::write(&weights, b"changed weights").unwrap();
+            assert!(value.verify_pins().is_err(), "{}", pin.model_id);
+        }
+        CANDIDATE_PIN_OVERRIDE.set(None);
+    }
+
+    #[test]
+    fn candidate_rejects_unmeasured_identity() {
+        let dir = TempDir::new().unwrap();
+        let value = real_candidate(dir.path(), "distil-large-v3.5-int8", "cuda:0");
+        assert!(value.validate().is_ok());
+        for index in 3..value.files.len() {
+            let mut wrong = value.clone();
+            wrong.files[index].sha256 = "0".repeat(64);
+            assert!(wrong.validate().is_err(), "file {index} must match");
+            let mut wrong = value.clone();
+            wrong.files.remove(index);
+            assert!(wrong.validate().is_err(), "file {index} must be pinned");
+        }
+        let with_option = |key: &str, text: &str| {
+            let mut changed = value.clone();
+            changed
+                .options
+                .insert(key.into(), serde_json::Value::from(text));
+            changed
+        };
+        assert!(with_option("revision", "main").validate().is_err());
+        assert!(
+            with_option("compute_type", "int8_float16")
+                .validate()
+                .is_ok()
+        );
+        assert!(with_option("compute_type", "int8").validate().is_err());
+        assert!(with_option("compute_type", "float16").validate().is_err());
+        let mut low = value.clone();
+        low.limits.vram_bytes -= 1;
+        assert!(low.validate().is_err(), "VRAM below the measured peak");
+        let mut hindi = value.clone();
+        hindi.language = "hi".into();
+        assert!(
+            hindi.validate().is_err(),
+            "distil-large-v3.5 is English only"
+        );
+
+        let cpu = real_candidate(dir.path(), "distil-large-v3.5-int8", "cpu");
+        assert!(cpu.validate().is_ok());
+        let mut cpu_float = cpu.clone();
+        cpu_float.options.insert(
+            "compute_type".into(),
+            serde_json::Value::from("int8_float16"),
+        );
+        assert!(cpu_float.validate().is_err());
+        CANDIDATE_PIN_OVERRIDE.set(None);
     }
 
     #[test]
