@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 import time
 from pathlib import Path
@@ -70,6 +71,13 @@ def _transcribe(adapter: BaseAdapter, pcm: bytes) -> tuple[str, dict[str, int]]:
     return text, {"peak_host_ram_bytes": host_peak, "peak_gpu_memory_bytes": gpu_peak}
 
 
+def _cpu_seconds() -> float:
+    """Worker user+system CPU time, including reaped child runtimes."""
+
+    times = os.times()
+    return times.user + times.system + times.children_user + times.children_system
+
+
 def _prepare(manifest: Manifest, adapter: BaseAdapter) -> None:
     """Run one real health inference before allowing any request."""
 
@@ -121,9 +129,11 @@ def serve_stream(
                         write_json_frame(writer, _error_response(request_id_value, "not_ready", "send prepare before transcribe"))
                         continue
                     started = time.monotonic_ns()
+                    cpu_started = _cpu_seconds()
                     with contextlib.redirect_stdout(sys.stderr):
                         text, peaks = _transcribe(adapter, pcm)
                     elapsed_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
+                    peaks["cpu_time_ms"] = max(0, round((_cpu_seconds() - cpu_started) * 1000))
                     if text.strip():
                         write_json_frame(
                             writer,

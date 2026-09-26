@@ -16,10 +16,11 @@ import re
 import resource
 import subprocess
 import tempfile
+import threading
 import traceback
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from .audio import pcm_to_float32, write_pcm16_wav
 from .manifest import (
@@ -534,37 +535,50 @@ def _read_maps() -> str:
         return ""
 
 
-def _nvml_process_gpu_memory_bytes(device_index: int) -> int | None:
-    try:
-        nvml = ctypes.CDLL("libnvidia-ml.so.1")
-    except OSError:
-        return None
-    if nvml.nvmlInit_v2() != _NVML_SUCCESS:
-        return None
+class _NvmlProcess(ctypes.Structure):
+    _fields_ = [
+        ("pid", ctypes.c_uint),
+        ("usedGpuMemory", ctypes.c_ulonglong),
+        ("gpuInstanceId", ctypes.c_uint),
+        ("computeInstanceId", ctypes.c_uint),
+    ]
 
-    class Proc(ctypes.Structure):
-        _fields_ = [
-            ("pid", ctypes.c_uint),
-            ("usedGpuMemory", ctypes.c_ulonglong),
-            ("gpuInstanceId", ctypes.c_uint),
-            ("computeInstanceId", ctypes.c_uint),
-        ]
 
-    try:
+class _NvmlDevice:
+    """One initialized NVML device handle, reusable across many samples."""
+
+    def __init__(self, nvml: Any, handle: ctypes.c_void_p):
+        self._nvml = nvml
+        self._handle = handle
+
+    @classmethod
+    def open(cls, device_index: int) -> "_NvmlDevice | None":
+        try:
+            nvml = ctypes.CDLL("libnvidia-ml.so.1")
+        except OSError:
+            return None
+        if nvml.nvmlInit_v2() != _NVML_SUCCESS:
+            return None
         handle = ctypes.c_void_p()
         if nvml.nvmlDeviceGetHandleByIndex_v2(device_index, ctypes.byref(handle)) != _NVML_SUCCESS:
+            nvml.nvmlShutdown()
             return None
-        pid = os.getpid()
+        return cls(nvml, handle)
+
+    def process_memory_bytes(self, pids: Iterable[int]) -> int | None:
+        """GPU memory NVML attributes to `pids`; 0 when none of them is listed."""
+
+        wanted = set(pids)
         count = ctypes.c_uint(8)
         for _ in range(4):
-            infos = (Proc * count.value)()
-            status = nvml.nvmlDeviceGetComputeRunningProcesses_v3(
-                handle, ctypes.byref(count), infos
+            infos = (_NvmlProcess * count.value)()
+            status = self._nvml.nvmlDeviceGetComputeRunningProcesses_v3(
+                self._handle, ctypes.byref(count), infos
             )
             if status == _NVML_SUCCESS:
                 used = 0
                 for index in range(count.value):
-                    if infos[index].pid != pid:
+                    if infos[index].pid not in wanted:
                         continue
                     if infos[index].usedGpuMemory == _NVML_VALUE_NOT_AVAILABLE:
                         continue
@@ -574,8 +588,145 @@ def _nvml_process_gpu_memory_bytes(device_index: int) -> int | None:
                 return None
             count = ctypes.c_uint(max(int(count.value) * 2, 8))
         return None
+
+    def close(self) -> None:
+        self._nvml.nvmlShutdown()
+
+
+def _nvml_process_gpu_memory_bytes(device_index: int) -> int | None:
+    device = _NvmlDevice.open(device_index)
+    if device is None:
+        return None
+    try:
+        return device.process_memory_bytes((os.getpid(),))
     finally:
-        nvml.nvmlShutdown()
+        device.close()
+
+
+def _process_tree_pids(root: int) -> list[int]:
+    """`root` and its live descendants, from /proc/<pid>/task/<tid>/children."""
+
+    pids = [root]
+    index = 0
+    while index < len(pids) and len(pids) < 256:
+        pid = pids[index]
+        index += 1
+        try:
+            tasks = os.listdir(f"/proc/{pid}/task")
+        except OSError:
+            continue
+        for task in tasks:
+            try:
+                children = Path(f"/proc/{pid}/task/{task}/children").read_text(encoding="ascii")
+            except OSError:
+                continue
+            pids.extend(int(child) for child in children.split() if child.isdigit())
+    return pids
+
+
+def _rss_bytes(pid: int) -> int:
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return 0
+    return 0
+
+
+def _children_peak_ram_bytes() -> int:
+    try:
+        return int(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss) * 1024
+    except (OSError, ValueError, AttributeError):
+        return 0
+
+
+class RequestResourceSampler:
+    """Peak process GPU memory and host RAM for one transcription.
+
+    Native runtimes (ggml, onnxruntime, a llama.cpp child) allocate and free
+    scratch memory inside a single call, so readings taken only before and
+    after the call can miss the peak. A daemon thread samples NVML per-process
+    used memory and VmRSS for the worker and its child processes every
+    `interval_s` while the call runs; ctypes and native runtimes release the
+    GIL, so the sampler keeps running during inference.
+
+    `peak_gpu_memory_bytes` is this request's peak (0 on CPU or when NVML is
+    unavailable, which the protocol reads as unknown). `peak_host_ram_bytes`
+    is the worker's high-water RSS, which includes the model load like the
+    Transformers adapters report; with `include_children` it is the largest
+    worker-plus-children RSS sampled at one instant during the request.
+    """
+
+    def __init__(self, device: str, *, include_children: bool = False, interval_s: float = 0.02):
+        self._device_index = int(device.split(":", 1)[1]) if device.startswith("cuda:") else None
+        self._include_children = include_children
+        self._interval_s = interval_s
+        self._pid = os.getpid()
+        self._nvml: _NvmlDevice | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._children_rss_at_start = 0
+        self.peak_gpu_memory_bytes = 0
+        self._peak_tree_rss_bytes = 0
+
+    def _pids(self) -> list[int]:
+        return _process_tree_pids(self._pid) if self._include_children else [self._pid]
+
+    def _sample(self) -> None:
+        pids = self._pids()
+        # One instant: worker and children are summed from the same sample.
+        self._peak_tree_rss_bytes = max(self._peak_tree_rss_bytes, sum(_rss_bytes(pid) for pid in pids))
+        if self._nvml is not None:
+            used = self._nvml.process_memory_bytes(pids)
+            if used:
+                self.peak_gpu_memory_bytes = max(self.peak_gpu_memory_bytes, used)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_s):
+            with contextlib.suppress(Exception):
+                self._sample()
+
+    def __enter__(self) -> "RequestResourceSampler":
+        if self._device_index is not None:
+            self._nvml = _NvmlDevice.open(self._device_index)
+        self._children_rss_at_start = _children_peak_ram_bytes()
+        with contextlib.suppress(Exception):
+            self._sample()
+        self._thread = threading.Thread(target=self._run, name="voisu-resource-sampler", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        with contextlib.suppress(Exception):
+            self._sample()
+        if self._nvml is not None:
+            self._nvml.close()
+            self._nvml = None
+
+    @property
+    def peak_host_ram_bytes(self) -> int:
+        # Each term is one process tree's footprint at one time; peaks from
+        # different moments are never added together.
+        peak = max(host_peak_ram_bytes(), self._peak_tree_rss_bytes)
+        if self._include_children:
+            # A child shorter than one sampling interval can escape the
+            # sampler; RUSAGE_CHILDREN keeps the largest reaped child's own
+            # peak, which is a lower bound on the tree at that moment.
+            reaped = _children_peak_ram_bytes()
+            if reaped > self._children_rss_at_start:
+                peak = max(peak, reaped)
+        return peak
+
+    def measured(self, metadata: AdapterMetadata) -> AdapterMetadata:
+        return replace(
+            metadata,
+            peak_host_ram_bytes=self.peak_host_ram_bytes,
+            peak_gpu_memory_bytes=self.peak_gpu_memory_bytes,
+        )
 
 
 def _cuda_context_device() -> int | None:
@@ -769,6 +920,12 @@ class NemoSpeechCAdapter(BaseAdapter):
             return "NeMo-Speech.cpp returned an unknown error"
 
     def transcribe(self, pcm: bytes) -> str:
+        with RequestResourceSampler(self.manifest.device) as sampler:
+            text = self._transcribe(pcm)
+        self.metadata = sampler.measured(self.metadata)
+        return text
+
+    def _transcribe(self, pcm: bytes) -> str:
         if self._library is None or not self._recognizer:
             raise AdapterError("not_ready", "NeMo-Speech.cpp recognizer is not loaded")
         samples = pcm_to_float32(pcm)
@@ -998,6 +1155,14 @@ class FunAsrLlamaCppAdapter(BaseAdapter):
         self.metadata = AdapterMetadata(manifest.model_id, "cpu", False, "funasr:llama.cpp")
 
     def transcribe(self, pcm: bytes) -> str:
+        # The CLI child loads the weights on every call, so its RSS is the
+        # footprint that matters; measure the worker and its children.
+        with RequestResourceSampler(self.manifest.device, include_children=True) as sampler:
+            text = self._transcribe(pcm)
+        self.metadata = sampler.measured(self.metadata)
+        return text
+
+    def _transcribe(self, pcm: bytes) -> str:
         with tempfile.TemporaryDirectory(prefix="voisu-funasr-") as temp:
             wav_path = Path(temp) / "audio.wav"
             write_pcm16_wav(wav_path, pcm)
@@ -1082,8 +1247,11 @@ class FunAsrAdapter(BaseAdapter):
         self.metadata = AdapterMetadata(self.manifest.model_id, observed, False, "funasr:AutoModel")
 
     def transcribe(self, pcm: bytes) -> str:
-        with _cuda_request(self.torch, self.manifest.device):
-            return self._transcribe(pcm)
+        with RequestResourceSampler(self.manifest.device) as sampler:
+            with _cuda_request(self.torch, self.manifest.device):
+                text = self._transcribe(pcm)
+        self.metadata = sampler.measured(self.metadata)
+        return text
 
     def _transcribe(self, pcm: bytes) -> str:
         if self.model is None:
@@ -1308,6 +1476,12 @@ class MoonshineAdapter(BaseAdapter):
             raise AdapterError("model_load_failed", f"Moonshine model load failed: {exc}") from exc
 
     def transcribe(self, pcm: bytes) -> str:
+        with RequestResourceSampler(self.manifest.device) as sampler:
+            text = self._transcribe(pcm)
+        self.metadata = sampler.measured(self.metadata)
+        return text
+
+    def _transcribe(self, pcm: bytes) -> str:
         if self.transcriber is None:
             raise AdapterError("not_ready", "Moonshine transcriber is not loaded")
         try:
@@ -1380,8 +1554,11 @@ class CohereTransformersAdapter(BaseAdapter):
         self.metadata = AdapterMetadata(self.manifest.model_id, observed, False, "transformers:CohereAsr")
 
     def transcribe(self, pcm: bytes) -> str:
-        with _cuda_request(self.torch, self.manifest.device):
-            return self._transcribe(pcm)
+        with RequestResourceSampler(self.manifest.device) as sampler:
+            with _cuda_request(self.torch, self.manifest.device):
+                text = self._transcribe(pcm)
+        self.metadata = sampler.measured(self.metadata)
+        return text
 
     def _transcribe(self, pcm: bytes) -> str:
         if self.model is None or self.processor is None or self.torch is None or self.numpy is None:

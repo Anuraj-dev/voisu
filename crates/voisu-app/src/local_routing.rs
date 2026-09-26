@@ -66,6 +66,9 @@ struct Gate {
     inference_checked_out: bool,
     runtime: Option<String>,
     requested_device: Option<String>,
+    /// Why the last worker install failed to reach Ready (for example the
+    /// worker's own `vram_admission` refusal), shown with the not-ready error.
+    worker_failure: Option<String>,
     #[cfg(test)]
     test_selected: Option<ActiveReceipt>,
     #[cfg(test)]
@@ -87,6 +90,7 @@ impl Gate {
             inference_checked_out: false,
             runtime: None,
             requested_device: None,
+            worker_failure: None,
             #[cfg(test)]
             test_selected: None,
             #[cfg(test)]
@@ -141,16 +145,12 @@ impl Gate {
                 || !self.lifecycle.can_launch_replacement()
             {
                 self.lifecycle.mark_unavailable();
-                self.readiness = LocalReadiness::Unavailable {
-                    error: LOCAL_NOT_READY.to_owned(),
-                };
+                self.readiness = self.not_ready();
                 return self.readiness.clone();
             }
             if !self.install_selected_worker(&selected) {
                 self.lifecycle.mark_unavailable();
-                self.readiness = LocalReadiness::Unavailable {
-                    error: LOCAL_NOT_READY.to_owned(),
-                };
+                self.readiness = self.not_ready();
                 return self.readiness.clone();
             }
             self.receipt = Some(selected);
@@ -164,9 +164,7 @@ impl Gate {
             return self.readiness.clone();
         } else if self.lifecycle.has_child() {
             self.lifecycle.mark_unavailable();
-            self.readiness = LocalReadiness::Unavailable {
-                error: LOCAL_NOT_READY.to_owned(),
-            };
+            self.readiness = self.not_ready();
             return self.readiness.clone();
         } else if self.lifecycle.can_launch_replacement() {
             if self.install_selected_worker(&selected) {
@@ -186,11 +184,18 @@ impl Gate {
             },
             WorkerState::Busy => LocalReadiness::Busy,
             WorkerState::Stopping => LocalReadiness::Stopping,
-            WorkerState::Unavailable => LocalReadiness::Unavailable {
-                error: LOCAL_NOT_READY.to_owned(),
-            },
+            WorkerState::Unavailable => self.not_ready(),
         };
         self.readiness.clone()
+    }
+
+    fn not_ready(&self) -> LocalReadiness {
+        LocalReadiness::Unavailable {
+            error: match &self.worker_failure {
+                Some(detail) => format!("{LOCAL_NOT_READY}: {detail}"),
+                None => LOCAL_NOT_READY.to_owned(),
+            },
+        }
     }
 
     fn peek_selected_receipt(&self) -> Option<ActiveReceipt> {
@@ -221,6 +226,7 @@ impl Gate {
     }
 
     fn install_selected_worker(&mut self, selected: &ActiveReceipt) -> bool {
+        self.worker_failure = None;
         if !self.lifecycle.can_launch_replacement() {
             return false;
         }
@@ -245,8 +251,11 @@ impl Gate {
                 child.model_receipt_hash = hash;
             }
         }
-        let ready = self.lifecycle.prepare("l4-prepare", Instant::now()).is_ok()
-            && self.lifecycle.state() == WorkerState::Ready;
+        let prepared = self.lifecycle.prepare("l4-prepare", Instant::now());
+        if let Err(error) = &prepared {
+            self.worker_failure = Some(error.to_string());
+        }
+        let ready = prepared.is_ok() && self.lifecycle.state() == WorkerState::Ready;
         if ready {
             self.capture_runtime_identity(selected);
         }
@@ -939,6 +948,7 @@ fn local_asr_from_session(
         inference_ms,
         peak_host_ram_bytes,
         peak_gpu_memory_bytes,
+        ..
     } = metrics;
     let mut diagnostic = LocalAsrDiagnostic {
         model_id: session.catalog_id.clone(),
@@ -1309,7 +1319,10 @@ mod tests {
             });
         }
         match admit_local(true) {
-            LocalAdmission::Unavailable { .. } => {}
+            LocalAdmission::Unavailable { error } => assert_eq!(
+                error,
+                format!("{LOCAL_NOT_READY}: worker refused: weird-native-code")
+            ),
             LocalAdmission::Ready { .. } => panic!("failed prepare must not admit"),
         }
         {
@@ -1328,7 +1341,13 @@ mod tests {
                 ..FakeWorker::default()
             });
         }
-        let _ = admit_local(true);
+        match admit_local(true) {
+            LocalAdmission::Unavailable { error } => assert!(
+                error.ends_with("worker refused: weird-native-code"),
+                "the held worker's refusal stays visible: {error}"
+            ),
+            LocalAdmission::Ready { .. } => panic!("held failed worker must not admit"),
+        }
         let gate = gate().lock().expect("gate");
         assert_eq!(
             gate.launch_count, 1,
