@@ -98,7 +98,7 @@ def candidate_for(manifest: Manifest, backend: str) -> Candidate:
 
 
 def require_vram_admission(manifest: Manifest) -> None:
-    """A CUDA manifest must fit the 75% admission budget before anything loads."""
+    """A CUDA manifest must fit the VRAM admission budget before anything loads."""
 
     if not manifest.device.startswith("cuda:"):
         return

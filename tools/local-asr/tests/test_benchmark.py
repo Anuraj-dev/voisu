@@ -413,7 +413,9 @@ class BenchmarkTests(unittest.TestCase):
         total = asr_adapters.RTX_5050_TOTAL_VRAM_BYTES
         budget = asr_adapters.vram_admission_bytes(total)
         reserve = asr_adapters.desktop_reserve_bytes(total)
-        self.assertEqual(budget, total * 75 // 100)
+        self.assertEqual(budget, total - 512 * 1024 * 1024)
+        # Qwen 1.7B's registered 5837 MiB peak fits an idle 8151 MiB card.
+        self.assertTrue(asr_adapters.gpu_profile_fits(6_120_538_112, total, free_vram_bytes=8_054_505_472))
         self.assertEqual(budget + reserve, total)
         self.assertTrue(asr_adapters.gpu_profile_fits(budget, total, free_vram_bytes=total))
         self.assertFalse(asr_adapters.gpu_profile_fits(budget + 1, total))

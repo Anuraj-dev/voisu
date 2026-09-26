@@ -88,10 +88,11 @@ def _language_code(manifest: Manifest) -> str | None:
 
 _QWEN_LANGUAGES = {"en": "English", "hi": "Hindi"}
 _QWEN_DTYPES = frozenset({"auto", "bfloat16", "float16", "float32"})
-# RTX 5050 Laptop reports 8151 MiB; 75% is admission, 25% stays desktop reserve.
 RTX_5050_TOTAL_VRAM_BYTES = 8151 * 1024 * 1024
-VRAM_ADMISSION_NUM = 75
-VRAM_ADMISSION_DEN = 100
+# Headroom kept free above the model's declared peak. Free VRAM already
+# excludes what the desktop is using now, so this only absorbs growth while
+# the worker runs; the user chose the model knowing its VRAM cost.
+DESKTOP_HEADROOM_BYTES = 512 * 1024 * 1024
 
 
 def resolve_qwen_language(language: str) -> str | None:
@@ -110,7 +111,7 @@ def resolve_qwen_language(language: str) -> str | None:
 
 
 def vram_admission_bytes(total_vram_bytes: int) -> int:
-    return int(total_vram_bytes) * VRAM_ADMISSION_NUM // VRAM_ADMISSION_DEN
+    return max(0, int(total_vram_bytes) - DESKTOP_HEADROOM_BYTES)
 
 
 def desktop_reserve_bytes(total_vram_bytes: int) -> int:
@@ -122,7 +123,7 @@ def gpu_profile_fits(
     total_vram_bytes: int,
     free_vram_bytes: int | None = None,
 ) -> bool:
-    """True when peak VRAM fits 75% admission and leaves desktop reserve.
+    """True when peak VRAM fits total and free VRAM less the desktop headroom.
 
     A CUDA request that would require CPU spill or consume the desktop reserve
     is a blocker, not a fallback.
@@ -134,8 +135,6 @@ def gpu_profile_fits(
     if peak_gpu_bytes > budget:
         return False
     reserve = desktop_reserve_bytes(total_vram_bytes)
-    if peak_gpu_bytes > total_vram_bytes - reserve:
-        return False
     if free_vram_bytes is not None and peak_gpu_bytes > max(0, free_vram_bytes - reserve):
         return False
     return True
