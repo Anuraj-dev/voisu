@@ -4,22 +4,24 @@
 //! pinned WAV through the supervised development worker. Production catalog
 //! selection is never written.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use voisu_core::{Command, DaemonState, Request, Response, WavScan, scan_wav_pcm};
 
 use crate::local_model::{
-    DevManifest, DevModelStatus, DevelopmentError, DevelopmentStore, development_catalog_entry,
+    DevManifest, DevModelStatus, DevelopmentError, DevelopmentStore, development_receipt,
     production_selection, shipped_catalog,
 };
 #[cfg(test)]
 use crate::local_worker::FakeWorker;
 use crate::local_worker::{
-    Correlation, DevWorker, InferenceMetrics, SupervisorError, TranscribeRequest, WorkerChild,
+    Correlation, DevWorker, InferenceMetrics, STOP_PROCESSING, TranscribeRequest, WorkerChild,
     WorkerOutcome, WorkerSupervisor, refuse_if_development_worker_loaded,
 };
 
@@ -27,14 +29,29 @@ const USAGE: &str = "\
 usage: voisu local-dev register --manifest <path>
        voisu local-dev select <model-id>
        voisu local-dev status [--json]
-       voisu local-dev replay --json --manifest <path> --audio <wav>";
+       voisu local-dev replay --json --manifest <path> --audio <wav> [--audio <wav> ...] [--timeout-ms <milliseconds>]";
+static TERMINATE_REPLAY: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_replay_termination(_: libc::c_int) {
+    TERMINATE_REPLAY.store(true, Ordering::Relaxed);
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalDevCommand {
-    Register { manifest: PathBuf },
-    Select { model_id: String },
-    Status { json: bool },
-    Replay { manifest: PathBuf, audio: PathBuf },
+    Register {
+        manifest: PathBuf,
+    },
+    Select {
+        model_id: String,
+    },
+    Status {
+        json: bool,
+    },
+    Replay {
+        manifest: PathBuf,
+        audios: Vec<PathBuf>,
+        timeout_ms: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -46,6 +63,15 @@ pub struct ReplayReport {
     pub observed_device: String,
     pub resident: bool,
     pub inference_ms: u64,
+    pub load_ms: Option<u64>,
+    pub phase: &'static str,
+    pub model_revision: String,
+    pub runtime_revision: String,
+    pub receipt_sha256: String,
+    pub artifact_hashes: BTreeMap<String, String>,
+    pub host_profile: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_profile: Option<&'static str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,66 +104,8 @@ impl Default for ExecuteOpts<'_> {
 }
 
 enum ExecuteError {
-    Usage(String),
     Failed(String),
-    Replay(ReplayReport),
-}
-
-trait ReplayMetrics {
-    fn replay_observed_device(&self) -> &str;
-    fn replay_resident(&self) -> bool;
-    fn replay_inference_ms(&self) -> u64;
-    fn replay_prepare_count(&self) -> u32 {
-        0
-    }
-    fn replay_transcribe_count(&self) -> u32 {
-        0
-    }
-}
-
-impl ReplayMetrics for DevWorker {
-    fn replay_observed_device(&self) -> &str {
-        self.observed_device()
-    }
-
-    fn replay_resident(&self) -> bool {
-        self.resident()
-    }
-
-    fn replay_inference_ms(&self) -> u64 {
-        self.last_inference_ms()
-    }
-}
-
-#[cfg(test)]
-impl ReplayMetrics for FakeWorker {
-    fn replay_observed_device(&self) -> &str {
-        &self.observed_device
-    }
-
-    fn replay_resident(&self) -> bool {
-        self.transcribe_count >= 2
-    }
-
-    fn replay_inference_ms(&self) -> u64 {
-        0
-    }
-
-    fn replay_prepare_count(&self) -> u32 {
-        self.prepare_count
-    }
-
-    fn replay_transcribe_count(&self) -> u32 {
-        self.transcribe_count
-    }
-}
-
-struct ReplayExecution {
-    report: ReplayReport,
-    #[cfg_attr(not(test), allow(dead_code))]
-    prepare_count: u32,
-    #[cfg_attr(not(test), allow(dead_code))]
-    transcribe_count: u32,
+    Replay(String),
 }
 
 /// Parse `voisu local-dev` arguments after the command name.
@@ -148,14 +116,9 @@ pub fn parse(args: &[String]) -> Result<LocalDevCommand, String> {
         [command, flag] if command == "status" && flag == "--json" => {
             Ok(LocalDevCommand::Status { json: true })
         }
-        [command, model_id] if command == "select" => {
-            if development_catalog_entry(model_id).is_none() {
-                return Err(format!("unknown development model: {model_id}"));
-            }
-            Ok(LocalDevCommand::Select {
-                model_id: model_id.clone(),
-            })
-        }
+        [command, model_id] if command == "select" => Ok(LocalDevCommand::Select {
+            model_id: model_id.clone(),
+        }),
         [command, flag, path] if command == "register" && flag == "--manifest" => {
             let manifest = PathBuf::from(path);
             require_absolute(&manifest, "manifest")?;
@@ -169,6 +132,34 @@ pub fn parse(args: &[String]) -> Result<LocalDevCommand, String> {
 /// Run `voisu local-dev` and return a process exit code.
 pub fn run(args: &[String]) -> u8 {
     match parse(args) {
+        Ok(LocalDevCommand::Replay {
+            manifest,
+            audios,
+            timeout_ms,
+        }) => {
+            TERMINATE_REPLAY.store(false, Ordering::Relaxed);
+            // The handler only sets a flag. The bounded worker exchange finishes,
+            // then replay cancels and reaps its unit before returning.
+            unsafe {
+                libc::signal(
+                    libc::SIGTERM,
+                    request_replay_termination as *const () as libc::sighandler_t,
+                )
+            };
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            let failed = replay_for_opts_stream(
+                &manifest,
+                &audios,
+                Duration::from_millis(timeout_ms),
+                ExecuteOpts::default(),
+                |report| {
+                    let _ = writeln!(out, "{}", encode_replay(&report));
+                    let _ = out.flush();
+                },
+            );
+            u8::from(failed)
+        }
         Ok(command) => emit(execute(command, ExecuteOpts::default())),
         Err(message) => {
             eprintln!("{message}");
@@ -183,16 +174,12 @@ fn emit(result: Result<String, ExecuteError>) -> u8 {
             println!("{output}");
             0
         }
-        Err(ExecuteError::Usage(message)) => {
-            eprintln!("{message}");
-            2
-        }
         Err(ExecuteError::Failed(message)) => {
             eprintln!("{message}");
             1
         }
-        Err(ExecuteError::Replay(report)) => {
-            println!("{}", encode_replay(&report));
+        Err(ExecuteError::Replay(output)) => {
+            println!("{output}");
             1
         }
     }
@@ -227,14 +214,24 @@ fn execute(command: LocalDevCommand, opts: ExecuteOpts<'_>) -> Result<String, Ex
             let store = open_store(opts.store_root)?;
             Ok(format_status(&store.statuses(), json))
         }
-        LocalDevCommand::Replay { manifest, audio } => {
-            require_absolute(&manifest, "manifest").map_err(ExecuteError::Usage)?;
-            require_absolute(&audio, "audio").map_err(ExecuteError::Usage)?;
-            let report = replay_for_opts(&manifest, &audio, opts);
-            if report.status == "error" {
-                return Err(ExecuteError::Replay(report));
+        LocalDevCommand::Replay {
+            manifest,
+            audios,
+            timeout_ms,
+        } => {
+            let reports =
+                replay_for_opts(&manifest, &audios, Duration::from_millis(timeout_ms), opts);
+            let failed = reports.iter().any(|report| report.status == "error");
+            let output = reports
+                .iter()
+                .map(encode_replay)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if failed {
+                Err(ExecuteError::Replay(output))
+            } else {
+                Ok(output)
             }
-            Ok(encode_replay(&report))
         }
     }
 }
@@ -250,7 +247,8 @@ fn open_store(root: Option<&Path>) -> Result<DevelopmentStore, ExecuteError> {
 fn parse_replay(args: &[String]) -> Result<LocalDevCommand, String> {
     let mut json = false;
     let mut manifest = None;
-    let mut audio = None;
+    let mut audios = Vec::new();
+    let mut timeout_ms = STOP_PROCESSING.as_millis() as u64;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -267,7 +265,15 @@ fn parse_replay(args: &[String]) -> Result<LocalDevCommand, String> {
                 let path = args
                     .get(index)
                     .ok_or_else(|| "--audio needs a path".to_owned())?;
-                audio = Some(PathBuf::from(path));
+                audios.push(PathBuf::from(path));
+            }
+            "--timeout-ms" => {
+                index += 1;
+                timeout_ms = args
+                    .get(index)
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| "--timeout-ms needs a positive integer".to_owned())?;
             }
             _ => return Err(USAGE.to_owned()),
         }
@@ -276,15 +282,18 @@ fn parse_replay(args: &[String]) -> Result<LocalDevCommand, String> {
     let Some(manifest) = manifest else {
         return Err(USAGE.to_owned());
     };
-    let Some(audio) = audio else {
-        return Err(USAGE.to_owned());
-    };
-    if !json {
+    if !json || audios.is_empty() {
         return Err(USAGE.to_owned());
     }
     require_absolute(&manifest, "manifest")?;
-    require_absolute(&audio, "audio")?;
-    Ok(LocalDevCommand::Replay { manifest, audio })
+    for audio in &audios {
+        require_absolute(audio, "audio")?;
+    }
+    Ok(LocalDevCommand::Replay {
+        manifest,
+        audios,
+        timeout_ms,
+    })
 }
 
 fn require_absolute(path: &Path, label: &str) -> Result<(), String> {
@@ -359,182 +368,218 @@ fn format_status(statuses: &[DevModelStatus], json: bool) -> String {
     lines.join("\n")
 }
 
-fn replay_for_opts(manifest_path: &Path, audio_path: &Path, opts: ExecuteOpts<'_>) -> ReplayReport {
-    #[cfg(test)]
-    if let Some(worker) = opts.replay_worker {
-        return replay_manifest_with_worker(manifest_path, audio_path, worker);
-    }
-    let _ = opts;
-    replay_manifest(manifest_path, audio_path)
+fn replay_for_opts(
+    manifest_path: &Path,
+    audios: &[PathBuf],
+    timeout: Duration,
+    opts: ExecuteOpts<'_>,
+) -> Vec<ReplayReport> {
+    let mut reports = Vec::with_capacity(audios.len());
+    replay_for_opts_stream(manifest_path, audios, timeout, opts, |report| {
+        reports.push(report)
+    });
+    reports
 }
 
-fn replay_manifest(manifest_path: &Path, audio_path: &Path) -> ReplayReport {
-    match load_replay_inputs(manifest_path, audio_path) {
-        Ok((manifest, hash, pcm)) => {
-            if let Err(error) = refuse_if_development_worker_loaded() {
-                return ReplayReport::from_manifest(&manifest).failed(format!(
-                    "another development worker is still loaded: {error}"
-                ));
+fn replay_for_opts_stream(
+    manifest_path: &Path,
+    audios: &[PathBuf],
+    timeout: Duration,
+    opts: ExecuteOpts<'_>,
+    mut emit: impl FnMut(ReplayReport),
+) -> bool {
+    let (manifest, hash, snapshot) = match load_replay_manifest(manifest_path, opts.store_root) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            for _ in audios {
+                emit(ReplayReport::unknown().failed(error.to_string()));
             }
-            match DevWorker::launch(manifest.clone(), hash.clone(), manifest_path) {
-                Ok(worker) => replay_with(&manifest, &hash, pcm, worker),
-                Err(error) => ReplayReport::from_manifest(&manifest)
-                    .failed(format!("failed to launch development worker: {error}")),
-            }
+            return true;
         }
-        Err(report) => report,
+    };
+    #[cfg(test)]
+    if let Some(worker) = opts.replay_worker {
+        return replay_batch_with_stream(&manifest, &hash, audios, timeout, worker, emit);
     }
+    if let Err(error) = refuse_if_development_worker_loaded() {
+        for _ in audios {
+            emit(ReplayReport::from_manifest(&manifest).failed(format!(
+                "another development worker is still loaded: {error}"
+            )));
+        }
+        return true;
+    }
+    match DevWorker::launch(manifest.clone(), hash.clone(), &snapshot) {
+        Ok(worker) => replay_batch_with_stream(&manifest, &hash, audios, timeout, worker, emit),
+        Err(error) => {
+            for _ in audios {
+                emit(
+                    ReplayReport::from_manifest(&manifest)
+                        .failed(format!("failed to launch development worker: {error}")),
+                );
+            }
+            true
+        }
+    }
+}
+
+fn load_replay_manifest(
+    manifest_path: &Path,
+    store_root: Option<&Path>,
+) -> Result<(DevManifest, String, PathBuf), DevelopmentError> {
+    let text = std::fs::read_to_string(manifest_path)
+        .map_err(|error| DevelopmentError::Io(format!("cannot read manifest: {error}")))?;
+    let requested = DevManifest::from_json(&text)?;
+    let store = match store_root {
+        Some(root) => DevelopmentStore::open(root.to_path_buf()),
+        None => DevelopmentStore::open_default(),
+    }?;
+    let (manifest, handle) = store.load(&requested.model_id)?;
+    if requested != manifest {
+        return Err(DevelopmentError::Invalid(
+            "manifest differs from the registered snapshot".into(),
+        ));
+    }
+    Ok((manifest, handle.manifest_hash, handle.path))
 }
 
 #[cfg(test)]
-fn replay_manifest_with_worker(
-    manifest_path: &Path,
-    audio_path: &Path,
-    worker: FakeWorker,
-) -> ReplayReport {
-    match load_replay_inputs(manifest_path, audio_path) {
-        Ok((manifest, hash, pcm)) => replay_with(&manifest, &hash, pcm, worker),
-        Err(report) => report,
-    }
-}
-
-fn load_replay_inputs(
-    manifest_path: &Path,
-    audio_path: &Path,
-) -> Result<(DevManifest, String, Vec<u8>), ReplayReport> {
-    let text = std::fs::read_to_string(manifest_path).map_err(|error| {
-        ReplayReport::unknown().failed(format!("cannot read manifest: {error}"))
-    })?;
-    let manifest = DevManifest::from_json(&text)
-        .map_err(|error| ReplayReport::unknown().failed(error.to_string()))?;
-    let hash = manifest
-        .verify_pins()
-        .map_err(|error| ReplayReport::from_manifest(&manifest).failed(error.to_string()))?;
-    let pcm = read_replay_pcm(audio_path)
-        .map_err(|error| ReplayReport::from_manifest(&manifest).failed(error))?;
-    Ok((manifest, hash, pcm))
-}
-
-fn replay_with<C: WorkerChild + ReplayMetrics>(
+fn replay_batch_with<C: WorkerChild>(
     manifest: &DevManifest,
     hash: &str,
-    pcm: Vec<u8>,
+    audios: &[PathBuf],
     worker: C,
-) -> ReplayReport {
-    replay_execute(manifest, hash, pcm, worker).report
+) -> Vec<ReplayReport> {
+    let mut reports = Vec::with_capacity(audios.len());
+    replay_batch_with_stream(manifest, hash, audios, STOP_PROCESSING, worker, |report| {
+        reports.push(report)
+    });
+    reports
 }
 
-fn replay_execute<C: WorkerChild + ReplayMetrics>(
+fn replay_batch_with_stream<C: WorkerChild>(
     manifest: &DevManifest,
     hash: &str,
-    pcm: Vec<u8>,
+    audios: &[PathBuf],
+    timeout: Duration,
     worker: C,
-) -> ReplayExecution {
-    let mut report = ReplayReport::from_manifest(manifest);
+    mut emit: impl FnMut(ReplayReport),
+) -> bool {
     let mut supervisor = WorkerSupervisor::absent();
-    if let Err(error) = supervisor.attach_pending(worker, Instant::now()) {
-        return ReplayExecution {
-            report: report.failed(error.to_string()),
-            prepare_count: 0,
-            transcribe_count: 0,
-        };
-    }
-    let prepare = correlation(hash, "prepare");
-    if let Err(error) = supervisor.prepare(prepare, Instant::now()) {
-        let _ = supervisor.cancel();
-        return ReplayExecution {
-            report: report.failed(error.to_string()),
-            prepare_count: 0,
-            transcribe_count: 0,
-        };
-    }
-    let started = Instant::now();
-    let first = supervisor.transcribe(TranscribeRequest {
-        correlation: correlation(hash, "transcribe"),
-        pcm: pcm.clone(),
-    });
-    if let Err(error) = first {
-        let metrics = capture_replay_metrics(&mut supervisor, &mut report, started);
-        let _ = supervisor.cancel();
-        return ReplayExecution {
-            report: report.failed(format_supervisor_error(&error)),
-            prepare_count: metrics.0,
-            transcribe_count: metrics.1,
-        };
-    }
-    // Same worker, same audio, no reload: the second inference is the
-    // residency proof. Resident stays false until this warm pass.
-    let outcome = supervisor.transcribe(TranscribeRequest {
-        correlation: correlation(hash, "transcribe-warm"),
-        pcm,
-    });
-    let metrics = capture_replay_metrics(&mut supervisor, &mut report, started);
-    let _ = supervisor.cancel();
-    let report = match outcome {
-        Ok(WorkerOutcome::Transcript {
-            text,
-            observed_device,
-            metrics,
-        }) => {
-            report.observed_device = observed_device;
-            report.text = text;
-            report.status = "transcript".into();
-            report.error = None;
-            apply_outcome_metrics(&mut report, metrics);
-            report
+    let prepared = supervisor
+        .attach_pending(worker, Instant::now())
+        .and_then(|()| supervisor.prepare(correlation(hash, "prepare"), Instant::now()));
+    let load_ms = match prepared {
+        Ok(duration) => u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        Err(error) => {
+            let _ = supervisor.cancel();
+            for _ in audios {
+                emit(ReplayReport::from_manifest(manifest).failed(error.to_string()));
+            }
+            return true;
         }
-        Ok(WorkerOutcome::NoText {
-            reason,
-            observed_device,
-            metrics,
-        }) => {
-            report.observed_device = observed_device;
-            report.status = "no_text".into();
-            report.error = Some(reason);
-            apply_outcome_metrics(&mut report, metrics);
-            report
-        }
-        Err(error) => report.failed(format_supervisor_error(&error)),
     };
-    ReplayExecution {
-        report,
-        prepare_count: metrics.0,
-        transcribe_count: metrics.1,
+    let mut failed = None;
+    let mut any_failed = false;
+    for (index, audio) in audios.iter().enumerate() {
+        let mut report = ReplayReport::from_manifest(manifest);
+        report.receipt_sha256 = development_receipt(manifest, hash).receipt_hash;
+        report.model_revision = manifest
+            .options
+            .get("revision")
+            .and_then(|value| value.as_str())
+            .unwrap_or(hash)
+            .to_owned();
+        report.artifact_hashes = manifest
+            .files
+            .iter()
+            .map(|pin| (pin.path.clone(), pin.sha256.clone()))
+            .collect();
+        report.phase = "cold";
+        if index == 0 {
+            report.load_ms = Some(load_ms);
+        }
+        if TERMINATE_REPLAY.load(Ordering::Relaxed) && failed.is_none() {
+            failed = Some("replay terminated".into());
+        }
+        if let Some(error) = &failed {
+            report.status = "unavailable".into();
+            report.error = Some(format!("worker unavailable after previous clip: {error}"));
+            any_failed = true;
+            emit(report);
+            continue;
+        }
+        let pcm = match read_replay_pcm(audio) {
+            Ok(pcm) => pcm,
+            Err(error) => {
+                failed = Some(error.clone());
+                any_failed = true;
+                emit(report.failed(error));
+                continue;
+            }
+        };
+        report.duration_profile = Some(if pcm.len() <= 10 * 32_000 {
+            "short"
+        } else {
+            "long"
+        });
+        let started = Instant::now();
+        let outcome = supervisor.transcribe_until(
+            TranscribeRequest {
+                correlation: correlation(hash, &format!("transcribe-{index}")),
+                pcm,
+            },
+            started + timeout,
+        );
+        report.observed_device = supervisor.observed_device().to_owned();
+        report.inference_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match outcome {
+            Ok(WorkerOutcome::Transcript {
+                text,
+                observed_device,
+                metrics,
+            }) => {
+                report.observed_device = observed_device;
+                report.text = text;
+                report.status = "transcript".into();
+                apply_outcome_metrics(&mut report, metrics, index);
+            }
+            Ok(WorkerOutcome::NoText {
+                reason,
+                observed_device,
+                metrics,
+            }) => {
+                report.observed_device = observed_device;
+                report.status = "no_text".into();
+                report.error = Some(reason);
+                apply_outcome_metrics(&mut report, metrics, index);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                failed = Some(message.clone());
+                any_failed = true;
+                report = report.failed(message);
+            }
+        }
+        emit(report);
     }
+    let _ = supervisor.cancel();
+    any_failed
 }
 
-fn apply_outcome_metrics(report: &mut ReplayReport, metrics: InferenceMetrics) {
+fn apply_outcome_metrics(report: &mut ReplayReport, metrics: InferenceMetrics, index: usize) {
     if let Some(backend) = metrics.backend {
         report.backend = Some(backend);
     }
-    if let Some(resident) = metrics.resident {
-        report.resident = resident;
+    report.resident = metrics.resident == Some(true);
+    if index > 0 && report.resident {
+        report.phase = "warm";
     }
     if let Some(ms) = metrics.inference_ms {
         report.inference_ms = ms;
     }
     report.peak_host_ram_bytes = metrics.peak_host_ram_bytes;
     report.peak_gpu_memory_bytes = metrics.peak_gpu_memory_bytes;
-}
-
-fn capture_replay_metrics<C: WorkerChild + ReplayMetrics>(
-    supervisor: &mut WorkerSupervisor<C>,
-    report: &mut ReplayReport,
-    started: Instant,
-) -> (u32, u32) {
-    let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    if let Some(child) = supervisor.child_mut() {
-        report.observed_device = child.replay_observed_device().to_owned();
-        report.resident = child.replay_resident();
-        let reported = child.replay_inference_ms();
-        report.inference_ms = if reported == 0 { wall_ms } else { reported };
-        (
-            child.replay_prepare_count(),
-            child.replay_transcribe_count(),
-        )
-    } else {
-        (0, 0)
-    }
 }
 
 fn correlation(hash: &str, request_id: &str) -> Correlation {
@@ -545,10 +590,6 @@ fn correlation(hash: &str, request_id: &str) -> Correlation {
         recording_id: "replay".into(),
         model_receipt_hash: hash.to_owned(),
     }
-}
-
-fn format_supervisor_error(error: &SupervisorError) -> String {
-    error.to_string()
 }
 
 fn read_replay_pcm(path: &Path) -> Result<Vec<u8>, String> {
@@ -582,6 +623,14 @@ impl ReplayReport {
             observed_device: "unknown".into(),
             resident: false,
             inference_ms: 0,
+            load_ms: None,
+            phase: "cold",
+            model_revision: String::new(),
+            runtime_revision: String::new(),
+            receipt_sha256: String::new(),
+            artifact_hashes: BTreeMap::new(),
+            host_profile: String::new(),
+            duration_profile: None,
             backend: None,
             peak_host_ram_bytes: None,
             peak_gpu_memory_bytes: None,
@@ -600,6 +649,15 @@ impl ReplayReport {
             observed_device: "unknown".into(),
             resident: false,
             inference_ms: 0,
+            load_ms: None,
+            phase: "cold",
+            model_revision: String::new(),
+            runtime_revision: manifest.runtime.revision.clone(),
+            receipt_sha256: String::new(),
+            artifact_hashes: BTreeMap::new(),
+            host_profile: std::env::var("VOISU_DEV_HOST_PROFILE")
+                .unwrap_or_else(|_| "unprofiled".into()),
+            duration_profile: None,
             backend: None,
             peak_host_ram_bytes: None,
             peak_gpu_memory_bytes: None,
@@ -628,7 +686,9 @@ mod tests {
     use crate::local_model::{
         DEV_MODEL_IDS, DevFilePin, DevLimits, DevRuntimeManifest, sha256_hex,
     };
+    use crate::local_worker::{ControlFrame, ReapOutcome, SupervisorError, WorkerFrame};
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     const REPLAY_FIELDS: [&str; 10] = [
@@ -726,8 +786,8 @@ mod tests {
             },
         ) {
             Ok(output) => (0, output),
-            Err(ExecuteError::Usage(message)) | Err(ExecuteError::Failed(message)) => (1, message),
-            Err(ExecuteError::Replay(report)) => (1, encode_replay(&report)),
+            Err(ExecuteError::Failed(message)) => (1, message),
+            Err(ExecuteError::Replay(output)) => (1, output),
         }
     }
 
@@ -761,12 +821,30 @@ mod tests {
             .unwrap(),
             LocalDevCommand::Replay {
                 manifest: PathBuf::from("/tmp/m.json"),
-                audio: PathBuf::from("/tmp/a.wav"),
+                audios: vec![PathBuf::from("/tmp/a.wav")],
+                timeout_ms: STOP_PROCESSING.as_millis() as u64,
             }
         );
-        assert!(parse(&args(&["select", "not-a-model"])).is_err());
         assert!(parse(&args(&["register", "--manifest", "relative.json"])).is_err());
         assert!(parse(&args(&["replay", "--manifest", "/tmp/m.json"])).is_err());
+        assert_eq!(
+            parse(&args(&[
+                "replay",
+                "--json",
+                "--manifest",
+                "/tmp/m.json",
+                "--audio",
+                "/tmp/a.wav",
+                "--timeout-ms",
+                "7"
+            ]))
+            .unwrap(),
+            LocalDevCommand::Replay {
+                manifest: PathBuf::from("/tmp/m.json"),
+                audios: vec![PathBuf::from("/tmp/a.wav")],
+                timeout_ms: 7,
+            }
+        );
     }
 
     #[test]
@@ -833,7 +911,12 @@ mod tests {
         let (manifest_path, manifest) = write_manifest(dir.path(), DEV_MODEL_IDS[0]);
         let audio = dir.path().join("audio.wav");
         fs::write(&audio, pcm_wav(&[1, 0, 2, 0])).unwrap();
-        let hash = manifest.verify_pins().unwrap();
+        let store_root = dir.path().join("local-dev");
+        let hash = DevelopmentStore::open(store_root.clone())
+            .unwrap()
+            .register(&manifest)
+            .unwrap()
+            .manifest_hash;
         let worker = FakeWorker {
             scripted_text: Some("hello raja".into()),
             model_receipt_hash: hash,
@@ -849,7 +932,7 @@ mod tests {
                 "--audio",
                 audio.to_str().unwrap(),
             ]),
-            &dir.path().join("local-dev"),
+            &store_root,
             None,
             Some(worker),
         );
@@ -864,35 +947,184 @@ mod tests {
         assert_eq!(value["language"], "en");
         assert_eq!(value["requested_device"], "cpu");
         assert_eq!(value["observed_device"], "cpu");
-        assert_eq!(value["resident"], true);
+        assert_eq!(value["resident"], false);
+        assert_eq!(value["phase"], "cold");
+        assert!(value["load_ms"].as_u64().is_some());
         assert!(value["inference_ms"].as_u64().is_some());
         assert_eq!(value["text"], "hello raja");
         assert_eq!(value["status"], "transcript");
         assert!(value["error"].is_null());
-        assert_eq!(value.as_object().unwrap().len(), REPLAY_FIELDS.len());
+        assert!(value.get("receipt_sha256").is_some());
     }
 
     #[test]
-    fn replay_warm_second_inference_does_not_reload() {
+    fn replay_batch_prepares_once_and_transcribes_each_clip_once() {
         let dir = TempDir::new().unwrap();
         let (manifest_path, manifest) = write_manifest(dir.path(), DEV_MODEL_IDS[1]);
         let audio = dir.path().join("audio.wav");
         fs::write(&audio, pcm_wav(&[1, 0, 2, 0])).unwrap();
-        let hash = manifest.verify_pins().unwrap();
+        let store_root = dir.path().join("local-dev");
+        let hash = DevelopmentStore::open(store_root.clone())
+            .unwrap()
+            .register(&manifest)
+            .unwrap()
+            .manifest_hash;
         let worker = FakeWorker {
             scripted_text: Some("ask not what your country can do".into()),
             model_receipt_hash: hash,
             observed_device: "cpu".into(),
             ..FakeWorker::default()
         };
-        let (loaded, loaded_hash, pcm) = load_replay_inputs(&manifest_path, &audio).unwrap();
-        let run = replay_execute(&loaded, &loaded_hash, pcm, worker);
-        assert_eq!(run.prepare_count, 1);
-        assert_eq!(run.transcribe_count, 2);
-        assert!(run.report.resident);
-        assert_eq!(run.report.model_id, DEV_MODEL_IDS[1]);
-        assert_eq!(run.report.language, "en");
-        assert_eq!(run.report.status, "transcript");
-        assert_eq!(run.report.text, "ask not what your country can do");
+        let (loaded, loaded_hash, _) =
+            load_replay_manifest(&manifest_path, Some(&store_root)).unwrap();
+        struct TrackingWorker {
+            inner: FakeWorker,
+            counts: Arc<Mutex<(usize, usize)>>,
+            fail_on_transcribe: Option<usize>,
+            timeout_on_transcribe: Option<usize>,
+            resident: Option<bool>,
+            reaps: Arc<Mutex<usize>>,
+            emitted_count: Option<Arc<Mutex<usize>>>,
+        }
+        impl WorkerChild for TrackingWorker {
+            fn exchange(
+                &mut self,
+                control: ControlFrame,
+                pcm: Option<&[u8]>,
+                deadline: Instant,
+            ) -> Result<WorkerFrame, SupervisorError> {
+                let mut counts = self.counts.lock().unwrap();
+                match &control {
+                    ControlFrame::Prepare(_) => counts.0 += 1,
+                    ControlFrame::Transcribe { .. } => counts.1 += 1,
+                    ControlFrame::Cancel { .. } => {}
+                }
+                let fail = self.fail_on_transcribe == Some(counts.1)
+                    && matches!(&control, ControlFrame::Transcribe { .. });
+                let timeout = self.timeout_on_transcribe == Some(counts.1)
+                    && matches!(&control, ControlFrame::Transcribe { .. });
+                if counts.1 == 2
+                    && matches!(&control, ControlFrame::Transcribe { .. })
+                    && let Some(emitted) = &self.emitted_count
+                {
+                    assert_eq!(*emitted.lock().unwrap(), 1);
+                }
+                drop(counts);
+                if fail {
+                    return Err(SupervisorError::Crashed);
+                }
+                if timeout {
+                    self.inner.block_for = Some(Duration::from_secs(1));
+                }
+                self.inner.exchange(control, pcm, deadline)
+            }
+            fn cancel_and_reap(&mut self) -> Result<ReapOutcome, SupervisorError> {
+                *self.reaps.lock().unwrap() += 1;
+                self.inner.cancel_and_reap()
+            }
+            fn last_inference_metrics(&self) -> InferenceMetrics {
+                InferenceMetrics {
+                    resident: self.resident,
+                    ..InferenceMetrics::default()
+                }
+            }
+        }
+        let counts = Arc::new(Mutex::new((0, 0)));
+        let reports = replay_batch_with(
+            &loaded,
+            &loaded_hash,
+            &[audio.clone(), audio.clone()],
+            TrackingWorker {
+                inner: worker.clone(),
+                counts: counts.clone(),
+                fail_on_transcribe: None,
+                timeout_on_transcribe: None,
+                resident: Some(true),
+                reaps: Arc::new(Mutex::new(0)),
+                emitted_count: None,
+            },
+        );
+        assert_eq!(*counts.lock().unwrap(), (1, 2));
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].phase, "cold");
+        assert_eq!(reports[1].phase, "warm");
+        assert_eq!(reports[0].text, "ask not what your country can do");
+        assert_eq!(reports[1].text, reports[0].text);
+        assert!(reports[0].load_ms.is_some());
+        assert!(reports[1].load_ms.is_none());
+        let counts = Arc::new(Mutex::new((0, 0)));
+        let failed = replay_batch_with(
+            &loaded,
+            &loaded_hash,
+            &[audio.clone(), audio.clone(), audio.clone()],
+            TrackingWorker {
+                inner: worker,
+                counts: counts.clone(),
+                fail_on_transcribe: Some(2),
+                timeout_on_transcribe: None,
+                resident: Some(true),
+                reaps: Arc::new(Mutex::new(0)),
+                emitted_count: None,
+            },
+        );
+        assert_eq!(*counts.lock().unwrap(), (1, 2));
+        assert_eq!(failed[0].status, "transcript");
+        assert_eq!(failed[1].status, "error");
+        assert_eq!(failed[2].status, "unavailable");
+        let missing = replay_batch_with(
+            &loaded,
+            &loaded_hash,
+            &[audio.clone(), audio.clone()],
+            TrackingWorker {
+                inner: FakeWorker {
+                    model_receipt_hash: loaded_hash.clone(),
+                    scripted_text: Some("words".into()),
+                    ..FakeWorker::default()
+                },
+                counts: Arc::new(Mutex::new((0, 0))),
+                fail_on_transcribe: None,
+                timeout_on_transcribe: None,
+                resident: None,
+                reaps: Arc::new(Mutex::new(0)),
+                emitted_count: None,
+            },
+        );
+        assert_eq!(missing[1].phase, "cold");
+        assert!(!missing[1].resident);
+        let reaps = Arc::new(Mutex::new(0));
+        let emitted_count = Arc::new(Mutex::new(0));
+        let mut emitted = Vec::new();
+        let failed = replay_batch_with_stream(
+            &loaded,
+            &loaded_hash,
+            &[audio.clone(), audio.clone(), audio],
+            Duration::from_millis(100),
+            TrackingWorker {
+                inner: FakeWorker {
+                    model_receipt_hash: loaded_hash.clone(),
+                    scripted_text: Some("words".into()),
+                    ..FakeWorker::default()
+                },
+                counts: Arc::new(Mutex::new((0, 0))),
+                fail_on_transcribe: None,
+                timeout_on_transcribe: Some(2),
+                resident: Some(true),
+                reaps: reaps.clone(),
+                emitted_count: Some(emitted_count.clone()),
+            },
+            |report| {
+                emitted.push(report);
+                *emitted_count.lock().unwrap() += 1;
+            },
+        );
+        assert!(failed);
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|report| report.status.as_str())
+                .collect::<Vec<_>>(),
+            ["transcript", "error", "unavailable"]
+        );
+        assert!(*reaps.lock().unwrap() >= 1);
     }
 }

@@ -196,7 +196,7 @@ impl Gate {
     fn peek_selected_receipt(&self) -> Option<ActiveReceipt> {
         #[cfg(test)]
         {
-            return self.test_selected.clone().or_else(|| self.receipt.clone());
+            self.test_selected.clone().or_else(|| self.receipt.clone())
         }
         #[cfg(not(test))]
         {
@@ -288,7 +288,7 @@ impl Gate {
         {
             let _ = selected;
             self.launch_count = self.launch_count.saturating_add(1);
-            return self.test_next_worker.take();
+            self.test_next_worker.take()
         }
         #[cfg(not(test))]
         {
@@ -304,7 +304,7 @@ impl Gate {
                     &handle.path,
                 )
                 .ok()
-                .map(RuntimeWorker::Development);
+                .map(|worker| RuntimeWorker::Development(Box::new(worker)));
             }
             let catalog = shipped_catalog();
             let entry = catalog.entries.iter().find(|entry| {
@@ -510,9 +510,9 @@ fn gate() -> &'static Mutex<Gate> {
 pub fn runtime_readiness() -> LocalReadiness {
     #[cfg(test)]
     {
-        return LocalReadiness::Unavailable {
+        LocalReadiness::Unavailable {
             error: LOCAL_UNAVAILABLE.to_owned(),
-        };
+        }
     }
     #[cfg(not(test))]
     {

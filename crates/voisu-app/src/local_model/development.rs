@@ -36,55 +36,6 @@ pub const DEV_MODEL_IDS: [&str; 7] = [
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DevDevice {
-    Cuda0,
-    Cpu,
-}
-
-impl DevDevice {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Cuda0 => "cuda:0",
-            Self::Cpu => "cpu",
-        }
-    }
-
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value {
-            "cuda:0" => Some(Self::Cuda0),
-            "cpu" => Some(Self::Cpu),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DevLanguage {
-    English,
-    Hindi,
-    Auto,
-}
-
-impl DevLanguage {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::English => "en",
-            Self::Hindi => "hi",
-            Self::Auto => "auto",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "en" => Some(Self::English),
-            "hi" => Some(Self::Hindi),
-            "auto" => Some(Self::Auto),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DevRuntimeKind {
     Native,
     Python,
@@ -107,7 +58,6 @@ pub struct DevCatalogEntry {
     pub devices: &'static [&'static str],
     pub memory_bytes: u64,
     pub vram_bytes: u64,
-    pub note: &'static str,
 }
 
 const EN: &[&str] = &["en"];
@@ -123,7 +73,6 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
         devices: CPU_CUDA,
         memory_bytes: 4 * 1024 * 1024 * 1024,
         vram_bytes: 2 * 1024 * 1024 * 1024,
-        note: "NeMo-Speech.cpp native development adapter",
     },
     DevCatalogEntry {
         model_id: "parakeet-tdt-0.6b-v3",
@@ -132,7 +81,6 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
         devices: CPU_CUDA,
         memory_bytes: 4 * 1024 * 1024 * 1024,
         vram_bytes: 2 * 1024 * 1024 * 1024,
-        note: "NeMo-Speech.cpp native English adapter",
     },
     DevCatalogEntry {
         model_id: "qwen3-asr-0.6b",
@@ -141,7 +89,6 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
         devices: CPU_CUDA,
         memory_bytes: 4 * 1024 * 1024 * 1024,
         vram_bytes: 2 * 1024 * 1024 * 1024,
-        note: "Measured Transformers CUDA on RTX 5050 8151 MiB: peak RAM 2465 MiB, peak VRAM 1804 MiB; observed cuda:0; English and Hinglish selectable",
     },
     DevCatalogEntry {
         model_id: "qwen3-asr-1.7b",
@@ -150,7 +97,6 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
         devices: CPU_CUDA,
         memory_bytes: 8 * 1024 * 1024 * 1024,
         vram_bytes: 5 * 1024 * 1024 * 1024,
-        note: "Measured Transformers CUDA on RTX 5050 8151 MiB: peak RAM 4869 MiB, peak VRAM 4196 MiB; fits 75% admission 6113 MiB plus 2038 MiB desktop reserve; observed cuda:0; English and Hinglish selectable",
     },
     DevCatalogEntry {
         model_id: "fun-asr-nano-2512",
@@ -159,7 +105,6 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
         devices: CPU_CUDA,
         memory_bytes: 6 * 1024 * 1024 * 1024,
         vram_bytes: 3 * 1024 * 1024 * 1024,
-        note: "Fun-ASR-Nano-2512 only (not Fun-ASR-MLT-Nano); llama.cpp CPU JFK 1.67s; Linux llama.cpp has no Nano CUDA package; Transformers CUDA on RTX 5050 observed cuda:0 peak RAM 2576 MiB / VRAM 1625 MiB; English comparison, no Hindi",
     },
     DevCatalogEntry {
         model_id: "moonshine-streaming-medium",
@@ -168,7 +113,6 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
         devices: CPU_ONLY,
         memory_bytes: 2 * 1024 * 1024 * 1024,
         vram_bytes: 0,
-        note: "Official moonshine-voice==0.1.5 Medium Streaming CPU-first English adapter; JFK load 0.274s cold 1.994s warm 1.934s; GPU is not a supported runtime profile",
     },
     DevCatalogEntry {
         model_id: "cohere-transcribe-03-2026",
@@ -177,14 +121,11 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
         devices: CPU_CUDA,
         memory_bytes: 8 * 1024 * 1024 * 1024,
         vram_bytes: 4 * 1024 * 1024 * 1024,
-        note: "Cohere Transcribe 03-2026 English-only Transformers adapter; Hugging Face gated HTTP 401 GatedRepo on this host; Hindi is not in the advertised language set",
     },
 ];
 
 /// Requested Fun-ASR Nano checkpoint. Fun-ASR-MLT-Nano is a different model.
 pub const FUN_ASR_NANO_CHECKPOINT: &str = "Fun-ASR-Nano-2512";
-pub const FUN_ASR_NANO_GGUF_SOURCE: &str = "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-GGUF";
-pub const FUN_ASR_NANO_GGUF_REV: &str = "46e849502a867080d66d351b8dfb1018b607e509";
 pub const FUN_ASR_ENCODER_NAME: &str = "funasr-encoder-f16.gguf";
 pub const FUN_ASR_ENCODER_SHA: &str =
     "f92f91d01a24fbed6c863495b2ee8c6a6788144a02858b75743f0946668de8a2";
@@ -197,8 +138,6 @@ pub const FUN_ASR_VAD_NAME: &str = "fsmn-vad.gguf";
 pub const FUN_ASR_VAD_SHA: &str =
     "1270f2559c495f4e7b6e739541151027d360761a3fda43fc147034f5719f5479";
 pub const FUN_ASR_VAD_BYTES: u64 = 1_720_512;
-pub const FUN_ASR_LLAMA_RUNTIME: &str = "runtime-llamacpp-v0.2.6";
-pub const FUN_ASR_HF_SOURCE: &str = "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512-hf";
 pub const FUN_ASR_HF_REV: &str = "d93b302ee7fd505e1b3576120fc142fc6f7820e1";
 pub const FUN_ASR_HF_WEIGHTS_NAME: &str = "model.safetensors";
 pub const FUN_ASR_HF_WEIGHTS_SHA: &str =
@@ -213,17 +152,6 @@ pub const QWEN_REQUIRED_FILES: [&str; 6] = [
     "tokenizer_config.json",
 ];
 pub const MOONSHINE_MEDIUM_ARCH: &str = "MEDIUM_STREAMING";
-pub const MOONSHINE_VOICE_SOURCE: &str =
-    "https://download.moonshine.ai/model/medium-streaming-en/quantized";
-pub const MOONSHINE_MEDIUM_FILES: [&str; 7] = [
-    "encoder.ort",
-    "adapter.ort",
-    "cross_kv.ort",
-    "decoder_kv.ort",
-    "frontend.ort",
-    "streaming_config.json",
-    "tokenizer.bin",
-];
 pub const MOONSHINE_MEDIUM_PINS: [(&str, &str, u64); 7] = [
     (
         "encoder.ort",
@@ -261,10 +189,7 @@ pub const MOONSHINE_MEDIUM_PINS: [(&str, &str, u64); 7] = [
         249_974,
     ),
 ];
-pub const FUN_ASR_LLAMA_LINUX_X64_AVX2_SHA: &str =
-    "aaebc5470f846ce915200b35d6e9f9bd0a0d3ed399d39e49bdeb7a1f1782bc70";
 pub const COHERE_HF_REV: &str = "b1eacc2686a3d08ceaae5f24a88b1d519620bc09";
-pub const COHERE_HF_SOURCE: &str = "https://huggingface.co/CohereLabs/cohere-transcribe-03-2026";
 
 #[must_use]
 pub fn development_catalog() -> &'static [DevCatalogEntry] {
@@ -438,22 +363,16 @@ impl DevManifest {
                 self.model_id
             )));
         };
-        let device = DevDevice::parse(&self.device)
-            .ok_or_else(|| DevelopmentError::Invalid("device must be cuda:0 or cpu".into()))?;
-        let language = DevLanguage::parse(&self.language)
-            .ok_or_else(|| DevelopmentError::Invalid("language must be en, hi, or auto".into()))?;
-        if !catalog.devices.contains(&device.as_str()) {
+        if !catalog.devices.contains(&self.device.as_str()) {
             return Err(DevelopmentError::Invalid(format!(
                 "{} does not support {}",
-                self.model_id,
-                device.as_str()
+                self.model_id, self.device
             )));
         }
-        if !catalog.languages.contains(&language.as_str()) {
+        if !catalog.languages.contains(&self.language.as_str()) {
             return Err(DevelopmentError::Invalid(format!(
                 "{} does not advertise {}",
-                self.model_id,
-                language.as_str()
+                self.model_id, self.language
             )));
         }
         if self.model_id == "parakeet-tdt-0.6b-v3" {
@@ -471,12 +390,12 @@ impl DevManifest {
             }
         }
         self.validate_remaining_model_identity()?;
-        if device == DevDevice::Cpu && self.limits.vram_bytes != 0 {
+        if self.device == "cpu" && self.limits.vram_bytes != 0 {
             return Err(DevelopmentError::Invalid(
                 "cpu manifests must set vram_bytes=0".into(),
             ));
         }
-        if device == DevDevice::Cuda0 && self.limits.vram_bytes == 0 {
+        if self.device == "cuda:0" && self.limits.vram_bytes == 0 {
             return Err(DevelopmentError::Invalid(
                 "cuda manifests must set a vram_bytes limit".into(),
             ));
@@ -633,12 +552,11 @@ impl DevManifest {
                     .options
                     .get("encoder")
                     .and_then(serde_json::Value::as_str)
+                    && Path::new(encoder).file_name() != Some(FUN_ASR_ENCODER_NAME.as_ref())
                 {
-                    if Path::new(encoder).file_name() != Some(FUN_ASR_ENCODER_NAME.as_ref()) {
-                        return Err(DevelopmentError::Invalid(
-                            "fun-asr-nano-2512 encoder must be funasr-encoder-f16.gguf".into(),
-                        ));
-                    }
+                    return Err(DevelopmentError::Invalid(
+                        "fun-asr-nano-2512 encoder must be funasr-encoder-f16.gguf".into(),
+                    ));
                 }
                 if let Some(decoder) = self
                     .options
@@ -659,12 +577,11 @@ impl DevManifest {
                     .options
                     .get("revision")
                     .and_then(serde_json::Value::as_str)
+                    && revision != FUN_ASR_HF_REV
                 {
-                    if revision != FUN_ASR_HF_REV {
-                        return Err(DevelopmentError::Invalid(
-                            "fun-asr-nano-2512 Transformers revision must be the pinned Fun-ASR-Nano-2512-hf commit".into(),
-                        ));
-                    }
+                    return Err(DevelopmentError::Invalid(
+                        "fun-asr-nano-2512 Transformers revision must be the pinned Fun-ASR-Nano-2512-hf commit".into(),
+                    ));
                 }
             }
             "moonshine-streaming-medium" => {
@@ -744,12 +661,12 @@ impl DevManifest {
         match self.model_id.as_str() {
             "fun-asr-nano-2512" => {
                 for key in ["encoder", "decoder", "llama_cli", "vad", "remote_code"] {
-                    if let Some(path) = self.options.get(key).and_then(serde_json::Value::as_str) {
-                        if !paths.contains_key(path) {
-                            return Err(DevelopmentError::Invalid(format!(
-                                "{key} must be an absolute pinned file"
-                            )));
-                        }
+                    if let Some(path) = self.options.get(key).and_then(serde_json::Value::as_str)
+                        && !paths.contains_key(path)
+                    {
+                        return Err(DevelopmentError::Invalid(format!(
+                            "{key} must be an absolute pinned file"
+                        )));
                     }
                 }
                 self.require_published_fun_asr_pin(
@@ -789,15 +706,12 @@ impl DevManifest {
                     .files
                     .iter()
                     .find(|pin| Path::new(&pin.path) == weights.as_path())
+                    && (!pin.sha256.eq_ignore_ascii_case(FUN_ASR_HF_WEIGHTS_SHA)
+                        || pin.bytes != FUN_ASR_HF_WEIGHTS_BYTES)
                 {
-                    if !pin.sha256.eq_ignore_ascii_case(FUN_ASR_HF_WEIGHTS_SHA)
-                        || pin.bytes != FUN_ASR_HF_WEIGHTS_BYTES
-                    {
-                        return Err(DevelopmentError::Invalid(
-                            "Fun-ASR-Nano-2512-hf weights do not match the published snapshot"
-                                .into(),
-                        ));
-                    }
+                    return Err(DevelopmentError::Invalid(
+                        "Fun-ASR-Nano-2512-hf weights do not match the published snapshot".into(),
+                    ));
                 }
             }
             "moonshine-streaming-medium" => {
@@ -877,7 +791,7 @@ impl DevManifest {
         Ok(())
     }
 
-    fn identity_hash(&self) -> Result<String, DevelopmentError> {
+    pub fn identity_hash(&self) -> Result<String, DevelopmentError> {
         self.validate()?;
         self.verify_pin_sizes()?;
         let encoded =
@@ -885,11 +799,10 @@ impl DevManifest {
         Ok(sha256_hex(&encoded))
     }
 
-    /// Validate the manifest and every pin against the current filesystem.
-    /// This is called immediately before a worker is launched and again after
-    /// a manifest is copied into the private store.
+    /// Hash every pinned artifact at registration. Later loads check the
+    /// private snapshot's metadata fingerprints without rehashing weights.
     pub fn verify_pins(&self) -> Result<String, DevelopmentError> {
-        self.verify_pin_sizes()?;
+        let hash = self.identity_hash()?;
         for pin in &self.files {
             let path = Path::new(&pin.path);
             let actual = sha256_file(path).map_err(|error| {
@@ -902,7 +815,7 @@ impl DevManifest {
                 )));
             }
         }
-        self.identity_hash()
+        Ok(hash)
     }
 }
 
@@ -913,6 +826,42 @@ struct DevSelection {
     model_id: String,
     manifest: String,
     manifest_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactFingerprint {
+    size: u64,
+    mtime_seconds: i64,
+    mtime_nanoseconds: i64,
+    inode: u64,
+    device: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactSnapshot {
+    manifest_sha256: String,
+    fingerprints: BTreeMap<String, ArtifactFingerprint>,
+}
+
+impl ArtifactFingerprint {
+    fn read(path: &str) -> Result<Self, DevelopmentError> {
+        let metadata = fs::metadata(path)
+            .map_err(|error| DevelopmentError::Io(format!("cannot inspect {path}: {error}")))?;
+        if !metadata.is_file() {
+            return Err(DevelopmentError::Invalid(format!(
+                "file pin type changed: {path}"
+            )));
+        }
+        Ok(Self {
+            size: metadata.len(),
+            mtime_seconds: metadata.mtime(),
+            mtime_nanoseconds: metadata.mtime_nsec(),
+            inode: metadata.ino(),
+            device: metadata.dev(),
+        })
+    }
 }
 
 pub struct DevelopmentStore {
@@ -931,17 +880,35 @@ impl DevelopmentStore {
         Self::open(state.join(DEVELOPMENT_ROOT_NAME))
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     pub fn register(&self, manifest: &DevManifest) -> Result<DevManifestHandle, DevelopmentError> {
+        let before: BTreeMap<_, _> = manifest
+            .files
+            .iter()
+            .map(|pin| Ok((pin.path.clone(), ArtifactFingerprint::read(&pin.path)?)))
+            .collect::<Result<_, DevelopmentError>>()?;
         let hash = manifest.verify_pins()?;
+        let fingerprints: BTreeMap<_, _> = manifest
+            .files
+            .iter()
+            .map(|pin| Ok((pin.path.clone(), ArtifactFingerprint::read(&pin.path)?)))
+            .collect::<Result<_, DevelopmentError>>()?;
+        if before != fingerprints {
+            return Err(DevelopmentError::Invalid(
+                "artifact changed during registration".into(),
+            ));
+        }
         let path = self
             .root
             .join("manifests")
             .join(format!("{}.json", manifest.model_id));
         let encoded = manifest.to_json()?;
+        let fingerprint_path = path.with_extension("fingerprints.json");
+        let fingerprints_encoded = serde_json::to_vec(&ArtifactSnapshot {
+            manifest_sha256: hash.clone(),
+            fingerprints,
+        })
+        .map_err(|error| DevelopmentError::Json(error.to_string()))?;
+        atomic_private_write(&fingerprint_path, &fingerprints_encoded)?;
         atomic_private_write(&path, encoded.as_bytes())?;
         Ok(DevManifestHandle {
             model_id: manifest.model_id.clone(),
@@ -951,11 +918,6 @@ impl DevelopmentStore {
     }
 
     pub fn register_file(&self, path: &Path) -> Result<DevManifestHandle, DevelopmentError> {
-        if !path.is_absolute() {
-            return Err(DevelopmentError::Invalid(
-                "manifest path must be absolute".into(),
-            ));
-        }
         let text =
             fs::read_to_string(path).map_err(|error| DevelopmentError::Io(error.to_string()))?;
         let manifest = DevManifest::from_json(&text)?;
@@ -976,6 +938,26 @@ impl DevelopmentStore {
             fs::read_to_string(&path).map_err(|error| DevelopmentError::Io(error.to_string()))?;
         let manifest = DevManifest::from_json(&text)?;
         let hash = manifest.identity_hash()?;
+        let fingerprint_path = path.with_extension("fingerprints.json");
+        let snapshot: ArtifactSnapshot =
+            serde_json::from_slice(&fs::read(&fingerprint_path).map_err(|error| {
+                DevelopmentError::Io(format!("cannot read artifact fingerprints: {error}"))
+            })?)
+            .map_err(|error| DevelopmentError::Json(error.to_string()))?;
+        if snapshot.manifest_sha256 != hash || snapshot.fingerprints.len() != manifest.files.len() {
+            return Err(DevelopmentError::Invalid(
+                "artifact fingerprints changed".into(),
+            ));
+        }
+        for pin in &manifest.files {
+            if snapshot.fingerprints.get(&pin.path) != Some(&ArtifactFingerprint::read(&pin.path)?)
+            {
+                return Err(DevelopmentError::Invalid(format!(
+                    "registered artifact changed: {}",
+                    pin.path
+                )));
+            }
+        }
         if manifest.model_id != model_id {
             return Err(DevelopmentError::Invalid(
                 "manifest filename/model mismatch".into(),
@@ -1055,31 +1037,23 @@ impl DevelopmentStore {
         let selected = self.selected().ok().map(|(_, handle)| handle.model_id);
         DEVELOPMENT_CATALOG
             .iter()
-            .map(|entry| match self.load(entry.model_id) {
-                Ok((_manifest, handle)) => DevModelStatus {
+            .map(|entry| {
+                let (manifest, error) = match self.load(entry.model_id) {
+                    Ok((_, handle)) => (Some(handle), None),
+                    Err(error) => (None, Some(error.to_string())),
+                };
+                DevModelStatus {
                     model_id: entry.model_id.into(),
                     runtime: entry.runtime,
                     languages: entry.languages.iter().map(|v| (*v).into()).collect(),
                     devices: entry.devices.iter().map(|v| (*v).into()).collect(),
                     memory_bytes: entry.memory_bytes,
                     vram_bytes: entry.vram_bytes,
-                    manifest: Some(handle),
+                    manifest,
                     selected: selected.as_deref() == Some(entry.model_id),
                     ready: false,
-                    error: None,
-                },
-                Err(error) => DevModelStatus {
-                    model_id: entry.model_id.into(),
-                    runtime: entry.runtime,
-                    languages: entry.languages.iter().map(|v| (*v).into()).collect(),
-                    devices: entry.devices.iter().map(|v| (*v).into()).collect(),
-                    memory_bytes: entry.memory_bytes,
-                    vram_bytes: entry.vram_bytes,
-                    manifest: None,
-                    selected: selected.as_deref() == Some(entry.model_id),
-                    ready: false,
-                    error: Some(error.to_string()),
-                },
+                    error,
+                }
             })
             .collect()
     }
@@ -1246,6 +1220,8 @@ mod tests {
         assert_eq!(hash.len(), 64);
         fs::write(dir.path().join("model.bin"), b"mutated").unwrap();
         assert!(value.verify_pins().is_err());
+        let store = DevelopmentStore::open(dir.path().join("local-dev")).unwrap();
+        assert!(store.register(&value).is_err());
     }
 
     #[test]
@@ -1290,6 +1266,25 @@ mod tests {
             .unwrap();
         fs::write(dir.path().join("model.bin"), b"mutated-pin").unwrap();
         assert!(store.selected().is_err());
+        assert!(store.load(DEV_MODEL_IDS[0]).is_err());
+    }
+
+    #[test]
+    fn registered_snapshot_rejects_same_size_artifact_after_registration() {
+        let dir = TempDir::new().unwrap();
+        let store = DevelopmentStore::open(dir.path().join("local-dev")).unwrap();
+        let value = manifest(dir.path(), DEV_MODEL_IDS[0]);
+        store.register(&value).unwrap();
+        let artifact = dir.path().join("model.bin");
+        fs::write(&artifact, b"other").unwrap();
+        File::open(&artifact)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+            )
+            .unwrap();
+        assert!(value.verify_pins().is_err());
         assert!(store.load(DEV_MODEL_IDS[0]).is_err());
     }
 
@@ -1359,11 +1354,7 @@ mod tests {
                 "{model_id} must pin tokenizer.json"
             );
         }
-        let small = development_catalog_entry("qwen3-asr-0.6b").unwrap();
         let large = development_catalog_entry("qwen3-asr-1.7b").unwrap();
-        assert!(small.note.contains("1804 MiB"), "{}", small.note);
-        assert!(large.note.contains("4196 MiB"), "{}", large.note);
-        assert!(!large.note.to_ascii_lowercase().contains("blocked"));
         assert!(large.vram_bytes < 8151u64 * 1024 * 1024 * 75 / 100);
         let catalog = crate::local_model::shipped_catalog();
         assert!(crate::local_model::production_selection(&catalog).is_none());
@@ -1482,7 +1473,6 @@ mod tests {
         ] {
             let entry = development_catalog_entry(model_id).unwrap();
             assert_eq!(entry.languages, &["en"]);
-            assert!(!entry.note.to_ascii_lowercase().contains("hindi candidate"));
             let dir = TempDir::new().unwrap();
             let mut value = remaining_manifest(dir.path(), model_id);
             assert!(value.validate().is_ok(), "{model_id}");
@@ -1495,17 +1485,8 @@ mod tests {
         assert_eq!(moonshine.devices, &["cpu"]);
         assert_eq!(moonshine.vram_bytes, 0);
         assert_eq!(moonshine.runtime, DevRuntimeKind::Python);
-        assert!(moonshine.note.contains("1.994s"));
-        assert!(!moonshine.note.to_ascii_lowercase().contains("hindi"));
         let fun = development_catalog_entry("fun-asr-nano-2512").unwrap();
         assert_eq!(fun.runtime, DevRuntimeKind::Native);
-        assert!(fun.note.contains(FUN_ASR_NANO_CHECKPOINT));
-        assert!(fun.note.contains("Fun-ASR-MLT-Nano"));
-        assert!(fun.note.contains("1625 MiB"));
-        assert!(!fun.note.to_ascii_lowercase().contains("hindi candidate"));
-        let cohere = development_catalog_entry("cohere-transcribe-03-2026").unwrap();
-        assert!(cohere.note.to_ascii_lowercase().contains("gated"));
-        assert!(cohere.note.contains("401"));
         assert_eq!(FUN_ASR_ENCODER_SHA.len(), 64);
         assert_eq!(FUN_ASR_DECODER_Q8_SHA.len(), 64);
         assert_eq!(FUN_ASR_ENCODER_BYTES, 469_331_008);
@@ -1513,25 +1494,10 @@ mod tests {
         assert_eq!(FUN_ASR_VAD_NAME, "fsmn-vad.gguf");
         assert_eq!(FUN_ASR_VAD_SHA.len(), 64);
         assert_eq!(FUN_ASR_VAD_BYTES, 1_720_512);
-        assert_eq!(FUN_ASR_NANO_GGUF_REV.len(), 40);
-        assert!(FUN_ASR_NANO_GGUF_SOURCE.contains("Fun-ASR-Nano-GGUF"));
-        assert_eq!(FUN_ASR_LLAMA_RUNTIME, "runtime-llamacpp-v0.2.6");
-        assert_eq!(MOONSHINE_MEDIUM_FILES.len(), 7);
         assert_eq!(MOONSHINE_MEDIUM_PINS.len(), 7);
-        assert!(MOONSHINE_MEDIUM_FILES.contains(&"encoder.ort"));
-        assert!(!MOONSHINE_MEDIUM_FILES.contains(&"encoder_model.ort"));
-        assert_eq!(
-            FUN_ASR_LLAMA_LINUX_X64_AVX2_SHA,
-            "aaebc5470f846ce915200b35d6e9f9bd0a0d3ed399d39e49bdeb7a1f1782bc70"
-        );
-        assert!(MOONSHINE_VOICE_SOURCE.contains("download.moonshine.ai"));
-        assert!(!MOONSHINE_VOICE_SOURCE.contains("huggingface.co"));
         assert_eq!(COHERE_HF_REV, "b1eacc2686a3d08ceaae5f24a88b1d519620bc09");
         assert_eq!(FUN_ASR_HF_REV, "d93b302ee7fd505e1b3576120fc142fc6f7820e1");
         assert_eq!(FUN_ASR_HF_WEIGHTS_BYTES, 1_659_773_320);
-        assert!(FUN_ASR_HF_SOURCE.contains("Fun-ASR-Nano-2512-hf"));
-        assert!(!FUN_ASR_HF_SOURCE.to_ascii_lowercase().contains("mlt"));
-        assert!(COHERE_HF_SOURCE.contains("CohereLabs/cohere-transcribe-03-2026"));
     }
 
     #[test]

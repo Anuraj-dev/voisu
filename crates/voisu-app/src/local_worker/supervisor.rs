@@ -583,7 +583,7 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         self.transcribe_until(request, Instant::now() + STOP_PROCESSING)
     }
 
-    fn transcribe_until(
+    pub(crate) fn transcribe_until(
         &mut self,
         request: TranscribeRequest,
         deadline: Instant,

@@ -70,13 +70,13 @@ Use `~/.local/bin/voisu-dev off` to return to the production service and `voisu 
 
 ## Replay exact audio through Rust
 
-`benchmark.py replay` invokes the protected Rust seam once for each selected model and each frozen recording. It never launches `worker.py` or another unrestricted Python process. The current seam is:
+`benchmark.py replay` invokes the protected Rust seam once per selected model. It never launches `worker.py` or another unrestricted Python process. Register each manifest before replay; the registered private snapshot is used for the run. Artifact SHA-256 pins are checked at registration. Replay checks the snapshot identity and file sizes without rehashing the weights.
 
 ```text
-voisu local-dev replay --json --manifest MODEL_MANIFEST --audio WAV
+voisu local-dev replay --json --manifest MODEL_MANIFEST --audio WAV1 --audio WAV2 ...
 ```
 
-The command must emit one JSON object on stdout and keep diagnostics on stderr. The required base fields are `version`, `model_id`, `language`, `requested_device`, `observed_device`, `resident`, `inference_ms`, `text`, `status`, and `error`. For benchmark evidence, add the exact `model_revision`, `runtime_revision`, receipt or artifact hashes, `backend`, `host_profile`, and protected execution identity. Include `load_ms` with an explicit `phase: "cold"` and `inference_ms` with `phase: "warm"` only when the worker session is resident and the phase is measured. A one-shot invocation that reloads weights for every recording has cold evidence only; the report leaves warm p50/p95 unavailable.
+The command emits one JSON object per WAV, in argument order, on stdout and keeps diagnostics on stderr. It loads one worker, transcribes each WAV once, then stops the worker. The first row has `phase: "cold"` and `load_ms`; later resident rows have `phase: "warm"` and `inference_ms`. A worker failure marks remaining WAVs unavailable. Duration profiles are `short` for at most 10 seconds and `long` above 10 seconds. Set `VOISU_DEV_HOST_PROFILE` for an explicit host label; without it, evidence is labeled `unprofiled`. The required base fields are `version`, `model_id`, `language`, `requested_device`, `observed_device`, `resident`, `inference_ms`, `text`, `status`, and `error`. Benchmark evidence also includes the exact `model_revision`, `runtime_revision`, receipt and artifact hashes, `backend`, and host profile.
 
 Run all selected models against the same manifest. The model manifest path identifies the model; the audio path always comes from the frozen corpus.
 

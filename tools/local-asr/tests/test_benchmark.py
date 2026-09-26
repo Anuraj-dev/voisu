@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
+from types import SimpleNamespace
 import wave
 
 
@@ -130,8 +132,132 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIsNone(result["labels"]["lowest_measured_memory"])
 
     def test_replay_command_uses_only_rust_protected_seam(self):
-        command = benchmark.build_replay_command("voisu", Path("/tmp/model.json"), Path("/tmp/audio.wav"))
-        self.assertEqual(command, ["voisu", "local-dev", "replay", "--json", "--manifest", "/tmp/model.json", "--audio", "/tmp/audio.wav"])
+        command = benchmark.build_replay_command("voisu", Path("/tmp/model.json"), [Path("/tmp/a.wav"), Path("/tmp/b.wav")])
+        self.assertEqual(command, ["voisu", "local-dev", "replay", "--json", "--manifest", "/tmp/model.json", "--audio", "/tmp/a.wav", "--audio", "/tmp/b.wav"])
+
+    def test_replay_runs_one_batch_per_model_and_keeps_partial_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            _, corpus = make_corpus(tmp)
+            models = ["qwen3-asr-0.6b", "qwen3-asr-1.7b"]
+            manifests = []
+            for model in models:
+                path = tmp / f"{model}.json"
+                path.write_text(json.dumps({"model_id": model}), encoding="utf-8")
+                manifests.append(f"{model}={path}")
+            good = [{"status": "transcript", "text": "words", "resident": True, "phase": "cold" if index == 0 else "warm", "load_ms": 5 if index == 0 else None, "inference_ms": 10 + index, "duration_profile": "long" if index == 1 else "short"} for index in range(3)]
+            partial = [{"status": "transcript", "text": "words", "phase": "cold", "load_ms": 5}, {"status": "error", "error": "worker crashed"}]
+            completed = [(0, "", "\n".join(map(json.dumps, good))), (1, "crashed", "\n".join(map(json.dumps, partial)))]
+            class FakeProcess:
+                def __init__(self, result):
+                    self.returncode, stderr, stdout = result
+                    self.stderr = stderr.encode()
+                    self.stdout = stdout.encode()
+
+                def communicate(self, timeout=None):
+                    return self.stdout, self.stderr
+
+            with mock.patch.object(benchmark.subprocess, "Popen", side_effect=[FakeProcess(result) for result in completed]) as run:
+                evidence = benchmark.replay(corpus, manifests, "voisu", tmp / "replay.json", 30, fixture=True)
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(len(evidence["records"]), 6)
+            self.assertEqual([row["raw_response"]["status"] for row in evidence["records"][3:]], ["transcript", "error", "unavailable"])
+            report = benchmark.score(corpus, evidence, models, None, allow_fixture=True)
+            self.assertEqual(report["models"][0]["timings"]["warm_inference_ms"]["sample_count"], 2)
+            self.assertEqual(report["models"][0]["duration_profiles"]["short"]["sample_count"], 2)
+            evidence["records"][1]["raw_response"].pop("resident")
+            evidence["records"][1].pop("resident")
+            evidence["evidence_sha256"] = benchmark.content_hash(evidence, "evidence_sha256")
+            report = benchmark.score(corpus, evidence, models, None, allow_fixture=True)
+            self.assertEqual(report["models"][0]["timings"]["warm_inference_ms"]["sample_count"], 1)
+
+    def test_replay_timeout_keeps_completed_line_and_terminates_cli(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            _, corpus = make_corpus(tmp)
+            manifest = tmp / "model.json"
+            manifest.write_text(json.dumps({"model_id": "qwen3-asr-0.6b"}), encoding="utf-8")
+            first = json.dumps({"status": "transcript", "text": "kept", "phase": "cold"}).encode() + b"\n"
+
+            class TimedOutProcess:
+                pid = 12345
+                returncode = None
+                calls = 0
+                terminated = False
+
+                def communicate(self, timeout=None):
+                    self.calls += 1
+                    if self.calls == 1:
+                        raise benchmark.subprocess.TimeoutExpired("voisu", timeout, output=first)
+                    self.returncode = 1
+                    return first + b'{"status":', b"terminated"
+
+                def terminate(self):
+                    self.terminated = True
+
+            process = TimedOutProcess()
+            with mock.patch.object(benchmark.subprocess, "Popen", return_value=process):
+                evidence = benchmark.replay(corpus, [f"qwen3-asr-0.6b={manifest}"], "voisu", tmp / "replay.json", 0.1, fixture=True)
+            self.assertTrue(process.terminated)
+            self.assertEqual([row["raw_response"]["status"] for row in evidence["records"]], ["transcript", "unavailable", "unavailable"])
+            self.assertEqual(evidence["records"][0]["raw_text"], "kept")
+
+    def test_replay_timeout_stops_only_its_worker_unit(self):
+        class TimedOutProcess:
+            pid = 12345
+            returncode = None
+            calls = 0
+
+            def communicate(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise benchmark.subprocess.TimeoutExpired("voisu", timeout)
+                self.returncode = 1
+                return b"", b""
+
+            def terminate(self):
+                pass
+
+        unit = "voisu-dev-worker-12345-1.service"
+        responses = [
+            SimpleNamespace(returncode=0, stdout=f"{unit} loaded active running\nvoisu-dev-worker-999-1.service loaded active running\n", stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="inactive\n", stderr=""),
+        ]
+        with mock.patch.object(benchmark.subprocess, "Popen", return_value=TimedOutProcess()), \
+             mock.patch.object(benchmark.subprocess, "run", side_effect=responses) as systemctl:
+            _, _, _, failure = benchmark._run_replay(["voisu"], 0.1)
+        self.assertEqual(failure, "protected replay timed out")
+        self.assertEqual(systemctl.call_args_list[1].args[0], ["systemctl", "--user", "stop", unit])
+
+    def test_replay_force_kill_cleans_unit_before_draining_pipes(self):
+        events = []
+
+        class HungProcess:
+            pid = 12345
+            returncode = None
+            calls = 0
+
+            def communicate(self, timeout=None):
+                self.calls += 1
+                events.append(f"communicate-{self.calls}")
+                if self.calls <= 2:
+                    raise benchmark.subprocess.TimeoutExpired("voisu", timeout, output=b'{"status":"transcript"}\n')
+                self.returncode = -9
+                return b'{"status":"transcript"}\n', b""
+
+            def terminate(self):
+                events.append("terminate")
+
+            def kill(self):
+                events.append("kill")
+
+        with mock.patch.object(benchmark.subprocess, "Popen", return_value=HungProcess()), \
+             mock.patch.object(benchmark, "_replay_unit_cleanup", side_effect=lambda pid: events.append("cleanup")):
+            stdout, _, _, failure = benchmark._run_replay(["voisu"], 0.1)
+        self.assertEqual(failure, "protected replay timed out")
+        self.assertIn('{"status":"transcript"}', stdout)
+        self.assertLess(events.index("cleanup"), events.index("communicate-3"))
 
     def test_worker_entry_is_worker_py_and_cache_dir_is_allowed(self):
         self.assertEqual(asr_service.WORKER_ENTRY.name, "worker.py")

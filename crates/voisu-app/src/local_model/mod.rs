@@ -24,9 +24,9 @@ pub use catalog::{
     pilot_candidate, production_selection, sha256_hex, shipped_catalog, verify_file_digest,
 };
 pub use development::{
-    DEV_MODEL_IDS, DEVELOPMENT_MANIFEST_VERSION, DEVELOPMENT_ROOT_NAME, DevCatalogEntry, DevDevice,
-    DevFilePin, DevLanguage, DevLimits, DevManifest, DevManifestHandle, DevModelStatus,
-    DevRuntimeKind, DevRuntimeManifest, DevelopmentError, DevelopmentStore, development_catalog,
+    DEV_MODEL_IDS, DEVELOPMENT_MANIFEST_VERSION, DEVELOPMENT_ROOT_NAME, DevCatalogEntry,
+    DevFilePin, DevLimits, DevManifest, DevManifestHandle, DevModelStatus, DevRuntimeKind,
+    DevRuntimeManifest, DevelopmentError, DevelopmentStore, development_catalog,
     development_catalog_entry, development_receipt,
 };
 pub use fetch::{
@@ -111,5 +111,17 @@ mod tests {
             Some("whisper-cpp-ggml-base.en")
         );
         assert!(production_selection(&catalog).is_none());
+    }
+
+    #[test]
+    fn only_development_service_enables_the_local_pilot() {
+        let dev = include_str!("../../../../packaging/voisu-dev.service");
+        let production = include_str!("../../../../packaging/voisu.service");
+        assert!(
+            dev.lines()
+                .any(|line| line == "Environment=VOISU_ENABLE_LOCAL_PILOT=1")
+        );
+        assert!(dev.lines().any(|line| line == "Conflicts=voisu.service"));
+        assert!(!production.contains("VOISU_ENABLE_LOCAL_PILOT"));
     }
 }

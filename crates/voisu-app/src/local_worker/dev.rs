@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
-use crate::local_model::{DevDevice, DevManifest};
+use crate::local_model::DevManifest;
 
 use super::bounds::{CANCEL_GRACE, MAX_JSON_FRAME_BYTES, MAX_PCM_BYTES, REAP_OBSERVE};
 use super::protocol::{
@@ -59,7 +59,11 @@ pub fn refuse_if_development_worker_loaded() -> Result<(), SupervisorError> {
 }
 
 fn refuse_if_units_live(pattern: &str) -> Result<(), SupervisorError> {
-    if live_units(pattern)?.is_empty() {
+    refuse_if_live_units(&live_units(pattern)?)
+}
+
+fn refuse_if_live_units(units: &[String]) -> Result<(), SupervisorError> {
+    if units.is_empty() {
         Ok(())
     } else {
         Err(SupervisorError::Busy)
@@ -68,7 +72,7 @@ fn refuse_if_units_live(pattern: &str) -> Result<(), SupervisorError> {
 
 pub enum RuntimeWorker {
     Whisper(WhisperCppWorker),
-    Development(DevWorker),
+    Development(Box<DevWorker>),
 }
 
 impl WorkerChild for RuntimeWorker {
@@ -105,14 +109,7 @@ impl DevWorker {
         manifest_hash: impl Into<String>,
         manifest_path: &Path,
     ) -> Result<Self, SupervisorError> {
-        manifest
-            .verify_pins()
-            .map_err(|_| SupervisorError::LoadAborted)?;
         let manifest_hash = manifest_hash.into();
-        if manifest_hash.len() != 64 || !manifest_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(SupervisorError::Protocol(FrameError::CorrelationMismatch));
-        }
         // Only one development worker may hold the model/GPU at a time,
         // including one that is still starting or being stopped.
         refuse_if_development_worker_loaded()?;
@@ -121,7 +118,7 @@ impl DevWorker {
             std::process::id(),
             NEXT_UNIT.fetch_add(1, Ordering::Relaxed)
         );
-        let cache = cache_path(&manifest)?;
+        let cache = cache_path(&manifest);
         std::fs::create_dir_all(&cache).map_err(|_| SupervisorError::LoadAborted)?;
         let args = systemd_run_args(&unit, &cache, &manifest, manifest_path);
         let mut command = Command::new(SYSTEMD_RUN);
@@ -347,9 +344,7 @@ impl DevWorker {
     }
 
     fn observe_resident(&mut self, value: &Value) {
-        if let Some(resident) = value.get("resident").and_then(Value::as_bool) {
-            self.resident = resident;
-        }
+        self.resident = value.get("resident").and_then(Value::as_bool) == Some(true);
     }
 
     /// Stops the unit within `REAP_OBSERVE + CANCEL_GRACE`.  Liveness is
@@ -453,13 +448,13 @@ impl WorkerChild for DevWorker {
                 model_receipt_hash: self.manifest_hash.clone(),
             },
         };
-        if let Some(pcm_bytes) = pcm_bytes {
-            if pcm.map_or(0, <[u8]>::len) != pcm_bytes || pcm_bytes > MAX_PCM_BYTES {
-                return Err(SupervisorError::Protocol(FrameError::DeclaredPcmMismatch {
-                    declared: pcm_bytes,
-                    actual: pcm.map_or(0, <[u8]>::len),
-                }));
-            }
+        if let Some(pcm_bytes) = pcm_bytes
+            && (pcm.map_or(0, <[u8]>::len) != pcm_bytes || pcm_bytes > MAX_PCM_BYTES)
+        {
+            return Err(SupervisorError::Protocol(FrameError::DeclaredPcmMismatch {
+                declared: pcm_bytes,
+                actual: pcm.map_or(0, <[u8]>::len),
+            }));
         }
         let mut request = json!({"v": 1, "op": op, "id": id});
         if let Some(pcm_bytes) = pcm_bytes {
@@ -491,7 +486,7 @@ impl Drop for DevWorker {
 /// Runs `systemctl --user` but gives up (and kills it) at `deadline`, so a
 /// slow user manager cannot stretch cancellation.  Only for short outputs.
 fn systemctl_until(args: &[&str], deadline: Instant) -> Option<std::process::Output> {
-    let mut child = Command::new(SYSTEMCTL)
+    let child = Command::new(SYSTEMCTL)
         .arg("--user")
         .args(args)
         .stdin(Stdio::null())
@@ -499,6 +494,10 @@ fn systemctl_until(args: &[&str], deadline: Instant) -> Option<std::process::Out
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    child_until(child, deadline)
+}
+
+fn child_until(mut child: Child, deadline: Instant) -> Option<std::process::Output> {
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return child.wait_with_output().ok(),
@@ -638,26 +637,16 @@ fn bounded_metadata(message: &str) -> Map<String, Value> {
 }
 
 fn requested_device_matches(requested: &str, observed: &str) -> bool {
-    match DevDevice::parse(requested) {
-        Some(DevDevice::Cuda0) => observed == "cuda:0",
-        Some(DevDevice::Cpu) => observed == "cpu",
-        None => false,
-    }
+    requested == observed && matches!(observed, "cpu" | "cuda:0")
 }
 
-fn cache_path(manifest: &DevManifest) -> Result<PathBuf, SupervisorError> {
-    let path = manifest
+fn cache_path(manifest: &DevManifest) -> PathBuf {
+    manifest
         .options
         .get("cache_dir")
         .and_then(Value::as_str)
         .map(PathBuf::from)
-        .unwrap_or_else(|| default_cache_path(Path::new(&manifest.model_path)));
-    if !path.is_absolute() {
-        return Err(SupervisorError::Unavailable(
-            "development cache path must be absolute",
-        ));
-    }
-    Ok(path)
+        .unwrap_or_else(|| default_cache_path(Path::new(&manifest.model_path)))
 }
 
 fn default_cache_path(model_path: &Path) -> PathBuf {
@@ -1105,6 +1094,18 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_command_deadline_kills_a_stalled_child() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        assert!(child_until(child, started + Duration::from_millis(100)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn write_until_delivers_every_byte_to_a_healthy_reader() {
         let mut child = Command::new("wc")
             .arg("-c")
@@ -1133,14 +1134,17 @@ voisu-dev-worker-1-4.service loaded inactive dead [systemd-run] python
 \u{25cf} voisu-dev-worker-1-5.service loaded failed failed [systemd-run] python
 voisu-dev-worker-1-6.service not-found inactive dead voisu-dev-worker-1-6.service
 ";
+        let live = parse_live_units(listing);
         assert_eq!(
-            parse_live_units(listing),
+            live,
             [
                 "voisu-dev-worker-1-1.service",
                 "voisu-dev-worker-1-2.service",
                 "voisu-dev-worker-1-3.service",
             ]
         );
+        assert_eq!(refuse_if_live_units(&live), Err(SupervisorError::Busy));
+        assert_eq!(refuse_if_live_units(&[]), Ok(()));
     }
 
     /// Transient user unit owned by one test.  Its names never match

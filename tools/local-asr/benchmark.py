@@ -358,10 +358,106 @@ def _resolve_model_manifests(values: Sequence[str]) -> list[tuple[str, Path]]:
     return result
 
 
-def build_replay_command(rust_cli: str, model_manifest: Path, audio: Path) -> list[str]:
+def build_replay_command(rust_cli: str, model_manifest: Path, audios: Sequence[Path], timeout_s: float | None = None) -> list[str]:
     """Build the protected Rust invocation agreed by the local-dev seam."""
 
-    return [rust_cli, "local-dev", "replay", "--json", "--manifest", str(model_manifest), "--audio", str(audio)]
+    command = [rust_cli, "local-dev", "replay", "--json", "--manifest", str(model_manifest)]
+    if timeout_s is not None:
+        command += ["--timeout-ms", str(max(1, int(timeout_s * 1000)))]
+    return command + [part for audio in audios for part in ("--audio", str(audio))]
+
+
+def _replay_unit_cleanup(pid: int) -> None:
+    """Last resort after killing a CLI: stop only units created by its PID."""
+    prefix = f"voisu-dev-worker-{pid}-"
+    listed = subprocess.run(
+        ["systemctl", "--user", "list-units", "--all", "--plain", "--no-legend", f"{prefix}*.service"],
+        capture_output=True, text=True, check=False, timeout=5,
+    )
+    if listed.returncode:
+        raise OSError(f"cannot list development worker units for CLI {pid}: {listed.stderr[-500:]}")
+    for line in listed.stdout.splitlines():
+        unit = line.split(maxsplit=1)[0]
+        if unit.startswith(prefix) and unit.endswith(".service"):
+            for action in (["stop", unit], ["kill", "--signal=SIGKILL", unit]):
+                try:
+                    subprocess.run(["systemctl", "--user", *action], capture_output=True, check=False, timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                for _ in range(20):
+                    try:
+                        state = subprocess.run(
+                            ["systemctl", "--user", "show", "--property=ActiveState", "--value", unit],
+                            capture_output=True, text=True, check=False, timeout=5,
+                        )
+                        if state.returncode == 0 and state.stdout.strip() in {"inactive", "failed"}:
+                            break
+                    except subprocess.TimeoutExpired:
+                        pass
+                    time.sleep(0.1)
+                else:
+                    continue
+                break
+            else:
+                raise OSError(f"development worker unit is still loaded: {unit}")
+
+
+def _run_replay(command: Sequence[str], timeout_s: float, cleanup_units: bool = True) -> tuple[str, str, int | None, str | None]:
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    cleanup_error = None
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_s)
+        failure = None
+    except subprocess.TimeoutExpired as exc:
+        partial_stdout = exc.stdout or b""
+        partial_stderr = exc.stderr or b""
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = process.communicate(timeout=65)
+        except subprocess.TimeoutExpired as grace_exc:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            # The detached worker wrapper may still hold stderr open after the
+            # CLI dies, so retire its exact unit before draining the pipes.
+            if cleanup_units:
+                try:
+                    _replay_unit_cleanup(process.pid)
+                except (OSError, subprocess.SubprocessError) as error:
+                    cleanup_error = error
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired as drain_exc:
+                stdout = drain_exc.stdout or grace_exc.stdout or partial_stdout
+                stderr = drain_exc.stderr or grace_exc.stderr or partial_stderr
+                if process.stdout:
+                    process.stdout.close()
+                if process.stderr:
+                    process.stderr.close()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired as error:
+                    cleanup_error = error
+            if not stdout:
+                stdout = grace_exc.stdout or partial_stdout
+        if not stdout.startswith(partial_stdout):
+            stdout = partial_stdout + stdout
+        if not stderr.startswith(partial_stderr):
+            stderr = partial_stderr + stderr
+        failure = "protected replay timed out"
+    if cleanup_units:
+        try:
+            _replay_unit_cleanup(process.pid)
+            cleanup_error = None
+        except (OSError, subprocess.SubprocessError) as error:
+            cleanup_error = error
+    if cleanup_error is not None:
+        failure = f"worker unit cleanup failed: {cleanup_error}"
+    return stdout.decode(errors="replace"), stderr.decode(errors="replace"), process.returncode, failure
 
 
 def _validate_rust_cli(rust_cli: str, allow_fixture: bool) -> None:
@@ -372,30 +468,32 @@ def _validate_rust_cli(rust_cli: str, allow_fixture: bool) -> None:
 def replay(corpus: Mapping[str, Any], model_manifests: Sequence[str], rust_cli: str, output: Path, timeout_s: float, fixture: bool = False) -> dict[str, Any]:
     validate_frozen(corpus)
     _validate_rust_cli(rust_cli, fixture)
+    _require(timeout_s > 0, "--timeout-seconds must be positive")
     models = _resolve_model_manifests(model_manifests)
     rows: list[dict[str, Any]] = []
     run_id = str(uuid.uuid4())
     for model_id, model_manifest in models:
         private_manifest = read_json(model_manifest)
         _require(private_manifest.get("model_id") == model_id, f"model manifest identity mismatch for {model_id}")
-        for record in corpus["records"]:
-            command = build_replay_command(rust_cli, model_manifest, Path(record["audio_path"]))
-            started = time.time()
-            try:
-                completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout_s)
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                response = {"status": "unavailable", "error": f"protected replay failed: {exc}"}
-                completed = None
-            else:
-                if completed.returncode != 0:
-                    response = {"status": "unavailable", "error": f"protected replay exit {completed.returncode}: {completed.stderr[-1000:]}"}
-                else:
-                    try:
-                        response = json.loads(completed.stdout)
-                    except json.JSONDecodeError as exc:
-                        raise BenchmarkError(f"Rust replay returned invalid JSON for {model_id}/{record['record_id']}: {exc}") from exc
-                    _require(isinstance(response, dict), f"Rust replay response must be an object for {model_id}/{record['record_id']}")
-            elapsed_ms = round((time.time() - started) * 1000, 3)
+        records = corpus["records"]
+        command = build_replay_command(rust_cli, model_manifest, [Path(record["audio_path"]) for record in records], timeout_s)
+        try:
+            stdout, stderr, returncode, timeout_failure = _run_replay(command, 60 + timeout_s * len(records) + 5, cleanup_units=not fixture)
+            responses = []
+            for line in stdout.splitlines():
+                try:
+                    response = json.loads(line)
+                except json.JSONDecodeError:
+                    break
+                if not isinstance(response, dict):
+                    break
+                responses.append(response)
+            failure = timeout_failure or (f"protected replay exit {returncode}: {stderr[-1000:]}" if returncode else "protected replay ended before all clips")
+        except OSError as exc:
+            responses = []
+            failure = f"protected replay failed: {exc}"
+        for index, record in enumerate(records):
+            response = responses[index] if index < len(responses) else {"status": "unavailable", "error": failure}
             row = {
                 "schema_version": SCHEMA_VERSION,
                 "run_id": run_id,
@@ -408,7 +506,6 @@ def replay(corpus: Mapping[str, Any], model_manifests: Sequence[str], rust_cli: 
                 "protected_execution": not fixture,
                 "execution_seam": "fixture" if fixture else "rust-protected",
                 "evidence_class": "fixture" if fixture else response.get("evidence_class", "unverified"),
-                "wall_time_ms": elapsed_ms,
                 "raw_response": response,
                 "raw_text": response.get("raw_text", response.get("text")) if response.get("status") not in {"unavailable", "error"} else None,
                 "delivered_text": response.get("delivered_text"),
@@ -440,6 +537,8 @@ def _load_replay_rows(path: Path) -> Mapping[str, Any]:
 
 
 def _require_identity(row: Mapping[str, Any], allow_fixture: bool) -> None:
+    if _response_status(row) in {"unavailable", "error"}:
+        return
     if row.get("evidence_class") == "fixture":
         _require(allow_fixture, "fixture evidence cannot be scored as quality evidence without --allow-fixture")
         return
@@ -494,10 +593,14 @@ def _score_field(rows: Sequence[Mapping[str, Any]], corpus_by_id: Mapping[str, M
     return {"overall": finish(total), "by_language": {language: finish(bucket) for language, bucket in sorted(by_language.items())}, "critical_content_errors": critical_errors}
 
 
-def _metric_samples(rows: Iterable[Mapping[str, Any]], key: str, phases: set[str]) -> list[float]:
+def _metric_samples(rows: Iterable[Mapping[str, Any]], key: str, phases: set[str], require_resident: bool = False) -> list[float]:
     values = []
     for row in rows:
+        if _response_status(row) in {"unavailable", "error"}:
+            continue
         phase = str(row.get("phase", row.get("raw_response", {}).get("phase", ""))).lower()
+        if require_resident and row.get("resident", row.get("raw_response", {}).get("resident")) is not True:
+            continue
         value = row.get(key, row.get("raw_response", {}).get(key))
         if phase in phases and isinstance(value, (int, float)) and value >= 0:
             values.append(float(value))
@@ -534,7 +637,7 @@ def _report_model(model_id: str, rows: Sequence[Mapping[str, Any]], corpus: Mapp
         if values:
             model_identity[key] = json.loads(values[0]) if len(values) == 1 else [json.loads(item) for item in values]
     cold_load = _metric_samples(rows, "load_ms", {"cold", "cold_load"})
-    warm_inference = _metric_samples(rows, "inference_ms", {"warm"})
+    warm_inference = _metric_samples(rows, "inference_ms", {"warm"}, require_resident=True)
     stop_transcript = _metric_samples(rows, "stop_to_transcript_ms", {"cold", "warm", ""})
     stop_delivery = _metric_samples(rows, "stop_to_delivery_ms", {"cold", "warm", ""})
     peak_ram = [float(row["peak_host_ram_bytes"]) for row in rows if isinstance(row.get("peak_host_ram_bytes"), (int, float))]
@@ -591,6 +694,13 @@ def score(corpus: Mapping[str, Any], evidence: Mapping[str, Any], expected_model
         _require_identity(row, allow_fixture)
         grouped[model_id].append(row)
     model_reports = [_report_model(model_id, grouped[model_id], corpus, version, mapping, allow_fixture) for model_id in sorted(expected)]
+    for model in model_reports:
+        profiles = {row.get("duration_profile") for row in grouped[model["model_id"]] if isinstance(row.get("duration_profile"), str)}
+        model["duration_profiles"] = {}
+        for profile in sorted(profiles):
+            scoped = _report_model(model["model_id"], [row for row in grouped[model["model_id"]] if row.get("duration_profile") == profile], corpus, version, mapping, allow_fixture)
+            scoped["identity"]["duration_profile"] = profile
+            model["duration_profiles"][profile] = scoped
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "kind": "benchmark_report",
@@ -610,6 +720,8 @@ def recommend(report: Mapping[str, Any], language: str, duration_profile: str | 
     language = _normalise_language(language)
     candidates = []
     for model in report.get("models", []):
+        if duration_profile is not None:
+            model = model.get("duration_profiles", {}).get(duration_profile, model if model.get("identity", {}).get("duration_profile") == duration_profile else {})
         if model.get("status") not in {"measured", "measured_partial"} or not model.get("quality_evidence"):
             continue
         identity = model.get("identity", {})
