@@ -8,6 +8,7 @@ startup behavior.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import gc
 import os
@@ -15,9 +16,10 @@ import re
 import resource
 import subprocess
 import tempfile
-from dataclasses import dataclass
+import traceback
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .audio import pcm_to_float32, write_pcm16_wav
 from .manifest import (
@@ -260,6 +262,43 @@ def _cuda_memory_bytes(torch: Any, device: str) -> int:
     if nvml:
         allocated = max(allocated, nvml)
     return allocated
+
+
+@contextlib.contextmanager
+def _cuda_request(torch: Any, device: str) -> Iterator[bool]:
+    """Scope one transcription's CUDA memory; the model stays resident.
+
+    Peak stats restart so reported peak GPU memory belongs to this request;
+    yields False when that reset failed, so the caller must not report a peak.
+    Afterwards the caching allocator's free blocks go back to the driver:
+    otherwise reserved memory stays at the high-water mark of the longest clip
+    ever transcribed (one 7-minute clip pinned ~7 GiB of an 8 GiB card for
+    every later dictation). Callers run the request in a separate function so
+    its tensors are already unreferenced here on success; on failure the
+    exception chain's frames still hold them, so their locals are cleared first.
+    """
+
+    if torch is None or not device.startswith("cuda:"):
+        yield True
+        return
+    peak_reset = False
+    with contextlib.suppress(Exception):
+        torch.cuda.reset_peak_memory_stats(int(device.split(":", 1)[1]))
+        peak_reset = True
+    try:
+        yield peak_reset
+    except BaseException as exc:
+        seen: set[int] = set()
+        link: BaseException | None = exc
+        while link is not None and id(link) not in seen:
+            seen.add(id(link))
+            traceback.clear_frames(link.__traceback__)
+            link = link.__cause__ or link.__context__
+        raise
+    finally:
+        # Cleanup must never replace the request's own result or error.
+        with contextlib.suppress(Exception):
+            torch.cuda.empty_cache()
 
 
 def _observe_torch_execution_device(torch: Any, model: Any, requested: str) -> str:
@@ -873,6 +912,15 @@ class QwenTransformersAdapter(BaseAdapter):
         self.metadata = self._metadata(observed)
 
     def transcribe(self, pcm: bytes) -> str:
+        self._peak_gpu_memory_bytes = 0
+        with _cuda_request(self.torch, self.manifest.device) as peak_reset:
+            text = self._transcribe(pcm)
+        if not peak_reset:
+            # A stale lifetime peak must not pass as this request's; 0 = unknown.
+            self.metadata = replace(self.metadata, peak_gpu_memory_bytes=0)
+        return text
+
+    def _transcribe(self, pcm: bytes) -> str:
         if self.model is None or self.processor is None or self.torch is None:
             raise AdapterError("not_ready", "Qwen model is not loaded")
         force_offline_hub()
@@ -1034,6 +1082,10 @@ class FunAsrAdapter(BaseAdapter):
         self.metadata = AdapterMetadata(self.manifest.model_id, observed, False, "funasr:AutoModel")
 
     def transcribe(self, pcm: bytes) -> str:
+        with _cuda_request(self.torch, self.manifest.device):
+            return self._transcribe(pcm)
+
+    def _transcribe(self, pcm: bytes) -> str:
         if self.model is None:
             raise AdapterError("not_ready", "Fun-ASR model is not loaded")
         force_offline_hub()
@@ -1173,6 +1225,15 @@ class FunAsrHfTransformersAdapter(BaseAdapter):
         self.metadata = self._metadata(observed)
 
     def transcribe(self, pcm: bytes) -> str:
+        self._peak_gpu_memory_bytes = 0
+        with _cuda_request(self.torch, self.manifest.device) as peak_reset:
+            text = self._transcribe(pcm)
+        if not peak_reset:
+            # A stale lifetime peak must not pass as this request's; 0 = unknown.
+            self.metadata = replace(self.metadata, peak_gpu_memory_bytes=0)
+        return text
+
+    def _transcribe(self, pcm: bytes) -> str:
         if self.model is None or self.processor is None or self.torch is None:
             raise AdapterError("not_ready", "Fun-ASR-Nano-2512-hf is not loaded")
         force_offline_hub()
@@ -1319,6 +1380,10 @@ class CohereTransformersAdapter(BaseAdapter):
         self.metadata = AdapterMetadata(self.manifest.model_id, observed, False, "transformers:CohereAsr")
 
     def transcribe(self, pcm: bytes) -> str:
+        with _cuda_request(self.torch, self.manifest.device):
+            return self._transcribe(pcm)
+
+    def _transcribe(self, pcm: bytes) -> str:
         if self.model is None or self.processor is None or self.torch is None or self.numpy is None:
             raise AdapterError("not_ready", "Cohere model is not loaded")
         force_offline_hub()
