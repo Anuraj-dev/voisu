@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .candidates import CANDIDATE_OPTIONS, CANDIDATES, candidate_error
+
 
 MODEL_IDS = frozenset(
     {
@@ -20,6 +22,7 @@ MODEL_IDS = frozenset(
         "fun-asr-nano-2512",
         "moonshine-streaming-medium",
         "cohere-transcribe-03-2026",
+        *CANDIDATES,
     }
 )
 DEVICES = frozenset({"cpu", "cuda:0"})
@@ -54,6 +57,7 @@ _MODEL_OPTIONS = {
     ),
     "moonshine-streaming-medium": frozenset({"model_arch"}),
     "cohere-transcribe-03-2026": frozenset({"revision", "punctuation", "max_new_tokens"}),
+    **{model_id: CANDIDATE_OPTIONS[item.backend] for model_id, item in CANDIDATES.items()},
 }
 FUN_ASR_NANO_CHECKPOINT = "Fun-ASR-Nano-2512"
 FUN_ASR_MLT_MARKER = "fun-asr-mlt-nano"
@@ -347,7 +351,7 @@ def load_manifest(path: str | Path, *, expected_worker: Path | None = None) -> M
         raise ManifestError("manifest version must be 1")
     model_id = document.get("model_id")
     if model_id not in MODEL_IDS:
-        raise ManifestError("manifest model_id is not one of the seven development models")
+        raise ManifestError("manifest model_id is not a development catalog model")
     device = document.get("device")
     language = document.get("language")
     if device not in DEVICES:
@@ -436,6 +440,13 @@ def load_manifest(path: str | Path, *, expected_worker: Path | None = None) -> M
         normalized_limits[name] = value
     if normalized_limits["tasks"] <= 0 or normalized_limits["cpu_cores"] <= 0 or normalized_limits["memory_bytes"] <= 0:
         raise ManifestError("memory_bytes, tasks, and cpu_cores must be positive")
+    if model_id in CANDIDATES:
+        pins = ((item.path, item.sha256, item.bytes) for item in artifacts)
+        error = candidate_error(
+            CANDIDATES[model_id], device, language, model_path, options, normalized_limits["vram_bytes"], pins
+        )
+        if error:
+            raise ManifestError(error)
 
     return Manifest(
         version=1,
