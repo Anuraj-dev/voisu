@@ -32,6 +32,14 @@ pub enum SupervisorError {
     Crashed,
     OutOfMemory,
     LoadAborted,
+    /// The worker answered with an error code this supervisor has no typed
+    /// mapping for (for example a development runtime's `vram_admission` or
+    /// `health_mismatch`). The worker's own code and message are kept so the
+    /// refusal is not reduced to a generic protocol failure.
+    Refused {
+        code: String,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for SupervisorError {
@@ -47,6 +55,10 @@ impl std::fmt::Display for SupervisorError {
             Self::Crashed => write!(f, "worker crashed"),
             Self::OutOfMemory => write!(f, "worker out of memory"),
             Self::LoadAborted => write!(f, "worker load aborted"),
+            Self::Refused { code, message } if message.is_empty() => {
+                write!(f, "worker refused: {code}")
+            }
+            Self::Refused { code, message } => write!(f, "worker refused: {code}: {message}"),
         }
     }
 }
@@ -68,6 +80,8 @@ pub struct InferenceMetrics {
     pub inference_ms: Option<u64>,
     pub peak_host_ram_bytes: Option<u64>,
     pub peak_gpu_memory_bytes: Option<u64>,
+    /// Worker process user+system CPU time spent on this request.
+    pub cpu_time_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -512,14 +526,26 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         err
     }
 
-    fn map_worker_error(&mut self, code: &str, unknown: WorkerState) -> SupervisorError {
+    fn map_worker_error(
+        &mut self,
+        code: &str,
+        metadata: &serde_json::Map<String, serde_json::Value>,
+        unknown: WorkerState,
+    ) -> SupervisorError {
         match code {
             "oom" => self.fail_and_reap(SupervisorError::OutOfMemory),
             "crash" => self.fail_and_reap(SupervisorError::Crashed),
             "load_abort" => self.fail_and_reap(SupervisorError::LoadAborted),
             _ => {
                 self.state = unknown;
-                SupervisorError::Protocol(FrameError::Unsolicited)
+                SupervisorError::Refused {
+                    code: code.to_owned(),
+                    message: metadata
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                }
             }
         }
     }
@@ -565,8 +591,8 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
                 self.state = WorkerState::Ready;
                 Ok(now.elapsed())
             }
-            WorkerFrame::Error { code, .. } => {
-                Err(self.map_worker_error(&code, WorkerState::Unavailable))
+            WorkerFrame::Error { code, metadata } => {
+                Err(self.map_worker_error(&code, &metadata, WorkerState::Unavailable))
             }
             _ => {
                 self.state = WorkerState::Unavailable;
@@ -651,8 +677,8 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
                     metrics,
                 })
             }
-            WorkerFrame::Error { code, .. } => {
-                Err(self.map_worker_error(&code, WorkerState::Ready))
+            WorkerFrame::Error { code, metadata } => {
+                Err(self.map_worker_error(&code, &metadata, WorkerState::Ready))
             }
             WorkerFrame::Ready { .. } => {
                 self.state = WorkerState::Ready;
@@ -972,10 +998,14 @@ mod tests {
         let mut supervisor = WorkerSupervisor::absent();
         supervisor.attach_ready(worker, Instant::now()).unwrap();
         let error = supervisor.prepare(corr(), Instant::now()).unwrap_err();
-        assert!(matches!(
+        assert_eq!(
             error,
-            SupervisorError::Protocol(FrameError::Unsolicited)
-        ));
+            SupervisorError::Refused {
+                code: "weird-native-code".into(),
+                message: String::new(),
+            }
+        );
+        assert_eq!(error.to_string(), "worker refused: weird-native-code");
         assert!(supervisor.child_mut().is_some());
     }
 

@@ -19,6 +19,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat as statmod
 import subprocess
 import sys
 import time
@@ -460,6 +461,172 @@ def _run_replay(command: Sequence[str], timeout_s: float, cleanup_units: bool = 
     return stdout.decode(errors="replace"), stderr.decode(errors="replace"), process.returncode, failure
 
 
+FOOTPRINT_METHOD = "apparent size of regular files, each file identity (device, inode) counted once across model and runtime paths; symlinks inside trees not followed; runtime directories not owned by this user are listed as system_paths and not counted; worker source and health audio excluded"
+
+FileSizes = dict[tuple[int, int], int]
+
+
+def _path_files(path: Path) -> FileSizes:
+    """Regular files of a file or directory tree, keyed by (device, inode)."""
+
+    files: FileSizes = {}
+    try:
+        if path.is_file():
+            # A pinned model file may itself be a symlink into a store.
+            entry = path.stat()
+            files[(entry.st_dev, entry.st_ino)] = entry.st_size
+            return files
+        for root, _dirs, names in os.walk(path):
+            for name in names:
+                entry = os.lstat(os.path.join(root, name))
+                if statmod.S_ISREG(entry.st_mode):
+                    files[(entry.st_dev, entry.st_ino)] = entry.st_size
+    except OSError as exc:
+        raise BenchmarkError(f"cannot measure install footprint of {path}: {exc}") from exc
+    return files
+
+
+def _is_under(path: Path, roots: Iterable[Path]) -> bool:
+    return any(path == root or root in path.parents for root in roots)
+
+
+def _user_install_root(root: Path) -> bool:
+    """A runtime root counted in the footprint: owned by this user and not
+    the home directory or one of its ancestors. System prefixes such as /usr
+    (a venv whose base interpreter is /usr/bin/python3) are never walked."""
+
+    home = Path.home().resolve()
+    if root == home or root in home.parents:
+        return False
+    try:
+        return root.stat().st_uid == os.getuid()
+    except OSError:
+        return False
+
+
+def _runtime_roots(manifest: Mapping[str, Any]) -> tuple[list[Path], list[Path]]:
+    """(counted, system) runtime roots: environment, base interpreter, native libraries."""
+
+    roots: list[Path] = []
+    python = Path(str(manifest["runtime"]["python"]))
+    environment = python.parent.parent if python.parent.name == "bin" else python.parent
+    config = environment / "pyvenv.cfg"
+    if config.is_file():
+        roots.append(environment)
+        for line in config.read_text(encoding="utf-8", errors="replace").splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "home" and value.strip():
+                home = Path(value.strip())
+                roots.append(home.parent if home.name == "bin" else home)
+    else:
+        resolved = python.resolve()
+        roots.append(resolved.parent.parent if resolved.parent.name == "bin" else resolved)
+    options = manifest.get("options") or {}
+    for key in ("library", "llama_cli"):
+        value = options.get(key)
+        if isinstance(value, str) and Path(value).is_absolute():
+            roots.append(Path(value).parent)
+    counted: list[Path] = []
+    system: list[Path] = []
+    # Resolved so one interpreter reached through two symlinked names is one path.
+    for root in (root.resolve() for root in roots):
+        if root in counted or root in system or _is_under(root, counted):
+            continue
+        (counted if _user_install_root(root) else system).append(root)
+    return counted, system
+
+
+def _footprint_layout(manifest: Mapping[str, Any]) -> tuple[list[Path], list[Path], list[Path]] | None:
+    """(model roots, counted runtime roots, system runtime roots) of one manifest."""
+
+    runtime = manifest.get("runtime")
+    model_path = manifest.get("model_path")
+    if not isinstance(runtime, Mapping) or not isinstance(runtime.get("python"), str) or not isinstance(model_path, str):
+        return None
+    worker_dir = Path(str(runtime.get("worker", "/"))).parent
+    if worker_dir == Path("/"):
+        return None
+    runtime_roots, system_roots = _runtime_roots(manifest)
+    options = manifest.get("options") or {}
+    excluded = {Path(str(options["health_audio"]))} if isinstance(options.get("health_audio"), str) else set()
+    model_roots = [Path(model_path).resolve()]
+    for pin in manifest.get("files") or []:
+        path = Path(str(pin.get("path", "")))
+        if not path.is_absolute() or path in excluded or _is_under(path, [worker_dir]):
+            continue
+        path = path.resolve()
+        if _is_under(path, [*runtime_roots, *system_roots, *model_roots]):
+            continue
+        model_roots.append(path)
+    return model_roots, runtime_roots, system_roots
+
+
+def install_footprints(manifests: Mapping[str, Mapping[str, Any]]) -> tuple[dict[str, dict[str, Any] | None], dict[str, Any]]:
+    """Per-model install bytes and a combined summary.
+
+    A model's total is its model files plus its whole runtime (Python
+    environment, base interpreter, native libraries), so it stands alone. A
+    file reachable from both a model root and a runtime root (for example a
+    model stored inside a venv) is counted once, as model bytes. The summary
+    counts every file identity once across all models, so a shared venv or
+    base interpreter adds its bytes once to `combined_unique_bytes`.
+    """
+
+    cache: dict[Path, FileSizes] = {}
+
+    def files(path: Path) -> FileSizes:
+        if path not in cache:
+            cache[path] = _path_files(path)
+        return cache[path]
+
+    per_model: dict[str, dict[str, Any] | None] = {}
+    combined: FileSizes = {}
+    owners: dict[str, list[str]] = {}
+    for model_id, manifest in sorted(manifests.items()):
+        layout = _footprint_layout(manifest)
+        if layout is None:
+            per_model[model_id] = None
+            continue
+        model_roots, runtime_roots, system_roots = layout
+        model_files: FileSizes = {}
+        for root in model_roots:
+            model_files.update(files(root))
+        runtime_files: FileSizes = {}
+        for root in runtime_roots:
+            runtime_files.update({key: size for key, size in files(root).items() if key not in model_files})
+        combined.update(model_files)
+        combined.update(runtime_files)
+        for root in (*model_roots, *runtime_roots):
+            owners.setdefault(str(root), []).append(model_id)
+        model_bytes = sum(model_files.values())
+        runtime_bytes = sum(runtime_files.values())
+        per_model[model_id] = {
+            "model_bytes": model_bytes,
+            "runtime_bytes": runtime_bytes,
+            "total_bytes": model_bytes + runtime_bytes,
+            "model_paths": [str(root) for root in model_roots],
+            "runtime_paths": [str(root) for root in runtime_roots],
+            "system_paths": [str(root) for root in system_roots],
+            "method": FOOTPRINT_METHOD,
+        }
+    summary = {
+        "per_model_total_bytes": {model_id: footprint["total_bytes"] if footprint else None for model_id, footprint in per_model.items()},
+        "combined_unique_bytes": sum(combined.values()),
+        "shared_paths": {path: models for path, models in sorted(owners.items()) if len(models) > 1},
+        "note": "each model total includes its full runtime; combined_unique_bytes counts every file once across all models, so a runtime shared by several models (shared_paths, e.g. one venv) is counted once",
+        "method": FOOTPRINT_METHOD,
+    }
+    return per_model, summary
+
+
+def real_time_factor(inference_ms: Any, duration_ms: Any) -> float | None:
+    """Inference time over audio duration; below 1 is faster than real time."""
+
+    if isinstance(inference_ms, (int, float)) and isinstance(duration_ms, (int, float)) and duration_ms > 0 and inference_ms >= 0:
+        return float(inference_ms) / float(duration_ms)
+    return None
+
+
 def _validate_rust_cli(rust_cli: str, allow_fixture: bool) -> None:
     name = Path(rust_cli).name.lower()
     _require(allow_fixture or "voisu" in name, "replay must use the protected Voisu Rust CLI; pass --fixture only for synthetic tests")
@@ -471,10 +638,12 @@ def replay(corpus: Mapping[str, Any], model_manifests: Sequence[str], rust_cli: 
     _require(timeout_s > 0, "--timeout-seconds must be positive")
     models = _resolve_model_manifests(model_manifests)
     rows: list[dict[str, Any]] = []
+    manifests: dict[str, Mapping[str, Any]] = {}
     run_id = str(uuid.uuid4())
     for model_id, model_manifest in models:
         private_manifest = read_json(model_manifest)
         _require(private_manifest.get("model_id") == model_id, f"model manifest identity mismatch for {model_id}")
+        manifests[model_id] = private_manifest
         records = corpus["records"]
         command = build_replay_command(rust_cli, model_manifest, [Path(record["audio_path"]) for record in records], timeout_s)
         try:
@@ -510,10 +679,15 @@ def replay(corpus: Mapping[str, Any], model_manifests: Sequence[str], rust_cli: 
                 "raw_text": response.get("raw_text", response.get("text")) if response.get("status") not in {"unavailable", "error"} else None,
                 "delivered_text": response.get("delivered_text"),
             }
-            for key in ("model_revision", "runtime_revision", "receipt_sha256", "artifact_hashes", "host_profile", "duration_profile", "backend", "requested_device", "observed_device", "resident", "load_ms", "inference_ms", "stop_to_transcript_ms", "stop_to_delivery_ms", "phase", "session_id", "peak_host_ram_bytes", "peak_gpu_memory_bytes", "duration_ms"):
+            for key in ("model_revision", "runtime_revision", "receipt_sha256", "artifact_hashes", "host_profile", "duration_profile", "backend", "requested_device", "observed_device", "resident", "load_ms", "inference_ms", "stop_to_transcript_ms", "stop_to_delivery_ms", "phase", "session_id", "peak_host_ram_bytes", "peak_gpu_memory_bytes", "duration_ms", "audio_ms", "cpu_time_ms"):
                 if key in response:
                     row[key] = response[key]
+            if response.get("status") not in {"unavailable", "error"}:
+                rtf = real_time_factor(response.get("inference_ms"), record.get("duration_ms"))
+                if rtf is not None:
+                    row["real_time_factor"] = rtf
             rows.append(row)
+    footprints, footprint_totals = install_footprints(manifests)
     envelope = {
         "schema_version": SCHEMA_VERSION,
         "kind": "replay_evidence",
@@ -521,6 +695,8 @@ def replay(corpus: Mapping[str, Any], model_manifests: Sequence[str], rust_cli: 
         "corpus_manifest_sha256": corpus["manifest_sha256"],
         "models": [model_id for model_id, _ in models],
         "fixture": fixture,
+        "install_footprints": footprints,
+        "install_footprint_summary": footprint_totals,
         "records": rows,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -607,6 +783,24 @@ def _metric_samples(rows: Iterable[Mapping[str, Any]], key: str, phases: set[str
     return values
 
 
+def measured_peak(row: Mapping[str, Any], key: str) -> float | None:
+    """A row's memory peak, or None when it was not measured.
+
+    The worker protocol reports 0 for an unknown peak (no NVML sample, a
+    failed peak reset). Host RAM is never really 0, and GPU memory is only a
+    real 0 on a CPU run, so a 0 elsewhere is unknown, not a measured 0.
+    """
+
+    value = row.get(key)
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+        return None
+    if value == 0:
+        cpu_run = row.get("requested_device") == "cpu" and row.get("observed_device") in (None, "cpu")
+        if key != "peak_gpu_memory_bytes" or not cpu_run:
+            return None
+    return float(value)
+
+
 def _report_model(model_id: str, rows: Sequence[Mapping[str, Any]], corpus: Mapping[str, Any], normalizer_version: str | None, normalizer: Mapping[str, str], allow_fixture: bool) -> dict[str, Any]:
     statuses = {_response_status(row) for row in rows}
     quality_rows = [row for row in rows if row.get("raw_text") is not None and _response_status(row) not in {"unavailable", "error"}]
@@ -640,8 +834,26 @@ def _report_model(model_id: str, rows: Sequence[Mapping[str, Any]], corpus: Mapp
     warm_inference = _metric_samples(rows, "inference_ms", {"warm"}, require_resident=True)
     stop_transcript = _metric_samples(rows, "stop_to_transcript_ms", {"cold", "warm", ""})
     stop_delivery = _metric_samples(rows, "stop_to_delivery_ms", {"cold", "warm", ""})
-    peak_ram = [float(row["peak_host_ram_bytes"]) for row in rows if isinstance(row.get("peak_host_ram_bytes"), (int, float))]
-    peak_gpu = [float(row["peak_gpu_memory_bytes"]) for row in rows if isinstance(row.get("peak_gpu_memory_bytes"), (int, float))]
+    cpu_time = _metric_samples(rows, "cpu_time_ms", {"cold", "warm"})
+    rtf = _metric_samples(rows, "real_time_factor", {"cold", "warm"})
+    peak_ram = [value for row in rows if (value := measured_peak(row, "peak_host_ram_bytes")) is not None]
+    peak_gpu = [value for row in rows if (value := measured_peak(row, "peak_gpu_memory_bytes")) is not None]
+
+    def peak_by_profile(key: str) -> dict[str, float | None]:
+        # Duration profile comes from the protected replay: short is at most
+        # 10 s of audio, long is above 10 s.
+        result: dict[str, float | None] = {}
+        for row in rows:
+            profile = row.get("duration_profile")
+            if isinstance(profile, str):
+                value = measured_peak(row, key)
+                current = result.get(profile)
+                if value is not None:
+                    result[profile] = max(value, current) if current is not None else value
+                else:
+                    result.setdefault(profile, None)
+        return dict(sorted(result.items()))
+
     return {
         "model_id": model_id,
         "status": status,
@@ -660,10 +872,14 @@ def _report_model(model_id: str, rows: Sequence[Mapping[str, Any]], corpus: Mapp
             "warm_inference_ms": timing_summary(warm_inference),
             "stop_to_transcript_ms": timing_summary(stop_transcript),
             "stop_to_delivery_ms": timing_summary(stop_delivery),
+            "cpu_time_ms": timing_summary(cpu_time),
+            "real_time_factor": {"p50": _percentile(rtf, 0.50), "p95": _percentile(rtf, 0.95), "sample_count": len(rtf)},
         },
         "resources": {
             "peak_host_ram_bytes": max(peak_ram) if peak_ram else None,
             "peak_gpu_memory_bytes": max(peak_gpu) if peak_gpu else None,
+            "peak_host_ram_bytes_by_duration_profile": peak_by_profile("peak_host_ram_bytes"),
+            "peak_gpu_memory_bytes_by_duration_profile": peak_by_profile("peak_gpu_memory_bytes"),
         },
         "limitations": (["warm metrics unavailable: protected seam did not label a resident warm phase"] if not warm_inference else []) + (["delivered transcript metrics unavailable"] if not delivered_available else []),
     }
@@ -701,6 +917,9 @@ def score(corpus: Mapping[str, Any], evidence: Mapping[str, Any], expected_model
             scoped = _report_model(model["model_id"], [row for row in grouped[model["model_id"]] if row.get("duration_profile") == profile], corpus, version, mapping, allow_fixture)
             scoped["identity"]["duration_profile"] = profile
             model["duration_profiles"][profile] = scoped
+    footprints = evidence.get("install_footprints") or {}
+    for model in model_reports:
+        model["install_footprint"] = footprints.get(model["model_id"])
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "kind": "benchmark_report",
@@ -710,6 +929,7 @@ def score(corpus: Mapping[str, Any], evidence: Mapping[str, Any], expected_model
         "quality_evidence": not allow_fixture and all(item["quality_evidence"] for item in model_reports if item["status"] in {"measured", "measured_partial"}),
         "normalization": {"strict": "unicode-nfkc-casefold-token-v1", "spelling_normalized_version": version},
         "models": model_reports,
+        "install_footprint": evidence.get("install_footprint_summary"),
         "recommendation_scope": {"host_profile": "from measured identity per model", "language": "must be selected explicitly", "duration_profile": "must be supplied by the protected replay evidence"},
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }

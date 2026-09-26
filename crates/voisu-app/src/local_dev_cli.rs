@@ -78,6 +78,12 @@ pub struct ReplayReport {
     pub peak_host_ram_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_gpu_memory_bytes: Option<u64>,
+    /// Clip duration from its PCM length, for real-time factor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_ms: Option<u64>,
+    /// Worker process user+system CPU time for this clip, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_time_ms: Option<u64>,
     pub text: String,
     pub status: String,
     pub error: Option<String>,
@@ -518,6 +524,7 @@ fn replay_batch_with_stream<C: WorkerChild>(
                 continue;
             }
         };
+        report.audio_ms = Some(u64::try_from(pcm.len() / 32).unwrap_or(u64::MAX));
         report.duration_profile = Some(if pcm.len() <= 10 * 32_000 {
             "short"
         } else {
@@ -580,6 +587,7 @@ fn apply_outcome_metrics(report: &mut ReplayReport, metrics: InferenceMetrics, i
     }
     report.peak_host_ram_bytes = metrics.peak_host_ram_bytes;
     report.peak_gpu_memory_bytes = metrics.peak_gpu_memory_bytes;
+    report.cpu_time_ms = metrics.cpu_time_ms;
 }
 
 fn correlation(hash: &str, request_id: &str) -> Correlation {
@@ -634,6 +642,8 @@ impl ReplayReport {
             backend: None,
             peak_host_ram_bytes: None,
             peak_gpu_memory_bytes: None,
+            audio_ms: None,
+            cpu_time_ms: None,
             text: String::new(),
             status: "error".into(),
             error: Some("replay failed".into()),
@@ -661,6 +671,8 @@ impl ReplayReport {
             backend: None,
             peak_host_ram_bytes: None,
             peak_gpu_memory_bytes: None,
+            audio_ms: None,
+            cpu_time_ms: None,
             text: String::new(),
             status: "error".into(),
             error: None,
@@ -955,6 +967,72 @@ mod tests {
         assert_eq!(value["status"], "transcript");
         assert!(value["error"].is_null());
         assert!(value.get("receipt_sha256").is_some());
+    }
+
+    #[test]
+    fn replay_reports_the_worker_refusal_code_and_message() {
+        let dir = TempDir::new().unwrap();
+        let (manifest_path, manifest) = write_manifest(dir.path(), DEV_MODEL_IDS[1]);
+        let audio = dir.path().join("audio.wav");
+        fs::write(&audio, pcm_wav(&[0; 64_000])).unwrap();
+        let store_root = dir.path().join("local-dev");
+        DevelopmentStore::open(store_root.clone())
+            .unwrap()
+            .register(&manifest)
+            .unwrap();
+        let (loaded, loaded_hash, _) =
+            load_replay_manifest(&manifest_path, Some(&store_root)).unwrap();
+        struct RefusingWorker;
+        impl WorkerChild for RefusingWorker {
+            fn exchange(
+                &mut self,
+                _control: ControlFrame,
+                _pcm: Option<&[u8]>,
+                _deadline: Instant,
+            ) -> Result<WorkerFrame, SupervisorError> {
+                let mut metadata = serde_json::Map::new();
+                metadata.insert(
+                    "message".into(),
+                    serde_json::Value::String("peak does not fit VRAM admission".into()),
+                );
+                Ok(WorkerFrame::Error {
+                    code: "vram_admission".into(),
+                    metadata,
+                })
+            }
+            fn cancel_and_reap(&mut self) -> Result<ReapOutcome, SupervisorError> {
+                Ok(ReapOutcome::Exited)
+            }
+        }
+        let reports = replay_batch_with(
+            &loaded,
+            &loaded_hash,
+            &[audio.clone(), audio],
+            RefusingWorker,
+        );
+        assert_eq!(reports.len(), 2);
+        for report in reports {
+            assert_eq!(report.status, "error");
+            assert_eq!(
+                report.error.as_deref(),
+                Some("worker refused: vram_admission: peak does not fit VRAM admission")
+            );
+        }
+    }
+
+    #[test]
+    fn replay_reports_worker_cpu_time() {
+        let mut report = ReplayReport::unknown();
+        apply_outcome_metrics(
+            &mut report,
+            InferenceMetrics {
+                cpu_time_ms: Some(1_234),
+                ..InferenceMetrics::default()
+            },
+            0,
+        );
+        let value: serde_json::Value = serde_json::from_str(&encode_replay(&report)).unwrap();
+        assert_eq!(value["cpu_time_ms"], 1_234);
     }
 
     #[test]

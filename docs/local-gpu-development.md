@@ -78,6 +78,8 @@ voisu local-dev replay --json --manifest MODEL_MANIFEST --audio WAV1 --audio WAV
 
 The command emits one JSON object per WAV, in argument order, on stdout and keeps diagnostics on stderr. It loads one worker, transcribes each WAV once, then stops the worker. The first row has `phase: "cold"` and `load_ms`; later resident rows have `phase: "warm"` and `inference_ms`. A worker failure marks remaining WAVs unavailable. Duration profiles are `short` for at most 10 seconds and `long` above 10 seconds. Set `VOISU_DEV_HOST_PROFILE` for an explicit host label; without it, evidence is labeled `unprofiled`. The required base fields are `version`, `model_id`, `language`, `requested_device`, `observed_device`, `resident`, `inference_ms`, `text`, `status`, and `error`. Benchmark evidence also includes the exact `model_revision`, `runtime_revision`, receipt and artifact hashes, `backend`, and host profile.
 
+Rows also carry resource numbers when the worker reports them: `audio_ms` (clip length), `cpu_time_ms` (worker user+system CPU time for that clip, including a child runtime such as the llama.cpp CLI), `peak_gpu_memory_bytes` (the request's peak process GPU memory, sampled through NVML while the call runs), and `peak_host_ram_bytes` (the worker's high-water RSS, which includes the model load). If the worker refuses to load or prepare, `error` carries its own code and message, for example `worker refused: vram_admission: ...`.
+
 Run all selected models against the same manifest. The model manifest path identifies the model; the audio path always comes from the frozen corpus.
 
 ```sh
@@ -115,6 +117,8 @@ python3 tools/local-asr/benchmark.py score \
 ```
 
 The scorer rejects a stale corpus hash, changed audio, changed language or split, duplicate results, missing protected Rust evidence, missing runtime/model identity, and unknown models. A selected model with no results is `untested`; one whose protected runs all report an unavailable status is `unavailable`; partial coverage is `measured_partial`. These states are retained in the report rather than converted into a ranking.
+
+Each model report also includes `timings.cpu_time_ms`, `timings.real_time_factor` (inference time divided by clip duration; below 1 is faster than real time), peak GPU memory and host RAM split by duration profile under `resources`, and `install_footprint`: bytes of the model files plus the runtime (Python environment, base interpreter, native libraries) from the model manifest's paths. Each model's total includes its whole runtime. The report-level `install_footprint` counts a runtime shared by several models, such as one venv, once in `combined_unique_bytes` and lists it under `shared_paths`.
 
 If a spelling normalization is agreed before held-out scoring, store only a versioned deterministic token map, for example `{ "version": "hinglish-spelling-v1", "token_map": { "accha": "achha" } }`, outside the repository and pass it with `--normalizer`. The strict result remains the primary score and the normalized result is labeled separately. No transliteration or generative correction is performed.
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 import time
 from pathlib import Path
@@ -39,6 +40,13 @@ def _ready_response(manifest: Manifest, adapter: BaseAdapter, request_id_value: 
         "peak_host_ram_bytes": metadata.peak_host_ram_bytes,
         "peak_gpu_memory_bytes": metadata.peak_gpu_memory_bytes,
     }
+
+
+def _cpu_seconds() -> float:
+    """Worker user+system CPU time, including reaped child runtimes."""
+
+    times = os.times()
+    return times.user + times.system + times.children_user + times.children_system
 
 
 def _prepare(manifest: Manifest, adapter: BaseAdapter) -> None:
@@ -92,12 +100,14 @@ def serve_stream(
                         write_json_frame(writer, _error_response(request_id_value, "not_ready", "send prepare before transcribe"))
                         continue
                     started = time.monotonic_ns()
+                    cpu_started = _cpu_seconds()
                     with contextlib.redirect_stdout(sys.stderr):
                         text = adapter.transcribe(pcm)
                     elapsed_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
                     peaks = {
                         "peak_host_ram_bytes": adapter.metadata.peak_host_ram_bytes,
                         "peak_gpu_memory_bytes": adapter.metadata.peak_gpu_memory_bytes,
+                        "cpu_time_ms": max(0, round((_cpu_seconds() - cpu_started) * 1000)),
                     }
                     if text.strip():
                         write_json_frame(

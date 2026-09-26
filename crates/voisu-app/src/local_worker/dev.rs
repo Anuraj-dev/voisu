@@ -45,6 +45,10 @@ pub struct DevWorker {
     backend: Option<String>,
     peak_host_ram_bytes: Option<u64>,
     peak_gpu_memory_bytes: Option<u64>,
+    cpu_time_ms: Option<u64>,
+    /// A reply echoing a request id has been seen. Before that, the worker
+    /// may still be loading and can refuse without having read the prepare.
+    correlated_reply_seen: bool,
     /// Set only once the unit is observed stopped and the wrapper reaped.
     /// Until then `Drop` retries the stop, so an `Unreaped` cancel is not
     /// forgotten.
@@ -143,6 +147,8 @@ impl DevWorker {
             backend: None,
             peak_host_ram_bytes: None,
             peak_gpu_memory_bytes: None,
+            cpu_time_ms: None,
+            correlated_reply_seen: false,
             unit_stopped: false,
         })
     }
@@ -162,6 +168,8 @@ impl DevWorker {
             backend: None,
             peak_host_ram_bytes: None,
             peak_gpu_memory_bytes: None,
+            cpu_time_ms: None,
+            correlated_reply_seen: false,
             // Nothing was launched, so there is nothing for `Drop` to stop.
             unit_stopped: true,
         }
@@ -192,6 +200,9 @@ impl DevWorker {
         if let Some(bytes) = value.get("peak_gpu_memory_bytes").and_then(Value::as_u64) {
             self.peak_gpu_memory_bytes = Some(bytes);
         }
+        // Per-request worker CPU time; a reply without it must not inherit
+        // the previous request's value.
+        self.cpu_time_ms = value.get("cpu_time_ms").and_then(Value::as_u64);
     }
 
     fn exchange_json(
@@ -241,10 +252,22 @@ impl DevWorker {
             .get("id")
             .and_then(Value::as_str)
             .ok_or(SupervisorError::Protocol(FrameError::InvalidJson))?;
-        if id != correlation.request_id {
+        let status = value.get("status").and_then(Value::as_str);
+        // A worker that refuses while loading (for example `vram_admission`)
+        // writes its error before it has read the prepare, so the id is
+        // empty. Only that startup refusal may be uncorrelated: it can only
+        // fail the pending prepare, never satisfy it. Once any reply has
+        // echoed a request id, and for every successful reply, the id must
+        // match exactly.
+        let startup_refusal =
+            !self.correlated_reply_seen && id.is_empty() && status == Some("error");
+        if id != correlation.request_id && !startup_refusal {
             return Err(SupervisorError::Protocol(FrameError::CorrelationMismatch));
         }
-        match value.get("status").and_then(Value::as_str) {
+        if !startup_refusal {
+            self.correlated_reply_seen = true;
+        }
+        match status {
             Some("ready") => {
                 let observed = value
                     .get("observed_device")
@@ -415,6 +438,7 @@ impl WorkerChild for DevWorker {
             inference_ms: Some(self.inference_ms),
             peak_host_ram_bytes: self.peak_host_ram_bytes,
             peak_gpu_memory_bytes: self.peak_gpu_memory_bytes,
+            cpu_time_ms: self.cpu_time_ms,
         }
     }
 
@@ -889,6 +913,118 @@ mod tests {
             SupervisorError::Unavailable("inference device changed")
         );
         assert_eq!(error.to_string(), "inference device changed");
+    }
+
+    #[test]
+    fn uncorrelated_startup_refusal_keeps_the_worker_code_and_message() {
+        // The Python worker writes this before reading any request when the
+        // adapter refuses to load, so its id cannot echo the prepare id.
+        let mut worker = DevWorker::for_test(test_manifest("cuda:0"), "h");
+        let frame = worker
+            .map_reply(
+                json!({
+                    "v": 1,
+                    "id": "",
+                    "status": "error",
+                    "code": "vram_admission",
+                    "message": "Qwen peak 6120538112 does not fit VRAM admission"
+                }),
+                &corr(),
+            )
+            .unwrap();
+        let WorkerFrame::Error { code, metadata } = frame else {
+            panic!("expected an error frame");
+        };
+        assert_eq!(code, "vram_admission");
+        assert_eq!(
+            metadata.get("message").and_then(Value::as_str),
+            Some("Qwen peak 6120538112 does not fit VRAM admission")
+        );
+    }
+
+    #[test]
+    fn uncorrelated_error_after_a_correlated_reply_is_a_mismatch() {
+        let mut worker = DevWorker::for_test(test_manifest("cpu"), "h");
+        worker
+            .map_reply(
+                json!({
+                    "id": "q",
+                    "status": "ready",
+                    "model_id": "nemotron-3.5-0.6b",
+                    "observed_device": "cpu",
+                    "resident": false
+                }),
+                &corr(),
+            )
+            .unwrap();
+        assert_eq!(
+            worker
+                .map_reply(
+                    json!({"id": "", "status": "error", "code": "invalid_id", "message": "m"}),
+                    &corr(),
+                )
+                .unwrap_err(),
+            SupervisorError::Protocol(FrameError::CorrelationMismatch)
+        );
+    }
+
+    #[test]
+    fn only_errors_may_be_uncorrelated() {
+        let mut worker = DevWorker::for_test(test_manifest("cpu"), "h");
+        for reply in [
+            json!({
+                "id": "",
+                "status": "ready",
+                "model_id": "nemotron-3.5-0.6b",
+                "observed_device": "cpu",
+                "resident": false
+            }),
+            json!({"id": "", "status": "transcript", "text": "hi", "observed_device": "cpu"}),
+            json!({"id": "", "status": "no_text", "observed_device": "cpu"}),
+            json!({"id": "other", "status": "error", "code": "x", "message": "y"}),
+        ] {
+            assert_eq!(
+                worker.map_reply(reply, &corr()).unwrap_err(),
+                SupervisorError::Protocol(FrameError::CorrelationMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_records_worker_cpu_time() {
+        let mut worker = DevWorker::for_test(test_manifest("cpu"), "h");
+        worker
+            .map_reply(
+                json!({
+                    "id": "q",
+                    "status": "ready",
+                    "model_id": "nemotron-3.5-0.6b",
+                    "observed_device": "cpu",
+                    "resident": false
+                }),
+                &corr(),
+            )
+            .unwrap();
+        worker
+            .map_reply(
+                json!({
+                    "id": "q",
+                    "status": "transcript",
+                    "text": "hi",
+                    "observed_device": "cpu",
+                    "resident": true,
+                    "inference_ms": 40,
+                    "cpu_time_ms": 75,
+                    "peak_host_ram_bytes": 10,
+                    "peak_gpu_memory_bytes": 0
+                }),
+                &corr(),
+            )
+            .unwrap();
+        let metrics = worker.last_inference_metrics();
+        assert_eq!(metrics.cpu_time_ms, Some(75));
+        assert_eq!(metrics.inference_ms, Some(40));
+        assert_eq!(metrics.peak_host_ram_bytes, Some(10));
     }
 
     #[test]
