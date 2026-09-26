@@ -12,6 +12,7 @@ from .adapters import AdapterError, BaseAdapter, create_adapter
 from .audio import AudioError, health_phrase_matches, read_health_wav, validate_pcm16
 from .manifest import Manifest, ManifestError, load_manifest
 from .protocol import ProtocolError, read_json_frame, read_pcm, request_id, sanitize_message, write_json_frame
+from .windowing import WindowingError, transcribe_windows
 
 WORKER_ENTRY = Path(__file__).resolve().parents[1] / "worker.py"
 
@@ -41,12 +42,40 @@ def _ready_response(manifest: Manifest, adapter: BaseAdapter, request_id_value: 
     }
 
 
+def _transcribe(adapter: BaseAdapter, pcm: bytes) -> tuple[str, dict[str, int]]:
+    """Transcribe one Recording window by window; return text and request peaks.
+
+    The adapter sees at most one bounded window per call, so its peak memory
+    no longer grows with Recording length. Adapters report peaks for their
+    latest call; the request peak is the maximum over the windows it ran.
+    A GPU peak of 0 means "unknown", so if any window that ran reported 0, or
+    no window ran (all-zero PCM), the request's GPU peak is 0 too: a max over
+    the other windows would understate the real peak. Host RAM is a
+    process-lifetime high-water mark, so it is never stale.
+    """
+
+    host_peak = adapter.metadata.peak_host_ram_bytes
+    gpu_peaks: list[int] = []
+
+    def transcribe_window(window: bytes) -> str:
+        nonlocal host_peak
+        text = adapter.transcribe(window)
+        metadata = adapter.metadata
+        host_peak = max(host_peak, metadata.peak_host_ram_bytes)
+        gpu_peaks.append(metadata.peak_gpu_memory_bytes)
+        return text
+
+    text = transcribe_windows(pcm, transcribe_window)
+    gpu_peak = 0 if not gpu_peaks or 0 in gpu_peaks else max(gpu_peaks)
+    return text, {"peak_host_ram_bytes": host_peak, "peak_gpu_memory_bytes": gpu_peak}
+
+
 def _prepare(manifest: Manifest, adapter: BaseAdapter) -> None:
     """Run one real health inference before allowing any request."""
 
     health_audio = read_health_wav(Path(manifest.options["health_audio"]))
     validate_pcm16(health_audio)
-    health_text = adapter.transcribe(health_audio)
+    health_text, _ = _transcribe(adapter, health_audio)
     if not health_text.strip():
         raise AdapterError("health_empty", "health inference returned no text")
     if not health_phrase_matches(health_text, manifest.options["health_expected"]):
@@ -93,12 +122,8 @@ def serve_stream(
                         continue
                     started = time.monotonic_ns()
                     with contextlib.redirect_stdout(sys.stderr):
-                        text = adapter.transcribe(pcm)
+                        text, peaks = _transcribe(adapter, pcm)
                     elapsed_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
-                    peaks = {
-                        "peak_host_ram_bytes": adapter.metadata.peak_host_ram_bytes,
-                        "peak_gpu_memory_bytes": adapter.metadata.peak_gpu_memory_bytes,
-                    }
                     if text.strip():
                         write_json_frame(
                             writer,
@@ -133,7 +158,7 @@ def serve_stream(
                     return
                 else:
                     raise ProtocolError("unknown_operation", "operation must be prepare, transcribe, or shutdown")
-            except (AdapterError, AudioError, ProtocolError) as exc:
+            except (AdapterError, AudioError, ProtocolError, WindowingError) as exc:
                 code = getattr(exc, "code", "worker_error")
                 message = getattr(exc, "message", str(exc))
                 write_json_frame(writer, _error_response(locals().get("request_id_value", ""), code, message))
