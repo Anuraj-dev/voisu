@@ -102,6 +102,17 @@ fn main() {
         }
         _ => {}
     }
+    // Under systemd the unit carries no display start condition (a skip is never
+    // retried), so wait for the session display here, before any
+    // display-dependent setup: exit 75 to be respawned with the manager's
+    // environment once it arrives, or 78 (not restarted) if it never does.
+    let systemd_owned = matches!(
+        std::env::args().skip(1).collect::<Vec<_>>().as_slice(),
+        [argument] if argument == "--systemd"
+    );
+    if let Some(code) = voisu_app::system::startup_display_gate(systemd_owned) {
+        std::process::exit(code);
+    }
     voisu_app::system::install_crypto_provider();
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();

@@ -105,6 +105,36 @@ Run `voisu doctor` if the Trigger Key does not respond — it reports a portal
 without a usable GlobalShortcuts interface, and adds `--verbose` for the full
 reasoning behind each check.
 
+### Ubuntu GNOME troubleshooting
+
+- **Voisu is not running after login.** The daemon waits up to 20 seconds for
+  GNOME to export `WAYLAND_DISPLAY`/`DISPLAY`. If `voisu service status` still
+  shows inactive or failed, run `voisu service restart` once the desktop is up,
+  and check `journalctl --user -u voisu.service`.
+- **`Paste action` and `Paste backend` show SKIP.** Those checks are
+  Hyprland-only; SKIP is expected on GNOME.
+- **`Focus guard none` shows WARN.** Expected on GNOME, where Voisu cannot
+  verify which window has focus. In `type` mode (`voisu delivery type`) Delivery
+  pastes into whichever window has focus. In `guarded` mode
+  (`voisu delivery guarded`) it cannot verify focus, so it leaves the Transcript
+  on the clipboard instead of pasting.
+- **The Overlay is the GNOME Shell extension `overlay@voisu.app`.**
+  `voisu-overlay.service` (the GTK observer) being inactive is expected there.
+- **Direct Delivery puts the Transcript on the clipboard and asks GNOME to
+  paste it.** It goes through the RemoteDesktop portal and libei. Unless the
+  compositor's input seat offers text input, Voisu submits a Ctrl+V keystroke, so
+  a window that pastes with a different shortcut (a terminal using
+  Ctrl+Shift+V) receives nothing; paste manually, the Transcript is on the
+  clipboard.
+- **Reset Voisu's RemoteDesktop grant.** This clears only the grant Voisu saved
+  itself. GNOME may ask again when the daemon restarts or at the next Delivery,
+  and a permission GNOME remembers on its own is not cleared by this.
+
+  ```sh
+  rm ~/.local/state/voisu/remote-desktop.restore-token
+  systemctl --user restart voisu.service
+  ```
+
 ## Command reference
 
 `voisu` controls the daemon (`voisu-daemon`). All history and diagnostics stay

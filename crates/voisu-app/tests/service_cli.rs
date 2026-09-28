@@ -447,6 +447,9 @@ fn assert_graphical_session_unit_shape(
 fn assert_packaged_daemon_runtime_contract(unit: &str) {
     for (assignment, expected) in [
         ("Restart=", "on-failure"),
+        // Exit 78 = the daemon gave up waiting for the session display; it must
+        // land in `failed` instead of being respawned in a loop.
+        ("RestartPreventExitStatus=", "78"),
         ("RestartSec=", "2s"),
         ("TimeoutStopSec=", "60s"),
         ("NoNewPrivileges=", "yes"),
@@ -513,14 +516,14 @@ fn packaged_units_have_graphical_session_readiness_without_portal_ownership() {
     assert_graphical_session_unit_shape(
         "voisu.service",
         PACKAGED_DAEMON_UNIT,
-        "wayland-session-waitenv.service dbus.socket pipewire.service",
+        "graphical-session.target wayland-session-waitenv.service dbus.socket pipewire.service",
         Some("dbus.socket pipewire.service"),
-        &["|WAYLAND_DISPLAY", "|DISPLAY"],
+        &[],
     );
     assert_graphical_session_unit_shape(
         "voisu-overlay.service",
         PACKAGED_OVERLAY_UNIT,
-        "wayland-session-waitenv.service voisu.service",
+        "graphical-session.target wayland-session-waitenv.service voisu.service",
         None,
         &["WAYLAND_DISPLAY"],
     );
@@ -630,9 +633,9 @@ fn install_is_idempotent_atomic_and_free_of_stale_session_or_checkout_values() {
     assert_graphical_session_unit_shape(
         "generated voisu.service",
         &unit,
-        "wayland-session-waitenv.service dbus.socket pipewire.service",
+        "graphical-session.target wayland-session-waitenv.service dbus.socket pipewire.service",
         Some("dbus.socket pipewire.service"),
-        &["|WAYLAND_DISPLAY", "|DISPLAY"],
+        &[],
     );
     assert!(unit.contains(&format!(
         "ExecStart=\"{}\" --systemd",
@@ -1127,6 +1130,7 @@ fn installed_service_bounds_repeated_startup_failures() {
 
     let unit = fs::read_to_string(fixture.unit_path()).unwrap();
     assert!(unit.contains("Restart=on-failure\n"), "{unit}");
+    assert!(unit.contains("RestartPreventExitStatus=78\n"), "{unit}");
     assert!(unit.contains("StartLimitIntervalSec=30s\n"), "{unit}");
     assert!(unit.contains("StartLimitBurst=3\n"), "{unit}");
     // Graceful shutdown's internal budget (stop, process, join, drain) peaks

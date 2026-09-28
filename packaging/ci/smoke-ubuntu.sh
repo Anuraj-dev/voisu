@@ -100,6 +100,16 @@ echo "== systemd-analyze verify (both user units) =="
 systemd-analyze verify /usr/lib/systemd/user/voisu.service
 systemd-analyze verify /usr/lib/systemd/user/voisu-overlay.service
 
+# Both units order after graphical-session.target. The daemon unit has no
+# ConditionEnvironment (a skip is never retried; the daemon waits for the display
+# itself and exits 78, which RestartPreventExitStatus keeps from looping).
+grep -qx 'After=graphical-session.target wayland-session-waitenv.service dbus.socket pipewire.service' /usr/lib/systemd/user/voisu.service
+grep -qx 'After=graphical-session.target wayland-session-waitenv.service voisu.service' /usr/lib/systemd/user/voisu-overlay.service
+grep -qx 'RestartPreventExitStatus=78' /usr/lib/systemd/user/voisu.service
+if grep -q '^ConditionEnvironment=' /usr/lib/systemd/user/voisu.service; then
+    echo "FAIL: packaged voisu.service must not gate startup on ConditionEnvironment"; exit 1
+fi
+
 # These directives can require capability or namespace setup unavailable to a
 # per-user manager when Ubuntu restricts unprivileged user namespaces.
 for unit in voisu.service voisu-overlay.service; do
