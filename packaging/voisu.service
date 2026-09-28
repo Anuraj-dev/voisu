@@ -1,10 +1,16 @@
 [Unit]
 Description=Voisu dictation daemon
-After=wayland-session-waitenv.service dbus.socket pipewire.service
+# Ordered after graphical-session.target because it helps and is harmless, but
+# it does not guarantee the session display variables are in the user manager
+# yet (GNOME imports them on its own schedule). There is deliberately no
+# ConditionEnvironment: a condition skip is evaluated once and never retried.
+# Instead the daemon waits for WAYLAND_DISPLAY/DISPLAY itself under --systemd:
+# if they arrive late it exits 75 so Restart=on-failure respawns it with the
+# manager's environment, and if they never arrive it exits 78, which
+# RestartPreventExitStatus turns into a plain failed unit rather than a loop.
+After=graphical-session.target wayland-session-waitenv.service dbus.socket pipewire.service
 Wants=dbus.socket pipewire.service
 PartOf=graphical-session.target
-ConditionEnvironment=|WAYLAND_DISPLAY
-ConditionEnvironment=|DISPLAY
 StartLimitIntervalSec=30s
 StartLimitBurst=3
 
@@ -14,6 +20,7 @@ ExecStart=/usr/bin/voisu-daemon --systemd
 # Local spoken-mark / list organize. Cloud extra formatting stays off.
 Environment=VOISU_ENABLE_DPR=1
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=2s
 TimeoutStopSec=60s
 
