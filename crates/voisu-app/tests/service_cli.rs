@@ -1425,6 +1425,10 @@ fn a_systemd_launched_duplicate_exits_cleanly_while_the_manual_daemon_remains_re
         .arg("--systemd")
         .env("XDG_RUNTIME_DIR", &fixture.runtime)
         .env("XDG_STATE_HOME", fixture.runtime.join("state"))
+        // A --systemd daemon waits for a session display before anything else;
+        // supply one so this test exercises duplicate handling on hosts (CI)
+        // with no graphical session.
+        .env("WAYLAND_DISPLAY", "wayland-voisu-test")
         .output()
         .unwrap();
     assert!(duplicate.status.success(), "{}", stderr(&duplicate));
