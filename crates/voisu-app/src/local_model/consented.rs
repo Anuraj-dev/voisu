@@ -1002,22 +1002,7 @@ fn download(
 ) -> Result<(), ConsentedError> {
     super::relative_file_name(pin.name).map_err(ConsentedError::Fs)?;
     check_deadline(&request.clock)?;
-    let fetched = request
-        .fetcher
-        .fetch(&FetchRequest {
-            url: pin.url.into(),
-            allowed_hosts: pin.hosts.iter().map(|host| (*host).into()).collect(),
-            expected_bytes: pin.bytes,
-        })
-        .map_err(|error| match error {
-            FetchError::Deadline | FetchError::NoProgress => ConsentedError::Deadline,
-            FetchError::NoSpace => ConsentedError::NoSpace,
-            other => ConsentedError::Fetch(other),
-        })?;
-    check_deadline(&request.clock)?;
-    if !super::verify_file_digest(&fetched.body, pin.sha256, pin.bytes) {
-        return Err(ConsentedError::Digest(pin.name.into()));
-    }
+    let mut pending = super::safe_fs::PendingDownload::new(dir).map_err(ConsentedError::Fs)?;
     if let Some(errno) = request.io.fail_write {
         return Err(if errno == libc::ENOSPC {
             ConsentedError::NoSpace
@@ -1025,12 +1010,36 @@ fn download(
             std::io::Error::from_raw_os_error(errno).into()
         });
     }
+    let map_fetch = |error| match error {
+        FetchError::Deadline | FetchError::NoProgress => ConsentedError::Deadline,
+        FetchError::NoSpace => ConsentedError::NoSpace,
+        other => ConsentedError::Fetch(other),
+    };
+    let fetched = request
+        .fetcher
+        .fetch_to(
+            &FetchRequest {
+                url: pin.url.into(),
+                allowed_hosts: pin.hosts.iter().map(|host| (*host).into()).collect(),
+                expected_bytes: pin.bytes,
+            },
+            pending.file_mut(),
+        )
+        .map_err(map_fetch)?;
+    check_deadline(&request.clock)?;
+    if !fetched.matches_pin(pin.sha256, pin.bytes) {
+        return Err(ConsentedError::Digest(pin.name.into()));
+    }
     let before = request.clock.elapsed();
-    write_new(dir, pin.name, &fetched.body)?;
+    pending
+        .file_mut()
+        .sync_all()
+        .map_err(|error| map_fetch(super::fetch::io_err(error)))?;
     if request.clock.elapsed().saturating_sub(before) > NO_PROGRESS {
         return Err(ConsentedError::Deadline);
     }
-    check_deadline(&request.clock)
+    check_deadline(&request.clock)?;
+    pending.publish(pin.name).map_err(ConsentedError::Fs)
 }
 fn write_new(dir: &Path, name: &str, data: &[u8]) -> Result<(), ConsentedError> {
     super::relative_file_name(name).map_err(ConsentedError::Fs)?;
@@ -1539,8 +1548,104 @@ pub(crate) mod install_tests {
             ));
             assert!(!builder.called.get());
             assert!(!receipt_path(&store).exists());
+            assert!(!install_root(&store, entry().id, &content_hash(&entry())).exists());
+            assert_eq!(
+                fs::read_dir(store.staging_dir("consented"))
+                    .unwrap()
+                    .count(),
+                0
+            );
         }
     }
+    #[test]
+    fn consented_streamed_failures_remove_partial_file_before_publication() {
+        struct StreamingOnly {
+            final_path: PathBuf,
+            error: Option<FetchError>,
+        }
+        impl ArtifactFetcher for StreamingOnly {
+            fn fetch(&self, _: &FetchRequest) -> Result<super::super::FetchResponse, FetchError> {
+                panic!("consented download must use fetch_to");
+            }
+            fn fetch_to(
+                &self,
+                request: &FetchRequest,
+                sink: &mut dyn Write,
+            ) -> Result<super::super::FetchedSummary, FetchError> {
+                assert!(!self.final_path.exists());
+                let mut body = DATA.to_vec();
+                body[0] ^= 1;
+                sink.write_all(&body).map_err(super::super::fetch::io_err)?;
+                assert!(!self.final_path.exists());
+                if let Some(error) = &self.error {
+                    return Err(error.clone());
+                }
+                Ok(super::super::FetchedSummary {
+                    bytes: request.expected_bytes,
+                    sha256_hex: sha256_hex(&body),
+                    hops: 0,
+                })
+            }
+        }
+        let (_temp, store) = store();
+        let dir = store.staging_dir("stream-test");
+        super::super::ensure_private_dir(&dir).unwrap();
+        let builder = FakeBuilder::default();
+        let health = health(&store, &entry(), false);
+        for error in [
+            None,
+            Some(FetchError::Truncated {
+                expected: DATA.len() as u64,
+                actual: 1,
+            }),
+            Some(FetchError::Oversized {
+                expected: DATA.len() as u64,
+                actual: DATA.len() as u64 + 1,
+            }),
+            Some(FetchError::NoSpace),
+        ] {
+            let fetcher = StreamingOnly {
+                final_path: dir.join("model.bin"),
+                error: error.clone(),
+            };
+            let result = download(
+                &request(&store, &fetcher, &builder, &health),
+                &WEIGHTS[0],
+                &dir,
+            )
+            .unwrap_err();
+            match error {
+                None => {
+                    assert!(matches!(result, ConsentedError::Digest(name) if name == "model.bin"))
+                }
+                Some(FetchError::NoSpace) => assert!(matches!(result, ConsentedError::NoSpace)),
+                Some(error) => {
+                    assert!(matches!(result, ConsentedError::Fetch(actual) if actual == error))
+                }
+            }
+            assert!(!dir.join("model.bin").exists());
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+            assert!(!receipt_path(&store).exists());
+        }
+        let fetcher = ScriptedFetcher::new(vec![ScriptedHop::Body(DATA.to_vec())]);
+        download(
+            &request(&store, &fetcher, &builder, &health),
+            &WEIGHTS[0],
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(fs::read(dir.join("model.bin")).unwrap(), DATA);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        assert_eq!(
+            fs::metadata(dir.join("model.bin"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
     #[test]
     fn consented_redirect_escape_truncation_and_enospc_keep_receipt() {
         let (_temp, store) = store();
