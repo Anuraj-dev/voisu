@@ -15,11 +15,13 @@ mod consented_pins;
 mod consented_runtime;
 mod development;
 mod fetch;
+mod hardware;
 mod health;
 mod installer;
 mod receipt;
 mod safe_fs;
 mod store;
+mod suggest;
 mod url_policy;
 
 pub(crate) fn consented_worker_files() -> &'static [(&'static str, &'static [u8])] {
@@ -59,6 +61,10 @@ pub use fetch::{
     ArtifactFetcher, FetchError, FetchRequest, FetchResponse, ProductionHttps, ScriptedFetcher,
     ScriptedHop, follow_catalog_redirects,
 };
+pub use hardware::{
+    CommandOutput, CommandRunner, GpuProbe, HostHardware, NvidiaGpu, RunError, SystemCommandRunner,
+    parse_nvidia_smi, probe_hardware,
+};
 pub use health::{CandidateHealth, HealthError, HealthProbe, HealthReport, verify_candidate};
 pub use installer::{
     InstallAbort, InstallClock, InstallConsent, InstallError, InstallIo, InstallRequest,
@@ -72,6 +78,10 @@ pub use safe_fs::{SafeFsError, ensure_private_dir, relative_file_name};
 pub use store::{
     ModelLease, ModelStore, StoreError, StoreLock, legacy_models_dir, models_dir, models_dir_from,
     models_dir_from_state, resolve_models_root,
+};
+pub use suggest::{
+    CpuReason, DISTIL_MIN_TOTAL_VRAM_MIB, DISTIL_MODEL_ID, LocalSuggestion, PARAKEET_MODEL_ID,
+    suggest_local, suggestion_lines, warnings,
 };
 pub use url_policy::{CatalogUrl, UrlPolicyError, validate_catalog_url};
 

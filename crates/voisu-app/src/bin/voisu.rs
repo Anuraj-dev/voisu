@@ -895,10 +895,13 @@ fn provider_key_rows(runtime: &tokio::runtime::Runtime) -> Vec<DoctorRow> {
 /// live before storing it. All logic lives in the injectable `voisu_app::setup`
 /// core; here we supply the real terminal, keyring, and live validator.
 fn setup() -> ExitCode {
+    use std::io::IsTerminal;
+    use voisu_app::local_model::{DEVELOPMENT_ROOT_NAME, SystemCommandRunner, probe_hardware};
     use voisu_app::setup::{
         LiveHyprlandSetupActions, LiveKeyValidator, ProviderOutcome, SETUP_COMPLETE_MESSAGE,
         StdioWizard, run_consented_local_setup, run_hyprland_setup, run_setup,
     };
+    use voisu_app::setup_engine::{EngineChoice, run_engine_screen};
     use voisu_app::setup_profile::{
         HyprlandConfig, SetupProfile, discover_setup_profile, live_setup_facts,
     };
@@ -912,12 +915,45 @@ fn setup() -> ExitCode {
         Err(error) => return fail(4, &error.message()),
     };
     println!("Detected {} Setup Profile.", discovery.profile.as_str());
+    let current = if voisu_app::local_setup::is_local_mode() {
+        AsrMode::Local
+    } else {
+        AsrMode::Cloud
+    };
+    let hardware = probe_hardware(&SystemCommandRunner);
+    let mut secrets = SecretToolStore;
+    let deepgram = secrets.diagnose(Provider::Deepgram);
+    let groq = secrets.diagnose(Provider::Groq);
+    let manifest_exists = |model_id: &str| {
+        voisu_core::state_dir().is_ok_and(|state| {
+            state
+                .join(DEVELOPMENT_ROOT_NAME)
+                .join("manifests")
+                .join(format!("{model_id}.json"))
+                .is_file()
+        })
+    };
+    match run_engine_screen(
+        &mut wizard,
+        current,
+        &hardware,
+        &deepgram,
+        &groq,
+        std::io::stdin().is_terminal(),
+        manifest_exists,
+    ) {
+        EngineChoice::Keep(_) => {}
+        EngineChoice::Switch(mode) => match voisu_app::asr_mode::apply_cli_mode(mode) {
+            Ok(message) => println!("{message}"),
+            Err(error) => return fail(4, &error.message),
+        },
+    }
     if voisu_app::local_setup::is_local_mode() {
         if let Err(error) = run_consented_local_setup(&mut wizard) {
             return fail(4, &error);
         }
         if wizard_only {
-            println!("{SETUP_COMPLETE_MESSAGE}");
+            println!("{}", local_complete_message());
             return ExitCode::SUCCESS;
         }
     }
@@ -941,9 +977,9 @@ fn setup() -> ExitCode {
             }
         }
         if discovery.profile == SetupProfile::UbuntuWayland {
-            return finish_ubuntu_setup(SETUP_COMPLETE_MESSAGE);
+            return finish_ubuntu_setup(&local_complete_message());
         }
-        println!("{SETUP_COMPLETE_MESSAGE}");
+        println!("{}", local_complete_message());
         return ExitCode::SUCCESS;
     }
     let outcome = run_setup(&mut wizard, &mut SecretToolStore, &mut LiveKeyValidator);
@@ -992,6 +1028,17 @@ fn setup() -> ExitCode {
         }
     } else {
         ExitCode::from(4)
+    }
+}
+
+fn local_complete_message() -> String {
+    if voisu_app::local_model::development_local_enabled() {
+        voisu_app::setup::SETUP_COMPLETE_MESSAGE.to_owned()
+    } else {
+        format!(
+            "{}\nRun `voisu mode cloud` to dictate with Cloud.",
+            voisu_app::asr_mode::LOCAL_UNAVAILABLE
+        )
     }
 }
 
