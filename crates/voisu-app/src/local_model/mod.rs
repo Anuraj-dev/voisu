@@ -58,8 +58,8 @@ pub use development::{
     development_catalog_entry, development_receipt,
 };
 pub use fetch::{
-    ArtifactFetcher, FetchError, FetchRequest, FetchResponse, ProductionHttps, ScriptedFetcher,
-    ScriptedHop, follow_catalog_redirects,
+    ArtifactFetcher, FetchError, FetchRequest, FetchResponse, FetchedSummary, ProductionHttps,
+    ScriptedFetcher, ScriptedHop, follow_catalog_redirects,
 };
 pub use hardware::{
     CommandOutput, CommandRunner, GpuProbe, HostHardware, NvidiaGpu, RunError, SystemCommandRunner,

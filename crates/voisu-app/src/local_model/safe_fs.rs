@@ -1,11 +1,11 @@
 //! Directory-descriptor relative opens. Symlinks, FIFOs, and escapes fail.
 
 use std::ffi::CString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,6 +159,7 @@ pub fn reject_forbidden_filename(name: &str) -> Result<(), SafeFsError> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn create_exclusive_file(dir: &Path, name: &str) -> Result<File, SafeFsError> {
     let name = relative_file_name(name)?;
     reject_forbidden_filename(name)?;
@@ -167,6 +168,48 @@ pub fn create_exclusive_file(dir: &Path, name: &str) -> Result<File, SafeFsError
     let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
     let fd = open_relative(dir_file.as_raw_fd(), &c_name, flags, 0o600)?;
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// A private download anchored to a checked directory descriptor. Dropping it
+/// removes partial bytes; publication requires the caller to verify the pin.
+pub(super) struct PendingDownload {
+    // Keep the directory descriptor alive until the tempfile is removed.
+    file: tempfile::NamedTempFile,
+    dir: File,
+}
+
+impl PendingDownload {
+    pub(super) fn new(dir: &Path) -> Result<Self, SafeFsError> {
+        let dir = open_dir(dir)?;
+        let file = tempfile::Builder::new().prefix("download-").make_in(
+            format!("/proc/self/fd/{}", dir.as_raw_fd()),
+            |path| {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(path)
+            },
+        )?;
+        Ok(Self { file, dir })
+    }
+
+    pub(super) fn file_mut(&mut self) -> &mut File {
+        self.file.as_file_mut()
+    }
+
+    /// The file must already be verified and synced. Never replace a prior name.
+    pub(super) fn publish(self, name: &str) -> Result<(), SafeFsError> {
+        relative_file_name(name)?;
+        let dest = format!("/proc/self/fd/{}/{name}", self.dir.as_raw_fd());
+        self.file
+            .persist_noclobber(dest)
+            .map_err(|error| SafeFsError::from(error.error))?;
+        self.dir.sync_all()?;
+        Ok(())
+    }
 }
 
 pub fn open_existing_file(dir: &Path, name: &str) -> Result<File, SafeFsError> {
@@ -518,6 +561,47 @@ mod tests {
     use super::durability;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn pending_download_cleans_up_and_never_replaces_existing_names() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("downloads");
+        ensure_private_dir(&dir).unwrap();
+        {
+            let mut pending = PendingDownload::new(&dir).unwrap();
+            pending.file_mut().write_all(b"partial").unwrap();
+            assert!(!dir.join("model.bin").exists());
+        }
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        fs::write(dir.join("model.bin"), b"prior").unwrap();
+        let mut pending = PendingDownload::new(&dir).unwrap();
+        pending.file_mut().write_all(b"new").unwrap();
+        pending.file_mut().sync_all().unwrap();
+        assert!(pending.publish("model.bin").is_err());
+        assert_eq!(fs::read(dir.join("model.bin")).unwrap(), b"prior");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn pending_download_stays_anchored_when_parent_is_renamed() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("downloads");
+        let moved = root.path().join("moved");
+        ensure_private_dir(&dir).unwrap();
+        let mut pending = PendingDownload::new(&dir).unwrap();
+        fs::rename(&dir, &moved).unwrap();
+        ensure_private_dir(&dir).unwrap();
+        pending.file_mut().write_all(b"verified").unwrap();
+        pending.file_mut().sync_all().unwrap();
+        pending.publish("model.bin").unwrap();
+        assert!(!dir.join("model.bin").exists());
+        assert_eq!(fs::read(moved.join("model.bin")).unwrap(), b"verified");
+        assert_eq!(fs::read_dir(&moved).unwrap().count(), 1);
+        assert_eq!(
+            fs::metadata(moved.join("model.bin")).unwrap().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn traversal_and_dot_names_are_rejected() {
