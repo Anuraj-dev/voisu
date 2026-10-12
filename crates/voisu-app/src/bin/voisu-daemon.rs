@@ -817,6 +817,11 @@ async fn actor_loop(
                 }
             },
             ActorMessage::CaptureAdmitted { token, result } => {
+                // A Local admission reserved the worker. Every `continue` below
+                // drops this claim and releases it; only a begun capture or a
+                // spawned Local replay takes the reservation over.
+                let unstarted =
+                    local_routing::UnstartedAdmission::claim(matches!(result, Ok(AsrMode::Local)));
                 let pending = match std::mem::replace(&mut state, ActorState::Idle) {
                     ActorState::Admitting {
                         token: current,
@@ -877,6 +882,8 @@ async fn actor_loop(
                             .fixture_dir();
                         let current_validator = validator.take().expect("validator is available");
                         let fixture_name = fixture_name.into_inner();
+                        // replay_local releases the reservation on every outcome.
+                        unstarted.hand_off();
                         let replay = tokio::spawn(async move {
                             let (deepgram_slot, groq_slot) = local_routing::cloud_free_slots();
                             let response = local_routing::replay_local(
@@ -1093,9 +1100,7 @@ async fn actor_loop(
                         // accepted, so startup failures and recovery evidence are
                         // correlated even though no adapter has started yet.
                         let correlation_id = voisu_core::correlation_id(id);
-                        if admitted_mode == AsrMode::Local {
-                            local_routing::begin_live_with_terms(&correlation_id, user_terms);
-                        }
+                        unstarted.begin_live_with_terms(&correlation_id, user_terms);
                         state = ActorState::Starting {
                             id,
                             correlation_id,
@@ -1185,6 +1190,9 @@ async fn actor_loop(
                 if let Some(correlation) = correlation {
                     match result {
                         Ok((active_capture, streams)) if shutdown_ack.is_some() => {
+                            if started_asr_mode == AsrMode::Local {
+                                local_routing::abandon_live(&correlation);
+                            }
                             level_ring.deactivate();
                             // Shutdown arrived while this Recording was starting:
                             // never start the pump. Abort everything the start
@@ -2427,6 +2435,7 @@ async fn process_recording(
             );
             let mut provider_failures = Vec::new();
             let local_asr = if asr_mode == AsrMode::Local {
+                local_routing::abandon_live(&correlation_id);
                 local_routing::current_local_asr_error(error.public_message())
             } else {
                 account_for_missing_providers(&[], &mut provider_failures, error.diagnostic());
@@ -2748,6 +2757,11 @@ async fn process_recording(
         Ok(())
     }
     .await;
+    // A Local capture that failed before inference (stream error, capture
+    // finish) still reserves the worker; once inference ran this is a no-op.
+    if asr_mode == AsrMode::Local && result.is_err() {
+        local_routing::abandon_live(&correlation_id);
+    }
 
     // On a failure that produced no usable Source Transcript (both providers
     // failed completion, a streaming failure aborted the Recording, or a

@@ -1010,6 +1010,53 @@ pub fn abandon_live(recording_id: &str) {
     }
 }
 
+/// The worker reservation made by a Local capture admission, held until the
+/// admitted work takes it over. Dropping it on any exit before then (shutdown,
+/// a cancelled or superseded admission, a quota refusal) releases the worker so
+/// later admissions are not refused until restart.
+#[must_use = "dropping an unstarted admission releases the reserved worker"]
+pub struct UnstartedAdmission {
+    armed: bool,
+}
+
+impl UnstartedAdmission {
+    /// Claims the reservation of a successful [`admit_local`]; `local` is false
+    /// for a Cloud admission, which reserved nothing.
+    pub fn claim(local: bool) -> Self {
+        Self { armed: local }
+    }
+
+    /// Capture begins: a Local Recording now holds the reservation until
+    /// completion or [`abandon_live`]. A Cloud claim begins nothing.
+    pub fn begin_live_with_terms(mut self, recording_id: &str, user_terms: Vec<String>) {
+        if std::mem::take(&mut self.armed) {
+            begin_live_with_terms(recording_id, user_terms);
+        }
+    }
+
+    /// Hands the reservation to work that releases it itself (Local replay).
+    pub fn hand_off(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnstartedAdmission {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut gate) = gate().lock()
+            // Only an admission no Recording or inference has taken over; a
+            // begun Recording keeps its worker until it completes or abandons.
+            && gate.admitted_generation.is_some()
+            && gate.admitted_recording.is_none()
+            && !gate.inference_checked_out
+        {
+            gate.release_admission();
+        }
+    }
+}
+
 pub fn skip_cloud_doctor_probes() -> bool {
     let Ok(state) = voisu_core::state_dir() else {
         return false;
@@ -1824,6 +1871,43 @@ mod tests {
             }
             assert!(gate.verification_count.get() > verifications);
         }
+    }
+
+    #[test]
+    fn unstarted_admission_releases_the_worker_when_capture_never_begins() {
+        let _session = test_session();
+        inject_ready(fixture_receipt(), "original");
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+        let unstarted = UnstartedAdmission::claim(true);
+        assert_eq!(readiness_snapshot(), LocalReadiness::Busy);
+        assert!(matches!(
+            admit_local(true),
+            LocalAdmission::Unavailable { .. }
+        ));
+        // The daemon refuses before capture (quota, shutdown, superseded
+        // admission): the claim is dropped without begin_live or abandon_live.
+        drop(unstarted);
+        assert!(matches!(readiness_snapshot(), LocalReadiness::Ready { .. }));
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+    }
+
+    #[test]
+    fn unstarted_admission_never_releases_a_begun_recording() {
+        let _session = test_session();
+        inject_ready(fixture_receipt(), "original");
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+        UnstartedAdmission::claim(true).begin_live_with_terms("running", Vec::new());
+        // A stale claim dropped while a Recording runs must not free its worker.
+        drop(UnstartedAdmission::claim(true));
+        {
+            let mut held = gate().lock().unwrap();
+            held.test_selected = Some(parakeet_receipt());
+            held.test_next_worker = Some(FakeWorker::default());
+            assert_eq!(held.refresh_passive(), LocalReadiness::Busy);
+            assert_eq!(held.receipt.as_ref().unwrap(), &fixture_receipt());
+        }
+        abandon_live("running");
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
     }
 
     #[test]
