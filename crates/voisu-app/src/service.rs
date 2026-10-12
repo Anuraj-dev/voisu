@@ -1145,17 +1145,21 @@ fn service_unit(executable: &Path) -> Result<String, String> {
         concat!(
             "[Unit]\n",
             "Description=Voisu dictation daemon\n",
-            "After=wayland-session-waitenv.service dbus.socket pipewire.service\n",
+            // Ordered after the target because it helps, but GNOME imports the
+            // display variables on its own schedule, and a ConditionEnvironment
+            // skip is never retried. The daemon waits for the display itself
+            // under --systemd: exit 75 (arrived late) is respawned by
+            // Restart=on-failure, exit 78 (never arrived) is not restarted.
+            "After=graphical-session.target wayland-session-waitenv.service dbus.socket pipewire.service\n",
             "Wants=dbus.socket pipewire.service\n",
             "PartOf=graphical-session.target\n",
-            "ConditionEnvironment=|WAYLAND_DISPLAY\n",
-            "ConditionEnvironment=|DISPLAY\n",
             "StartLimitIntervalSec=30s\n",
             "StartLimitBurst=3\n\n",
             "[Service]\n",
             "Type=simple\n",
             "ExecStart={} --systemd\n",
             "Restart=on-failure\n",
+            "RestartPreventExitStatus=78\n",
             "RestartSec=2s\n",
             // Graceful shutdown stops an active Recording, processes it to
             // completion, joins the actor, and drains retained provider cleanup;

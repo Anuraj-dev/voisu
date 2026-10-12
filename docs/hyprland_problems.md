@@ -35,7 +35,7 @@ Systemd breaks the cycle by deleting a start job. On the observed cold login, it
 #### Intended fix
 
 - The desktop session owns the portal. Voisu must not add `After=` or `Wants=` dependencies on `xdg-desktop-portal.service`.
-- On Omarchy/UWSM, start Voisu after `wayland-session-waitenv.service` and use `ConditionEnvironment=WAYLAND_DISPLAY`. The service remains enabled by `graphical-session.target` but must not also order itself after that target, which would create a cycle.
+- Order Voisu `After=graphical-session.target` and, on Omarchy/UWSM, `wayland-session-waitenv.service`. `WantedBy=graphical-session.target` with that `After=` does not cycle; the cycle recorded above came from `After=xdg-desktop-portal.service`, since the portal itself starts after that target. Ordering alone does not prove the session display variables are already in the user manager (GNOME imports them on its own schedule), and a `ConditionEnvironment=` skip is never retried, so the daemon unit has no start condition. Under `--systemd` the daemon itself waits up to 20 s for `WAYLAND_DISPLAY` or `DISPLAY` to appear in the user manager: if they arrive late it exits 75 and `Restart=on-failure` respawns it with the manager's environment; if they never arrive it exits 78, which `RestartPreventExitStatus=78` leaves as a failed unit.
 - Keep `PartOf=graphical-session.target` so Voisu stops with the compositor.
 - Keep login enablement through `WantedBy=graphical-session.target`.
 - Replace the complete packaged dependency set. Systemd cannot remove `After=` or `Wants=` dependencies from a drop-in by assigning an empty value.
@@ -45,10 +45,13 @@ The target shape is:
 
 ```ini
 [Unit]
-After=wayland-session-waitenv.service dbus.socket pipewire.service
+After=graphical-session.target wayland-session-waitenv.service dbus.socket pipewire.service
 Wants=dbus.socket pipewire.service
 PartOf=graphical-session.target
-ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Restart=on-failure
+RestartPreventExitStatus=78
 
 [Install]
 WantedBy=graphical-session.target
@@ -69,7 +72,7 @@ It could capture audio and produce a Transcript, but clipboard Delivery failed w
 #### Intended fix
 
 - Order startup after the session environment readiness boundary. Omarchy/UWSM provides `wayland-session-waitenv.service`, which imports Wayland variables before `graphical-session.target` completes.
-- Require `WAYLAND_DISPLAY` for graphical startup rather than starting a permanently degraded daemon.
+- Require a display (`WAYLAND_DISPLAY` or `DISPLAY`) for graphical startup rather than starting a permanently degraded daemon; the daemon waits for it under `--systemd`.
 - Make the daemon rediscover the active Wayland socket and session metadata after compositor changes. It must not trust its initial process environment forever.
 - Recover after a compositor or portal restart without requiring `voisu service restart`.
 
@@ -132,7 +135,7 @@ The Overlay previously checked for a display once, selected journal-only feedbac
 
 #### Intended fix
 
-- Apply the same graphical-session ordering and `ConditionEnvironment=WAYLAND_DISPLAY` used by the daemon.
+- Apply the same `After=graphical-session.target` ordering as the daemon and keep `ConditionEnvironment=WAYLAND_DISPLAY` on the Overlay unit (it only observes, so a skip is acceptable; the daemon unit has no condition).
 - Retry display discovery after compositor changes instead of degrading permanently after one check.
 - Keep supervision so a child crash does not affect Recording or Transcript Delivery.
 - Investigate the GTK crash only if it repeats with a comparable or symbolized stack.

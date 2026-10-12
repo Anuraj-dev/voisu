@@ -1,7 +1,9 @@
 [Unit]
 Description=Voisu overlay observer
 PartOf=graphical-session.target
-After=wayland-session-waitenv.service voisu.service
+# See voisu.service: GNOME exports the display environment while
+# graphical-session.target is being reached, and a condition skip is not retried.
+After=graphical-session.target wayland-session-waitenv.service voisu.service
 ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
