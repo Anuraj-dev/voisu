@@ -76,7 +76,7 @@ impl LocalSetupActions for ProductionLocalSetup {
     }
 }
 
-struct SetupMaintenance {
+pub(crate) struct SetupMaintenance {
     lifetime: Mutex<Option<SingleInstance>>,
 }
 

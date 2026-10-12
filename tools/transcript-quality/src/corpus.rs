@@ -69,7 +69,7 @@ pub enum ResultOrigin {
 /// One provider Source Transcript in a result sidecar.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CaseSource {
-    /// Lowercase provider name: `groq` or `deepgram`.
+    /// Lowercase provider name: `groq`, `deepgram`, or a local catalog id.
     pub provider: String,
     pub text: String,
 }
@@ -120,6 +120,8 @@ pub struct CaseResult {
     pub delivery: Option<CaseDelivery>,
     #[serde(default)]
     pub telemetry: Option<CaseTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_asr: Option<voisu_core::LocalAsrDiagnostic>,
 }
 
 /// One loaded, validated corpus case.
@@ -264,9 +266,9 @@ pub fn parse_case_result(text: &str, case_id: &str) -> Result<CaseResult, String
     }
     for source in &mut result.source_transcripts {
         source.provider = source.provider.trim().to_ascii_lowercase();
-        if !matches!(source.provider.as_str(), "groq" | "deepgram") {
+        if !is_source_provider_id(&source.provider) {
             return Err(format!(
-                "case {case_id}: {RESULT_FILE} source provider {:?} is not groq or deepgram",
+                "case {case_id}: {RESULT_FILE} source provider {:?} is not a cloud or local model id",
                 source.provider
             ));
         }
@@ -353,7 +355,7 @@ fn case_result_from_record(record: &DiagnosticRecord, case_id: &str, now_ms: u64
         .filter(|text| !text.is_empty())
         .map(str::to_owned);
     let delivered = record.delivery_count > 0 || record.delivery_method.is_some();
-    CaseResult {
+    let mut result = CaseResult {
         schema: RESULT_SCHEMA.to_owned(),
         case_id: case_id.to_owned(),
         origin: ResultOrigin::History,
@@ -383,7 +385,33 @@ fn case_result_from_record(record: &DiagnosticRecord, case_id: &str, now_ms: u64
             stop_to_finalized_ms: record.stop_to_finalized_ms,
             stop_to_delivered_ms: record.stop_to_delivered_ms,
         }),
+        local_asr: record.local_asr.clone(),
+    };
+    if result.source_transcripts.is_empty()
+        && let Some(local) = result.local_asr.as_ref()
+        && local.outcome == voisu_core::LocalAsrOutcome::Transcript
+        && let Some(text) = result.final_transcript.clone()
+    {
+        result.source_transcripts.push(CaseSource {
+            provider: local.model_id.clone(),
+            text,
+        });
     }
+    result
+}
+
+fn is_source_provider_id(provider: &str) -> bool {
+    matches!(provider, "groq" | "deepgram") || is_local_model_id(provider)
+}
+
+fn is_local_model_id(provider: &str) -> bool {
+    let bytes = provider.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 96
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'-' | b'_'))
 }
 
 /// Loads a `history.jsonl` file or a `voisu history --json` array.
@@ -513,6 +541,17 @@ mod tests {
     fn provider_names_match_core_serialization() {
         assert_eq!(provider_name(Provider::Groq), "groq");
         assert_eq!(provider_name(Provider::Deepgram), "deepgram");
+    }
+
+    #[test]
+    fn local_catalog_ids_are_valid_source_providers() {
+        assert!(is_source_provider_id("groq"));
+        assert!(is_source_provider_id("deepgram"));
+        assert!(is_source_provider_id("qwen3-asr-0.6b"));
+        assert!(is_source_provider_id("parakeet-tdt-0.6b-v3"));
+        assert!(is_source_provider_id("whisper-cpp-ggml-base.en"));
+        assert!(!is_source_provider_id(""));
+        assert!(!is_source_provider_id("qwen3 asr"));
     }
 
     #[test]

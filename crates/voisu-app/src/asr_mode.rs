@@ -26,8 +26,7 @@ const MODE_INITIALIZED_NAME: &str = "mode-initialized";
 const CONFIG_REVISION_NAME: &str = "config-revision";
 const IO_DEADLINE: Duration = Duration::from_secs(2);
 const MAX_MODE_RESPONSE_BYTES: usize = 64 * 1024;
-#[allow(dead_code)]
-const LOCAL_UNAVAILABLE: &str = "Local selected; model unavailable";
+pub const LOCAL_UNAVAILABLE: &str = "Local selected; model unavailable";
 const LOCAL_START_REFUSED: &str = "Local ASR is unavailable; Start refused before capture";
 const LOCAL_REPLAY_REFUSED: &str = "Local ASR is unavailable; Replay refused before capture";
 
@@ -452,14 +451,14 @@ pub fn select_resources(mode: AsrMode) -> AsrPathResources {
     match mode {
         AsrMode::Cloud => AsrPathResources::Cloud,
         AsrMode::Local => AsrPathResources::Local {
-            readiness: production_local_readiness(),
+            readiness: crate::local_routing::admission_readiness(),
         },
     }
 }
 
-fn production_local_readiness() -> LocalReadiness {
+fn runtime_local_readiness() -> LocalReadiness {
     let _ = crate::local_model::observe_for_admission();
-    crate::local_routing::production_readiness()
+    crate::local_routing::runtime_readiness()
 }
 
 pub fn status_report(active: Option<AsrMode>) -> AsrModeStatus {
@@ -488,7 +487,7 @@ pub fn status_report_at(
             revision: Some(revision),
             local_readiness: match mode {
                 AsrMode::Cloud => LocalReadiness::Absent,
-                AsrMode::Local => production_local_readiness(),
+                AsrMode::Local => runtime_local_readiness(),
             },
             admission_error: None,
             audio_retention: Some(crate::local_recovery::audio_retention_label(
@@ -640,6 +639,9 @@ fn try_connect_daemon() -> Result<UnixStream, String> {
 fn set_mode_over_ipc(stream: UnixStream, mode: AsrMode) -> Result<String, CliModeError> {
     // The daemon serves one command per connection, matching `voisu` itself.
     let status = send_request(stream, Command::Status)?;
+    if !status.ok {
+        return Err(CliModeError::new(4, status.message));
+    }
     if !status
         .capabilities
         .iter()
@@ -877,6 +879,26 @@ fn read_frame(stream: &mut BufReader<UnixStream>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn busy_status_preserves_daemon_error_before_capability_check() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let daemon = std::thread::spawn(move || {
+            let mut request = String::new();
+            BufReader::new(server.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: Request = serde_json::from_str(&request).unwrap();
+            assert!(matches!(request.command, Command::Status));
+            serde_json::to_writer(&mut server, &Response::rejected(None, "daemon is busy"))
+                .unwrap();
+            server.write_all(b"\n").unwrap();
+        });
+        let error = set_mode_over_ipc(client, AsrMode::Local).unwrap_err();
+        daemon.join().unwrap();
+        assert_eq!(error.exit_code, 4);
+        assert_eq!(error.message, "daemon is busy");
+    }
 
     #[test]
     fn missing_mode_without_marker_is_legacy_cloud() {

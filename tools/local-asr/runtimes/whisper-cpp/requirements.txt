@@ -1,0 +1,32 @@
+# Resident whisper.cpp runtime (native GGML; no torch) for
+# whisper-cpp-large-v3-turbo-q5-0 and whisper-cpp-small-q8-0.
+#
+# pywhispercpp 1.5.1 bundles whisper.cpp 1.8.5. PyPI wheels are CPU-only, so
+# the sdist (sha256 5df897e5dd9d9f16804fc937bd85b9f5880a0b29a55f8843585e0e03d76195e5)
+# is built with CUDA for sm_120 using a pip-installed CUDA 13.3 toolchain
+# (nvidia-cuda-nvcc==13.3.73, nvidia-cuda-crt==13.3.73, nvidia-nvvm==13.3.73,
+# nvidia-cuda-runtime==13.3.29, nvidia-cuda-cccl==13.3.4.3.1, cmake, ninja).
+# The host driver (610.57) reports CUDA 13.3, so the toolkit must not be newer.
+# GCC 16 is newer than nvcc 13.3 supports; -allow-unsupported-compiler built
+# and ran correctly here. Build (CUDAToolkit_ROOT is a directory with bin/,
+# include/, nvvm/ and lib/ holding the pip wheel contents plus unversioned
+# libcudart.so / libcublas.so / libcublasLt.so / libcuda.so links):
+#   GGML_CUDA=1 CMAKE_CUDA_ARCHITECTURES=120-real CUDAToolkit_ROOT=$CUDA \
+#   CMAKE_CUDA_COMPILER=$CUDA/bin/nvcc \
+#   CMAKE_ARGS="-DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+#     -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler -DGGML_NATIVE=OFF \
+#     -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON" \
+#   uv build --wheel pywhispercpp-1.5.1
+# Install the wheel with the CUDA user-space libraries, then point the
+# extension's RUNPATH at them (the build leaves the toolkit path there):
+#   uv pip install --python $VENV/bin/python pywhispercpp-1.5.1-*.whl \
+#     nvidia-cuda-runtime==13.3.29 nvidia-cublas==13.6.2.16
+#   patchelf --set-rpath '$ORIGIN/nvidia/cu13/lib' \
+#     $VENV/lib/python3.12/site-packages/_pywhispercpp.cpython-312-x86_64-linux-gnu.so
+# The same build runs CPU-only with use_gpu=false; a CPU-only install needs no
+# nvidia-* packages. Vulkan (GGML_VULKAN=1) is buildable on this host
+# (vulkan-headers, shaderc/glslc, NVIDIA ICD present) but was not built or
+# measured, and the adapter's CUDA device observation would not accept it.
+pywhispercpp==1.5.1
+nvidia-cuda-runtime==13.3.29
+nvidia-cublas==13.6.2.16

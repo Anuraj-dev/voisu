@@ -220,6 +220,7 @@ fn score_known_audio<W: WorkerChild>(
         Ok(WorkerOutcome::Transcript {
             text,
             observed_device,
+            ..
         }) => {
             if text.to_ascii_lowercase().contains(expected_phrase) {
                 Ok(HealthReport {

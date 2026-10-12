@@ -228,32 +228,38 @@ where
             .iter()
             .map(|host| (*host).to_owned())
             .collect();
-        // Idle TCP is already timed out by ProductionHttps. Transfer duration
-        // is bounded by INSTALL_DEADLINE, not NO_PROGRESS.
-        let fetched = request
-            .fetcher
-            .fetch(&FetchRequest {
-                url: file.url.to_owned(),
-                allowed_hosts: hosts,
-                expected_bytes: file.bytes,
-            })
-            .map_err(map_fetch)?;
-        deadline(request.clock.elapsed())?;
-        if u64::try_from(fetched.body.len()).unwrap_or(u64::MAX) != file.bytes {
-            return Err(InstallError::Size);
-        }
-        if !verify_file_digest(&fetched.body, file.sha256_hex, file.bytes) {
-            return Err(InstallError::Hash);
-        }
+        let mut pending = safe_fs::PendingDownload::new(&staging).map_err(InstallError::Fs)?;
         if let Some(errno) = request.io.fail_write {
             return Err(map_write_errno(errno));
         }
+        // Network reads and individual sink writes are bounded by NO_PROGRESS;
+        // the complete transfer is bounded by INSTALL_DEADLINE.
+        let fetched = request
+            .fetcher
+            .fetch_to(
+                &FetchRequest {
+                    url: file.url.to_owned(),
+                    allowed_hosts: hosts,
+                    expected_bytes: file.bytes,
+                },
+                pending.file_mut(),
+            )
+            .map_err(map_fetch)?;
+        deadline(request.clock.elapsed())?;
+        if fetched.bytes != file.bytes {
+            return Err(InstallError::Size);
+        }
+        if !fetched.matches_pin(file.sha256_hex, file.bytes) {
+            return Err(InstallError::Hash);
+        }
         let write_started = request.clock.elapsed();
-        let mut dest =
-            safe_fs::create_exclusive_file(&staging, file.name).map_err(InstallError::Fs)?;
-        safe_fs::durable_write(&mut dest, &fetched.body).map_err(InstallError::Fs)?;
+        pending
+            .file_mut()
+            .sync_all()
+            .map_err(|error| map_fetch(super::fetch::io_err(error)))?;
         no_progress(request.clock.elapsed().saturating_sub(write_started))?;
         deadline(request.clock.elapsed())?;
+        pending.publish(file.name).map_err(InstallError::Fs)?;
     }
     if request.io.abort == Some(InstallAbort::AfterFetch) {
         return abort(prior);
@@ -338,6 +344,7 @@ fn map_store(error: StoreError) -> InstallError {
 fn map_fetch(error: FetchError) -> InstallError {
     match error {
         FetchError::Deadline | FetchError::NoProgress => InstallError::Deadline,
+        FetchError::NoSpace => InstallError::NoSpace,
         other => InstallError::Fetch(other),
     }
 }
@@ -487,6 +494,77 @@ mod tests {
             InstallError::Hash | InstallError::Size | InstallError::Fetch(_)
         ));
         assert!(store.load_active().unwrap().is_none());
+    }
+
+    #[test]
+    fn streamed_mismatch_and_partial_errors_leave_no_final_or_temporary_file() {
+        struct StreamingOnly {
+            staging: std::path::PathBuf,
+            error: Option<FetchError>,
+        }
+        impl ArtifactFetcher for StreamingOnly {
+            fn fetch(&self, _: &FetchRequest) -> Result<FetchResponse, FetchError> {
+                panic!("installer must use fetch_to");
+            }
+            fn fetch_to(
+                &self,
+                request: &FetchRequest,
+                sink: &mut dyn io::Write,
+            ) -> Result<super::super::FetchedSummary, FetchError> {
+                assert!(!self.staging.join("model.bin").exists());
+                let mut body = CatalogEntry::fixture_model_bytes().to_vec();
+                body[0] ^= 1;
+                sink.write_all(&body).map_err(super::super::fetch::io_err)?;
+                assert!(!self.staging.join("model.bin").exists());
+                if let Some(error) = &self.error {
+                    return Err(error.clone());
+                }
+                Ok(super::super::FetchedSummary {
+                    bytes: request.expected_bytes,
+                    sha256_hex: sha256_hex(&body),
+                    hops: 0,
+                })
+            }
+        }
+        let entry = ci_fixture_entry();
+        for error in [
+            None,
+            Some(FetchError::Truncated {
+                expected: entry.files[0].bytes,
+                actual: 1,
+            }),
+            Some(FetchError::Oversized {
+                expected: entry.files[0].bytes,
+                actual: entry.files[0].bytes + 1,
+            }),
+            Some(FetchError::NoSpace),
+        ] {
+            let (_temp, mut store) = open_store();
+            let staging = store.staging_dir(&format!("s-{}", sha256_hex(entry.id.as_bytes())));
+            let fetcher = StreamingOnly {
+                staging: staging.clone(),
+                error: error.clone(),
+            };
+            let result = install_entry(InstallRequest {
+                store: &mut store,
+                entry,
+                fetcher: &fetcher,
+                health: &CandidateHealth::default(),
+                maintenance: &IdleMaintenance,
+                consent: consent(entry),
+                io: InstallIo::default(),
+                clock: InstallClock::default(),
+            })
+            .unwrap_err();
+            match error {
+                None => assert_eq!(result, InstallError::Hash),
+                Some(FetchError::NoSpace) => assert_eq!(result, InstallError::NoSpace),
+                Some(error) => assert_eq!(result, InstallError::Fetch(error)),
+            }
+            assert!(!staging.join("model.bin").exists());
+            assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+            assert!(store.load_active().unwrap().is_none());
+        }
     }
 
     #[test]

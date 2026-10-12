@@ -117,6 +117,7 @@ url = "2"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 voisu-core = { path = "../voisu-core" }
 sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
 webpki-roots = "1"
 xkbcommon = { version = "0.9", default-features = false }
 zbus = { version = "5.13.2", default-features = false, features = ["tokio"] }

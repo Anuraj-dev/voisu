@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voisu.local/schemas/local-asr-benchmark-report-v1.json",
+  "title": "Voisu local ASR benchmark report",
+  "type": "object",
+  "required": ["schema_version", "kind", "corpus_manifest_sha256", "models", "report_sha256"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "benchmark_report"},
+    "corpus_id": {"type": "string"},
+    "corpus_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "quality_evidence": {"type": "boolean"},
+    "normalization": {"type": "object"},
+    "models": {"type": "array", "items": {"type": "object"}},
+    "report_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "additionalProperties": true
+}

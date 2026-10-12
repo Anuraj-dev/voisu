@@ -1,7 +1,9 @@
 //! Deterministic Local tail: dictionary replacements, local formatting, Delivery.
 //!
 //! Dictionary replacements and `format_validated` are local-only. Empty or
-//! silence is explicit no-text. Replay never receives a Delivery permit.
+//! silence is explicit no-text, as are ASR outro hallucinations (the shared
+//! Source Transcript sanitizer) and whole-transcript Whisper silence phrases.
+//! Replay never receives a Delivery permit.
 
 use std::collections::BTreeSet;
 
@@ -93,7 +95,8 @@ impl DeliveryCoordinator {
     }
 }
 
-/// One terminal decision: no-text, or dictionary then local formatting.
+/// One terminal decision: no-text, or hallucination sanitizing, dictionary,
+/// then local formatting.
 pub fn decide_transcript(
     recording_id: &str,
     pcm: &[u8],
@@ -121,7 +124,18 @@ pub fn decide_transcript(
                     reason: "empty".to_owned(),
                 });
             }
-            let replaced = apply_local_dictionary(trimmed, user_terms);
+            let sanitized = voisu_core::sanitize_source_transcript_text(trimmed);
+            if sanitized.trim().is_empty() {
+                return Ok(TerminalDecision::NoText {
+                    reason: "hallucinated suffix".to_owned(),
+                });
+            }
+            if is_whole_silence_phrase(&sanitized) {
+                return Ok(TerminalDecision::NoText {
+                    reason: "silence hallucination".to_owned(),
+                });
+            }
+            let replaced = apply_local_dictionary(&sanitized, user_terms);
             let formatted = format_validated(&replaced, writing_mode);
             let rendered = formatted.rendered().trim();
             if rendered.is_empty() {
@@ -160,6 +174,37 @@ pub fn decide_replay(
     Ok(decision)
 }
 
+/// Phrases local Whisper emits for near-silent audio. Matched only against the
+/// WHOLE transcript, so a real sign-off after speech ("... Thank you.") is kept.
+const WHISPER_SILENCE_PHRASES: [&str; 8] = [
+    "thank you",
+    "thanks",
+    "thank you very much",
+    "thank you so much",
+    "thanks for listening",
+    "you",
+    "bye",
+    "bye bye",
+];
+
+/// Lowercase, treat punctuation as a word break, collapse whitespace, then
+/// compare to the closed silence-phrase set.
+fn is_whole_silence_phrase(text: &str) -> bool {
+    let spaced: String = text
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .to_lowercase();
+    let normalized = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    WHISPER_SILENCE_PHRASES.contains(&normalized.as_str())
+}
+
 /// User-vocabulary replacements via the Cloud span-aware matcher, ungated.
 pub fn apply_local_dictionary(text: &str, user_terms: &[String]) -> String {
     voisu_core::apply_user_vocabulary(text, user_terms, &[])
@@ -173,6 +218,7 @@ mod tests {
         WorkerOutcome::Transcript {
             text: text.to_owned(),
             observed_device: "cpu".to_owned(),
+            metrics: crate::local_worker::InferenceMetrics::default(),
         }
     }
 
@@ -248,6 +294,101 @@ mod tests {
                 &CloudCapabilitySentinel::new(),
             ),
             Err(TailError::DuplicateDecision)
+        );
+    }
+
+    fn decide(text: &str, user_terms: &[String]) -> TerminalDecision {
+        decide_transcript(
+            "rec-1",
+            &[1, 0],
+            outcome(text),
+            user_terms,
+            WritingMode::Literal,
+            &mut DeliveryCoordinator::new(),
+            &CloudCapabilitySentinel::new(),
+        )
+        .unwrap()
+    }
+
+    fn no_text(reason: &str) -> TerminalDecision {
+        TerminalDecision::NoText {
+            reason: reason.to_owned(),
+        }
+    }
+
+    #[test]
+    fn anchored_outro_is_stripped_and_real_speech_kept() {
+        assert_eq!(
+            decide("Please send the report today. Thanks for watching!", &[]),
+            TerminalDecision::Transcript("Please send the report today.".to_owned())
+        );
+    }
+
+    #[test]
+    fn outro_only_transcript_is_no_text() {
+        for text in [
+            "Thanks for watching!",
+            "Thank you for watching.",
+            "Thank you. Thanks for watching.",
+            "Please like and subscribe",
+        ] {
+            assert_eq!(decide(text, &[]), no_text("hallucinated suffix"), "{text}");
+        }
+    }
+
+    #[test]
+    fn whole_transcript_silence_phrase_is_no_text() {
+        for text in [
+            "Thank you.",
+            "thank you",
+            "  THANK YOU!  ",
+            "Thanks.",
+            "Thank you very much.",
+            "Thank you so much!",
+            "Thanks for listening.",
+            "You",
+            "you.",
+            "Bye.",
+            "Bye bye.",
+            "Bye-bye!",
+            "Thank   you ...",
+        ] {
+            assert_eq!(
+                decide(text, &[]),
+                no_text("silence hallucination"),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_sign_off_after_real_speech_is_kept() {
+        assert_eq!(
+            decide("Please send the report. Thank you.", &[]),
+            TerminalDecision::Transcript("Please send the report. Thank you.".to_owned())
+        );
+        assert_eq!(
+            decide("Thank you for the update", &[]),
+            TerminalDecision::Transcript("Thank you for the update".to_owned())
+        );
+    }
+
+    #[test]
+    fn normal_speech_is_unchanged() {
+        assert_eq!(
+            decide("The build finished in four minutes.", &[]),
+            TerminalDecision::Transcript("The build finished in four minutes.".to_owned())
+        );
+    }
+
+    #[test]
+    fn dictionary_still_applies_after_outro_strip() {
+        assert_eq!(
+            decide(
+                "run the daemon reload now. Thanks for watching.",
+                &["daemon-reload".to_owned()]
+            ),
+            TerminalDecision::Transcript("run the daemon-reload now.".to_owned())
         );
     }
 

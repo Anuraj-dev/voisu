@@ -57,6 +57,42 @@ impl<C: WorkerChild, D: DeliverySeam> LocalLifecycle<C, D> {
     }
 
     #[must_use]
+    pub fn has_child(&self) -> bool {
+        self.supervisor.has_child()
+    }
+
+    #[must_use]
+    pub fn released(&self) -> bool {
+        self.supervisor.released()
+    }
+
+    #[must_use]
+    pub fn can_launch_replacement(&self) -> bool {
+        self.supervisor.can_launch_replacement()
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn mark_unavailable(&mut self) {
+        self.supervisor.mark_unavailable();
+    }
+
+    pub fn child_mut(&mut self) -> Option<&mut C> {
+        self.supervisor.child_mut()
+    }
+
+    pub fn take_supervisor(&mut self) -> WorkerSupervisor<C> {
+        std::mem::replace(&mut self.supervisor, WorkerSupervisor::absent())
+    }
+
+    pub fn restore_supervisor(&mut self, supervisor: WorkerSupervisor<C>) {
+        self.supervisor = supervisor;
+    }
+
+    #[must_use]
     pub fn delivered(&self) -> Option<&D> {
         Some(&self.delivery)
     }
@@ -153,6 +189,43 @@ impl<C: WorkerChild, D: DeliverySeam> LocalLifecycle<C, D> {
         self.supervisor.unload_idle()
     }
 
+    /// Idle-only development model switch. Retire the generation first so a
+    /// stale Transcript cannot become Delivery, then drain and reap the old
+    /// worker. A replacement is attached only after release is confirmed.
+    pub fn begin_idle_switch(&mut self) -> Result<ReapOutcome, SupervisorError> {
+        if matches!(
+            self.supervisor.state(),
+            WorkerState::Busy | WorkerState::Stopping
+        ) {
+            return Err(SupervisorError::Busy);
+        }
+        self.invalidate();
+        let outcome = self.supervisor.drain_for_switch()?;
+        if self.supervisor.has_child() {
+            self.supervisor.mark_unavailable();
+            return Err(SupervisorError::Unavailable(
+                "previous worker unreaped; Local unavailable",
+            ));
+        }
+        Ok(outcome)
+    }
+
+    /// Attach a replacement only after [`Self::begin_idle_switch`] confirmed
+    /// the previous model is gone. A failed attach leaves Local unavailable.
+    pub fn attach_replacement(&mut self, child: C, now: Instant) -> Result<(), SupervisorError> {
+        if !self.supervisor.released() || self.supervisor.has_child() {
+            self.supervisor.mark_unavailable();
+            return Err(SupervisorError::Unavailable(
+                "previous model still loaded; Local unavailable",
+            ));
+        }
+        if let Err(error) = self.attach(child, now) {
+            self.supervisor.mark_unavailable();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// True while the rolling start budget is spent: only this explicit
     /// retry path (after the window slides) or a daemon restart starts again.
     pub fn restart_budget_exhausted(&mut self, now: Instant) -> bool {
@@ -213,11 +286,24 @@ impl<C: WorkerChild, D: DeliverySeam> LocalLifecycle<C, D> {
     }
 }
 
-/// Production Start and Replay remain refused before capture until measurement
-/// selects a catalog entry. A Pilot Candidate alone cannot open this gate.
+/// Runtime Local admission. Production remains closed; the developer pilot
+/// service may explicitly open this runtime gate through its environment.
 #[must_use]
-pub fn production_local_admission() -> bool {
-    crate::local_model::production_selection(&crate::local_model::shipped_catalog()).is_some()
+pub fn local_runtime_admission() -> bool {
+    crate::local_model::runtime_selection(&crate::local_model::shipped_catalog()).is_some()
+}
+
+/// Explicit Consented Install admission; the developer pilot takes precedence.
+#[must_use]
+pub fn consented_runtime_admission(store: &crate::local_model::ModelStore) -> bool {
+    !crate::local_model::development_local_enabled()
+        && crate::local_model::verify_consented_install(store).is_ok()
+}
+
+#[must_use]
+pub fn default_consented_runtime_admission() -> bool {
+    !crate::local_model::development_local_enabled()
+        && super::consented::verify_default_consented_install().is_ok()
 }
 
 #[cfg(test)]
@@ -251,7 +337,7 @@ mod tests {
 
     #[test]
     fn production_admission_ignores_the_unmeasured_pilot_candidate() {
-        assert!(!production_local_admission());
+        assert!(!local_runtime_admission());
     }
 
     #[test]
@@ -515,5 +601,100 @@ mod tests {
             .is_ok()
         );
         assert_eq!(life.delivery_mut().delivered, vec!["hello".to_owned()]);
+    }
+
+    #[test]
+    fn idle_switch_loads_the_replacement_after_release_and_rejects_stale_delivery() {
+        let mut life = ready("nemotron");
+        life.transcribe("rec-1", "q1", vec![1, 0]).unwrap();
+        assert_eq!(life.delivery_mut().delivered, vec!["nemotron".to_owned()]);
+        let old_generation = life.generation;
+        let hash = fixture_receipt_hash();
+        assert_eq!(life.begin_idle_switch().unwrap(), ReapOutcome::Exited);
+        assert_eq!(life.state(), WorkerState::Absent);
+        assert!(life.supervisor.child_mut().is_none());
+        let replacement = FakeWorker {
+            scripted_text: Some("parakeet".into()),
+            generation: 1,
+            model_receipt_hash: hash.clone(),
+            ..FakeWorker::default()
+        };
+        life.pin_model_receipt_hash(hash);
+        life.attach_replacement(replacement, Instant::now())
+            .unwrap();
+        if let Some(child) = life.supervisor.child_mut() {
+            child.generation = life.generation;
+        }
+        life.prepare("rec-2", Instant::now()).unwrap();
+        assert_eq!(life.state(), WorkerState::Ready);
+        let late = WorkerFrame::Transcript {
+            correlation: Correlation {
+                daemon_nonce: "l3".into(),
+                generation: old_generation,
+                request_id: "q1".into(),
+                recording_id: "rec-1".into(),
+                model_receipt_hash: fixture_receipt_hash(),
+            },
+            text: "stale-nemotron".into(),
+        };
+        assert!(life.inject_late_frame(late, "rec-1").is_ok());
+        assert_eq!(life.delivery_mut().delivered, vec!["nemotron".to_owned()]);
+        life.transcribe("rec-2", "q2", vec![1, 0]).unwrap();
+        assert_eq!(
+            life.delivery_mut().delivered,
+            vec!["nemotron".to_owned(), "parakeet".to_owned()]
+        );
+    }
+
+    #[test]
+    fn failed_idle_switch_leaves_local_unavailable() {
+        let mut life = ready("nemotron");
+        assert_eq!(life.begin_idle_switch().unwrap(), ReapOutcome::Exited);
+        let hash = fixture_receipt_hash();
+        let replacement = FakeWorker {
+            scripted_error: Some("load_abort".into()),
+            generation: 1,
+            model_receipt_hash: hash.clone(),
+            ..FakeWorker::default()
+        };
+        life.pin_model_receipt_hash(hash);
+        life.attach_replacement(replacement, Instant::now())
+            .unwrap();
+        if let Some(child) = life.supervisor.child_mut() {
+            child.generation = life.generation;
+        }
+        let error = life.prepare("rec-2", Instant::now()).unwrap_err();
+        assert!(matches!(error, SupervisorError::LoadAborted));
+        assert_eq!(life.state(), WorkerState::Unavailable);
+        let transcribe = life.transcribe("rec-2", "q", vec![1, 0]).unwrap_err();
+        assert!(matches!(transcribe, SupervisorError::NotReady(_)));
+        assert!(life.delivery_mut().delivered.is_empty());
+    }
+
+    #[test]
+    fn idle_switch_refuses_busy_work() {
+        let mut life = LocalLifecycle::harness();
+        let hash = fixture_receipt_hash();
+        life.pin_model_receipt_hash(hash.clone());
+        let worker = FakeWorker {
+            scripted_text: Some("late".into()),
+            generation: 1,
+            model_receipt_hash: hash,
+            ignore_cancel: true,
+            hold_until_cancel: true,
+            ..FakeWorker::default()
+        };
+        life.attach(worker, Instant::now()).unwrap();
+        if let Some(child) = life.supervisor.child_mut() {
+            child.generation = life.generation;
+        }
+        life.prepare("rec-1", Instant::now()).unwrap();
+        let inflight = life.transcribe("rec-1", "q", vec![1, 0]).unwrap_err();
+        assert!(matches!(inflight, SupervisorError::Busy));
+        assert!(matches!(
+            life.begin_idle_switch().unwrap_err(),
+            SupervisorError::Busy | SupervisorError::Unavailable(_)
+        ));
+        assert!(life.supervisor.child_mut().is_some());
     }
 }

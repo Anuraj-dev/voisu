@@ -1,0 +1,9 @@
+# Isolated Moonshine Voice Medium Streaming CPU runtime. GPU is not required.
+# Install with:
+#   uv pip install --python $VENV/bin/python moonshine-voice==0.1.5
+# Official artifacts are the Medium Streaming .ort bundle from
+# https://download.moonshine.ai/model/medium-streaming-en/quantized
+# (encoder.ort, adapter.ort, cross_kv.ort, decoder_kv.ort, frontend.ort,
+# streaming_config.json, tokenizer.bin). The Hugging Face safetensors
+# checkpoint is a different adapter and is not used here.
+moonshine-voice==0.1.5

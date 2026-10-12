@@ -1,0 +1,12 @@
+# Isolated Fun-ASR-Nano-2512-hf Transformers CUDA runtime. Inference is offline.
+# Linux llama.cpp v0.2.6 has no Fun-ASR-Nano CUDA package; this is the Python fallback.
+# Install with the same CUDA torch pin as qwen-transformers, plus matching torchaudio
+# (the native feature extractor uses torchaudio.compliance.kaldi.fbank):
+#   uv pip install --python $VENV/bin/python --index-url https://download.pytorch.org/whl/cu128 \
+#     --index-strategy unsafe-best-match torch==2.9.1+cu128 torchaudio==2.9.1+cu128
+#   uv pip install --python $VENV/bin/python transformers==5.17.0 soundfile==0.13.1 librosa==1.0.0
+torch==2.9.1+cu128
+torchaudio==2.9.1+cu128
+transformers==5.17.0
+soundfile==0.13.1
+librosa==1.0.0

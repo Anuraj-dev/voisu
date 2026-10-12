@@ -61,7 +61,7 @@ Enable it for your user:
 
 ```sh
 systemctl --user enable --now voisu.service
-voisu setup   # guided wizard: validate and store your provider keys
+voisu setup   # guided wizard: Cloud or Local, then keys / Consented Install
 # optional on-screen Overlay (on Fedora, install voisu-overlay first):
 systemctl --user enable --now voisu-overlay.service
 ```
@@ -105,6 +105,21 @@ Run `voisu doctor` if the Trigger Key does not respond — it reports a portal
 without a usable GlobalShortcuts interface, and adds `--verbose` for the full
 reasoning behind each check.
 
+### Local (Consented Install)
+
+`voisu setup` shows Cloud and Local on one screen. Local is **Suggested for
+this hardware**, with development evidence from one host and one speaker (not
+the release gate); Cloud stays selected until you pick Local. English only;
+Hinglish stays on Cloud.
+
+On NVIDIA GPU 0 with at least 3584 MiB total VRAM, setup can install
+`distil-large-v3.5-int8` as a Consented Install after you agree to the download
+size (about 2.98 GB), MIT licence, English-only limits, and that this is
+development evidence rather than a Bakeoff Winner. Nothing is fetched until
+that explicit yes. Once installed it runs offline on the GPU, with no automatic
+CPU or Cloud fallback. Decline keeps Local selected with no model. Remove it with
+`voisu local remove` (non-interactive: `voisu local remove --yes`).
+
 ### Ubuntu GNOME troubleshooting
 
 - **Voisu is not running after login.** The daemon waits up to 20 seconds for
@@ -144,7 +159,8 @@ local to your machine.
 | --- | --- |
 | `voisu start` / `stop` / `toggle` / `status` | Control and inspect the daemon |
 | `voisu shortcut` | Show the desktop-approved Trigger Key |
-| `voisu setup` | Guided wizard: Trigger Key, Delivery, provider keys |
+| `voisu setup` | Guided wizard: Cloud or Local, Trigger Key, Delivery, provider keys or Consented Install |
+| `voisu local remove [--yes]` | Remove a Consented Install (`--yes` required when stdin is not a terminal) |
 | `voisu auth set` / `auth verify <groq\|deepgram>` | Store or verify a provider key (key on stdin) |
 | `voisu deepgram on` / `off` | Enable or disable Deepgram streaming |
 | `voisu delivery [type\|clipboard\|guarded]` | Show or set the Delivery mode |

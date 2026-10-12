@@ -119,6 +119,16 @@ pub fn production_selection(_catalog: &Catalog) -> Option<&CatalogEntry> {
     None
 }
 
+/// Development-only selection for the Local pilot service.
+///
+/// This is intentionally separate from `production_selection`: the pilot can
+/// be exercised on a developer host without changing the production catalog
+/// decision.
+#[must_use]
+pub fn development_selection(catalog: &Catalog) -> Option<&CatalogEntry> {
+    pilot_candidate(catalog)
+}
+
 #[must_use]
 pub fn ci_fixture_entry() -> &'static CatalogEntry {
     &SHIPPED_ENTRIES[0]

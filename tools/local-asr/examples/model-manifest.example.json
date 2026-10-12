@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "model_id": "<one-required-model-id>",
+  "device": "cuda:0",
+  "language": "auto",
+  "runtime": {
+    "python": "/absolute/private/venv/bin/python",
+    "worker": "/absolute/private/tools/local-asr/worker.py",
+    "revision": "<pinned-runtime-identity>"
+  },
+  "model_path": "/absolute/private/local-model-directory",
+  "files": [{"path": "/absolute/private/model-file", "sha256": "<64-hex-sha256>", "bytes": 0}],
+  "options": {},
+  "limits": {"memory_bytes": 8589934592, "tasks": 128, "cpu_cores": 4, "cache_bytes": 268435456, "vram_bytes": 0}
+}

@@ -22,7 +22,7 @@
 //! deprecated `release_to_text_ms` (measured from recording start), so latency
 //! percentiles computed over them are comparable across dictation lengths.
 
-use voisu_core::{LifecycleEvidence, Provider, ProviderTiming};
+use voisu_core::{LifecycleEvidence, Provider};
 
 /// Rendered in place of any value the Recording did not measure. A key is never
 /// dropped: a parser that splits on `key=value` sees a stable key set.
@@ -61,7 +61,7 @@ pub fn recording_journal_lines(
             render_correlation_id(&evidence.correlation_id),
             render_millis(evidence.first_chunk_ms),
             render_millis(evidence.capture_finalized_ms),
-            render_provider_timings(&evidence.provider_timings_ms),
+            render_provider_timings(evidence),
             render_millis(evidence.release_to_text_ms),
             render_millis(evidence.recording_duration_ms),
             render_millis(evidence.stop_to_finalized_ms),
@@ -123,16 +123,55 @@ fn render_millis(value: Option<u64>) -> String {
 }
 
 /// `deepgram:412,groq:640` — comma-separated, whitespace-free, in the order the
-/// providers completed. No timing at all renders as [`ABSENT`].
-fn render_provider_timings(timings: &[ProviderTiming]) -> String {
-    if timings.is_empty() {
+/// providers completed. A Local Recording records `model-id:inference_ms` on
+/// the same key so journal greps stay one field. No timing at all renders as
+/// [`ABSENT`].
+fn render_provider_timings(evidence: &LifecycleEvidence) -> String {
+    if let Some(local) = evidence.local_asr.as_ref() {
+        let model = journal_token(&local.model_id);
+        let ms = local
+            .inference_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| ABSENT.to_owned());
+        let mut parts = vec![format!("{model}:{ms}")];
+        if let Some(device) = local.observed_device.as_deref() {
+            parts.push(format!("device:{}", journal_token(device)));
+        }
+        if let Some(backend) = local.backend.as_deref() {
+            parts.push(format!("backend:{}", journal_token(backend)));
+        }
+        if let Some(ram) = local.peak_host_ram_bytes {
+            parts.push(format!("ram:{ram}"));
+        }
+        if let Some(gpu) = local.peak_gpu_memory_bytes {
+            parts.push(format!("gpu:{gpu}"));
+        }
+        return parts.join(",");
+    }
+    if evidence.provider_timings_ms.is_empty() {
         return ABSENT.to_owned();
     }
-    timings
+    evidence
+        .provider_timings_ms
         .iter()
         .map(|timing| format!("{}:{}", provider_key(timing.provider), timing.completed_ms))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Journal tokens must stay whitespace-free so `key=value` parsers keep
+/// splitting on spaces.
+fn journal_token(value: &str) -> String {
+    if value.is_empty() {
+        return ABSENT.to_owned();
+    }
+    value
+        .chars()
+        .map(|character| match character {
+            ' ' | '\t' | '\n' | '\r' | ',' | '=' => '-',
+            other => other,
+        })
+        .collect()
 }
 
 /// A lowercase, stable key for a provider. Deliberately not `cli_label`, which
@@ -147,7 +186,7 @@ fn provider_key(provider: Provider) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voisu_core::LifecycleStage;
+    use voisu_core::{LifecycleStage, ProviderTiming};
 
     fn evidence() -> LifecycleEvidence {
         LifecycleEvidence {
@@ -191,6 +230,7 @@ mod tests {
             confidence_arbitration: None,
             source_transcripts: Vec::new(),
             final_transcript: None,
+            local_asr: None,
         }
     }
 
@@ -375,5 +415,36 @@ mod tests {
             }
             assert!(!lines.structured.contains('\n'));
         }
+    }
+
+    #[test]
+    fn local_asr_metrics_occupy_the_provider_timings_key() {
+        let mut evidence = evidence();
+        evidence.provider_timings_ms.clear();
+        evidence.local_asr = Some(voisu_core::LocalAsrDiagnostic {
+            model_id: "qwen3-asr-0.6b".into(),
+            outcome: voisu_core::LocalAsrOutcome::Transcript,
+            runtime: Some("python".into()),
+            backend: Some("transformers".into()),
+            language: Some("auto".into()),
+            requested_device: Some("cuda:0".into()),
+            observed_device: Some("cuda:0".into()),
+            resident: Some(true),
+            manifest_hash: None,
+            reason: None,
+            inference_ms: Some(412),
+            peak_host_ram_bytes: Some(2_147_483_648),
+            peak_gpu_memory_bytes: Some(891_289_600),
+        });
+        let lines = recording_journal_lines(7, &evidence, None);
+        assert!(
+            lines
+                .structured
+                .contains("provider_timings_ms=qwen3-asr-0.6b:412,device:cuda:0,backend:transformers,ram:2147483648,gpu:891289600"),
+            "{}",
+            lines.structured
+        );
+        assert!(!lines.structured.contains("deepgram"));
+        assert!(!lines.structured.contains("groq"));
     }
 }

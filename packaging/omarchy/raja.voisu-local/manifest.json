@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "raja.voisu-local",
+  "name": "Voisu Local",
+  "version": "1.0.0",
+  "author": "Raja",
+  "license": "MIT",
+  "description": "Pick one Voisu development model at a time from the Omarchy bar. Talks only to voisu local-dev.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "widget/BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Voisu Local",
+    "description": "Development model selector. Click a registered local-dev model; activating one clears the previous selection.",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "voisuBinary": "/home/raja/Anuraj-dev/voisu/target/release/voisu"
+    },
+    "schema": [
+      {
+        "key": "voisuBinary",
+        "type": "string",
+        "label": "voisu binary",
+        "defaultValue": "/home/raja/Anuraj-dev/voisu/target/release/voisu",
+        "description": "Path to a voisu binary that has local-dev. Packaged /usr/bin/voisu does not yet."
+      }
+    ]
+  }
+}

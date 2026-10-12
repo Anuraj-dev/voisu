@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voisu.local/schemas/local-asr-inventory-v1.json",
+  "title": "Voisu private local ASR inventory",
+  "type": "object",
+  "required": ["schema_version", "kind", "corpus_id", "records", "inventory_sha256"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "inventory"},
+    "corpus_id": {"type": "string", "minLength": 1},
+    "inventory_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/record"}
+    }
+  },
+  "$defs": {
+    "record": {
+      "type": "object",
+      "required": ["record_id", "audio_path", "audio_sha256", "language", "reference", "consent_id"],
+      "properties": {
+        "record_id": {"type": "string", "minLength": 1},
+        "audio_path": {"type": "string", "pattern": "^/"},
+        "audio_relpath": {"type": "string", "minLength": 1},
+        "audio_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "audio_bytes": {"type": "integer", "minimum": 0},
+        "duration_ms": {"type": "integer", "minimum": 0},
+        "language": {"enum": ["english", "hinglish", "negative"]},
+        "reference": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "critical_tokens": {"type": "array", "items": {"type": "string"}},
+        "consent_id": {"type": "string", "minLength": 1},
+        "split": {"enum": [null, "development", "heldout"]}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

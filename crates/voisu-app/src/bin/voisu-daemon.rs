@@ -273,7 +273,24 @@ async fn run() -> Result<(), String> {
                 };
                 let permit = match connections.clone().try_acquire_owned() {
                     Ok(permit) => permit,
-                    Err(_) => continue,
+                    Err(_) => {
+                        tokio::spawn(async move {
+                            let payload = serde_json::to_vec(&Response::rejected(
+                                None,
+                                "daemon is busy; retry when Idle",
+                            ))
+                            .unwrap_or_default();
+                            let mut stream = stream;
+                            let _ = timeout(IO_DEADLINE, async {
+                                use tokio::io::AsyncWriteExt;
+                                stream.write_all(&payload).await?;
+                                stream.write_all(b"\n").await?;
+                                Ok::<_, std::io::Error>(())
+                            })
+                            .await;
+                        });
+                        continue;
+                    }
                 };
                 let actor = actor_tx.clone();
                 let levels = levels.clone();
@@ -800,6 +817,11 @@ async fn actor_loop(
                 }
             },
             ActorMessage::CaptureAdmitted { token, result } => {
+                // A Local admission reserved the worker. Every `continue` below
+                // drops this claim and releases it; only a begun capture or a
+                // spawned Local replay takes the reservation over.
+                let unstarted =
+                    local_routing::UnstartedAdmission::claim(matches!(result, Ok(AsrMode::Local)));
                 let pending = match std::mem::replace(&mut state, ActorState::Idle) {
                     ActorState::Admitting {
                         token: current,
@@ -860,6 +882,8 @@ async fn actor_loop(
                             .fixture_dir();
                         let current_validator = validator.take().expect("validator is available");
                         let fixture_name = fixture_name.into_inner();
+                        // replay_local releases the reservation on every outcome.
+                        unstarted.hand_off();
                         let replay = tokio::spawn(async move {
                             let (deepgram_slot, groq_slot) = local_routing::cloud_free_slots();
                             let response = local_routing::replay_local(
@@ -1076,9 +1100,7 @@ async fn actor_loop(
                         // accepted, so startup failures and recovery evidence are
                         // correlated even though no adapter has started yet.
                         let correlation_id = voisu_core::correlation_id(id);
-                        if admitted_mode == AsrMode::Local {
-                            local_routing::begin_live_with_terms(&correlation_id, user_terms);
-                        }
+                        unstarted.begin_live_with_terms(&correlation_id, user_terms);
                         state = ActorState::Starting {
                             id,
                             correlation_id,
@@ -1168,6 +1190,9 @@ async fn actor_loop(
                 if let Some(correlation) = correlation {
                     match result {
                         Ok((active_capture, streams)) if shutdown_ack.is_some() => {
+                            if started_asr_mode == AsrMode::Local {
+                                local_routing::abandon_live(&correlation);
+                            }
                             level_ring.deactivate();
                             // Shutdown arrived while this Recording was starting:
                             // never start the pump. Abort everything the start
@@ -2043,6 +2068,7 @@ fn base_evidence(
         // the same texts).
         source_transcripts: Vec::new(),
         final_transcript: None,
+        local_asr: None,
     }
 }
 
@@ -2408,10 +2434,16 @@ async fn process_recording(
                 format!("capture pump task failed: {join_error}"),
             );
             let mut provider_failures = Vec::new();
-            account_for_missing_providers(&[], &mut provider_failures, error.diagnostic());
-            if !deepgram_enabled {
-                normalize_disabled_deepgram(&mut provider_failures);
-            }
+            let local_asr = if asr_mode == AsrMode::Local {
+                local_routing::abandon_live(&correlation_id);
+                local_routing::current_local_asr_error(error.public_message())
+            } else {
+                account_for_missing_providers(&[], &mut provider_failures, error.diagnostic());
+                if !deepgram_enabled {
+                    normalize_disabled_deepgram(&mut provider_failures);
+                }
+                None
+            };
             let record = diagnostic_record(
                 &evidence,
                 Vec::new(),
@@ -2421,6 +2453,7 @@ async fn process_recording(
                 None,
                 None,
                 Some(&error),
+                local_asr,
             );
             if let Some(store) = diagnostics.as_ref()
                 && let Err(record_error) = store.record(record)
@@ -2444,6 +2477,7 @@ async fn process_recording(
     let mut final_transcript: Option<String> = None;
     let mut smart_writing: Option<SmartWritingDiagnostic> = None;
     let mut dpr: Option<DprDiagnostic> = None;
+    let mut local_asr = None;
     let mut debug_audio = None;
 
     let result = async {
@@ -2477,11 +2511,19 @@ async fn process_recording(
             let rec_id = correlation_id.clone();
             let recovery = local_recovery::enabled();
             match local_routing::finish_local_stop(&rec_id, pcm, writing_mode, recovery) {
-                Ok(LocalStopResult::NoText { reason }) => {
+                Ok(LocalStopResult::NoText {
+                    reason,
+                    local_asr: asr,
+                }) => {
+                    local_asr = Some(asr);
                     evidence.stages.push(LifecycleStage::ValidationCompleted);
                     return Err(BoundaryError::new(BoundaryKind::SilentRecording, reason));
                 }
-                Ok(LocalStopResult::Transcript(text)) => {
+                Ok(LocalStopResult::Transcript {
+                    text,
+                    local_asr: asr,
+                }) => {
+                    local_asr = Some(asr);
                     evidence.stages.push(LifecycleStage::ValidationCompleted);
                     let finalized_at = Instant::now();
                     let mut authorized = CorrelationAuthorizedDelivery {
@@ -2505,6 +2547,7 @@ async fn process_recording(
                     return Ok(());
                 }
                 Err(error) => {
+                    local_asr = local_routing::current_local_asr_error(error.message().as_str());
                     local_routing::mark_recovery_failed(&rec_id, recovery);
                     local_routing::abandon_live(&rec_id);
                     return Err(BoundaryError::new(
@@ -2714,32 +2757,51 @@ async fn process_recording(
         Ok(())
     }
     .await;
+    // A Local capture that failed before inference (stream error, capture
+    // finish) still reserves the worker; once inference ran this is a no-op.
+    if asr_mode == AsrMode::Local && result.is_err() {
+        local_routing::abandon_live(&correlation_id);
+    }
 
     // On a failure that produced no usable Source Transcript (both providers
     // failed completion, a streaming failure aborted the Recording, or a
     // deadline cleanup failed), the coordinator attached the per-provider
     // failure evidence to the error rather than to a ProviderCompletion. Recover
     // it here so history shows each provider's absence instead of a bare error.
-    if let Some(error) = result.as_ref().err() {
-        if provider_failures.is_empty() {
-            provider_failures = error.provider_failures().to_vec();
+    // Local ASR does not occupy Groq/Deepgram slots, so cloud accounting stays
+    // off that path; the selected model is recorded on `local_asr`.
+    if asr_mode != AsrMode::Local {
+        if let Some(error) = result.as_ref().err() {
+            if provider_failures.is_empty() {
+                provider_failures = error.provider_failures().to_vec();
+            }
+            // Every configured provider must end with EITHER a Source Transcript or
+            // a failure entry. On a capture-abort or a one-sided streaming failure,
+            // the provider(s) that merely got torn down have neither yet, so record
+            // them as Aborted — no silent absence on any exit path.
+            account_for_missing_providers(
+                &source_records,
+                &mut provider_failures,
+                error.diagnostic(),
+            );
         }
-        // Every configured provider must end with EITHER a Source Transcript or
-        // a failure entry. On a capture-abort or a one-sided streaming failure,
-        // the provider(s) that merely got torn down have neither yet, so record
-        // them as Aborted — no silent absence on any exit path.
-        account_for_missing_providers(&source_records, &mut provider_failures, error.diagnostic());
-    }
 
-    // Deepgram was disabled for this Recording: whatever the completion, abort,
-    // or torn-down accounting recorded above (Completion when the barrier
-    // resolved instantly, Aborted on a capture/streaming failure that never
-    // reached the barrier), collapse it to the single canonical NotStarted
-    // record on EVERY exit path — success or failure — so a Groq-only Recording
-    // always shows why only one source ran.
-    if !deepgram_enabled {
-        normalize_disabled_deepgram(&mut provider_failures);
+        // Deepgram was disabled for this Recording: whatever the completion, abort,
+        // or torn-down accounting recorded above (Completion when the barrier
+        // resolved instantly, Aborted on a capture/streaming failure that never
+        // reached the barrier), collapse it to the single canonical NotStarted
+        // record on EVERY exit path — success or failure — so a Groq-only Recording
+        // always shows why only one source ran.
+        if !deepgram_enabled {
+            normalize_disabled_deepgram(&mut provider_failures);
+        }
+    } else if local_asr.is_none() {
+        local_asr = result
+            .as_ref()
+            .err()
+            .and_then(|error| local_routing::current_local_asr_error(error.public_message()));
     }
+    evidence.local_asr = local_asr.clone();
 
     let record = diagnostic_record(
         &evidence,
@@ -2750,6 +2812,7 @@ async fn process_recording(
         smart_writing,
         dpr,
         result.as_ref().err(),
+        local_asr,
     );
     if let Some(store) = diagnostics.as_ref()
         && let Err(error) = store.record(record)
@@ -2954,6 +3017,7 @@ async fn supervise_recording(
                 None,
                 None,
                 Some(&error),
+                None,
             );
             if let Some(store) = diagnostics.as_ref()
                 && let Err(record_error) = store.record(record)
@@ -3184,6 +3248,7 @@ fn diagnostic_record(
     smart_writing: Option<SmartWritingDiagnostic>,
     dpr: Option<DprDiagnostic>,
     error: Option<&BoundaryError>,
+    local_asr: Option<voisu_core::LocalAsrDiagnostic>,
 ) -> DiagnosticRecord {
     let mut record = DiagnosticRecord::new(evidence.correlation_id.clone(), evidence.recording_id);
     record.stages = evidence.stages.clone();
@@ -3220,6 +3285,7 @@ fn diagnostic_record(
     record.dpr = dpr;
     record.intent_reconstruction = evidence.intent_reconstruction.clone();
     record.confidence_arbitration = evidence.confidence_arbitration.clone();
+    record.local_asr = local_asr;
     record
 }
 

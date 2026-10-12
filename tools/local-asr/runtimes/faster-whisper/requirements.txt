@@ -1,0 +1,25 @@
+# Resident CTranslate2 runtime (native; no torch) for
+# faster-whisper-large-v3-turbo-int8, whisper-hindi2hinglish-apex-int8, and
+# distil-large-v3.5-int8. Weights are stored float16 and quantized on load
+# (int8_float16 on CUDA, int8 on CPU).
+# Install with:
+#   uv pip install --python $VENV/bin/python faster-whisper==1.2.1 ctranslate2==4.8.2 \
+#     nvidia-cublas-cu12==12.8.4.1 nvidia-cudnn-cu12==9.10.2.21 nvidia-cuda-runtime-cu12==12.8.90
+# The CUDA wheels are only needed for cuda:0; CTranslate2 dlopens libcublas.so.12,
+# which the adapter preloads from this venv.
+#
+# Whisper-Hindi2Hinglish-Apex has no published CTranslate2 build. The pinned
+# model.bin (sha256 1a47e83dbb61709cb703159c4ca16dae4f2d33bffab1f21d7615c4d0b46786b2)
+# is the official converter's float16 output of upstream revision
+# f3214eed20b4e4d4144e739982d911f87b9cb223 (model.safetensors sha256
+# 5560830fe8fa09b8cdf1b5926d0cc39a2586eadaad685d809e156432c4ebca80); two
+# conversions produced identical bytes. Converter environment:
+# ctranslate2==4.8.2, transformers==4.56.1, torch==2.9.1+cu128 (CPU only).
+#   ct2-transformers-converter --model $APEX_HF --output_dir $OUT \
+#     --copy_files tokenizer.json preprocessor_config.json \
+#     --quantization float16 --low_cpu_mem_usage
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+nvidia-cublas-cu12==12.8.4.1
+nvidia-cudnn-cu12==9.10.2.21
+nvidia-cuda-runtime-cu12==12.8.90

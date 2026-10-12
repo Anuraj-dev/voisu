@@ -141,6 +141,8 @@ struct EvidenceSnapshot {
     decision: DecisionEvidence,
     #[serde(skip_serializing_if = "Option::is_none")]
     model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_asr: Option<voisu_core::LocalAsrDiagnostic>,
     timing: TimingSnapshot,
     stages: Vec<LifecycleStage>,
     audio: AudioSnapshot,
@@ -613,7 +615,13 @@ fn build_snapshot(
             reconciliation_requested: record.reconciliation_requested,
             dpr,
         },
-        model_id,
+        model_id: model_id.or_else(|| {
+            record
+                .local_asr
+                .as_ref()
+                .map(|local| local.model_id.clone())
+        }),
+        local_asr: record.local_asr.clone(),
         timing: TimingSnapshot {
             first_chunk_ms: record.first_chunk_ms,
             capture_finalized_ms: record.capture_finalized_ms,

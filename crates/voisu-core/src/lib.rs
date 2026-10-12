@@ -31,17 +31,18 @@ pub use diagnostics::{
     DEFAULT_MAX_AGE, DEFAULT_MAX_RECORDS, DebugAudioRecord, DiagnosticExport, DiagnosticRecord,
     DiagnosticStore, EXPORT_ENV_ALLOWLIST, EnglishEligibilityOutcome,
     IntentReconstructionDiagnostic, IntentReconstructionEligibility, IntentReconstructionOutcome,
-    MAX_CONFIDENCE_ARBITRATION_REJECTIONS, MAX_MODEL_ID_UTF8_BYTES,
-    MAX_SMART_WRITING_DIAGNOSTIC_EDITS, MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES,
-    MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES, MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES,
-    MAX_STORED_TEXT, PruneOutcome, REDACTED, ReplayOutcome, RetentionPolicy,
-    SMART_WRITING_DIAGNOSTIC_VERSION, SmartWritingDiagnostic, SmartWritingEditEvidence,
-    SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode, SourceCoverageRecord,
-    SourceSelectionConfidence, SourceSelectionDiagnostic, SourceTranscriptRecord, TELEMETRY_SCHEMA,
-    TEXT_SHA256_FINGERPRINT_LEN, clamp_stored_transcript_text, clamp_utf8_bytes, correlation_id,
-    export_record, is_secret_env_key, is_text_sha256_fingerprint, redacted_environment,
-    replay_capture, sanitize_url, scrub_embedded_urls, scrub_secret_values,
-    text_sha256_fingerprint, unix_millis_now,
+    LocalAsrDiagnostic, LocalAsrOutcome, MAX_CONFIDENCE_ARBITRATION_REJECTIONS,
+    MAX_MODEL_ID_UTF8_BYTES, MAX_SMART_WRITING_DIAGNOSTIC_EDITS,
+    MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES, MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES,
+    MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES, MAX_STORED_TEXT, PruneOutcome, REDACTED, ReplayOutcome,
+    RetentionPolicy, SMART_WRITING_DIAGNOSTIC_VERSION, SmartWritingDiagnostic,
+    SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode,
+    SourceCoverageRecord, SourceSelectionConfidence, SourceSelectionDiagnostic,
+    SourceTranscriptRecord, TELEMETRY_SCHEMA, TEXT_SHA256_FINGERPRINT_LEN,
+    clamp_stored_transcript_text, clamp_utf8_bytes, correlation_id, export_record,
+    is_secret_env_key, is_text_sha256_fingerprint, redacted_environment, replay_capture,
+    sanitize_url, scrub_embedded_urls, scrub_secret_values, text_sha256_fingerprint,
+    unix_millis_now,
 };
 pub(crate) use timing::duration_millis;
 pub use timing::{StopAnchoredTimings, stop_anchored_timings};
@@ -418,6 +419,10 @@ pub struct LifecycleEvidence {
     pub source_transcripts: Vec<SourceTranscriptRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_transcript: Option<String>,
+    /// Additive Local ASR identity and resource metrics. Absent on Cloud
+    /// dual-provider Recordings so existing IPC readers stay byte-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_asr: Option<crate::LocalAsrDiagnostic>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4545,6 +4550,7 @@ mod replay_evidence_additivity_tests {
                 },
             ],
             final_transcript: Some("Replay this dictation.".to_owned()),
+            local_asr: None,
         };
         let encoded = serde_json::to_value(&evidence).unwrap();
         assert_eq!(
