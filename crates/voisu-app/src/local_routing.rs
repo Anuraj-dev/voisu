@@ -66,6 +66,11 @@ struct Gate {
     lifecycle: LocalLifecycle<GateWorker, FakeDelivery>,
     coordinator: DeliveryCoordinator,
     sentinel: CloudCapabilitySentinel,
+    published_sentinel: Arc<AtomicBool>,
+    /// Pins this worker from admission through capture and inference. Refresh
+    /// cannot replace or invalidate it until completion or abandonment.
+    admitted_generation: Option<u64>,
+    admitted_recording: Option<String>,
     pending_permit: Option<DeliveryPermit>,
     user_terms: Vec<String>,
     /// Supervisor is checked out for inference; refresh must not map the
@@ -89,6 +94,8 @@ struct Gate {
     launch_count: u32,
     #[cfg(test)]
     verification_count: std::cell::Cell<u32>,
+    #[cfg(test)]
+    test_before_refresh: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Gate {
@@ -104,6 +111,9 @@ impl Gate {
             lifecycle: LocalLifecycle::new(FakeDelivery::default()),
             coordinator: DeliveryCoordinator::new(),
             sentinel: CloudCapabilitySentinel::new(),
+            published_sentinel: Arc::new(AtomicBool::new(true)),
+            admitted_generation: None,
+            admitted_recording: None,
             pending_permit: None,
             user_terms: Vec::new(),
             inference_checked_out: false,
@@ -120,12 +130,61 @@ impl Gate {
             launch_count: 0,
             #[cfg(test)]
             verification_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            test_before_refresh: None,
         }
     }
 
     fn publish(&self, readiness: LocalReadiness) {
-        if let Ok(mut published) = self.published.lock() {
-            *published = readiness;
+        *self
+            .published
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = readiness;
+    }
+
+    fn reset_sentinel(&mut self) {
+        self.sentinel = CloudCapabilitySentinel::new();
+        self.published_sentinel.store(true, Ordering::Release);
+    }
+
+    fn release_admission(&mut self) {
+        self.admitted_generation = None;
+        self.admitted_recording = None;
+        if !self.inference_checked_out {
+            self.readiness = if self.lifecycle.state() == WorkerState::Ready {
+                LocalReadiness::Ready {
+                    model_identity: self.receipt.as_ref().map(local_model_identity),
+                }
+            } else {
+                self.not_ready()
+            };
+            self.publish(self.readiness.clone());
+        }
+    }
+
+    fn admit(&mut self, kind_ready_required: bool) -> LocalAdmission {
+        let readiness = self.refresh();
+        if kind_ready_required && !readiness.admits_capture() {
+            return LocalAdmission::Unavailable {
+                error: match &readiness {
+                    LocalReadiness::Unavailable { error } => error.clone(),
+                    _ => LOCAL_NOT_READY.to_owned(),
+                },
+            };
+        }
+        match (self.receipt.clone(), readiness) {
+            (Some(receipt), LocalReadiness::Ready { model_identity }) => {
+                self.admitted_generation = Some(self.lifecycle.generation());
+                self.readiness = LocalReadiness::Busy;
+                self.publish(self.readiness.clone());
+                LocalAdmission::Ready {
+                    model_identity: model_identity.unwrap_or_else(|| receipt.catalog_id.clone()),
+                    receipt,
+                }
+            }
+            _ => LocalAdmission::Unavailable {
+                error: LOCAL_NOT_READY.to_owned(),
+            },
         }
     }
 
@@ -144,20 +203,36 @@ impl Gate {
     }
 
     fn refresh(&mut self) -> LocalReadiness {
-        let readiness = self.refresh_inner();
+        self.refresh_with_completion(|| {})
+    }
+
+    fn refresh_with_completion(&mut self, after_attempt: impl FnOnce()) -> LocalReadiness {
         let consented_path =
             crate::local_model::runtime_selection(&crate::local_model::shipped_catalog()).is_none()
                 && !crate::local_model::development_local_enabled();
-        self.finish_refresh(readiness, consented_path)
+        let observation = if consented_path
+            && self.admitted_generation.is_none()
+            && !self.inference_checked_out
+        {
+            self.observe_consented()
+        } else {
+            None
+        };
+        let readiness = self.refresh_inner();
+        after_attempt();
+        self.finish_refresh(readiness, consented_path, observation)
     }
 
     fn finish_refresh(
         &mut self,
         readiness: LocalReadiness,
         consented_path: bool,
+        observation: Option<crate::local_model::consented::ConsentedObservation>,
     ) -> LocalReadiness {
         if consented_path && matches!(readiness, LocalReadiness::Unavailable { .. }) {
-            self.failed_observation = self.observe_consented();
+            // Never associate an old failure with a tree repaired during the
+            // attempt. Incomplete preflight observations retain passive retries.
+            self.failed_observation = observation.filter(|observation| observation.unchanged());
         } else {
             self.failed_observation = None;
         }
@@ -168,20 +243,26 @@ impl Gate {
     fn observe_consented(&self) -> Option<crate::local_model::consented::ConsentedObservation> {
         #[cfg(test)]
         {
-            self.test_consented.as_ref().map(|(store, entry)| {
+            self.test_consented.as_ref().and_then(|(store, entry)| {
                 crate::local_model::consented::observe_with_entry(store, entry)
             })
         }
         #[cfg(not(test))]
         {
             let store = ModelStore::open(models_dir().ok()?).ok()?;
-            Some(crate::local_model::consented::observe_consented_install(
-                &store,
-            ))
+            crate::local_model::consented::observe_consented_install(&store)
         }
     }
 
     fn refresh_inner(&mut self) -> LocalReadiness {
+        #[cfg(test)]
+        if let Some(before_refresh) = self.test_before_refresh.take() {
+            before_refresh();
+        }
+        if self.admitted_generation.is_some() {
+            self.readiness = LocalReadiness::Busy;
+            return self.readiness.clone();
+        }
         if self.inference_checked_out {
             return self.readiness.clone();
         }
@@ -619,10 +700,22 @@ struct InferenceSession {
 fn take_inference_session() -> Result<InferenceSession, LocalError> {
     let mut gate = gate().lock().map_err(|_| LocalError::Unavailable)?;
     if !gate.sentinel.local_path_clean() {
+        gate.release_admission();
         return Err(LocalError::CloudCapability);
     }
-    let receipt = gate.receipt.clone().ok_or(LocalError::Unavailable)?;
+    let Some(receipt) = gate.receipt.clone() else {
+        gate.release_admission();
+        return Err(LocalError::Unavailable);
+    };
     if gate.lifecycle.state() != WorkerState::Ready {
+        gate.release_admission();
+        return Err(LocalError::Unavailable);
+    }
+    if gate
+        .admitted_generation
+        .is_some_and(|generation| generation != gate.lifecycle.generation())
+    {
+        gate.release_admission();
         return Err(LocalError::Unavailable);
     }
     let supervisor = gate.lifecycle.take_supervisor();
@@ -647,12 +740,7 @@ fn restore_inference_session(session: InferenceSession) {
         gate.lifecycle.restore_supervisor(session.supervisor);
         gate.coordinator = session.coordinator;
         gate.inference_checked_out = false;
-        if gate.lifecycle.state() == WorkerState::Ready {
-            gate.readiness = LocalReadiness::Ready {
-                model_identity: gate.receipt.as_ref().map(local_model_identity),
-            };
-        }
-        gate.publish(gate.readiness.clone());
+        gate.release_admission();
     }
 }
 
@@ -736,6 +824,7 @@ fn gate() -> &'static Mutex<Gate> {
     GATE.get_or_init(|| {
         let mut gate = Gate::new();
         gate.published = published_readiness().clone();
+        gate.published_sentinel = published_sentinel().clone();
         Mutex::new(gate)
     })
 }
@@ -753,7 +842,26 @@ fn published_snapshot(published: &Mutex<LocalReadiness>) -> LocalReadiness {
     published
         .lock()
         .map(|readiness| readiness.clone())
-        .unwrap_or(LocalReadiness::Verifying)
+        .unwrap_or_else(|_| refresh_failed_readiness())
+}
+
+fn published_sentinel() -> &'static Arc<AtomicBool> {
+    static CLEAN: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    CLEAN.get_or_init(|| Arc::new(AtomicBool::new(true)))
+}
+
+fn refresh_failed_readiness() -> LocalReadiness {
+    LocalReadiness::Unavailable {
+        error: "Local readiness failed; restart daemon to recover".to_owned(),
+    }
+}
+
+fn publish_poisoned_gate(gate: std::sync::PoisonError<std::sync::MutexGuard<'_, Gate>>) {
+    // Keep the mutex poisoned: worker ownership after a panic is uncertain.
+    // Admission remains fail-closed until daemon restart; only publish failure.
+    let mut gate = gate.into_inner();
+    gate.readiness = refresh_failed_readiness();
+    gate.publish(gate.readiness.clone());
 }
 
 fn schedule_readiness_refresh(
@@ -779,8 +887,18 @@ fn schedule_readiness_refresh(
                 }
             }
             let _reset = Reset(refreshing);
-            if let Ok(mut gate) = gate.lock() {
-                gate.refresh_passive();
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match gate.lock() {
+                    Ok(mut gate) => {
+                        gate.refresh_passive();
+                    }
+                    Err(poison) => publish_poisoned_gate(poison),
+                }));
+            if result.is_err() {
+                match gate.lock() {
+                    Err(poison) => publish_poisoned_gate(poison),
+                    Ok(gate) => gate.publish(refresh_failed_readiness()),
+                }
             }
         });
     match result {
@@ -828,39 +946,26 @@ pub fn admission_readiness() -> LocalReadiness {
     }
     #[cfg(not(test))]
     {
-        gate()
-            .lock()
-            .map(|mut gate| gate.refresh())
-            .unwrap_or_else(|_| LocalReadiness::Unavailable {
-                error: LOCAL_NOT_READY.to_owned(),
-            })
+        match gate().lock() {
+            Ok(mut gate) => gate.refresh(),
+            Err(poison) => {
+                publish_poisoned_gate(poison);
+                refresh_failed_readiness()
+            }
+        }
     }
 }
 
 #[must_use]
 pub fn admit_local(kind_ready_required: bool) -> LocalAdmission {
-    let Ok(mut gate) = gate().lock() else {
-        return LocalAdmission::Unavailable {
-            error: LOCAL_UNAVAILABLE.to_owned(),
-        };
-    };
-    let readiness = gate.refresh();
-    if kind_ready_required && !readiness.admits_capture() {
-        return LocalAdmission::Unavailable {
-            error: match &readiness {
-                LocalReadiness::Unavailable { error } => error.clone(),
-                _ => LOCAL_NOT_READY.to_owned(),
-            },
-        };
-    }
-    match (gate.receipt.clone(), readiness) {
-        (Some(receipt), LocalReadiness::Ready { model_identity }) => LocalAdmission::Ready {
-            model_identity: model_identity.unwrap_or_else(|| receipt.catalog_id.clone()),
-            receipt,
-        },
-        _ => LocalAdmission::Unavailable {
-            error: LOCAL_NOT_READY.to_owned(),
-        },
+    match gate().lock() {
+        Ok(mut gate) => gate.admit(kind_ready_required),
+        Err(poison) => {
+            publish_poisoned_gate(poison);
+            LocalAdmission::Unavailable {
+                error: LOCAL_NOT_READY.to_owned(),
+            }
+        }
     }
 }
 
@@ -871,27 +976,37 @@ pub fn begin_live(recording_id: &str) {
 pub fn begin_live_with_terms(recording_id: &str, user_terms: Vec<String>) {
     if let Ok(mut gate) = gate().lock() {
         gate.coordinator.begin_live(recording_id);
+        gate.admitted_recording = Some(recording_id.to_owned());
         gate.user_terms = user_terms;
         gate.pending_permit = None;
-        gate.sentinel = CloudCapabilitySentinel::new();
+        gate.reset_sentinel();
     }
 }
 
 pub fn begin_local_session() {
     if let Ok(mut gate) = gate().lock() {
-        gate.sentinel = CloudCapabilitySentinel::new();
+        gate.reset_sentinel();
     }
 }
 
 pub fn note_cloud_capability_used() {
+    published_sentinel().store(false, Ordering::Release);
     if let Ok(mut gate) = gate().lock() {
         gate.sentinel.construct_cloud_client();
+        gate.published_sentinel.store(false, Ordering::Release);
     }
 }
 
 pub fn abandon_live(recording_id: &str) {
     if let Ok(mut gate) = gate().lock() {
         gate.coordinator.abandon_live(recording_id);
+        if gate
+            .admitted_recording
+            .as_deref()
+            .is_none_or(|current| current == recording_id)
+        {
+            gate.release_admission();
+        }
     }
 }
 
@@ -1067,13 +1182,17 @@ pub fn replay_local(
         match crate::local_recovery::read_pcm(fixture_name) {
             Ok(bytes) => bytes,
             Err(error) => {
+                abandon_live(recording_id);
                 return Response::rejected(Some(DaemonState::Idle), error.message());
             }
         }
     } else {
         match load_diagnostic(fixture_name) {
             Ok(bytes) => bytes,
-            Err(error) => return Response::rejected(Some(DaemonState::Idle), error),
+            Err(error) => {
+                abandon_live(recording_id);
+                return Response::rejected(Some(DaemonState::Idle), error);
+            }
         }
     };
     match complete_replay(
@@ -1305,16 +1424,19 @@ pub fn quota_before_local_capture(recovery_enabled: bool) -> Result<(), LocalErr
     if !recovery_enabled {
         return Ok(());
     }
-    RecoveryStore::open_default(RecoveryClock::system())
+    let result = RecoveryStore::open_default(RecoveryClock::system())
         .and_then(|store| store.quota_before_capture())
-        .map_err(LocalError::Recovery)
+        .map_err(LocalError::Recovery);
+    if result.is_err()
+        && let Ok(mut gate) = gate().lock()
+    {
+        gate.release_admission();
+    }
+    result
 }
 
 pub fn sentinel_is_clean() -> bool {
-    gate()
-        .try_lock()
-        .map(|gate| gate.sentinel.local_path_clean())
-        .unwrap_or(false)
+    published_sentinel().load(Ordering::Acquire)
 }
 
 /// Test-only: attach a Ready worker and verified receipt without env.
@@ -1327,7 +1449,7 @@ pub fn inject_ready(receipt: ActiveReceipt, text: &str) {
     gate.readiness = LocalReadiness::Ready {
         model_identity: Some(receipt.catalog_id),
     };
-    gate.sentinel = CloudCapabilitySentinel::new();
+    gate.reset_sentinel();
     gate.coordinator = DeliveryCoordinator::new();
     gate.pending_permit = None;
     gate.user_terms = Vec::new();
@@ -1338,6 +1460,8 @@ pub fn reset_gate_for_tests() {
     if let Ok(mut gate) = gate().lock() {
         *gate = Gate::new();
         gate.published = published_readiness().clone();
+        gate.published_sentinel = published_sentinel().clone();
+        gate.reset_sentinel();
         gate.publish(LocalReadiness::Absent);
     }
 }
@@ -1476,7 +1600,7 @@ mod tests {
         drop(install);
         let failure = gate.refresh();
         assert!(gate.failed_observation.is_some());
-        gate.finish_refresh(failure, false);
+        gate.finish_refresh(failure, false, None);
         assert!(gate.failed_observation.is_none());
         let verifications = gate.verification_count.get();
         gate.refresh_passive();
@@ -1528,6 +1652,77 @@ mod tests {
     }
 
     #[test]
+    fn missing_tree_recovers_without_rewriting_receipt() {
+        let (_state, mut gate, _) = consented_gate();
+        let install = gate.verify_consented().unwrap();
+        let root = install.layout().root.clone();
+        drop(install);
+        let saved = root.with_extension("saved");
+        std::fs::rename(&root, &saved).unwrap();
+        assert!(matches!(gate.refresh(), LocalReadiness::Unavailable { .. }));
+        std::fs::rename(&saved, &root).unwrap();
+        assert!(matches!(
+            gate.refresh_passive(),
+            LocalReadiness::Ready { .. }
+        ));
+    }
+
+    #[test]
+    fn repair_before_failure_publication_is_not_cached() {
+        let (_state, mut gate, _) = consented_gate();
+        let install = gate.verify_consented().unwrap();
+        let path = install.layout().weights.join("model.bin");
+        let original = std::fs::read(&path).unwrap();
+        drop(install);
+        std::fs::write(&path, vec![b'x'; original.len()]).unwrap();
+        let failure = gate.refresh_with_completion(|| std::fs::write(&path, original).unwrap());
+        assert!(
+            matches!(&failure, LocalReadiness::Unavailable { error } if error.contains("Digest"))
+        );
+        assert!(gate.failed_observation.is_none());
+        assert!(matches!(
+            gate.refresh_passive(),
+            LocalReadiness::Ready { .. }
+        ));
+    }
+
+    #[test]
+    fn admission_reserves_worker_across_queued_refresh_until_abandoned() {
+        let _session = test_session();
+        inject_ready(fixture_receipt(), "original");
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+        let admitted_generation = gate().lock().unwrap().lifecycle.generation();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let refresh_barrier = barrier.clone();
+        let refresher = std::thread::spawn(move || {
+            refresh_barrier.wait();
+            gate().lock().unwrap().refresh_passive()
+        });
+        {
+            let mut held = gate().lock().unwrap();
+            held.test_selected = Some(parakeet_receipt());
+            held.test_next_worker = Some(FakeWorker::default());
+        }
+        barrier.wait();
+        assert_eq!(refresher.join().unwrap(), LocalReadiness::Busy);
+        begin_live("reserved");
+        abandon_live("stale-recording");
+        {
+            let mut held = gate().lock().unwrap();
+            assert_eq!(held.refresh(), LocalReadiness::Busy);
+            assert_eq!(held.lifecycle.generation(), admitted_generation);
+            assert_eq!(held.receipt.as_ref().unwrap(), &fixture_receipt());
+            assert_eq!(held.launch_count, 0);
+        }
+        abandon_live("reserved");
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+        assert_eq!(
+            gate().lock().unwrap().receipt.as_ref().unwrap(),
+            &parakeet_receipt()
+        );
+    }
+
+    #[test]
     fn verification_and_loading_replace_stale_unavailable_snapshot() {
         let (_state, mut gate, _) = consented_gate();
         gate.publish(LocalReadiness::Unavailable {
@@ -1567,6 +1762,106 @@ mod tests {
     }
 
     #[test]
+    fn refresh_panic_publishes_terminal_failure_and_releases_ownership() {
+        for stale in [
+            LocalReadiness::Ready {
+                model_identity: Some("old worker".into()),
+            },
+            LocalReadiness::Verifying,
+            LocalReadiness::Loading,
+        ] {
+            let mut owned = Gate::new();
+            owned.publish(stale);
+            owned.test_before_refresh = Some(Box::new(|| panic!("refresh failure")));
+            let published = owned.published.clone();
+            let gate: &'static Mutex<Gate> = Box::leak(Box::new(Mutex::new(owned)));
+            let refreshing = Box::leak(Box::new(AtomicBool::new(false)));
+            schedule_readiness_refresh(gate, refreshing)
+                .unwrap()
+                .join()
+                .unwrap();
+            assert!(!refreshing.load(Ordering::Acquire));
+            assert!(gate.is_poisoned());
+            assert_eq!(published_snapshot(&published), refresh_failed_readiness());
+            // A later poll takes the poisoned-lock path and must not restart
+            // workers or resurrect the previous Ready/progress snapshot.
+            schedule_readiness_refresh(gate, refreshing)
+                .unwrap()
+                .join()
+                .unwrap();
+            assert!(!refreshing.load(Ordering::Acquire));
+            assert_eq!(published_snapshot(&published), refresh_failed_readiness());
+        }
+    }
+
+    #[test]
+    fn audited_extra_permission_change_refuses_status_and_capture() {
+        use std::os::unix::fs::PermissionsExt;
+        for admission in [false, true] {
+            let (_state, mut gate, _) = consented_gate();
+            let install = gate.verify_consented().unwrap();
+            let cache = install
+                .layout()
+                .root
+                .join("runtime/venv/lib/python3.11/site-packages/fixture/__pycache__");
+            drop(install);
+            std::fs::create_dir(&cache).unwrap();
+            let path = cache.join("fixture.pyc");
+            std::fs::write(&path, b"cache").unwrap();
+            assert!(matches!(gate.refresh(), LocalReadiness::Ready { .. }));
+            let verifications = gate.verification_count.get();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+            if admission {
+                assert!(matches!(
+                    gate.admit(true),
+                    LocalAdmission::Unavailable { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    gate.refresh_passive(),
+                    LocalReadiness::Unavailable { .. }
+                ));
+            }
+            assert!(gate.verification_count.get() > verifications);
+        }
+    }
+
+    #[test]
+    fn reserved_worker_completes_before_receipt_replacement() {
+        let _session = test_session();
+        inject_ready(fixture_receipt(), "original");
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+        begin_live("reserved-completion");
+        {
+            let mut held = gate().lock().unwrap();
+            held.test_selected = Some(parakeet_receipt());
+            held.test_next_worker = Some(FakeWorker::default());
+            assert_eq!(held.refresh_passive(), LocalReadiness::Busy);
+        }
+        let completion = complete_recording(
+            "reserved-completion",
+            vec![1, 0],
+            &[],
+            WritingMode::Literal,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            completion.decision,
+            TerminalDecision::Transcript("original".into())
+        );
+        let mut held = gate().lock().unwrap();
+        assert!(held.admitted_generation.is_none());
+        assert_eq!(held.receipt.as_ref().unwrap(), &fixture_receipt());
+        assert!(matches!(
+            held.refresh_passive(),
+            LocalReadiness::Ready { .. }
+        ));
+        assert_eq!(held.receipt.as_ref().unwrap(), &parakeet_receipt());
+    }
+
+    #[test]
     fn status_and_sentinel_do_not_wait_for_gate_verification() {
         let _session = test_session();
         let state = tempfile::tempdir().unwrap();
@@ -1588,7 +1883,13 @@ mod tests {
         caller.join().unwrap();
         let status = status.expect("status must reply while verification owns the gate");
         assert_eq!(status.local_readiness, LocalReadiness::Verifying);
-        assert_eq!(status.local_path_clean, Some(false));
+        assert_eq!(status.local_path_clean, Some(true));
+        note_cloud_capability_used();
+        let _held = gate().lock().unwrap();
+        assert!(
+            !sentinel_is_clean(),
+            "contention must also preserve actual taint"
+        );
     }
 
     #[test]

@@ -190,10 +190,7 @@ impl ConsentedObservation {
         install.observation.clone()
     }
 
-    fn capture(
-        layout: &ConsentedLayout,
-        receipt: &ConsentedReceipt,
-    ) -> Result<Self, ConsentedError> {
+    fn capture(layout: &ConsentedLayout) -> Result<Self, ConsentedError> {
         let root = &layout.root;
         let models = root
             .parent()
@@ -201,13 +198,6 @@ impl ConsentedObservation {
             .and_then(Path::parent)
             .ok_or(ConsentedError::Receipt)?;
         let mut paths = vec![models.join("private/consented.receipt.json"), root.clone()];
-        paths.extend(receipt.files.keys().map(|name| root.join(name)));
-        paths.extend(
-            receipt
-                .runtime_manifest
-                .keys()
-                .map(|name| root.join("runtime").join(name)),
-        );
         // Ancestors detect replaced directories and entries added or removed.
         paths.extend(paths.clone().into_iter().flat_map(|path| {
             path.ancestors()
@@ -218,7 +208,7 @@ impl ConsentedObservation {
         }));
         paths.sort();
         paths.dedup();
-        let files = paths
+        let mut files: Vec<_> = paths
             .into_iter()
             .map(|path| {
                 let identity = match file_identity(&path) {
@@ -229,7 +219,32 @@ impl ConsentedObservation {
                 Ok((path, identity))
             })
             .collect::<Result<_, std::io::Error>>()?;
-        Ok(Self { files })
+        // The security audit includes unmanifested nodes (e.g. Python caches).
+        // Record directories before enumeration so a concurrent addition or
+        // removal invalidates the observation. Never recurse through links.
+        fn observe_children(
+            path: &Path,
+            files: &mut Vec<(PathBuf, Option<FileIdentity>)>,
+        ) -> std::io::Result<()> {
+            for child in fs::read_dir(path)? {
+                let path = child?.path();
+                let identity = file_identity(&path)?;
+                let is_dir = identity.mode & libc::S_IFMT == libc::S_IFDIR;
+                files.push((path.clone(), Some(identity)));
+                if is_dir {
+                    observe_children(&path, files)?;
+                }
+            }
+            Ok(())
+        }
+        observe_children(root, &mut files)?;
+        let observation = Self { files };
+        if !observation.unchanged() {
+            return Err(ConsentedError::Tree(
+                "installation changed during observation".into(),
+            ));
+        }
+        Ok(observation)
     }
 
     pub(crate) fn unchanged(&self) -> bool {
@@ -244,24 +259,22 @@ impl ConsentedObservation {
 
 /// Failure observation carries no verification authority. Retry only when the
 /// failed tree changes, or when an explicit capture asks for admission again.
+/// Decline caching when preflight cannot observe the complete expected tree:
+/// a restored install must be retried even if its receipt never changes.
 pub(crate) fn observe_with_entry(
     store: &ModelStore,
     entry: &ConsentedCatalogEntry,
-) -> ConsentedObservation {
-    let observed = load_receipt(store).and_then(|receipt| {
-        let layout = validate_receipt(store, entry, &receipt)?;
-        ConsentedObservation::capture(&layout, &receipt)
-    });
-    observed.unwrap_or_else(|_| ConsentedObservation {
-        files: vec![(
-            receipt_path(store),
-            file_identity(&receipt_path(store)).ok(),
-        )],
-    })
+) -> Option<ConsentedObservation> {
+    load_receipt(store)
+        .and_then(|receipt| {
+            let layout = validate_receipt(store, entry, &receipt)?;
+            ConsentedObservation::capture(&layout)
+        })
+        .ok()
 }
 
 #[cfg(not(test))]
-pub(crate) fn observe_consented_install(store: &ModelStore) -> ConsentedObservation {
+pub(crate) fn observe_consented_install(store: &ModelStore) -> Option<ConsentedObservation> {
     observe_with_entry(store, &CONSENTED_ENTRY)
 }
 
@@ -516,7 +529,7 @@ fn verify_with_entry_mode(
     let receipt = load_receipt(store)?;
     let layout = validate_receipt(store, entry, &receipt)?;
     let lease = consented_install_lease(&layout)?;
-    let observation = ConsentedObservation::capture(&layout, &receipt)?;
+    let observation = ConsentedObservation::capture(&layout)?;
     on_verifying();
     if full {
         verify_layout_full(&layout, &receipt)?;
@@ -2167,9 +2180,13 @@ pub(crate) mod install_tests {
         let cache = root.join("runtime/venv/lib/python3.11/site-packages/fixture/__pycache__");
         fs::create_dir(&cache).unwrap();
         fs::write(cache.join("fixture.pyc"), b"cache").unwrap();
-        assert!(verify_with_entry(&store, &entry()).is_ok());
+        let install = verify_with_entry(&store, &entry()).unwrap();
+        let observation = ConsentedObservation::after_verification(&install);
+        drop(install);
+        assert!(observation.unchanged());
         assert!(verify_with_entry_mode(&store, &entry(), true, || {}).is_err());
         fs::set_permissions(cache.join("fixture.pyc"), fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(!observation.unchanged());
         assert!(verify_with_entry(&store, &entry()).is_err());
     }
     #[test]
