@@ -1,6 +1,7 @@
 //! Bounded NVIDIA discovery and the existing host topology measurements.
 
 use std::io::{self, Read};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -68,6 +69,7 @@ impl CommandRunner for SystemCommandRunner {
             .ok_or_else(|| RunError::Other("Invalid command timeout".into()))?;
         let mut child = Command::new(program)
             .args(args)
+            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -79,6 +81,7 @@ impl CommandRunner for SystemCommandRunner {
                     io_error(error)
                 }
             })?;
+        let pgid = child.id() as libc::pid_t;
         let result = (|| {
             let stdout = child
                 .stdout
@@ -111,6 +114,12 @@ impl CommandRunner for SystemCommandRunner {
         })();
         if result.is_err() {
             let _ = child.kill();
+            // SAFETY: pgid is our own child's group (spawned with process_group(0)),
+            // so the signal cannot reach daemon siblings. Kill descendants even
+            // when the direct child exited but inherited pipes missed the deadline.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
             let _ = child.wait();
         }
         result
@@ -161,6 +170,16 @@ fn receive_pipe(
 
 #[must_use]
 pub fn probe_hardware(runner: &dyn CommandRunner) -> HostHardware {
+    probe_hardware_with(runner, &|| {
+        std::path::Path::new("/proc/driver/nvidia/version").exists()
+    })
+}
+
+#[must_use]
+pub fn probe_hardware_with(
+    runner: &dyn CommandRunner,
+    nvidia_driver_present: &dyn Fn() -> bool,
+) -> HostHardware {
     let gpu = match runner.run(
         "nvidia-smi",
         &[
@@ -169,6 +188,9 @@ pub fn probe_hardware(runner: &dyn CommandRunner) -> HostHardware {
         ],
         Duration::from_secs(3),
     ) {
+        Err(RunError::NotFound) if nvidia_driver_present() => {
+            GpuProbe::Failed("NVIDIA driver is loaded but nvidia-smi was not found".into())
+        }
         Err(RunError::NotFound) => GpuProbe::NoneFound,
         Err(RunError::Timeout) => GpuProbe::Failed("NVIDIA GPU probe timed out after 3 s".into()),
         Err(RunError::Other(reason)) => {
@@ -264,7 +286,10 @@ mod tests {
     #[test]
     fn probe_distinguishes_absent_failed_and_detected_nvidia_gpus() {
         for result in [Err(RunError::NotFound), output(true, " \n", "")] {
-            assert_eq!(probe_hardware(&FakeRunner(result)).gpu, GpuProbe::NoneFound);
+            assert_eq!(
+                probe_hardware_with(&FakeRunner(result), &|| false).gpu,
+                GpuProbe::NoneFound
+            );
         }
         for result in [
             Err(RunError::Timeout),
@@ -289,6 +314,22 @@ mod tests {
             }])
         );
         assert!(hw.cpu_cores > 0);
+    }
+
+    #[test]
+    fn missing_nvidia_smi_with_loaded_driver_is_a_probe_failure() {
+        assert_eq!(
+            probe_hardware_with(&FakeRunner(Err(RunError::NotFound)), &|| true).gpu,
+            GpuProbe::Failed("NVIDIA driver is loaded but nvidia-smi was not found".into())
+        );
+    }
+
+    #[test]
+    fn missing_nvidia_smi_without_loaded_driver_means_no_gpu_found() {
+        assert_eq!(
+            probe_hardware_with(&FakeRunner(Err(RunError::NotFound)), &|| false).gpu,
+            GpuProbe::NoneFound
+        );
     }
 
     #[test]
@@ -366,5 +407,52 @@ mod tests {
         assert!(output.status_success);
         assert_eq!(output.stdout.len(), 65536);
         assert_eq!(output.stderr.len(), 65536);
+    }
+
+    #[test]
+    fn system_runner_kills_descendants_holding_pipes_after_child_exits() {
+        let pid_file = tempfile::NamedTempFile::new().expect("background PID file");
+        let started = Instant::now();
+        let result = SystemCommandRunner.run(
+            "sh",
+            &[
+                "-c",
+                "sleep 30 & echo $! > \"$1\"; exit 0",
+                "voisu-test",
+                pid_file.path().to_str().expect("PID file path"),
+            ],
+            Duration::from_millis(300),
+        );
+        assert_eq!(result, Err(RunError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let pid: u32 = std::fs::read_to_string(pid_file.path())
+            .expect("recorded background PID")
+            .trim()
+            .parse()
+            .expect("background PID");
+        let process_stat = format!("/proc/{pid}/stat");
+        let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            // An orphan can remain a zombie until init reaps it; it no longer holds pipes.
+            match std::fs::read_to_string(&process_stat) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                Ok(stat)
+                    if stat
+                        .rsplit_once(") ")
+                        .is_some_and(|(_, rest)| rest.starts_with('Z')) =>
+                {
+                    break;
+                }
+                _ if Instant::now() < cleanup_deadline => thread::sleep(Duration::from_millis(10)),
+                _ => {
+                    // Also clean up when this regression test runs against the unfixed runner.
+                    let _ = Command::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .status();
+                    panic!("background sleep {pid} survived command timeout");
+                }
+            }
+        }
     }
 }
