@@ -29,8 +29,9 @@ pub use catalog::{
 };
 pub use consented::{
     ConsentedConsent, ConsentedError, ConsentedFilePin, ConsentedHealth, ConsentedInstallRequest,
-    ConsentedLayout, ConsentedReceipt, VerifiedConsentedInstall, install_consented_install,
-    remove_consented_install, verify_consented_install,
+    ConsentedLayout, ConsentedReceipt, ConsentedRuntimeEntry, VerifiedConsentedInstall,
+    install_consented_install, remove_consented_install, verify_consented_install,
+    verify_consented_install_full,
 };
 pub use consented_catalog::{
     CONSENT_TEXT, CONSENTED_ENTRY, ConsentedCatalogEntry, DownloadPin,

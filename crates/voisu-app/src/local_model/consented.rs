@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -68,6 +68,15 @@ pub struct ConsentedFilePin {
     pub sha256: String,
     pub bytes: u64,
 }
+/// Paths are relative to runtime/. Directory sizes are not portable invariants.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "type", rename_all = "snake_case")]
+pub enum ConsentedRuntimeEntry {
+    Directory,
+    File { bytes: u64, sha256: String },
+    Symlink { target: PathBuf },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsentedReceipt {
@@ -79,6 +88,9 @@ pub struct ConsentedReceipt {
     pub consent_text_sha256: String,
     pub files: BTreeMap<String, ConsentedFilePin>,
     pub runtime_inputs: BTreeMap<String, ConsentedFilePin>,
+    // Omit an empty manifest so v1 receipts remain readable for explicit removal.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub runtime_manifest: BTreeMap<String, ConsentedRuntimeEntry>,
     pub python_path: PathBuf,
     pub venv_path: PathBuf,
     pub device: String,
@@ -155,6 +167,14 @@ fn install_with_entry(
     request: ConsentedInstallRequest<'_>,
     entry: &ConsentedCatalogEntry,
 ) -> Result<ConsentedReceipt, ConsentedError> {
+    install_with_receipt_sync(request, entry, sync_dir)
+}
+
+fn install_with_receipt_sync(
+    request: ConsentedInstallRequest<'_>,
+    entry: &ConsentedCatalogEntry,
+    receipt_sync: impl Fn(&Path) -> std::io::Result<()>,
+) -> Result<ConsentedReceipt, ConsentedError> {
     if !entry.consent_installable
         || request.consent.text.as_bytes() != entry.consent_text.as_bytes()
         || request.consent.license_spdx != entry.license_spdx
@@ -173,6 +193,7 @@ fn install_with_entry(
         .store
         .lock_exclusive()
         .map_err(ConsentedError::Store)?;
+    resume_removal(request.store, entry, || Ok(()))?;
     abort(&request, InstallAbort::AfterLock)?;
     let required = 2 * (entry.total_download_bytes + entry.estimated_extracted_runtime_bytes);
     if request
@@ -233,11 +254,18 @@ fn install_with_entry(
     audit_runtime_tree(&staging.root)?;
     executable(&staging.venv_python())?;
     let mut receipt = make_receipt(entry, request.consent.clone(), &published);
+    receipt.runtime_manifest = runtime_manifest(&staging.root.join("runtime"))?;
     receipt.receipt_hash = receipt_hash(&receipt)?;
     verify_files(&staging, &receipt)?;
     let existed = match fs::symlink_metadata(&published.root) {
         Ok(_) => {
-            verify_layout(&published, &receipt)?;
+            // Rebuilds produce different .pyc bytes (staging paths/timestamps).
+            // Reuse only a previously receipted tree, checked against its own manifest.
+            let prior = load_receipt(request.store)?;
+            validate_receipt(request.store, entry, &prior)?;
+            verify_layout(&published, &prior)?;
+            receipt.runtime_manifest = prior.runtime_manifest;
+            receipt.receipt_hash = receipt_hash(&receipt)?;
             true
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -250,27 +278,34 @@ fn install_with_entry(
         super::safe_fs::durable_rename(&staging.root, &published.root)
             .map_err(ConsentedError::Fs)?;
     }
+    // Once receipt replacement is attempted, rollback must be durable before
+    // this tree may be deleted. An uncertain rollback retains both trees.
+    let mut may_reference_new = false;
     let result = (|| {
         abort(&request, InstallAbort::AfterPublish)?;
-        verify_layout(&published, &receipt)?;
+        verify_layout_full(&published, &receipt)?;
         request.health.check(&published)?;
         verify_layout(&published, &receipt)?;
         check_deadline(&request.clock)?;
         abort(&request, InstallAbort::AfterHealth)?;
-        store_receipt(request.store, &receipt)?;
+        store_receipt_with_sync(
+            request.store,
+            &receipt,
+            &mut may_reference_new,
+            receipt_sync,
+        )?;
         Ok(receipt)
     })();
-    if result.is_err() && !existed {
+    if result.is_err() && !existed && !may_reference_new {
         fs::remove_dir_all(&published.root)?;
         File::open(published.root.parent().expect("parent"))?.sync_all()?;
     }
     result
 }
 
-/// Full hash for model/fixture/embedded worker, tree audit for the offline runtime.
-/// Runtime inputs were hashed before execution; auditing owner/modes/links avoids
-/// reading gigabytes of CUDA libraries on every admission. This does not defend
-/// against a malicious process with the same uid (which can also replace Voisu).
+/// Per-launch admission hashes model/fixture/worker and checks runtime metadata.
+/// It does not detect same-size runtime edits; use the full verifier for that.
+/// Neither receipt hash nor filesystem audit defends against a malicious same uid.
 pub fn verify_consented_install(
     store: &ModelStore,
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
@@ -280,12 +315,33 @@ fn verify_with_entry(
     store: &ModelStore,
     entry: &ConsentedCatalogEntry,
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
+    verify_with_entry_mode(store, entry, false)
+}
+
+/// Re-hash every runtime file and reject all unmanifested runtime entries.
+/// Uses the same lease and lock contract as per-launch admission.
+pub fn verify_consented_install_full(
+    store: &ModelStore,
+) -> Result<VerifiedConsentedInstall, ConsentedError> {
+    verify_with_entry_mode(store, &CONSENTED_ENTRY, true)
+}
+
+fn verify_with_entry_mode(
+    store: &ModelStore,
+    entry: &ConsentedCatalogEntry,
+    full: bool,
+) -> Result<VerifiedConsentedInstall, ConsentedError> {
     let _lock = store.lock_exclusive().map_err(ConsentedError::Store)?;
+    resume_removal(store, entry, || Ok(()))?;
     let receipt = load_receipt(store)?;
     let layout = validate_receipt(store, entry, &receipt)?;
     let lease = lease_file(store, &receipt.content_hash)?;
     flock(&lease, libc::LOCK_SH)?;
-    verify_layout(&layout, &receipt)?;
+    if full {
+        verify_layout_full(&layout, &receipt)?;
+    } else {
+        verify_layout(&layout, &receipt)?;
+    }
     Ok(VerifiedConsentedInstall {
         layout,
         receipt,
@@ -300,33 +356,82 @@ fn remove_with_entry(
     store: &ModelStore,
     entry: &ConsentedCatalogEntry,
 ) -> Result<(), ConsentedError> {
+    remove_with_delete_hook(store, entry, || Ok(()))
+}
+fn remove_with_delete_hook(
+    store: &ModelStore,
+    entry: &ConsentedCatalogEntry,
+    after_receipt_delete: impl FnOnce() -> Result<(), ConsentedError>,
+) -> Result<(), ConsentedError> {
     let _lock = store.lock_exclusive().map_err(ConsentedError::Store)?;
+    resume_removal(store, entry, || Ok(()))?;
     let receipt = match load_receipt(store) {
         Err(ConsentedError::Missing) => return Ok(()),
         other => other?,
     };
-    // Removal needs a safe target, not current admission: an older embedded
-    // worker or a partially deleted runtime must remain uninstallable.
+    validate_removal_target(entry, &receipt)?;
+    let lease = lease_file(store, &receipt.content_hash)?;
+    flock(&lease, libc::LOCK_EX)?;
+    // Journal the exact target durably before withdrawing its receipt.
+    write_record(
+        store,
+        "consented.removal.json",
+        &serde_json::to_vec(&receipt).map_err(|_| ConsentedError::Receipt)?,
+    )?;
+    drop(lease);
+    resume_removal(store, entry, after_receipt_delete)
+}
+
+fn validate_removal_target(
+    entry: &ConsentedCatalogEntry,
+    receipt: &ConsentedReceipt,
+) -> Result<(), ConsentedError> {
+    // Old pins and partially removed runtimes must remain uninstallable.
     if receipt.entry_id != entry.id
         || receipt.content_hash.len() != 64
         || !receipt
             .content_hash
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || receipt.receipt_hash != receipt_hash(&receipt)?
+        || receipt.receipt_hash != receipt_hash(receipt)?
     {
         return Err(ConsentedError::Receipt);
     }
-    let root = install_root(store, entry.id, &receipt.content_hash);
-    let present = super::safe_fs::dir_present(&root).map_err(ConsentedError::Fs)?;
+    Ok(())
+}
+
+// Caller holds the store lock. A lease blocks both initial and resumed removal.
+fn resume_removal(
+    store: &ModelStore,
+    entry: &ConsentedCatalogEntry,
+    after_receipt_delete: impl FnOnce() -> Result<(), ConsentedError>,
+) -> Result<(), ConsentedError> {
+    let bytes = match read_record(store, "consented.removal.json") {
+        Err(ConsentedError::Missing) => return Ok(()),
+        other => other?,
+    };
+    let receipt: ConsentedReceipt =
+        serde_json::from_slice(&bytes).map_err(|_| ConsentedError::Receipt)?;
+    validate_removal_target(entry, &receipt)?;
     let lease = lease_file(store, &receipt.content_hash)?;
     flock(&lease, libc::LOCK_EX)?;
-    fs::remove_file(receipt_path(store))?;
-    File::open(store.root().join("private"))?.sync_all()?;
-    if present {
-        fs::remove_dir_all(&root)?;
-        File::open(root.parent().expect("parent"))?.sync_all()?;
+    match load_receipt(store) {
+        Ok(active) if active == receipt => fs::remove_file(receipt_path(store))?,
+        Err(ConsentedError::Missing) => {}
+        Ok(_) => return Err(ConsentedError::Receipt),
+        Err(error) => return Err(error),
     }
+    sync_dir(&store.root().join("private"))?;
+    after_receipt_delete()?;
+    let root = install_root(store, entry.id, &receipt.content_hash);
+    if super::safe_fs::dir_present(&root).map_err(ConsentedError::Fs)? {
+        fs::remove_dir_all(&root)?;
+    }
+    if super::safe_fs::dir_present(root.parent().expect("parent")).map_err(ConsentedError::Fs)? {
+        sync_dir(root.parent().expect("parent"))?;
+    }
+    fs::remove_file(store.root().join("private/consented.removal.json"))?;
+    sync_dir(&store.root().join("private"))?;
     Ok(())
 }
 
@@ -389,7 +494,7 @@ fn make_receipt(
         runtime_inputs.insert(item.name.into(), pin(item));
     }
     ConsentedReceipt {
-        version: 1,
+        version: 2,
         entry_id: entry.id.into(),
         revision: entry.revision.into(),
         content_hash: content_hash(entry),
@@ -397,6 +502,7 @@ fn make_receipt(
         consent,
         files,
         runtime_inputs,
+        runtime_manifest: BTreeMap::new(),
         python_path: layout.python.join("bin/python3"),
         venv_path: layout.venv_python(),
         device: "cuda:0".into(),
@@ -406,7 +512,7 @@ fn make_receipt(
 }
 fn content_hash(entry: &ConsentedCatalogEntry) -> String {
     let mut bytes = format!(
-        "consented-builder-v1\n{}\n{}\ncuda:0\nint8_float16\n",
+        "consented-builder-v2\n{}\n{}\ncuda:0\nint8_float16\n",
         entry.id, entry.revision
     );
     for item in entry
@@ -443,6 +549,8 @@ fn validate_receipt(
     }
     let layout = ConsentedLayout::at(install_root(store, entry.id, &content_hash(entry)));
     let mut expected = make_receipt(entry, receipt.consent.clone(), &layout);
+    validate_runtime_manifest(&receipt.runtime_manifest)?;
+    expected.runtime_manifest = receipt.runtime_manifest.clone();
     expected.receipt_hash = receipt_hash(&expected)?;
     if *receipt != expected {
         return Err(ConsentedError::Receipt);
@@ -455,32 +563,86 @@ fn validate_receipt(
     }
     Ok(layout)
 }
-fn load_receipt(store: &ModelStore) -> Result<ConsentedReceipt, ConsentedError> {
-    let bytes = super::safe_fs::read_existing_file(
-        &store.root().join("private"),
-        "consented.receipt.json",
-        128 * 1024,
-    )
-    .map_err(|error| {
-        if error == SafeFsError::NotFound {
-            ConsentedError::Missing
-        } else {
-            ConsentedError::Fs(error)
-        }
-    })?;
-    serde_json::from_slice(&bytes).map_err(|_| ConsentedError::Receipt)
+const MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
+
+fn read_record(store: &ModelStore, name: &str) -> Result<Vec<u8>, ConsentedError> {
+    // Tens of thousands of Python/CUDA files need more than the old 128 KiB cap.
+    super::safe_fs::read_existing_file(&store.root().join("private"), name, MAX_RECORD_BYTES)
+        .map_err(|error| {
+            if error == SafeFsError::NotFound {
+                ConsentedError::Missing
+            } else {
+                ConsentedError::Fs(error)
+            }
+        })
 }
-fn store_receipt(store: &ModelStore, receipt: &ConsentedReceipt) -> Result<(), ConsentedError> {
-    let parent = store.root().join("private");
+fn load_receipt(store: &ModelStore) -> Result<ConsentedReceipt, ConsentedError> {
+    serde_json::from_slice(&read_record(store, "consented.receipt.json")?)
+        .map_err(|_| ConsentedError::Receipt)
+}
+fn sync_dir(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+fn stage_record(
+    store: &ModelStore,
+    bytes: &[u8],
+) -> Result<tempfile::NamedTempFile, ConsentedError> {
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(ConsentedError::Receipt);
+    }
     let mut staged = tempfile::Builder::new()
-        .prefix(".consented-receipt-")
-        .tempfile_in(&parent)?;
-    staged.write_all(&serde_json::to_vec_pretty(receipt).map_err(|_| ConsentedError::Receipt)?)?;
+        .prefix(".consented-record-")
+        .tempfile_in(store.root().join("private"))?;
+    staged.write_all(bytes)?;
     staged.as_file().sync_all()?;
+    Ok(staged)
+}
+fn write_record(store: &ModelStore, name: &str, bytes: &[u8]) -> Result<(), ConsentedError> {
+    stage_record(store, bytes)?
+        .persist(store.root().join("private").join(name))
+        .map_err(|error| ConsentedError::Io(error.error))?;
+    sync_dir(&store.root().join("private"))?;
+    Ok(())
+}
+#[cfg(test)]
+fn store_receipt(store: &ModelStore, receipt: &ConsentedReceipt) -> Result<(), ConsentedError> {
+    store_receipt_with_sync(store, receipt, &mut false, sync_dir)
+}
+fn store_receipt_with_sync(
+    store: &ModelStore,
+    receipt: &ConsentedReceipt,
+    may_reference_new: &mut bool,
+    sync: impl Fn(&Path) -> std::io::Result<()>,
+) -> Result<(), ConsentedError> {
+    let parent = store.root().join("private");
+    let prior = match read_record(store, "consented.receipt.json") {
+        Ok(bytes) => Some(stage_record(store, &bytes)?),
+        Err(ConsentedError::Missing) => None,
+        Err(error) => return Err(error),
+    };
+    let staged = stage_record(
+        store,
+        &serde_json::to_vec_pretty(receipt).map_err(|_| ConsentedError::Receipt)?,
+    )?;
     staged
         .persist(receipt_path(store))
         .map_err(|error| ConsentedError::Io(error.error))?;
-    File::open(parent)?.sync_all()?;
+    *may_reference_new = true;
+    if let Err(error) = sync(&parent) {
+        // Restore the old receipt, but retain the new tree if either rollback
+        // rename/unlink or rollback fsync fails: disk may still reference it.
+        let restored = match prior {
+            Some(prior) => prior
+                .persist(receipt_path(store))
+                .map(|_| ())
+                .map_err(|error| error.error),
+            None => fs::remove_file(receipt_path(store)),
+        };
+        if restored.is_ok() && sync(&parent).is_ok() {
+            *may_reference_new = false;
+        }
+        return Err(error.into());
+    }
     Ok(())
 }
 fn verify_layout(
@@ -493,7 +655,171 @@ fn verify_layout(
         return Err(ConsentedError::Tree("missing runtime directory".into()));
     }
     executable(&layout.venv_python())?;
+    verify_runtime_manifest(layout, &receipt.runtime_manifest)?;
     verify_files(layout, receipt)
+}
+fn verify_layout_full(
+    layout: &ConsentedLayout,
+    receipt: &ConsentedReceipt,
+) -> Result<(), ConsentedError> {
+    verify_layout(layout, receipt)?;
+    if runtime_manifest(&layout.root.join("runtime"))? != receipt.runtime_manifest {
+        return Err(ConsentedError::Tree(
+            "runtime manifest digest or entry mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+fn runtime_manifest(
+    root: &Path,
+) -> Result<BTreeMap<String, ConsentedRuntimeEntry>, ConsentedError> {
+    fn collect(
+        root: &Path,
+        dir: &Path,
+        manifest: &mut BTreeMap<String, ConsentedRuntimeEntry>,
+    ) -> Result<(), ConsentedError> {
+        for child in fs::read_dir(dir)? {
+            let path = child?.path();
+            let name = path
+                .strip_prefix(root)
+                .expect("runtime child")
+                .to_str()
+                .ok_or_else(|| ConsentedError::Tree("non-UTF-8 runtime path".into()))?
+                .to_owned();
+            let meta = fs::symlink_metadata(&path)?;
+            let entry = if meta.is_dir() {
+                collect(root, &path, manifest)?;
+                ConsentedRuntimeEntry::Directory
+            } else if meta.is_file() {
+                ConsentedRuntimeEntry::File {
+                    bytes: meta.len(),
+                    sha256: hash_runtime_file(&path)?,
+                }
+            } else if meta.file_type().is_symlink() {
+                ConsentedRuntimeEntry::Symlink {
+                    target: fs::read_link(&path)?,
+                }
+            } else {
+                return Err(ConsentedError::Tree(format!(
+                    "special runtime node: {name}"
+                )));
+            };
+            manifest.insert(name, entry);
+        }
+        Ok(())
+    }
+    let mut manifest = BTreeMap::new();
+    collect(root, root, &mut manifest)?;
+    Ok(manifest)
+}
+fn hash_runtime_file(path: &Path) -> Result<String, ConsentedError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut hash = Sha256::new();
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        let len = file.read(&mut buf)?;
+        if len == 0 {
+            break;
+        }
+        hash.update(&buf[..len]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+fn validate_runtime_manifest(
+    manifest: &BTreeMap<String, ConsentedRuntimeEntry>,
+) -> Result<(), ConsentedError> {
+    for required in ["python", "venv", "venv/bin"] {
+        if manifest.get(required) != Some(&ConsentedRuntimeEntry::Directory) {
+            return Err(ConsentedError::Receipt);
+        }
+    }
+    if !matches!(
+        manifest.get("venv/bin/python"),
+        Some(ConsentedRuntimeEntry::File { .. })
+    ) {
+        return Err(ConsentedError::Receipt);
+    }
+    for (name, entry) in manifest {
+        let path = Path::new(name);
+        if name.is_empty()
+            || path
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err(ConsentedError::Receipt);
+        }
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            && manifest.get(parent.to_str().ok_or(ConsentedError::Receipt)?)
+                != Some(&ConsentedRuntimeEntry::Directory)
+        {
+            return Err(ConsentedError::Receipt);
+        }
+        match entry {
+            ConsentedRuntimeEntry::File { sha256, .. }
+                if sha256.len() != 64
+                    || !sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+            {
+                return Err(ConsentedError::Receipt);
+            }
+            ConsentedRuntimeEntry::Symlink { target } if target.is_absolute() => {
+                return Err(ConsentedError::Receipt);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+fn verify_runtime_manifest(
+    layout: &ConsentedLayout,
+    manifest: &BTreeMap<String, ConsentedRuntimeEntry>,
+) -> Result<(), ConsentedError> {
+    validate_runtime_manifest(manifest)?;
+    let runtime = layout.root.join("runtime");
+    for (name, expected) in manifest {
+        let path = runtime.join(name);
+        let meta = fs::symlink_metadata(&path)?;
+        let matches = match expected {
+            ConsentedRuntimeEntry::Directory => meta.is_dir(),
+            ConsentedRuntimeEntry::File { bytes, .. } => meta.is_file() && meta.len() == *bytes,
+            ConsentedRuntimeEntry::Symlink { target } => {
+                meta.file_type().is_symlink() && fs::read_link(&path)? == *target
+            }
+        };
+        if !matches {
+            return Err(ConsentedError::Tree(format!(
+                "runtime metadata mismatch: {name}"
+            )));
+        }
+        // Executable entrypoints and import/metadata roots must have exactly the
+        // recorded children: extras here can change command/import resolution.
+        // Deeper extras (e.g. __pycache__ from health/worker runs) are allowed on
+        // launch, but still audited for ownership/mode/links. Full verification
+        // rejects all extras and hashes every file in the tree.
+        if matches!(expected, ConsentedRuntimeEntry::Directory)
+            && (name == "venv/bin" || path.file_name().is_some_and(|leaf| leaf == "site-packages"))
+        {
+            for child in fs::read_dir(&path)? {
+                let child = child?;
+                let leaf = child.file_name();
+                let leaf = leaf
+                    .to_str()
+                    .ok_or_else(|| ConsentedError::Tree("non-UTF-8 runtime path".into()))?;
+                if !manifest.contains_key(&format!("{name}/{leaf}")) {
+                    return Err(ConsentedError::Tree(format!(
+                        "extra runtime entry: {name}/{leaf}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 fn verify_files(
     layout: &ConsentedLayout,
@@ -745,7 +1071,21 @@ mod install_tests {
                 fs::Permissions::from_mode(0o700),
             )
             .unwrap();
-            fs::create_dir(build.staging.venv.join("lib")).unwrap();
+            fs::create_dir_all(
+                build
+                    .staging
+                    .venv
+                    .join("lib/python3.11/site-packages/fixture"),
+            )
+            .unwrap();
+            fs::write(
+                build
+                    .staging
+                    .venv
+                    .join("lib/python3.11/site-packages/fixture/__init__.py"),
+                b"fixture",
+            )
+            .unwrap();
             symlink("lib", build.staging.venv.join("lib64")).unwrap();
             Ok(())
         }
@@ -753,17 +1093,14 @@ mod install_tests {
     struct FakeHealth {
         fail: bool,
         called: Cell<bool>,
+        expected_root: PathBuf,
     }
     impl ConsentedHealth for FakeHealth {
         fn check(&self, layout: &ConsentedLayout) -> Result<(), ConsentedError> {
             self.called.set(true);
             assert!(layout.root.exists());
             assert!(!layout.root.join("inputs").exists());
-            assert!(
-                !layout
-                    .root
-                    .starts_with(layout.root.parent().unwrap().join("staging"))
-            );
+            assert_eq!(layout.root, self.expected_root);
             if self.fail {
                 Err(ConsentedError::Health("fake CUDA health failure".into()))
             } else {
@@ -771,10 +1108,11 @@ mod install_tests {
             }
         }
     }
-    fn health(fail: bool) -> FakeHealth {
+    fn health(store: &ModelStore, entry: &ConsentedCatalogEntry, fail: bool) -> FakeHealth {
         FakeHealth {
             fail,
             called: Cell::new(false),
+            expected_root: install_root(store, entry.id, &content_hash(entry)),
         }
     }
     fn request<'a>(
@@ -796,7 +1134,12 @@ mod install_tests {
     }
     fn install(store: &ModelStore) -> ConsentedReceipt {
         install_with_entry(
-            request(store, &fetcher(), &FakeBuilder::default(), &health(false)),
+            request(
+                store,
+                &fetcher(),
+                &FakeBuilder::default(),
+                &health(store, &entry(), false),
+            ),
             &entry(),
         )
         .unwrap()
@@ -848,12 +1191,30 @@ mod install_tests {
         }
     }
     #[test]
+    fn consented_removal_reads_manifestless_v1_receipt() {
+        let (_temp, store) = store();
+        let mut receipt = install(&store);
+        let root = install_root(&store, &receipt.entry_id, &receipt.content_hash);
+        receipt.version = 1;
+        receipt.runtime_manifest.clear();
+        receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+        let bytes = serde_json::to_vec(&receipt).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("runtime_manifest"));
+        write_record(&store, "consented.receipt.json", &bytes).unwrap();
+        assert!(matches!(
+            verify_with_entry(&store, &entry()),
+            Err(ConsentedError::Receipt)
+        ));
+        remove_with_entry(&store, &entry()).unwrap();
+        assert!(!root.exists());
+    }
+    #[test]
     fn consented_gate_rejects_wrong_text_spdx_or_noninstallable_before_fetch() {
         let (_temp, store) = store();
         for kind in 0..3 {
             let builder = FakeBuilder::default();
             let fetcher = ScriptedFetcher::default();
-            let health = health(false);
+            let health = health(&store, &entry(), false);
             let mut request = request(&store, &fetcher, &builder, &health);
             let mut entry = entry();
             match kind {
@@ -874,7 +1235,7 @@ mod install_tests {
         let (_temp, store) = store();
         let builder = FakeBuilder::default();
         let fetcher = ScriptedFetcher::default();
-        let health = health(false);
+        let health = health(&store, &entry(), false);
         let mut req = request(&store, &fetcher, &builder, &health);
         req.io.available_bytes = 1;
         assert!(matches!(
@@ -910,7 +1271,7 @@ mod install_tests {
             bodies[bad][0] ^= 1;
             let fetcher = ScriptedFetcher::new(bodies.into_iter().map(ScriptedHop::Body).collect());
             let builder = FakeBuilder::default();
-            let health = health(false);
+            let health = health(&store, &entry(), false);
             assert!(matches!(
                 install_with_entry(request(&store, &fetcher, &builder, &health), &entry()),
                 Err(ConsentedError::Digest(_))
@@ -931,7 +1292,12 @@ mod install_tests {
             let fetcher = ScriptedFetcher::new(vec![hop]);
             assert!(
                 install_with_entry(
-                    request(&store, &fetcher, &FakeBuilder::default(), &health(false)),
+                    request(
+                        &store,
+                        &fetcher,
+                        &FakeBuilder::default(),
+                        &health(&store, &entry(), false)
+                    ),
                     &entry()
                 )
                 .is_err()
@@ -940,7 +1306,7 @@ mod install_tests {
         }
         let fetcher = fetcher();
         let builder = FakeBuilder::default();
-        let health = health(false);
+        let health = health(&store, &entry(), false);
         let mut req = request(&store, &fetcher, &builder, &health);
         req.io.fail_write = Some(libc::ENOSPC);
         assert!(matches!(
@@ -962,7 +1328,12 @@ mod install_tests {
             };
             assert!(
                 install_with_entry(
-                    request(&store, &fetcher(), &builder, &health(!fail_build)),
+                    request(
+                        &store,
+                        &fetcher(),
+                        &builder,
+                        &health(&store, &next, !fail_build)
+                    ),
                     &next
                 )
                 .is_err()
@@ -973,7 +1344,12 @@ mod install_tests {
         }
         assert!(
             install_with_entry(
-                request(&store, &fetcher(), &FakeBuilder::default(), &health(true)),
+                request(
+                    &store,
+                    &fetcher(),
+                    &FakeBuilder::default(),
+                    &health(&store, &entry(), true)
+                ),
                 &entry()
             )
             .is_err()
@@ -995,7 +1371,7 @@ mod install_tests {
         ] {
             let fetcher = fetcher();
             let builder = FakeBuilder::default();
-            let health = health(false);
+            let health = health(&store, &next, false);
             let mut req = request(&store, &fetcher, &builder, &health);
             req.io.abort = Some(point);
             assert!(matches!(
@@ -1011,7 +1387,7 @@ mod install_tests {
         let (_temp, store) = store();
         let fetcher = ScriptedFetcher::default();
         let builder = FakeBuilder::default();
-        let health = health(false);
+        let health = health(&store, &entry(), false);
         let req = request(&store, &fetcher, &builder, &health);
         req.clock.advance(Duration::from_secs(1801));
         assert!(matches!(
@@ -1074,6 +1450,238 @@ mod install_tests {
         fs::remove_file(&python).unwrap();
         symlink("../../python/bin/python3", &python).unwrap();
         assert!(verify_with_entry(&store, &entry()).is_err());
+    }
+    #[test]
+    fn consented_receipt_fsync_failure_restores_prior_or_retains_both_trees() {
+        for rollback_fails in [false, true] {
+            let (_temp, store) = store();
+            let prior = install(&store);
+            let prior_root = install_root(&store, prior.entry_id.as_str(), &prior.content_hash);
+            let mut next = entry();
+            next.revision = "2";
+            let new_root = install_root(&store, next.id, &content_hash(&next));
+            let calls = Cell::new(0);
+            let result = install_with_receipt_sync(
+                request(
+                    &store,
+                    &fetcher(),
+                    &FakeBuilder::default(),
+                    &health(&store, &next, false),
+                ),
+                &next,
+                |parent| {
+                    let call = calls.get();
+                    calls.set(call + 1);
+                    if call == 0 {
+                        // Injection occurs after the real replacement: this is
+                        // the new receipt and exact final publication path.
+                        let active = load_receipt(&store).unwrap();
+                        assert_eq!(active.revision, "2");
+                        assert_eq!(
+                            install_root(&store, &active.entry_id, &active.content_hash),
+                            new_root
+                        );
+                        assert!(new_root.exists());
+                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                    }
+                    if rollback_fails {
+                        Err(std::io::Error::from_raw_os_error(libc::EIO))
+                    } else {
+                        sync_dir(parent)
+                    }
+                },
+            );
+            assert!(
+                matches!(result, Err(ConsentedError::Io(error)) if error.raw_os_error() == Some(libc::EIO))
+            );
+            assert_eq!(calls.get(), 2);
+            assert_eq!(load_receipt(&store).unwrap(), prior);
+            assert!(prior_root.exists());
+            // With uncertain rollback fsync, either namespace version could
+            // survive power loss, so both possible receipt targets stay alive.
+            assert_eq!(new_root.exists(), rollback_fails);
+            assert!(verify_with_entry(&store, &entry()).is_ok());
+        }
+    }
+    #[test]
+    fn consented_runtime_manifest_detects_truncation_deletion_links_and_extras() {
+        for mutation in 0..5 {
+            let (_temp, store) = store();
+            let receipt = install(&store);
+            let root = install_root(&store, &receipt.entry_id, &receipt.content_hash);
+            let runtime = root.join("runtime");
+            match mutation {
+                0 => fs::write(runtime.join("venv/bin/python"), b"short").unwrap(),
+                1 => fs::remove_dir_all(runtime.join("venv/lib/python3.11/site-packages/fixture"))
+                    .unwrap(),
+                2 => {
+                    fs::remove_file(runtime.join("venv/lib64")).unwrap();
+                    symlink("../python", runtime.join("venv/lib64")).unwrap();
+                }
+                3 => fs::write(runtime.join("venv/bin/unexpected"), b"extra").unwrap(),
+                _ => fs::write(
+                    runtime.join("venv/lib/python3.11/site-packages/extra.pth"),
+                    b"extra",
+                )
+                .unwrap(),
+            }
+            assert!(
+                verify_with_entry(&store, &entry()).is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
+    #[test]
+    fn consented_full_verifier_detects_same_size_runtime_edits() {
+        let (_temp, store) = store();
+        let receipt = install(&store);
+        let root = install_root(&store, &receipt.entry_id, &receipt.content_hash);
+        let path = root.join("runtime/venv/lib/python3.11/site-packages/fixture/__init__.py");
+        fs::write(&path, b"changed").unwrap(); // same length as "fixture"
+        assert!(verify_with_entry(&store, &entry()).is_ok());
+        assert!(verify_with_entry_mode(&store, &entry(), true).is_err());
+    }
+    #[test]
+    fn consented_launch_allows_audited_deep_cache_full_verifier_rejects_extras() {
+        let (_temp, store) = store();
+        let receipt = install(&store);
+        let root = install_root(&store, &receipt.entry_id, &receipt.content_hash);
+        let cache = root.join("runtime/venv/lib/python3.11/site-packages/fixture/__pycache__");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("fixture.pyc"), b"cache").unwrap();
+        assert!(verify_with_entry(&store, &entry()).is_ok());
+        assert!(verify_with_entry_mode(&store, &entry(), true).is_err());
+        fs::set_permissions(cache.join("fixture.pyc"), fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(verify_with_entry(&store, &entry()).is_err());
+    }
+    #[test]
+    fn consented_runtime_manifest_is_covered_by_receipt_hash() {
+        let (_temp, store) = store();
+        let mut receipt = install(&store);
+        receipt.runtime_manifest.remove("venv/lib64");
+        // Leave the hash intact; metadata-only admission must reject this.
+        write_record(
+            &store,
+            "consented.receipt.json",
+            &serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_with_entry(&store, &entry()),
+            Err(ConsentedError::Receipt)
+        ));
+    }
+    #[test]
+    fn consented_tombstone_resumes_after_receipt_deletion_on_all_entrypoints() {
+        for retry in 0..3 {
+            let (_temp, store) = store();
+            let receipt = install(&store);
+            let root = install_root(&store, &receipt.entry_id, &receipt.content_hash);
+            assert!(matches!(
+                remove_with_delete_hook(&store, &entry(), || Err(ConsentedError::Aborted)),
+                Err(ConsentedError::Aborted)
+            ));
+            assert!(!receipt_path(&store).exists());
+            assert!(root.exists());
+            assert!(store.root().join("private/consented.removal.json").exists());
+            let lease = lease_file(&store, &receipt.content_hash).unwrap();
+            flock(&lease, libc::LOCK_SH).unwrap();
+            assert!(matches!(
+                remove_with_entry(&store, &entry()),
+                Err(ConsentedError::Leased)
+            ));
+            assert!(root.exists());
+            drop(lease);
+            match retry {
+                0 => remove_with_entry(&store, &entry()).unwrap(),
+                1 => assert!(matches!(
+                    verify_with_entry(&store, &entry()),
+                    Err(ConsentedError::Missing)
+                )),
+                _ => {
+                    let mut next = entry();
+                    next.revision = "2";
+                    install_with_entry(
+                        request(
+                            &store,
+                            &fetcher(),
+                            &FakeBuilder::default(),
+                            &health(&store, &next, false),
+                        ),
+                        &next,
+                    )
+                    .unwrap();
+                }
+            }
+            assert!(!root.exists());
+            assert!(!store.root().join("private/consented.removal.json").exists());
+        }
+    }
+    #[test]
+    fn consented_real_venv_runs_after_install_publication() {
+        use super::super::consented_runtime::{
+            SystemConsentedCommandRunner, prepared_run, relocate_venv,
+        };
+        use std::process::Command;
+        match Command::new("python3")
+            .args(["-I", "-c", "import venv"])
+            .output()
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "SKIP consented_real_venv_runs_after_install_publication: no host python3"
+                );
+                return;
+            }
+            result => assert!(
+                result.unwrap().status.success(),
+                "host python3 cannot import venv"
+            ),
+        }
+        struct HostVenv;
+        impl ConsentedRuntimeBuilder for HostVenv {
+            fn build(&self, build: &RuntimeBuild<'_>) -> Result<(), ConsentedError> {
+                FakeBuilder::default().build(build)?;
+                fs::remove_dir_all(&build.staging.venv)?;
+                prepared_run(
+                    &SystemConsentedCommandRunner,
+                    Command::new("python3")
+                        .args(["-I", "-m", "venv", "--copies", "--without-pip"])
+                        .arg(&build.staging.venv),
+                    &build.staging.root,
+                    build.clock,
+                )?;
+                relocate_venv(build)
+            }
+        }
+        struct PrefixHealth {
+            expected: PathBuf,
+        }
+        impl ConsentedHealth for PrefixHealth {
+            fn check(&self, layout: &ConsentedLayout) -> Result<(), ConsentedError> {
+                assert_eq!(layout.root, self.expected);
+                assert!(!layout.root.join("inputs").exists());
+                let output = Command::new(layout.venv_python())
+                    .env_clear()
+                    .args(["-I", "-c", "import sys; print(sys.prefix)"])
+                    .output()?;
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    String::from_utf8(output.stdout).unwrap().trim(),
+                    layout.venv.to_str().unwrap()
+                );
+                Ok(())
+            }
+        }
+        let (_temp, store) = store();
+        let expected = install_root(&store, entry().id, &content_hash(&entry()));
+        let health = PrefixHealth { expected };
+        install_with_entry(request(&store, &fetcher(), &HostVenv, &health), &entry()).unwrap();
+        assert!(verify_with_entry(&store, &entry()).is_ok());
     }
     #[test]
     fn consented_catalog_pins_are_complete_and_group_scoped() {

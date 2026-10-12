@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use super::consented::{ConsentedError, ConsentedLayout, check_deadline};
 use super::consented_catalog::ConsentedCatalogEntry;
-use super::{INSTALL_DEADLINE, InstallClock, NO_PROGRESS};
+use super::{INSTALL_DEADLINE, InstallClock};
 
 pub struct RuntimeBuild<'a> {
     pub staging: &'a ConsentedLayout,
@@ -144,7 +144,7 @@ impl OfflineRuntimeBuilder {
 
 // venv records absolute paths even with --copies. Rewrite pyvenv.cfg and text
 // entrypoints before atomic rename, so the runtime never depends on staging.
-fn relocate_venv(build: &RuntimeBuild<'_>) -> Result<(), ConsentedError> {
+pub(super) fn relocate_venv(build: &RuntimeBuild<'_>) -> Result<(), ConsentedError> {
     let old = build
         .staging
         .root
@@ -173,7 +173,7 @@ fn relocate_venv(build: &RuntimeBuild<'_>) -> Result<(), ConsentedError> {
     Ok(())
 }
 
-fn prepared_run(
+pub(super) fn prepared_run(
     runner: &dyn ConsentedCommandRunner,
     command: &mut Command,
     staging: &Path,
@@ -190,6 +190,13 @@ fn prepared_run(
         .env("HOME", &home)
         .env("TMPDIR", &tmp)
         .env("PYTHONNOUSERSITE", "1")
+        // pip treats os.devnull specially and skips ALL configuration files,
+        // including global/XDG and venv config. Leave pip out of --isolated
+        // mode so the explicit PIP_* controls below remain effective.
+        .env("PIP_CONFIG_FILE", "/dev/null")
+        .env("PIP_NO_INDEX", "1")
+        .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        .env("PIP_NO_INPUT", "1")
         .env("LANG", "C")
         .current_dir(staging)
         .stdin(Stdio::null())
@@ -229,21 +236,15 @@ fn run_child(
     let pgid = i32::try_from(child.id()).expect("Linux pid fits i32");
     let mut group = ChildGroup { child, pgid };
     let started = Instant::now();
-    let mut progress = Instant::now();
-    let mut written = 0;
+    // The shared 30-minute install deadline covers extraction/install/fsync on
+    // slow storage (~1.4 GB wheels, ~2.3 GB expanded). Quiet pip unpacking must
+    // not be judged by stdout activity. The clock includes all previous phases.
     let result = loop {
         let next = stdout.metadata()?.len() + stderr.metadata()?.len();
         if next > 4 * 1024 * 1024 {
             break Err(ConsentedError::Build("child output cap".into()));
         }
-        if next != written {
-            written = next;
-            progress = Instant::now();
-        }
-        if clock.elapsed() > INSTALL_DEADLINE
-            || started.elapsed() > INSTALL_DEADLINE
-            || progress.elapsed() > NO_PROGRESS
-        {
+        if clock.elapsed() > INSTALL_DEADLINE || started.elapsed() > INSTALL_DEADLINE {
             break Err(ConsentedError::Deadline);
         }
         match group.child.try_wait() {
@@ -366,7 +367,11 @@ mod tests {
                 .get_envs()
                 .map(|(key, value)| (key.to_str().unwrap(), value.unwrap().to_str().unwrap()))
                 .collect::<std::collections::BTreeMap<_, _>>();
-            assert_eq!(env.len(), 5);
+            assert_eq!(env.len(), 9);
+            assert_eq!(env["PIP_CONFIG_FILE"], "/dev/null");
+            assert_eq!(env["PIP_NO_INDEX"], "1");
+            assert_eq!(env["PIP_DISABLE_PIP_VERSION_CHECK"], "1");
+            assert_eq!(env["PIP_NO_INPUT"], "1");
             assert_eq!(env["PATH"], "/usr/bin:/bin");
             assert_eq!(env["LANG"], "C");
             assert_eq!(env["PYTHONNOUSERSITE"], "1");
@@ -490,6 +495,133 @@ mod tests {
             ));
             assert_eq!(runner.calls.get(), 1);
         }
+    }
+    #[test]
+    fn consented_real_child_environment_is_exactly_the_allowed_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/usr/bin/env");
+        // Command-local poison avoids racing other tests over process env.
+        // /usr/bin/env also observes any real inherited host environment.
+        for key in [
+            "PIP_INDEX_URL",
+            "PIP_FIND_LINKS",
+            "PIP_TARGET",
+            "PYTHONPATH",
+            "LD_PRELOAD",
+            "VOISU_POISON",
+        ] {
+            command.env(key, "poison");
+        }
+        let output = prepared_run(
+            &SystemConsentedCommandRunner,
+            &mut command,
+            temp.path(),
+            &InstallClock::default(),
+        )
+        .unwrap();
+        let actual = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let (key, value) = line.split_once('=').unwrap();
+                (key.to_owned(), value.to_owned())
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let expected = [
+            ("PATH", "/usr/bin:/bin".to_owned()),
+            (
+                "HOME",
+                temp.path().join("build-home").to_str().unwrap().to_owned(),
+            ),
+            (
+                "TMPDIR",
+                temp.path().join("build-tmp").to_str().unwrap().to_owned(),
+            ),
+            ("PYTHONNOUSERSITE", "1".to_owned()),
+            ("LANG", "C".to_owned()),
+            ("PIP_CONFIG_FILE", "/dev/null".to_owned()),
+            ("PIP_NO_INDEX", "1".to_owned()),
+            ("PIP_DISABLE_PIP_VERSION_CHECK", "1".to_owned()),
+            ("PIP_NO_INPUT", "1".to_owned()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect();
+        assert_eq!(actual, expected);
+    }
+    #[test]
+    fn consented_pip_devnull_skips_global_user_and_site_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        // Use the host's bundled pip without installing it or fetching anything.
+        // Redirect its real configuration loader to poisoned fixture files so
+        // this test never writes /etc or the user's configuration directories.
+        for name in ["global.conf", "user.conf", "site.conf"] {
+            fs::write(temp.path().join(name), "[global]\nfind-links = https://invalid.test/\n[install]\ntarget = /invalid-target\n").unwrap();
+        }
+        let mut command = Command::new("python3");
+        command.args([
+            "-I",
+            "-c",
+            r#"
+import os, pathlib, sys
+try:
+    import ensurepip
+except ImportError:
+    print('SKIP: host python3 has no bundled ensurepip')
+    sys.exit(0)
+wheel = next((pathlib.Path(ensurepip.__file__).parent / '_bundled').glob('pip-*.whl'))
+sys.path.insert(0, str(wheel))
+from pip._internal import configuration as c
+c.get_configuration_files = lambda: {
+    c.kinds.GLOBAL: ['global.conf'],
+    c.kinds.USER: ['user.conf'],
+    c.kinds.SITE: ['site.conf'],
+}
+config = c.Configuration(isolated=False)
+config.load()
+assert config._parsers == {kind: [] for kind in c.OVERRIDE_ORDER}, config._parsers
+assert not any(key in dict(config.items()) for key in ['global.find-links', 'install.target'])
+assert os.environ['PIP_CONFIG_FILE'] == '/dev/null'
+print('all configuration files skipped')
+"#,
+        ]);
+        let output = match prepared_run(
+            &SystemConsentedCommandRunner,
+            &mut command,
+            temp.path(),
+            &InstallClock::default(),
+        ) {
+            Err(ConsentedError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "SKIP consented_pip_devnull_skips_global_user_and_site_configuration: no host python3"
+                );
+                return;
+            }
+            result => String::from_utf8(result.unwrap()).unwrap(),
+        };
+        if output.starts_with("SKIP:") {
+            eprintln!("{output}");
+        } else {
+            assert_eq!(output.trim(), "all configuration files skipped");
+        }
+    }
+    #[test]
+    fn consented_quiet_child_can_pass_old_silence_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let clock = InstallClock::default();
+        // Exercise actual silence beyond the old watchdog, not a clock offset
+        // (the old watchdog measured its own Instant and ignored that offset).
+        let mut command = Command::new("/bin/sleep");
+        command.arg((super::super::NO_PROGRESS.as_secs() + 1).to_string());
+        assert!(
+            prepared_run(
+                &SystemConsentedCommandRunner,
+                &mut command,
+                temp.path(),
+                &clock
+            )
+            .is_ok()
+        );
     }
     #[test]
     fn consented_child_timeout_kills_its_process_group() {
