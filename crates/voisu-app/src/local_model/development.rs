@@ -1146,14 +1146,19 @@ struct DevSelection {
     manifest_sha256: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactFingerprint {
     size: u64,
     mtime_seconds: i64,
     mtime_nanoseconds: i64,
     inode: u64,
-    device: u64,
+    /// `st_dev` is not a stable identity: btrfs hands each mount an anonymous
+    /// device number that changes across reboots. Older snapshots carry it, so
+    /// it is still accepted on read, but never written or compared
+    /// (`IgnoredAny` values are always equal).
+    #[serde(default, skip_serializing)]
+    device: serde::de::IgnoredAny,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1177,7 +1182,7 @@ impl ArtifactFingerprint {
             mtime_seconds: metadata.mtime(),
             mtime_nanoseconds: metadata.mtime_nsec(),
             inode: metadata.ino(),
-            device: metadata.dev(),
+            device: serde::de::IgnoredAny,
         })
     }
 }
@@ -1747,6 +1752,51 @@ mod tests {
             .unwrap();
         assert!(value.verify_pins().is_err());
         assert!(store.load(DEV_MODEL_IDS[0]).is_err());
+    }
+
+    /// btrfs gives a mount a new anonymous `st_dev` after reboot; a snapshot
+    /// written before the reboot must still load, while any change to size,
+    /// mtime, or inode still fails.
+    #[test]
+    fn registered_snapshot_ignores_device_number_but_not_file_identity() {
+        let dir = TempDir::new().unwrap();
+        let store = DevelopmentStore::open(dir.path().join("local-dev")).unwrap();
+        let value = manifest(dir.path(), DEV_MODEL_IDS[0]);
+        store.register(&value).unwrap();
+        let snapshot_path = dir.path().join(format!(
+            "local-dev/manifests/{}.fingerprints.json",
+            DEV_MODEL_IDS[0]
+        ));
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+        let rewrite = |field: &str, change: &dyn Fn(u64) -> u64| {
+            let mut snapshot = written.clone();
+            for fingerprint in snapshot["fingerprints"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+            {
+                let fingerprint = fingerprint.as_object_mut().unwrap();
+                assert!(!fingerprint.contains_key("device"), "device is not written");
+                let current = fingerprint
+                    .get(field)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(57);
+                fingerprint.insert(field.into(), serde_json::Value::from(change(current)));
+            }
+            fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        };
+
+        // A legacy snapshot recorded before a reboot, with another device number.
+        rewrite("device", &|_| 57);
+        assert!(store.load(DEV_MODEL_IDS[0]).is_ok());
+        for field in ["size", "mtime_seconds", "mtime_nanoseconds", "inode"] {
+            rewrite(field, &|current| current + 1);
+            assert!(
+                store.load(DEV_MODEL_IDS[0]).is_err(),
+                "a changed {field} must fail"
+            );
+        }
     }
 
     #[test]
