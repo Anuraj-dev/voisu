@@ -569,7 +569,10 @@ try:
 except ImportError:
     print('SKIP: host python3 has no bundled ensurepip')
     sys.exit(0)
-wheel = next((pathlib.Path(ensurepip.__file__).parent / '_bundled').glob('pip-*.whl'))
+wheel = next((pathlib.Path(ensurepip.__file__).parent / '_bundled').glob('pip-*.whl'), None)
+if wheel is None:
+    print('SKIP: host python3 ships ensurepip without a bundled pip wheel')
+    sys.exit(0)
 sys.path.insert(0, str(wheel))
 from pip._internal import configuration as c
 c.get_configuration_files = lambda: {

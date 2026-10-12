@@ -35,7 +35,7 @@ const INSTALL_SUCCESS: &str = "Installed distil-large-v3.5-int8 (Consented Insta
 const DAEMON_RESTARTED: &str = "Restarted the Voisu daemon; Local dictation is ready.";
 const CLOUD_PROMPT: &str = "Also set up Cloud?";
 const CLOUD_SKIPPED: &str = "Cloud skipped; setup will not ask again. To add Cloud later, run `voisu setup` and choose Cloud, or `voisu auth set groq`.";
-/// State file that remembers a No to [`CLOUD_PROMPT`]. It lives in the state
+/// State file that remembers a No to the Cloud prompt. It lives in the state
 /// directory, not the user config: it records what setup already asked, not a
 /// setting the user tunes.
 pub const CLOUD_DECLINED_MARKER: &str = "setup-cloud-declined";
