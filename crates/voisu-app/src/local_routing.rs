@@ -2,7 +2,8 @@
 
 mod silent;
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use voisu_core::{
@@ -55,7 +56,13 @@ pub enum LocalAdmission {
 
 struct Gate {
     readiness: LocalReadiness,
+    published: Arc<Mutex<LocalReadiness>>,
+    failed_observation: Option<crate::local_model::consented::ConsentedObservation>,
     receipt: Option<ActiveReceipt>,
+    consented_observation: Option<(
+        crate::local_model::consented::ConsentedObservation,
+        ActiveReceipt,
+    )>,
     lifecycle: LocalLifecycle<GateWorker, FakeDelivery>,
     coordinator: DeliveryCoordinator,
     sentinel: CloudCapabilitySentinel,
@@ -80,13 +87,18 @@ struct Gate {
     test_next_worker: Option<FakeWorker>,
     #[cfg(test)]
     launch_count: u32,
+    #[cfg(test)]
+    verification_count: std::cell::Cell<u32>,
 }
 
 impl Gate {
     fn new() -> Self {
         Self {
             readiness: LocalReadiness::Absent,
+            published: Arc::new(Mutex::new(LocalReadiness::Absent)),
+            failed_observation: None,
             receipt: None,
+            consented_observation: None,
             lifecycle: LocalLifecycle::new(FakeDelivery::default()),
             coordinator: DeliveryCoordinator::new(),
             sentinel: CloudCapabilitySentinel::new(),
@@ -104,10 +116,70 @@ impl Gate {
             test_next_worker: None,
             #[cfg(test)]
             launch_count: 0,
+            #[cfg(test)]
+            verification_count: std::cell::Cell::new(0),
         }
     }
 
+    fn publish(&self, readiness: LocalReadiness) {
+        if let Ok(mut published) = self.published.lock() {
+            *published = readiness;
+        }
+    }
+
+    fn refresh_passive(&mut self) -> LocalReadiness {
+        if crate::local_model::runtime_selection(&crate::local_model::shipped_catalog()).is_none()
+            && !crate::local_model::development_local_enabled()
+            && matches!(self.readiness, LocalReadiness::Unavailable { .. })
+            && self
+                .failed_observation
+                .as_ref()
+                .is_some_and(|observation| observation.unchanged())
+        {
+            return self.readiness.clone();
+        }
+        self.refresh()
+    }
+
     fn refresh(&mut self) -> LocalReadiness {
+        let readiness = self.refresh_inner();
+        let consented_path =
+            crate::local_model::runtime_selection(&crate::local_model::shipped_catalog()).is_none()
+                && !crate::local_model::development_local_enabled();
+        self.finish_refresh(readiness, consented_path)
+    }
+
+    fn finish_refresh(
+        &mut self,
+        readiness: LocalReadiness,
+        consented_path: bool,
+    ) -> LocalReadiness {
+        if consented_path && matches!(readiness, LocalReadiness::Unavailable { .. }) {
+            self.failed_observation = self.observe_consented();
+        } else {
+            self.failed_observation = None;
+        }
+        self.publish(readiness.clone());
+        readiness
+    }
+
+    fn observe_consented(&self) -> Option<crate::local_model::consented::ConsentedObservation> {
+        #[cfg(test)]
+        {
+            self.test_consented.as_ref().map(|(store, entry)| {
+                crate::local_model::consented::observe_with_entry(store, entry)
+            })
+        }
+        #[cfg(not(test))]
+        {
+            let store = ModelStore::open(models_dir().ok()?).ok()?;
+            Some(crate::local_model::consented::observe_consented_install(
+                &store,
+            ))
+        }
+    }
+
+    fn refresh_inner(&mut self) -> LocalReadiness {
         if self.inference_checked_out {
             return self.readiness.clone();
         }
@@ -127,7 +199,10 @@ impl Gate {
                 self.lifecycle.mark_unavailable();
             }
             self.readiness = LocalReadiness::Unavailable {
-                error: LOCAL_UNAVAILABLE.to_owned(),
+                error: self
+                    .worker_failure
+                    .clone()
+                    .unwrap_or_else(|| LOCAL_UNAVAILABLE.to_owned()),
             };
             return self.readiness.clone();
         };
@@ -206,6 +281,8 @@ impl Gate {
     {
         #[cfg(test)]
         {
+            self.verification_count
+                .set(self.verification_count.get() + 1);
             let (store, entry) = self
                 .test_consented
                 .as_ref()
@@ -218,16 +295,44 @@ impl Gate {
         }
     }
 
-    fn peek_selected_receipt(&self) -> Option<ActiveReceipt> {
+    fn peek_selected_receipt(&mut self) -> Option<ActiveReceipt> {
         // Shared production selection: developer pilot excludes consented
         // admission; a verified receipt is the only source of this candidate.
-        if crate::local_model::runtime_selection(&crate::local_model::shipped_catalog()).is_none()
-            && let Some(receipt) = crate::local_worker::select_consented_receipt(
-                crate::local_model::development_local_enabled(),
-                || self.verify_consented(),
-            )
+        #[cfg(test)]
+        let consider_consented = self.test_consented.is_some();
+        #[cfg(not(test))]
+        let consider_consented = true;
+        if consider_consented
+            && crate::local_model::runtime_selection(&crate::local_model::shipped_catalog())
+                .is_none()
+            && !crate::local_model::development_local_enabled()
         {
-            return Some(receipt);
+            if let Some((observation, receipt)) = self.consented_observation.as_ref()
+                && observation.unchanged()
+            {
+                return Some(receipt.clone());
+            }
+            self.consented_observation = None;
+            self.publish(LocalReadiness::Verifying);
+            if let Some(receipt) = crate::local_worker::select_consented_receipt(false, || {
+                let install = self.verify_consented().map_err(|error| {
+                    self.worker_failure = Some(match error {
+                        crate::local_model::ConsentedError::Missing => LOCAL_UNAVAILABLE.to_owned(),
+                        _ => format!("{LOCAL_UNAVAILABLE}: {error:?}"),
+                    });
+                    error
+                })?;
+                self.worker_failure = None;
+                let receipt = crate::local_worker::consented_active_receipt(&install);
+                let observation =
+                    crate::local_model::consented::ConsentedObservation::after_verification(
+                        &install,
+                    );
+                self.consented_observation = Some((observation, receipt));
+                Ok(install)
+            }) {
+                return Some(receipt);
+            }
         }
         #[cfg(test)]
         {
@@ -265,6 +370,7 @@ impl Gate {
         if !self.lifecycle.can_launch_replacement() {
             return false;
         }
+        self.publish(LocalReadiness::Loading);
         let Some(worker) = self.spawn_worker(selected) else {
             return false;
         };
@@ -494,6 +600,7 @@ fn take_inference_session() -> Result<InferenceSession, LocalError> {
     let coordinator = std::mem::replace(&mut gate.coordinator, DeliveryCoordinator::new());
     gate.inference_checked_out = true;
     gate.readiness = LocalReadiness::Busy;
+    gate.publish(gate.readiness.clone());
     Ok(InferenceSession {
         receipt_hash: receipt.receipt_hash,
         catalog_id: receipt.catalog_id,
@@ -516,6 +623,7 @@ fn restore_inference_session(session: InferenceSession) {
                 model_identity: gate.receipt.as_ref().map(local_model_identity),
             };
         }
+        gate.publish(gate.readiness.clone());
     }
 }
 
@@ -596,25 +704,112 @@ fn is_consented_receipt(receipt: &ActiveReceipt) -> bool {
 
 fn gate() -> &'static Mutex<Gate> {
     static GATE: OnceLock<Mutex<Gate>> = OnceLock::new();
-    GATE.get_or_init(|| Mutex::new(Gate::new()))
+    GATE.get_or_init(|| {
+        let mut gate = Gate::new();
+        gate.published = published_readiness().clone();
+        Mutex::new(gate)
+    })
+}
+
+fn published_readiness() -> &'static Arc<Mutex<LocalReadiness>> {
+    static PUBLISHED: OnceLock<Arc<Mutex<LocalReadiness>>> = OnceLock::new();
+    PUBLISHED.get_or_init(|| Arc::new(Mutex::new(LocalReadiness::Absent)))
+}
+
+fn published_snapshot(published: &Mutex<LocalReadiness>) -> LocalReadiness {
+    published
+        .lock()
+        .map(|readiness| readiness.clone())
+        .unwrap_or(LocalReadiness::Verifying)
+}
+
+fn publish_initial_verification(published: &Mutex<LocalReadiness>) {
+    if let Ok(mut readiness) = published.lock()
+        && matches!(*readiness, LocalReadiness::Absent)
+    {
+        *readiness = LocalReadiness::Verifying;
+    }
+}
+
+fn schedule_readiness_refresh(
+    gate: &'static Mutex<Gate>,
+    refreshing: &'static AtomicBool,
+) -> Option<std::thread::JoinHandle<()>> {
+    if refreshing
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    // Polling never waits for model hashing or worker startup. The same gate
+    // owns refresh, admission and inference, so a pending refresh cannot launch
+    // a replacement underneath an admitted worker.
+    let result = std::thread::Builder::new()
+        .name("local-readiness".into())
+        .spawn(move || {
+            struct Reset(&'static AtomicBool);
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _reset = Reset(refreshing);
+            if let Ok(mut gate) = gate.lock() {
+                gate.refresh_passive();
+            }
+        });
+    match result {
+        Ok(handle) => Some(handle),
+        Err(_) => {
+            refreshing.store(false, Ordering::Release);
+            None
+        }
+    }
+}
+
+fn readiness_snapshot() -> LocalReadiness {
+    published_snapshot(published_readiness())
 }
 
 #[must_use]
 pub fn runtime_readiness() -> LocalReadiness {
     #[cfg(test)]
     {
+        // Unit tests have no production worker. A published Verifying snapshot
+        // is still the status answer, so a gate held by verification cannot
+        // look like a confirmed failure.
+        let readiness = readiness_snapshot();
+        if matches!(readiness, LocalReadiness::Verifying) {
+            return readiness;
+        }
         LocalReadiness::Unavailable {
             error: LOCAL_UNAVAILABLE.to_owned(),
         }
     }
     #[cfg(not(test))]
     {
-        let Ok(mut gate) = gate().lock() else {
-            return LocalReadiness::Unavailable {
+        static REFRESHING: AtomicBool = AtomicBool::new(false);
+        publish_initial_verification(published_readiness());
+        let _ = schedule_readiness_refresh(gate(), &REFRESHING);
+        readiness_snapshot()
+    }
+}
+
+/// Capture admission runs on the admission queue, never on the status path.
+/// Unlike a polling snapshot it must wait for and revalidate the selected model.
+pub fn admission_readiness() -> LocalReadiness {
+    #[cfg(test)]
+    {
+        runtime_readiness()
+    }
+    #[cfg(not(test))]
+    {
+        gate()
+            .lock()
+            .map(|mut gate| gate.refresh())
+            .unwrap_or_else(|_| LocalReadiness::Unavailable {
                 error: LOCAL_NOT_READY.to_owned(),
-            };
-        };
-        gate.refresh()
+            })
     }
 }
 
@@ -1093,7 +1288,7 @@ pub fn quota_before_local_capture(recovery_enabled: bool) -> Result<(), LocalErr
 
 pub fn sentinel_is_clean() -> bool {
     gate()
-        .lock()
+        .try_lock()
         .map(|gate| gate.sentinel.local_path_clean())
         .unwrap_or(false)
 }
@@ -1118,6 +1313,8 @@ pub fn inject_ready(receipt: ActiveReceipt, text: &str) {
 pub fn reset_gate_for_tests() {
     if let Ok(mut gate) = gate().lock() {
         *gate = Gate::new();
+        gate.published = published_readiness().clone();
+        gate.publish(LocalReadiness::Absent);
     }
 }
 
@@ -1151,6 +1348,183 @@ mod tests {
     }
 
     #[test]
+    fn initial_publication_never_overwrites_a_completed_refresh() {
+        let published = Mutex::new(LocalReadiness::Absent);
+        publish_initial_verification(&published);
+        assert_eq!(published_snapshot(&published), LocalReadiness::Verifying);
+        for completed in [
+            LocalReadiness::Ready {
+                model_identity: Some("verified".into()),
+            },
+            LocalReadiness::Unavailable {
+                error: "confirmed failure".into(),
+            },
+        ] {
+            *published.lock().unwrap() = completed.clone();
+            publish_initial_verification(&published);
+            assert_eq!(published_snapshot(&published), completed);
+        }
+    }
+
+    #[test]
+    fn failure_suppression_is_not_retained_outside_consented_path() {
+        let (_state, mut gate, _) = consented_gate();
+        let install = gate.verify_consented().unwrap();
+        std::fs::write(install.layout().weights.join("model.bin"), b"bad weight").unwrap();
+        drop(install);
+        let failure = gate.refresh();
+        assert!(gate.failed_observation.is_some());
+        gate.finish_refresh(failure, false);
+        assert!(gate.failed_observation.is_none());
+        let verifications = gate.verification_count.get();
+        gate.refresh_passive();
+        assert!(
+            gate.verification_count.get() > verifications,
+            "non-consented failures must retain passive retries"
+        );
+    }
+
+    #[test]
+    fn published_ready_does_not_flicker_during_passive_refresh() {
+        let (_state, mut owned, _) = consented_gate();
+        let ready = owned.refresh();
+        assert!(matches!(ready, LocalReadiness::Ready { .. }));
+        let published = owned.published.clone();
+        let gate: &'static Mutex<Gate> = Box::leak(Box::new(Mutex::new(owned)));
+        let refreshing = Box::leak(Box::new(AtomicBool::new(false)));
+        let held = gate.lock().unwrap();
+        let worker = schedule_readiness_refresh(gate, refreshing).unwrap();
+        assert_eq!(published_snapshot(&published), ready);
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(published_snapshot(&published), ready);
+    }
+
+    #[test]
+    fn confirmed_verification_failure_stays_visible_until_tree_changes() {
+        let (_state, mut gate, _) = consented_gate();
+        let install = gate.verify_consented().unwrap();
+        let path = install.layout().weights.join("model.bin");
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, vec![b'x'; original.len()]).unwrap();
+        drop(install);
+        let failure = gate.refresh();
+        assert!(
+            matches!(&failure, LocalReadiness::Unavailable { error } if error.contains("Digest"))
+        );
+        let verifications = gate.verification_count.get();
+        for _ in 0..3 {
+            assert_eq!(gate.refresh_passive(), failure);
+            assert_eq!(published_snapshot(&gate.published), failure);
+        }
+        assert_eq!(gate.verification_count.get(), verifications);
+        std::fs::write(&path, original).unwrap();
+        assert!(matches!(
+            gate.refresh_passive(),
+            LocalReadiness::Ready { .. }
+        ));
+    }
+
+    #[test]
+    fn verification_and_loading_replace_stale_unavailable_snapshot() {
+        let (_state, mut gate, _) = consented_gate();
+        gate.publish(LocalReadiness::Unavailable {
+            error: "previous failure".into(),
+        });
+        // Selection verifies before launch; its stage is published through the
+        // independent short mutex rather than falling back to a gate-lock error.
+        let selected = gate.peek_selected_receipt().unwrap();
+        assert_eq!(
+            published_snapshot(&gate.published),
+            LocalReadiness::Verifying
+        );
+        assert!(gate.install_selected_worker(&selected));
+        gate.receipt = Some(selected);
+        assert_eq!(published_snapshot(&gate.published), LocalReadiness::Loading);
+        assert!(matches!(gate.refresh(), LocalReadiness::Ready { .. }));
+        assert!(matches!(
+            published_snapshot(&gate.published),
+            LocalReadiness::Ready { .. }
+        ));
+    }
+
+    #[test]
+    fn readiness_refresh_is_single_flight_and_releases_ownership() {
+        let gate: &'static Mutex<Gate> = Box::leak(Box::new(Mutex::new(Gate::new())));
+        let refreshing = Box::leak(Box::new(AtomicBool::new(false)));
+        let held = gate.lock().unwrap();
+        let first = schedule_readiness_refresh(gate, refreshing).unwrap();
+        assert!(schedule_readiness_refresh(gate, refreshing).is_none());
+        drop(held);
+        first.join().unwrap();
+        assert!(!refreshing.load(Ordering::Acquire));
+        schedule_readiness_refresh(gate, refreshing)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn status_and_sentinel_do_not_wait_for_gate_verification() {
+        let _session = test_session();
+        let state = tempfile::tempdir().unwrap();
+        let config = state.path().join("config.toml");
+        crate::asr_mode::persist_asr_mode_at(&config, state.path(), voisu_core::AsrMode::Local)
+            .unwrap();
+        // Hold the exact lock owned by model verification/worker preparation.
+        let held = gate().lock().unwrap();
+        held.publish(LocalReadiness::Verifying);
+        assert_eq!(readiness_snapshot(), LocalReadiness::Verifying);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state_path = state.path().to_path_buf();
+        let caller = std::thread::spawn(move || {
+            let status = crate::asr_mode::status_report_at(&config, &Some(state_path), None);
+            tx.send(status).unwrap();
+        });
+        let status = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        caller.join().unwrap();
+        let status = status.expect("status must reply while verification owns the gate");
+        assert_eq!(status.local_readiness, LocalReadiness::Verifying);
+        assert_eq!(status.local_path_clean, Some(false));
+    }
+
+    #[test]
+    fn same_size_model_edit_invalidates_verified_observation() {
+        let (_state, mut gate, _) = consented_gate();
+        assert!(matches!(gate.refresh(), LocalReadiness::Ready { .. }));
+        let install = gate.verify_consented().unwrap();
+        let path = install.layout().weights.join("model.bin");
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, vec![b'x'; bytes.len()]).unwrap();
+        drop(install);
+        assert!(matches!(gate.refresh(), LocalReadiness::Unavailable { .. }));
+        assert_eq!(gate.lifecycle.state(), WorkerState::Unavailable);
+        assert_eq!(gate.launch_count, 1);
+    }
+
+    #[test]
+    fn withdrawn_receipt_invalidates_verified_observation() {
+        let (_state, mut gate, _) = consented_gate();
+        assert!(matches!(gate.refresh(), LocalReadiness::Ready { .. }));
+        let (store, _) = gate.test_consented.as_ref().unwrap();
+        std::fs::remove_file(store.root().join("private/consented.receipt.json")).unwrap();
+        assert!(matches!(gate.refresh(), LocalReadiness::Unavailable { .. }));
+        assert_eq!(gate.lifecycle.state(), WorkerState::Unavailable);
+    }
+
+    #[test]
+    fn unchanged_ready_refresh_does_not_rehash_model_files() {
+        let (_state, mut gate, _) = consented_gate();
+        assert!(matches!(gate.refresh(), LocalReadiness::Ready { .. }));
+        let verifications = gate.verification_count.get();
+        for _ in 0..3 {
+            assert!(matches!(gate.refresh(), LocalReadiness::Ready { .. }));
+        }
+        assert_eq!(gate.verification_count.get(), verifications);
+    }
+
+    #[test]
     fn consented_verified_install_is_excluded_by_dev_pilot_precedence() {
         let (_state, gate, receipt) = consented_gate();
         assert_eq!(
@@ -1178,11 +1552,8 @@ mod tests {
         )
         .unwrap();
         drop(install);
-        assert_eq!(
-            gate.refresh(),
-            LocalReadiness::Unavailable {
-                error: LOCAL_UNAVAILABLE.into()
-            }
+        assert!(
+            matches!(gate.refresh(), LocalReadiness::Unavailable { error } if error.starts_with(LOCAL_UNAVAILABLE))
         );
         assert_eq!(gate.lifecycle.state(), WorkerState::Unavailable);
         assert_eq!(gate.launch_count, 1, "corruption cannot launch a fallback");

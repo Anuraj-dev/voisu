@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -141,6 +141,7 @@ pub struct VerifiedConsentedInstall {
     layout: ConsentedLayout,
     receipt: ConsentedReceipt,
     _lease: ConsentedLease,
+    observation: ConsentedObservation,
 }
 impl VerifiedConsentedInstall {
     pub fn layout(&self) -> &ConsentedLayout {
@@ -149,6 +150,119 @@ impl VerifiedConsentedInstall {
     pub fn receipt(&self) -> &ConsentedReceipt {
         &self.receipt
     }
+}
+
+/// A daemon-local observation of an already verified installation. It cannot
+/// authorize a launch; every launch still obtains a fresh verification token.
+#[derive(Clone, Debug)]
+pub(crate) struct ConsentedObservation {
+    files: Vec<(PathBuf, Option<FileIdentity>)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
+    let metadata = fs::symlink_metadata(path)?;
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.len(),
+        mode: metadata.mode(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        modified: (metadata.mtime(), metadata.mtime_nsec()),
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+    })
+}
+
+impl ConsentedObservation {
+    pub(crate) fn after_verification(install: &VerifiedConsentedInstall) -> Self {
+        install.observation.clone()
+    }
+
+    fn capture(
+        layout: &ConsentedLayout,
+        receipt: &ConsentedReceipt,
+    ) -> Result<Self, ConsentedError> {
+        let root = &layout.root;
+        let models = root
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .ok_or(ConsentedError::Receipt)?;
+        let mut paths = vec![models.join("private/consented.receipt.json"), root.clone()];
+        paths.extend(receipt.files.keys().map(|name| root.join(name)));
+        paths.extend(
+            receipt
+                .runtime_manifest
+                .keys()
+                .map(|name| root.join("runtime").join(name)),
+        );
+        // Ancestors detect replaced directories and entries added or removed.
+        paths.extend(paths.clone().into_iter().flat_map(|path| {
+            path.ancestors()
+                .skip(1)
+                .take_while(|parent| parent.starts_with(models))
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>()
+        }));
+        paths.sort();
+        paths.dedup();
+        let files = paths
+            .into_iter()
+            .map(|path| {
+                let identity = match file_identity(&path) {
+                    Ok(identity) => Some(identity),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error),
+                };
+                Ok((path, identity))
+            })
+            .collect::<Result<_, std::io::Error>>()?;
+        Ok(Self { files })
+    }
+
+    pub(crate) fn unchanged(&self) -> bool {
+        self.files
+            .iter()
+            .all(|(path, expected)| match file_identity(path) {
+                Ok(actual) => expected.as_ref() == Some(&actual),
+                Err(error) => expected.is_none() && error.kind() == std::io::ErrorKind::NotFound,
+            })
+    }
+}
+
+/// Failure observation carries no verification authority. Retry only when the
+/// failed tree changes, or when an explicit capture asks for admission again.
+pub(crate) fn observe_with_entry(
+    store: &ModelStore,
+    entry: &ConsentedCatalogEntry,
+) -> ConsentedObservation {
+    let observed = load_receipt(store).and_then(|receipt| {
+        let layout = validate_receipt(store, entry, &receipt)?;
+        ConsentedObservation::capture(&layout, &receipt)
+    });
+    observed.unwrap_or_else(|_| ConsentedObservation {
+        files: vec![(
+            receipt_path(store),
+            file_identity(&receipt_path(store)).ok(),
+        )],
+    })
+}
+
+#[cfg(not(test))]
+pub(crate) fn observe_consented_install(store: &ModelStore) -> ConsentedObservation {
+    observe_with_entry(store, &CONSENTED_ENTRY)
 }
 
 /// The caller keeps this shared lease across transient-unit startup and stop.
@@ -381,15 +495,29 @@ fn verify_with_entry_mode(
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
     let _lock = store.lock_exclusive().map_err(ConsentedError::Store)?;
     resume_removal(store, entry, || Ok(()))?;
+    let receipt_identity = file_identity(&receipt_path(store)).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ConsentedError::Missing
+        } else {
+            ConsentedError::Io(error)
+        }
+    })?;
     let receipt = load_receipt(store)?;
     let layout = validate_receipt(store, entry, &receipt)?;
     let lease = consented_install_lease(&layout)?;
+    let observation = ConsentedObservation::capture(&layout, &receipt)?;
     if full {
         verify_layout_full(&layout, &receipt)?;
     } else {
         verify_layout(&layout, &receipt)?;
     }
+    if file_identity(&receipt_path(store))? != receipt_identity || !observation.unchanged() {
+        return Err(ConsentedError::Tree(
+            "installation changed during verification".into(),
+        ));
+    }
     Ok(VerifiedConsentedInstall {
+        observation,
         layout,
         receipt,
         _lease: lease,

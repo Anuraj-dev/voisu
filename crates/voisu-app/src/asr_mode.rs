@@ -451,7 +451,7 @@ pub fn select_resources(mode: AsrMode) -> AsrPathResources {
     match mode {
         AsrMode::Cloud => AsrPathResources::Cloud,
         AsrMode::Local => AsrPathResources::Local {
-            readiness: runtime_local_readiness(),
+            readiness: crate::local_routing::admission_readiness(),
         },
     }
 }
@@ -639,6 +639,9 @@ fn try_connect_daemon() -> Result<UnixStream, String> {
 fn set_mode_over_ipc(stream: UnixStream, mode: AsrMode) -> Result<String, CliModeError> {
     // The daemon serves one command per connection, matching `voisu` itself.
     let status = send_request(stream, Command::Status)?;
+    if !status.ok {
+        return Err(CliModeError::new(4, status.message));
+    }
     if !status
         .capabilities
         .iter()
@@ -876,6 +879,26 @@ fn read_frame(stream: &mut BufReader<UnixStream>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn busy_status_preserves_daemon_error_before_capability_check() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let daemon = std::thread::spawn(move || {
+            let mut request = String::new();
+            BufReader::new(server.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: Request = serde_json::from_str(&request).unwrap();
+            assert!(matches!(request.command, Command::Status));
+            serde_json::to_writer(&mut server, &Response::rejected(None, "daemon is busy"))
+                .unwrap();
+            server.write_all(b"\n").unwrap();
+        });
+        let error = set_mode_over_ipc(client, AsrMode::Local).unwrap_err();
+        daemon.join().unwrap();
+        assert_eq!(error.exit_code, 4);
+        assert_eq!(error.message, "daemon is busy");
+    }
 
     #[test]
     fn missing_mode_without_marker_is_legacy_cloud() {
