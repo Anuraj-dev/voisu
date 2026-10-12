@@ -162,6 +162,9 @@ pub fn consented_error_line(error: &ConsentedError) -> String {
         ConsentedError::NoSpace => "Not enough free disk space.".into(),
         ConsentedError::Maintenance => IN_USE.into(),
         ConsentedError::Health(_) => "The installed model failed its health check.".into(),
+        ConsentedError::HealthUnreaped => {
+            "The health-check worker did not stop; its files were kept.".into()
+        }
         ConsentedError::Fetch(_) | ConsentedError::Deadline => {
             "The download failed (network or deadline).".into()
         }
