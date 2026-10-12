@@ -72,7 +72,10 @@ struct Gate {
     #[cfg(test)]
     test_selected: Option<ActiveReceipt>,
     #[cfg(test)]
-    test_verify: Option<Box<dyn Fn() -> Option<ActiveReceipt> + Send>>,
+    test_consented: Option<(
+        crate::local_model::ModelStore,
+        crate::local_model::ConsentedCatalogEntry,
+    )>,
     #[cfg(test)]
     test_next_worker: Option<FakeWorker>,
     #[cfg(test)]
@@ -96,7 +99,7 @@ impl Gate {
             #[cfg(test)]
             test_selected: None,
             #[cfg(test)]
-            test_verify: None,
+            test_consented: None,
             #[cfg(test)]
             test_next_worker: None,
             #[cfg(test)]
@@ -197,11 +200,39 @@ impl Gate {
         }
     }
 
-    fn peek_selected_receipt(&self) -> Option<ActiveReceipt> {
+    fn verify_consented(
+        &self,
+    ) -> Result<crate::local_model::VerifiedConsentedInstall, crate::local_model::ConsentedError>
+    {
         #[cfg(test)]
         {
-            if let Some(verify) = &self.test_verify {
-                return verify();
+            let (store, entry) = self
+                .test_consented
+                .as_ref()
+                .ok_or(crate::local_model::ConsentedError::Missing)?;
+            crate::local_model::consented::verify_with_entry(store, entry)
+        }
+        #[cfg(not(test))]
+        {
+            crate::local_worker::verify_default_consented_install()
+        }
+    }
+
+    fn peek_selected_receipt(&self) -> Option<ActiveReceipt> {
+        // Shared production selection: developer pilot excludes consented
+        // admission; a verified receipt is the only source of this candidate.
+        if crate::local_model::runtime_selection(&crate::local_model::shipped_catalog()).is_none()
+            && let Some(receipt) = crate::local_worker::select_consented_receipt(
+                crate::local_model::development_local_enabled(),
+                || self.verify_consented(),
+            )
+        {
+            return Some(receipt);
+        }
+        #[cfg(test)]
+        {
+            if self.test_consented.is_some() {
+                return None;
             }
             self.test_selected.clone().or_else(|| self.receipt.clone())
         }
@@ -219,9 +250,7 @@ impl Gate {
                     Err(_) => return None,
                 }
             } else if runtime_selection(&shipped_catalog()).is_none() {
-                return crate::local_worker::verify_default_consented_install()
-                    .ok()
-                    .map(|install| crate::local_worker::consented_active_receipt(&install));
+                return None;
             }
             (|| {
                 let dir = models_dir().ok()?;
@@ -302,6 +331,36 @@ impl Gate {
         if !self.lifecycle.can_launch_replacement() {
             return None;
         }
+        if !crate::local_model::development_local_enabled() && is_consented_receipt(selected) {
+            // This exact re-verification and receipt comparison also runs in
+            // tests. Only process creation is replaced by the scripted worker.
+            let install = match self.verify_consented() {
+                Ok(install)
+                    if crate::local_worker::consented_active_receipt(&install) == *selected =>
+                {
+                    install
+                }
+                _ => {
+                    self.worker_failure = Some(LOCAL_UNAVAILABLE.into());
+                    return None;
+                }
+            };
+            #[cfg(not(test))]
+            {
+                return match crate::local_worker::launch_consented_worker(install) {
+                    Ok(worker) => Some(RuntimeWorker::Consented(Box::new(worker))),
+                    Err(error) => {
+                        self.worker_failure = Some(match error {
+                            crate::local_model::ConsentedError::Health(detail) => detail,
+                            error => format!("{error:?}"),
+                        });
+                        None
+                    }
+                };
+            }
+            #[cfg(test)]
+            drop(install);
+        }
         #[cfg(test)]
         {
             let _ = selected;
@@ -316,31 +375,17 @@ impl Gate {
                 && selected.catalog_id == manifest.model_id
                 && selected.artifact_id == handle.manifest_hash
             {
-                return crate::local_worker::DevWorker::launch(
+                return match crate::local_worker::DevWorker::launch(
                     manifest,
                     handle.manifest_hash,
                     &handle.path,
-                )
-                .ok()
-                .map(|worker| RuntimeWorker::Development(Box::new(worker)));
-            }
-            if !development_local_enabled() && is_consented_receipt(selected) {
-                // Re-verify immediately before launch. The worker owns the
-                // shared lease until the transient unit is stopped/reaped.
-                let install = match crate::local_worker::verify_default_consented_install() {
-                    Ok(install) => install,
-                    Err(_) => {
-                        self.worker_failure = Some(LOCAL_UNAVAILABLE.into());
-                        return None;
+                ) {
+                    Ok(worker) => Some(RuntimeWorker::Development(Box::new(worker))),
+                    Err(error) => {
+                        self.worker_failure = Some(error.to_string());
+                        None
                     }
                 };
-                if crate::local_worker::consented_active_receipt(&install) != *selected {
-                    self.worker_failure = Some(LOCAL_UNAVAILABLE.into());
-                    return None;
-                }
-                return crate::local_worker::launch_consented_worker(install)
-                    .ok()
-                    .map(|worker| RuntimeWorker::Consented(Box::new(worker)));
             }
             let catalog = shipped_catalog();
             let entry = catalog.entries.iter().find(|entry| {
@@ -1085,43 +1130,51 @@ pub fn test_session() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn consented_receipt_opens_local_and_corrupted_weight_makes_it_unavailable() {
+    fn consented_gate() -> (tempfile::TempDir, Gate, ActiveReceipt) {
         let state = tempfile::tempdir().unwrap();
-        let weight = state.path().join("weights.bin");
-        std::fs::write(&weight, b"consented weight").unwrap();
-        let digest = crate::local_model::sha256_hex(b"consented weight");
-        let mut receipt = fixture_receipt();
-        receipt.catalog_id = "distil-large-v3.5-int8".into();
-        receipt.runtime_abi = "voisu-consented:pinned-revision".into();
-        let verified = receipt.clone();
-        let checked_weight = weight.clone();
+        let store = crate::local_model::ModelStore::open(state.path().join("models")).unwrap();
+        crate::local_model::consented::install_tests::install(&store);
+        let entry = crate::local_model::consented::install_tests::entry();
+        let install = crate::local_model::consented::verify_with_entry(&store, &entry).unwrap();
+        let receipt = crate::local_worker::consented_active_receipt(&install);
         let mut gate = Gate::new();
-        // Fake verified install at the filesystem boundary. The lifecycle,
-        // receipt correlation, readiness, and presentation run unchanged.
-        gate.test_verify = Some(Box::new(move || {
-            let bytes = std::fs::read(&checked_weight).ok()?;
-            crate::local_model::verify_file_digest(&bytes, &digest, 16).then(|| verified.clone())
-        }));
+        gate.test_consented = Some((store, entry));
         gate.test_next_worker = Some(FakeWorker {
             model_receipt_hash: receipt.receipt_hash.clone(),
             observed_device: "cuda:0".into(),
             ..Default::default()
         });
-        let readiness = gate.refresh();
+        (state, gate, receipt)
+    }
+
+    #[test]
+    fn consented_verified_install_is_excluded_by_dev_pilot_precedence() {
+        let (_state, gate, receipt) = consented_gate();
         assert_eq!(
-            readiness,
-            LocalReadiness::Ready {
-                model_identity: Some("distil-large-v3.5-int8 (Consented Install)".into()),
-            }
+            crate::local_worker::select_consented_receipt(false, || gate.verify_consented()),
+            Some(receipt)
         );
-        assert_eq!(gate.launch_count, 1);
+        assert!(
+            crate::local_worker::select_consented_receipt(true, || panic!(
+                "pilot must not verify consented install"
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn consented_verified_receipt_opens_local_and_corruption_closes_it() {
+        let (_state, mut gate, receipt) = consented_gate();
+        assert_eq!(gate.peek_selected_receipt(), Some(receipt.clone()));
+        assert!(matches!(gate.refresh(), LocalReadiness::Ready { .. }));
         assert_eq!(gate.receipt, Some(receipt));
-        assert_eq!(
-            crate::local_status::format_local_readiness(&readiness),
-            "ready (distil-large-v3.5-int8 (Consented Install))"
-        );
-        std::fs::write(&weight, b"corrupted weight").unwrap();
+        let install = gate.verify_consented().unwrap();
+        std::fs::write(
+            install.layout().weights.join("model.bin"),
+            b"corrupted weight",
+        )
+        .unwrap();
+        drop(install);
         assert_eq!(
             gate.refresh(),
             LocalReadiness::Unavailable {
@@ -1129,10 +1182,40 @@ mod tests {
             }
         );
         assert_eq!(gate.lifecycle.state(), WorkerState::Unavailable);
-        assert_eq!(
-            gate.launch_count, 1,
-            "verification failure cannot launch a fallback"
-        );
+        assert_eq!(gate.launch_count, 1, "corruption cannot launch a fallback");
+        assert!(gate.sentinel.local_path_clean());
+    }
+
+    #[test]
+    fn consented_launch_reverifies_weight_after_selection() {
+        let (_state, mut gate, receipt) = consented_gate();
+        assert_eq!(gate.peek_selected_receipt(), Some(receipt.clone()));
+        let install = gate.verify_consented().unwrap();
+        std::fs::write(
+            install.layout().weights.join("model.bin"),
+            b"corrupted weight",
+        )
+        .unwrap();
+        drop(install);
+        assert!(!gate.install_selected_worker(&receipt));
+        assert_eq!(gate.worker_failure.as_deref(), Some(LOCAL_UNAVAILABLE));
+        assert_eq!(gate.launch_count, 0);
+        assert!(gate.sentinel.local_path_clean());
+    }
+
+    #[test]
+    fn consented_launch_refuses_replaced_receipt_after_selection() {
+        let (_state, mut gate, receipt) = consented_gate();
+        assert_eq!(gate.peek_selected_receipt(), Some(receipt.clone()));
+        let (store, _) = gate.test_consented.as_ref().unwrap();
+        let new = crate::local_model::consented::install_tests::replace_fixture_receipt(store);
+        assert_ne!(new.receipt_hash, receipt.receipt_hash);
+        assert!(!gate.install_selected_worker(&receipt));
+        assert_eq!(gate.launch_count, 0);
+        let selected = gate.peek_selected_receipt().unwrap();
+        assert_eq!(selected.receipt_hash, new.receipt_hash);
+        assert!(gate.install_selected_worker(&selected));
+        assert_eq!(gate.launch_count, 1);
     }
 
     fn fixture_receipt() -> ActiveReceipt {

@@ -9,7 +9,7 @@ pub const INSTALL_DEADLINE: Duration = Duration::from_secs(30 * 60);
 pub const NO_PROGRESS: Duration = Duration::from_secs(30);
 
 mod catalog;
-mod consented;
+pub(crate) mod consented;
 mod consented_catalog;
 mod consented_pins;
 mod consented_runtime;
@@ -25,7 +25,6 @@ mod url_policy;
 pub(crate) fn consented_worker_files() -> &'static [(&'static str, &'static [u8])] {
     consented_catalog::WORKER_FILES
 }
-#[cfg(not(test))]
 pub(crate) use receipt::FilePin;
 
 pub use catalog::{
