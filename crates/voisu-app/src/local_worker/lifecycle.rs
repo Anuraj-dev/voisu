@@ -286,27 +286,24 @@ impl<C: WorkerChild, D: DeliverySeam> LocalLifecycle<C, D> {
     }
 }
 
-/// Catalog production selection remains independent of Consented Installs.
-/// The explicit developer pilot takes precedence over consented verification.
+/// Runtime Local admission. Production remains closed; the developer pilot
+/// service may explicitly open this runtime gate through its environment.
 #[must_use]
 pub fn local_runtime_admission() -> bool {
-    runtime_admission_with(
-        crate::local_model::development_local_enabled(),
-        crate::local_model::runtime_selection(&crate::local_model::shipped_catalog()).is_some(),
-        || super::consented::verify_default_consented_install().is_ok(),
-    )
+    crate::local_model::runtime_selection(&crate::local_model::shipped_catalog()).is_some()
 }
 
-fn runtime_admission_with(
-    pilot: bool,
-    catalog_selected: bool,
-    verify: impl FnOnce() -> bool,
-) -> bool {
-    if pilot || catalog_selected {
-        catalog_selected
-    } else {
-        verify()
-    }
+/// Explicit Consented Install admission; the developer pilot takes precedence.
+#[must_use]
+pub fn consented_runtime_admission(store: &crate::local_model::ModelStore) -> bool {
+    !crate::local_model::development_local_enabled()
+        && crate::local_model::verify_consented_install(store).is_ok()
+}
+
+#[must_use]
+pub fn default_consented_runtime_admission() -> bool {
+    !crate::local_model::development_local_enabled()
+        && super::consented::verify_default_consented_install().is_ok()
 }
 
 #[cfg(test)]
@@ -314,31 +311,6 @@ mod tests {
     use super::*;
     use crate::local_worker::MAX_RESTARTS;
     use std::time::Duration;
-
-    #[test]
-    fn consented_admission_opens_only_after_verification_and_dev_takes_precedence() {
-        let state = tempfile::tempdir().unwrap();
-        let store = crate::local_model::ModelStore::open(state.path().join("models")).unwrap();
-        assert!(!runtime_admission_with(false, false, || {
-            crate::local_model::verify_consented_install(&store).is_ok()
-        }));
-        // Inject the filesystem verification boundary with a tiny pinned
-        // install: no catalog weight download, GPU, or user manager.
-        let weight = state.path().join("weight");
-        std::fs::write(&weight, b"consented weight").unwrap();
-        let hash = crate::local_model::sha256_hex(b"consented weight");
-        let verify =
-            || crate::local_model::verify_file_digest(&std::fs::read(&weight).unwrap(), &hash, 16);
-        assert!(runtime_admission_with(false, false, verify));
-        std::fs::write(&weight, b"corrupted weight").unwrap();
-        assert!(!runtime_admission_with(false, false, verify));
-        assert!(runtime_admission_with(true, true, || panic!(
-            "dev pilot must not inspect consented install"
-        )));
-        assert!(!runtime_admission_with(true, false, || panic!(
-            "dev pilot must not use consented install"
-        )));
-    }
 
     fn fixture_receipt_hash() -> String {
         crate::local_model::from_entry(crate::local_model::ci_fixture_entry(), "l3-artifact")

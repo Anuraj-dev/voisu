@@ -32,6 +32,8 @@ pub enum ConsentedError {
     Tree(String),
     Build(String),
     Health(String),
+    /// Stop/reap was not observed; the publication must remain protected.
+    HealthUnreaped,
     Fetch(FetchError),
     Store(StoreError),
     Fs(SafeFsError),
@@ -135,7 +137,7 @@ pub trait ConsentedHealth {
 pub struct VerifiedConsentedInstall {
     layout: ConsentedLayout,
     receipt: ConsentedReceipt,
-    _lease: File,
+    _lease: ConsentedLease,
 }
 impl VerifiedConsentedInstall {
     pub fn layout(&self) -> &ConsentedLayout {
@@ -144,6 +146,35 @@ impl VerifiedConsentedInstall {
     pub fn receipt(&self) -> &ConsentedReceipt {
         &self.receipt
     }
+}
+
+/// The caller keeps this shared lease across transient-unit startup and stop.
+#[derive(Debug)]
+pub(crate) struct ConsentedLease {
+    pub(crate) path: PathBuf,
+    _file: File,
+}
+
+pub(crate) fn consented_install_lease(
+    layout: &ConsentedLayout,
+) -> Result<ConsentedLease, ConsentedError> {
+    let models = layout
+        .root
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or(ConsentedError::Receipt)?;
+    let hash = layout
+        .root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(ConsentedError::Receipt)?;
+    let path = models
+        .join("private")
+        .join(format!("consented-{hash}.lease"));
+    let file = open_lease(&path)?;
+    flock(&file, libc::LOCK_SH)?;
+    Ok(ConsentedLease { path, _file: file })
 }
 
 pub struct ConsentedInstallRequest<'a> {
@@ -194,6 +225,7 @@ fn install_with_receipt_sync(
         .lock_exclusive()
         .map_err(ConsentedError::Store)?;
     resume_removal(request.store, entry, || Ok(()))?;
+    remove_unreceipted_publish(request.store, entry)?;
     abort(&request, InstallAbort::AfterLock)?;
     let required = 2 * (entry.total_download_bytes + entry.estimated_extracted_runtime_bytes);
     if request
@@ -296,9 +328,22 @@ fn install_with_receipt_sync(
         )?;
         Ok(receipt)
     })();
-    if result.is_err() && !existed && !may_reference_new {
-        fs::remove_dir_all(&published.root)?;
-        File::open(published.root.parent().expect("parent"))?.sync_all()?;
+    if result.is_err()
+        && !existed
+        && !may_reference_new
+        && !matches!(result, Err(ConsentedError::HealthUnreaped))
+    {
+        // Never roll back beneath a health or daemon worker. Even an ordinary
+        // failure may leave a unit alive; unknown stop state retains the tree.
+        let lease = lease_file(request.store, &hash)?;
+        match flock(&lease, libc::LOCK_EX) {
+            Ok(()) => {
+                fs::remove_dir_all(&published.root)?;
+                File::open(published.root.parent().expect("parent"))?.sync_all()?;
+            }
+            Err(ConsentedError::Leased) => {}
+            Err(error) => return Err(error),
+        }
     }
     result
 }
@@ -311,7 +356,7 @@ pub fn verify_consented_install(
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
     verify_with_entry(store, &CONSENTED_ENTRY)
 }
-fn verify_with_entry(
+pub(crate) fn verify_with_entry(
     store: &ModelStore,
     entry: &ConsentedCatalogEntry,
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
@@ -335,8 +380,7 @@ fn verify_with_entry_mode(
     resume_removal(store, entry, || Ok(()))?;
     let receipt = load_receipt(store)?;
     let layout = validate_receipt(store, entry, &receipt)?;
-    let lease = lease_file(store, &receipt.content_hash)?;
-    flock(&lease, libc::LOCK_SH)?;
+    let lease = consented_install_lease(&layout)?;
     if full {
         verify_layout_full(&layout, &receipt)?;
     } else {
@@ -365,6 +409,7 @@ fn remove_with_delete_hook(
 ) -> Result<(), ConsentedError> {
     let _lock = store.lock_exclusive().map_err(ConsentedError::Store)?;
     resume_removal(store, entry, || Ok(()))?;
+    remove_unreceipted_publish(store, entry)?;
     let receipt = match load_receipt(store) {
         Err(ConsentedError::Missing) => return Ok(()),
         other => other?,
@@ -435,7 +480,37 @@ fn resume_removal(
     Ok(())
 }
 
+/// Only the current entry's exact publication can be an orphan. The store
+/// lock serializes namespace changes; the lease excludes a surviving unit.
+fn remove_unreceipted_publish(
+    store: &ModelStore,
+    entry: &ConsentedCatalogEntry,
+) -> Result<(), ConsentedError> {
+    let hash = content_hash(entry);
+    match load_receipt(store) {
+        Ok(receipt) if receipt.content_hash == hash => return Ok(()),
+        Ok(_) | Err(ConsentedError::Missing) => {}
+        Err(error) => return Err(error),
+    }
+    let root = install_root(store, entry.id, &hash);
+    if super::safe_fs::dir_present(&root).map_err(ConsentedError::Fs)? {
+        let lease = lease_file(store, &hash)?;
+        flock(&lease, libc::LOCK_EX)?;
+        fs::remove_dir_all(&root)?;
+        sync_dir(root.parent().expect("version parent"))?;
+    }
+    Ok(())
+}
+
 fn lease_file(store: &ModelStore, hash: &str) -> Result<File, ConsentedError> {
+    open_lease(
+        &store
+            .root()
+            .join("private")
+            .join(format!("consented-{hash}.lease")),
+    )
+}
+fn open_lease(path: &Path) -> Result<File, ConsentedError> {
     Ok(OpenOptions::new()
         .read(true)
         .write(true)
@@ -443,12 +518,7 @@ fn lease_file(store: &ModelStore, hash: &str) -> Result<File, ConsentedError> {
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(
-            store
-                .root()
-                .join("private")
-                .join(format!("consented-{hash}.lease")),
-        )?)
+        .open(path)?)
 }
 fn flock(file: &File, operation: i32) -> Result<(), ConsentedError> {
     // SAFETY: flock borrows a valid owned fd; it does not dereference memory.
@@ -957,7 +1027,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod install_tests {
+pub(crate) mod install_tests {
     use super::super::installer::{BusyMaintenance, IdleMaintenance};
     use super::super::{CatalogEntry, ScriptedFetcher, ScriptedHop};
     use super::*;
@@ -992,7 +1062,7 @@ mod install_tests {
             ..INPUT
         }
     }
-    fn entry() -> ConsentedCatalogEntry {
+    pub(crate) fn entry() -> ConsentedCatalogEntry {
         ConsentedCatalogEntry {
             id: "consented-test",
             revision: "1",
@@ -1132,7 +1202,7 @@ mod install_tests {
             clock: InstallClock::default(),
         }
     }
-    fn install(store: &ModelStore) -> ConsentedReceipt {
+    pub(crate) fn install(store: &ModelStore) -> ConsentedReceipt {
         install_with_entry(
             request(
                 store,
@@ -1144,6 +1214,14 @@ mod install_tests {
         )
         .unwrap()
     }
+    pub(crate) fn replace_fixture_receipt(store: &ModelStore) -> ConsentedReceipt {
+        let mut receipt = load_receipt(store).unwrap();
+        receipt.consent.unix_time += 1;
+        receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+        store_receipt(store, &receipt).unwrap();
+        receipt
+    }
+
     #[test]
     fn consented_install_verifies_and_removes_without_production_receipt() {
         let (_temp, store) = store();
@@ -1315,6 +1393,63 @@ mod install_tests {
         ));
         assert_eq!(load_receipt(&store).unwrap(), prior);
     }
+    #[test]
+    fn consented_unreaped_health_retains_unreceipted_publish_and_next_install_resumes() {
+        struct Unreaped;
+        impl ConsentedHealth for Unreaped {
+            fn check(&self, _: &ConsentedLayout) -> Result<(), ConsentedError> {
+                Err(ConsentedError::HealthUnreaped)
+            }
+        }
+        let (_temp, store) = store();
+        let root = install_root(&store, entry().id, &content_hash(&entry()));
+        assert!(matches!(
+            install_with_entry(
+                request(&store, &fetcher(), &FakeBuilder::default(), &Unreaped),
+                &entry()
+            ),
+            Err(ConsentedError::HealthUnreaped)
+        ));
+        assert!(root.exists());
+        assert!(!receipt_path(&store).exists());
+        // Once the unit has stopped, a new install safely rebuilds this orphan.
+        install(&store);
+        assert!(verify_with_entry(&store, &entry()).is_ok());
+    }
+
+    #[test]
+    fn consented_rollback_and_remove_preserve_a_live_health_lease() {
+        use std::cell::RefCell;
+        struct LeasedHealth(RefCell<Option<ConsentedLease>>);
+        impl ConsentedHealth for LeasedHealth {
+            fn check(&self, layout: &ConsentedLayout) -> Result<(), ConsentedError> {
+                *self.0.borrow_mut() = Some(consented_install_lease(layout)?);
+                Err(ConsentedError::Health(
+                    "ordinary failure while still leased".into(),
+                ))
+            }
+        }
+        let (_temp, store) = store();
+        let root = install_root(&store, entry().id, &content_hash(&entry()));
+        let health = LeasedHealth(RefCell::new(None));
+        assert!(
+            install_with_entry(
+                request(&store, &fetcher(), &FakeBuilder::default(), &health),
+                &entry()
+            )
+            .is_err()
+        );
+        assert!(root.exists());
+        assert!(!receipt_path(&store).exists());
+        assert!(matches!(
+            remove_with_entry(&store, &entry()),
+            Err(ConsentedError::Leased)
+        ));
+        drop(health);
+        remove_with_entry(&store, &entry()).unwrap();
+        assert!(!root.exists());
+    }
+
     #[test]
     fn consented_build_and_health_failure_remove_new_publish_keep_prior_receipt() {
         let (_temp, store) = store();

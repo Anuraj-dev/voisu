@@ -13,7 +13,6 @@ use super::bounds::{
 use super::dev::DevWorker;
 use super::protocol::{ControlFrame, Correlation, WorkerFrame};
 use super::supervisor::{ReapOutcome, SupervisorError, WorkerChild};
-#[cfg(not(test))]
 use crate::local_model::{ActiveReceipt, FilePin};
 use crate::local_model::{
     CONSENTED_ENTRY, ConsentedError, ConsentedFilePin, ConsentedHealth, ConsentedLayout,
@@ -38,10 +37,11 @@ impl ConsentedHealth for ConsentedWorkerHealth {
     fn check(&self, layout: &ConsentedLayout) -> Result<(), ConsentedError> {
         // The installer holds its exclusive store lock and has verified the
         // published tree; the receipt is committed only after this probe.
+        let lease = crate::local_model::consented::consented_install_lease(layout)?;
         let pins = catalog_pins();
         let (manifest, hash, file) = prepare_manifest(layout, &pins, &self.state_dir)?;
         let mut worker =
-            DevWorker::launch_consented(manifest, hash.clone(), file, &layout.root, None)
+            DevWorker::launch_consented(manifest, hash.clone(), file, &layout.root, None, lease)
                 .map_err(health_error)?;
         check_worker_health(&mut worker, &hash)
     }
@@ -88,11 +88,11 @@ fn check_worker_health(worker: &mut impl WorkerChild, hash: &str) -> Result<(), 
             Instant::now() + CANCEL_GRACE,
         );
     }
-    let reaped = worker.cancel_and_reap().map_err(health_error)?;
+    let reaped = worker
+        .cancel_and_reap()
+        .map_err(|_| ConsentedError::HealthUnreaped)?;
     if reaped == ReapOutcome::Unreaped {
-        return Err(ConsentedError::Health(
-            "health worker unit was not reaped".into(),
-        ));
+        return Err(ConsentedError::HealthUnreaped);
     }
     result
 }
@@ -105,7 +105,18 @@ pub(crate) fn verify_default_consented_install() -> Result<VerifiedConsentedInst
     verify_consented_install(&store)
 }
 
-#[cfg(not(test))]
+pub(crate) fn select_consented_receipt(
+    pilot: bool,
+    verify: impl FnOnce() -> Result<VerifiedConsentedInstall, ConsentedError>,
+) -> Option<ActiveReceipt> {
+    if pilot {
+        return None;
+    }
+    verify()
+        .ok()
+        .map(|install| consented_active_receipt(&install))
+}
+
 pub(crate) fn consented_active_receipt(install: &VerifiedConsentedInstall) -> ActiveReceipt {
     let receipt = install.receipt();
     ActiveReceipt {
@@ -146,7 +157,9 @@ pub(crate) fn launch_consented_worker(
     let state = models.parent().ok_or(ConsentedError::Receipt)?;
     let (manifest, hash, file) = prepare_manifest(layout, &install.receipt().files, state)?;
     let root = layout.root.clone();
-    DevWorker::launch_consented(manifest, hash, file, &root, Some(install)).map_err(health_error)
+    let lease = crate::local_model::consented::consented_install_lease(install.layout())?;
+    DevWorker::launch_consented(manifest, hash, file, &root, Some(install), lease)
+        .map_err(health_error)
 }
 
 fn catalog_pins() -> BTreeMap<String, ConsentedFilePin> {
@@ -347,7 +360,11 @@ mod tests {
                 shutdown: false,
                 reaped: false,
             };
-            assert_eq!(check_worker_health(&mut worker, "h").is_ok(), accepted);
+            let result = check_worker_health(&mut worker, "h");
+            assert_eq!(result.is_ok(), accepted);
+            if reap == ReapOutcome::Unreaped {
+                assert!(matches!(result, Err(ConsentedError::HealthUnreaped)));
+            }
             assert!(worker.reaped);
             assert_eq!(worker.shutdown, device == "cuda:0" && refusal.is_none());
         }
