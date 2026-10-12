@@ -477,7 +477,17 @@ pub(crate) fn verify_with_entry(
     store: &ModelStore,
     entry: &ConsentedCatalogEntry,
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
-    verify_with_entry_mode(store, entry, false)
+    verify_with_entry_notifying(store, entry, || {})
+}
+
+/// Notify only after receipt and install preflight succeeds, before the costly
+/// file verification. Missing or inadmissible installs never enter this stage.
+pub(crate) fn verify_with_entry_notifying(
+    store: &ModelStore,
+    entry: &ConsentedCatalogEntry,
+    on_verifying: impl FnOnce(),
+) -> Result<VerifiedConsentedInstall, ConsentedError> {
+    verify_with_entry_mode(store, entry, false, on_verifying)
 }
 
 /// Re-hash every runtime file and reject all unmanifested runtime entries.
@@ -485,13 +495,14 @@ pub(crate) fn verify_with_entry(
 pub fn verify_consented_install_full(
     store: &ModelStore,
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
-    verify_with_entry_mode(store, &CONSENTED_ENTRY, true)
+    verify_with_entry_mode(store, &CONSENTED_ENTRY, true, || {})
 }
 
 fn verify_with_entry_mode(
     store: &ModelStore,
     entry: &ConsentedCatalogEntry,
     full: bool,
+    on_verifying: impl FnOnce(),
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
     let _lock = store.lock_exclusive().map_err(ConsentedError::Store)?;
     resume_removal(store, entry, || Ok(()))?;
@@ -506,6 +517,7 @@ fn verify_with_entry_mode(
     let layout = validate_receipt(store, entry, &receipt)?;
     let lease = consented_install_lease(&layout)?;
     let observation = ConsentedObservation::capture(&layout, &receipt)?;
+    on_verifying();
     if full {
         verify_layout_full(&layout, &receipt)?;
     } else {
@@ -2145,7 +2157,7 @@ pub(crate) mod install_tests {
         let path = root.join("runtime/venv/lib/python3.11/site-packages/fixture/__init__.py");
         fs::write(&path, b"changed").unwrap(); // same length as "fixture"
         assert!(verify_with_entry(&store, &entry()).is_ok());
-        assert!(verify_with_entry_mode(&store, &entry(), true).is_err());
+        assert!(verify_with_entry_mode(&store, &entry(), true, || {}).is_err());
     }
     #[test]
     fn consented_launch_allows_audited_deep_cache_full_verifier_rejects_extras() {
@@ -2156,7 +2168,7 @@ pub(crate) mod install_tests {
         fs::create_dir(&cache).unwrap();
         fs::write(cache.join("fixture.pyc"), b"cache").unwrap();
         assert!(verify_with_entry(&store, &entry()).is_ok());
-        assert!(verify_with_entry_mode(&store, &entry(), true).is_err());
+        assert!(verify_with_entry_mode(&store, &entry(), true, || {}).is_err());
         fs::set_permissions(cache.join("fixture.pyc"), fs::Permissions::from_mode(0o666)).unwrap();
         assert!(verify_with_entry(&store, &entry()).is_err());
     }

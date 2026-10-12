@@ -95,7 +95,9 @@ impl Gate {
     fn new() -> Self {
         Self {
             readiness: LocalReadiness::Absent,
-            published: Arc::new(Mutex::new(LocalReadiness::Absent)),
+            published: Arc::new(Mutex::new(LocalReadiness::Unavailable {
+                error: LOCAL_UNAVAILABLE.to_owned(),
+            })),
             failed_observation: None,
             receipt: None,
             consented_observation: None,
@@ -281,17 +283,41 @@ impl Gate {
     {
         #[cfg(test)]
         {
+            self.verify_consented_with_progress(|| {})
+        }
+        #[cfg(not(test))]
+        {
+            crate::local_worker::verify_default_consented_install()
+        }
+    }
+
+    fn verify_consented_with_progress(
+        &self,
+        on_verifying: impl FnOnce(),
+    ) -> Result<crate::local_model::VerifiedConsentedInstall, crate::local_model::ConsentedError>
+    {
+        #[cfg(test)]
+        {
             self.verification_count
                 .set(self.verification_count.get() + 1);
             let (store, entry) = self
                 .test_consented
                 .as_ref()
                 .ok_or(crate::local_model::ConsentedError::Missing)?;
-            crate::local_model::consented::verify_with_entry(store, entry)
+            crate::local_model::consented::verify_with_entry_notifying(store, entry, on_verifying)
         }
         #[cfg(not(test))]
         {
-            crate::local_worker::verify_default_consented_install()
+            use crate::local_model::{CONSENTED_ENTRY, ConsentedError, models_dir_from_state};
+            let dir =
+                models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+                    .map_err(ConsentedError::Store)?;
+            let store = ModelStore::open(dir).map_err(ConsentedError::Store)?;
+            crate::local_model::consented::verify_with_entry_notifying(
+                &store,
+                &CONSENTED_ENTRY,
+                on_verifying,
+            )
         }
     }
 
@@ -313,15 +339,18 @@ impl Gate {
                 return Some(receipt.clone());
             }
             self.consented_observation = None;
-            self.publish(LocalReadiness::Verifying);
             if let Some(receipt) = crate::local_worker::select_consented_receipt(false, || {
-                let install = self.verify_consented().map_err(|error| {
-                    self.worker_failure = Some(match error {
-                        crate::local_model::ConsentedError::Missing => LOCAL_UNAVAILABLE.to_owned(),
-                        _ => format!("{LOCAL_UNAVAILABLE}: {error:?}"),
-                    });
-                    error
-                })?;
+                let install = self
+                    .verify_consented_with_progress(|| self.publish(LocalReadiness::Verifying))
+                    .map_err(|error| {
+                        self.worker_failure = Some(match error {
+                            crate::local_model::ConsentedError::Missing => {
+                                LOCAL_UNAVAILABLE.to_owned()
+                            }
+                            _ => format!("{LOCAL_UNAVAILABLE}: {error:?}"),
+                        });
+                        error
+                    })?;
                 self.worker_failure = None;
                 let receipt = crate::local_worker::consented_active_receipt(&install);
                 let observation =
@@ -713,7 +742,11 @@ fn gate() -> &'static Mutex<Gate> {
 
 fn published_readiness() -> &'static Arc<Mutex<LocalReadiness>> {
     static PUBLISHED: OnceLock<Arc<Mutex<LocalReadiness>>> = OnceLock::new();
-    PUBLISHED.get_or_init(|| Arc::new(Mutex::new(LocalReadiness::Absent)))
+    PUBLISHED.get_or_init(|| {
+        Arc::new(Mutex::new(LocalReadiness::Unavailable {
+            error: LOCAL_UNAVAILABLE.to_owned(),
+        }))
+    })
 }
 
 fn published_snapshot(published: &Mutex<LocalReadiness>) -> LocalReadiness {
@@ -721,14 +754,6 @@ fn published_snapshot(published: &Mutex<LocalReadiness>) -> LocalReadiness {
         .lock()
         .map(|readiness| readiness.clone())
         .unwrap_or(LocalReadiness::Verifying)
-}
-
-fn publish_initial_verification(published: &Mutex<LocalReadiness>) {
-    if let Ok(mut readiness) = published.lock()
-        && matches!(*readiness, LocalReadiness::Absent)
-    {
-        *readiness = LocalReadiness::Verifying;
-    }
 }
 
 fn schedule_readiness_refresh(
@@ -789,7 +814,6 @@ pub fn runtime_readiness() -> LocalReadiness {
     #[cfg(not(test))]
     {
         static REFRESHING: AtomicBool = AtomicBool::new(false);
-        publish_initial_verification(published_readiness());
         let _ = schedule_readiness_refresh(gate(), &REFRESHING);
         readiness_snapshot()
     }
@@ -1348,22 +1372,100 @@ mod tests {
     }
 
     #[test]
-    fn initial_publication_never_overwrites_a_completed_refresh() {
-        let published = Mutex::new(LocalReadiness::Absent);
-        publish_initial_verification(&published);
-        assert_eq!(published_snapshot(&published), LocalReadiness::Verifying);
-        for completed in [
-            LocalReadiness::Ready {
-                model_identity: Some("verified".into()),
-            },
-            LocalReadiness::Unavailable {
-                error: "confirmed failure".into(),
-            },
-        ] {
-            *published.lock().unwrap() = completed.clone();
-            publish_initial_verification(&published);
-            assert_eq!(published_snapshot(&published), completed);
+    fn missing_consented_install_never_publishes_verifying() {
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::local_model::ModelStore::open(state.path().join("models")).unwrap();
+        let mut gate = Gate::new();
+        gate.test_consented = Some((store, crate::local_model::consented::install_tests::entry()));
+        let unavailable = LocalReadiness::Unavailable {
+            error: LOCAL_UNAVAILABLE.to_owned(),
+        };
+        assert_eq!(published_snapshot(&gate.published), unavailable);
+        assert!(gate.peek_selected_receipt().is_none());
+        assert_eq!(published_snapshot(&gate.published), unavailable);
+        assert_eq!(gate.refresh(), unavailable);
+        assert!(!gate.readiness.admits_capture());
+        assert_eq!(gate.launch_count, 0);
+    }
+
+    #[test]
+    fn inadmissible_consented_install_never_publishes_verifying() {
+        for missing_install in [false, true] {
+            let (_state, mut gate, _) = consented_gate();
+            let install = gate.verify_consented().unwrap();
+            let root = install.layout().root.clone();
+            drop(install);
+            let (store, _) = gate.test_consented.as_ref().unwrap();
+            if missing_install {
+                std::fs::remove_dir_all(root).unwrap();
+            } else {
+                std::fs::write(
+                    store.root().join("private/consented.receipt.json"),
+                    b"invalid",
+                )
+                .unwrap();
+            }
+            let unavailable = published_snapshot(&gate.published);
+            assert!(gate.peek_selected_receipt().is_none());
+            assert_eq!(published_snapshot(&gate.published), unavailable);
+            assert!(matches!(
+                gate.refresh(),
+                LocalReadiness::Unavailable { error } if error.starts_with(LOCAL_UNAVAILABLE)
+            ));
+            assert_eq!(gate.launch_count, 0);
         }
+    }
+
+    #[test]
+    fn consented_verification_publishes_before_file_hashing() {
+        let (_state, owned, _) = consented_gate();
+        let install = owned.verify_consented().unwrap();
+        let weights = install.layout().weights.join("model.bin");
+        let bytes = std::fs::read(&weights).unwrap();
+        drop(install);
+        let published = owned.published.clone();
+        let gate = Mutex::new(owned);
+        let (stage_tx, stage_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let verifier = std::thread::spawn(move || {
+            let held = gate.lock().unwrap();
+            held.verify_consented_with_progress(|| {
+                held.publish(LocalReadiness::Verifying);
+                stage_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            })
+        });
+        stage_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("an installed model must enter verification");
+        let during_verification = published_snapshot(&published);
+        // A mutation after the notification must still be caught by hashing.
+        std::fs::write(weights, vec![b'x'; bytes.len()]).unwrap();
+        resume_tx.send(()).unwrap();
+        let result = verifier.join().unwrap();
+        assert_eq!(during_verification, LocalReadiness::Verifying);
+        assert!(matches!(
+            result,
+            Err(crate::local_model::ConsentedError::Digest(_))
+        ));
+    }
+
+    #[test]
+    fn queued_refresh_without_an_install_stays_unavailable() {
+        let owned = Gate::new();
+        let published = owned.published.clone();
+        let gate: &'static Mutex<Gate> = Box::leak(Box::new(Mutex::new(owned)));
+        let refreshing = Box::leak(Box::new(AtomicBool::new(false)));
+        let held = gate.lock().unwrap();
+        let worker = schedule_readiness_refresh(gate, refreshing).unwrap();
+        let unavailable = LocalReadiness::Unavailable {
+            error: LOCAL_UNAVAILABLE.to_owned(),
+        };
+        let queued = published_snapshot(&published);
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(queued, unavailable);
+        assert_eq!(published_snapshot(&published), unavailable);
     }
 
     #[test]
