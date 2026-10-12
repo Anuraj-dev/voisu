@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
-use crate::local_model::DevManifest;
+use crate::local_model::{DevManifest, VerifiedConsentedInstall};
 
 use super::bounds::{CANCEL_GRACE, MAX_JSON_FRAME_BYTES, MAX_PCM_BYTES, REAP_OBSERVE};
 use super::protocol::{
@@ -29,6 +29,7 @@ const SYSTEMCTL: &str = "systemctl";
 const MAX_REPLY_BYTES: usize = MAX_JSON_FRAME_BYTES;
 const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 const DEV_WORKER_UNITS: &str = "voisu-dev-worker-*";
+const CONSENTED_WORKER_UNITS: &str = "voisu-consented-worker-*";
 static NEXT_UNIT: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
@@ -53,17 +54,21 @@ pub struct DevWorker {
     /// Until then `Drop` retries the stop, so an `Unreaped` cancel is not
     /// forgotten.
     unit_stopped: bool,
+    /// Removal must remain refused until the unit is confirmed stopped.
+    consented_install: Option<VerifiedConsentedInstall>,
+    manifest_file: Option<tempfile::NamedTempFile>,
 }
 
 /// Runtime factory output used by the existing Caps Lock Local path.  The
 /// production Whisper adapter remains available, while an explicit private
 /// development manifest selects the supervised development adapter.
 pub fn refuse_if_development_worker_loaded() -> Result<(), SupervisorError> {
-    refuse_if_units_live(DEV_WORKER_UNITS)
+    refuse_if_live_units(&live_units(&[DEV_WORKER_UNITS, CONSENTED_WORKER_UNITS])?)
 }
 
+#[cfg(test)]
 fn refuse_if_units_live(pattern: &str) -> Result<(), SupervisorError> {
-    refuse_if_live_units(&live_units(pattern)?)
+    refuse_if_live_units(&live_units(&[pattern])?)
 }
 
 fn refuse_if_live_units(units: &[String]) -> Result<(), SupervisorError> {
@@ -77,6 +82,7 @@ fn refuse_if_live_units(units: &[String]) -> Result<(), SupervisorError> {
 pub enum RuntimeWorker {
     Whisper(WhisperCppWorker),
     Development(Box<DevWorker>),
+    Consented(Box<DevWorker>),
 }
 
 impl WorkerChild for RuntimeWorker {
@@ -88,21 +94,23 @@ impl WorkerChild for RuntimeWorker {
     ) -> Result<WorkerFrame, SupervisorError> {
         match self {
             Self::Whisper(worker) => worker.exchange(control, pcm, deadline),
-            Self::Development(worker) => worker.exchange(control, pcm, deadline),
+            Self::Development(worker) | Self::Consented(worker) => {
+                worker.exchange(control, pcm, deadline)
+            }
         }
     }
 
     fn cancel_and_reap(&mut self) -> Result<ReapOutcome, SupervisorError> {
         match self {
             Self::Whisper(worker) => worker.cancel_and_reap(),
-            Self::Development(worker) => worker.cancel_and_reap(),
+            Self::Development(worker) | Self::Consented(worker) => worker.cancel_and_reap(),
         }
     }
 
     fn last_inference_metrics(&self) -> super::supervisor::InferenceMetrics {
         match self {
             Self::Whisper(worker) => worker.last_inference_metrics(),
-            Self::Development(worker) => worker.last_inference_metrics(),
+            Self::Development(worker) | Self::Consented(worker) => worker.last_inference_metrics(),
         }
     }
 }
@@ -113,18 +121,49 @@ impl DevWorker {
         manifest_hash: impl Into<String>,
         manifest_path: &Path,
     ) -> Result<Self, SupervisorError> {
-        let manifest_hash = manifest_hash.into();
-        // Only one development worker may hold the model/GPU at a time,
+        Self::launch_isolated(manifest, manifest_hash.into(), manifest_path, None)
+    }
+
+    pub(crate) fn launch_consented(
+        manifest: DevManifest,
+        manifest_hash: String,
+        manifest_file: tempfile::NamedTempFile,
+        install_root: &Path,
+        install: Option<VerifiedConsentedInstall>,
+    ) -> Result<Self, SupervisorError> {
+        let mut worker = Self::launch_isolated(
+            manifest,
+            manifest_hash,
+            manifest_file.path(),
+            Some(install_root),
+        )?;
+        worker.consented_install = install;
+        worker.manifest_file = Some(manifest_file);
+        Ok(worker)
+    }
+
+    fn launch_isolated(
+        manifest: DevManifest,
+        manifest_hash: String,
+        manifest_path: &Path,
+        install_root: Option<&Path>,
+    ) -> Result<Self, SupervisorError> {
+        // Only one transient worker may hold the model/GPU at a time,
         // including one that is still starting or being stopped.
         refuse_if_development_worker_loaded()?;
+        let prefix = if install_root.is_some() {
+            "voisu-consented-worker"
+        } else {
+            "voisu-dev-worker"
+        };
         let unit = format!(
-            "voisu-dev-worker-{}-{}",
+            "{prefix}-{}-{}",
             std::process::id(),
             NEXT_UNIT.fetch_add(1, Ordering::Relaxed)
         );
         let cache = cache_path(&manifest);
         std::fs::create_dir_all(&cache).map_err(|_| SupervisorError::LoadAborted)?;
-        let args = systemd_run_args(&unit, &cache, &manifest, manifest_path);
+        let args = isolated_systemd_run_args(&unit, &cache, &manifest, manifest_path, install_root);
         let mut command = Command::new(SYSTEMD_RUN);
         command
             .args(&args)
@@ -150,6 +189,8 @@ impl DevWorker {
             cpu_time_ms: None,
             correlated_reply_seen: false,
             unit_stopped: false,
+            consented_install: None,
+            manifest_file: None,
         })
     }
 
@@ -172,6 +213,8 @@ impl DevWorker {
             correlated_reply_seen: false,
             // Nothing was launched, so there is nothing for `Drop` to stop.
             unit_stopped: true,
+            consented_install: None,
+            manifest_file: None,
         }
     }
 
@@ -504,6 +547,16 @@ impl Drop for DevWorker {
         if !self.unit_stopped {
             let _ = self.unit_stop();
         }
+        if !self.unit_stopped {
+            // A failed reap must not release the lease or delete the manifest
+            // underneath a live unit. Retain them conservatively until exit.
+            if let Some(install) = self.consented_install.take() {
+                std::mem::forget(install);
+            }
+            if let Some(file) = self.manifest_file.take() {
+                std::mem::forget(file);
+            }
+        }
     }
 }
 
@@ -685,7 +738,7 @@ fn default_cache_path(model_path: &Path) -> PathBuf {
 }
 
 /// Loaded units matching `pattern` that may still hold a worker.
-fn live_units(pattern: &str) -> Result<Vec<String>, SupervisorError> {
+fn live_units(patterns: &[&str]) -> Result<Vec<String>, SupervisorError> {
     let output = Command::new(SYSTEMCTL)
         .args([
             "--user",
@@ -694,8 +747,8 @@ fn live_units(pattern: &str) -> Result<Vec<String>, SupervisorError> {
             "--type=service",
             "--plain",
             "--no-legend",
-            pattern,
         ])
+        .args(patterns)
         .output()
         .map_err(|_| SupervisorError::Unavailable("cannot list development worker units"))?;
     if !output.status.success() {
@@ -718,11 +771,22 @@ fn parse_live_units(listing: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn systemd_run_args(
     unit: &str,
     cache: &Path,
     manifest: &DevManifest,
     manifest_path: &Path,
+) -> Vec<String> {
+    isolated_systemd_run_args(unit, cache, manifest, manifest_path, None)
+}
+
+fn isolated_systemd_run_args(
+    unit: &str,
+    cache: &Path,
+    manifest: &DevManifest,
+    manifest_path: &Path,
+    install_root: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
         "--user".into(),
@@ -735,7 +799,7 @@ fn systemd_run_args(
         "--property=RestrictAddressFamilies=AF_UNIX".into(),
         "--property=ProtectSystem=strict".into(),
         "--property=ProtectHome=read-only".into(),
-        format!("--property=ReadWritePaths={}", cache.display()),
+        format!("--property=ReadWritePaths={}", systemd_path(cache)),
         format!("--property=MemoryMax={}", manifest.limits.memory_bytes),
         format!("--property=TasksMax={}", manifest.limits.tasks),
         format!(
@@ -767,6 +831,13 @@ fn systemd_run_args(
     {
         args.push(format!("--setenv=LD_LIBRARY_PATH={}", library.display()));
     }
+    if let Some(root) = install_root {
+        args.push(format!(
+            "--property=ReadOnlyPaths={} {}",
+            systemd_path(root),
+            systemd_path(manifest_path)
+        ));
+    }
     args.extend([
         "--".into(),
         manifest.runtime.python.clone(),
@@ -778,10 +849,75 @@ fn systemd_run_args(
     args
 }
 
+/// Path-list unit properties parse quoting themselves, after argv handling.
+fn systemd_path(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('%', "%%");
+    if value
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '"' | '\\'))
+    {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        value
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::local_model::{DevLimits, DevRuntimeManifest};
+
+    #[test]
+    fn consented_transient_unit_preserves_the_offline_sandbox() {
+        let mut manifest = test_manifest("cuda:0");
+        manifest.runtime.python = "/state/install/runtime/venv/bin/python".into();
+        manifest.runtime.worker = "/state/install/worker/worker.py".into();
+        assert_eq!(
+            isolated_systemd_run_args(
+                "voisu-consented-worker-123-1",
+                Path::new("/state/cache"),
+                &manifest,
+                Path::new("/state/manifest.json"),
+                Some(Path::new("/state/install"))
+            ),
+            vec![
+                "--user",
+                "--pipe",
+                "--wait",
+                "--collect",
+                "--unit=voisu-consented-worker-123-1",
+                "--property=NoNewPrivileges=yes",
+                "--property=PrivateNetwork=yes",
+                "--property=RestrictAddressFamilies=AF_UNIX",
+                "--property=ProtectSystem=strict",
+                "--property=ProtectHome=read-only",
+                "--property=ReadWritePaths=/state/cache",
+                "--property=MemoryMax=1024",
+                "--property=TasksMax=4",
+                "--property=CPUQuota=100%",
+                "--property=RestrictSUIDSGID=yes",
+                "--property=UMask=0077",
+                "--setenv=PYTHONNOUSERSITE=1",
+                "--setenv=HF_HUB_OFFLINE=1",
+                "--setenv=TRANSFORMERS_OFFLINE=1",
+                "--setenv=HF_DATASETS_OFFLINE=1",
+                "--setenv=HOME=/state/cache",
+                "--setenv=TMPDIR=/state/cache",
+                "--setenv=TMP=/state/cache",
+                "--setenv=TEMP=/state/cache",
+                "--setenv=VOISU_DEV_DEVICE=cuda:0",
+                "--setenv=CUDA_VISIBLE_DEVICES=0",
+                "--setenv=CUDA_DEVICE_ORDER=PCI_BUS_ID",
+                "--property=ReadOnlyPaths=/state/install /state/manifest.json",
+                "--",
+                "/state/install/runtime/venv/bin/python",
+                "-I",
+                "/state/install/worker/worker.py",
+                "--manifest",
+                "/state/manifest.json",
+            ]
+        );
+    }
 
     fn test_manifest(device: &str) -> DevManifest {
         let vram_bytes = if device == "cpu" { 0 } else { 1 };

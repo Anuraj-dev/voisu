@@ -9,6 +9,7 @@
 
 mod bakeoff;
 mod bounds;
+mod consented;
 mod dev;
 mod lifecycle;
 mod protocol;
@@ -35,6 +36,11 @@ pub use bounds::{
     desired_cgroup_spec, host_cpu_cores, host_physical_ram_bytes, local_response_deadline,
     record_resource_evidence, resolve_live_worker_limits, resolve_worker_limits, vram_budget_bytes,
     worker_cpu_quota_cores, worker_memory_ceiling_bytes,
+};
+pub use consented::ConsentedWorkerHealth;
+#[cfg(not(test))]
+pub(crate) use consented::{
+    consented_active_receipt, launch_consented_worker, verify_default_consented_install,
 };
 pub use dev::{DevWorker, RuntimeWorker, refuse_if_development_worker_loaded};
 pub use lifecycle::{LocalLifecycle, local_runtime_admission};

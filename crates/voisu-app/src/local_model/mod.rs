@@ -22,6 +22,12 @@ mod safe_fs;
 mod store;
 mod url_policy;
 
+pub(crate) fn consented_worker_files() -> &'static [(&'static str, &'static [u8])] {
+    consented_catalog::WORKER_FILES
+}
+#[cfg(not(test))]
+pub(crate) use receipt::FilePin;
+
 pub use catalog::{
     Catalog, CatalogEntry, CatalogFile, DeviceSupport, FileKind, LicenseTerms, Provenance,
     Redistribution, RuntimeAbi, SHA256_HEX_LEN, ci_fixture_entry, development_selection,
