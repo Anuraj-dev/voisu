@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.63.1
+Version:        0.64.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -163,6 +163,9 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Mon Oct 12 2026 Voisu maintainers <voisu@example.invalid> - 0.64.0-1
+- feat(local): make Local launch-ready with honest readiness, no filler text, and a compact setup (#27
+
 * Mon Sep 28 2026 Voisu maintainers <voisu@example.invalid> - 0.63.1-1
 - fix(ubuntu): start the daemon once GNOME exports the display (#277)
 
