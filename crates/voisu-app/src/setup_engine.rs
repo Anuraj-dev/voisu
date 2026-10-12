@@ -5,7 +5,8 @@
 use voisu_core::{AsrMode, KeyDiagnosis, KeyLocation, Provider};
 
 use crate::local_model::{
-    HostHardware, LocalSuggestion, suggest_local, suggestion_lines, warnings,
+    CONSENTED_ENTRY, DISTIL_MODEL_ID, HostHardware, LocalSuggestion, suggest_local,
+    suggestion_lines, warnings,
 };
 use crate::setup::WizardIo;
 
@@ -17,8 +18,18 @@ const GROQ_ONLY_HINT: &str =
     "No Deepgram key configured — run `voisu deepgram off` for the faster Groq-only path.";
 const LOCAL_AVAILABILITY: &str =
     "Availability: not installed — no Local model can be installed by setup in this release yet.";
+pub const INSTALLED_AVAILABILITY: &str =
+    "Availability: installed — distil-large-v3.5-int8 (Consented Install)";
 const LOCAL_SWITCH_CONFIRM: &str = "Local has no installed model yet; Voisu will refuse to dictate until one is installed. Switch to Local anyway?";
 const MAX_ENGINE_ATTEMPTS: u32 = 3;
+
+/// Injected Consented Install status. Tests never open the model store.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConsentedStatus {
+    Installed,
+    NotInstalled,
+    Unknown(String),
+}
 
 /// Outcome of the engine screen. The core does not persist the choice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,8 +41,9 @@ pub enum EngineChoice {
 /// Prints Cloud and Local together, then lets the user choose.
 ///
 /// `interactive` is decided by the binary from `stdin().is_terminal()`.
-/// `manifest_exists` is injected so tests never touch the filesystem.
+/// `manifest_exists` and `consented` are injected so tests never touch the filesystem.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn run_engine_screen(
     io: &mut dyn WizardIo,
     current: AsrMode,
@@ -40,9 +52,15 @@ pub fn run_engine_screen(
     groq: &KeyDiagnosis,
     interactive: bool,
     manifest_exists: impl Fn(&str) -> bool,
+    consented: ConsentedStatus,
 ) -> EngineChoice {
-    write_engine_screen(io, hw, deepgram, groq, &manifest_exists);
-    choose_engine(io, current, interactive)
+    write_engine_screen(io, hw, deepgram, groq, &manifest_exists, &consented);
+    choose_engine(
+        io,
+        current,
+        interactive,
+        matches!(consented, ConsentedStatus::Installed),
+    )
 }
 
 fn write_engine_screen(
@@ -51,6 +69,7 @@ fn write_engine_screen(
     deepgram: &KeyDiagnosis,
     groq: &KeyDiagnosis,
     manifest_exists: &impl Fn(&str) -> bool,
+    consented: &ConsentedStatus,
 ) {
     io.writeln(TITLE);
     io.writeln("");
@@ -78,7 +97,7 @@ fn write_engine_screen(
     for warning in warnings(hw) {
         io.writeln(&format!("Note: {warning}"));
     }
-    io.writeln(LOCAL_AVAILABILITY);
+    io.writeln(&availability_line(&suggestion, consented));
     let model_id = suggested_model_id(&suggestion);
     if manifest_exists(model_id) {
         io.writeln(&format!(
@@ -87,7 +106,47 @@ fn write_engine_screen(
     }
 }
 
-fn choose_engine(io: &mut dyn WizardIo, current: AsrMode, interactive: bool) -> EngineChoice {
+fn availability_line(suggestion: &LocalSuggestion, consented: &ConsentedStatus) -> String {
+    match consented {
+        ConsentedStatus::Installed => INSTALLED_AVAILABILITY.to_owned(),
+        ConsentedStatus::Unknown(reason) => format!("Availability: unknown — {reason}"),
+        ConsentedStatus::NotInstalled if distil_is_suggested(suggestion) => {
+            format!(
+                "Availability: not installed — setup can install {DISTIL_MODEL_ID} after explicit agreement ({} bytes).",
+                format_byte_count(CONSENTED_ENTRY.total_download_bytes)
+            )
+        }
+        ConsentedStatus::NotInstalled => LOCAL_AVAILABILITY.to_owned(),
+    }
+}
+
+#[must_use]
+pub(crate) fn distil_is_suggested(suggestion: &LocalSuggestion) -> bool {
+    matches!(
+        suggestion,
+        LocalSuggestion::Gpu { model_id, .. } if *model_id == DISTIL_MODEL_ID
+    )
+}
+
+#[must_use]
+pub(crate) fn format_byte_count(bytes: u64) -> String {
+    let digits = bytes.to_string().into_bytes();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.iter().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(char::from(*digit));
+    }
+    grouped
+}
+
+fn choose_engine(
+    io: &mut dyn WizardIo,
+    current: AsrMode,
+    interactive: bool,
+    local_model_installed: bool,
+) -> EngineChoice {
     if !interactive {
         io.writeln(&format!(
             "Non-interactive: keeping {}; use `voisu mode local|cloud` to change.",
@@ -114,6 +173,9 @@ fn choose_engine(io: &mut dyn WizardIo, current: AsrMode, interactive: bool) -> 
                 "2" => {
                     if current == AsrMode::Local {
                         return EngineChoice::Keep(AsrMode::Local);
+                    }
+                    if local_model_installed {
+                        return EngineChoice::Switch(AsrMode::Local);
                     }
                     return match ask_yes_no(io, LOCAL_SWITCH_CONFIRM, false) {
                         Some(true) => EngineChoice::Switch(AsrMode::Local),
@@ -172,7 +234,7 @@ fn mode_label(mode: AsrMode) -> &'static str {
 
 /// Asks a yes/no question. `None` means three invalid answers; EOF and Enter
 /// still take `default_yes` (No on the Local switch confirm).
-fn ask_yes_no(io: &mut dyn WizardIo, question: &str, default_yes: bool) -> Option<bool> {
+pub(crate) fn ask_yes_no(io: &mut dyn WizardIo, question: &str, default_yes: bool) -> Option<bool> {
     let suffix = if default_yes { " [Y/n]" } else { " [y/N]" };
     for _ in 0..MAX_ENGINE_ATTEMPTS {
         match io.prompt_line(&format!("{question}{suffix} ")) {
@@ -274,6 +336,29 @@ mod tests {
         answers: Vec<Option<&str>>,
         manifest_exists: impl Fn(&str) -> bool,
     ) -> (EngineChoice, FakeIo) {
+        run_with(
+            hw,
+            current,
+            deepgram,
+            groq,
+            interactive,
+            answers,
+            manifest_exists,
+            ConsentedStatus::NotInstalled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_with(
+        hw: &HostHardware,
+        current: AsrMode,
+        deepgram: &KeyDiagnosis,
+        groq: &KeyDiagnosis,
+        interactive: bool,
+        answers: Vec<Option<&str>>,
+        manifest_exists: impl Fn(&str) -> bool,
+        consented: ConsentedStatus,
+    ) -> (EngineChoice, FakeIo) {
         let mut io = FakeIo::new(answers);
         let choice = run_engine_screen(
             &mut io,
@@ -283,6 +368,7 @@ mod tests {
             groq,
             interactive,
             manifest_exists,
+            consented,
         );
         (choice, io)
     }
@@ -688,5 +774,98 @@ mod tests {
                 "hint condition ({status}): {text}"
             );
         }
+    }
+
+    #[test]
+    fn distil_availability_names_the_consented_install_and_size() {
+        let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
+        let (_, io) = run(
+            &hw,
+            AsrMode::Cloud,
+            &absent(),
+            &absent(),
+            false,
+            vec![],
+            |_| false,
+        );
+        let text = io.transcript();
+        let expected = format!(
+            "Availability: not installed — setup can install {DISTIL_MODEL_ID} after explicit agreement ({} bytes).",
+            format_byte_count(CONSENTED_ENTRY.total_download_bytes)
+        );
+        assert!(text.contains(&expected), "{text}");
+        assert!(
+            crate::local_model::CONSENT_TEXT
+                .contains(&format_byte_count(CONSENTED_ENTRY.total_download_bytes)),
+            "availability size must match CONSENT_TEXT"
+        );
+        assert!(!text.contains(LOCAL_AVAILABILITY), "{text}");
+        assert!(!text.contains("Recommended"), "{text}");
+    }
+
+    #[test]
+    fn parakeet_keeps_the_closed_availability_wording() {
+        for hw in [
+            host(GpuProbe::Nvidia(vec![gpu(0, 2048)])),
+            host(GpuProbe::NoneFound),
+        ] {
+            let (_, io) = run(
+                &hw,
+                AsrMode::Cloud,
+                &absent(),
+                &absent(),
+                false,
+                vec![],
+                |_| false,
+            );
+            let text = io.transcript();
+            assert!(text.contains(LOCAL_AVAILABILITY), "{text}");
+            assert!(
+                !text.contains("setup can install"),
+                "parakeet has no Consented Install: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn verified_install_shows_consented_availability_and_skips_the_switch_warning() {
+        let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
+        let (choice, io) = run_with(
+            &hw,
+            AsrMode::Cloud,
+            &absent(),
+            &absent(),
+            true,
+            vec![Some("2")],
+            |_| false,
+            ConsentedStatus::Installed,
+        );
+        assert_eq!(choice, EngineChoice::Switch(AsrMode::Local));
+        let text = io.transcript();
+        assert!(text.contains(INSTALLED_AVAILABILITY), "{text}");
+        assert!(!text.contains("Switch to Local anyway?"), "{text}");
+        assert_eq!(io.prompts, 1);
+    }
+
+    #[test]
+    fn unknown_consented_status_is_printed_and_still_confirms_a_switch() {
+        let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
+        let (choice, io) = run_with(
+            &hw,
+            AsrMode::Cloud,
+            &absent(),
+            &absent(),
+            true,
+            vec![Some("2"), Some("n")],
+            |_| false,
+            ConsentedStatus::Unknown("the model store is busy or unavailable".into()),
+        );
+        assert_eq!(choice, EngineChoice::Keep(AsrMode::Cloud));
+        let text = io.transcript();
+        assert!(
+            text.contains("Availability: unknown — the model store is busy or unavailable"),
+            "{text}"
+        );
+        assert!(text.contains("Switch to Local anyway?"), "{text}");
     }
 }
