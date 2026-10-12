@@ -18,7 +18,8 @@ is selected. Left click opens the panel. Middle click refreshes status.
 
 ## Panel
 
-The panel always lists the seven catalog ids:
+The panel always lists the development catalog ids (`DEV_MODEL_IDS` in
+`crates/voisu-app/src/local_model/development.rs`):
 
 - `nemotron-3.5-0.6b`
 - `parakeet-tdt-0.6b-v3`
@@ -27,6 +28,12 @@ The panel always lists the seven catalog ids:
 - `fun-asr-nano-2512`
 - `moonshine-streaming-medium`
 - `cohere-transcribe-03-2026`
+- `whisper-cpp-large-v3-turbo-q5-0`
+- `whisper-cpp-small-q8-0`
+- `faster-whisper-large-v3-turbo-int8`
+- `whisper-hindi2hinglish-apex-int8`
+- `distil-large-v3.5-int8`
+- `granite-speech-5.0-470m-turboctc`
 
 Exactly one row can be selected. Clicking a registered model runs
 `voisu local-dev select`. Unregistered models stay visible and disabled, with

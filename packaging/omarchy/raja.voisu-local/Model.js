@@ -9,7 +9,13 @@ var CATALOG_IDS = [
   "qwen3-asr-1.7b",
   "fun-asr-nano-2512",
   "moonshine-streaming-medium",
-  "cohere-transcribe-03-2026"
+  "cohere-transcribe-03-2026",
+  "whisper-cpp-large-v3-turbo-q5-0",
+  "whisper-cpp-small-q8-0",
+  "faster-whisper-large-v3-turbo-int8",
+  "whisper-hindi2hinglish-apex-int8",
+  "distil-large-v3.5-int8",
+  "granite-speech-5.0-470m-turboctc"
 ]
 
 var SHORT_LABELS = {
@@ -19,7 +25,13 @@ var SHORT_LABELS = {
   "qwen3-asr-1.7b": "Qwen 1.7B",
   "fun-asr-nano-2512": "Fun-ASR",
   "moonshine-streaming-medium": "Moonshine",
-  "cohere-transcribe-03-2026": "Cohere"
+  "cohere-transcribe-03-2026": "Cohere",
+  "whisper-cpp-large-v3-turbo-q5-0": "Turbo q5",
+  "whisper-cpp-small-q8-0": "Small q8",
+  "faster-whisper-large-v3-turbo-int8": "FW Turbo",
+  "whisper-hindi2hinglish-apex-int8": "Hinglish",
+  "distil-large-v3.5-int8": "Distil 3.5",
+  "granite-speech-5.0-470m-turboctc": "Granite"
 }
 
 var DEFAULT_VOISU_BINARY = "/home/raja/Anuraj-dev/voisu/target/release/voisu"

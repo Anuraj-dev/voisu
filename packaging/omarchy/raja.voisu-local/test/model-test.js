@@ -10,7 +10,13 @@ const CATALOG = [
   "qwen3-asr-1.7b",
   "fun-asr-nano-2512",
   "moonshine-streaming-medium",
-  "cohere-transcribe-03-2026"
+  "cohere-transcribe-03-2026",
+  "whisper-cpp-large-v3-turbo-q5-0",
+  "whisper-cpp-small-q8-0",
+  "faster-whisper-large-v3-turbo-int8",
+  "whisper-hindi2hinglish-apex-int8",
+  "distil-large-v3.5-int8",
+  "granite-speech-5.0-470m-turboctc"
 ]
 
 let failed = 0
@@ -60,9 +66,9 @@ function unregistered(modelId, error) {
   }
 }
 
-test("catalog lists the seven development model ids", () => {
+test("catalog lists every development model id", () => {
   assert.deepEqual(Model.catalogIds(), CATALOG)
-  assert.equal(Model.CATALOG_IDS.length, 7)
+  assert.equal(Model.CATALOG_IDS.length, CATALOG.length)
 })
 
 test("voisuBinary defaults to the development release binary", () => {
@@ -84,12 +90,12 @@ test("voisuBinary defaults to the development release binary", () => {
   ])
 })
 
-test("parseStatus always returns the seven catalog rows", () => {
+test("parseStatus always returns every catalog row", () => {
   const parsed = Model.parseStatus(JSON.stringify({
     production_selection: null,
     models: [registered(CATALOG[0], { selected: true })]
   }))
-  assert.equal(parsed.models.length, 7)
+  assert.equal(parsed.models.length, CATALOG.length)
   assert.deepEqual(parsed.models.map((row) => row.model_id), CATALOG)
   assert.equal(parsed.selectedId, CATALOG[0])
   assert.equal(Model.selectedCount(parsed), 1)
@@ -145,7 +151,7 @@ test("bar shows Local when none is selected", () => {
   assert.equal(Model.selectedCount(empty), 0)
   assert.equal(Model.barLabel(empty), "Local")
   assert.equal(Model.barLabel(Model.emptyStatus()), "Local")
-  assert.equal(Model.parseStatus("[]").models.length, 7)
+  assert.equal(Model.parseStatus("[]").models.length, CATALOG.length)
 })
 
 test("unknown ids in JSON are ignored", () => {
@@ -155,7 +161,7 @@ test("unknown ids in JSON are ignored", () => {
       registered(CATALOG[6], { selected: true })
     ]
   }))
-  assert.equal(parsed.models.length, 7)
+  assert.equal(parsed.models.length, CATALOG.length)
   assert.equal(parsed.selectedId, CATALOG[6])
   assert.equal(Model.findModel(parsed, "not-a-model"), null)
 })
