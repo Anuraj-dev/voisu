@@ -9,6 +9,10 @@ pub const INSTALL_DEADLINE: Duration = Duration::from_secs(30 * 60);
 pub const NO_PROGRESS: Duration = Duration::from_secs(30);
 
 mod catalog;
+mod consented;
+mod consented_catalog;
+mod consented_pins;
+mod consented_runtime;
 mod development;
 mod fetch;
 mod health;
@@ -22,6 +26,21 @@ pub use catalog::{
     Catalog, CatalogEntry, CatalogFile, DeviceSupport, FileKind, LicenseTerms, Provenance,
     Redistribution, RuntimeAbi, SHA256_HEX_LEN, ci_fixture_entry, development_selection,
     pilot_candidate, production_selection, sha256_hex, shipped_catalog, verify_file_digest,
+};
+pub use consented::{
+    ConsentedConsent, ConsentedError, ConsentedFilePin, ConsentedHealth, ConsentedInstallRequest,
+    ConsentedLayout, ConsentedReceipt, VerifiedConsentedInstall, install_consented_install,
+    remove_consented_install, verify_consented_install,
+};
+pub use consented_catalog::{
+    CONSENT_TEXT, CONSENTED_ENTRY, ConsentedCatalogEntry, DownloadPin,
+    ESTIMATED_EXTRACTED_RUNTIME_BYTES, EXPECTED_HEALTH_TEXT, REQUIRED_FREE_BYTES,
+    consented_health_clip,
+};
+pub use consented_pins::TOTAL_DOWNLOAD_BYTES;
+pub use consented_runtime::{
+    ConsentedCommandRunner, ConsentedRuntimeBuilder, OfflineRuntimeBuilder, RuntimeBuild,
+    SystemConsentedCommandRunner, audit_runtime_tree,
 };
 pub use development::{
     DEV_MODEL_IDS, DEVELOPMENT_MANIFEST_VERSION, DEVELOPMENT_ROOT_NAME, DevCatalogEntry,
