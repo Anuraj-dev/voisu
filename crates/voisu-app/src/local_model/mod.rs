@@ -18,6 +18,7 @@ mod fetch;
 mod hardware;
 mod health;
 mod installer;
+mod progress;
 mod receipt;
 mod safe_fs;
 mod store;
@@ -70,6 +71,9 @@ pub use installer::{
     InstallAbort, InstallClock, InstallConsent, InstallError, InstallIo, InstallRequest,
     MaintenanceError, MaintenanceKind, MaintenanceReservation, install_entry,
 };
+#[cfg(test)]
+pub(crate) use progress::ProgressSink;
+pub use progress::{InstallPhase, InstallProgress, SilentProgress};
 pub use receipt::{
     ActiveReceipt, ReceiptError, encode as encode_receipt, from_entry, parse as parse_receipt,
     retained_receipt_path, store_atomic as store_receipt_atomic,
@@ -81,7 +85,7 @@ pub use store::{
 };
 pub use suggest::{
     CpuReason, DISTIL_MIN_TOTAL_VRAM_MIB, DISTIL_MODEL_ID, LocalSuggestion, PARAKEET_MODEL_ID,
-    suggest_local, suggestion_lines, warnings,
+    RECOMMENDATION_PREFIX, suggest_local, suggestion_line, warnings,
 };
 pub use url_policy::{CatalogUrl, UrlPolicyError, validate_catalog_url};
 

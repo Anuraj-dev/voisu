@@ -14,6 +14,7 @@ use super::consented_catalog::{CONSENTED_ENTRY, ConsentedCatalogEntry, DownloadP
 use super::consented_runtime::{
     ConsentedRuntimeBuilder, RuntimeBuild, audit_runtime_tree, executable, sync_tree,
 };
+use super::progress::{InstallPhase, InstallProgress, ProgressSink};
 use super::{
     ArtifactFetcher, FetchError, FetchRequest, INSTALL_DEADLINE, InstallAbort, InstallClock,
     InstallIo, MaintenanceKind, MaintenanceReservation, ModelStore, NO_PROGRESS, SafeFsError,
@@ -303,6 +304,8 @@ pub struct ConsentedInstallRequest<'a> {
     pub maintenance: &'a dyn MaintenanceReservation,
     pub io: InstallIo,
     pub clock: InstallClock,
+    /// Observes download bytes and post-download phases; never alters results.
+    pub progress: &'a dyn InstallProgress,
 }
 
 pub fn install_consented_install(
@@ -386,6 +389,7 @@ fn install_with_receipt_sync(
         )?;
     }
     abort(&request, InstallAbort::AfterFetch)?;
+    request.progress.phase(InstallPhase::BuildingRuntime);
     request.builder.build(&RuntimeBuild {
         staging: &staging,
         published: &published,
@@ -433,6 +437,7 @@ fn install_with_receipt_sync(
     let result = (|| {
         abort(&request, InstallAbort::AfterPublish)?;
         verify_layout_full(&published, &receipt)?;
+        request.progress.phase(InstallPhase::CheckingGpu);
         request.health.check(&published)?;
         verify_layout(&published, &receipt)?;
         check_deadline(&request.clock)?;
@@ -1151,7 +1156,7 @@ fn download(
                 allowed_hosts: pin.hosts.iter().map(|host| (*host).into()).collect(),
                 expected_bytes: pin.bytes,
             },
-            pending.file_mut(),
+            &mut ProgressSink::new(pending.file_mut(), request.progress),
         )
         .map_err(map_fetch)?;
     check_deadline(&request.clock)?;
@@ -1349,7 +1354,7 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod install_tests {
     use super::super::installer::{BusyMaintenance, IdleMaintenance};
-    use super::super::{CatalogEntry, ScriptedFetcher, ScriptedHop};
+    use super::super::{CatalogEntry, ScriptedFetcher, ScriptedHop, SilentProgress};
     use super::*;
     use std::cell::Cell;
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -1520,6 +1525,7 @@ pub(crate) mod install_tests {
             maintenance: &IdleMaintenance,
             io: InstallIo::default(),
             clock: InstallClock::default(),
+            progress: &SilentProgress,
         }
     }
     pub(crate) fn install(store: &ModelStore) -> ConsentedReceipt {
@@ -1567,6 +1573,47 @@ pub(crate) mod install_tests {
             verify_with_entry(&store, &entry()),
             Err(ConsentedError::Missing)
         ));
+    }
+    #[test]
+    fn consented_install_reports_monotonic_download_bytes_then_phases() {
+        #[derive(Default)]
+        struct Recorder(std::cell::RefCell<Vec<String>>);
+        impl InstallProgress for Recorder {
+            fn downloaded(&self, bytes: u64) {
+                self.0.borrow_mut().push(format!("bytes {bytes}"));
+            }
+            fn phase(&self, phase: InstallPhase) {
+                self.0.borrow_mut().push(format!("{phase:?}"));
+            }
+        }
+        let (_temp, store) = store();
+        let recorder = Recorder::default();
+        let (fetcher, builder, health) = (
+            fetcher(),
+            FakeBuilder::default(),
+            health(&store, &entry(), false),
+        );
+        let mut install = request(&store, &fetcher, &builder, &health);
+        install.progress = &recorder;
+        install_with_entry(install, &entry()).unwrap();
+        let events = recorder.0.into_inner();
+        let phases: Vec<_> = events.iter().filter(|e| !e.starts_with("bytes ")).collect();
+        assert_eq!(phases, ["BuildingRuntime", "CheckingGpu"]);
+        // Every byte arrives before the build, and the running total only grows
+        // until it equals the sum of the pinned downloads.
+        let fixture = entry();
+        let pinned: u64 = fixture.weights.iter().map(|pin| pin.bytes).sum::<u64>()
+            + (fixture.health_clip)().bytes
+            + fixture.python.bytes
+            + fixture.wheels.iter().map(|pin| pin.bytes).sum::<u64>();
+        let build_at = events.iter().position(|e| e == "BuildingRuntime").unwrap();
+        let mut total = 0_u64;
+        for event in &events[..build_at] {
+            let bytes: u64 = event.strip_prefix("bytes ").unwrap().parse().unwrap();
+            assert!(bytes > 0);
+            total += bytes;
+        }
+        assert_eq!(total, pinned);
     }
     #[test]
     fn consented_removal_accepts_old_worker_pins_and_missing_tree() {
