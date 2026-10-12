@@ -6,14 +6,13 @@ use voisu_core::{AsrMode, KeyDiagnosis, KeyLocation, Provider};
 
 use crate::local_model::{
     CONSENTED_ENTRY, DISTIL_MODEL_ID, HostHardware, LocalSuggestion, suggest_local,
-    suggestion_lines, warnings,
+    suggestion_line, warnings,
 };
 use crate::setup::WizardIo;
 
 const TITLE: &str = "Choose how Voisu transcribes:";
 const CLOUD_TITLE: &str = "[1] Cloud — Deepgram + Groq (audio is sent to the providers)";
 const LOCAL_TITLE: &str = "[2] Local — runs on this computer";
-const CLOUD_SUGGESTION: &str = "Suggested for Hinglish, and whenever no Local model is installed.";
 const GROQ_ONLY_HINT: &str =
     "No Deepgram key configured — run `voisu deepgram off` for the faster Groq-only path.";
 const LOCAL_AVAILABILITY: &str =
@@ -55,12 +54,18 @@ pub fn run_engine_screen(
     consented: ConsentedStatus,
 ) -> EngineChoice {
     write_engine_screen(io, hw, deepgram, groq, &manifest_exists, &consented);
-    choose_engine(
-        io,
-        current,
-        interactive,
-        matches!(consented, ConsentedStatus::Installed),
-    )
+    let switch_needs_no_confirm = matches!(consented, ConsentedStatus::Installed)
+        || consent_confirms_local_switch(hw, &consented);
+    choose_engine(io, current, interactive, switch_needs_no_confirm)
+}
+
+/// Whether choosing Local leads straight to the Consented Install prompt,
+/// which then serves as the only confirmation of the switch: the suggested
+/// model is consent-installable and known not to be installed. Setup must
+/// keep Cloud if that prompt is declined.
+#[must_use]
+pub fn consent_confirms_local_switch(hw: &HostHardware, consented: &ConsentedStatus) -> bool {
+    matches!(consented, ConsentedStatus::NotInstalled) && distil_is_suggested(&suggest_local(hw))
 }
 
 fn write_engine_screen(
@@ -84,20 +89,19 @@ fn write_engine_screen(
         Provider::Groq.cli_label(),
         key_status(groq)
     ));
-    io.writeln(CLOUD_SUGGESTION);
     if matches!(deepgram, KeyDiagnosis::Absent) && groq.is_configured() {
         io.writeln(GROQ_ONLY_HINT);
     }
     io.writeln("");
     io.writeln(LOCAL_TITLE);
     let suggestion = suggest_local(hw);
-    for line in suggestion_lines(&suggestion) {
-        io.writeln(&line);
-    }
+    io.writeln(&suggestion_line(&suggestion));
     for warning in warnings(hw) {
         io.writeln(&format!("Note: {warning}"));
     }
     io.writeln(&availability_line(&suggestion, consented));
+    // The binary passes `manifest_exists` only under the developer Local pilot
+    // flag, so production output never shows this line.
     let model_id = suggested_model_id(&suggestion);
     if manifest_exists(model_id) {
         io.writeln(&format!(
@@ -112,8 +116,8 @@ fn availability_line(suggestion: &LocalSuggestion, consented: &ConsentedStatus) 
         ConsentedStatus::Unknown(reason) => format!("Availability: unknown — {reason}"),
         ConsentedStatus::NotInstalled if distil_is_suggested(suggestion) => {
             format!(
-                "Availability: not installed — setup can install {DISTIL_MODEL_ID} after explicit agreement ({} bytes).",
-                format_byte_count(CONSENTED_ENTRY.total_download_bytes)
+                "Availability: not installed — setup can download it ({}) after you agree.",
+                format_size(CONSENTED_ENTRY.total_download_bytes)
             )
         }
         ConsentedStatus::NotInstalled => LOCAL_AVAILABILITY.to_owned(),
@@ -128,24 +132,27 @@ pub(crate) fn distil_is_suggested(suggestion: &LocalSuggestion) -> bool {
     )
 }
 
+/// Human byte size in binary units, one decimal: `2.8 GiB`, `25.3 MiB`.
 #[must_use]
-pub(crate) fn format_byte_count(bytes: u64) -> String {
-    let digits = bytes.to_string().into_bytes();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, digit) in digits.iter().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(char::from(*digit));
+pub(crate) fn format_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let value = bytes as f64;
+    if value >= KIB * KIB * KIB {
+        format!("{:.1} GiB", value / (KIB * KIB * KIB))
+    } else if value >= KIB * KIB {
+        format!("{:.1} MiB", value / (KIB * KIB))
+    } else if value >= KIB {
+        format!("{:.1} KiB", value / KIB)
+    } else {
+        format!("{bytes} B")
     }
-    grouped
 }
 
 fn choose_engine(
     io: &mut dyn WizardIo,
     current: AsrMode,
     interactive: bool,
-    local_model_installed: bool,
+    switch_needs_no_confirm: bool,
 ) -> EngineChoice {
     if !interactive {
         io.writeln(&format!(
@@ -174,7 +181,7 @@ fn choose_engine(
                     if current == AsrMode::Local {
                         return EngineChoice::Keep(AsrMode::Local);
                     }
-                    if local_model_installed {
+                    if switch_needs_no_confirm {
                         return EngineChoice::Switch(AsrMode::Local);
                     }
                     return match ask_yes_no(io, LOCAL_SWITCH_CONFIRM, false) {
@@ -392,14 +399,22 @@ mod tests {
             text.contains("[1] Cloud — Deepgram + Groq (audio is sent to the providers)"),
             "{text}"
         );
-        assert!(text.contains("distil-large-v3.5-int8"), "{text}");
-        assert!(text.contains("Suggested for this hardware"), "{text}");
         assert!(
-            text.contains("Suggested for Hinglish, and whenever no Local model is installed."),
+            text.contains(
+                "\n[2] Local — runs on this computer\nRecommended for this computer: distil-large-v3.5-int8 (RTX 5050 Laptop)\nAvailability: not installed — setup can download it (2.8 GiB) after you agree.\nPROMPT "
+            ),
             "{text}"
         );
-        assert!(!text.contains("Recommended"), "{text}");
-        assert!(!text.contains("Developer pilot:"), "no manifest: {text}");
+        for removed in [
+            "WER",
+            "Invented",
+            "Hinglish",
+            "Development evidence",
+            "Developer pilot:",
+            "Suggested",
+        ] {
+            assert!(!text.contains(removed), "{removed}: {text}");
+        }
     }
 
     #[test]
@@ -415,12 +430,10 @@ mod tests {
             |_| false,
         );
         let text = io.transcript();
-        assert!(text.contains("parakeet-tdt-0.6b-v3 on CPU"), "{text}");
         assert!(
-            text.contains("GPU 0 has 2048 MiB, below 3584 MiB"),
+            text.contains("Recommended for this computer: parakeet-tdt-0.6b-v3 on CPU (RTX 5050 Laptop has 2048 MiB; 3584 MiB needed for the GPU model)"),
             "{text}"
         );
-        assert!(!text.contains("Recommended"), "{text}");
     }
 
     #[test]
@@ -436,8 +449,12 @@ mod tests {
             |_| false,
         );
         let text = io.transcript();
-        assert!(text.contains("parakeet-tdt-0.6b-v3"), "{text}");
-        assert!(text.contains("No NVIDIA GPU detected"), "{text}");
+        assert!(
+            text.contains(
+                "Recommended for this computer: parakeet-tdt-0.6b-v3 on CPU (no NVIDIA GPU detected)\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
@@ -484,8 +501,51 @@ mod tests {
     }
 
     #[test]
-    fn switching_to_local_from_cloud_requires_confirm() {
+    fn switching_to_local_before_a_consented_install_has_no_extra_confirm() {
         let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
+        let (choice, io) = run(
+            &hw,
+            AsrMode::Cloud,
+            &absent(),
+            &absent(),
+            true,
+            vec![Some("2"), Some("n")],
+            |_| false,
+        );
+        // The Consented Install prompt that follows is the confirmation.
+        assert_eq!(choice, EngineChoice::Switch(AsrMode::Local));
+        assert_eq!(io.prompts, 1);
+        assert_eq!(
+            io.lines,
+            vec![Some("n".to_owned())],
+            "the answer is left for consent"
+        );
+        assert!(
+            !io.transcript().contains("Switch to Local anyway?"),
+            "{}",
+            io.transcript()
+        );
+        assert!(consent_confirms_local_switch(
+            &hw,
+            &ConsentedStatus::NotInstalled
+        ));
+        assert!(!consent_confirms_local_switch(
+            &hw,
+            &ConsentedStatus::Installed
+        ));
+        assert!(!consent_confirms_local_switch(
+            &hw,
+            &ConsentedStatus::Unknown("busy".into())
+        ));
+        assert!(!consent_confirms_local_switch(
+            &host(GpuProbe::NoneFound),
+            &ConsentedStatus::NotInstalled
+        ));
+    }
+
+    #[test]
+    fn switching_to_local_without_an_installable_model_requires_confirm() {
+        let hw = host(GpuProbe::NoneFound);
         let (yes, io) = run(
             &hw,
             AsrMode::Cloud,
@@ -649,7 +709,7 @@ mod tests {
 
     #[test]
     fn local_confirm_three_invalid_answers_keep_current_and_leave_later_input() {
-        let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
+        let hw = host(GpuProbe::NoneFound);
         let (choice, io) = run(
             &hw,
             AsrMode::Cloud,
@@ -789,18 +849,28 @@ mod tests {
             |_| false,
         );
         let text = io.transcript();
-        let expected = format!(
-            "Availability: not installed — setup can install {DISTIL_MODEL_ID} after explicit agreement ({} bytes).",
-            format_byte_count(CONSENTED_ENTRY.total_download_bytes)
-        );
-        assert!(text.contains(&expected), "{text}");
         assert!(
-            crate::local_model::CONSENT_TEXT
-                .contains(&format_byte_count(CONSENTED_ENTRY.total_download_bytes)),
-            "availability size must match CONSENT_TEXT"
+            text.contains(
+                "Availability: not installed — setup can download it (2.8 GiB) after you agree."
+            ),
+            "{text}"
         );
+        assert_eq!(
+            format_size(CONSENTED_ENTRY.total_download_bytes),
+            "2.8 GiB",
+            "2,980,914,661 bytes"
+        );
+        assert!(text.contains(DISTIL_MODEL_ID), "{text}");
         assert!(!text.contains(LOCAL_AVAILABILITY), "{text}");
-        assert!(!text.contains("Recommended"), "{text}");
+    }
+
+    #[test]
+    fn format_size_uses_binary_units() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(1023), "1023 B");
+        assert_eq!(format_size(1536), "1.5 KiB");
+        assert_eq!(format_size(25 * 1024 * 1024 + 300 * 1024), "25.3 MiB");
+        assert_eq!(format_size(3 * 1024 * 1024 * 1024), "3.0 GiB");
     }
 
     #[test]
@@ -821,7 +891,7 @@ mod tests {
             let text = io.transcript();
             assert!(text.contains(LOCAL_AVAILABILITY), "{text}");
             assert!(
-                !text.contains("setup can install"),
+                !text.contains("setup can download"),
                 "parakeet has no Consented Install: {text}"
             );
         }

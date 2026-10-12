@@ -863,8 +863,12 @@ fn isolated_systemd_run_args(
     ] {
         literal_path(path)?;
     }
+    // --quiet drops systemd-run's own "Running as unit", "Finished with
+    // result" and resource-usage chatter; worker stderr stays inherited, and
+    // a failed unit still exits non-zero.
     let mut args = vec![
         "--user".into(),
+        "--quiet".into(),
         "--pipe".into(),
         "--wait".into(),
         "--collect".into(),
@@ -1181,6 +1185,20 @@ mod tests {
     }
 
     #[test]
+    fn transient_worker_unit_silences_systemd_run_chatter_but_still_waits() {
+        let args = systemd_run_args(
+            "voisu-dev-worker-1-1",
+            Path::new("/state/cache"),
+            &test_manifest("cuda:0"),
+            Path::new("/state/manifest.json"),
+        );
+        assert_eq!(
+            args[..5],
+            ["--user", "--quiet", "--pipe", "--wait", "--collect"]
+        );
+    }
+
+    #[test]
     fn consented_transient_unit_preserves_the_offline_sandbox() {
         let mut manifest = test_manifest("cuda:0");
         manifest.runtime.python = "/state/install/runtime/venv/bin/python".into();
@@ -1198,6 +1216,7 @@ mod tests {
             .unwrap(),
             vec![
                 "--user",
+                "--quiet",
                 "--pipe",
                 "--wait",
                 "--collect",

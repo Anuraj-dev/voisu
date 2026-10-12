@@ -1143,6 +1143,24 @@ mod tests {
     }
 
     #[test]
+    fn no_configured_trigger_defaults_to_caps_lock_on_enter_or_eof() {
+        for answers in [vec![Some("")], vec![]] {
+            let mut io = FakeIo::new(vec![], answers);
+            let prefer_caps_lock = caps_lock_trigger_preferred(&free_caps_lock(), &mut io).unwrap();
+            assert!(prefer_caps_lock);
+            assert!(
+                !io.transcript().contains("Right Alt"),
+                "{}",
+                io.transcript()
+            );
+            assert_eq!(
+                plan_trigger_binding("", prefer_caps_lock),
+                TriggerBindingPlan::Install { key: CAPS_LOCK }
+            );
+        }
+    }
+
+    #[test]
     fn rejecting_caps_lock_falls_back_without_installing_left_alt() {
         let mut io = FakeIo::new(vec![], vec![Some("n")]);
         assert!(!caps_lock_trigger_preferred(&free_caps_lock(), &mut io).unwrap());

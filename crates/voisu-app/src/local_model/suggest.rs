@@ -6,24 +6,12 @@ pub const DISTIL_MODEL_ID: &str = "distil-large-v3.5-int8";
 pub const PARAKEET_MODEL_ID: &str = "parakeet-tdt-0.6b-v3";
 pub const DISTIL_MIN_TOTAL_VRAM_MIB: u64 = 3584;
 
-// Rows from docs/research/local-asr-benchmark-2026-10-12.md, development evidence only.
-const DISTIL_ENGLISH_WER_PERCENT: f64 = 9.0;
-const DISTIL_HINGLISH_WER_PERCENT: f64 = 79.8;
-const DISTIL_WARM_P50_MS: u32 = 292;
-const DISTIL_COLD_LOAD_SECONDS: f64 = 4.7;
-const DISTIL_PEAK_VRAM_GB: f64 = 1.09;
-const DISTIL_SILENCE_INSERTED_WORDS: u32 = 18;
-const PARAKEET_ENGLISH_WER_PERCENT: f64 = 12.8;
-const PARAKEET_HINGLISH_WER_PERCENT: f64 = 80.8;
-const PARAKEET_CPU_P50_SECONDS: f64 = 0.61;
-const PARAKEET_CPU_P95_SECONDS: f64 = 1.2;
-const PARAKEET_SILENCE_INSERTED_WORDS: u32 = 0;
-const SILENT_CLIP_COUNT: u32 = 12;
+// The CPU-quota warning refers to the core count the parakeet CPU row in
+// docs/research/local-asr-benchmark-2026-10-12.md was measured with.
 const BENCHMARK_WORKER_CORES: u32 = 4;
 
-const DEVELOPMENT_CAVEAT: &str =
-    "Development evidence: one host, one speaker, scripted prompts — not the release gate.";
-const HINGLISH_CAVEAT: &str = "Hinglish: no Local model in this suggestion handles it; use Cloud.";
+/// Prefix of the one-line engine-screen recommendation.
+pub const RECOMMENDATION_PREFIX: &str = "Recommended for this computer:";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CpuReason {
@@ -94,7 +82,9 @@ pub fn warnings(hw: &HostHardware) -> Vec<String> {
     }
     let quota = crate::local_worker::worker_cpu_quota_cores(hw.cpu_cores);
     if quota < BENCHMARK_WORKER_CORES {
-        warnings.push(format!("the CPU figures were measured with {BENCHMARK_WORKER_CORES} worker cores; this host allots {quota}"));
+        warnings.push(format!(
+            "the Local worker gets {quota} CPU cores here, fewer than the {BENCHMARK_WORKER_CORES} it was tested with; CPU transcription may be slower"
+        ));
     }
     if matches!(&hw.gpu, GpuProbe::Nvidia(gpus) if gpus.len() > 1) {
         warnings
@@ -103,55 +93,32 @@ pub fn warnings(hw: &HostHardware) -> Vec<String> {
     warnings
 }
 
+/// One line for the setup engine screen. Measured figures stay in
+/// docs/research; the consent summary carries the language and GPU limits.
 #[must_use]
-pub fn suggestion_lines(suggestion: &LocalSuggestion) -> Vec<String> {
-    let mut lines = vec!["Suggested for this hardware".into()];
-    match suggestion {
-        LocalSuggestion::Gpu { model_id, gpu, .. } => {
-            lines.push(format!(
-                "{model_id} on {} ({} MiB)",
-                gpu.name, gpu.total_vram_mib
-            ));
-            lines.push(format!("English WER {DISTIL_ENGLISH_WER_PERCENT:.1}%; warm p50 {DISTIL_WARM_P50_MS} ms after a {DISTIL_COLD_LOAD_SECONDS:.1} s cold load; peak VRAM {DISTIL_PEAK_VRAM_GB:.2} GB."));
-            lines.push(format!("Invented {DISTIL_SILENCE_INSERTED_WORDS} words across {SILENT_CLIP_COUNT} silent clips."));
-            lines.push(format!(
-                "English only — not for Hinglish ({DISTIL_HINGLISH_WER_PERCENT:.1}% WER)."
-            ));
-        }
-        LocalSuggestion::Cpu { model_id, reason } => {
-            lines.push(format!("{model_id} on CPU"));
-            lines.push(match reason {
-                CpuReason::NoNvidiaGpu => "No NVIDIA GPU detected; no NVIDIA GPU usable by the measured CUDA runtime.".into(),
-                CpuReason::GpuTooSmall { name, total_vram_mib } => format!("GPU 0 has {total_vram_mib} MiB, below {DISTIL_MIN_TOTAL_VRAM_MIB} MiB ({name})."),
-            });
-            lines.extend(cpu_evidence_lines());
-        }
+pub fn suggestion_line(suggestion: &LocalSuggestion) -> String {
+    let detail = match suggestion {
+        LocalSuggestion::Gpu { model_id, gpu, .. } => format!("{model_id} ({})", gpu.name),
+        LocalSuggestion::Cpu {
+            model_id,
+            reason: CpuReason::NoNvidiaGpu,
+        } => format!("{model_id} on CPU (no NVIDIA GPU detected)"),
+        LocalSuggestion::Cpu {
+            model_id,
+            reason:
+                CpuReason::GpuTooSmall {
+                    name,
+                    total_vram_mib,
+                },
+        } => format!(
+            "{model_id} on CPU ({name} has {total_vram_mib} MiB; {DISTIL_MIN_TOTAL_VRAM_MIB} MiB needed for the GPU model)"
+        ),
         LocalSuggestion::GpuUnknown {
             error,
             cpu_fallback_model_id,
-        } => {
-            lines.push(format!("GPU status unknown: {error}"));
-            lines.push(format!(
-                "If this host has no NVIDIA GPU: {cpu_fallback_model_id} on CPU"
-            ));
-            lines.extend(cpu_evidence_lines());
-        }
-    }
-    lines.push(DEVELOPMENT_CAVEAT.into());
-    lines.push(HINGLISH_CAVEAT.into());
-    lines
-}
-
-fn cpu_evidence_lines() -> [String; 3] {
-    [
-        format!(
-            "English WER {PARAKEET_ENGLISH_WER_PERCENT:.1}%; p50 {PARAKEET_CPU_P50_SECONDS:.2} s, p95 {PARAKEET_CPU_P95_SECONDS:.1} s on {BENCHMARK_WORKER_CORES} cores."
-        ),
-        format!(
-            "No invented words on silence ({PARAKEET_SILENCE_INSERTED_WORDS} across {SILENT_CLIP_COUNT} silent clips)."
-        ),
-        format!("English only ({PARAKEET_HINGLISH_WER_PERCENT:.1}% Hinglish WER)."),
-    ]
+        } => format!("{cpu_fallback_model_id} on CPU (GPU status unknown: {error})"),
+    };
+    format!("{RECOMMENDATION_PREFIX} {detail}")
 }
 
 #[cfg(test)]
@@ -271,7 +238,7 @@ mod tests {
             warnings(&hw),
             vec![
                 "Host RAM could not be read.",
-                "the CPU figures were measured with 4 worker cores; this host allots 2",
+                "the Local worker gets 2 CPU cores here, fewer than the 4 it was tested with; CPU transcription may be slower",
                 "Voisu uses GPU 0 (PCI bus order); mapping to other GPUs is unverified",
             ]
         );
@@ -297,81 +264,30 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_constants_pin_the_measured_rows() {
-        assert_eq!(DISTIL_ENGLISH_WER_PERCENT, 9.0);
-        assert_eq!(DISTIL_HINGLISH_WER_PERCENT, 79.8);
-        assert_eq!(DISTIL_WARM_P50_MS, 292);
-        assert_eq!(DISTIL_COLD_LOAD_SECONDS, 4.7);
-        assert_eq!(DISTIL_PEAK_VRAM_GB, 1.09);
-        assert_eq!(DISTIL_SILENCE_INSERTED_WORDS, 18);
-        assert_eq!(PARAKEET_ENGLISH_WER_PERCENT, 12.8);
-        assert_eq!(PARAKEET_HINGLISH_WER_PERCENT, 80.8);
-        assert_eq!(PARAKEET_CPU_P50_SECONDS, 0.61);
-        assert_eq!(PARAKEET_CPU_P95_SECONDS, 1.2);
-        assert_eq!(PARAKEET_SILENCE_INSERTED_WORDS, 0);
-        assert_eq!(SILENT_CLIP_COUNT, 12);
-        assert_eq!(BENCHMARK_WORKER_CORES, 4);
-        assert_eq!(DISTIL_MIN_TOTAL_VRAM_MIB, 3584);
-    }
-
-    #[test]
-    fn suggestion_text_preserves_evidence_and_language_limits() {
-        for suggestion in [
-            suggest_local(&host(GpuProbe::Nvidia(vec![gpu(0, 8151)]))),
-            suggest_local(&host(GpuProbe::Nvidia(vec![gpu(0, 2048)]))),
-            suggest_local(&host(GpuProbe::NoneFound)),
-            suggest_local(&host(GpuProbe::Failed("driver failed".into()))),
-        ] {
-            let lines = suggestion_lines(&suggestion);
-            let text = lines.join("\n");
-            assert!(text.contains("Suggested for this hardware"));
-            assert!(!text.contains("Recommended"));
-            assert_eq!(
-                lines[lines.len() - 2],
-                "Development evidence: one host, one speaker, scripted prompts — not the release gate."
-            );
-            assert_eq!(
-                lines.last().map(String::as_str),
-                Some("Hinglish: no Local model in this suggestion handles it; use Cloud.")
-            );
-            match &suggestion {
-                LocalSuggestion::Gpu { .. } => {
-                    assert!(text.contains("distil-large-v3.5-int8 on RTX 5050 Laptop (8151 MiB)"));
-                    assert!(text.contains("English WER 9.0%; warm p50 292 ms after a 4.7 s cold load; peak VRAM 1.09 GB"));
-                    assert!(text.contains("Invented 18 words across 12 silent clips"));
-                    assert!(text.contains("English only — not for Hinglish (79.8% WER)"));
-                }
-                LocalSuggestion::Cpu { .. } | LocalSuggestion::GpuUnknown { .. } => {
-                    assert!(text.contains("parakeet-tdt-0.6b-v3 on CPU"));
-                    assert!(text.contains("English WER 12.8%; p50 0.61 s, p95 1.2 s on 4 cores"));
-                    assert!(text.contains("No invented words on silence"));
-                    assert!(text.contains("English only (80.8% Hinglish WER)"));
-                }
-            }
-            match &suggestion {
-                LocalSuggestion::Cpu {
-                    reason: CpuReason::NoNvidiaGpu,
-                    ..
-                } => {
-                    assert!(text.contains("No NVIDIA GPU detected"));
-                    assert!(text.contains("no NVIDIA GPU usable by the measured CUDA runtime"));
-                    assert!(!text.to_lowercase().contains("no gpu"));
-                }
-                LocalSuggestion::Cpu {
-                    reason: CpuReason::GpuTooSmall { .. },
-                    ..
-                } => {
-                    assert!(text.contains("GPU 0 has 2048 MiB, below 3584 MiB"));
-                }
-                LocalSuggestion::GpuUnknown { .. } => {
-                    assert!(text.contains("GPU status unknown: driver failed"));
-                    assert!(
-                        text.contains(
-                            "If this host has no NVIDIA GPU: parakeet-tdt-0.6b-v3 on CPU"
-                        )
-                    );
-                }
-                LocalSuggestion::Gpu { .. } => {}
+    fn suggestion_is_one_compact_line_without_benchmark_figures() {
+        let cases = [
+            (
+                GpuProbe::Nvidia(vec![gpu(0, 8151)]),
+                "Recommended for this computer: distil-large-v3.5-int8 (RTX 5050 Laptop)",
+            ),
+            (
+                GpuProbe::Nvidia(vec![gpu(0, 2048)]),
+                "Recommended for this computer: parakeet-tdt-0.6b-v3 on CPU (RTX 5050 Laptop has 2048 MiB; 3584 MiB needed for the GPU model)",
+            ),
+            (
+                GpuProbe::NoneFound,
+                "Recommended for this computer: parakeet-tdt-0.6b-v3 on CPU (no NVIDIA GPU detected)",
+            ),
+            (
+                GpuProbe::Failed("driver failed".into()),
+                "Recommended for this computer: parakeet-tdt-0.6b-v3 on CPU (GPU status unknown: driver failed)",
+            ),
+        ];
+        for (probe, expected) in cases {
+            let line = suggestion_line(&suggest_local(&host(probe)));
+            assert_eq!(line, expected);
+            for removed in ["WER", "Invented", "Hinglish", "Development evidence", "p50"] {
+                assert!(!line.contains(removed), "{removed}: {line}");
             }
         }
     }

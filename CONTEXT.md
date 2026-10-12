@@ -39,10 +39,12 @@ required gate, there is no Bakeoff Winner.
 _Avoid_: Pilot winner, provisional winner, hardcoded winner
 
 **Consented Install**:
-A Local model the user chose to install after setup showed it as suggested for
-their hardware, with its development evidence, size, and licence. It may run
-without a Bakeoff Winner, but it is never selected by default.
-_Avoid_: Recommended model, default model, winner
+A Local model the user chose to install after setup suggested it for their
+hardware and showed its download size and limits. Setup may display it as
+"Recommended for this computer"; that display text does not make it a Bakeoff
+Winner or a Model Recommendation. It may run without a Bakeoff Winner, but it
+is never selected by default.
+_Avoid_: default model, winner
 
 **Source Transcript**:
 Text returned independently by Groq or Deepgram before reconciliation and

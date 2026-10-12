@@ -5,25 +5,42 @@
 //! second download; it stays evidence-gated. This offer is the only setup path
 //! that can fetch, and only after an explicit yes.
 
-use voisu_core::AsrMode;
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use voisu_core::{AsrMode, KeyDiagnosis};
 
 use crate::asr_mode::LOCAL_UNAVAILABLE;
 use crate::local_model::consented::ConsentedRemoveOutcome;
 use crate::local_model::{
-    CONSENT_TEXT, CONSENTED_ENTRY, ConsentedConsent, ConsentedError, ConsentedInstallRequest,
-    HostHardware, InstallClock, InstallIo, ModelStore, OfflineRuntimeBuilder, ProductionHttps,
-    models_dir_from_state, remove_consented_install, suggest_local, verify_consented_install,
+    CONSENTED_ENTRY, ConsentedConsent, ConsentedError, ConsentedInstallRequest, HostHardware,
+    InstallClock, InstallIo, InstallPhase, InstallProgress, ModelStore, OfflineRuntimeBuilder,
+    ProductionHttps, models_dir_from_state, remove_consented_install, suggest_local,
+    verify_consented_install,
 };
 use crate::local_setup::SetupMaintenance;
 use crate::local_worker::ConsentedWorkerHealth;
 use crate::setup::{SETUP_COMPLETE_MESSAGE, WizardIo};
-use crate::setup_engine::{ConsentedStatus, ask_yes_no, distil_is_suggested};
+use crate::setup_engine::{ConsentedStatus, ask_yes_no, distil_is_suggested, format_size};
 
 pub use crate::local_model::{DEVELOPMENT_ROOT_NAME, SystemCommandRunner, probe_hardware};
 
-const INSTALL_PROMPT: &str = "Download and install distil-large-v3.5-int8 now?";
+const INSTALL_PROMPT: &str = "Download and install now?";
 const INSTALL_DURATION_HINT: &str = "This can take several minutes.";
 const INSTALL_SUCCESS: &str = "Installed distil-large-v3.5-int8 (Consented Install).";
+const DAEMON_RESTARTED: &str = "Restarted the Voisu daemon; Local dictation is ready.";
+const CLOUD_PROMPT: &str = "Also set up Cloud?";
+const CLOUD_SKIPPED: &str = "Cloud skipped; setup will not ask again. To add Cloud later, run `voisu setup` and choose Cloud, or `voisu auth set groq`.";
+/// State file that remembers a No to [`CLOUD_PROMPT`]. It lives in the state
+/// directory, not the user config: it records what setup already asked, not a
+/// setting the user tunes.
+pub const CLOUD_DECLINED_MARKER: &str = "setup-cloud-declined";
+const BUILDING_RUNTIME: &str = "Building runtime…";
+const CHECKING_GPU: &str = "Checking GPU…";
 const INSTALL_RETRY: &str =
     "Run `voisu setup` to retry or `voisu mode cloud` to dictate with Cloud.";
 const REMOVE_CONFIRM: &str = "Remove distil-large-v3.5-int8 (Consented Install)?";
@@ -65,7 +82,26 @@ pub enum LocalRemoveStatus {
     Failed(String),
 }
 
-/// Prints CONSENT_TEXT and installs only after an explicit yes.
+/// The facts shown before the install prompt, one per line.
+///
+/// Display only: the receipt still records the full, hashed `CONSENT_TEXT`
+/// through [`ConsentedConsent::accepted`], which this summary never replaces.
+#[must_use]
+pub fn consent_summary() -> [String; 4] {
+    [
+        format!(
+            "Download size: {}",
+            format_size(CONSENTED_ENTRY.total_download_bytes)
+        ),
+        "English only".into(),
+        "Needs an NVIDIA GPU".into(),
+        "Runs offline after install".into(),
+    ]
+}
+
+/// Shows the consent summary and installs only after an explicit yes. A
+/// successful install then restarts the daemon through `restart_daemon`; a
+/// failed restart is a warning, never a failed install.
 ///
 /// Non-interactive, parakeet, and an already-verified install never fetch.
 pub fn run_consented_install_step(
@@ -75,17 +111,28 @@ pub fn run_consented_install_step(
     installed: bool,
     now_unix: u64,
     install: impl FnOnce(ConsentedConsent) -> Result<(), ConsentedError>,
+    restart_daemon: impl FnOnce() -> Result<(), String>,
 ) -> ConsentedInstallStep {
     if installed || !interactive || !distil_is_suggested(&suggest_local(hw)) {
         return ConsentedInstallStep::Skipped;
     }
-    io.writeln(CONSENT_TEXT);
+    io.writeln("");
+    for fact in consent_summary() {
+        io.writeln(&fact);
+        io.writeln("");
+    }
     match ask_yes_no(io, INSTALL_PROMPT, false) {
         Some(true) => {
             io.writeln(INSTALL_DURATION_HINT);
             match install(ConsentedConsent::accepted(now_unix)) {
                 Ok(()) => {
                     io.writeln(INSTALL_SUCCESS);
+                    match restart_daemon() {
+                        Ok(()) => io.writeln(DAEMON_RESTARTED),
+                        Err(reason) => io.writeln(&format!(
+                            "Warning: could not restart the Voisu daemon ({reason}). Run `voisu service restart` to use Local."
+                        )),
+                    }
                     ConsentedInstallStep::Installed
                 }
                 Err(error) => {
@@ -97,6 +144,330 @@ pub fn run_consented_install_step(
             }
         }
         Some(false) | None => ConsentedInstallStep::Declined,
+    }
+}
+
+/// After Local setup, asks once whether to also configure Cloud keys.
+///
+/// Only an interactive user with neither Cloud key configured, and no earlier
+/// No saved at `declined_marker`, is asked; the default is No. A No (including
+/// Enter) is saved so later Local reruns never ask again. Returns whether the
+/// Cloud key prompts should run. The ASR mode is never changed here.
+pub fn ask_cloud_after_local(
+    io: &mut dyn WizardIo,
+    interactive: bool,
+    deepgram: &KeyDiagnosis,
+    groq: &KeyDiagnosis,
+    declined_marker: Option<&Path>,
+) -> bool {
+    if !interactive
+        || deepgram.is_configured()
+        || groq.is_configured()
+        || declined_marker.is_some_and(Path::exists)
+    {
+        return false;
+    }
+    let answer = ask_yes_no(io, CLOUD_PROMPT, false);
+    if answer == Some(true) {
+        return true;
+    }
+    io.writeln(CLOUD_SKIPPED);
+    // Three invalid answers are not a decision; only a real No is remembered.
+    if answer == Some(false)
+        && let Some(marker) = declined_marker
+        && let Err(error) = remember_cloud_declined(marker)
+    {
+        io.writeln(&format!(
+            "Note: could not save this choice ({error}); setup may ask again."
+        ));
+    }
+    false
+}
+
+fn remember_cloud_declined(marker: &Path) -> std::io::Result<()> {
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(marker, b"declined\n")
+}
+
+/// Production location of [`CLOUD_DECLINED_MARKER`].
+#[must_use]
+pub fn production_cloud_declined_marker() -> Option<std::path::PathBuf> {
+    voisu_core::state_dir()
+        .ok()
+        .map(|state| state.join(CLOUD_DECLINED_MARKER))
+}
+
+/// Whether the engine screen shows the Developer pilot line for `model_id`.
+/// Dev-only: requires the developer Local pilot flag and a development
+/// manifest, so normal setup never mentions the pilot.
+#[must_use]
+pub fn developer_pilot_manifest_exists(model_id: &str) -> bool {
+    crate::local_model::development_local_enabled()
+        && voisu_core::state_dir().is_ok_and(|state| {
+            state
+                .join(DEVELOPMENT_ROOT_NAME)
+                .join("manifests")
+                .join(format!("{model_id}.json"))
+                .is_file()
+        })
+}
+
+/// Production daemon restart after a successful install.
+pub fn production_restart_daemon() -> Result<(), String> {
+    let report = crate::service::manage_user_service(crate::service::UserServiceAction::Restart)?;
+    if report.exit_code == 0 {
+        Ok(())
+    } else {
+        Err(report
+            .message
+            .lines()
+            .next()
+            .unwrap_or("the restart did not complete")
+            .to_owned())
+    }
+}
+
+/// `1.2 GiB / 2.8 GiB (43%) at 25.3 MiB/s, ETA 1m 05s`, or without a total
+/// `1.2 GiB at 25.3 MiB/s`. Speed and ETA read `--` until bytes have moved;
+/// an ETA beyond 99 hours reads `>99h`. Never panics on any input.
+#[must_use]
+pub fn format_download_progress(done: u64, total: Option<u64>, elapsed: Duration) -> String {
+    let speed = (done > 0 && !elapsed.is_zero()).then(|| done as f64 / elapsed.as_secs_f64());
+    let rate = speed.map_or_else(
+        || "-- /s".to_owned(),
+        // `as u64` saturates, so an absurd rate still formats.
+        |bytes_per_second| format!("{}/s", format_size(bytes_per_second as u64)),
+    );
+    let Some(total) = total.filter(|total| *total > 0) else {
+        return format!("Downloading {} at {rate}", format_size(done));
+    };
+    let remaining = total.saturating_sub(done);
+    let eta = match speed {
+        _ if remaining == 0 => "0s".to_owned(),
+        Some(bytes_per_second) => format_eta(remaining as f64 / bytes_per_second),
+        None => "--".to_owned(),
+    };
+    format!(
+        "Downloading {} / {} ({}%) at {rate}, ETA {eta}",
+        format_size(done),
+        format_size(total),
+        percent(done, total)
+    )
+}
+
+/// Longest ETA shown in full; anything longer is `>99h`.
+const MAX_ETA_SECONDS: u64 = 100 * 3600 - 1;
+
+fn format_eta(seconds: f64) -> String {
+    // Rounds up so a running download never shows `0s`. Checked against the
+    // bound before any integer math, so a huge or non-finite value cannot
+    // overflow.
+    let seconds = seconds.ceil();
+    if !seconds.is_finite() || seconds > MAX_ETA_SECONDS as f64 {
+        return ">99h".to_owned();
+    }
+    let seconds = seconds.max(0.0) as u64;
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m {:02}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {:02}m", seconds / 3600, (seconds % 3600) / 60),
+    }
+}
+
+fn percent(done: u64, total: u64) -> u64 {
+    (u128::from(done) * 100 / u128::from(total)).min(100) as u64
+}
+
+const MIB: u64 = 1024 * 1024;
+/// Width assumed when the terminal size cannot be read.
+const FALLBACK_COLUMNS: usize = 80;
+/// How often the render thread samples the byte counter.
+const RENDER_TICK: Duration = Duration::from_millis(200);
+
+/// Cuts `line` so a `\r` redraw never wraps: one column is left free because
+/// writing the last column makes some terminals wrap early.
+#[must_use]
+pub fn fit_to_columns(line: &str, columns: usize) -> String {
+    line.chars()
+        .take(columns.saturating_sub(1).max(1))
+        .collect()
+}
+
+/// Columns of the terminal on stdout, if it is one.
+fn stdout_columns() -> Option<usize> {
+    // SAFETY: TIOCGWINSZ only writes one `winsize` into the struct passed by
+    // pointer, which lives for the whole call.
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) };
+    (result == 0 && size.ws_col > 0).then_some(usize::from(size.ws_col))
+}
+
+/// Turns byte counts and phases into terminal lines. Pure and single
+/// threaded, so tests drive it directly. On a TTY it redraws one line in place
+/// at every whole percent, fitted to the terminal width; otherwise it prints a
+/// plain line every 10%. Output is keyed to bytes, never to wall time.
+struct ProgressRenderer<W: Write> {
+    out: W,
+    tty: bool,
+    total: Option<u64>,
+    columns: fn() -> Option<usize>,
+    last_step: Option<u64>,
+    line_open: bool,
+}
+
+impl<W: Write> ProgressRenderer<W> {
+    fn new(out: W, tty: bool, total: Option<u64>, columns: fn() -> Option<usize>) -> Self {
+        Self {
+            out,
+            tty,
+            total,
+            columns,
+            last_step: None,
+            line_open: false,
+        }
+    }
+
+    fn step(&self, done: u64) -> u64 {
+        match (self.total.filter(|total| *total > 0), self.tty) {
+            (Some(total), true) => percent(done, total),
+            (Some(total), false) => percent(done, total) / 10,
+            (None, true) => done / (16 * MIB),
+            (None, false) => done / (256 * MIB),
+        }
+    }
+
+    // Terminal output is best effort; a closed stdout must not fail the install.
+    fn bytes(&mut self, done: u64, elapsed: Duration) {
+        if done == 0 {
+            return;
+        }
+        let step = self.step(done);
+        if self.last_step.is_some_and(|last| step <= last) {
+            return;
+        }
+        self.last_step = Some(step);
+        let line = format_download_progress(done, self.total, elapsed);
+        if self.tty {
+            let columns = (self.columns)().unwrap_or(FALLBACK_COLUMNS);
+            let _ = write!(self.out, "\r{}\x1b[K", fit_to_columns(&line, columns));
+            self.line_open = true;
+        } else {
+            let _ = writeln!(self.out, "{line}");
+        }
+        let _ = self.out.flush();
+    }
+
+    fn phase(&mut self, phase: InstallPhase) {
+        self.finish();
+        let _ = writeln!(
+            self.out,
+            "{}",
+            match phase {
+                InstallPhase::BuildingRuntime => BUILDING_RUNTIME,
+                InstallPhase::CheckingGpu => CHECKING_GPU,
+            }
+        );
+        let _ = self.out.flush();
+    }
+
+    /// Ends an open redraw line so the next message starts on its own line.
+    fn finish(&mut self) {
+        if std::mem::take(&mut self.line_open) {
+            let _ = writeln!(self.out);
+            let _ = self.out.flush();
+        }
+    }
+}
+
+/// Terminal observer for the Consented Install.
+///
+/// The fetch sink calls [`InstallProgress::downloaded`] on the download path,
+/// so it only adds to an atomic counter; phases go over a channel. A separate
+/// render thread samples both and writes to the terminal. A paused or slow
+/// terminal therefore blocks only that thread and can never stall the
+/// download or trip the fetch's no-progress timeout. Dropping the observer
+/// stops the thread and waits for its last line.
+pub struct TerminalProgress {
+    done: Arc<AtomicU64>,
+    phases: Option<mpsc::Sender<InstallPhase>>,
+    renderer: Option<thread::JoinHandle<()>>,
+}
+
+impl TerminalProgress {
+    /// Starts the render thread. `columns` is read before every TTY redraw so
+    /// a resized terminal still gets a fitting line.
+    pub fn spawn<W: Write + Send + 'static>(
+        out: W,
+        tty: bool,
+        total: Option<u64>,
+        columns: fn() -> Option<usize>,
+    ) -> Self {
+        let done = Arc::new(AtomicU64::new(0));
+        let (phases, received) = mpsc::channel();
+        let counter = Arc::clone(&done);
+        let started = Instant::now();
+        let renderer = thread::Builder::new()
+            .name("voisu-progress".into())
+            .spawn(move || {
+                let mut renderer = ProgressRenderer::new(out, tty, total, columns);
+                let sample = |renderer: &mut ProgressRenderer<W>| {
+                    renderer.bytes(counter.load(Ordering::Relaxed), started.elapsed());
+                };
+                loop {
+                    match received.recv_timeout(RENDER_TICK) {
+                        Ok(phase) => {
+                            sample(&mut renderer);
+                            renderer.phase(phase);
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => sample(&mut renderer),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            sample(&mut renderer);
+                            renderer.finish();
+                            return;
+                        }
+                    }
+                }
+            })
+            // Without a render thread the install still runs, just silently.
+            .ok();
+        Self {
+            done,
+            phases: Some(phases),
+            renderer,
+        }
+    }
+
+    /// Production observer on stdout.
+    #[must_use]
+    pub fn stdout(total: u64) -> Self {
+        let stdout = std::io::stdout();
+        let tty = std::io::IsTerminal::is_terminal(&stdout);
+        Self::spawn(stdout, tty, Some(total), stdout_columns)
+    }
+}
+
+impl InstallProgress for TerminalProgress {
+    fn downloaded(&self, bytes: u64) {
+        self.done.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn phase(&self, phase: InstallPhase) {
+        if let Some(phases) = &self.phases {
+            let _ = phases.send(phase);
+        }
+    }
+}
+
+impl Drop for TerminalProgress {
+    fn drop(&mut self) {
+        // Closing the channel tells the thread to draw the final count, end an
+        // open line, and exit.
+        drop(self.phases.take());
+        if let Some(renderer) = self.renderer.take() {
+            let _ = renderer.join();
+        }
     }
 }
 
@@ -252,6 +623,7 @@ pub fn production_install(consent: ConsentedConsent) -> Result<(), ConsentedErro
     let builder = OfflineRuntimeBuilder;
     let health = ConsentedWorkerHealth::new(state);
     let maintenance = SetupMaintenance::default();
+    let progress = TerminalProgress::stdout(CONSENTED_ENTRY.total_download_bytes);
     crate::local_model::install_consented_install(ConsentedInstallRequest {
         store: &store,
         consent,
@@ -261,6 +633,7 @@ pub fn production_install(consent: ConsentedConsent) -> Result<(), ConsentedErro
         maintenance: &maintenance,
         io: InstallIo::default(),
         clock: InstallClock::default(),
+        progress: &progress,
     })
     .map(|_| ())
 }
@@ -287,7 +660,9 @@ const _: () = assert!(CONSENTED_ENTRY.consent_installable);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::local_model::{DISTIL_MODEL_ID, FetchError, GpuProbe, NvidiaGpu};
+    use crate::local_model::{
+        CONSENT_TEXT, DISTIL_MODEL_ID, FetchError, GpuProbe, NvidiaGpu, ProgressSink,
+    };
     use crate::setup_engine::{
         ConsentedStatus, EngineChoice, INSTALLED_AVAILABILITY, run_engine_screen,
     };
@@ -364,10 +739,28 @@ mod tests {
         answers: Vec<Option<&str>>,
         result: Result<(), ConsentedError>,
     ) -> (ConsentedInstallStep, FakeIo) {
+        let (step, io, _) = offer_with_restart(hw, interactive, installed, answers, result, Ok(()));
+        (step, io)
+    }
+
+    fn offer_with_restart(
+        hw: &HostHardware,
+        interactive: bool,
+        installed: bool,
+        answers: Vec<Option<&str>>,
+        result: Result<(), ConsentedError>,
+        restart: Result<(), String>,
+    ) -> (ConsentedInstallStep, FakeIo, usize) {
         let mut io = FakeIo::new(answers);
         let mut recorded = Vec::new();
-        let step =
-            run_consented_install_step(&mut io, hw, interactive, installed, NOW, |consent| {
+        let mut restarts = 0;
+        let step = run_consented_install_step(
+            &mut io,
+            hw,
+            interactive,
+            installed,
+            NOW,
+            |consent| {
                 recorded.push(consent);
                 match &result {
                     Ok(()) => Ok(()),
@@ -380,10 +773,17 @@ mod tests {
                     Err(ConsentedError::Fetch(error)) => Err(ConsentedError::Fetch(error.clone())),
                     Err(_) => Err(ConsentedError::NoSpace),
                 }
-            });
+            },
+            || {
+                restarts += 1;
+                restart
+            },
+        );
         io.install_calls = recorded;
-        (step, io)
+        (step, io, restarts)
     }
+
+    const SUMMARY_BLOCK: &str = "\nDownload size: 2.8 GiB\n\nEnglish only\n\nNeeds an NVIDIA GPU\n\nRuns offline after install\n\nPROMPT Download and install now? [y/N] ";
 
     #[test]
     fn rtx_5050_offers_install_and_decline_never_fetches() {
@@ -391,13 +791,12 @@ mod tests {
         let (step, io) = offer(&hw, true, false, vec![Some("n")], Ok(()));
         assert_eq!(step, ConsentedInstallStep::Declined);
         assert!(
-            io.transcript().contains(CONSENT_TEXT),
+            io.transcript().starts_with(SUMMARY_BLOCK),
             "{}",
             io.transcript()
         );
         assert!(
-            io.transcript()
-                .contains("Download and install distil-large-v3.5-int8 now? [y/N]"),
+            !io.transcript().contains(CONSENT_TEXT),
             "{}",
             io.transcript()
         );
@@ -415,6 +814,8 @@ mod tests {
         let (step, io) = offer(&hw, true, false, vec![Some("y")], Ok(()));
         assert_eq!(step, ConsentedInstallStep::Installed);
         assert_eq!(io.install_calls, vec![ConsentedConsent::accepted(NOW)]);
+        // The hashed consent record keeps the full catalog text even though
+        // the terminal shows only the short summary.
         assert_eq!(io.install_calls[0].text, CONSENT_TEXT);
         assert_eq!(
             io.install_calls[0].license_spdx,
@@ -444,7 +845,7 @@ mod tests {
             assert_eq!(io.prompts, 0);
             assert!(io.install_calls.is_empty());
             assert!(
-                !io.transcript().contains(CONSENT_TEXT),
+                !io.transcript().contains("Download size"),
                 "{}",
                 io.transcript()
             );
@@ -527,7 +928,7 @@ mod tests {
             io.transcript()
         );
         assert!(
-            !io.transcript().contains(CONSENT_TEXT),
+            !io.transcript().contains("Download size"),
             "{}",
             io.transcript()
         );
@@ -537,16 +938,460 @@ mod tests {
     fn eof_and_enter_are_declines() {
         let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
         for answers in [vec![], vec![Some("")]] {
-            let (step, io) = offer(&hw, true, false, answers, Ok(()));
+            let (step, io, restarts) =
+                offer_with_restart(&hw, true, false, answers, Ok(()), Ok(()));
             assert_eq!(step, ConsentedInstallStep::Declined);
             assert!(io.install_calls.is_empty());
+            assert_eq!(restarts, 0);
+            assert!(
+                io.transcript().contains("Download and install now? [y/N] "),
+                "{}",
+                io.transcript()
+            );
         }
+    }
+
+    #[test]
+    fn successful_install_restarts_the_daemon_once() {
+        let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
+        let (step, io, restarts) =
+            offer_with_restart(&hw, true, false, vec![Some("y")], Ok(()), Ok(()));
+        assert_eq!(step, ConsentedInstallStep::Installed);
+        assert_eq!(restarts, 1);
+        assert_eq!(io.output.last().map(String::as_str), Some(DAEMON_RESTARTED));
+    }
+
+    #[test]
+    fn failed_restart_warns_with_the_manual_command_and_keeps_the_install() {
+        let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
+        let (step, io, restarts) = offer_with_restart(
+            &hw,
+            true,
+            false,
+            vec![Some("y")],
+            Ok(()),
+            Err("voisu.service is not installed".into()),
+        );
+        assert_eq!(step, ConsentedInstallStep::Installed);
+        assert_eq!(restarts, 1);
+        assert_eq!(
+            io.output.last().map(String::as_str),
+            Some(
+                "Warning: could not restart the Voisu daemon (voisu.service is not installed). Run `voisu service restart` to use Local."
+            )
+        );
+        assert!(
+            io.transcript().contains(INSTALL_SUCCESS),
+            "{}",
+            io.transcript()
+        );
+    }
+
+    #[test]
+    fn failed_install_never_restarts_the_daemon() {
+        let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
+        let (step, _, restarts) = offer_with_restart(
+            &hw,
+            true,
+            false,
+            vec![Some("y")],
+            Err(ConsentedError::NoSpace),
+            Ok(()),
+        );
+        assert_eq!(step, ConsentedInstallStep::Failed);
+        assert_eq!(restarts, 0);
+    }
+
+    fn ask_cloud(
+        interactive: bool,
+        deepgram: KeyDiagnosis,
+        groq: KeyDiagnosis,
+        marker: &Path,
+        answers: Vec<Option<&str>>,
+    ) -> (bool, FakeIo) {
+        let mut io = FakeIo::new(answers);
+        let wants_cloud =
+            ask_cloud_after_local(&mut io, interactive, &deepgram, &groq, Some(marker));
+        (wants_cloud, io)
+    }
+
+    fn marker() -> (tempfile::TempDir, std::path::PathBuf) {
+        let state = tempfile::tempdir().unwrap();
+        let marker = state.path().join("voisu").join(CLOUD_DECLINED_MARKER);
+        (state, marker)
+    }
+
+    #[test]
+    fn cloud_question_no_is_remembered_and_never_asked_again() {
+        for answers in [vec![Some("n")], vec![Some("")], vec![]] {
+            let (_state, marker) = marker();
+            let (wants_cloud, io) = ask_cloud(
+                true,
+                KeyDiagnosis::Absent,
+                KeyDiagnosis::Absent,
+                &marker,
+                answers,
+            );
+            assert!(!wants_cloud);
+            assert_eq!(
+                io.output,
+                vec![
+                    "PROMPT Also set up Cloud? [y/N] ".to_owned(),
+                    CLOUD_SKIPPED.to_owned()
+                ]
+            );
+            assert!(marker.is_file());
+            // A later Local rerun, still without keys, does not ask.
+            let (wants_cloud, rerun) = ask_cloud(
+                true,
+                KeyDiagnosis::Absent,
+                KeyDiagnosis::Absent,
+                &marker,
+                vec![Some("y")],
+            );
+            assert!(!wants_cloud);
+            assert_eq!(rerun.prompts, 0);
+            assert!(rerun.output.is_empty(), "{:?}", rerun.output);
+        }
+    }
+
+    #[test]
+    fn cloud_question_yes_continues_to_the_key_prompts_and_is_not_remembered() {
+        let (_state, marker) = marker();
+        for _ in 0..2 {
+            let (wants_cloud, io) = ask_cloud(
+                true,
+                KeyDiagnosis::Absent,
+                KeyDiagnosis::Absent,
+                &marker,
+                vec![Some("y")],
+            );
+            assert!(wants_cloud);
+            assert_eq!(io.prompts, 1);
+            assert!(
+                !io.transcript().contains(CLOUD_SKIPPED),
+                "{}",
+                io.transcript()
+            );
+        }
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn cloud_question_without_a_valid_answer_is_not_remembered() {
+        let (_state, marker) = marker();
+        let (wants_cloud, _) = ask_cloud(
+            true,
+            KeyDiagnosis::Absent,
+            KeyDiagnosis::Absent,
+            &marker,
+            vec![Some("maybe"), Some("later"), Some("?")],
+        );
+        assert!(!wants_cloud);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn cloud_decline_that_cannot_be_saved_says_setup_may_ask_again() {
+        let state = tempfile::tempdir().unwrap();
+        let file = state.path().join("not-a-dir");
+        std::fs::write(&file, b"").unwrap();
+        let marker = file.join(CLOUD_DECLINED_MARKER);
+        let (wants_cloud, io) = ask_cloud(
+            true,
+            KeyDiagnosis::Absent,
+            KeyDiagnosis::Absent,
+            &marker,
+            vec![Some("n")],
+        );
+        assert!(!wants_cloud);
+        assert!(
+            io.output
+                .last()
+                .is_some_and(|line| line.ends_with("setup may ask again.")),
+            "{:?}",
+            io.output
+        );
+    }
+
+    #[test]
+    fn cloud_question_is_not_asked_with_a_key_or_without_a_terminal() {
+        let key = || KeyDiagnosis::Found {
+            location: voisu_core::KeyLocation::Keyring,
+            credential: voisu_core::Credential::new("test-key".into()).unwrap(),
+        };
+        let (_state, marker) = marker();
+        for (interactive, deepgram, groq) in [
+            (true, key(), KeyDiagnosis::Absent),
+            (true, KeyDiagnosis::Absent, key()),
+            (false, KeyDiagnosis::Absent, KeyDiagnosis::Absent),
+        ] {
+            let (wants_cloud, io) =
+                ask_cloud(interactive, deepgram, groq, &marker, vec![Some("y")]);
+            assert!(!wants_cloud);
+            assert_eq!(io.prompts, 0);
+            assert!(io.output.is_empty(), "{:?}", io.output);
+        }
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn download_progress_formats_percent_speed_and_eta() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(
+            format_download_progress(GIB, Some(3 * GIB), Duration::from_secs(64)),
+            "Downloading 1.0 GiB / 3.0 GiB (33%) at 16.0 MiB/s, ETA 2m 08s"
+        );
+        assert_eq!(
+            format_download_progress(3 * GIB, Some(3 * GIB), Duration::from_secs(100)),
+            "Downloading 3.0 GiB / 3.0 GiB (100%) at 30.7 MiB/s, ETA 0s"
+        );
+        assert_eq!(
+            format_download_progress(MIB, Some(GIB), Duration::from_secs(1)),
+            "Downloading 1.0 MiB / 1.0 GiB (0%) at 1.0 MiB/s, ETA 17m 03s"
+        );
+        assert_eq!(
+            format_download_progress(MIB, Some(4 * GIB), Duration::from_secs(1)),
+            "Downloading 1.0 MiB / 4.0 GiB (0%) at 1.0 MiB/s, ETA 1h 08m"
+        );
+    }
+
+    #[test]
+    fn download_progress_without_movement_or_total() {
+        assert_eq!(
+            format_download_progress(0, Some(10 * MIB), Duration::ZERO),
+            "Downloading 0 B / 10.0 MiB (0%) at -- /s, ETA --"
+        );
+        assert_eq!(
+            format_download_progress(5 * MIB, None, Duration::from_secs(2)),
+            "Downloading 5.0 MiB at 2.5 MiB/s"
+        );
+        assert_eq!(
+            format_download_progress(5 * MIB, Some(0), Duration::ZERO),
+            "Downloading 5.0 MiB at -- /s"
+        );
+    }
+
+    #[test]
+    fn download_progress_boundaries_never_panic() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(
+            format_download_progress(1, Some(u64::MAX), Duration::from_secs(2)),
+            "Downloading 1 B / 17179869184.0 GiB (0%) at 0 B/s, ETA >99h"
+        );
+        assert_eq!(
+            format_download_progress(u64::MAX, Some(u64::MAX), Duration::from_nanos(1)),
+            "Downloading 17179869184.0 GiB / 17179869184.0 GiB (100%) at 17179869184.0 GiB/s, ETA 0s"
+        );
+        assert_eq!(
+            format_download_progress(2 * GIB, Some(GIB), Duration::from_secs(1)),
+            "Downloading 2.0 GiB / 1.0 GiB (100%) at 2.0 GiB/s, ETA 0s"
+        );
+        assert_eq!(
+            format_download_progress(0, Some(GIB), Duration::from_secs(5)),
+            "Downloading 0 B / 1.0 GiB (0%) at -- /s, ETA --"
+        );
+        assert_eq!(
+            format_download_progress(u64::MAX, None, Duration::ZERO),
+            "Downloading 17179869184.0 GiB at -- /s"
+        );
+    }
+
+    #[test]
+    fn eta_rounds_up_and_caps_at_ninety_nine_hours() {
+        assert_eq!(format_eta(0.2), "1s");
+        assert_eq!(format_eta(59.0), "59s");
+        assert_eq!(format_eta(60.0), "1m 00s");
+        assert_eq!(format_eta(359_999.0), "99h 59m");
+        assert_eq!(format_eta(359_999.5), ">99h");
+        assert_eq!(format_eta(f64::INFINITY), ">99h");
+        assert_eq!(format_eta(f64::MAX), ">99h");
+    }
+
+    #[test]
+    fn progress_line_is_cut_to_the_terminal_width() {
+        assert_eq!(fit_to_columns("abcdef", 4), "abc");
+        assert_eq!(fit_to_columns("abc", 80), "abc");
+        assert_eq!(fit_to_columns("abc", 0), "a");
+        let mut renderer = ProgressRenderer::new(Vec::new(), true, Some(4 * MIB), || Some(30));
+        for done in 1..=4 {
+            renderer.bytes(done * MIB, Duration::from_secs(1));
+        }
+        renderer.finish();
+        let text = String::from_utf8(renderer.out).unwrap();
+        let redraws: Vec<_> = text
+            .split('\r')
+            .skip(1)
+            .map(|redraw| redraw.split("\x1b[K").next().unwrap())
+            .collect();
+        assert_eq!(redraws.len(), 4, "{text:?}");
+        for redraw in redraws {
+            assert_eq!(redraw.chars().count(), 29, "{redraw:?}");
+            assert!(redraw.starts_with("Downloading "), "{redraw:?}");
+        }
+    }
+
+    /// Feeds cumulative byte counts at a fixed one-second elapsed time.
+    fn render(
+        tty: bool,
+        total: Option<u64>,
+        drive: impl FnOnce(&mut ProgressRenderer<Vec<u8>>),
+    ) -> String {
+        let mut renderer = ProgressRenderer::new(Vec::new(), tty, total, || None);
+        drive(&mut renderer);
+        String::from_utf8(renderer.out).unwrap()
+    }
+
+    #[test]
+    fn non_tty_progress_prints_a_plain_line_every_ten_percent_then_phases() {
+        let text = render(false, Some(100 * MIB), |renderer| {
+            for done in 1..=100 {
+                renderer.bytes(done * MIB, Duration::from_secs(1));
+            }
+            renderer.phase(InstallPhase::BuildingRuntime);
+            renderer.phase(InstallPhase::CheckingGpu);
+        });
+        assert!(!text.contains('\r'), "{text:?}");
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 11 + 2, "{text}");
+        assert!(lines[0].contains("(1%)"), "{text}");
+        assert!(lines[1].contains("(10%)"), "{text}");
+        assert!(lines[10].contains("(100%)"), "{text}");
+        assert_eq!(lines[11..], [BUILDING_RUNTIME, CHECKING_GPU]);
+    }
+
+    #[test]
+    fn tty_progress_redraws_in_place_and_ends_the_line_before_a_phase() {
+        let text = render(true, Some(4 * MIB), |renderer| {
+            for done in 1..=4 {
+                renderer.bytes(done * MIB, Duration::from_secs(done));
+            }
+            renderer.phase(InstallPhase::BuildingRuntime);
+        });
+        assert_eq!(text.matches('\r').count(), 4, "{text:?}");
+        assert!(
+            text.ends_with("(100%) at 1.0 MiB/s, ETA 0s\x1b[K\nBuilding runtime…\n"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn tty_progress_finish_closes_an_interrupted_line_once() {
+        let text = render(true, Some(4 * MIB), |renderer| {
+            renderer.bytes(MIB, Duration::from_secs(1));
+            renderer.finish();
+            renderer.finish();
+        });
+        assert!(
+            text.ends_with("(25%) at 1.0 MiB/s, ETA 3s\x1b[K\n"),
+            "{text:?}"
+        );
+    }
+
+    /// A terminal writer that blocks every write until released, like a
+    /// terminal paused with Ctrl-S.
+    #[derive(Clone, Default)]
+    struct PausedTerminal {
+        open: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl PausedTerminal {
+        fn release(&self) {
+            let (open, changed) = &*self.open;
+            *open.lock().unwrap() = true;
+            changed.notify_all();
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.bytes.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl Write for PausedTerminal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let (open, changed) = &*self.open;
+            let mut released = open.lock().unwrap();
+            while !*released {
+                released = changed.wait(released).unwrap();
+            }
+            drop(released);
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn paused_terminal_never_stalls_the_download_sink() {
+        struct CountingFile(usize);
+        impl Write for CountingFile {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0 += buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let terminal = PausedTerminal::default();
+        let reporter = TerminalProgress::spawn(terminal.clone(), false, Some(100 * MIB), || None);
+        let chunk = vec![0_u8; 64 * 1024];
+        let (finished, sink_done) = mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut file = CountingFile(0);
+                let mut sink = ProgressSink::new(&mut file, &reporter);
+                let written = (0..1600).try_for_each(|_| sink.write_all(&chunk));
+                reporter.phase(InstallPhase::BuildingRuntime);
+                reporter.phase(InstallPhase::CheckingGpu);
+                let _ = finished.send((written, file.0));
+            });
+            // Generous bound: the sink only touches an atomic, so this returns
+            // in milliseconds unless the terminal can block it.
+            let outcome: Result<(std::io::Result<()>, usize), _> =
+                sink_done.recv_timeout(Duration::from_secs(60));
+            let printed_while_paused = terminal.text();
+            terminal.release();
+            let (written, bytes) = outcome.expect("a paused terminal stalled the download sink");
+            written.expect("the sink reported every write as successful");
+            assert_eq!(bytes as u64, 100 * MIB);
+            assert_eq!(printed_while_paused, "");
+        });
+        drop(reporter);
+        let text = terminal.text();
+        assert!(text.contains("(100%)"), "{text}");
+        assert!(
+            text.ends_with("Building runtime…\nChecking GPU…\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn terminal_progress_totals_bytes_across_files() {
+        let terminal = PausedTerminal::default();
+        terminal.release();
+        let reporter = TerminalProgress::spawn(terminal.clone(), false, None, || None);
+        reporter.downloaded(200 * MIB);
+        reporter.downloaded(100 * MIB);
+        drop(reporter);
+        let text = terminal.text();
+        assert!(
+            text.lines()
+                .last()
+                .is_some_and(|line| line.starts_with("Downloading 300.0 MiB at")),
+            "{text}"
+        );
     }
 
     #[test]
     fn rtx_5050_setup_transcript_decline_and_accept() {
         let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
-        let mut decline = FakeIo::new(vec![Some("2"), Some("y"), Some("n")]);
+        // The consent prompt is the only confirmation of the Cloud -> Local switch.
+        let mut decline = FakeIo::new(vec![Some("2"), Some("n")]);
         let choice = run_engine_screen(
             &mut decline,
             AsrMode::Cloud,
@@ -558,24 +1403,30 @@ mod tests {
             ConsentedStatus::NotInstalled,
         );
         assert_eq!(choice, EngineChoice::Switch(AsrMode::Local));
-        let step = run_consented_install_step(&mut decline, &hw, true, false, NOW, |_| {
-            panic!("decline must not install")
-        });
+        let step = run_consented_install_step(
+            &mut decline,
+            &hw,
+            true,
+            false,
+            NOW,
+            |_| panic!("decline must not install"),
+            || panic!("decline must not restart the daemon"),
+        );
         assert_eq!(step, ConsentedInstallStep::Declined);
         let declined = decline.transcript();
         assert!(
-            declined.contains("Suggested for this hardware"),
+            declined.contains(&format!(
+                "Recommended for this computer: {DISTIL_MODEL_ID} (RTX 5050 Laptop)"
+            )),
             "{declined}"
         );
-        assert!(declined.contains(DISTIL_MODEL_ID), "{declined}");
-        assert!(declined.contains(CONSENT_TEXT), "{declined}");
-        assert!(
-            declined.contains("Download and install distil-large-v3.5-int8 now? [y/N]"),
-            "{declined}"
-        );
+        assert!(declined.contains(SUMMARY_BLOCK), "{declined}");
+        assert!(!declined.contains(CONSENT_TEXT), "{declined}");
         assert!(!declined.contains(INSTALL_SUCCESS), "{declined}");
+        assert!(!declined.contains("Switch to Local anyway?"), "{declined}");
+        assert_eq!(decline.prompts, 2, "engine choice, then consent");
 
-        let mut accept = FakeIo::new(vec![Some("2"), Some("y"), Some("y")]);
+        let mut accept = FakeIo::new(vec![Some("2"), Some("y")]);
         let choice = run_engine_screen(
             &mut accept,
             AsrMode::Cloud,
@@ -588,14 +1439,23 @@ mod tests {
         );
         assert_eq!(choice, EngineChoice::Switch(AsrMode::Local));
         let mut consents = Vec::new();
-        let step = run_consented_install_step(&mut accept, &hw, true, false, NOW, |consent| {
-            consents.push(consent);
-            Ok(())
-        });
+        let step = run_consented_install_step(
+            &mut accept,
+            &hw,
+            true,
+            false,
+            NOW,
+            |consent| {
+                consents.push(consent);
+                Ok(())
+            },
+            || Ok(()),
+        );
         assert_eq!(step, ConsentedInstallStep::Installed);
         assert_eq!(consents, vec![ConsentedConsent::accepted(NOW)]);
         let accepted = accept.transcript();
-        assert!(accepted.contains(CONSENT_TEXT), "{accepted}");
+        assert!(accepted.contains(SUMMARY_BLOCK), "{accepted}");
+        assert!(accepted.contains(DAEMON_RESTARTED), "{accepted}");
         assert!(accepted.contains(INSTALL_DURATION_HINT), "{accepted}");
         assert!(accepted.contains(INSTALL_SUCCESS), "{accepted}");
     }
@@ -733,7 +1593,8 @@ mod tests {
 
         let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
         let mut io = FakeIo::new(vec![Some("y")]);
-        let step = run_consented_install_step(&mut io, &hw, true, false, NOW, |_| Ok(()));
+        let step =
+            run_consented_install_step(&mut io, &hw, true, false, NOW, |_| Ok(()), || Ok(()));
         assert_eq!(step, ConsentedInstallStep::Installed);
         let mut catalog_ran = false;
         run_catalog_repair_if_needed(&mut io, step, false, |io| {

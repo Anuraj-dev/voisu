@@ -903,11 +903,14 @@ fn setup() -> ExitCode {
         StdioWizard, run_consented_local_setup, run_hyprland_setup, run_setup,
     };
     use voisu_app::setup_consented::{
-        ConsentedInstallStep, DEVELOPMENT_ROOT_NAME, SystemCommandRunner, probe_hardware,
-        production_consented_status, production_install, run_catalog_repair_if_needed,
-        run_consented_install_step,
+        ConsentedInstallStep, SystemCommandRunner, ask_cloud_after_local,
+        developer_pilot_manifest_exists, probe_hardware, production_cloud_declined_marker,
+        production_consented_status, production_install, production_restart_daemon,
+        run_catalog_repair_if_needed, run_consented_install_step,
     };
-    use voisu_app::setup_engine::{EngineChoice, run_engine_screen};
+    use voisu_app::setup_engine::{
+        ConsentedStatus, EngineChoice, consent_confirms_local_switch, run_engine_screen,
+    };
     use voisu_app::setup_profile::{
         HyprlandConfig, SetupProfile, discover_setup_profile, live_setup_facts,
     };
@@ -930,40 +933,36 @@ fn setup() -> ExitCode {
     let mut secrets = SecretToolStore;
     let deepgram = secrets.diagnose(Provider::Deepgram);
     let groq = secrets.diagnose(Provider::Groq);
-    let manifest_exists = |model_id: &str| {
-        voisu_core::state_dir().is_ok_and(|state| {
-            state
-                .join(DEVELOPMENT_ROOT_NAME)
-                .join("manifests")
-                .join(format!("{model_id}.json"))
-                .is_file()
-        })
-    };
     let consented = production_consented_status();
     let interactive = std::io::stdin().is_terminal();
-    match run_engine_screen(
+    let choice = run_engine_screen(
         &mut wizard,
         current,
         &hardware,
         &deepgram,
         &groq,
         interactive,
-        manifest_exists,
+        developer_pilot_manifest_exists,
         consented.clone(),
-    ) {
+    );
+    // The engine screen skipped its own switch warning because the consent
+    // prompt below confirms the switch; declining it must keep Cloud.
+    let consent_confirms_switch = choice == EngineChoice::Switch(AsrMode::Local)
+        && consent_confirms_local_switch(&hardware, &consented);
+    match choice {
         EngineChoice::Keep(_) => {}
         EngineChoice::Switch(mode) => match voisu_app::asr_mode::apply_cli_mode(mode) {
             Ok(message) => println!("{message}"),
             Err(error) => return fail(4, &error.message),
         },
     }
-    if voisu_app::local_setup::is_local_mode() {
+    // Decided once: the optional Cloud key prompts below must not move a
+    // Local setup onto the Cloud-only completion path.
+    let mut local = voisu_app::local_setup::is_local_mode();
+    if local {
         // Consented Install offer first; the Bakeoff-catalog repair flow
         // after this stays evidence-gated and never offers a second download.
-        let installed = matches!(
-            consented,
-            voisu_app::setup_engine::ConsentedStatus::Installed
-        );
+        let installed = matches!(consented, ConsentedStatus::Installed);
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
@@ -975,8 +974,16 @@ fn setup() -> ExitCode {
             installed,
             now_unix,
             production_install,
+            production_restart_daemon,
         ) {
             ConsentedInstallStep::Failed => return ExitCode::from(4),
+            ConsentedInstallStep::Declined if consent_confirms_switch => {
+                if let Err(error) = voisu_app::asr_mode::apply_cli_mode(AsrMode::Cloud) {
+                    return fail(4, &error.message);
+                }
+                println!("Local was not installed; keeping Cloud.");
+                local = false;
+            }
             step => {
                 if let Err(error) = run_catalog_repair_if_needed(
                     &mut wizard,
@@ -987,6 +994,20 @@ fn setup() -> ExitCode {
                     return fail(4, &error);
                 }
             }
+        }
+    }
+    if local {
+        // A first-time Local user without Cloud keys is asked once; No keeps
+        // `asr_mode = "local"`, skips every key prompt, and is remembered.
+        let declined_marker = production_cloud_declined_marker();
+        if ask_cloud_after_local(
+            &mut wizard,
+            interactive,
+            &deepgram,
+            &groq,
+            declined_marker.as_deref(),
+        ) {
+            run_setup(&mut wizard, &mut SecretToolStore, &mut LiveKeyValidator);
         }
         if wizard_only {
             println!("{}", local_complete_message());
@@ -1000,7 +1021,7 @@ fn setup() -> ExitCode {
     {
         return fail(4, &error);
     }
-    if voisu_app::local_setup::is_local_mode() {
+    if local {
         if let Some(HyprlandConfig::CurrentLua(config)) = hyprland_config {
             let mut actions = LiveHyprlandSetupActions { io: &mut wizard };
             if let Err(error) = run_hyprland_setup(&config, &mut actions) {
