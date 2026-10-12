@@ -9,19 +9,47 @@ pub const INSTALL_DEADLINE: Duration = Duration::from_secs(30 * 60);
 pub const NO_PROGRESS: Duration = Duration::from_secs(30);
 
 mod catalog;
+pub(crate) mod consented;
+mod consented_catalog;
+mod consented_pins;
+mod consented_runtime;
 mod development;
 mod fetch;
+mod hardware;
 mod health;
 mod installer;
 mod receipt;
 mod safe_fs;
 mod store;
+mod suggest;
 mod url_policy;
+
+pub(crate) fn consented_worker_files() -> &'static [(&'static str, &'static [u8])] {
+    consented_catalog::WORKER_FILES
+}
+pub(crate) use receipt::FilePin;
 
 pub use catalog::{
     Catalog, CatalogEntry, CatalogFile, DeviceSupport, FileKind, LicenseTerms, Provenance,
     Redistribution, RuntimeAbi, SHA256_HEX_LEN, ci_fixture_entry, development_selection,
     pilot_candidate, production_selection, sha256_hex, shipped_catalog, verify_file_digest,
+};
+pub(crate) use consented::consented_receipt_exists;
+pub use consented::{
+    ConsentedConsent, ConsentedError, ConsentedFilePin, ConsentedHealth, ConsentedInstallRequest,
+    ConsentedLayout, ConsentedReceipt, ConsentedRuntimeEntry, VerifiedConsentedInstall,
+    install_consented_install, remove_consented_install, verify_consented_install,
+    verify_consented_install_full,
+};
+pub use consented_catalog::{
+    CONSENT_TEXT, CONSENTED_ENTRY, ConsentedCatalogEntry, DownloadPin,
+    ESTIMATED_EXTRACTED_RUNTIME_BYTES, EXPECTED_HEALTH_TEXT, REQUIRED_FREE_BYTES,
+    consented_health_clip,
+};
+pub use consented_pins::TOTAL_DOWNLOAD_BYTES;
+pub use consented_runtime::{
+    ConsentedCommandRunner, ConsentedRuntimeBuilder, OfflineRuntimeBuilder, RuntimeBuild,
+    SystemConsentedCommandRunner, audit_runtime_tree,
 };
 pub use development::{
     DEV_MODEL_IDS, DEVELOPMENT_MANIFEST_VERSION, DEVELOPMENT_ROOT_NAME, DevCatalogEntry,
@@ -32,6 +60,10 @@ pub use development::{
 pub use fetch::{
     ArtifactFetcher, FetchError, FetchRequest, FetchResponse, ProductionHttps, ScriptedFetcher,
     ScriptedHop, follow_catalog_redirects,
+};
+pub use hardware::{
+    CommandOutput, CommandRunner, GpuProbe, HostHardware, NvidiaGpu, RunError, SystemCommandRunner,
+    parse_nvidia_smi, probe_hardware,
 };
 pub use health::{CandidateHealth, HealthError, HealthProbe, HealthReport, verify_candidate};
 pub use installer::{
@@ -46,6 +78,10 @@ pub use safe_fs::{SafeFsError, ensure_private_dir, relative_file_name};
 pub use store::{
     ModelLease, ModelStore, StoreError, StoreLock, legacy_models_dir, models_dir, models_dir_from,
     models_dir_from_state, resolve_models_root,
+};
+pub use suggest::{
+    CpuReason, DISTIL_MIN_TOTAL_VRAM_MIB, DISTIL_MODEL_ID, LocalSuggestion, PARAKEET_MODEL_ID,
+    suggest_local, suggestion_lines, warnings,
 };
 pub use url_policy::{CatalogUrl, UrlPolicyError, validate_catalog_url};
 

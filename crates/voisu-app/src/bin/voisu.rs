@@ -55,6 +55,7 @@ enum CliAction {
     DictionaryList { json: bool },
     Service(UserServiceAction),
     LocalDev(Vec<String>),
+    LocalRemove { yes: bool },
     Help,
     Version,
 }
@@ -87,6 +88,7 @@ fn main() -> ExitCode {
             Err(message) => fail(4, &message),
         },
         Ok(CliAction::LocalDev(args)) => ExitCode::from(voisu_app::local_dev_cli::run(&args)),
+        Ok(CliAction::LocalRemove { yes }) => local_remove(yes),
         Ok(CliAction::Help) => {
             println!("{}", usage());
             ExitCode::SUCCESS
@@ -895,10 +897,17 @@ fn provider_key_rows(runtime: &tokio::runtime::Runtime) -> Vec<DoctorRow> {
 /// live before storing it. All logic lives in the injectable `voisu_app::setup`
 /// core; here we supply the real terminal, keyring, and live validator.
 fn setup() -> ExitCode {
+    use std::io::IsTerminal;
     use voisu_app::setup::{
         LiveHyprlandSetupActions, LiveKeyValidator, ProviderOutcome, SETUP_COMPLETE_MESSAGE,
         StdioWizard, run_consented_local_setup, run_hyprland_setup, run_setup,
     };
+    use voisu_app::setup_consented::{
+        ConsentedInstallStep, DEVELOPMENT_ROOT_NAME, SystemCommandRunner, probe_hardware,
+        production_consented_status, production_install, run_catalog_repair_if_needed,
+        run_consented_install_step,
+    };
+    use voisu_app::setup_engine::{EngineChoice, run_engine_screen};
     use voisu_app::setup_profile::{
         HyprlandConfig, SetupProfile, discover_setup_profile, live_setup_facts,
     };
@@ -912,12 +921,75 @@ fn setup() -> ExitCode {
         Err(error) => return fail(4, &error.message()),
     };
     println!("Detected {} Setup Profile.", discovery.profile.as_str());
+    let current = if voisu_app::local_setup::is_local_mode() {
+        AsrMode::Local
+    } else {
+        AsrMode::Cloud
+    };
+    let hardware = probe_hardware(&SystemCommandRunner);
+    let mut secrets = SecretToolStore;
+    let deepgram = secrets.diagnose(Provider::Deepgram);
+    let groq = secrets.diagnose(Provider::Groq);
+    let manifest_exists = |model_id: &str| {
+        voisu_core::state_dir().is_ok_and(|state| {
+            state
+                .join(DEVELOPMENT_ROOT_NAME)
+                .join("manifests")
+                .join(format!("{model_id}.json"))
+                .is_file()
+        })
+    };
+    let consented = production_consented_status();
+    let interactive = std::io::stdin().is_terminal();
+    match run_engine_screen(
+        &mut wizard,
+        current,
+        &hardware,
+        &deepgram,
+        &groq,
+        interactive,
+        manifest_exists,
+        consented.clone(),
+    ) {
+        EngineChoice::Keep(_) => {}
+        EngineChoice::Switch(mode) => match voisu_app::asr_mode::apply_cli_mode(mode) {
+            Ok(message) => println!("{message}"),
+            Err(error) => return fail(4, &error.message),
+        },
+    }
     if voisu_app::local_setup::is_local_mode() {
-        if let Err(error) = run_consented_local_setup(&mut wizard) {
-            return fail(4, &error);
+        // Consented Install offer first; the Bakeoff-catalog repair flow
+        // after this stays evidence-gated and never offers a second download.
+        let installed = matches!(
+            consented,
+            voisu_app::setup_engine::ConsentedStatus::Installed
+        );
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        match run_consented_install_step(
+            &mut wizard,
+            &hardware,
+            interactive,
+            installed,
+            now_unix,
+            production_install,
+        ) {
+            ConsentedInstallStep::Failed => return ExitCode::from(4),
+            step => {
+                if let Err(error) = run_catalog_repair_if_needed(
+                    &mut wizard,
+                    step,
+                    installed,
+                    run_consented_local_setup,
+                ) {
+                    return fail(4, &error);
+                }
+            }
         }
         if wizard_only {
-            println!("{SETUP_COMPLETE_MESSAGE}");
+            println!("{}", local_complete_message());
             return ExitCode::SUCCESS;
         }
     }
@@ -941,9 +1013,9 @@ fn setup() -> ExitCode {
             }
         }
         if discovery.profile == SetupProfile::UbuntuWayland {
-            return finish_ubuntu_setup(SETUP_COMPLETE_MESSAGE);
+            return finish_ubuntu_setup(&local_complete_message());
         }
-        println!("{SETUP_COMPLETE_MESSAGE}");
+        println!("{}", local_complete_message());
         return ExitCode::SUCCESS;
     }
     let outcome = run_setup(&mut wizard, &mut SecretToolStore, &mut LiveKeyValidator);
@@ -992,6 +1064,36 @@ fn setup() -> ExitCode {
         }
     } else {
         ExitCode::from(4)
+    }
+}
+
+fn local_complete_message() -> String {
+    voisu_app::setup_consented::production_local_complete_message()
+}
+
+fn local_remove(yes: bool) -> ExitCode {
+    use std::io::IsTerminal;
+    use voisu_app::setup::StdioWizard;
+    use voisu_app::setup_consented::{
+        LocalCommand, LocalRemoveStatus, production_remove, run_local_remove,
+    };
+
+    let mut wizard = StdioWizard;
+    let mode = if voisu_app::local_setup::is_local_mode() {
+        AsrMode::Local
+    } else {
+        AsrMode::Cloud
+    };
+    match run_local_remove(
+        &mut wizard,
+        std::io::stdin().is_terminal(),
+        LocalCommand::Remove { yes },
+        mode,
+        production_remove,
+    ) {
+        LocalRemoveStatus::Success => ExitCode::SUCCESS,
+        LocalRemoveStatus::Usage(message) => fail(2, message),
+        LocalRemoveStatus::Failed(message) => fail(4, &message),
     }
 }
 
@@ -1452,6 +1554,14 @@ fn parse_command() -> Result<CliAction, String> {
         [service, action] if service == "service" => {
             Ok(CliAction::Service(parse_service_action(action)?))
         }
+        [command, rest @ ..] if command == "local" => {
+            match voisu_app::setup_consented::parse_local_command(rest) {
+                Ok(voisu_app::setup_consented::LocalCommand::Remove { yes }) => {
+                    Ok(CliAction::LocalRemove { yes })
+                }
+                Err(message) => Err(message),
+            }
+        }
         [command, rest @ ..] if command == "local-dev" => Ok(CliAction::LocalDev(rest.to_vec())),
         _ => Err(usage().to_owned()),
     }
@@ -1538,6 +1648,7 @@ commands:
   dictionary remove <term>
   dictionary list [--json]
   service <install|start|stop|restart|status|uninstall>
+  local remove [--yes]
   local-dev register|select|status|replay
 
 options:

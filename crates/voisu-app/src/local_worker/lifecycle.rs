@@ -293,6 +293,19 @@ pub fn local_runtime_admission() -> bool {
     crate::local_model::runtime_selection(&crate::local_model::shipped_catalog()).is_some()
 }
 
+/// Explicit Consented Install admission; the developer pilot takes precedence.
+#[must_use]
+pub fn consented_runtime_admission(store: &crate::local_model::ModelStore) -> bool {
+    !crate::local_model::development_local_enabled()
+        && crate::local_model::verify_consented_install(store).is_ok()
+}
+
+#[must_use]
+pub fn default_consented_runtime_admission() -> bool {
+    !crate::local_model::development_local_enabled()
+        && super::consented::verify_default_consented_install().is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

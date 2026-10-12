@@ -26,8 +26,7 @@ const MODE_INITIALIZED_NAME: &str = "mode-initialized";
 const CONFIG_REVISION_NAME: &str = "config-revision";
 const IO_DEADLINE: Duration = Duration::from_secs(2);
 const MAX_MODE_RESPONSE_BYTES: usize = 64 * 1024;
-#[allow(dead_code)]
-const LOCAL_UNAVAILABLE: &str = "Local selected; model unavailable";
+pub const LOCAL_UNAVAILABLE: &str = "Local selected; model unavailable";
 const LOCAL_START_REFUSED: &str = "Local ASR is unavailable; Start refused before capture";
 const LOCAL_REPLAY_REFUSED: &str = "Local ASR is unavailable; Replay refused before capture";
 
