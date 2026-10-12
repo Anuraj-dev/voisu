@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -529,11 +530,27 @@ fn open_lease(path: &Path) -> Result<File, ConsentedError> {
         .open(path)?)
 }
 fn flock(file: &File, operation: i32) -> Result<(), ConsentedError> {
-    // SAFETY: flock borrows a valid owned fd; it does not dereference memory.
-    if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } != 0 {
-        return Err(ConsentedError::Leased);
+    // Retry EAGAIN/EWOULDBLOCK: a fork-inherited duplicate descriptor can hold the lock between fork and exec.
+    const BUDGET: Duration = Duration::from_millis(200);
+    const PAUSE: Duration = Duration::from_millis(8);
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        // SAFETY: flock borrows a valid owned fd; it does not dereference memory.
+        if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(errno) if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK => {
+                if Instant::now() >= deadline {
+                    return Err(ConsentedError::Leased);
+                }
+                std::thread::sleep(PAUSE);
+            }
+            _ => return Err(error.into()),
+        }
     }
-    Ok(())
 }
 fn install_root(store: &ModelStore, id: &str, hash: &str) -> PathBuf {
     store.root().join("consented").join(id).join(hash)
@@ -1031,6 +1048,21 @@ mod tests {
         fs::write(root.join("bad"), b"x").unwrap();
         fs::set_permissions(root.join("bad"), fs::Permissions::from_mode(0o4700)).unwrap();
         assert!(audit_runtime_tree(&root).is_err());
+    }
+
+    #[test]
+    fn flock_acquires_after_brief_hold_on_another_open_file_description() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("lease");
+        let holder = open_lease(&path).unwrap();
+        flock(&holder, libc::LOCK_EX).unwrap();
+        let waiter = open_lease(&path).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(holder);
+        });
+        flock(&waiter, libc::LOCK_EX).unwrap();
+        release.join().unwrap();
     }
 }
 
