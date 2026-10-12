@@ -66,7 +66,7 @@ fn write_engine_screen(
         key_status(groq)
     ));
     io.writeln(CLOUD_SUGGESTION);
-    if !deepgram.is_configured() && groq.is_configured() {
+    if matches!(deepgram, KeyDiagnosis::Absent) && groq.is_configured() {
         io.writeln(GROQ_ONLY_HINT);
     }
     io.writeln("");
@@ -115,10 +115,16 @@ fn choose_engine(io: &mut dyn WizardIo, current: AsrMode, interactive: bool) -> 
                     if current == AsrMode::Local {
                         return EngineChoice::Keep(AsrMode::Local);
                     }
-                    return if ask_yes_no(io, LOCAL_SWITCH_CONFIRM, false) {
-                        EngineChoice::Switch(AsrMode::Local)
-                    } else {
-                        EngineChoice::Keep(AsrMode::Cloud)
+                    return match ask_yes_no(io, LOCAL_SWITCH_CONFIRM, false) {
+                        Some(true) => EngineChoice::Switch(AsrMode::Local),
+                        Some(false) => EngineChoice::Keep(AsrMode::Cloud),
+                        None => {
+                            io.writeln(&format!(
+                                "Keeping {}; no valid confirmation after 3 attempts.",
+                                current.as_str()
+                            ));
+                            EngineChoice::Keep(current)
+                        }
                     };
                 }
                 _ => io.writeln("Please answer 1 or 2."),
@@ -137,13 +143,13 @@ fn key_status(diagnosis: &KeyDiagnosis) -> &'static str {
         KeyDiagnosis::Found {
             location: KeyLocation::EnvOverride,
             ..
-        }
-        | KeyDiagnosis::EnvOverrideInvalid => "set via env",
+        } => "set via env",
         KeyDiagnosis::Found { .. } => "configured",
-        KeyDiagnosis::Absent
-        | KeyDiagnosis::Locked
-        | KeyDiagnosis::Unavailable
-        | KeyDiagnosis::ToolMissing => "not configured",
+        KeyDiagnosis::EnvOverrideInvalid => "env override invalid",
+        KeyDiagnosis::Absent => "not configured",
+        KeyDiagnosis::Locked => "keyring locked — status unknown",
+        KeyDiagnosis::Unavailable => "keyring unavailable — status unknown",
+        KeyDiagnosis::ToolMissing => "secret-tool missing — status unknown",
     }
 }
 
@@ -164,19 +170,22 @@ fn mode_label(mode: AsrMode) -> &'static str {
     }
 }
 
-fn ask_yes_no(io: &mut dyn WizardIo, question: &str, default_yes: bool) -> bool {
+/// Asks a yes/no question. `None` means three invalid answers; EOF and Enter
+/// still take `default_yes` (No on the Local switch confirm).
+fn ask_yes_no(io: &mut dyn WizardIo, question: &str, default_yes: bool) -> Option<bool> {
     let suffix = if default_yes { " [Y/n]" } else { " [y/N]" };
-    loop {
+    for _ in 0..MAX_ENGINE_ATTEMPTS {
         match io.prompt_line(&format!("{question}{suffix} ")) {
-            None => return default_yes,
+            None => return Some(default_yes),
             Some(answer) => match answer.trim().to_ascii_lowercase().as_str() {
-                "" => return default_yes,
-                "y" | "yes" => return true,
-                "n" | "no" => return false,
+                "" => return Some(default_yes),
+                "y" | "yes" => return Some(true),
+                "n" | "no" => return Some(false),
                 _ => io.writeln("Please answer y or n."),
             },
         }
     }
+    None
 }
 
 #[cfg(test)]
@@ -553,6 +562,42 @@ mod tests {
     }
 
     #[test]
+    fn local_confirm_three_invalid_answers_keep_current_and_leave_later_input() {
+        let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
+        let (choice, io) = run(
+            &hw,
+            AsrMode::Cloud,
+            &absent(),
+            &absent(),
+            true,
+            vec![
+                Some("2"),
+                Some("maybe"),
+                Some("sure"),
+                Some("ok"),
+                Some("y"),
+            ],
+            |_| false,
+        );
+        assert_eq!(choice, EngineChoice::Keep(AsrMode::Cloud));
+        assert_eq!(
+            io.prompts, 4,
+            "engine choice plus three confirmation attempts"
+        );
+        assert_eq!(
+            io.lines,
+            vec![Some("y".to_owned())],
+            "the later y must remain unread"
+        );
+        assert!(
+            io.transcript()
+                .contains("Keeping cloud; no valid confirmation after 3 attempts."),
+            "{}",
+            io.transcript()
+        );
+    }
+
+    #[test]
     fn cloud_key_status_and_groq_only_hint() {
         let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
         let (_, io) = run(
@@ -581,5 +626,67 @@ mod tests {
         assert!(text.contains("Deepgram: not configured"), "{text}");
         assert!(text.contains("Groq: configured"), "{text}");
         assert!(text.contains(GROQ_ONLY_HINT), "{text}");
+    }
+
+    #[test]
+    fn key_status_covers_every_diagnosis_and_hint_only_when_deepgram_absent() {
+        let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
+        let groq_ok = found(KeyLocation::Keyring);
+        let cases = [
+            (found(KeyLocation::Keyring), "configured"),
+            (found(KeyLocation::PlaintextFile), "configured"),
+            (found(KeyLocation::EnvOverride), "set via env"),
+            (KeyDiagnosis::EnvOverrideInvalid, "env override invalid"),
+            (KeyDiagnosis::Absent, "not configured"),
+            (KeyDiagnosis::Locked, "keyring locked — status unknown"),
+            (
+                KeyDiagnosis::Unavailable,
+                "keyring unavailable — status unknown",
+            ),
+            (
+                KeyDiagnosis::ToolMissing,
+                "secret-tool missing — status unknown",
+            ),
+        ];
+        for (diagnosis, status) in &cases {
+            let (_, io) = run(
+                &hw,
+                AsrMode::Cloud,
+                diagnosis,
+                &absent(),
+                false,
+                vec![],
+                |_| false,
+            );
+            let text = io.transcript();
+            assert!(
+                text.contains(&format!("Deepgram: {status}")),
+                "{status}: {text}"
+            );
+            assert!(
+                !text.contains(GROQ_ONLY_HINT),
+                "hint with Groq absent ({status}): {text}"
+            );
+
+            let (_, io) = run(
+                &hw,
+                AsrMode::Cloud,
+                diagnosis,
+                &groq_ok,
+                false,
+                vec![],
+                |_| false,
+            );
+            let text = io.transcript();
+            assert!(
+                text.contains(&format!("Deepgram: {status}")),
+                "{status} with Groq: {text}"
+            );
+            assert_eq!(
+                text.contains(GROQ_ONLY_HINT),
+                matches!(diagnosis, KeyDiagnosis::Absent),
+                "hint condition ({status}): {text}"
+            );
+        }
     }
 }
