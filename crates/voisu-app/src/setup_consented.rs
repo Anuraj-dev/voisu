@@ -8,11 +8,11 @@
 use voisu_core::AsrMode;
 
 use crate::asr_mode::LOCAL_UNAVAILABLE;
+use crate::local_model::consented::ConsentedRemoveOutcome;
 use crate::local_model::{
     CONSENT_TEXT, CONSENTED_ENTRY, ConsentedConsent, ConsentedError, ConsentedInstallRequest,
     HostHardware, InstallClock, InstallIo, ModelStore, OfflineRuntimeBuilder, ProductionHttps,
-    consented_receipt_exists, models_dir_from_state, remove_consented_install, suggest_local,
-    verify_consented_install,
+    models_dir_from_state, remove_consented_install, suggest_local, verify_consented_install,
 };
 use crate::local_setup::SetupMaintenance;
 use crate::local_worker::ConsentedWorkerHealth;
@@ -276,12 +276,9 @@ pub fn production_remove() -> Result<RemoveOutcome, ConsentedError> {
 }
 
 fn remove_consented_from_store(store: &ModelStore) -> Result<RemoveOutcome, ConsentedError> {
-    let present = consented_receipt_exists(store);
-    remove_consented_install(store)?;
-    Ok(if present {
-        RemoveOutcome::Removed
-    } else {
-        RemoveOutcome::Absent
+    Ok(match remove_consented_install(store)? {
+        ConsentedRemoveOutcome::Removed => RemoveOutcome::Removed,
+        ConsentedRemoveOutcome::Absent => RemoveOutcome::Absent,
     })
 }
 
@@ -806,6 +803,29 @@ mod tests {
             RemoveOutcome::Removed
         );
         assert!(!store.root().join("private/consented.receipt.json").exists());
+    }
+
+    #[test]
+    fn remove_resumes_journaled_tree_without_receipt_and_reports_removed() {
+        let (_temp, store) = test_store();
+        let receipt = removal_receipt();
+        let root = store
+            .root()
+            .join("consented")
+            .join(&receipt.entry_id)
+            .join(&receipt.content_hash);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("remaining-file"), b"partial removal").unwrap();
+        let journal = store.root().join("private/consented.removal.json");
+        std::fs::write(&journal, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert!(!store.root().join("private/consented.receipt.json").exists());
+
+        assert_eq!(
+            remove_consented_from_store(&store).unwrap(),
+            RemoveOutcome::Removed
+        );
+        assert!(!root.exists());
+        assert!(!journal.exists());
     }
 
     #[test]

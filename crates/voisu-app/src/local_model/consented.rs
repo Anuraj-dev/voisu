@@ -396,7 +396,16 @@ fn verify_with_entry_mode(
     })
 }
 
-pub fn remove_consented_install(store: &ModelStore) -> Result<(), ConsentedError> {
+/// Result decided under the store lock, including recovery and orphan cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsentedRemoveOutcome {
+    Removed,
+    Absent,
+}
+
+pub fn remove_consented_install(
+    store: &ModelStore,
+) -> Result<ConsentedRemoveOutcome, ConsentedError> {
     remove_with_entry(store, &CONSENTED_ENTRY)
 }
 
@@ -408,21 +417,27 @@ pub(crate) fn consented_receipt_exists(store: &ModelStore) -> bool {
 fn remove_with_entry(
     store: &ModelStore,
     entry: &ConsentedCatalogEntry,
-) -> Result<(), ConsentedError> {
+) -> Result<ConsentedRemoveOutcome, ConsentedError> {
     remove_with_delete_hook(store, entry, || Ok(()))
 }
 fn remove_with_delete_hook(
     store: &ModelStore,
     entry: &ConsentedCatalogEntry,
     after_receipt_delete: impl FnOnce() -> Result<(), ConsentedError>,
-) -> Result<(), ConsentedError> {
+) -> Result<ConsentedRemoveOutcome, ConsentedError> {
     let _lock = store.lock_exclusive().map_err(ConsentedError::Store)?;
-    resume_removal(store, entry, || Ok(()))?;
-    remove_unreceipted_publish(store, entry)?;
-    let receipt = match load_receipt(store) {
-        Err(ConsentedError::Missing) => return Ok(()),
-        other => other?,
-    };
+    let resumed = resume_removal(store, entry, || Ok(()))?;
+    let cleaned = remove_unreceipted_publish(store, entry)?;
+    // Cleanup already parsed any present receipt. The lock keeps this absence
+    // check and the completed recovery work in the same namespace snapshot.
+    if !super::consented_receipt_exists(store) {
+        return Ok(if resumed || cleaned {
+            ConsentedRemoveOutcome::Removed
+        } else {
+            ConsentedRemoveOutcome::Absent
+        });
+    }
+    let receipt = load_receipt(store)?;
     validate_removal_target(entry, &receipt)?;
     let lease = lease_file(store, &receipt.content_hash)?;
     flock(&lease, libc::LOCK_EX)?;
@@ -433,7 +448,8 @@ fn remove_with_delete_hook(
         &serde_json::to_vec(&receipt).map_err(|_| ConsentedError::Receipt)?,
     )?;
     drop(lease);
-    resume_removal(store, entry, after_receipt_delete)
+    resume_removal(store, entry, after_receipt_delete)?;
+    Ok(ConsentedRemoveOutcome::Removed)
 }
 
 fn validate_removal_target(
@@ -459,9 +475,9 @@ fn resume_removal(
     store: &ModelStore,
     entry: &ConsentedCatalogEntry,
     after_receipt_delete: impl FnOnce() -> Result<(), ConsentedError>,
-) -> Result<(), ConsentedError> {
+) -> Result<bool, ConsentedError> {
     let bytes = match read_record(store, "consented.removal.json") {
-        Err(ConsentedError::Missing) => return Ok(()),
+        Err(ConsentedError::Missing) => return Ok(false),
         other => other?,
     };
     let receipt: ConsentedReceipt =
@@ -475,6 +491,8 @@ fn resume_removal(
         Ok(_) => return Err(ConsentedError::Receipt),
         Err(error) => return Err(error),
     }
+    // Stabilize receipt withdrawal (including a prior uncertain rollback)
+    // before deleting its target. A failed sync leaves the tree and journal.
     sync_dir(&store.root().join("private"))?;
     after_receipt_delete()?;
     let root = install_root(store, entry.id, &receipt.content_hash);
@@ -486,7 +504,7 @@ fn resume_removal(
     }
     fs::remove_file(store.root().join("private/consented.removal.json"))?;
     sync_dir(&store.root().join("private"))?;
-    Ok(())
+    Ok(true)
 }
 
 /// Only the current entry's exact publication can be an orphan. The store
@@ -494,10 +512,21 @@ fn resume_removal(
 fn remove_unreceipted_publish(
     store: &ModelStore,
     entry: &ConsentedCatalogEntry,
-) -> Result<(), ConsentedError> {
+) -> Result<bool, ConsentedError> {
+    remove_unreceipted_publish_with_sync(store, entry, sync_dir)
+}
+fn remove_unreceipted_publish_with_sync(
+    store: &ModelStore,
+    entry: &ConsentedCatalogEntry,
+    private_sync: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<bool, ConsentedError> {
+    // An earlier receipt replacement and rollback may both have failed fsync.
+    // Stabilize the visible receipt before treating its other target as orphaned.
+    // Caller holds the store lock; failure must retain the publication.
+    private_sync(&store.root().join("private"))?;
     let hash = content_hash(entry);
     match load_receipt(store) {
-        Ok(receipt) if receipt.content_hash == hash => return Ok(()),
+        Ok(receipt) if receipt.content_hash == hash => return Ok(false),
         Ok(_) | Err(ConsentedError::Missing) => {}
         Err(error) => return Err(error),
     }
@@ -507,8 +536,9 @@ fn remove_unreceipted_publish(
         flock(&lease, libc::LOCK_EX)?;
         fs::remove_dir_all(&root)?;
         sync_dir(root.parent().expect("version parent"))?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn lease_file(store: &ModelStore, hash: &str) -> Result<File, ConsentedError> {
@@ -530,23 +560,40 @@ fn open_lease(path: &Path) -> Result<File, ConsentedError> {
         .open(path)?)
 }
 fn flock(file: &File, operation: i32) -> Result<(), ConsentedError> {
+    flock_with_retry(
+        || {
+            // SAFETY: flock borrows a valid owned fd; it does not dereference memory.
+            if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        },
+        Instant::now,
+        std::thread::sleep,
+    )
+}
+fn flock_with_retry(
+    mut attempt: impl FnMut() -> std::io::Result<()>,
+    now: impl Fn() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), ConsentedError> {
     // Retry EAGAIN/EWOULDBLOCK: a fork-inherited duplicate descriptor can hold the lock between fork and exec.
     const BUDGET: Duration = Duration::from_millis(200);
     const PAUSE: Duration = Duration::from_millis(8);
-    let deadline = Instant::now() + BUDGET;
+    let deadline = now() + BUDGET;
     loop {
-        // SAFETY: flock borrows a valid owned fd; it does not dereference memory.
-        if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
+        let error = match attempt() {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
         match error.raw_os_error() {
             Some(libc::EINTR) => continue,
             Some(errno) if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK => {
-                if Instant::now() >= deadline {
+                if now() >= deadline {
                     return Err(ConsentedError::Leased);
                 }
-                std::thread::sleep(PAUSE);
+                sleep(PAUSE);
             }
             _ => return Err(error.into()),
         }
@@ -1032,6 +1079,7 @@ fn available_space(root: &Path) -> Result<u64, ConsentedError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -1051,18 +1099,113 @@ mod tests {
     }
 
     #[test]
-    fn flock_acquires_after_brief_hold_on_another_open_file_description() {
+    fn flock_retries_contention_then_succeeds() {
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut attempts = 0;
+        let mut pauses = 0;
+        flock_with_retry(
+            || {
+                attempts += 1;
+                if attempts <= 3 {
+                    Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
+                } else {
+                    Ok(())
+                }
+            },
+            || start + elapsed.get(),
+            |pause| {
+                assert_eq!(pause, Duration::from_millis(8));
+                pauses += 1;
+                elapsed.set(elapsed.get() + pause);
+            },
+        )
+        .unwrap();
+        assert_eq!(attempts, 4);
+        assert_eq!(pauses, 3);
+        assert_eq!(elapsed.get(), Duration::from_millis(24));
+    }
+
+    #[test]
+    fn flock_contention_exhausts_budget() {
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut attempts = 0;
+        let mut pauses = 0;
+        assert!(matches!(
+            flock_with_retry(
+                || {
+                    attempts += 1;
+                    Err(std::io::Error::from_raw_os_error(libc::EWOULDBLOCK))
+                },
+                || start + elapsed.get(),
+                |pause| {
+                    assert_eq!(pause, Duration::from_millis(8));
+                    pauses += 1;
+                    elapsed.set(elapsed.get() + pause);
+                },
+            ),
+            Err(ConsentedError::Leased)
+        ));
+        assert_eq!(attempts, 26);
+        assert_eq!(pauses, 25);
+        assert_eq!(elapsed.get(), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn flock_retries_eintr_without_sleep_or_contention_deadline() {
+        let start = Instant::now();
+        let attempts = Cell::new(0);
+        flock_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() <= 2 {
+                    Err(std::io::Error::from_raw_os_error(libc::EINTR))
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                if attempts.get() == 0 {
+                    start
+                } else {
+                    start + Duration::from_secs(1)
+                }
+            },
+            |_| panic!("EINTR must retry immediately"),
+        )
+        .unwrap();
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn flock_other_errno_is_io_without_retry() {
+        let mut attempts = 0;
+        assert!(matches!(
+            flock_with_retry(
+                || {
+                    attempts += 1;
+                    Err(std::io::Error::from_raw_os_error(libc::EBADF))
+                },
+                Instant::now,
+                |_| panic!("other errnos must return immediately"),
+            ),
+            Err(ConsentedError::Io(error)) if error.raw_os_error() == Some(libc::EBADF)
+        ));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn flock_held_on_another_open_file_description_is_leased() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("lease");
         let holder = open_lease(&path).unwrap();
         flock(&holder, libc::LOCK_EX).unwrap();
         let waiter = open_lease(&path).unwrap();
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            drop(holder);
-        });
-        flock(&waiter, libc::LOCK_EX).unwrap();
-        release.join().unwrap();
+        assert!(matches!(
+            flock(&waiter, libc::LOCK_EX),
+            Err(ConsentedError::Leased)
+        ));
     }
 }
 
@@ -1675,9 +1818,64 @@ pub(crate) mod install_tests {
             // With uncertain rollback fsync, either namespace version could
             // survive power loss, so both possible receipt targets stay alive.
             assert_eq!(new_root.exists(), rollback_fails);
+            if rollback_fails {
+                let _lock = store.lock_exclusive().unwrap();
+                assert!(matches!(
+                    remove_unreceipted_publish_with_sync(&store, &next, |parent| {
+                        assert_eq!(parent, store.root().join("private"));
+                        Err(std::io::Error::from_raw_os_error(libc::EIO))
+                    }),
+                    Err(ConsentedError::Io(error)) if error.raw_os_error() == Some(libc::EIO)
+                ));
+                assert!(new_root.exists());
+                assert!(prior_root.exists());
+                assert_eq!(load_receipt(&store).unwrap(), prior);
+                assert!(remove_unreceipted_publish(&store, &next).unwrap());
+                assert!(!new_root.exists());
+                assert!(prior_root.exists());
+                assert_eq!(load_receipt(&store).unwrap(), prior);
+            }
             assert!(verify_with_entry(&store, &entry()).is_ok());
         }
     }
+    #[test]
+    fn consented_uncertain_receipt_unlink_retains_publish_until_cleanup_syncs() {
+        let (_temp, store) = store();
+        let root = install_root(&store, entry().id, &content_hash(&entry()));
+        let calls = Cell::new(0);
+        assert!(matches!(
+            install_with_receipt_sync(
+                request(
+                    &store,
+                    &fetcher(),
+                    &FakeBuilder::default(),
+                    &health(&store, &entry(), false),
+                ),
+                &entry(),
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Err(std::io::Error::from_raw_os_error(libc::EIO))
+                },
+            ),
+            Err(ConsentedError::Io(error)) if error.raw_os_error() == Some(libc::EIO)
+        ));
+        assert_eq!(calls.get(), 2);
+        assert!(matches!(load_receipt(&store), Err(ConsentedError::Missing)));
+        assert!(root.exists());
+
+        let _lock = store.lock_exclusive().unwrap();
+        assert!(matches!(
+            remove_unreceipted_publish_with_sync(&store, &entry(), |parent| {
+                assert_eq!(parent, store.root().join("private"));
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            }),
+            Err(ConsentedError::Io(error)) if error.raw_os_error() == Some(libc::EIO)
+        ));
+        assert!(root.exists());
+        assert!(remove_unreceipted_publish(&store, &entry()).unwrap());
+        assert!(!root.exists());
+    }
+
     #[test]
     fn consented_runtime_manifest_detects_truncation_deletion_links_and_extras() {
         for mutation in 0..5 {
@@ -1768,7 +1966,10 @@ pub(crate) mod install_tests {
             assert!(root.exists());
             drop(lease);
             match retry {
-                0 => remove_with_entry(&store, &entry()).unwrap(),
+                0 => assert_eq!(
+                    remove_with_entry(&store, &entry()).unwrap(),
+                    ConsentedRemoveOutcome::Removed
+                ),
                 1 => assert!(matches!(
                     verify_with_entry(&store, &entry()),
                     Err(ConsentedError::Missing)
