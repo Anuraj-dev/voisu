@@ -352,6 +352,9 @@ impl Gate {
                     Err(error) => {
                         self.worker_failure = Some(match error {
                             crate::local_model::ConsentedError::Health(detail) => detail,
+                            crate::local_model::ConsentedError::GpuBusy => {
+                                crate::local_worker::GPU_BUSY.to_owned()
+                            }
                             error => format!("{error:?}"),
                         });
                         None

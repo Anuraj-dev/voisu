@@ -904,7 +904,8 @@ fn setup() -> ExitCode {
     };
     use voisu_app::setup_consented::{
         ConsentedInstallStep, DEVELOPMENT_ROOT_NAME, SystemCommandRunner, probe_hardware,
-        production_consented_status, production_install, run_consented_install_step,
+        production_consented_status, production_install, run_catalog_repair_if_needed,
+        run_consented_install_step,
     };
     use voisu_app::setup_engine::{EngineChoice, run_engine_screen};
     use voisu_app::setup_profile::{
@@ -976,12 +977,16 @@ fn setup() -> ExitCode {
             production_install,
         ) {
             ConsentedInstallStep::Failed => return ExitCode::from(4),
-            ConsentedInstallStep::Skipped
-            | ConsentedInstallStep::Declined
-            | ConsentedInstallStep::Installed => {}
-        }
-        if let Err(error) = run_consented_local_setup(&mut wizard) {
-            return fail(4, &error);
+            step => {
+                if let Err(error) = run_catalog_repair_if_needed(
+                    &mut wizard,
+                    step,
+                    installed,
+                    run_consented_local_setup,
+                ) {
+                    return fail(4, &error);
+                }
+            }
         }
         if wizard_only {
             println!("{}", local_complete_message());

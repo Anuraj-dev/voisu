@@ -29,7 +29,7 @@ use super::whisper_cli::WhisperCppWorker;
 
 const FLOCK: &str = "/usr/bin/flock";
 const GPU_LOCK_CONFLICT: i32 = 73;
-const GPU_BUSY: &str = "another Local worker holds the GPU";
+pub(crate) const GPU_BUSY: &str = "another Local worker holds the GPU";
 const SYSTEMD_RUN: &str = "systemd-run";
 const SYSTEMCTL: &str = "systemctl";
 const MAX_REPLY_BYTES: usize = MAX_JSON_FRAME_BYTES;

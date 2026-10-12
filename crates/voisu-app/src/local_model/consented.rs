@@ -32,6 +32,8 @@ pub enum ConsentedError {
     Tree(String),
     Build(String),
     Health(String),
+    /// Another Local worker holds the GPU (live unit or GPU flock).
+    GpuBusy,
     /// Stop/reap was not observed; the publication must remain protected.
     HealthUnreaped,
     Fetch(FetchError),
@@ -395,6 +397,12 @@ fn verify_with_entry_mode(
 
 pub fn remove_consented_install(store: &ModelStore) -> Result<(), ConsentedError> {
     remove_with_entry(store, &CONSENTED_ENTRY)
+}
+
+/// Whether a Consented Install receipt file is present. Does not parse it.
+#[must_use]
+pub(crate) fn consented_receipt_exists(store: &ModelStore) -> bool {
+    receipt_path(store).is_file()
 }
 fn remove_with_entry(
     store: &ModelStore,

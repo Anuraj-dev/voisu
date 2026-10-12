@@ -11,7 +11,8 @@ use crate::asr_mode::LOCAL_UNAVAILABLE;
 use crate::local_model::{
     CONSENT_TEXT, CONSENTED_ENTRY, ConsentedConsent, ConsentedError, ConsentedInstallRequest,
     HostHardware, InstallClock, InstallIo, ModelStore, OfflineRuntimeBuilder, ProductionHttps,
-    models_dir_from_state, remove_consented_install, suggest_local, verify_consented_install,
+    consented_receipt_exists, models_dir_from_state, remove_consented_install, suggest_local,
+    verify_consented_install,
 };
 use crate::local_setup::SetupMaintenance;
 use crate::local_worker::ConsentedWorkerHealth;
@@ -32,6 +33,7 @@ const REMOVED: &str = "Removed distil-large-v3.5-int8 (Consented Install).";
 const NOTHING_TO_REMOVE: &str = "No Consented Install is installed.";
 const IN_USE: &str =
     "The Consented Install is in use; stop dictation or run `voisu service stop` first.";
+const GPU_BUSY: &str = "Another Local worker is using the GPU; stop it (for example `voisu service stop`, or stop voisu-dev.service), then run `voisu setup` again.";
 
 /// Outcome of the setup Consented Install offer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,6 +97,26 @@ pub fn run_consented_install_step(
             }
         }
         Some(false) | None => ConsentedInstallStep::Declined,
+    }
+}
+
+/// Bakeoff-catalog repair after the Consented Install offer. Skip it when a
+/// verified install already exists or was just installed.
+#[must_use]
+pub fn runs_catalog_repair(step: ConsentedInstallStep, already_installed: bool) -> bool {
+    !already_installed && step != ConsentedInstallStep::Installed
+}
+
+pub fn run_catalog_repair_if_needed(
+    io: &mut dyn WizardIo,
+    step: ConsentedInstallStep,
+    already_installed: bool,
+    catalog: impl FnOnce(&mut dyn WizardIo) -> Result<(), String>,
+) -> Result<(), String> {
+    if runs_catalog_repair(step, already_installed) {
+        catalog(io)
+    } else {
+        Ok(())
     }
 }
 
@@ -162,6 +184,7 @@ pub fn consented_error_line(error: &ConsentedError) -> String {
         ConsentedError::NoSpace => "Not enough free disk space.".into(),
         ConsentedError::Maintenance => IN_USE.into(),
         ConsentedError::Health(_) => "The installed model failed its health check.".into(),
+        ConsentedError::GpuBusy => GPU_BUSY.into(),
         ConsentedError::HealthUnreaped => {
             "The health-check worker did not stop; its files were kept.".into()
         }
@@ -249,15 +272,17 @@ pub fn production_remove() -> Result<RemoveOutcome, ConsentedError> {
         return Ok(RemoveOutcome::Absent);
     }
     let store = ModelStore::open(dir).map_err(ConsentedError::Store)?;
-    match verify_consented_install(&store) {
-        Err(ConsentedError::Missing) => Ok(RemoveOutcome::Absent),
-        Err(error) => Err(error),
-        Ok(verified) => {
-            drop(verified);
-            remove_consented_install(&store)?;
-            Ok(RemoveOutcome::Removed)
-        }
-    }
+    remove_consented_from_store(&store)
+}
+
+fn remove_consented_from_store(store: &ModelStore) -> Result<RemoveOutcome, ConsentedError> {
+    let present = consented_receipt_exists(store);
+    remove_consented_install(store)?;
+    Ok(if present {
+        RemoveOutcome::Removed
+    } else {
+        RemoveOutcome::Absent
+    })
 }
 
 const _: () = assert!(CONSENTED_ENTRY.consent_installable);
@@ -354,6 +379,7 @@ mod tests {
                     Err(ConsentedError::Health(message)) => {
                         Err(ConsentedError::Health(message.clone()))
                     }
+                    Err(ConsentedError::GpuBusy) => Err(ConsentedError::GpuBusy),
                     Err(ConsentedError::Fetch(error)) => Err(ConsentedError::Fetch(error.clone())),
                     Err(_) => Err(ConsentedError::NoSpace),
                 }
@@ -473,6 +499,10 @@ mod tests {
             (
                 ConsentedError::Health("cuda".into()),
                 "Install failed: The installed model failed its health check.",
+            ),
+            (
+                ConsentedError::GpuBusy,
+                "Install failed: Another Local worker is using the GPU; stop it (for example `voisu service stop`, or stop voisu-dev.service), then run `voisu setup` again.",
             ),
         ];
         for (error, line) in cases {
@@ -663,6 +693,136 @@ mod tests {
         assert!(text.contains(REMOVED), "{text}");
         assert!(text.contains(LOCAL_UNAVAILABLE), "{text}");
         assert_eq!(io.prompts, 0);
+    }
+
+    #[test]
+    fn gpu_busy_prints_the_setup_line() {
+        assert_eq!(consented_error_line(&ConsentedError::GpuBusy), GPU_BUSY);
+    }
+
+    #[test]
+    fn catalog_repair_runs_only_without_a_verified_consented_install() {
+        assert!(!runs_catalog_repair(ConsentedInstallStep::Installed, false));
+        assert!(!runs_catalog_repair(ConsentedInstallStep::Skipped, true));
+        assert!(runs_catalog_repair(ConsentedInstallStep::Declined, false));
+        assert!(runs_catalog_repair(ConsentedInstallStep::Skipped, false));
+    }
+
+    #[test]
+    fn after_installed_catalog_repair_is_not_run() {
+        use crate::local_setup::{LocalSetupActions, run_with};
+
+        struct EmptyCatalog;
+        impl LocalSetupActions for EmptyCatalog {
+            fn catalog_lines(&self) -> Vec<String> {
+                vec!["whisper-cpp-ggml-base.en".into()]
+            }
+            fn active_identity(&self) -> Option<String> {
+                None
+            }
+            fn retained_identity(&self) -> Option<String> {
+                None
+            }
+            fn restore_retained(&mut self) -> Result<String, String> {
+                panic!("catalog repair must not restore after Consented Install")
+            }
+            fn install_fixture(
+                &mut self,
+                _consent: crate::local_model::InstallConsent,
+            ) -> Result<String, String> {
+                panic!("catalog repair must not install after Consented Install")
+            }
+        }
+
+        let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
+        let mut io = FakeIo::new(vec![Some("y")]);
+        let step = run_consented_install_step(&mut io, &hw, true, false, NOW, |_| Ok(()));
+        assert_eq!(step, ConsentedInstallStep::Installed);
+        let mut catalog_ran = false;
+        run_catalog_repair_if_needed(&mut io, step, false, |io| {
+            catalog_ran = true;
+            run_with(io, &mut EmptyCatalog).map(|_| ())
+        })
+        .unwrap();
+        assert!(!catalog_ran);
+        let text = io.transcript();
+        assert!(text.contains(INSTALL_SUCCESS), "{text}");
+        assert!(!text.contains("Active model: none"), "{text}");
+    }
+
+    fn test_store() -> (tempfile::TempDir, ModelStore) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = models_dir_from_state(Some(temp.path().as_os_str().to_owned()), None).unwrap();
+        let store = ModelStore::open(root).unwrap();
+        (temp, store)
+    }
+
+    fn removal_receipt() -> crate::local_model::ConsentedReceipt {
+        let mut receipt = crate::local_model::ConsentedReceipt {
+            version: 1,
+            entry_id: CONSENTED_ENTRY.id.into(),
+            revision: CONSENTED_ENTRY.revision.into(),
+            content_hash: "a".repeat(64),
+            consent: ConsentedConsent {
+                text: String::new(),
+                license_spdx: String::new(),
+                unix_time: 0,
+            },
+            consent_text_sha256: String::new(),
+            files: std::collections::BTreeMap::new(),
+            runtime_inputs: std::collections::BTreeMap::new(),
+            runtime_manifest: std::collections::BTreeMap::new(),
+            python_path: std::path::PathBuf::from("runtime/python"),
+            venv_path: std::path::PathBuf::from("runtime/venv"),
+            device: "cuda:0".into(),
+            compute_type: "int8_float16".into(),
+            receipt_hash: String::new(),
+        };
+        receipt.receipt_hash =
+            crate::local_model::sha256_hex(&serde_json::to_vec(&receipt).unwrap());
+        receipt
+    }
+
+    #[test]
+    fn remove_without_receipt_is_absent() {
+        let (_temp, store) = test_store();
+        assert_eq!(
+            remove_consented_from_store(&store).unwrap(),
+            RemoveOutcome::Absent
+        );
+    }
+
+    #[test]
+    fn remove_with_receipt_is_removed_without_verifying() {
+        let (_temp, store) = test_store();
+        let receipt = removal_receipt();
+        std::fs::write(
+            store.root().join("private/consented.receipt.json"),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            remove_consented_from_store(&store).unwrap(),
+            RemoveOutcome::Removed
+        );
+        assert!(!store.root().join("private/consented.receipt.json").exists());
+    }
+
+    #[test]
+    fn remove_rejects_a_malformed_receipt() {
+        let (_temp, store) = test_store();
+        std::fs::write(
+            store.root().join("private/consented.receipt.json"),
+            b"not-a-receipt",
+        )
+        .unwrap();
+        let error = remove_consented_from_store(&store).unwrap_err();
+        assert!(matches!(error, ConsentedError::Receipt));
+        assert_eq!(
+            consented_error_line(&error),
+            "The Consented Install receipt is invalid."
+        );
+        assert!(store.root().join("private/consented.receipt.json").exists());
     }
 
     #[test]

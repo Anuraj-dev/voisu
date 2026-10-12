@@ -11,6 +11,7 @@ use super::bounds::{
     CANCEL_GRACE, LOAD_DEADLINE, WorkerResourceLimits, resolve_live_worker_limits,
 };
 use super::dev::DevWorker;
+use super::dev::GPU_BUSY;
 use super::protocol::{ControlFrame, Correlation, WorkerFrame};
 use super::supervisor::{ReapOutcome, SupervisorError, WorkerChild};
 use crate::local_model::{ActiveReceipt, FilePin};
@@ -48,7 +49,10 @@ impl ConsentedHealth for ConsentedWorkerHealth {
 }
 
 fn health_error(error: SupervisorError) -> ConsentedError {
-    ConsentedError::Health(error.to_string())
+    match error {
+        SupervisorError::Busy | SupervisorError::Unavailable(GPU_BUSY) => ConsentedError::GpuBusy,
+        other => ConsentedError::Health(other.to_string()),
+    }
 }
 
 fn check_worker_health(worker: &mut impl WorkerChild, hash: &str) -> Result<(), ConsentedError> {
@@ -339,6 +343,26 @@ mod tests {
             manifest.files.last().unwrap().sha256,
             sha256_hex(b"fake Python")
         );
+    }
+
+    #[test]
+    fn health_error_maps_gpu_busy_without_a_health_failure() {
+        assert!(matches!(
+            health_error(SupervisorError::Busy),
+            ConsentedError::GpuBusy
+        ));
+        assert!(matches!(
+            health_error(SupervisorError::Unavailable(GPU_BUSY)),
+            ConsentedError::GpuBusy
+        ));
+        assert!(matches!(
+            health_error(SupervisorError::Crashed),
+            ConsentedError::Health(_)
+        ));
+        assert!(matches!(
+            health_error(SupervisorError::Unavailable("cannot lock Local GPU")),
+            ConsentedError::Health(_)
+        ));
     }
 
     #[test]

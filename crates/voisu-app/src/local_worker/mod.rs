@@ -41,6 +41,8 @@ pub use consented::ConsentedWorkerHealth;
 pub(crate) use consented::{consented_active_receipt, select_consented_receipt};
 #[cfg(not(test))]
 pub(crate) use consented::{launch_consented_worker, verify_default_consented_install};
+#[cfg(not(test))]
+pub(crate) use dev::GPU_BUSY;
 pub use dev::{DevWorker, RuntimeWorker, refuse_if_development_worker_loaded};
 pub use lifecycle::{
     LocalLifecycle, consented_runtime_admission, default_consented_runtime_admission,

@@ -34,6 +34,7 @@ pub use catalog::{
     Redistribution, RuntimeAbi, SHA256_HEX_LEN, ci_fixture_entry, development_selection,
     pilot_candidate, production_selection, sha256_hex, shipped_catalog, verify_file_digest,
 };
+pub(crate) use consented::consented_receipt_exists;
 pub use consented::{
     ConsentedConsent, ConsentedError, ConsentedFilePin, ConsentedHealth, ConsentedInstallRequest,
     ConsentedLayout, ConsentedReceipt, ConsentedRuntimeEntry, VerifiedConsentedInstall,
