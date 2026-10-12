@@ -38,6 +38,12 @@ reliability, packaging, and host acceptance gates. If no candidate passes every
 required gate, there is no Bakeoff Winner.
 _Avoid_: Pilot winner, provisional winner, hardcoded winner
 
+**Consented Install**:
+A Local model the user chose to install after setup showed it as suggested for
+their hardware, with its development evidence, size, and licence. It may run
+without a Bakeoff Winner, but it is never selected by default.
+_Avoid_: Recommended model, default model, winner
+
 **Source Transcript**:
 Text returned independently by Groq or Deepgram before reconciliation and
 quality validation.
